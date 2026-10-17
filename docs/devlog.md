@@ -3456,3 +3456,14 @@ and a user message 16/16 times. System text stays available, and is what a
 context not offered the tool gets. A turn that ends without a reply now
 leaves a short system notice saying so. See `docs/conversation-session.md`,
 "Kernel instructions" and "A turn that ended without a reply".
+
+The next day completion notices and drift arrivals joined the same path, and
+the form moved from storage to rendering. A completion notice was a
+`(User, Text)` block, so the model read it as the person's words; it is now
+a kernel instruction, and the nudge is stored as one too instead of as a call
+the model never made. Hydration renders kernel instructions and drifts in
+the context's form, so the log and the UI keep what each block is. Amy: at
+one delivery point everything from the kernel goes in one
+`get_system_messages` call, in log order, never two calls in a row. Each
+entry names its sender (`"from":"kaijutsu"` or `"from":"context <id>"`), and
+the call id names its first block so held prefixes keep matching.

@@ -261,6 +261,8 @@ mod tests {
         deliver(kernel, &source, &tokio_util::sync::CancellationToken::new()).await.unwrap();
         let notice = read(&kernel.kernel_db().lock(), &source).unwrap().unwrap();
         let block = notice.block.expect("the notice is in the log");
+        let stored = kernel.blocks().get_block_snapshot(context, &block).unwrap().unwrap();
+        assert!(crate::llm::hydrate::is_kernel_instruction(&stored), "a kernel instruction, not a user message: {stored:?}");
         assert_eq!(kernel.turns().active_count(context), 1, "no turn of its own");
         let pending = kernel.turns().close_ingress(context, lease.id());
         assert_eq!(pending, vec![crate::runtime::turn_state::LiveInput { block,

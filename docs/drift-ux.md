@@ -149,8 +149,10 @@ no reason for this beyond the two paths having been written at different times.
 
 ### 4. A received drift is a dead end for reply
 
-Hydration renders the block as `[push from context a1b2c3d4]`
-(`llm/hydrate.rs:344-357`) — the **short id only**. If the sending context has a
+Hydration renders the block as `[push from context a1b2c3d4]`, or as a
+`get_system_messages` entry `{"from":"context a1b2c3d4","kind":"push",...}`
+in a context offered that tool (`llm/hydrate.rs`, `system_message_entry`) —
+the **short id only**. If the sending context has a
 human-friendly label, the receiver never sees it. There is no thread id, and
 nothing in the block tells the receiving model that replying is possible or how.
 

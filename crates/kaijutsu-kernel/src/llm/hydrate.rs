@@ -98,6 +98,8 @@ pub(crate) struct HydrationState {
     /// that attaches an image appends it before its own result lands, so the
     /// image waits and follows the results to keep the call and result adjacent.
     pending_images: Vec<Message>,
+    /// How kernel instructions and drift arrivals render.
+    form: InstructionForm,
 }
 
 /// Whether a block belongs in model-visible history.
@@ -135,14 +137,136 @@ pub(crate) fn is_history_eligible(block: &BlockSnapshot) -> bool {
 }
 
 /// Whether a block is a kernel instruction to the model: a payload-less
-/// `(System, Notification)` block the kernel authored. It hydrates as a
-/// system message; a broker notification carries a payload and stays a user
-/// message.
+/// `(System, Notification)` block the kernel authored, such as a completion
+/// notice or the notice after a text-only reply. It hydrates in the
+/// context's `InstructionForm`; a broker notification carries a payload and
+/// stays a user message.
 pub(crate) fn is_kernel_instruction(block: &BlockSnapshot) -> bool {
     block.role == BlockRole::System
         && block.kind == BlockKind::Notification
         && block.notification.is_none()
         && block.id.principal_id == kaijutsu_types::PrincipalId::system()
+}
+
+/// How a message to the model from another player reaches it: a kernel
+/// instruction or a drift arrival. See `docs/conversation-session.md`,
+/// "Kernel instructions".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InstructionForm {
+    /// A system message at the block's point, which each provider sends as
+    /// system text or as user text (`Role::System`).
+    #[default]
+    SystemText,
+    /// A `get_system_messages` call joined to the reply before it, and its
+    /// result `{"messages":[...]}`. Consecutive messages share one call, in
+    /// log order. Only a context offered the tool uses it.
+    SystemMessagesTool,
+}
+
+/// The tool whose result carries messages in the `SystemMessagesTool` form.
+pub(crate) const SYSTEM_MESSAGES_TOOL: &str = "get_system_messages";
+
+/// The id of an emulated `get_system_messages` call starts with this and
+/// names the first block the call carries, so every hydration sends the
+/// same id.
+const SYSTEM_CALL_PREFIX: &str = "kj_system_";
+
+/// A `get_system_messages` result: compact JSON, `{"messages":[...]}`.
+pub(crate) fn system_messages_result(messages: &[serde_json::Value]) -> String {
+    serde_json::json!({ "messages": messages }).to_string()
+}
+
+/// One entry of a `get_system_messages` result: who sent it, and what.
+fn system_message_entry(block: &BlockSnapshot) -> serde_json::Value {
+    match block.kind {
+        BlockKind::Drift => {
+            let from = block.source_context
+                .map_or_else(|| "unknown context".to_string(), |id| format!("context {}", id.short()));
+            let kind = block.drift_kind.map_or("drift", |k| k.as_str());
+            serde_json::json!({ "from": from, "kind": kind, "text": block.content })
+        }
+        _ => serde_json::json!({ "from": "kaijutsu", "text": block.content }),
+    }
+}
+
+/// The id and entries of `message` when it is the result of an emulated
+/// `get_system_messages` call.
+fn system_messages_of(message: &Message) -> Option<(&str, Vec<serde_json::Value>)> {
+    let (Role::User, MessageContent::Blocks(blocks)) = (message.role, &message.content) else { return None };
+    let [ContentBlock::ToolResult { tool_use_id, content, is_error: false }] = &blocks[..] else { return None };
+    if !tool_use_id.starts_with(SYSTEM_CALL_PREFIX) {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(content).ok()?;
+    Some((tool_use_id, body.get("messages")?.as_array()?.clone()))
+}
+
+/// Add `entries` to the emulated `get_system_messages` result that ends
+/// `messages`, or that only user text follows, such as a person's submit.
+/// Returns whether they were added. Messages that arrive together share one
+/// call, and the person's text stays after it.
+fn join_system_messages(messages: &mut [Message], entries: &[serde_json::Value]) -> bool {
+    let at = messages.iter().rposition(|message|
+        !(message.role == Role::User && matches!(message.content, MessageContent::Text(_))));
+    let Some(at) = at else { return false };
+    let Some((id, mut joined)) = system_messages_of(&messages[at]) else { return false };
+    let id = id.to_string();
+    let answered = at.checked_sub(1).is_some_and(|i| matches!(&messages[i].content,
+        MessageContent::Blocks(blocks) if messages[i].role == Role::Assistant
+            && matches!(blocks.last(), Some(ContentBlock::ToolUse { id: call, .. }) if *call == id)));
+    if !answered {
+        return false;
+    }
+    joined.extend(entries.iter().cloned());
+    messages[at] = Message::tool_results(vec![ContentBlock::ToolResult {
+        tool_use_id: id, content: system_messages_result(&joined), is_error: false,
+    }]);
+    true
+}
+
+/// Append the messages a live turn delivers after those it already sent,
+/// joined as hydration of the same log joins them: an emulated
+/// `get_system_messages` call adds its entries to an open one
+/// (`join_system_messages`), and a first one joins the reply before it.
+pub(crate) fn append_delivered(messages: &mut Vec<Message>, delivered: Vec<Message>) {
+    let mut delivered = delivered.into_iter().peekable();
+    let mut first = true;
+    while let Some(message) = delivered.next() {
+        let after_reply = std::mem::take(&mut first);
+        if is_system_call(&message)
+            && let Some(result) = delivered.next_if(|result| system_messages_of(result).is_some())
+        {
+            let (_, entries) = system_messages_of(&result).expect("a system messages result");
+            if join_system_messages(messages, &entries) {
+                continue;
+            }
+            match messages.last_mut() {
+                Some(reply) if after_reply && reply.role == Role::Assistant => {
+                    let mut blocks = blocks_of(std::mem::replace(&mut reply.content, MessageContent::Blocks(Vec::new())));
+                    blocks.extend(blocks_of(message.content));
+                    reply.content = MessageContent::Blocks(blocks);
+                }
+                _ => messages.push(message),
+            }
+            messages.push(result);
+            continue;
+        }
+        messages.push(message);
+    }
+}
+
+/// Whether `message` is only an emulated `get_system_messages` call.
+fn is_system_call(message: &Message) -> bool {
+    message.role == Role::Assistant && matches!(&message.content, MessageContent::Blocks(blocks)
+        if matches!(&blocks[..], [ContentBlock::ToolUse { id, name, .. }]
+            if name == SYSTEM_MESSAGES_TOOL && id.starts_with(SYSTEM_CALL_PREFIX)))
+}
+
+fn blocks_of(content: MessageContent) -> Vec<ContentBlock> {
+    match content {
+        MessageContent::Text(text) => vec![ContentBlock::Text { text }],
+        MessageContent::Blocks(blocks) => blocks,
+    }
 }
 
 /// A standalone Error block as a message. A model stream error the kernel
@@ -159,6 +283,10 @@ fn standalone_error(block: &BlockSnapshot, envelope: String) -> Message {
 
 impl HydrationState {
     pub(crate) fn new() -> Self {
+        Self::in_form(InstructionForm::default())
+    }
+
+    pub(crate) fn in_form(form: InstructionForm) -> Self {
         Self {
             messages: Vec::new(),
             assistant_text: None,
@@ -167,7 +295,41 @@ impl HydrationState {
             tool_results: Vec::new(),
             user_shell_pending: HashMap::new(),
             pending_images: Vec::new(),
+            form,
         }
+    }
+
+    /// A message to the model from another player, in this state's form.
+    /// `text` is the system message the `SystemText` form sends.
+    fn system_message(&mut self, block: &BlockSnapshot, text: String) {
+        if self.form == InstructionForm::SystemText {
+            self.flush_all();
+            self.messages.push(Message::system(text));
+            return;
+        }
+        // Reasoning with no reply to carry it is dropped, as at any flush.
+        if self.assistant_text.is_none() && self.tool_uses.is_empty() {
+            self.flush_assistant();
+        }
+        let entry = system_message_entry(block);
+        let idle = self.assistant_text.is_none() && self.tool_uses.is_empty()
+            && self.tool_results.is_empty() && self.pending_images.is_empty();
+        if idle && join_system_messages(&mut self.messages, std::slice::from_ref(&entry)) {
+            return;
+        }
+        self.flush_tool_results();
+        if !self.tool_uses.is_empty() {
+            self.flush_assistant();
+        }
+        let id = format!("{SYSTEM_CALL_PREFIX}{}_{}", block.id.principal_id.short(), block.id.seq);
+        // The call joins a reply still being folded, as the live turn joins
+        // it to the reply it replays.
+        self.tool_uses.push(ContentBlock::ToolUse { id: id.clone(), name: SYSTEM_MESSAGES_TOOL.to_string(),
+            input: serde_json::json!({}) });
+        self.flush_assistant();
+        self.messages.push(Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: id, content: system_messages_result(&[entry]), is_error: false,
+        }]));
     }
 
     /// Fold one block into the in-progress session.
@@ -381,7 +543,8 @@ impl HydrationState {
                 }
             }
             (_, BlockKind::Drift) => {
-                // Drift blocks become user messages with provenance context
+                // A drift arrival is another context's message, delivered
+                // with its provenance in the context's instruction form.
                 let source_label = block
                     .source_context
                     .map(|id| id.short())
@@ -391,8 +554,7 @@ impl HydrationState {
                     "[{} from context {}]\n\n{}",
                     drift_kind, source_label, block.content
                 );
-                self.flush_all();
-                self.messages.push(Message::user(&prefixed));
+                self.system_message(block, prefixed);
             }
             (_, BlockKind::Error) => {
                 // A result a model turn sent already carries this envelope.
@@ -446,11 +608,9 @@ impl HydrationState {
                 }
             }
             (_, BlockKind::Notification) if is_kernel_instruction(block) => {
-                // A kernel instruction to the model, such as the notice
-                // after a text-only reply, is system text at its point in
-                // the history, not a user message.
-                self.flush_all();
-                self.messages.push(Message::system(&block.content));
+                // A kernel instruction to the model, such as a completion
+                // notice, is never a user message.
+                self.system_message(block, block.content.clone());
             }
             (_, BlockKind::Notification) => {
                 // Notification blocks (D-34): surface broker tool/log events to the

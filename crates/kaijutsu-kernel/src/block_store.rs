@@ -1406,7 +1406,9 @@ impl BlockStore {
             let author = PrincipalId::system();
             let after = entry.doc.block_ids_ordered().last().copied();
             entry.doc.set_principal_id(author);
-            let id = entry.doc.insert_block(None, after.as_ref(), Role::User, BlockKind::Text,
+            // A kernel instruction, so it never reads as a person's words
+            // (`llm::hydrate::is_kernel_instruction`).
+            let id = entry.doc.insert_block(None, after.as_ref(), Role::System, BlockKind::Notification,
                 &message, Status::Done, ContentType::Plain)?;
             entry.touch(author);
             let snapshot = entry.doc.get_block_snapshot(&id).expect("inserted completion exists");

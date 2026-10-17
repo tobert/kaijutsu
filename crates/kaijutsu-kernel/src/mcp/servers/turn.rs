@@ -11,11 +11,11 @@
 //! there.
 //!
 //! In the `SystemMessagesTool` form (`llm_stream::INSTRUCTION_FORM`) the
-//! instance also offers `get_system_messages`. The kernel's notice after a
-//! text-only reply is recorded as a call to it and its result, so the model
-//! reads the notice as runtime output rather than as a user message. Every
-//! context offered `done` is offered it on every turn, so its tools stay the
-//! same from turn to turn. A call the model makes itself returns no messages.
+//! instance also offers `get_system_messages`. Kernel instructions and drift
+//! arrivals hydrate as a call to it and its result, so the model reads them
+//! as runtime output rather than as a user message. Every context offered
+//! `done` is offered it on every turn, so its tools stay the same from turn
+//! to turn. A call the model makes itself returns no messages.
 //!
 //! `*` does not cover this instance: a context type opts in with
 //! `kj binding allow builtin.turn`, because offering `done` changes how every

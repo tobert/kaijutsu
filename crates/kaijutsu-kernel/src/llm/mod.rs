@@ -1677,7 +1677,8 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 ///
 /// Walks blocks in order and produces the `Message` sequence expected by the
 /// LLM API. Skips thinking, file, and empty blocks.
-/// Drift blocks are included as User messages with a provenance prefix.
+/// Kernel instructions and drift blocks are system messages, the
+/// `SystemText` form; [`hydrate_in_form`] renders them in another form.
 ///
 /// Preserves `tool_use_id` from blocks when available, falling back to
 /// `BlockId::to_key()` for pre-migration blocks.
@@ -1686,13 +1687,19 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 /// interruption errors, and orphan results are dropped with warnings.
 /// `Provider::stream` validates the final pairing before backend dispatch.
 pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Message> {
+    hydrate_in_form(blocks, hydrate::InstructionForm::default())
+}
+
+/// [`hydrate_from_blocks`], rendering kernel instructions and drift blocks
+/// in `form`.
+pub(crate) fn hydrate_in_form(blocks: &[kaijutsu_types::BlockSnapshot], form: hydrate::InstructionForm) -> Vec<Message> {
     // Index for parent lookups — only the Error branch consults it, and
     // only for `parent_id`. Incremental callers pass the parent
     // directly to `translate_block` and don't need an index.
     let blocks_by_id: HashMap<kaijutsu_types::BlockId, &kaijutsu_types::BlockSnapshot> =
         blocks.iter().map(|b| (b.id, b)).collect();
 
-    let mut state = hydrate::HydrationState::new();
+    let mut state = hydrate::HydrationState::in_form(form);
     for block in blocks {
         let parent = block
             .parent_id
@@ -2579,11 +2586,11 @@ mod tests {
             ];
 
             let msgs = hydrate_from_blocks(&blocks);
-            // user + assistant + drift (as user) = 3; thinking/file/empty skipped
+            // user + assistant + drift (as system text) = 3; thinking/file/empty skipped
             assert_eq!(msgs.len(), 3);
             assert_eq!(msgs[0].as_text(), Some("Hello"));
             assert_eq!(msgs[1].as_text(), Some("Hi"));
-            assert_eq!(msgs[2].role, Role::User); // drift becomes user message
+            assert_eq!(msgs[2].role, Role::System); // a drift is never the user's words
             assert!(msgs[2].as_text().unwrap().contains("drift content"));
         }
 
@@ -2830,7 +2837,7 @@ mod tests {
         }
 
         #[test]
-        fn drift_blocks_become_user_messages() {
+        fn drift_blocks_become_system_messages() {
             let c = ctx();
             let u = user();
             let m = model();
@@ -2875,8 +2882,8 @@ mod tests {
             );
             assert_eq!(msgs[0].role, Role::User);
             assert_eq!(msgs[1].role, Role::Assistant);
-            // Drift block becomes a User message
-            assert_eq!(msgs[2].role, Role::User);
+            // A drift block is a system message in the `SystemText` form
+            assert_eq!(msgs[2].role, Role::System);
             let drift_text = msgs[2].as_text().unwrap();
             assert!(
                 drift_text.contains("pull"),
@@ -3890,6 +3897,65 @@ mod tests {
             assert_eq!(roles, [Role::User, Role::Assistant, Role::System, Role::User]);
             assert_eq!(msgs[2].as_text(), Some("You replied without a tool call, so the task is still open."));
             assert_eq!(msgs[3].as_text(), Some("a handoff note"));
+        }
+
+        /// In the `SystemMessagesTool` form, kernel instructions and drifts
+        /// that arrive together are one `get_system_messages` call joined to
+        /// the reply, with one entry each in log order. A person's text
+        /// between them stays after the call. The call id names the first
+        /// block, so every hydration, whole or folded in parts, sends the
+        /// same messages. A later kernel instruction after more model output
+        /// is its own call.
+        #[test]
+        fn messages_that_arrive_together_are_one_get_system_messages_call() {
+            use crate::llm::hydrate::InstructionForm;
+            let c = ctx();
+            let (m, u) = (model(), user());
+            let source = ContextId::new();
+            let notice = |seq: u64, text: &str| {
+                kaijutsu_types::BlockSnapshotBuilder::new(BlockId::new(c, system(), seq), kaijutsu_types::BlockKind::Notification)
+                    .role(BlockRole::System)
+                    .content(text)
+                    .build()
+            };
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "run the build"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "It is running."),
+                notice(7, "Shell operation op-1 completed with status done."),
+                BlockSnapshot::text(BlockId::new(c, u, 1), None, BlockRole::User, "how is it going?"),
+                BlockSnapshot::drift(BlockId::new(c, PrincipalId::new(), 0), None, "the tests pass here", source, None,
+                    kaijutsu_types::DriftKind::Push),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Built."),
+                notice(8, "You replied without a tool call."),
+            ];
+            let first = format!("kj_system_{}_7", system().short());
+            let second = format!("kj_system_{}_8", system().short());
+            let call = |id: &str, text: &str| Message::with_reasoning_text_and_tool_uses(Vec::new(), Some(text.into()),
+                vec![ContentBlock::ToolUse { id: id.into(), name: "get_system_messages".into(), input: serde_json::json!({}) }]);
+            let result = |id: &str, content: String| Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(), content, is_error: false }]);
+            let expected = serde_json::to_value(vec![
+                Message::user("run the build"),
+                call(&first, "It is running."),
+                result(&first, serde_json::json!({"messages": [
+                    {"from": "kaijutsu", "text": "Shell operation op-1 completed with status done."},
+                    {"from": format!("context {}", source.short()), "kind": "push", "text": "the tests pass here"},
+                ]}).to_string()),
+                Message::user("how is it going?"),
+                call(&second, "Built."),
+                result(&second, r#"{"messages":[{"from":"kaijutsu","text":"You replied without a tool call."}]}"#.into()),
+            ]).unwrap();
+            let whole = hydrate_in_form(&blocks, InstructionForm::SystemMessagesTool);
+            assert_eq!(serde_json::to_value(&whole).unwrap(), expected);
+            let mut folded = ConversationMailbox::new();
+            folded.set_instruction_form(InstructionForm::SystemMessagesTool);
+            folded.catch_up(&blocks[..3]);
+            folded.catch_up(&blocks);
+            assert_eq!(serde_json::to_value(folded.snapshot()).unwrap(), expected);
+
+            // Without the tool, each is a system message at its point.
+            let roles: Vec<Role> = hydrate_from_blocks(&blocks).iter().map(|m| m.role).collect();
+            assert_eq!(roles, [Role::User, Role::Assistant, Role::System, Role::User, Role::System, Role::Assistant, Role::System]);
         }
 
         // ── (Tool, Text) content-typed blocks (svg_block / abc_block, A1) ──

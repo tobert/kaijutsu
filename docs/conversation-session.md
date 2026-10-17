@@ -148,31 +148,50 @@ done_tool`).
 
 ## Kernel instructions
 
-A kernel instruction is runtime text for the model inside a turn: the notice
-after a text-only reply and the output-ceiling notice. It never reads as a
-user message. A chat template such as Gemma 4's drops the agent turn's
-thinking before the last user message, so a notice sent as one made the
-model treat it as a new user turn and recap the conversation.
+A message to the model from another player never reads as a user message:
+the notice after a text-only reply, the output-ceiling notice, a completion
+notice, and a drift arrival. A chat template such as Gemma 4's drops the
+agent turn's thinking before the last user message, so a notice sent as one
+made the model treat it as a new user turn and recap the conversation. A
+person's submit stays a user message.
 
-`InstructionForm` in `runtime/llm_stream.rs` chooses the shape:
+The log stores each as it is: the three kernel notices are payload-less
+`(System, Notification)` blocks from the system principal, called kernel
+instructions (`llm/hydrate.rs`, `is_kernel_instruction`), and a drift is a
+`Drift` block. Hydration renders them in the context's form,
+`InstructionForm`, which the turn sets on its mailbox from its tools:
 
 - `SystemMessagesTool`, for a context offered `get_system_messages`. The
-  reply is recorded as calling `get_system_messages` with `{}`, and its result
-  reads `{"messages":["You replied without a tool call, ..."]}`. The call
-  joins the reply's assistant message; the blocks are an ordinary call and
-  result authored by the system principal. `builtin.turn` offers the tool
-  beside `done` while `INSTRUCTION_FORM` is `SystemMessagesTool`, so a
-  context's tools are the same on every turn. A call the model makes itself
-  returns `{"messages":[]}`.
-- `SystemText`, for every other context. A payload-less
-  `(System, Notification)` block from the system principal hydrates as
-  `llm::Role::System` at its point in the history. Council v2 and `/mk/v1`
+  messages render as the model calling `get_system_messages` with `{}` and
+  its result. Each entry says who sent it:
+
+  ```
+  {"messages":[{"from":"kaijutsu","text":"Shell operation op-1 completed ..."},{"from":"context 1a2b3c4d","kind":"push","text":"the tests pass"}]}
+  ```
+
+  Messages that arrive together share one call, in log order: at a delivery
+  point the nudge, the ceiling notice, completions, and drifts are one call
+  and one result, never two calls in a row. A person's text between them
+  stays after the call; a submit that arrived before them stays before it.
+  The call joins the reply's assistant message when it follows a reply. Its
+  id is `kj_system_<principal short id>_<seq>` of its first block, so every
+  hydration sends the same id. `builtin.turn` offers the tool beside `done`
+  while `INSTRUCTION_FORM` is `SystemMessagesTool`, so a context's tools are
+  the same on every turn. A call the model makes itself returns
+  `{"messages":[]}`.
+- `SystemText`, for every other context. Each message is
+  `llm::Role::System` at its point in the history; a drift keeps its
+  `[push from context 1a2b3c4d]` prefix. Council v2 and `/mk/v1`
   send it as a `system` message, which mkviolet renders as its own system
   turn. Hosted OpenAI sends a `system` message. Anthropic, DeepSeek, and other
   OpenAI-compatible servers send it as user text: Anthropic takes system text
   only in its top-level field, DeepSeek's template moves every system message
   into the system prompt, and some local templates refuse a later system
   message. Broker notifications carry a payload and stay user messages.
+
+The turn records the nudge or the ceiling notice after any input pending at
+that point (`instruct` in `runtime/llm_stream.rs`) and delivers them
+together, so the request carries what a later hydration of the log sends.
 
 On Gemma 4 over mkviolet, 16 samples per form, nudged after a text-only reply
 to the fourth prompt: the tool form called `done` 16/16 times, never named an
@@ -191,8 +210,9 @@ partial reply as finished:
 (The previous turn failed before it finished: LLM stream error: provider fell over. It gave no complete reply; do not resume it unless asked.)
 ```
 
-It is a `(System, Notification)` block from the system principal, so it is
-system text in every form (`record_turn_end` in `runtime/llm_stream.rs`). It
+It is a kernel instruction (`record_turn_end` in `runtime/llm_stream.rs`), so
+it renders in the context's form like any other: a `get_system_messages`
+result in a context offered the tool, system text elsewhere. It
 lands before the first user block after the prompt that the model never read,
 so input sent during the turn follows it. A partial reply keeps its text; its
 thinking has no continuity signature and is dropped. The stream error block a
@@ -260,7 +280,10 @@ point.
 Delivery (`deliver_live_input`, `ConversationMailbox::live_tail`) reads
 the log after the turn's write point, the block its next output follows.
 It renders every unseen, hydratable block there as hydration would, then
-moves the write point to the last of them. The turn's next blocks follow
+moves the write point to the last of them. Completion notices and drift
+arrivals render in the context's instruction form (see "Kernel
+instructions"), joined to the messages the turn already sent as hydration
+joins them (`llm::hydrate::append_delivered`). The turn's next blocks follow
 the input in the log, so a later hydration sends what the turn sent.
 Blocks folded at turn start, and drafts, are skipped. Other writers'
 blocks in that span ride along, in the position a later hydration gives

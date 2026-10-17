@@ -228,13 +228,25 @@ fn takes_live_input(interrupt: &ContextInterruptState, turn_lease: &TurnLease) -
         && !turn_lease.owes_timed_delivery()
 }
 
+/// Where a turn delivers input it has not read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// After a tool round's results. Any pending input triggers it.
+    ToolRound,
+    /// After the final inference. Only input whose wake continues a turn
+    /// triggers it.
+    FinalInference,
+    /// With a kernel instruction the turn just recorded, which always
+    /// triggers it.
+    Instruction,
+}
+
 /// Deliver input that arrived while this turn runs (`docs/conversation-session.md`,
 /// "Input during a turn"). Appends the unseen blocks after the turn's write
 /// point as hydration renders them and moves the write point past them so
 /// the turn's next blocks follow. Adds the blocks the next request carries to
-/// `carried`; the loop settles them once that inference completes. At the
-/// final yield (`extends_turn`), only input whose wake continues a turn
-/// triggers delivery. Returns whether any message was added.
+/// `carried`; the loop settles them once that inference completes. `point`
+/// says which input triggers delivery. Returns whether any message was added.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_live_input(
     kernel: &Kernel,
@@ -246,10 +258,14 @@ async fn deliver_live_input(
     messages: &mut Vec<LlmMessage>,
     write_point: &mut kaijutsu_types::BlockId,
     carried: &mut Vec<kaijutsu_types::BlockId>,
-    extends_turn: bool,
+    point: Delivery,
 ) -> Result<bool, StreamFailure> {
     let pending = kernel.turns().pending_inputs(context_id, turn_id);
-    let wanted = if extends_turn { pending.iter().any(|input| input.wake.continues_turn()) } else { !pending.is_empty() };
+    let wanted = match point {
+        Delivery::ToolRound => !pending.is_empty(),
+        Delivery::FinalInference => pending.iter().any(|input| input.wake.continues_turn()),
+        Delivery::Instruction => true,
+    };
     if !wanted { return Ok(false) }
     let blocks = documents.block_snapshots(context_id)
         .map_err(|error| StreamFailure::LiveInput(error.to_string()))?;
@@ -267,7 +283,7 @@ async fn deliver_live_input(
     crate::resolve_image_blocks_from_cas(&mut delivered, kernel.cas().clone(), Some(image_cache)).await;
     tracing::info!(%context_id, blocks = tail.delivered.len(), messages = delivered.len(),
         "Delivered input to the running turn");
-    messages.extend(delivered);
+    crate::llm::hydrate::append_delivered(messages, delivered);
     Ok(true)
 }
 
@@ -848,19 +864,7 @@ pub(crate) const DONE_TOOL: &str = "done";
 /// spin.
 const MAX_DONE_NUDGES: u32 = 2;
 
-/// How a kernel instruction reaches the model inside a turn: the notice
-/// after a text-only reply, or after an output-ceiling stop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InstructionForm {
-    /// A payload-less `(System, Notification)` block. It hydrates as a
-    /// system message at its point, which each provider sends as system text
-    /// or as user text (`llm::Role::System`).
-    SystemText,
-    /// A `get_system_messages` call by the model and its result, which holds
-    /// the instruction as `{"messages":[...]}`. Only a context offered the
-    /// tool uses it; others get `SystemText`.
-    SystemMessagesTool,
-}
+pub(crate) use crate::llm::hydrate::{InstructionForm, SYSTEM_MESSAGES_TOOL, system_messages_result};
 
 /// The form for contexts offered `done`. `builtin.turn` offers
 /// `get_system_messages` only in the `SystemMessagesTool` form, which reads
@@ -868,59 +872,31 @@ pub(crate) enum InstructionForm {
 /// "Kernel instructions".
 pub(crate) const INSTRUCTION_FORM: InstructionForm = InstructionForm::SystemMessagesTool;
 
-/// The tool whose result carries kernel instructions in the
-/// `SystemMessagesTool` form.
-pub(crate) const SYSTEM_MESSAGES_TOOL: &str = "get_system_messages";
-
-/// A `get_system_messages` result: compact JSON, `{"messages":[...]}`.
-pub(crate) fn system_messages_result(messages: &[&str]) -> String {
-    serde_json::json!({ "messages": messages }).to_string()
-}
-
-/// Record a kernel instruction after `last_block_id` and add it to the live
-/// request, in `form`. The durable blocks hydrate to the same messages, so
-/// the next turn reads what this one sent.
-fn instruct(
+/// Record a kernel instruction and deliver it with any input pending after
+/// the turn's write point. The block follows that input in the log, so
+/// hydration renders them together, in the context's form, as this turn
+/// sends them.
+#[allow(clippy::too_many_arguments)]
+async fn instruct(
+    kernel: &Kernel,
     documents: &SharedBlockStore,
     context_id: ContextId,
-    last_block_id: &mut kaijutsu_types::BlockId,
+    turn_id: kaijutsu_types::TurnId,
+    mailbox: &crate::ConversationMailbox,
+    image_cache: &crate::llm::image_cache::ImageBase64Cache,
     messages: &mut Vec<LlmMessage>,
-    form: InstructionForm,
+    write_point: &mut kaijutsu_types::BlockId,
+    carried: &mut Vec<kaijutsu_types::BlockId>,
     text: &str,
-) -> crate::block_store::BlockStoreResult<()> {
-    match form {
-        InstructionForm::SystemText => {
-            *last_block_id = documents.insert_block_as(context_id, None, Some(last_block_id), Role::System,
-                BlockKind::Notification, text, Status::Done, ContentType::Plain, Some(PrincipalId::system()))?;
-            messages.push(LlmMessage::system(text));
-        }
-        InstructionForm::SystemMessagesTool => {
-            let id = format!("kj_system_{}", uuid::Uuid::new_v4().simple());
-            let input = serde_json::json!({});
-            let call = documents.insert_tool_call_as(context_id, None, Some(last_block_id), SYSTEM_MESSAGES_TOOL,
-                input.clone(), Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(id.clone()), None)?;
-            documents.set_status(context_id, &call, Status::Done)?;
-            let content = system_messages_result(&[text]);
-            *last_block_id = documents.insert_tool_result_as(context_id, &call, Some(&call), content.as_str(),
-                Status::Done, None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(id.clone()))?;
-            // The call joins the reply it answers, as hydration folds a
-            // reply's text and calls into one assistant message.
-            let call = ContentBlock::ToolUse { id: id.clone(), name: SYSTEM_MESSAGES_TOOL.to_string(), input };
-            match messages.last_mut() {
-                Some(reply) if reply.role == crate::llm::Role::Assistant => {
-                    let blocks = match std::mem::replace(&mut reply.content, crate::llm::MessageContent::Blocks(Vec::new())) {
-                        crate::llm::MessageContent::Text(text) => vec![ContentBlock::Text { text }],
-                        crate::llm::MessageContent::Blocks(blocks) => blocks,
-                    };
-                    reply.content = crate::llm::MessageContent::Blocks(blocks.into_iter().chain([call]).collect());
-                }
-                _ => messages.push(LlmMessage::with_tool_uses(None, vec![call])),
-            }
-            messages.push(LlmMessage::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: id, content, is_error: false,
-            }]));
-        }
-    }
+) -> Result<(), StreamFailure> {
+    let blocks = documents.block_snapshots(context_id)
+        .map_err(|error| StreamFailure::LiveInput(error.to_string()))?;
+    let pending = mailbox.live_tail(&blocks, write_point).map_err(StreamFailure::LiveInput)?;
+    let after = pending.delivered.last().copied().unwrap_or(*write_point);
+    documents.insert_block_as(context_id, None, Some(&after), Role::System, BlockKind::Notification, text,
+        Status::Done, ContentType::Plain, Some(PrincipalId::system()))?;
+    deliver_live_input(kernel, documents, context_id, turn_id, mailbox, image_cache, messages, write_point,
+        carried, Delivery::Instruction).await?;
     Ok(())
 }
 
@@ -2527,6 +2503,13 @@ async fn run_llm_stream(
             });
         }
     };
+    // A context offered `get_system_messages` reads kernel instructions and
+    // drift arrivals through it.
+    mailbox.set_instruction_form(if tools.iter().any(|tool| tool.name == SYSTEM_MESSAGES_TOOL) {
+        InstructionForm::SystemMessagesTool
+    } else {
+        InstructionForm::SystemText
+    });
     let mut messages = match hydrate_messages(
         &documents,
         context_id,
@@ -2631,12 +2614,6 @@ async fn run_llm_stream(
     let runs_to_done = offers_done
         && (origin == TurnOrigin::Autonomous || kernel.mode() == crate::KernelMode::Headless);
     let mut done_nudges: u32 = 0;
-    // A context offered `get_system_messages` reads instructions through it.
-    let instruction_form = if tools.iter().any(|tool| tool.name == SYSTEM_MESSAGES_TOOL) {
-        InstructionForm::SystemMessagesTool
-    } else {
-        InstructionForm::SystemText
-    };
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
 
@@ -3372,7 +3349,8 @@ async fn run_llm_stream(
                 // writes above): the notice and the message sent are one
                 // fact, and continuing with only the wire copy would send an
                 // instruction no later hydration can reproduce.
-                instruct(&documents, context_id, &mut last_block_id, &mut messages, instruction_form, &notice)?;
+                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.image_cache(),
+                    &mut messages, &mut last_block_id, &mut carried_input, &notice).await?;
                 continue 'agentic;
             }
             if output_ceiling_hit {
@@ -3390,27 +3368,19 @@ async fn run_llm_stream(
                     "Output ceiling reached and the turn does not continue"
                 );
             }
-            // Input that arrived during the final inference earns the turn
-            // another one when its wake says so. A stopping turn, or one a
-            // beat waits on, leaves input pending for the turn's end.
             if let Some(assistant) = replayed_assistant(
                 std::mem::take(&mut assistant_reasoning),
                 &assistant_text,
             ) {
                 messages.push(assistant);
             }
-            if takes_live_input(&interrupt, turn_lease) && deliver_live_input(&kernel, &documents,
-                context_id, turn_id, mailbox, conversation_cache.image_cache(), &mut messages,
-                &mut last_block_id, &mut carried_input, true).await?
-            {
-                continue 'agentic;
-            }
             // A turn that runs to `done` ends its task by calling it. Text
             // alone is narration, not an ending: ask for a tool call or
             // `done`, up to `MAX_DONE_NUDGES` times. A turn a person prompted
             // on an interactive kernel ends on text, because the person
             // answers it. The other guards are the ceiling's: no notice for
-            // an inference that will not run.
+            // an inference that will not run. Input pending here rides with
+            // the notice.
             if runs_to_done && !output_ceiling_hit && done_nudges < MAX_DONE_NUDGES
                 && !stop.timed_delivery && !stop.cancelled && !stop.stopping_after_turn
             {
@@ -3420,7 +3390,17 @@ async fn run_llm_stream(
                     continue with a tool call.";
                 tracing::info!(%context_id, nudge = done_nudges, limit = MAX_DONE_NUDGES,
                     "Text-only reply in a context offered `done`; continuing the turn with a notice");
-                instruct(&documents, context_id, &mut last_block_id, &mut messages, instruction_form, notice)?;
+                instruct(&kernel, &documents, context_id, turn_id, mailbox, conversation_cache.image_cache(),
+                    &mut messages, &mut last_block_id, &mut carried_input, notice).await?;
+                continue 'agentic;
+            }
+            // Input that arrived during the final inference earns the turn
+            // another one when its wake says so. A stopping turn, or one a
+            // beat waits on, leaves input pending for the turn's end.
+            if takes_live_input(&interrupt, turn_lease) && deliver_live_input(&kernel, &documents,
+                context_id, turn_id, mailbox, conversation_cache.image_cache(), &mut messages,
+                &mut last_block_id, &mut carried_input, Delivery::FinalInference).await?
+            {
                 continue 'agentic;
             }
             if runs_to_done {
@@ -3565,7 +3545,7 @@ async fn run_llm_stream(
         if takes_live_input(&interrupt, turn_lease) {
             deliver_live_input(&kernel, &documents, context_id, turn_id, mailbox,
                 conversation_cache.image_cache(), &mut messages, &mut last_block_id,
-                &mut carried_input, false).await?;
+                &mut carried_input, Delivery::ToolRound).await?;
         }
 
         // Each mutation is now journaled via journal_op — no explicit checkpoint needed.
@@ -4402,7 +4382,8 @@ mod publish_tests {
 
     /// In the `SystemMessagesTool` form the nudge is a `get_system_messages`
     /// call joined to the text-only reply and a result holding the notice, as
-    /// the request sends it and as the next turn rehydrates it.
+    /// the request sends it and as the next turn rehydrates it. The log keeps
+    /// the notice as a kernel instruction; only the rendering is a call.
     #[tokio::test]
     async fn the_nudge_in_the_tool_form_is_a_get_system_messages_call() {
         tokio::task::LocalSet::new().run_until(async {
@@ -4428,12 +4409,14 @@ mod publish_tests {
             };
             let [crate::llm::ContentBlock::ToolResult { content, is_error: false, .. }] = &result[..] else { panic!("{request}") };
             let body: serde_json::Value = serde_json::from_str(content).unwrap();
-            assert!(body["messages"][0].as_str().unwrap().starts_with("You replied without a tool call"), "{content}");
+            assert_eq!(body["messages"][0]["from"], "kaijutsu", "{content}");
+            assert!(body["messages"][0]["text"].as_str().unwrap().starts_with("You replied without a tool call"), "{content}");
             assert!(!content.contains(": "), "compact JSON: {content}");
 
             let blocks = documents.block_snapshots(ctx).unwrap();
-            assert!(!blocks.iter().any(|b| b.kind == BlockKind::Notification), "no notification in the tool form");
-            let rehydrated = crate::llm::hydrate_from_blocks(&blocks);
+            assert!(blocks.iter().any(crate::llm::hydrate::is_kernel_instruction), "the notice is a kernel instruction");
+            assert!(!blocks.iter().any(|b| b.tool_name.as_deref() == Some(SYSTEM_MESSAGES_TOOL)), "no call in the log");
+            let rehydrated = crate::llm::hydrate_in_form(&blocks, InstructionForm::SystemMessagesTool);
             assert_eq!(serde_json::to_value(&rehydrated[..n]).unwrap(), request, "live and rehydrated differ");
         }).await;
     }
@@ -9081,6 +9064,7 @@ mod lifetime_tests {
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         assert!(mentions(&sent[1], "a sibling's finding"), "{:#?}", sent[1]);
+        assert_eq!(sent[1].last().unwrap().role, crate::llm::Role::System, "without the tool, a drift is system text");
         let mut expected = sent[1].clone();
         expected.push(LlmMessage::assistant("ack"));
         assert_same_wire(&rehydrated(&kernel, context), &expected);
@@ -9120,12 +9104,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         submit_text(&kernel, context, call.principal_id, "go").await;
         tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
-        let tail = kernel.blocks().last_block_id(context);
-        let notice = kernel.blocks().insert_block_as(context, None, tail.as_ref(), Role::User, BlockKind::Text,
-            "Shell operation op-1 completed", Status::Done, ContentType::Plain, Some(PrincipalId::system())).unwrap();
-        assert!(kernel.turns().offer_input(context, crate::runtime::turn_state::LiveInput { block: notice,
-            wake: crate::runtime::turn_state::Wake::Completion {
-                source: crate::runtime::completion_notice::Source::Shell("op-1".into()), resume_allowed: true } }));
+        complete_in(&kernel, context, "Shell operation op-1 completed", true);
         hold.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
@@ -9135,7 +9114,160 @@ mod lifetime_tests {
             "the delivered notice never reaches its post-turn wake");
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
-        assert_eq!(user_text(sent[1].last().unwrap()), Some("Shell operation op-1 completed"));
+        // A context without `get_system_messages` reads it as system text.
+        let last = sent[1].last().unwrap();
+        assert_eq!((last.role, last.as_text()), (crate::llm::Role::System, Some("Shell operation op-1 completed")));
+        let mut expected = sent[1].clone();
+        expected.push(LlmMessage::assistant("ack"));
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// Land a completion notice at the log tail, as `insert_completion_notice`
+    /// writes it, and offer it to the running turn.
+    fn complete_in(kernel: &Kernel, context: ContextId, text: &str, resume_allowed: bool) -> BlockId {
+        let tail = kernel.blocks().last_block_id(context);
+        let notice = kernel.blocks().insert_block_as(context, None, tail.as_ref(), Role::System, BlockKind::Notification,
+            text, Status::Done, ContentType::Plain, Some(PrincipalId::system())).unwrap();
+        assert!(kernel.turns().offer_input(context, crate::runtime::turn_state::LiveInput { block: notice,
+            wake: crate::runtime::turn_state::Wake::Completion {
+                source: crate::runtime::completion_notice::Source::Shell("op-1".into()), resume_allowed } }));
+        notice
+    }
+
+    /// Offer the context `builtin.turn`, so its turns declare `done` and
+    /// `get_system_messages`.
+    async fn offer_system_messages(kernel: &Arc<Kernel>, context: ContextId) {
+        kernel.broker().register(Arc::new(crate::mcp::servers::BuiltinTurnServer::new()),
+            crate::mcp::InstancePolicy::for_kernel(kernel)).await.unwrap();
+        kernel.broker().set_binding(context, crate::mcp::ContextToolBinding::with_instances(vec![
+            crate::mcp::InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE)])).await.unwrap();
+    }
+
+    /// What a fresh hydration of the whole log sends to a context offered
+    /// `get_system_messages`.
+    fn rehydrated_with_system_messages(kernel: &Kernel, context: ContextId) -> Vec<LlmMessage> {
+        let mut mailbox = crate::ConversationMailbox::new();
+        mailbox.set_instruction_form(InstructionForm::SystemMessagesTool);
+        mailbox.catch_up(&kernel.blocks().block_snapshots(context).unwrap());
+        mailbox.snapshot()
+    }
+
+    /// The call id and entries of an emulated `get_system_messages` call
+    /// and its result: `call` must end with the call, `result` answer it.
+    fn system_messages(call: &LlmMessage, result: &LlmMessage) -> (String, Vec<serde_json::Value>) {
+        let crate::llm::MessageContent::Blocks(calls) = &call.content else { panic!("no call: {call:?}") };
+        let Some(ContentBlock::ToolUse { id, name, input }) = calls.last() else { panic!("no call: {call:?}") };
+        assert_eq!((call.role, name.as_str(), input), (crate::llm::Role::Assistant, SYSTEM_MESSAGES_TOOL, &serde_json::json!({})));
+        let crate::llm::MessageContent::Blocks(results) = &result.content else { panic!("no result: {result:?}") };
+        let [ContentBlock::ToolResult { tool_use_id, content, is_error: false }] = &results[..] else { panic!("{result:?}") };
+        assert_eq!(tool_use_id, id);
+        assert!(!content.contains(": "), "compact JSON: {content}");
+        let body: serde_json::Value = serde_json::from_str(content).unwrap();
+        (id.clone(), body["messages"].as_array().unwrap().clone())
+    }
+
+    /// In a context offered `get_system_messages`, a completion and a drift
+    /// that arrive during a tool round are one call after its results, with
+    /// one entry each in log order, and a later hydration sends the same.
+    #[tokio::test]
+    async fn a_completion_and_a_drift_during_a_tool_round_are_one_get_system_messages_call() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
+                input: serde_json::json!({}) }, done("tool_use")],
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        offer_system_messages(&kernel, context).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        let notice = complete_in(&kernel, context, "Shell operation op-1 completed", false);
+        drift_in(&kernel, context, "a sibling's finding");
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let n = sent[1].len();
+        assert!(matches!(&sent[1][n - 3].content, crate::llm::MessageContent::Blocks(b)
+            if matches!(&b[..], [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "call_1")), "{:#?}", sent[1]);
+        let (id, entries) = system_messages(&sent[1][n - 2], &sent[1][n - 1]);
+        assert_eq!(id, format!("kj_system_{}_{}", notice.principal_id.short(), notice.seq), "named for its first block");
+        assert_eq!(entries[0], serde_json::json!({"from": "kaijutsu", "text": "Shell operation op-1 completed"}));
+        assert_eq!(entries[1]["kind"], "push");
+        assert_eq!(entries[1]["text"], "a sibling's finding");
+        assert!(entries[1]["from"].as_str().unwrap().starts_with("context "), "{entries:?}");
+        assert_eq!(entries.len(), 2);
+        let mut expected = sent[1].clone();
+        expected.push(LlmMessage::assistant("ack"));
+        assert_same_wire(&rehydrated_with_system_messages(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A completion that arrives during the final inference is a call joined
+    /// to the replayed reply, as hydration joins it.
+    #[tokio::test]
+    async fn a_completion_during_the_final_inference_joins_the_reply_as_a_get_system_messages_call() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![text_reply("waiting on it"), text_reply("ack")])
+            .recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        offer_system_messages(&kernel, context).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        complete_in(&kernel, context, "Shell operation op-1 completed", true);
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let n = sent[1].len();
+        let (_, entries) = system_messages(&sent[1][n - 2], &sent[1][n - 1]);
+        assert_eq!(entries, [serde_json::json!({"from": "kaijutsu", "text": "Shell operation op-1 completed"})]);
+        assert!(matches!(&sent[1][n - 2].content, crate::llm::MessageContent::Blocks(b)
+            if matches!(&b[0], ContentBlock::Text { text } if text == "waiting on it")), "{:#?}", sent[1]);
+        let mut expected = sent[1].clone();
+        expected.push(LlmMessage::assistant("ack"));
+        assert_same_wire(&rehydrated_with_system_messages(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// The nudge after a text-only reply and a completion pending at that
+    /// point are one call, in log order. A person's note that arrived after
+    /// the completion stays after the call.
+    #[tokio::test]
+    async fn a_nudge_and_a_completion_at_the_same_point_are_one_get_system_messages_call() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            text_reply("Next I'll run the tests."),
+            vec![StreamEvent::ToolUse { id: "call_done".into(), name: "done".into(),
+                input: serde_json::json!({"status": "done", "feedback": "ran them"}) }, done("tool_use")],
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        offer_system_messages(&kernel, context).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Autonomous, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        complete_in(&kernel, context, "Shell operation op-1 completed", false);
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2, "one more inference: {sent:#?}");
+        let n = sent[1].len();
+        assert_eq!(user_text(&sent[1][n - 1]), Some("a note"), "{:#?}", sent[1]);
+        let (_, entries) = system_messages(&sent[1][n - 3], &sent[1][n - 2]);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["text"], "Shell operation op-1 completed");
+        assert!(entries[1]["text"].as_str().unwrap().starts_with("You replied without a tool call"), "{entries:?}");
+        assert_eq!(sent[1].iter().filter(|m| serde_json::to_string(m).unwrap().contains(SYSTEM_MESSAGES_TOOL)).count(), 1,
+            "one call: {:#?}", sent[1]);
+        assert_same_wire(&rehydrated_with_system_messages(&kernel, context)[..n], &sent[1]);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

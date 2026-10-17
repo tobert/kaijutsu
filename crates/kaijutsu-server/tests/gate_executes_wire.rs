@@ -463,7 +463,7 @@ fn shutdown_keeps_the_approved_turns_delivery_seed() {
         }).await;
         tokio::time::timeout(std::time::Duration::from_secs(2),
             s.kernel.kernel.shutdown_runtime_worker()).await.unwrap().unwrap();
-        assert!(s.worker_blocks().iter().any(|block| block.kind == BlockKind::Text
+        assert!(s.worker_blocks().iter().any(|block| block.kind == BlockKind::Notification
             && block.content.contains("approved and ran: ")),
             "shutdown discarded the durable delivery seed for the spent approval");
         assert!(!s.undelivered(&ask));
@@ -756,7 +756,7 @@ fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
 
         wait_for("the seed block saying it ran", || {
             s.worker_blocks().iter().any(|b| {
-                b.kind == kaijutsu_types::BlockKind::Text
+                b.kind == kaijutsu_types::BlockKind::Notification
                     && b.content.contains("approved and ran: ")
             })
         })
@@ -769,7 +769,7 @@ fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
             .expect("the filled output block");
         let seed_index = blocks
             .iter()
-            .position(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("approved and ran: "))
+            .position(|b| b.kind == kaijutsu_types::BlockKind::Notification && b.content.contains("approved and ran: "))
             .expect("the seed block");
         assert!(
             seed_index > output_index,
@@ -1170,7 +1170,7 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
         // blocks in its own context.
         wait_for("the seed block saying it ran", || {
             s.worker_blocks().iter().any(|b| {
-                b.kind == kaijutsu_types::BlockKind::Text
+                b.kind == kaijutsu_types::BlockKind::Notification
                     && b.content.contains("approved and ran: ")
             })
         })
@@ -1179,7 +1179,7 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
         let seed = s
             .worker_blocks()
             .into_iter()
-            .find(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("approved and ran: "))
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Notification && b.content.contains("approved and ran: "))
             .expect("the seed block");
         assert!(
             !seed.content.contains("Nothing has run yet"),

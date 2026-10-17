@@ -55,6 +55,11 @@ pub struct ConversationMailbox {
     /// [`rehydrate_windowed`]: Self::rehydrate_windowed
     /// [`catch_up`]: Self::catch_up
     windowed: bool,
+    /// How kernel instructions and drift arrivals render; see
+    /// [`set_instruction_form`].
+    ///
+    /// [`set_instruction_form`]: Self::set_instruction_form
+    form: super::hydrate::InstructionForm,
 }
 
 /// The keep-set a windowed conversation hydrates, as its maximal runs over the
@@ -96,6 +101,20 @@ impl ConversationMailbox {
             seen: HashSet::new(),
             materialized: false,
             windowed: false,
+            form: super::hydrate::InstructionForm::default(),
+        }
+    }
+
+    /// Render kernel instructions and drift arrivals in `form`, the form of
+    /// the context's tools. A change discards the folded state, so the next
+    /// [`catch_up`] renders the whole log in the new form.
+    ///
+    /// [`catch_up`]: Self::catch_up
+    pub(crate) fn set_instruction_form(&mut self, form: super::hydrate::InstructionForm) {
+        if self.form != form {
+            self.form = form;
+            self.state = HydrationState::in_form(form);
+            self.seen.clear();
         }
     }
 
@@ -158,7 +177,7 @@ impl ConversationMailbox {
         // the whole log in chronological order. (Reached via `kj context hydrate
         // --clear` or a fail-safe-to-None policy read.)
         if self.windowed {
-            self.state = HydrationState::new();
+            self.state = HydrationState::in_form(self.form);
             self.seen.clear();
             self.windowed = false;
         }
@@ -213,7 +232,7 @@ impl ConversationMailbox {
                  hydrating FULL history (cost guard OFF). Re-set with `kj context hydrate`."
             );
         }
-        self.state = HydrationState::new();
+        self.state = HydrationState::in_form(self.form);
         self.seen.clear();
         let by_id: HashMap<BlockId, &BlockSnapshot> =
             blocks.iter().map(|b| (b.id, b)).collect();
@@ -267,7 +286,7 @@ impl ConversationMailbox {
         let start = blocks.iter().position(|block| block.id == *write_point)
             .ok_or_else(|| format!("the turn's write point {write_point} is not in the log"))?;
         let by_id: HashMap<BlockId, &BlockSnapshot> = blocks.iter().map(|b| (b.id, b)).collect();
-        let mut state = HydrationState::new();
+        let mut state = HydrationState::in_form(self.form);
         let mut delivered = Vec::new();
         for block in &blocks[start + 1..] {
             if self.seen.contains(&block.id) || !super::hydrate::is_history_eligible(block) {
