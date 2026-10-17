@@ -7622,13 +7622,24 @@ impl KernelDb {
 
     /// Delete a backend by name.
     ///
-    /// Refuses loudly when a cast slot or a model alias still points at it —
-    /// the FK would reject the DELETE anyway, but a named list of the
-    /// referents is the difference between "fix this" and "SQLITE_CONSTRAINT".
+    /// Refuses loudly while the defaults name it, or a cast slot or a model
+    /// alias still points at it. The FK would reject a slot's or an alias's
+    /// DELETE anyway, but a named list of the referents is the difference
+    /// between "fix this" and "SQLITE_CONSTRAINT".
     pub fn delete_backend(&self, name: &str) -> KernelDbResult<()> {
         let Some(backend) = self.get_backend_by_name(name)? else {
             return Err(KernelDbError::NotFound(format!("backend '{name}'")));
         };
+        // The registry refuses to build when the defaults name a missing
+        // backend, so the default backend cannot be removed.
+        if let Some(defaults) = self.get_llm_defaults()?
+            && defaults.default_backend == backend.name
+        {
+            return Err(KernelDbError::Validation(format!(
+                "backend '{name}' is the default backend — make another one the default \
+                 first with `kj backend default set --backend <name> --model <model>`"
+            )));
+        }
         let id = blob_param(backend.backend_id.as_bytes());
         let slots: Vec<String> = {
             let mut stmt = self.conn.prepare(

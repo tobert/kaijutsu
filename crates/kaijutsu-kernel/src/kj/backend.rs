@@ -92,7 +92,8 @@ enum BackendCommand {
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
     },
-    /// Remove a backend. Refused while a cast slot or alias still points at it.
+    /// Remove a backend. Refused while the defaults, a cast slot, or an alias
+    /// still names it.
     #[command(alias = "rm")]
     Remove {
         /// Backend name
@@ -1048,6 +1049,23 @@ mod tests {
             }
             other => panic!("a referenced backend must not vanish: {other:?}"),
         }
+    }
+
+    /// The defaults name a backend, so removing it is refused with how to
+    /// change the default first; once the default moves, it removes.
+    #[tokio::test]
+    async fn remove_is_refused_while_the_defaults_name_the_backend() {
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d.dispatch(&argv(&["backend", "rm", "deepseek"]), &c).await;
+        assert!(!r.is_ok(), "the default backend must not be removed: {}", r.message());
+        assert!(r.message().contains("kj backend default set --backend"), "{}", r.message());
+        assert!(d.kernel_db().lock().get_backend_by_name("deepseek").unwrap().is_some());
+
+        let moved = d.dispatch(&argv(&["backend", "default", "set", "--backend", "ollama", "--model", "gemma4:31b"]), &c).await;
+        assert!(moved.is_ok(), "{}", moved.message());
+        let r = d.dispatch(&argv(&["backend", "rm", "deepseek"]), &c).await;
+        assert!(r.is_ok(), "{}", r.message());
     }
 
     #[tokio::test]
