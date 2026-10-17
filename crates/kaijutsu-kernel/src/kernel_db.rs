@@ -2829,7 +2829,6 @@ impl KernelDb {
                 Err(error) => return Err(error.into()),
             }
         }
-        Self::migrate_context_model_rollover(conn)?;
         Self::migrate_preset_cast_narrowing(conn)?;
         Self::drop_legacy_value_enum_checks(conn)?;
         Self::migrate_well_known_lost_found(conn)?;
@@ -3136,82 +3135,6 @@ impl KernelDb {
              ALTER TABLE {staging} RENAME TO {table};",
         ))?;
         Ok(true)
-    }
-
-    /// One-shot rollover for the Track A → Track D backend rename (2026-08-03,
-    /// design round with Amy — see `docs/devlog.md`). Track A replaced the old
-    /// free-form provider strings with honest backend NAMES
-    /// (`anthropic`/`deepseek`/`gpt`/`ollama`); this walks
-    /// every existing context row's `provider`/`model` columns and rewrites
-    /// them so no context is left pointing at a name no backend answers to:
-    ///
-    /// - `anthropic`/`deepseek`/`ollama`/`gpt` (case-insensitive) survive
-    ///   as-is — same name, new factory floor. `gpt` is in the KEEP set (not
-    ///   just the openai-rename target) so a row already rolled over on a
-    ///   prior boot is left alone on this one — the whole migration is a
-    ///   no-op re-run.
-    /// - `openai` renames to `gpt` (same endpoint, renamed) — the model id is
-    ///   untouched.
-    /// - anything else that has a `provider` or `model` set (`lemonade`,
-    ///   `local`, a typo, garbage, or a model with no provider at all) is not
-    ///   a name we can resolve any more, so it is reassigned to the kernel's
-    ///   affordable default: `deepseek` / `deepseek-flash` (Amy: "mostly we
-    ///   can toss them to deepseek v4 flash for now"; the undated id tracks
-    ///   each flash generation).
-    /// - a row with BOTH columns NULL is left untouched — that already means
-    ///   "fall through to the registry default", and remapping it would turn
-    ///   an implicit default into an explicit pin nobody asked for.
-    ///
-    /// Every changed row logs at `info` (old → new), plus a one-line summary
-    /// count. A row whose id fails to parse is a corrupt DB, not a skip —
-    /// this fails loud rather than silently leaving a context's model
-    /// unrolled (no-silent-fallbacks).
-    fn migrate_context_model_rollover(conn: &Connection) -> KernelDbResult<()> {
-        const KEEP: [&str; 4] = ["anthropic", "deepseek", "ollama", "gpt"];
-        const FALLBACK_PROVIDER: &str = "deepseek";
-        const FALLBACK_MODEL: &str = "deepseek-flash";
-
-        let rows: Vec<(Vec<u8>, Option<String>, Option<String>)> = {
-            let mut stmt = conn.prepare("SELECT context_id, provider, model FROM contexts")?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<SqliteResult<_>>()?
-        };
-
-        let mut changed = 0usize;
-        for (id_bytes, provider, model) in rows {
-            if provider.is_none() && model.is_none() {
-                continue;
-            }
-            let (new_provider, new_model): (Option<String>, Option<String>) =
-                match provider.as_deref() {
-                    Some(p) if KEEP.iter().any(|k| p.eq_ignore_ascii_case(k)) => continue,
-                    Some(p) if p.eq_ignore_ascii_case("openai") => {
-                        (Some("gpt".to_string()), model.clone())
-                    }
-                    _ => (Some(FALLBACK_PROVIDER.to_string()), Some(FALLBACK_MODEL.to_string())),
-                };
-
-            let id = ContextId::try_from_slice(&id_bytes).ok_or_else(|| {
-                KernelDbError::Validation(
-                    "context model rollover: corrupt context_id blob".to_string(),
-                )
-            })?;
-            info!(
-                "context model rollover: {} {:?}/{:?} -> {:?}/{:?}",
-                id.short(),
-                provider,
-                model,
-                new_provider,
-                new_model
-            );
-            conn.execute(
-                "UPDATE contexts SET provider = ?1, model = ?2 WHERE context_id = ?3",
-                params![new_provider, new_model, id_bytes],
-            )?;
-            changed += 1;
-        }
-        info!("context model rollover: {changed} context row(s) updated");
-        Ok(())
     }
 
     /// One-shot preset narrowing for Track D (2026-08-03): a preset's old
@@ -9732,169 +9655,31 @@ mod tests {
         assert_eq!(loaded.cache_ttl_secs, 300);
     }
 
-    // ── Track D: context model rollover + preset cast narrowing ─────────
+    // ── Context model pins + Track D preset cast narrowing ──────────────
 
-    /// Surviving backend names (`anthropic`/`deepseek`/`ollama`/`gpt`,
-    /// case-insensitive) are untouched by the rollover — they're the SAME
-    /// name in the new factory floor, not a rename target.
+    /// A context's model belongs to its context row: opening the DB keeps a
+    /// pin to any backend name, including one called `openai`.
     #[test]
-    fn context_model_rollover_keeps_surviving_backend_names_untouched() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let mut anthropic = make_context_row(Some("keep-anthropic"));
-        anthropic.provider = Some("anthropic".to_string());
-        anthropic.model = Some("claude-opus-4-6".to_string());
-        insert_context_with_doc(&db, &anthropic, ws_id);
-
-        let mut deepseek = make_context_row(Some("keep-deepseek"));
-        deepseek.provider = Some("DeepSeek".to_string()); // case-insensitive
-        deepseek.model = Some("deepseek-r1".to_string());
-        insert_context_with_doc(&db, &deepseek, ws_id);
-
-        let mut ollama = make_context_row(Some("keep-ollama"));
-        ollama.provider = Some("ollama".to_string());
-        ollama.model = Some("gemma4:31b".to_string());
-        insert_context_with_doc(&db, &ollama, ws_id);
-
-        let mut gpt = make_context_row(Some("keep-gpt"));
-        gpt.provider = Some("gpt".to_string());
-        gpt.model = Some("gpt-5.6-terra".to_string());
-        insert_context_with_doc(&db, &gpt, ws_id);
-
-        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
-
-        for (id, expected_provider, expected_model) in [
-            (anthropic.context_id, "anthropic", "claude-opus-4-6"),
-            (deepseek.context_id, "DeepSeek", "deepseek-r1"),
-            (ollama.context_id, "ollama", "gemma4:31b"),
-            (gpt.context_id, "gpt", "gpt-5.6-terra"),
-        ] {
-            let row = db.get_context(id).unwrap().unwrap();
-            assert_eq!(row.provider.as_deref(), Some(expected_provider));
-            assert_eq!(row.model.as_deref(), Some(expected_model));
+    fn opening_the_db_keeps_every_context_model_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let pins = [(Some("zorak"), Some("qwen3.8-27b")), (Some("openai"), Some("gpt-5.6")), (None, Some("bare-model"))];
+        let ids: Vec<ContextId> = {
+            let db = KernelDb::open(&path).unwrap();
+            let ws_id = setup_test_db(&db);
+            pins.iter().map(|(provider, model)| {
+                let mut row = make_context_row(None);
+                row.provider = provider.map(str::to_string);
+                row.model = model.map(str::to_string);
+                insert_context_with_doc(&db, &row, ws_id);
+                row.context_id
+            }).collect()
+        };
+        let db = KernelDb::open(&path).unwrap();
+        for (id, (provider, model)) in ids.iter().zip(pins) {
+            let row = db.get_context(*id).unwrap().unwrap();
+            assert_eq!((row.provider.as_deref(), row.model.as_deref()), (provider, model));
         }
-    }
-
-    /// `openai` renames to `gpt` (same endpoint, renamed) — the model id
-    /// travels unchanged.
-    #[test]
-    fn context_model_rollover_renames_openai_to_gpt() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let mut row = make_context_row(Some("was-openai"));
-        row.provider = Some("openai".to_string());
-        row.model = Some("gpt-4-turbo".to_string());
-        insert_context_with_doc(&db, &row, ws_id);
-
-        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
-
-        let updated = db.get_context(row.context_id).unwrap().unwrap();
-        assert_eq!(updated.provider.as_deref(), Some("gpt"));
-        assert_eq!(updated.model.as_deref(), Some("gpt-4-turbo"), "model id is untouched");
-    }
-
-    /// Everything else with a provider or model set — a retired local-server
-    /// name, a typo, or a model with no provider at all — is reassigned to
-    /// the kernel's affordable default (Amy: "mostly we can toss them to
-    /// deepseek v4 flash for now").
-    #[test]
-    fn context_model_rollover_falls_back_everything_else_to_deepseek_flash() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let mut lemonade = make_context_row(Some("was-lemonade"));
-        lemonade.provider = Some("lemonade".to_string());
-        lemonade.model = Some("some-local-model".to_string());
-        insert_context_with_doc(&db, &lemonade, ws_id);
-
-        let mut local = make_context_row(Some("was-local"));
-        local.provider = Some("local".to_string());
-        local.model = Some("whatever".to_string());
-        insert_context_with_doc(&db, &local, ws_id);
-
-        let mut typo = make_context_row(Some("was-typo"));
-        typo.provider = Some("anthorpic".to_string()); // misspelled
-        typo.model = Some("claude-opus-4-6".to_string());
-        insert_context_with_doc(&db, &typo, ws_id);
-
-        // provider absent but a model string survives — "empty-with-garbage".
-        let mut garbage = make_context_row(Some("was-garbage"));
-        garbage.provider = None;
-        garbage.model = Some("???".to_string());
-        insert_context_with_doc(&db, &garbage, ws_id);
-
-        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
-
-        for id in [
-            lemonade.context_id,
-            local.context_id,
-            typo.context_id,
-            garbage.context_id,
-        ] {
-            let row = db.get_context(id).unwrap().unwrap();
-            assert_eq!(row.provider.as_deref(), Some("deepseek"));
-            assert_eq!(row.model.as_deref(), Some("deepseek-flash"));
-        }
-    }
-
-    /// A row with BOTH `provider` and `model` NULL already means "fall
-    /// through to the registry default" — the rollover must leave it alone,
-    /// not turn an implicit default into an explicit pin nobody asked for.
-    #[test]
-    fn context_model_rollover_leaves_fully_unset_rows_untouched() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let row = make_context_row(Some("never-configured"));
-        assert!(row.provider.is_none() && row.model.is_none());
-        insert_context_with_doc(&db, &row, ws_id);
-
-        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
-
-        let after = db.get_context(row.context_id).unwrap().unwrap();
-        assert!(after.provider.is_none());
-        assert!(after.model.is_none());
-    }
-
-    /// The whole migration re-runs on every kernel `open()`/`temporary()` —
-    /// it must be a no-op the second time, including for rows it JUST
-    /// rewrote (a re-mapped `gpt`/`deepseek` row must not be re-mapped
-    /// again on the next pass).
-    #[test]
-    fn context_model_rollover_is_idempotent() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let mut openai = make_context_row(Some("was-openai-2"));
-        openai.provider = Some("openai".to_string());
-        openai.model = Some("gpt-4-turbo".to_string());
-        insert_context_with_doc(&db, &openai, ws_id);
-
-        let mut garbage = make_context_row(Some("was-garbage-2"));
-        garbage.provider = Some("lemonade".to_string());
-        garbage.model = Some("whatever".to_string());
-        insert_context_with_doc(&db, &garbage, ws_id);
-
-        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
-        let after_first = (
-            db.get_context(openai.context_id).unwrap().unwrap(),
-            db.get_context(garbage.context_id).unwrap().unwrap(),
-        );
-
-        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
-        let after_second = (
-            db.get_context(openai.context_id).unwrap().unwrap(),
-            db.get_context(garbage.context_id).unwrap().unwrap(),
-        );
-
-        assert_eq!(after_first.0.provider, after_second.0.provider);
-        assert_eq!(after_first.0.model, after_second.0.model);
-        assert_eq!(after_first.1.provider, after_second.1.provider);
-        assert_eq!(after_first.1.model, after_second.1.model);
-        assert_eq!(after_second.0.provider.as_deref(), Some("gpt"));
-        assert_eq!(after_second.1.provider.as_deref(), Some("deepseek"));
     }
 
     /// `migrate_preset_cast_narrowing` against a pre-Track-D `presets` table
