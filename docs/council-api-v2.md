@@ -109,10 +109,12 @@ POST /council/v2/contexts
   its own system turn and the turn's thinking before it stays. Like a user
   message, it carries no `reasoning` or `tool_calls`.
 - **The server renders thinking where the model was trained to see it.**
-  For a model whose template drops earlier thinking, such as Gemma 4 and
-  Qwen 3, `reasoning` before the last user message is not rendered; inside
-  one agent turn it is. The rule is the template's, so it is part of
-  `template` in identity.
+  The rule is the template's, so it is part of `template` in identity.
+  mkviolet renders Gemma 4 with the template's `preserve_thinking` on: an
+  assistant message with tool calls keeps its `reasoning` for the rest of
+  the context, so an agent turn renders the same after the next prompt and
+  a held prefix stays a prefix; a text answer's `reasoning` is not rendered
+  once a later user message follows.
 - **`snap: true` marks a boundary** at the end of that message. The server
   renders the context, starts from the longest boundary it holds, feeds
   the rest, and holds a snapshot at each boundary it passes and at the end.
@@ -121,11 +123,10 @@ POST /council/v2/contexts
   tokens it did not feed.
 - **A boundary exists only where the rendering keeps it.** A marked message
   whose rendering is not a prefix of the whole context is not a boundary,
-  and the reply lists no snapshot for it. In Gemma 4 this is a message
-  inside an agent turn once a later user message follows, because the
-  template then drops that turn's thinking. The end of a user message is
-  always a boundary, and so is the end of a run of tool results until the
-  next user message.
+  and the reply lists no snapshot for it. In Gemma 4 this is a text answer
+  with thinking once a later user message follows, because the template
+  then drops that thinking. The end of a user message and the end of a run
+  of tool results are always boundaries.
 - **Every call carries an `id`**, printable text the server never renders, and a
   `tool` message names the call it answers in `tool_call_id`, a call of the
   assistant message before its run of tool messages.
