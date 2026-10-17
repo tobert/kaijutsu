@@ -335,6 +335,15 @@ A server serves the model-specific rest under its own prefix and lists it in
 - **Thinking at decision time.** `think` costs about 21 ms a token on
   mkviolet, which does not serve it yet. Whether it pays, and at what
   length, is the bench's next measurement.
+- **Decisions that ride with a generation.** Queued after the stateless
+  draft settles. A generation could carry `decisions: [{spec_id, ask?,
+  when}]`, with `when` one of `before` (after the prompt), `after` (after
+  the reply), or `each_call` (after each parsed tool call), each read as a
+  late system turn on rows past the head and then dropped, and answered in
+  `done` in a decision read's shape. `done` could also report each tool
+  call's mean and least token log probability and its arguments' entropy,
+  which cost no extra pass. Neither means anything until it is calibrated
+  against outcomes, so the first use is logging them beside each case.
 - **Tool-result size.** A tool result is written whole into a context,
   even when the context then has no room for another turn. The client's
   preview and storage rules for large results are its own.
