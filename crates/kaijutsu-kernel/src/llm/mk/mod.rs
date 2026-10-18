@@ -22,9 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kaijutsu_mk::council::wire::ServerIdentity;
-use kaijutsu_mk::council_v2::GenerationStream;
-use kaijutsu_mk::council_v2::wire::GenerationEvent;
+use gogi_proto::identity::ServerIdentity;
+use kaijutsu_mk::council::{GenerationEvent, GenerationStream};
 use kaijutsu_mk::generate::{
     Finish, GenerateEvent, GenerateRequest, GenerateStream, Message as MkMessage, Sample, Source, MAX_TOKENS_LIMIT,
 };
@@ -178,14 +177,14 @@ impl Client {
         }
     }
 
-    /// A streamed turn. On a council v2 server that lists `generate`, it is
-    /// a generation after the whole conversation. Otherwise the request is
+    /// A streamed turn. On a council v2 server that serves the turn's model
+    /// with `generate`, it is a generation after the whole conversation. Otherwise the request is
     /// rendered and checked against the window before `/mk/v1/generate`
     /// starts.
     pub async fn stream(&self, opts: BuildOpts, history: Vec<Message>) -> LlmResult<Stream> {
         let (thinking, reasoning_effort) = build::effort(opts.effort.as_deref())?;
         let turn = self.turn();
-        if let Some(identity) = self.council_v2(&turn).await? {
+        if let Some(identity) = self.council_v2(&turn, &opts.model).await? {
             return self.stream_v2(opts, history, identity, turn).await;
         }
         let messages = build::messages(opts.system.as_deref(), &history)?;
@@ -393,7 +392,7 @@ enum Inner {
 enum Event {
     Token(String),
     Done(kaijutsu_mk::generate::Done),
-    V2Done(kaijutsu_mk::council_v2::wire::GenerationDone),
+    V2Done(gogi_proto::generation::GenerationDone),
 }
 
 impl Inner {
@@ -572,10 +571,13 @@ mod tests {
     fn v2_identity(capabilities: serde_json::Value) -> kaijutsu_mk::test_server::Reply {
         http(
             200,
-            json!({"model": "gemma-4", "weight_hash": "w4", "tokenizer_hash": "t", "template": "x", "engine": "e",
-                   "limits": {"context_tokens": 32768, "state_bytes": 1000, "contexts_per_decision": 8,
-                              "choice_options": 26, "default_timeout_ms": 2000},
-                   "capabilities": capabilities})
+            json!({"models": [{"model": "gemma-4", "aliases": ["qwen"], "status": "ready", "weight_hash": "w4",
+                               "tokenizer_hash": "t", "template": "x", "engine": "e",
+                               "limits": {"context_tokens": 32768, "decision_context_tokens": 3072, "snapshot_bytes": 1,
+                                          "contexts_per_decision": 8, "default_timeout_ms": 2000},
+                               "capabilities": capabilities}],
+                   "limits": {"state_bytes": 1000, "choice_options": 26},
+                   "capabilities": []})
             .to_string(),
         )
     }
@@ -602,7 +604,7 @@ mod tests {
             out.push_str(&format!("event: token\ndata: {t}\n\n"));
         }
         let head = if head == 0 { json!(null) } else { json!(snap_id(head)) };
-        let done = json!({"content": content, "reasoning": "", "tool_calls": calls, "finish": "stop",
+        let done = json!({"model": "gemma-4", "content": content, "reasoning": "", "tool_calls": calls, "finish": "stop",
                           "usage": {"prompt": 47, "kept": 40, "fed": 7, "completion": 3}, "head": head,
                           "snapshots": [{"id": snap_id(1), "message": 1, "tokens": 15}]});
         out.push_str(&format!("event: done\ndata: {done}\n\n"));
@@ -681,7 +683,7 @@ mod tests {
         let tools = json!([{"type": "function", "function": {"name": "ls", "description": "List.", "parameters": {"type": "object"}}}]);
         assert_eq!(
             gens[0],
-            json!({"context": {"thinking": false, "tools": tools,
+            json!({"model": "gemma-4", "context": {"thinking": false, "tools": tools,
                                "messages": [{"role": "system", "content": "rules", "snap": true},
                                             {"role": "user", "content": "list /tmp", "snap": true}]},
                    "max_tokens": 64, "stream": true})
@@ -726,6 +728,25 @@ mod tests {
         let err = probing(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::ContextFull(m) if m.contains("32768") && m.contains("fork")), "{err:?}");
         assert_eq!(err.category_and_code(), (kaijutsu_types::ErrorCategory::Context, Some("full")));
+    }
+
+    /// A turn's model names a served model by its `model` or an alias, and
+    /// the generation names it by its `model`. A model the server does not
+    /// serve is refused before any generation, naming the ones it serves.
+    ///
+    /// Falsified by a generation that sends the alias, or one sent for a
+    /// model the server lacks.
+    #[tokio::test]
+    async fn a_turn_names_its_served_model_and_one_the_server_lacks_is_refused() {
+        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), generation("hi", json!([]), 2)]).await;
+        let c = probing(&base);
+        drain(&mut c.stream(opts(64), vec![Message::user("u1")]).await.unwrap()).await;
+        assert_eq!(bodies(&seen, "/council/v2/generations")[0]["model"], "gemma-4", "the alias qwen routes to gemma-4");
+        let mut other = opts(64);
+        other.model = "llama".into();
+        let err = c.stream(other, vec![Message::user("u1")]).await.err().unwrap();
+        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("\"llama\"") && m.contains("it serves gemma-4")), "{err:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the identity and one generation");
     }
 
     /// A conversation that ends with an assistant message has nothing to

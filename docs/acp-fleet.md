@@ -364,13 +364,13 @@ undo = "irreversible"
 ```
 
 A scenario with `[council] verdicts` gets a scripted council for the run
-(`crates/kaijutsu-acp-fleet/src/council.rs`). It serves the council
-contract on 127.0.0.1: it reports an identity, holds the specs and
-contexts the kernel sends, and answers each decision with the next
-verdict. It answers only `verdict`, and `undo` when the scenario gives one,
+(`crates/kaijutsu-acp-fleet/src/council.rs`). It serves council v2 on
+127.0.0.1: it reports an identity with no capabilities, holds the specs
+the kernel sends, builds the contexts it sends, and answers each decision
+with the next verdict. It answers only `verdict`, and `undo` when the scenario gives one,
 so a spec that also asks the rubric decides by the verdict
-(`docs/council.md`, "Bumper mode"). Its numbers pass `math::verify`, so the
-kernel reads them as a real council's. After the run the report lists the
+(`docs/council.md`, "Bumper mode"). Its numbers pass gogi-proto's
+`math::verify`, so the kernel reads them as a real council's. After the run the report lists the
 answers it gave, such as `scripted council answered 3 decision(s):
 try_harder, do_less, try_harder`, and any request it could not serve fails
 the scenario.
@@ -403,7 +403,8 @@ prompt, so a live seat's bumps land where the scenario means them to.
 
 A contained agent reaches the scripted council, so the council bounds what
 it keeps. It answers a request body over 8 MiB with 413 and a head over
-64 KiB with 431, without reading either. It holds at most 64 specs. It
+64 KiB with 431, without reading either. It holds at most 64 specs. It answers a route it does not serve, such
+as any council v1 route, with 404. It
 keeps the first 32 errors, each cut to 1024 bytes, and counts the rest.
 Each refusal is recorded as an error, so it fails the scenario.
 

@@ -440,6 +440,10 @@ pub(crate) struct CouncilThreshold {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CouncilConfig {
     pub(crate) server: String,
+    /// `[council] model`: the served model the server's decisions run on,
+    /// by its `model` or an alias. `None` is the server's only served
+    /// model; a server that serves several makes that a miss.
+    pub(crate) model: Option<String>,
     pub(crate) contexts: Vec<String>,
     pub(crate) pool_method: CouncilPoolMethod,
     pub(crate) pool_weights: CouncilPoolWeights,
@@ -494,6 +498,8 @@ impl CouncilConfig {
 #[serde(deny_unknown_fields)]
 struct CouncilToml {
     server: String,
+    #[serde(default)]
+    model: Option<String>,
     contexts: Vec<String>,
     pool: CouncilPoolToml,
     deadline_ms: i64,
@@ -920,8 +926,12 @@ impl GateConfig {
                 mass_floor: t.mass_floor,
             });
         }
+        if raw.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(err("[council] model is empty; name a served model or leave the key out".to_string()));
+        }
         Ok(CouncilConfig {
             server: raw.server.clone(),
+            model: raw.model.clone(),
             contexts: raw.contexts.clone(),
             pool_method,
             pool_weights,
@@ -2898,6 +2908,15 @@ enabled = false
         assert_eq!(c.thresholds.len(), 1);
         assert_eq!(c.thresholds[0].allow_at, 0.98);
         assert_eq!(c.thresholds[0].mass_floor, -0.05);
+    }
+
+    #[test]
+    fn the_council_model_is_the_servers_only_one_unless_named() {
+        assert_eq!(config(COUNCIL_FULL).council().unwrap().model, None);
+        let named = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmodel = \"gemma-4\""));
+        assert_eq!(named.council().unwrap().model.as_deref(), Some("gemma-4"));
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmodel = \" \""));
+        assert!(m.contains("[council] model is empty"), "{m}");
     }
 
     #[test]

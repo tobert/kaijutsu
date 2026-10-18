@@ -1,6 +1,6 @@
 # Council dossier: decision APIs outside kaijutsu
 
-Source material for `docs/council.md` and `docs/council-api.md`. It records what
+Source material for `docs/council.md` and gogi's `docs/council-api.md`. It records what
 other decision APIs look like, as of 2026-10-04, so the council API's choices
 can be checked against them. Every claim names its source. Most sources are
 secondary (blogs, gateway docs, press); none of them is a vendor specification

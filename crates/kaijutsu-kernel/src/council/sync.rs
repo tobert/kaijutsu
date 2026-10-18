@@ -10,8 +10,8 @@
 //! (`llm::endpoint::mk_call`), waiting no later than the caller's deadline,
 //! and a 429 is sent again after its cooldown.
 //!
-//! A server that answers `GET /council/v2/identity` is spoken to in council
-//! v2 (`docs/council-api-v2.md`). The server keeps no context records: a
+//! The server speaks council v2 (gogi's `docs/council-api-v2.md`) and keeps
+//! no context records: a
 //! seat is its context value, the projected context as a queue seat for the
 //! decision's spec (`super::seat`). A seat is built with
 //! `POST /council/v2/contexts` when its value changes, and each decision
@@ -23,22 +23,15 @@
 //! forgets seats nothing current reaches before it sends the set.
 //! [`build_seats`] builds the configured seats when the kernel starts, and
 //! [`build_context_seats`] the seats that depend on one proposing seat.
-//!
-//! A server that answers the v2 identity 404 is spoken to in v1, each
-//! context under its own id. This kernel is the only writer of its v1
-//! council contexts, so a `PUT` carries the head the server last reported
-//! as `If-Match`; a head that moved anyway is a miss, not a retry. The
-//! caller bounds `prepare_labels` with the decision's deadline and may drop
-//! it part way. A `PUT` dropped before its answer may still have landed, so
-//! the context is forgotten and the next `PUT` carries no `If-Match`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use kaijutsu_mk::council::canon;
-use kaijutsu_mk::council::wire::{Capability, ContextPut, ServerIdentity, SnapshotId, Spec, SpecId, SpecQuestion};
-use kaijutsu_mk::council_v2::wire::{Context, PinsPut};
+use gogi_proto::identity::{Capability, ModelStatus, ServedModel, ServerIdentity};
+use gogi_proto::pins::PinsPut;
+use gogi_proto::spec::{QuestionKind, Spec};
+use gogi_proto::{Context, SnapshotId, SpecId};
 use kaijutsu_mk::{MkClient, MkError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
@@ -46,13 +39,6 @@ use sha2::{Digest, Sha256};
 use super::projection::{HOUSE_RULES_BYTES_PER_TOKEN, HouseRules, project, project_house_rules, project_shadow};
 use crate::kj::gate_policy::CouncilConfig;
 use crate::llm::endpoint::{Endpoint, NoSlot, SlotWaits, mk_call};
-
-/// Which council API a server speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Wire {
-    V1,
-    V2,
-}
 
 /// Everything one decision needs from the server's side.
 pub(crate) struct Prepared {
@@ -62,9 +48,8 @@ pub(crate) struct Prepared {
     pub(crate) client: MkClient,
     /// The server's endpoint, which each call takes a slot from.
     pub(crate) endpoint: Arc<Endpoint>,
-    /// The API the decision is sent in.
-    pub(crate) wire: Wire,
-    pub(crate) identity: ServerIdentity,
+    /// The served model the decision runs on, which was `ready`.
+    pub(crate) identity: ServedModel,
     pub(crate) spec: Spec,
     pub(crate) spec_id: SpecId,
     /// In the order the labels were given, then the house-rules context when
@@ -78,35 +63,24 @@ impl Prepared {
         self.contexts.iter().find(|c| c.house_rules)
     }
 
-    /// The name the answer's reads give the context at `index`: its held
-    /// id in v1, its index in the decision's `contexts` in v2.
+    /// The name the answer's reads give the context at `index`: its index
+    /// in the decision's `contexts`.
     pub(crate) fn read_name(&self, index: usize) -> String {
-        match &self.contexts[index].server {
-            ServerContext::Held(id) => id.to_string(),
-            ServerContext::Seat(_) => index.to_string(),
-        }
+        index.to_string()
     }
 
     /// The prepared context a read names ([`Self::read_name`]).
     pub(crate) fn read_context(&self, name: &str) -> Option<&PreparedContext> {
-        (0..self.contexts.len()).find(|&i| self.read_name(i) == name).map(|i| &self.contexts[i])
+        name.parse::<usize>().ok().filter(|i| i.to_string() == name).and_then(|i| self.contexts.get(i))
     }
-}
-
-/// What a decision sends for one council context.
-#[derive(Clone, Debug)]
-pub(crate) enum ServerContext {
-    /// v1: the id the server holds the context under, the context id.
-    Held(ContextId),
-    /// v2: the queue seat, sent whole.
-    Seat(Box<Context>),
 }
 
 /// One council context as the server reads it.
 pub(crate) struct PreparedContext {
     pub(crate) label: String,
     pub(crate) context_id: ContextId,
-    pub(crate) server: ServerContext,
+    /// The queue seat, which a decision sends whole.
+    pub(crate) seat: Box<Context>,
     /// The head the server reported for the body this kernel sent.
     pub(crate) head: SnapshotId,
     /// The house-rules context (`docs/council.md`, "House rules"), not a
@@ -143,7 +117,7 @@ const HOUSE_RULES_NAMESPACE: uuid::Uuid = uuid::uuid!("5c1f0b0e-9a47-4d3b-8e62-7
 /// The id the council server holds a house-rules body under: UUIDv5 of the
 /// body's sha256 in [`HOUSE_RULES_NAMESPACE`]. The same body is the same id
 /// for every seat, and a changed body is a new id.
-fn house_rules_id(body: &ContextPut) -> Result<ContextId, PrepareMiss> {
+fn house_rules_id(body: &Context) -> Result<ContextId, PrepareMiss> {
     Ok(ContextId::from(uuid::Uuid::new_v5(&HOUSE_RULES_NAMESPACE, &body_hash(body)?)))
 }
 
@@ -173,6 +147,9 @@ struct Link<'a> {
     waits: &'a SlotWaits,
     /// The owner of this kernel's pins ([`pin_owner`]).
     owner: String,
+    /// The served model's `model`, which every build names. Empty until
+    /// the identity names it.
+    model: String,
 }
 
 impl Link<'_> {
@@ -196,6 +173,17 @@ fn endpoint_of(kernel: &crate::Kernel, server: &str) -> Result<(Arc<Endpoint>, S
     Ok((kernel.endpoints().for_url(server).map_err(missed)?, key))
 }
 
+/// A served model's status as identity spells it.
+pub(crate) fn status_word(status: ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::Ready => "ready",
+        ModelStatus::Loading => "loading",
+        ModelStatus::Draining => "draining",
+        ModelStatus::Unloaded => "unloaded",
+        ModelStatus::Unknown => "in a status this kernel does not know",
+    }
+}
+
 /// Why the council cannot be asked right now, in plain words; the gate
 /// records it as a miss cause.
 #[derive(Debug)]
@@ -204,11 +192,9 @@ pub(crate) struct PrepareMiss(pub(crate) String);
 #[derive(Clone)]
 struct Held {
     /// The context the body projects: a labeled context's id, a
-    /// house-rules id, or a shadow's id. In v1 the server holds the body
-    /// under it.
+    /// house-rules id, or a shadow's id.
     id: ContextId,
-    /// sha256 of the body last sent, the v1 projection or the v2 seat,
-    /// before `warm` or `persist` is added.
+    /// sha256 of the seat last built.
     body: [u8; 32],
     head: SnapshotId,
 }
@@ -226,39 +212,39 @@ enum Slot {
     Shadow(ContextId),
 }
 
-/// A body the server holds: the server's origin, the slot, and in v2 the
-/// spec its seat serves.
-type HeldKey = (String, Slot, Option<String>);
+/// A seat the server holds: the server's origin, the served model, the
+/// slot, and the spec the seat serves.
+type HeldKey = (String, String, Slot, String);
 
 /// Keyed by each server's origin.
 #[derive(Default)]
 struct State {
-    identities: HashMap<String, (Wire, ServerIdentity)>,
+    identities: HashMap<String, ServerIdentity>,
     specs: HashSet<(String, SpecId)>,
     contexts: HashMap<HeldKey, Held>,
-    /// Each v2 server's pin set, which its pinner task sends.
-    pins: HashMap<String, tokio::sync::watch::Sender<BTreeSet<SnapshotId>>>,
+    /// Each server's pin set, which its pinner task sends.
+    pins: HashMap<String, tokio::sync::watch::Sender<BTreeSet<String>>>,
 }
 
 impl State {
-    /// The heads of every v2 seat held on the server `key`.
-    fn seat_heads(&self, key: &str) -> BTreeSet<SnapshotId> {
+    /// The heads of every seat held on the server `key`.
+    fn seat_heads(&self, key: &str) -> BTreeSet<String> {
         self.contexts
             .iter()
-            .filter(|((server, _, spec), _)| server == key && spec.is_some())
-            .map(|(_, held)| held.head.clone())
+            .filter(|((server, _, _, _), _)| server == key)
+            .map(|(_, held)| held.head.to_string())
             .collect()
     }
 }
 
 /// What this kernel believes each council server holds.
 pub(crate) struct CouncilSync {
-    /// Serializes `prepare`, so two decisions never `PUT` the same context
-    /// against the same head.
+    /// Serializes `prepare`, so two decisions never build the same seat at
+    /// once.
     serial: tokio::sync::Mutex<()>,
     /// Serializes [`CouncilSync::prime_shadow`] apart from `prepare`: a
     /// decision never reads a shadow while shadows only record, so a slow
-    /// priming `PUT` never holds up the gate.
+    /// priming build never holds up the gate.
     shadow_serial: tokio::sync::Mutex<()>,
     state: Arc<parking_lot::Mutex<State>>,
     /// How often a pinner sends an unchanged set again, in milliseconds.
@@ -277,28 +263,6 @@ impl Default for CouncilSync {
             state: Default::default(),
             pin_renew_ms: std::sync::atomic::AtomicU64::new(PIN_RENEW.as_millis() as u64),
             kernel: Default::default(),
-        }
-    }
-}
-
-/// Forgets a v1 context whose `PUT` was dropped before it answered: the
-/// server may hold the new body under a head this kernel never saw.
-struct PutInFlight<'a> {
-    state: &'a parking_lot::Mutex<State>,
-    key: Option<HeldKey>,
-}
-
-impl PutInFlight<'_> {
-    /// The `PUT` answered; the caller records what it learned.
-    fn answered(mut self) {
-        self.key = None;
-    }
-}
-
-impl Drop for PutInFlight<'_> {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.state.lock().contexts.remove(&key);
         }
     }
 }
@@ -392,18 +356,30 @@ impl CouncilSync {
         let client = MkClient::new(server, Duration::from_millis(council.deadline_ms))
             .map_err(|e| self.failed(&key, server, "client", e))?;
         let owner = pin_owner(kernel.id());
-        let link = Link { client: &client, server, key, endpoint: endpoint.clone(), deadline, deadline_ms: council.deadline_ms, waits, owner };
+        let mut link = Link {
+            client: &client,
+            server,
+            key,
+            endpoint: endpoint.clone(),
+            deadline,
+            deadline_ms: council.deadline_ms,
+            waits,
+            owner,
+            model: String::new(),
+        };
 
-        let (wire, identity) = self.identity(&link).await?;
+        let server_identity = self.identity(&link).await?;
+        let identity = self.served(&link, &server_identity, council.model.as_deref())?;
+        link.model = identity.model.clone();
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
-        if let Some(text) = spec_body.questions.iter().find(|q| matches!(q, SpecQuestion::Text(_)))
-            && !identity.capabilities.contains(&Capability::Describe)
+        if let Some(text) = spec_body.questions.iter().find(|q| matches!(q.kind, QuestionKind::Text { .. }))
+            && !identity.has(Capability::Describe)
         {
             return Err(PrepareMiss(format!(
-                "spec {spec_name} holds the text question `{}`, and council server {server} lacks the \
-                 `describe` capability that answers one; remove the question from \
+                "spec {spec_name} holds the text question `{}`, and model {} on council server {server} \
+                 lacks the `describe` capability that answers one; remove the question from \
                  /config/kernel/council/{spec_name}.json",
-                text.id()
+                text.id, identity.model
             )));
         }
         if let Some((i, label)) = labels.iter().enumerate().find(|(i, l)| labels[..*i].contains(l)) {
@@ -433,13 +409,14 @@ impl CouncilSync {
             }
             named.extend(added.iter().cloned());
             return Err(PrepareMiss(format!(
-                "a decision on spec {spec_name} reads {reads} contexts ({}), and council server {server} \
-                 reads at most {} per decision (identity.limits.contexts_per_decision)",
+                "a decision on spec {spec_name} reads {reads} contexts ({}), and model {} on council \
+                 server {server} reads at most {} per decision (limits.contexts_per_decision)",
                 named.join(", "),
+                identity.model,
                 identity.limits.contexts_per_decision
             )));
         }
-        self.ensure_spec(&link, wire, &spec_body, &spec_id).await?;
+        self.ensure_spec(&link, &spec_body, &spec_id).await?;
 
         let mut contexts = Vec::with_capacity(reads - added.len());
         for label in labels {
@@ -450,47 +427,47 @@ impl CouncilSync {
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
             let slot = Slot::Label(label.clone());
-            let (server, head) =
-                self.hold(&link, wire, &identity, &spec_body, &spec_id, slot, label, context_id, body, true).await?;
-            contexts.push(PreparedContext { label: label.clone(), context_id, server, head, house_rules: false });
+            let (seat, head) = self.hold(&link, &spec_body, slot, label, context_id, body).await?;
+            contexts.push(PreparedContext { label: label.clone(), context_id, seat, head, house_rules: false });
         }
         if let Some((context_id, slot, body)) = house {
-            let (server, head) =
-                self.hold(&link, wire, &identity, &spec_body, &spec_id, slot, HOUSE_RULES_LABEL, context_id, body, false).await?;
-            contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, server, head, house_rules: true });
+            let (seat, head) = self.hold(&link, &spec_body, slot, HOUSE_RULES_LABEL, context_id, body).await?;
+            contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, seat, head, house_rules: true });
         }
-        self.pin_seats(&link, &identity);
+        self.pin_seats(&link, &server_identity);
 
         let spec = spec_body;
         drop(link);
-        Ok(Prepared { client, endpoint, wire, identity, spec, spec_id, contexts })
+        Ok(Prepared { client, endpoint, identity, spec, spec_id, contexts })
     }
 
-    /// Sends the shadow `shadow` of the seat labeled `seat` to `server`, so
-    /// the server holds its dialogue before the next question about it,
-    /// and returns what a decision sends for it and its head.
-    /// Warms the spec named `spec_name` when the server can. Sends nothing
-    /// when the server already holds this body. Each call waits for a slot
+    /// Builds the shadow `shadow` of the seat labeled `seat` on `server`'s
+    /// served model `model` as a queue seat for the spec named `spec_name`, so the server holds its
+    /// dialogue before the next question about it, and returns the seat and
+    /// its head. Sends nothing when the server already holds this seat. Each call waits for a slot
     /// no later than `deadline`, adding its wait to `waits`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prime_shadow(
         &self,
         kernel: &crate::Kernel,
         server: &str,
+        model: Option<&str>,
         spec_name: &str,
         shadow: ContextId,
         seat: &str,
         deadline: tokio::time::Instant,
         waits: &SlotWaits,
-    ) -> Result<(ServerContext, SnapshotId), PrepareMiss> {
+    ) -> Result<(Box<Context>, SnapshotId), PrepareMiss> {
         let _serial = self.shadow_serial.lock().await;
         let (endpoint, key) = endpoint_of(kernel, server)?;
         let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
         let deadline_ms = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
-        let link = Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()) };
-        let (wire, identity) = self.identity(&link).await?;
+        let mut link =
+            Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()), model: String::new() };
+        let identity = self.identity(&link).await?;
+        link.model = self.served(&link, &identity, model)?.model;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
-        self.ensure_spec(&link, wire, &spec_body, &spec_id).await?;
+        self.ensure_spec(&link, &spec_body, &spec_id).await?;
         let blocks = kernel
             .blocks()
             .block_snapshots(shadow)
@@ -498,115 +475,44 @@ impl CouncilSync {
         let body = project_shadow(&blocks, &*kernel.kernel_db().lock())
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
         let label = format!("shadow of {seat}");
-        let held = self.hold(&link, wire, &identity, &spec_body, &spec_id, Slot::Shadow(shadow), &label, shadow, body, true).await?;
+        let held = self.hold(&link, &spec_body, Slot::Shadow(shadow), &label, shadow, body).await?;
         self.pin_seats(&link, &identity);
         Ok(held)
     }
 
-    /// Makes the server hold `body`, the projection of `context_id`, and
-    /// returns what a decision sends for it and its head. A v1 server holds
-    /// the body as `context_id` ([`Self::hold_v1`]). A v2 server builds the
-    /// queue seat for `spec` ([`super::seat::queue_seat`]) with
-    /// `POST /council/v2/contexts`, and the decision sends the seat whole.
-    /// Sends nothing when the server already holds this body. The body
-    /// replaces whatever `slot` held before on this server and spec.
-    #[allow(clippy::too_many_arguments)]
+    /// Makes the server hold the queue seat for `spec`
+    /// ([`super::seat::queue_seat`]) built from `body`, the projection of
+    /// `context_id`, with `POST /council/v2/contexts`, and returns the seat
+    /// and its head. Sends nothing when the server already holds this seat.
+    /// The seat replaces whatever `slot` held before on this server and spec.
     async fn hold(
         &self,
         link: &Link<'_>,
-        wire: Wire,
-        identity: &ServerIdentity,
         spec: &Spec,
-        spec_id: &SpecId,
         slot: Slot,
         label: &str,
         context_id: ContextId,
-        body: ContextPut,
-        persistent: bool,
-    ) -> Result<(ServerContext, SnapshotId), PrepareMiss> {
-        if wire == Wire::V1 {
-            let head = self.hold_v1(link, identity, spec_id, slot, label, context_id, body, persistent).await?;
-            return Ok((ServerContext::Held(context_id), head));
-        }
+        body: Context,
+    ) -> Result<(Box<Context>, SnapshotId), PrepareMiss> {
         let seat = super::seat::queue_seat(body, spec).map_err(|e| {
             PrepareMiss(format!("council context \"{label}\" has no council v2 seat for spec {}: {e}", spec.name))
         })?;
         let hash = body_hash(&seat)?;
-        let key = (link.key.clone(), slot, Some(spec.name.clone()));
+        let key = (link.key.clone(), link.model.clone(), slot, spec.name.clone());
         let held =
             self.state.lock().contexts.get(&key).filter(|h| h.id == context_id && h.body == hash).map(|h| h.head.clone());
         if let Some(head) = held {
-            return Ok((ServerContext::Seat(Box::new(seat)), head));
+            return Ok((Box::new(seat), head));
         }
         let built = link
-            .send(|| async { link.client.v2().build_context(&seat, false).await })
+            .send(|| async { link.client.council().build_context(&link.model, &seat, false).await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, &format!("build of context \"{label}\""), e))?;
         self.state.lock().contexts.insert(key, Held { id: context_id, body: hash, head: built.head.clone() });
-        Ok((ServerContext::Seat(Box::new(seat)), built.head))
+        Ok((Box::new(seat), built.head))
     }
 
-    /// Makes a v1 server hold `body` as `context_id` and returns its head.
-    /// A context that is not `persistent` is sent with `persist: false`
-    /// when the server lists the capability: the kernel sends it again
-    /// after a restart, so the server need not keep it on disk. The body
-    /// warms the spec when the server can. A slot that held another id is
-    /// sent fresh, with no `If-Match`.
-    #[allow(clippy::too_many_arguments)]
-    async fn hold_v1(
-        &self,
-        link: &Link<'_>,
-        identity: &ServerIdentity,
-        spec_id: &SpecId,
-        slot: Slot,
-        label: &str,
-        context_id: ContextId,
-        body: ContextPut,
-        persistent: bool,
-    ) -> Result<SnapshotId, PrepareMiss> {
-        let server = link.server;
-        let hash = body_hash(&body)?;
-        let mut body = body;
-        if identity.capabilities.contains(&Capability::Warm) {
-            body.warm = Some(vec![spec_id.clone()]);
-        }
-        body.persist = (!persistent && identity.capabilities.contains(&Capability::Persist)).then_some(false);
-        let key = (link.key.clone(), slot, None);
-        let held = self.state.lock().contexts.get(&key).filter(|h| h.id == context_id).cloned();
-        if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
-            return Ok(h.head.clone());
-        }
-        let id = context_id.to_string();
-        let mut if_match = held.as_ref().map(|h| h.head.clone());
-        let in_flight = PutInFlight { state: &self.state, key: Some(key.clone()) };
-        let result = loop {
-            let put = || async { link.client.put_context(&id, &body, if_match.as_ref()).await.map(|r| r.head) };
-            match link.send(put).await? {
-                Err(e) if e.status() == Some(404) && if_match.is_some() => {
-                    if_match = None;
-                }
-                other => break other,
-            }
-        };
-        in_flight.answered();
-        match result {
-            Ok(head) => {
-                self.state.lock().contexts.insert(key, Held { id: context_id, body: hash, head: head.clone() });
-                Ok(head)
-            }
-            Err(e) if e.status() == Some(412) => {
-                self.state.lock().contexts.remove(&key);
-                Err(PrepareMiss(format!(
-                    "council context \"{label}\" moved on {server} under If-Match \
-                     (server head {}); the next decision sends it fresh",
-                    e.head().map(|h| h.to_string()).unwrap_or_else(|| "unknown".into()),
-                )))
-            }
-            Err(e) => Err(self.failed(&link.key, server, &format!("PUT of context \"{label}\""), e)),
-        }
-    }
-
-    /// Hands the server's pinner the heads of every v2 seat this kernel
+    /// Hands the server's pinner the heads of every seat this kernel
     /// built on it, starting the pinner on the first call. A server without
     /// the `pins` capability pins nothing.
     fn pin_seats(&self, link: &Link<'_>, identity: &ServerIdentity) {
@@ -679,14 +585,6 @@ impl CouncilSync {
         tracing::info!(seats = gone.len(), "council seats forgotten: nothing current reaches them");
     }
 
-    /// Forgets what the server is believed to hold under `held`
-    /// ([`ServerContext::Held`]) on a v1 server, so the next
-    /// `prepare_labels` sends it again without `If-Match`. Call it after a
-    /// 404 or 409 from a v1 decision.
-    pub(crate) fn invalidate(&self, held: ContextId) {
-        self.state.lock().contexts.retain(|(_, _, spec), h| spec.is_some() || h.id != held);
-    }
-
     /// Pinners started after this renew an unchanged set every `renew`.
     #[cfg(test)]
     pub(crate) fn set_pin_renew(&self, renew: Duration) {
@@ -699,58 +597,45 @@ impl CouncilSync {
         self.state.lock().specs.retain(|(_, id)| id != spec_id);
     }
 
-    /// The server's identity and the API it speaks: council v2 when
-    /// `GET /council/v2/identity` answers, v1 when that is a 404.
-    async fn identity(&self, link: &Link<'_>) -> Result<(Wire, ServerIdentity), PrepareMiss> {
+    /// The server's council v2 identity, asked once per server.
+    async fn identity(&self, link: &Link<'_>) -> Result<ServerIdentity, PrepareMiss> {
         if let Some(i) = self.state.lock().identities.get(&link.key) {
             return Ok(i.clone());
         }
-        let failed = |e| self.failed(&link.key, link.server, "identity", e);
-        let v2 = link
-            .send(|| async {
-                match link.client.v2().identity().await {
-                    Ok(identity) => Ok(Some(identity)),
-                    Err(e) if matches!(e.status(), Some(404 | 405 | 501)) => Ok(None),
-                    Err(e) => Err(e),
-                }
-            })
+        let identity = link
+            .send(|| async { link.client.council().identity().await })
             .await?
-            .map_err(failed)?;
-        let identity = match v2 {
-            Some(identity) => (Wire::V2, identity),
-            None => (Wire::V1, link.send(|| link.client.identity()).await?.map_err(failed)?),
-        };
+            .map_err(|e| self.failed(&link.key, link.server, "council v2 identity", e))?;
         self.state.lock().identities.insert(link.key.clone(), identity.clone());
         Ok(identity)
     }
 
-    /// Whether `server` speaks council v2, asked as a decision would.
-    async fn speaks_v2(
-        &self,
-        kernel: &crate::Kernel,
-        server: &str,
-        deadline: tokio::time::Instant,
-        waits: &SlotWaits,
-    ) -> Result<bool, PrepareMiss> {
-        let (endpoint, key) = endpoint_of(kernel, server)?;
-        let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
-        let deadline_ms = SHADOW_PRIME_TIMEOUT.as_millis() as u64;
-        let link = Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()) };
-        Ok(self.identity(&link).await?.0 == Wire::V2)
+    /// The served model `model` names on the server, by its `model` or an
+    /// alias; `None` names the only one. A model that is not `ready` is a
+    /// miss, and its identity is asked again on the next prepare.
+    fn served(&self, link: &Link<'_>, identity: &ServerIdentity, model: Option<&str>) -> Result<ServedModel, PrepareMiss> {
+        let server = link.server;
+        let served = identity.route(model).map_err(|e| {
+            let names: Vec<&str> = identity.models.iter().map(|m| m.model.as_str()).collect();
+            PrepareMiss(format!("council server {server}: {}; it serves {}", e.message, names.join(", ")))
+        })?;
+        if served.status != ModelStatus::Ready {
+            self.state.lock().identities.remove(&link.key);
+            return Err(PrepareMiss(format!(
+                "council server {server}: model {} is {}, not ready",
+                served.model,
+                status_word(served.status)
+            )));
+        }
+        Ok(served.clone())
     }
 
-    async fn ensure_spec(&self, link: &Link<'_>, wire: Wire, spec: &Spec, spec_id: &SpecId) -> Result<(), PrepareMiss> {
+    async fn ensure_spec(&self, link: &Link<'_>, spec: &Spec, spec_id: &SpecId) -> Result<(), PrepareMiss> {
         let key = (link.key.clone(), spec_id.clone());
         if self.state.lock().specs.contains(&key) {
             return Ok(());
         }
-        let post = || async {
-            match wire {
-                Wire::V1 => link.client.post_spec(spec).await,
-                Wire::V2 => link.client.v2().post_spec(spec).await,
-            }
-        };
-        link.send(post)
+        link.send(|| async { link.client.council().post_spec(spec).await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, &format!("POST of spec \"{}\"", spec.name), e))?;
         self.state.lock().specs.insert(key);
@@ -768,7 +653,7 @@ impl CouncilSync {
     }
 }
 
-/// Sends one v2 server's pin set: the whole set whenever it changes, and
+/// Sends one server's pin set: the whole set whenever it changes, and
 /// again every `renew` while it does not, each under [`PIN_TTL`]. Runs
 /// until the [`CouncilSync`] that started it is dropped.
 struct Pinner {
@@ -787,7 +672,7 @@ impl Pinner {
     /// Each time the set changes, and every `renew` while it does not:
     /// forget the seats nothing current reaches, when the kernel is
     /// shared, then send the heads still held.
-    async fn run(self, mut set: tokio::sync::watch::Receiver<BTreeSet<SnapshotId>>) {
+    async fn run(self, mut set: tokio::sync::watch::Receiver<BTreeSet<String>>) {
         let client = match MkClient::new(&self.server, PIN_TIMEOUT) {
             Ok(client) => client,
             Err(e) => {
@@ -827,11 +712,11 @@ impl Pinner {
     /// forgotten, so the next decision builds its seat again; every
     /// failure is logged and the set is sent again at the next change or
     /// renewal. An empty set drops the owner's pins with `DELETE`.
-    async fn put(&self, client: &MkClient, heads: Vec<SnapshotId>) {
+    async fn put(&self, client: &MkClient, heads: Vec<String>) {
         let deadline = tokio::time::Instant::now() + PIN_TIMEOUT;
         let waits = SlotWaits::default();
         if heads.is_empty() {
-            let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.v2().delete_pins(&self.owner).await }).await;
+            let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.council().delete_pins(&self.owner).await }).await;
             match answer {
                 Ok((_slot, Ok(()))) => tracing::info!(server = %self.server, owner = %self.owner, "council pins dropped: no seat is current"),
                 Ok((_slot, Err(e))) if e.status() == Some(404) => {}
@@ -841,7 +726,7 @@ impl Pinner {
             return;
         }
         let body = PinsPut { snapshots: heads, ttl_s: PIN_TTL.as_secs() };
-        let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.v2().put_pins(&self.owner, &body).await }).await;
+        let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.council().put_pins(&self.owner, &body).await }).await;
         let pinned = match answer {
             Ok((_slot, Ok(pinned))) => pinned,
             Ok((_slot, Err(e))) => {
@@ -853,21 +738,21 @@ impl Pinner {
                 return;
             }
         };
-        let gone: Vec<SnapshotId> = pinned.snapshots.into_iter().filter(|p| !p.held).map(|p| p.id).collect();
+        let gone: Vec<String> = pinned.snapshots.into_iter().filter(|p| !p.held).map(|p| p.id).collect();
         tracing::info!(server = %self.server, owner = %self.owner, seats = body.snapshots.len(), gone = gone.len(), expires_in_s = ?pinned.expires_in_s, "council seats pinned");
         if gone.is_empty() {
             return;
         }
         let Some(state) = self.state.upgrade() else { return };
-        state.lock().contexts.retain(|(server, _, spec), held| !(*server == self.key && spec.is_some() && gone.contains(&held.head)));
+        state.lock().contexts.retain(|(server, _, _, _), held| !(*server == self.key && gone.iter().any(|g| g == held.head.as_str())));
     }
 }
 
-/// Builds every council v2 seat the kernel's gate config names, so the
-/// first decision finds them held and pinned: for each council and each
-/// of its specs, `[council] contexts` and the spec's own. The seats that
-/// depend on a proposing seat are [`build_context_seats`]'s. A v1 server, an absent config, and each failure are
-/// logged and leave the seats to the first decision.
+/// Builds every council seat the kernel's gate config names, so the first
+/// decision finds them held and pinned: for each council and each of its
+/// specs, `[council] contexts` and the spec's own. The seats that depend on
+/// a proposing seat are [`build_context_seats`]'s. An absent config and
+/// each failure are logged and leave the seats to the first decision.
 pub(crate) async fn build_seats(kernel: &crate::Kernel) {
     let config = match crate::kj::gate_policy::load_config(kernel.vfs()).await {
         Ok(config) => config,
@@ -886,14 +771,6 @@ pub(crate) async fn build_seats(kernel: &crate::Kernel) {
             let deadline = tokio::time::Instant::now() + SHADOW_PRIME_TIMEOUT;
             let waits = SlotWaits::default();
             let sync = kernel.council_sync();
-            match sync.speaks_v2(kernel, &council.server, deadline, &waits).await {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(PrepareMiss(cause)) => {
-                    tracing::warn!(server = %council.server, %cause, "council seats are not built at startup");
-                    continue;
-                }
-            }
             let council = CouncilConfig { deadline_ms: SHADOW_PRIME_TIMEOUT.as_millis() as u64, ..council.clone() };
             match sync.prepare_labels(kernel, &council, &spec.name, &labels, None, &[], deadline, &waits).await {
                 Ok(prepared) => tracing::info!(server = %council.server, spec = %spec.name, seats = prepared.contexts.len(), "council seats built"),
@@ -987,10 +864,10 @@ pub(crate) async fn plan_context_seats(
     }
     let judge = super::shadow::judge_server(&db, &row)
         .map_err(|e| format!("the judge slot of context {} cannot be read: {e}", context.short()))?;
-    if let (Some(server), Some(spec)) = (judge, shell) {
+    if let (Some(judge), Some(spec)) = (judge, shell) {
         let seat_name = row.label.clone().unwrap_or_else(|| context.short());
         builds.push(SeatBuild {
-            council: CouncilConfig { server, ..long.clone() },
+            council: CouncilConfig { server: judge.server, model: Some(judge.model), ..long.clone() },
             spec: spec.name.clone(),
             labels: super::shadow::judge_labels(council, spec),
             seat,
@@ -1000,24 +877,15 @@ pub(crate) async fn plan_context_seats(
     Ok((builds, without_chain))
 }
 
-/// Builds each planned decision's seats ([`plan_context_seats`]) on a
-/// council v2 server with the prepare the decision runs, so the decision
-/// finds them held, and pins them. A v1 server is left to the first
-/// decision. Each failure is logged.
+/// Builds each planned decision's seats ([`plan_context_seats`]) with the
+/// prepare the decision runs, so the decision finds them held, and pins
+/// them. Each failure is logged.
 pub(crate) async fn build_context_seats(kernel: &crate::Kernel, context: ContextId, builds: Vec<SeatBuild>) {
     let sync = kernel.council_sync();
     for build in builds {
         let deadline = tokio::time::Instant::now() + SHADOW_PRIME_TIMEOUT;
         let waits = SlotWaits::default();
         let server = build.server().to_string();
-        match sync.speaks_v2(kernel, &server, deadline, &waits).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(PrepareMiss(cause)) => {
-                tracing::warn!(context = %context.short(), %server, %cause, "council seats are not built ahead");
-                continue;
-            }
-        }
         let prepared = sync
             .prepare_labels(kernel, &build.council, &build.spec, &build.labels, build.seat, &build.added, deadline, &waits)
             .await;
@@ -1045,11 +913,10 @@ pub(crate) async fn build_context_seats(kernel: &crate::Kernel, context: Context
 /// - a shadow is not archived.
 async fn reachable(kernel: &crate::Kernel, config: &crate::kj::gate_policy::GateConfig, key: &HeldKey, id: ContextId) -> bool {
     use crate::vfs::VfsOps;
-    let (_, slot, spec) = key;
+    let (_, _, slot, spec) = key;
     let councils: Vec<&CouncilConfig> = config.councils().collect();
     let reviewer_contexts = councils.iter().any(|c| c.reviewer_contexts);
-    if let Some(spec) = spec
-        && !councils.iter().any(|c| c.specs.iter().any(|s| s.name == *spec))
+    if !councils.iter().any(|c| c.specs.iter().any(|s| s.name == *spec))
         && !(reviewer_contexts && spec == super::observe::DIRECTION_CHECK)
     {
         return false;
@@ -1102,10 +969,9 @@ async fn read_spec(kernel: &crate::Kernel, name: &str) -> Result<(Spec, SpecId),
         .read_all(std::path::Path::new(&path))
         .await
         .map_err(|e| PrepareMiss(format!("council spec file {path} cannot be read: {e}")))?;
-    let spec: Spec = serde_json::from_slice(&bytes)
-        .map_err(|e| PrepareMiss(format!("council spec file {path} is not a spec: {e}")))?;
-    let id = canon::spec_id(&spec)
-        .map_err(|e| PrepareMiss(format!("council spec file {path} has no spec id: {e}")))?;
+    let text = String::from_utf8(bytes).map_err(|e| PrepareMiss(format!("council spec file {path} is not UTF-8: {e}")))?;
+    let spec = super::parse_spec(&text).map_err(|e| PrepareMiss(format!("council spec file {path} is not a spec: {e}")))?;
+    let id = SpecId::parse(spec.id()).map_err(|e| PrepareMiss(format!("council spec file {path} has no spec id: {e}")))?;
     Ok((spec, id))
 }
 
@@ -1116,8 +982,6 @@ pub(super) mod mock {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use kaijutsu_mk::council::canon;
-    use kaijutsu_mk::council::wire::Spec;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1139,14 +1003,7 @@ pub(super) mod mock {
     pub(crate) struct Captured {
         pub(crate) method: String,
         pub(crate) path: String,
-        pub(crate) headers: Vec<(String, String)>,
         pub(crate) body: String,
-    }
-
-    impl Captured {
-        pub(crate) fn header(&self, name: &str) -> Option<&str> {
-            self.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
-        }
     }
 
     /// A mock council server on 127.0.0.1 that answers the contract's happy
@@ -1175,22 +1032,16 @@ pub(super) mod mock {
                 .collect()
         }
 
-        /// Every context `PUT`, with its `If-Match`.
-        pub(crate) fn puts(&self) -> Vec<(Option<String>, serde_json::Value)> {
-            self.seen
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|c| c.method == "PUT" && c.path.contains("/contexts/"))
-                .map(|c| (c.header("if-match").map(String::from), serde_json::from_str(&c.body).unwrap()))
-                .collect()
+        /// The body of every seat build, `POST /council/v2/contexts`.
+        pub(crate) fn builds(&self) -> Vec<serde_json::Value> {
+            self.bodies("/council/v2/contexts")
         }
 
         pub(crate) fn count(&self) -> usize {
             self.seen.lock().unwrap().len()
         }
 
-        /// Answer each `POST /council/v1/decisions` with `f` of its body.
+        /// Answer each `POST /council/v2/decisions` with `f` of its body.
         pub(crate) fn on_decide(&self, f: impl Fn(&str) -> Reply + Send + 'static) {
             *self.decide.lock().unwrap() = Some(Box::new(f));
         }
@@ -1223,78 +1074,60 @@ pub(super) mod mock {
         format!("snap:{n:064x}")
     }
 
-    pub(crate) fn identity_json() -> String {
-        identity_listing(json!(["leave_one_out"]))
-    }
-
-    /// The mock's identity with `capabilities`.
+    /// The mock's identity: one served model, `m`, ready. The server and
+    /// its model both list `capabilities`.
     pub(crate) fn identity_listing(capabilities: serde_json::Value) -> String {
-        json!({"model": "m", "weight_hash": "w", "tokenizer_hash": "t", "template": "tpl",
-               "engine": "e",
-               "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 4,
-                          "choice_options": 8, "default_timeout_ms": 1000},
+        json!({"models": [{"model": "m", "status": "ready", "weight_hash": "w", "tokenizer_hash": "t", "template": "tpl",
+                           "engine": "e",
+                           "limits": {"context_tokens": 1, "decision_context_tokens": 1, "snapshot_bytes": 1,
+                                      "contexts_per_decision": 4, "default_timeout_ms": 1000},
+                           "capabilities": capabilities}],
+               "limits": {"state_bytes": 1, "choice_options": 8},
                "capabilities": capabilities})
         .to_string()
     }
 
-    /// The happy path for `c`. A v1 server has no `/council/v2` routes; a
-    /// v2 server serves the same routes under `/council/v2`.
-    fn default_reply(c: &Captured, puts: &mut u64, v2: bool) -> Reply {
-        let path = match c.path.strip_prefix("/council/v2/") {
-            Some(_) if !v2 => return reply(404, json!({"error": {"type": "not_found", "message": "no such route"}}).to_string()),
-            Some(rest) => format!("/council/v1/{rest}"),
-            None if v2 => return reply(404, json!({"error": {"type": "not_found", "message": "no such route"}}).to_string()),
-            None => c.path.clone(),
-        };
-        match (c.method.as_str(), path.as_str()) {
-            ("GET", "/council/v1/identity") if v2 => reply(200, identity_listing(json!(["leave_one_out", "pins"]))),
-            ("GET", "/council/v1/identity") => reply(200, identity_json()),
-            ("POST", "/council/v1/contexts") if v2 => {
-                *puts += 1;
+    /// The happy path for `c`, with `capabilities` in the identity. Seat
+    /// `n` is built with head [`snap`]`(n)`, and every pin is held.
+    fn default_reply(c: &Captured, builds: &mut u64, capabilities: &serde_json::Value) -> Reply {
+        match (c.method.as_str(), c.path.as_str()) {
+            ("GET", "/council/v2/identity") => reply(200, identity_listing(capabilities.clone())),
+            ("POST", "/council/v2/contexts") => {
+                *builds += 1;
                 reply(
                     200,
-                    json!({"head": snap(*puts), "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
-                           "snapshots": [{"id": snap(*puts), "message": 1, "tokens": 1}]})
+                    json!({"model": "m", "head": snap(*builds), "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                           "snapshots": [{"id": snap(*builds), "message": 1, "tokens": 1}]})
                     .to_string(),
                 )
             }
-            ("PUT", p) if v2 && p.starts_with("/council/v1/pins/") => {
+            ("PUT", p) if p.starts_with("/council/v2/pins/") => {
                 let body: serde_json::Value = serde_json::from_str(&c.body).unwrap();
                 let held: Vec<serde_json::Value> =
                     body["snapshots"].as_array().unwrap().iter().map(|id| json!({"id": id, "held": true})).collect();
                 reply(200, json!({"owner": p.rsplit('/').next().unwrap(), "snapshots": held, "expires_in_s": body["ttl_s"]}).to_string())
             }
-            ("POST", "/council/v1/specs") => {
-                let spec: Spec = serde_json::from_str(&c.body).unwrap();
-                let id = canon::spec_id(&spec).unwrap();
+            ("POST", "/council/v2/specs") => {
+                let spec: serde_json::Value = serde_json::from_str(&c.body).unwrap();
+                let id = gogi_proto::spec_id_of(&spec).unwrap();
                 reply(200, json!({"spec_id": id, "spec": spec, "template": "t"}).to_string())
             }
-            ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
-                *puts += 1;
-                reply(
-                    200,
-                    json!({"id": p.rsplit('/').next().unwrap(), "head": snap(*puts), "tokens": 1,
-                           "kept": 0, "fed": 1, "from": null, "dry_run": false, "snapshots": []})
-                    .to_string(),
-                )
-            }
-            _ => reply(500, "unexpected"),
+            _ => reply(404, json!({"error": {"type": "not_found", "message": "no such route"}}).to_string()),
         }
     }
 
-    /// A council v1 server.
+    /// A council v2 server that does not list `pins`.
     pub(crate) async fn serve() -> Mock {
-        serve_as(false).await
+        serve_with(json!(["leave_one_out"])).await
     }
 
-    /// A council v2 server: the same routes under `/council/v2`, and none
-    /// under `/council/v1`. It lists `pins`, builds contexts with
-    /// `POST /council/v2/contexts`, and holds every pin it is sent.
-    pub(crate) async fn serve_v2() -> Mock {
-        serve_as(true).await
+    /// A council v2 server that lists `pins` and holds every pin it is
+    /// sent.
+    pub(crate) async fn serve_pinning() -> Mock {
+        serve_with(json!(["leave_one_out", "pins"])).await
     }
 
-    async fn serve_as(v2: bool) -> Mock {
+    async fn serve_with(capabilities: serde_json::Value) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1302,7 +1135,7 @@ pub(super) mod mock {
         let decide: Decide = Arc::default();
         let (log, queue, decider) = (seen.clone(), forced.clone(), decide.clone());
         tokio::spawn(async move {
-            let mut puts = 0u64;
+            let mut builds = 0u64;
             loop {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = Vec::new();
@@ -1326,36 +1159,25 @@ pub(super) mod mock {
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-                let mut lines = head.lines();
-                let mut first = lines.next().unwrap().split(' ');
+                let mut first = head.lines().next().unwrap().split(' ');
                 let method = first.next().unwrap().to_string();
                 let path = first.next().unwrap().to_string();
-                let headers = lines
-                    .filter_map(|l| l.split_once(':'))
-                    .map(|(n, v)| (n.trim().to_lowercase(), v.trim().to_string()))
-                    .collect();
                 let captured = Captured {
                     method,
                     path,
-                    headers,
                     body: String::from_utf8_lossy(&buf[head_end..]).to_string(),
                 };
-                let other_version = if v2 { "/council/v1/" } else { "/council/v2/" };
-                let forced_reply = match captured.path.starts_with(other_version) {
-                    true => None,
-                    false => {
-                        let mut q = queue.lock().unwrap();
-                        q.iter().position(|(m, _)| *m == captured.method).and_then(|i| q.remove(i))
-                    }
+                let forced_reply = {
+                    let mut q = queue.lock().unwrap();
+                    q.iter().position(|(m, _)| *m == captured.method).and_then(|i| q.remove(i))
                 };
-                let decisions = if v2 { "/council/v2/decisions" } else { "/council/v1/decisions" };
-                let decided = (captured.path == decisions)
+                let decided = (captured.path == "/council/v2/decisions")
                     .then(|| decider.lock().unwrap().as_ref().map(|f| f(&captured.body)))
                     .flatten();
                 let r = match (forced_reply, decided) {
                     (Some((_, r)), _) => r,
                     (None, Some(r)) => r,
-                    (None, None) => default_reply(&captured, &mut puts, v2),
+                    (None, None) => default_reply(&captured, &mut builds, &capabilities),
                 };
                 log.lock().unwrap().push(captured);
                 tokio::time::sleep(r.delay).await;
@@ -1379,7 +1201,7 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::mock::{Mock, identity_json, reply, serve, serve_v2, snap};
+    use super::mock::{Mock, reply, serve, serve_pinning, snap};
     use super::super::projection::fixtures::{append_dialogue, live_context};
     use super::*;
 
@@ -1394,7 +1216,7 @@ mod tests {
     /// The shipped shell spec: no `text` question, so it needs no
     /// `describe` capability.
     const SPEC: &str = crate::config_seed::DEFAULT_COUNCIL_SHELL_GATE;
-    /// The contract's example spec, which holds the `text` question `effect`.
+    /// gogi's example spec, which holds the `text` question `effect`.
     const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json");
 
     struct Rig {
@@ -1425,6 +1247,7 @@ mod tests {
         let spec = CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None };
         let council = CouncilConfig {
             server: mock.base.clone(),
+            model: None,
             contexts: vec!["reviewer".into()],
             pool_method: CouncilPoolMethod::Linear,
             pool_weights: CouncilPoolWeights::Uniform,
@@ -1476,36 +1299,34 @@ mod tests {
         }
     }
 
-    /// Answers each v2 decision with `allow` from every context it sends,
+    /// Answers each decision with `allow` from every context it sends,
     /// each read named by its index.
-    fn decide_v2(r: &Rig) {
+    fn decide_allow(r: &Rig) {
         r.mock.on_decide(|body| {
-            let request: kaijutsu_mk::council_v2::wire::DecisionRequest = serde_json::from_str(body).unwrap();
-            reply(200, super::super::gate::test_support::answer(&request.by_index(), &[[-0.01, -5.0, -6.0]]).to_string())
+            let request: gogi_proto::decision::DecisionRequest = serde_json::from_str(body).unwrap();
+            reply(200, super::super::gate::test_support::answer(&request, &[[-0.01, -5.0, -6.0]]).to_string())
         });
     }
 
-    /// A server that answers `GET /council/v2/identity` gets council v2:
-    /// the spec under `/council/v2/specs`, each context built as a queue
+    /// A decision is council v2: the spec under `/council/v2/specs`, each
+    /// context built as a queue
     /// seat for the spec with `POST /council/v2/contexts` (the projection's
     /// messages, the system message first and each turn's `reasoning` on
     /// its message, then the task and the queue calls), and the decision
     /// under `/council/v2/decisions`, each seat sent whole, with no
     /// `think`. The answer names the seat by its index, which reads back to
-    /// the reviewer. Nothing goes to `/council/v1`, and no context is
-    /// `PUT`.
+    /// the reviewer.
     ///
-    /// Falsified by a sync that keeps v2 context records (a `PUT` or a
-    /// context id), sends a decision without the seat's messages, or maps
-    /// an index read to no context.
+    /// Falsified by a sync that sends a decision without the seat's
+    /// messages, or maps an index read to no context.
     #[tokio::test]
-    async fn a_v2_decision_sends_each_seat_whole() {
-        let r = rig_on(serve_v2().await).await;
+    async fn a_decision_sends_each_seat_whole() {
+        let r = rig_on(serve_pinning().await).await;
         converse(&r);
-        decide_v2(&r);
+        decide_allow(&r);
         let p = r.prepare().await.expect("prepared");
         let council = &r.council;
-        let request = super::super::gate::decision_request(&p, council, kaijutsu_mk::Json::from("git push origin main"));
+        let request = super::super::gate::decision_request(&p, council, serde_json::Value::from("git push origin main"));
         let answer = super::super::gate::ask_within(&r.kernel, &p, &request, council, far(), &SlotWaits::default()).await;
         let sent = r.mock.bodies("/council/v2/decisions");
         assert_eq!(sent.len(), 1);
@@ -1521,31 +1342,29 @@ mod tests {
         assert_eq!(sent[0]["contexts"][0]["queue"], super::super::seat::QUEUE_TOOL);
         assert!(sent[0].get("think").is_none(), "{}", sent[0]);
 
-        assert_eq!(p.wire, Wire::V2);
         assert_eq!(r.mock.calls("GET"), ["/council/v2/identity"]);
         assert_eq!(r.mock.calls("POST"), ["/council/v2/specs", "/council/v2/contexts", "/council/v2/decisions"]);
-        assert!(r.mock.puts().is_empty(), "no context PUT: {:?}", r.mock.puts());
-        let built = r.mock.bodies("/council/v2/contexts");
-        assert_eq!(built, [json!({"context": sent[0]["contexts"][0]})], "the decision sends the seat it built, and nothing else");
+        let built = r.mock.builds();
+        assert_eq!(built, [json!({"model": "m", "context": sent[0]["contexts"][0]})], "the decision sends the seat it built, and nothing else");
+        assert_eq!(sent[0]["model"], "m", "the decision names the served model");
         assert_eq!(sent[0]["contexts"].as_array().unwrap().len(), 1);
         assert_eq!(p.contexts[0].context_id, r.reviewer);
         assert_eq!(p.contexts[0].head.as_str(), snap(1), "the head the build reported");
 
         let response = answer.expect("answered");
-        kaijutsu_mk::council::math::verify(&response, &request).expect("the index view recomputes");
+        gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
         assert_eq!(response.reads[0].context.as_deref(), Some("0"));
         assert_eq!(p.read_context("0").map(|c| c.context_id), Some(r.reviewer));
     }
 
-    /// One council context read under two specs is two queue seats on a v2
-    /// server, each with its spec's answers schema, and an unchanged seat
+    /// One council context read under two specs is two queue seats, each with its spec's answers schema, and an unchanged seat
     /// is not built again.
     ///
     /// Falsified by one seat that each spec overwrites in turn, or a seat
     /// built again for every decision.
     #[tokio::test]
-    async fn a_v2_server_builds_one_seat_per_spec() {
-        let r = rig_on(serve_v2().await).await;
+    async fn one_seat_per_spec() {
+        let r = rig_on(serve_pinning().await).await;
         std::fs::write(r.config.path().join("council/program-gate.json"), crate::config_seed::DEFAULT_COUNCIL_PROGRAM_GATE)
             .unwrap();
         let waits = SlotWaits::default();
@@ -1586,7 +1405,7 @@ mod tests {
         }
     }
 
-    /// Every seat head this kernel built on a v2 server is pinned under one
+    /// Every seat head this kernel built on a server is pinned under one
     /// owner named by the kernel's id, for an hour: the whole set when it
     /// changes, and the same set again at each renewal.
     ///
@@ -1594,7 +1413,7 @@ mod tests {
     /// that keeps a replaced head, or pins that are never renewed.
     #[tokio::test]
     async fn seats_are_pinned_under_the_kernel_and_renewed() {
-        let r = rig_on(serve_v2().await).await;
+        let r = rig_on(serve_pinning().await).await;
         r.kernel.council_sync().set_pin_renew(Duration::from_millis(300));
         let owner = format!("kernel-{}", r.kernel.id().to_hex());
         let first = r.prepare().await.expect("prepared");
@@ -1620,7 +1439,7 @@ mod tests {
     /// Falsified by a sync that keeps believing the server holds it.
     #[tokio::test]
     async fn a_seat_the_server_does_not_hold_is_built_again() {
-        let r = rig_on(serve_v2().await).await;
+        let r = rig_on(serve_pinning().await).await;
         r.mock.force("PUT", reply(200, json!({"owner": "k", "snapshots": [{"id": snap(1), "held": false}], "expires_in_s": 3600}).to_string()));
         r.prepare().await.expect("prepared");
         pin_puts(&r, 1).await;
@@ -1633,23 +1452,22 @@ mod tests {
         assert_eq!(r.mock.bodies("/council/v2/contexts").len(), 2, "built again");
     }
 
-    /// A v2 server without the `pins` capability pins nothing.
+    /// A server without the `pins` capability pins nothing.
     #[tokio::test]
     async fn a_server_without_pins_is_not_pinned() {
-        let r = rig_on(serve_v2().await).await;
-        r.mock.force("GET", reply(200, super::mock::identity_listing(json!(["leave_one_out"]))));
+        let r = rig().await;
         r.prepare().await.expect("prepared");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(r.mock.calls("PUT").is_empty(), "{:?}", r.mock.calls("PUT"));
     }
 
     /// At startup the kernel builds and pins each configured council's
-    /// seats on a v2 server: `[council] contexts` under each spec.
+    /// seats: `[council] contexts` under each spec.
     ///
     /// Falsified by seats that wait for the first decision.
     #[tokio::test]
     async fn build_seats_builds_and_pins_the_configured_seats() {
-        let r = rig_on(serve_v2().await).await;
+        let r = rig_on(serve_pinning().await).await;
         let gate = format!(
             "[council]\nserver = \"{}\"\ncontexts = [\"reviewer\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
              [[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.98\nmass_floor = -0.05\n\n\
@@ -1664,42 +1482,17 @@ mod tests {
         assert_eq!(pin_puts(&r, 1).await.len(), 1);
     }
 
-    /// A v2 server that fails its identity with anything but a 404 is a
-    /// miss, not a quiet fall back to v1.
+    /// A failed identity is a miss. A 404, from a server without council
+    /// v2, is a miss too: there is no other API to fall back to.
     #[tokio::test]
-    async fn a_failed_v2_identity_is_a_miss() {
-        let r = rig_on(serve_v2().await).await;
-        r.mock.force("GET", reply(500, "boom"));
-        let miss = r.prepare().await.err().expect("a miss");
-        assert!(miss.0.contains("identity failed"), "{}", miss.0);
-        assert_eq!(r.mock.calls("GET"), ["/council/v2/identity"]);
-    }
-
-    /// A prepare dropped while a `PUT` waits forgets the context: the server
-    /// may hold the new body, so the next `PUT` carries no `If-Match`.
-    ///
-    /// Falsified by a prepare that keeps the old head when it is dropped:
-    /// the next `PUT` names it, and the server answers 412.
-    #[tokio::test]
-    async fn a_prepare_dropped_during_a_put_sends_the_context_fresh_next_time() {
-        let r = rig().await;
-        r.prepare().await.unwrap();
-        r.grow("and never force push");
-        let mut slow = reply(
-            200,
-            json!({"id": r.reviewer.to_string(), "head": snap(7), "tokens": 1, "kept": 0, "fed": 1,
-                   "dry_run": false, "snapshots": []})
-            .to_string(),
-        );
-        slow.delay = std::time::Duration::from_millis(400);
-        r.mock.force("PUT", slow);
-        let dropped = tokio::time::timeout(std::time::Duration::from_millis(100), r.prepare()).await;
-        assert!(dropped.is_err(), "the prepare is dropped while its PUT waits");
-        r.prepare().await.expect("prepared");
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 3, "first, the dropped one, the fresh one");
-        assert!(puts[1].0.is_some(), "the dropped PUT named the head it knew");
-        assert_eq!(puts[2].0, None, "the next PUT carries no If-Match");
+    async fn a_failed_identity_is_a_miss() {
+        for status in [500, 404] {
+            let r = rig().await;
+            r.mock.force("GET", reply(status, "boom"));
+            let miss = r.prepare().await.err().expect("a miss");
+            assert!(miss.0.contains("council v2 identity failed") && miss.0.contains(&status.to_string()), "{}", miss.0);
+            assert_eq!(r.mock.calls("GET"), ["/council/v2/identity"]);
+        }
     }
 
     #[tokio::test]
@@ -1707,29 +1500,29 @@ mod tests {
         let r = rig().await;
         let p = r.prepare().await.unwrap();
         r.prepare().await.unwrap();
-        assert_eq!(r.mock.calls("POST").len(), 1);
+        assert_eq!(r.mock.calls("POST"), ["/council/v2/specs", "/council/v2/contexts"]);
         r.kernel.council_sync().invalidate_spec(&p.spec_id);
         r.prepare().await.unwrap();
-        assert_eq!(r.mock.calls("POST").len(), 2, "posted again");
-        assert_eq!(r.mock.puts().len(), 1, "the context is still held");
+        assert_eq!(r.mock.calls("POST").last().unwrap(), "/council/v2/specs", "posted again");
+        assert_eq!(r.mock.builds().len(), 1, "the seat is still held");
     }
 
     #[tokio::test]
-    async fn the_first_prepare_gets_the_identity_posts_the_spec_and_puts_each_context() {
+    async fn the_first_prepare_gets_the_identity_posts_the_spec_and_builds_each_seat() {
         let r = rig().await;
         let p = r.prepare().await.expect("prepared");
-        assert_eq!(r.mock.calls("GET"), ["/council/v2/identity", "/council/v1/identity"], "v2 first; a v1 server answers it 404");
-        assert_eq!(r.mock.calls("POST"), ["/council/v1/specs"]);
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 1);
-        assert_eq!(puts[0].0, None, "the first PUT has no If-Match");
-        assert_eq!(puts[0].1["turns"].as_array().unwrap().len(), 2);
-        assert!(puts[0].1.get("warm").is_none() && puts[0].1.get("dry_run").is_none());
+        assert_eq!(r.mock.calls("GET"), ["/council/v2/identity"]);
+        assert_eq!(r.mock.calls("POST"), ["/council/v2/specs", "/council/v2/contexts"]);
+        let builds = r.mock.builds();
+        assert_eq!(builds.len(), 1);
+        let messages = builds[0]["context"]["messages"].as_array().unwrap();
+        assert_eq!(messages[1..3].iter().map(|m| m["content"].as_str().unwrap()).collect::<Vec<_>>(), ["never rm -rf the repo", "understood"]);
+        assert!(builds[0].get("dry_run").is_none());
         assert_eq!(p.contexts.len(), 1);
         assert_eq!(p.contexts[0].label, "reviewer");
         assert_eq!(p.contexts[0].context_id, r.reviewer);
         assert_eq!(p.contexts[0].head.as_str(), snap(1));
-        assert_eq!(p.spec_id, canon::spec_id(&p.spec).unwrap());
+        assert_eq!(p.spec_id.as_str(), p.spec.id());
         assert_eq!(p.identity.engine, "e");
     }
 
@@ -1744,92 +1537,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_changed_context_puts_again_with_the_last_head_in_if_match() {
+    async fn a_changed_context_builds_its_seat_again() {
         let r = rig().await;
         let first = r.prepare().await.unwrap();
-        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
-        super::super::projection::fixtures::append(
-            &r.kernel,
-            r.reviewer,
-            ids.last().map(|b| &b.id),
-            kaijutsu_types::Role::User,
-            kaijutsu_types::BlockKind::Text,
-            kaijutsu_types::Status::Done,
-            "and never force push",
-        );
+        r.grow("and never force push");
         let second = r.prepare().await.unwrap();
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 2);
-        assert_eq!(puts[1].0.as_deref(), Some(first.contexts[0].head.as_str()));
-        assert_eq!(puts[1].1["turns"].as_array().unwrap().len(), 3);
+        let builds = r.mock.builds();
+        assert_eq!(builds.len(), 2);
+        assert!(builds[1].to_string().contains("and never force push"), "{}", builds[1]);
+        assert_ne!(second.contexts[0].head, first.contexts[0].head);
         assert_eq!(second.contexts[0].head.as_str(), snap(2));
-    }
-
-    #[tokio::test]
-    async fn a_404_on_put_sends_the_context_again_without_if_match() {
-        let r = rig().await;
-        r.prepare().await.unwrap();
-        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
-        super::super::projection::fixtures::append(
-            &r.kernel,
-            r.reviewer,
-            ids.last().map(|b| &b.id),
-            kaijutsu_types::Role::User,
-            kaijutsu_types::BlockKind::Text,
-            kaijutsu_types::Status::Done,
-            "more guidance",
-        );
-        r.mock.force(
-            "PUT",
-            reply(404, json!({"error": {"type": "not_found", "message": "no such context"}}).to_string()),
-        );
-        let p = r.prepare().await.expect("recovers within the call");
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 3, "first, the refused one, the retry");
-        assert!(puts[1].0.is_some());
-        assert_eq!(puts[2].0, None);
-        assert_eq!(p.contexts[0].head.as_str(), snap(2));
-    }
-
-    #[tokio::test]
-    async fn a_412_is_a_miss_and_the_next_prepare_puts_fresh() {
-        let r = rig().await;
-        r.prepare().await.unwrap();
-        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
-        super::super::projection::fixtures::append(
-            &r.kernel,
-            r.reviewer,
-            ids.last().map(|b| &b.id),
-            kaijutsu_types::Role::User,
-            kaijutsu_types::BlockKind::Text,
-            kaijutsu_types::Status::Done,
-            "more guidance",
-        );
-        r.mock.force(
-            "PUT",
-            reply(
-                412,
-                json!({"error": {"type": "head_mismatch", "message": "moved", "head": snap(9)}})
-                    .to_string(),
-            ),
-        );
-        let miss = r.prepare().await.err().expect("a miss");
-        assert!(miss.0.contains("reviewer") && miss.0.contains(&snap(9)), "{}", miss.0);
-        let p = r.prepare().await.expect("recovers on the next call");
-        let puts = r.mock.puts();
-        assert_eq!(puts.last().unwrap().0, None, "fresh PUT carries no If-Match");
-        assert_eq!(p.contexts[0].label, "reviewer");
-    }
-
-    #[tokio::test]
-    async fn invalidate_makes_the_next_prepare_send_the_context_again() {
-        let r = rig().await;
-        r.prepare().await.unwrap();
-        r.kernel.council_sync().invalidate(r.reviewer);
-        r.prepare().await.unwrap();
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 2);
-        assert_eq!(puts[1].0, None);
     }
 
     #[tokio::test]
@@ -1846,7 +1563,7 @@ mod tests {
         std::fs::remove_file(r.config.path().join("council/shell-gate.json")).unwrap();
         let miss = r.prepare().await.err().expect("a miss");
         assert!(miss.0.contains("/config/kernel/council/shell-gate.json"), "{}", miss.0);
-        assert_eq!(r.mock.puts().len(), 0);
+        assert_eq!(r.mock.builds().len(), 0);
     }
 
     #[tokio::test]
@@ -1875,24 +1592,16 @@ mod tests {
         let r = rig().await;
         r.prepare().await.unwrap();
         r.prepare().await.unwrap();
-        assert_eq!(r.mock.calls("GET").len(), 2, "cached across prepares: the v2 404 and the v1 identity");
+        assert_eq!(r.mock.calls("GET").len(), 1, "cached across prepares");
 
-        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
-        super::super::projection::fixtures::append(
-            &r.kernel,
-            r.reviewer,
-            ids.last().map(|b| &b.id),
-            kaijutsu_types::Role::User,
-            kaijutsu_types::BlockKind::Text,
-            kaijutsu_types::Status::Done,
-            "more guidance",
-        );
-        r.mock.force("PUT", reply(500, "boom"));
+        r.grow("more guidance");
+        r.mock.force("POST", reply(500, "boom"));
         let miss = r.prepare().await.err().expect("a miss");
         assert!(miss.0.contains(&r.mock.base), "{}", miss.0);
         r.prepare().await.expect("recovered");
-        assert_eq!(r.mock.calls("GET").len(), 4, "refetched after the failure");
-        assert_eq!(r.mock.calls("POST").len(), 2, "specs are posted again with it");
+        assert_eq!(r.mock.calls("GET").len(), 2, "refetched after the failure");
+        let specs = r.mock.calls("POST").iter().filter(|p| *p == "/council/v2/specs").count();
+        assert_eq!(specs, 2, "specs are posted again with it");
     }
 
     #[tokio::test]
@@ -1907,9 +1616,7 @@ mod tests {
     }
 
     fn identity_with(capabilities: serde_json::Value) -> String {
-        let mut id: serde_json::Value = serde_json::from_str(&identity_json()).unwrap();
-        id["capabilities"] = capabilities;
-        id.to_string()
+        super::mock::identity_listing(capabilities)
     }
 
     #[tokio::test]
@@ -1918,16 +1625,20 @@ mod tests {
         std::fs::write(r.config.path().join("council/shell-gate.json"), SPEC_WITH_TEXT).unwrap();
         let miss = r.prepare().await.err().expect("a miss");
         assert!(miss.0.contains("`effect`") && miss.0.contains("`describe`"), "{}", miss.0);
-        assert!(r.mock.calls("POST").is_empty(), "the spec is not posted");
-        assert!(r.mock.puts().is_empty(), "no context is sent");
+        assert!(r.mock.calls("POST").is_empty(), "neither the spec nor a seat is sent");
     }
 
+    /// With `describe`, a spec holding a `text` question is posted. Its
+    /// queue seat cannot answer the `text` question with a letter, so the
+    /// prepare misses there, naming the question.
     #[tokio::test]
-    async fn a_text_question_with_describe_prepares() {
+    async fn a_text_question_with_describe_posts_and_has_no_seat() {
         let r = rig().await;
         std::fs::write(r.config.path().join("council/shell-gate.json"), SPEC_WITH_TEXT).unwrap();
         r.mock.force("GET", reply(200, identity_with(json!(["leave_one_out", "describe"]))));
-        r.prepare().await.expect("prepared");
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("text question `effect`"), "{}", miss.0);
+        assert_eq!(r.mock.calls("POST"), ["/council/v2/specs"]);
     }
 
     #[tokio::test]
@@ -1943,7 +1654,7 @@ mod tests {
         let one = vec!["council-amy".to_string()];
         let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None, &[], far(), &SlotWaits::default()).await.unwrap();
         assert_eq!(p.contexts.len(), 1, "a single reviewer, without [council] contexts");
-        assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
+        assert_eq!(r.mock.builds().len(), 2, "each seat is built once");
     }
 
     /// A seat with a brief and narration, labeled `label`, working in `cwd`.
@@ -1995,7 +1706,7 @@ mod tests {
     ///
     /// Falsified by a sync that reads only the working directory itself (the
     /// rules one level up never arrive), or one that projects the seat's
-    /// blocks (the narration changes the body and sends a `PUT`).
+    /// blocks (the narration changes the seat and builds it again).
     #[tokio::test]
     async fn the_house_rules_come_from_the_nearest_agents_md_and_ignore_the_seat() {
         let mut r = rig().await;
@@ -2007,13 +1718,13 @@ mod tests {
             p.contexts.iter().map(|c| (c.label.as_str(), c.house_rules)).collect::<Vec<_>>(),
             [("reviewer", false), ("house-rules", true)]
         );
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 2);
-        let body = &puts[1].1;
-        assert!(body["system"].as_str().unwrap().contains("you know the house rules"), "{body}");
-        assert_eq!(body["turns"].as_array().unwrap().len(), 1, "{body}");
+        let builds = r.mock.builds();
+        assert_eq!(builds.len(), 2);
+        let body = &builds[1];
+        let messages = body["context"]["messages"].as_array().unwrap();
+        assert!(messages[0]["content"].as_str().unwrap().contains("you know the house rules"), "{body}");
         assert_eq!(
-            body["turns"][0]["content"].as_str().unwrap(),
+            messages[1]["content"].as_str().unwrap(),
             "The house rules in /work/repo/AGENTS.md:\n\nBack up data before changing it."
         );
         assert!(!body.to_string().contains("WAL"), "the seat's narration stays out: {body}");
@@ -2022,43 +1733,15 @@ mod tests {
         append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text, "No backup exists yet.");
         append_to(&r, seat, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text, "a later prompt");
         let again = prepare_seat(&r, seat).await.unwrap();
-        assert_eq!(r.mock.puts().len(), 2, "narration and prompts send nothing");
+        assert_eq!(r.mock.builds().len(), 2, "narration and prompts send nothing");
         assert_eq!(again.house_rules().unwrap().head, p.house_rules().unwrap().head);
-    }
-
-    /// A house-rules context is ephemeral: it is sent with `persist: false`
-    /// when the server lists the `persist` capability, so the server need not
-    /// park it; a labeled context never carries `persist`, and a server
-    /// without the capability never sees the field.
-    ///
-    /// Falsified by a sync that leaves `persist` off: the house-rules body
-    /// has no `persist`.
-    #[tokio::test]
-    async fn house_rules_are_sent_with_persist_false_when_the_server_can_drop_them() {
-        let mut r = rig().await;
-        r.council.house_rules = true;
-        r.mock.force("GET", reply(200, identity_with(json!(["leave_one_out", "persist"]))));
-        write_rules(&r, "Back up data before changing it.").await;
-        let seat = seat_in(&r, "lane-a", Some("/work/repo"));
-        prepare_seat(&r, seat).await.expect("prepared");
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 2);
-        assert!(puts[0].1.get("persist").is_none(), "a labeled context stays persistent: {}", puts[0].1);
-        assert_eq!(puts[1].1["persist"], json!(false), "{}", puts[1].1);
-
-        let mut plain = rig().await;
-        plain.council.house_rules = true;
-        write_rules(&plain, "Back up data before changing it.").await;
-        let seat = seat_in(&plain, "lane-a", Some("/work/repo"));
-        prepare_seat(&plain, seat).await.expect("prepared");
-        assert!(plain.mock.puts()[1].1.get("persist").is_none(), "no capability, no field");
     }
 
     /// The held id comes from the body, so every seat under one `AGENTS.md`
     /// shares one held context, and an edited file is a new id.
     ///
     /// Falsified by an id derived from the seat's context id: the two seats
-    /// hold two contexts and the second prepare sends another `PUT`.
+    /// hold two contexts and the second prepare builds another seat.
     #[tokio::test]
     async fn seats_under_one_agents_md_share_one_held_context_and_an_edit_is_a_new_id() {
         let mut r = rig().await;
@@ -2072,15 +1755,13 @@ mod tests {
         assert_eq!(h1.context_id, h2.context_id, "one body, one id");
         assert_ne!(h1.context_id, one);
         assert_ne!(h1.context_id, two);
-        assert_eq!(r.mock.puts().len(), 2, "the reviewer, and the rules once");
+        assert_eq!(r.mock.builds().len(), 2, "the reviewer, and the rules once");
 
         write_rules(&r, "Back up data. Never push.").await;
         let p3 = prepare_seat(&r, one).await.unwrap();
         let h3 = p3.house_rules().unwrap();
         assert_ne!(h3.context_id, h1.context_id, "an edited file is a new id");
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 3);
-        assert_eq!(puts[2].0, None, "a new id has no head to match");
+        assert_eq!(r.mock.builds().len(), 3);
     }
 
     /// An edit to the house rules replaces the house-rules seat in the pin
@@ -2092,7 +1773,7 @@ mod tests {
     /// one more seat for each edit.
     #[tokio::test]
     async fn an_edit_to_the_house_rules_replaces_the_pinned_seat() {
-        let mut r = rig_on(serve_v2().await).await;
+        let mut r = rig_on(serve_pinning().await).await;
         r.council.house_rules = true;
         write_rules(&r, "Back up data before changing it.").await;
         let seat = seat_in(&r, "lane-a", Some("/work/repo/sub"));
@@ -2120,7 +1801,7 @@ mod tests {
     /// label's head stays in the set.
     #[tokio::test]
     async fn a_seat_the_config_no_longer_reads_leaves_the_pin_set() {
-        let r = rig_on(serve_v2().await).await;
+        let r = rig_on(serve_pinning().await).await;
         r.kernel.council_sync().serve(&r.kernel);
         let other = live_context(&r.kernel, "other");
         append_dialogue(&r.kernel, other, &["never delete originals"]);
@@ -2163,7 +1844,7 @@ mod tests {
         let p = prepare_seat(&r, seat).await.unwrap();
         assert!(p.house_rules().is_none());
         assert_eq!(p.contexts.len(), 1);
-        assert_eq!(r.mock.puts().len(), 1, "only the labeled context");
+        assert_eq!(r.mock.builds().len(), 1, "only the labeled context");
     }
 
     /// The labels and the house-rules context together must fit the
@@ -2213,102 +1894,184 @@ mod tests {
         let twice = vec!["reviewer".to_string(), "reviewer".to_string()];
         let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None, &[], far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("\"reviewer\" twice"), "{}", miss.0);
-        assert!(r.mock.puts().is_empty());
+        assert!(r.mock.builds().is_empty());
     }
 
-    /// Live, by hand: an edited `AGENTS.md` replaces its seat in the
-    /// kernel's pin set on the server. Drops the pins at the end.
-    /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "needs a council v2 server at COUNCIL_URL"]
-    async fn live_council_v2_house_rules_edit_replaces_the_pinned_seat() {
-        let server = std::env::var("COUNCIL_URL").expect("COUNCIL_URL names the server");
-        let mut r = rig_on(serve_v2().await).await;
+    /// gogi's fake council server, with room for whole seats: its tokens
+    /// are bytes, and a seat with worked examples runs past the default
+    /// limits on a decision's context and on pinned bytes.
+    fn fake_council() -> gogi_fake::Server {
+        let config = gogi_fake::Config {
+            context_tokens: 1 << 20,
+            decision_context_tokens: 1 << 20,
+            pin_bytes: 1 << 34,
+            ..gogi_fake::Config::default()
+        };
+        gogi_fake::Server::start(config).expect("the fake council starts")
+    }
+
+    /// Waits until `owner`'s pins on `client`'s server are exactly `want`.
+    async fn pinned_exactly(client: &MkClient, owner: &str, want: &[&SnapshotId]) -> gogi_proto::pins::PinSet {
+        let want: BTreeSet<&str> = want.iter().map(|id| id.as_str()).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match client.council().get_pins(owner).await {
+                Ok(pins) if pins.snapshots.iter().map(String::as_str).collect::<BTreeSet<_>>() == want => return pins,
+                _ if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
+                other => panic!("pins for {owner} never became {want:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// An edited `AGENTS.md` replaces its seat in the kernel's pin set on
+    /// the council server at `server`. Drops the pins at the end.
+    async fn house_rules_edit_replaces_the_pinned_seat(server: String) {
+        let mut r = rig_on(serve_pinning().await).await;
         r.council.server = server.clone();
+        r.council.model = std::env::var("COUNCIL_MODEL").ok();
         r.council.deadline_ms = 120_000;
         r.council.house_rules = true;
         let owner = pin_owner(r.kernel.id());
         let client = MkClient::new(&server, Duration::from_secs(30)).unwrap();
-        let pinned = |want: Vec<SnapshotId>| {
-            let (client, owner) = (&client, &owner);
-            async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-                loop {
-                    match client.v2().get_pins(owner).await {
-                        Ok(pins) if pins.snapshots.iter().collect::<BTreeSet<_>>() == want.iter().collect() => return pins,
-                        _ if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(200)).await,
-                        other => panic!("pins for {owner} never became {want:?}: {other:?}"),
-                    }
-                }
-            }
-        };
         write_rules(&r, "Back up data before changing it.").await;
         let seat = seat_in(&r, "lane-a", Some("/work/repo"));
         let first = prepare_seat(&r, seat).await.expect("prepared");
         let reviewer = first.contexts[0].head.clone();
         let old = first.house_rules().unwrap().head.clone();
-        println!("pins: {:?}", pinned(vec![reviewer.clone(), old.clone()]).await);
+        println!("pins: {:?}", pinned_exactly(&client, &owner, &[&reviewer, &old]).await);
 
         write_rules(&r, "Back up data. Never push.").await;
         let second = prepare_seat(&r, seat).await.expect("prepared");
         let new = second.house_rules().unwrap().head.clone();
         assert_ne!(new, old);
-        let pins = pinned(vec![reviewer, new]).await;
+        let pins = pinned_exactly(&client, &owner, &[&reviewer, &new]).await;
         println!("after the edit: {pins:?}");
-        assert!(!pins.snapshots.contains(&old), "{pins:?}");
-        client.v2().delete_pins(&owner).await.expect("pins dropped");
+        assert!(!pins.snapshots.iter().any(|id| id == old.as_str()), "{pins:?}");
+        client.council().delete_pins(&owner).await.expect("pins dropped");
     }
 
-    /// Live, by hand: a council v2 seat built, pinned under the kernel's
-    /// owner, and read whole by a decision whose numbers recompute. Drops
-    /// the pins at the end.
-    /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "needs a council v2 server at COUNCIL_URL"]
-    async fn live_council_v2_seat_is_pinned_and_read_whole() {
-        let server = std::env::var("COUNCIL_URL").expect("COUNCIL_URL names the server");
-        let mut r = rig_on(serve_v2().await).await;
+    /// A seat built on the council server at `server`, pinned under the
+    /// kernel's owner, and read whole by a decision whose numbers
+    /// recompute. Drops the pins at the end.
+    async fn seat_is_pinned_and_read_whole(server: String) {
+        let mut r = rig_on(serve_pinning().await).await;
         r.council.server = server.clone();
+        r.council.model = std::env::var("COUNCIL_MODEL").ok();
         r.council.deadline_ms = 120_000;
         converse(&r);
         let owner = pin_owner(r.kernel.id());
         let started = std::time::Instant::now();
         let p = r.prepare().await.expect("prepared");
-        assert_eq!(p.wire, Wire::V2);
         let head = p.contexts[0].head.clone();
         println!("seat built in {} ms, head {head}", started.elapsed().as_millis());
 
         let client = MkClient::new(&server, Duration::from_secs(30)).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        let pins = loop {
-            match client.v2().get_pins(&owner).await {
-                Ok(pins) => break pins,
-                Err(e) if e.status() == Some(404) && tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Err(e) => panic!("no pins for {owner}: {e}"),
-            }
-        };
+        let pins = pinned_exactly(&client, &owner, &[&head]).await;
         println!("pins: {pins:?}");
-        assert_eq!(pins.snapshots, [head.clone()]);
         assert!(pins.expires_in_s > 3500 && pins.expires_in_s <= 3600, "{pins:?}");
-        let snapshot = client.v2().snapshot(&head).await.expect("the head is held");
+        let snapshot = client.council().snapshot(&head).await.expect("the head is held");
         println!("snapshot: {snapshot:?}");
         assert!(snapshot.pins.iter().any(|pin| pin.owner == owner), "{snapshot:?}");
 
-        let request = super::super::gate::decision_request(&p, &r.council, kaijutsu_mk::Json::from("git push origin main"));
+        let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
         let asked = std::time::Instant::now();
         let response = super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default())
             .await
             .expect("answered");
-        kaijutsu_mk::council::math::verify(&response, &request).expect("the numbers recompute");
+        gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
         assert_eq!(response.reads[0].context.as_deref(), Some("0"));
+        assert_eq!(response.identity.spec_id.as_ref(), Some(&p.spec_id));
         println!(
             "decision in {} ms: answers {}",
             asked.elapsed().as_millis(),
             serde_json::to_string(&response.answers).unwrap()
         );
         println!("read snapshot {:?}", response.reads[0].snapshot);
-        client.v2().delete_pins(&owner).await.expect("pins dropped");
+        client.council().delete_pins(&owner).await.expect("pins dropped");
+    }
+
+    /// The kernel and gogi's fake council server agree on the contract: a
+    /// seat the kernel builds is held and pinned, and a decision over it
+    /// returns numbers gogi's math recomputes.
+    ///
+    /// Falsified by a seat, pin set, or decision request the fake refuses,
+    /// or a read the kernel cannot map back to its seat.
+    #[tokio::test]
+    async fn against_the_fake_a_seat_is_pinned_and_read_whole() {
+        let fake = fake_council();
+        seat_is_pinned_and_read_whole(fake.url()).await;
+    }
+
+    /// Against gogi's fake council server, an edited `AGENTS.md` replaces
+    /// its seat in the pin set.
+    #[tokio::test]
+    async fn against_the_fake_a_house_rules_edit_replaces_the_pinned_seat() {
+        let fake = fake_council();
+        house_rules_edit_replaces_the_pinned_seat(fake.url()).await;
+    }
+
+    /// On a server that serves several models, the council names one. With
+    /// no `[council] model` it is a miss naming the served models. A model
+    /// that is loading is a miss naming its status, and the next prepare
+    /// asks the identity again. Named by its alias, the model takes every
+    /// build and the decision, and each answer names it by its `model`.
+    ///
+    /// Falsified by a build or decision that leaves `model` out, or an
+    /// identity cached while its model was loading.
+    #[tokio::test]
+    async fn against_the_fake_the_council_names_its_served_model() {
+        let b = gogi_fake::FakeModel { aliases: vec!["bee".into()], ..gogi_fake::FakeModel::ready("b", 1) };
+        let config = gogi_fake::Config {
+            models: vec![gogi_fake::FakeModel::ready("a", 0), b],
+            context_tokens: 1 << 20,
+            decision_context_tokens: 1 << 20,
+            pin_bytes: 1 << 34,
+            ..gogi_fake::Config::default()
+        };
+        let fake = gogi_fake::Server::start(config).expect("the fake council starts");
+        let mut r = rig_on(serve_pinning().await).await;
+        r.council.server = fake.url();
+        r.council.deadline_ms = 120_000;
+        converse(&r);
+        let miss = r.prepare().await.err().expect("no model is named");
+        assert!(miss.0.contains("model is required") && miss.0.contains("it serves a, b"), "{}", miss.0);
+
+        r.council.model = Some("bee".into());
+        fake.set_status("b", gogi_fake::ModelStatus::Loading).unwrap();
+        let miss = r.prepare().await.err().expect("b is loading");
+        assert!(miss.0.contains("model b is loading, not ready"), "{}", miss.0);
+        fake.set_status("b", gogi_fake::ModelStatus::Ready).unwrap();
+        let p = r.prepare().await.expect("prepared once b is ready");
+        assert_eq!(p.identity.model, "b");
+        let client = MkClient::new(&fake.url(), Duration::from_secs(30)).unwrap();
+        assert_eq!(client.council().snapshot(&p.contexts[0].head).await.unwrap().model, "b");
+
+        let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
+        assert_eq!(request.model.as_deref(), Some("b"));
+        let response = super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default())
+            .await
+            .expect("answered");
+        gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
+        assert_eq!(response.identity.model, "b");
+    }
+
+    /// Live, by hand: [`house_rules_edit_replaces_the_pinned_seat`] against
+    /// a real server.
+    /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
+    /// Set `COUNCIL_MODEL` on a server that serves several models.
+    #[tokio::test]
+    #[ignore = "needs a council v2 server at COUNCIL_URL"]
+    async fn live_council_v2_house_rules_edit_replaces_the_pinned_seat() {
+        house_rules_edit_replaces_the_pinned_seat(std::env::var("COUNCIL_URL").expect("COUNCIL_URL names the server")).await;
+    }
+
+    /// Live, by hand: [`seat_is_pinned_and_read_whole`] against a real
+    /// server.
+    /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
+    /// Set `COUNCIL_MODEL` on a server that serves several models.
+    #[tokio::test]
+    #[ignore = "needs a council v2 server at COUNCIL_URL"]
+    async fn live_council_v2_seat_is_pinned_and_read_whole() {
+        seat_is_pinned_and_read_whole(std::env::var("COUNCIL_URL").expect("COUNCIL_URL names the server")).await;
     }
 }

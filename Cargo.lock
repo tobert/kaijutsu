@@ -5471,6 +5471,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "gogi-fake"
+version = "0.1.0"
+source = "git+https://github.com/tobert/gogi?rev=ee6174caf0b123bde8f21aaaa99ed430279cbd99#ee6174caf0b123bde8f21aaaa99ed430279cbd99"
+dependencies = [
+ "gogi-proto",
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "gogi-proto"
+version = "0.1.0"
+source = "git+https://github.com/tobert/gogi?rev=ee6174caf0b123bde8f21aaaa99ed430279cbd99#ee6174caf0b123bde8f21aaaa99ed430279cbd99"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6686,7 +6710,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "kaijutsu-mk",
+ "gogi-proto",
  "rustix 0.38.44",
  "serde",
  "serde_json",
@@ -6968,6 +6992,8 @@ dependencies = [
  "dunce",
  "eventsource-stream",
  "futures",
+ "gogi-fake",
+ "gogi-proto",
  "http",
  "ignore",
  "include_dir",
@@ -7048,13 +7074,13 @@ dependencies = [
 name = "kaijutsu-mk"
 version = "0.1.0"
 dependencies = [
- "hex",
+ "gogi-fake",
+ "gogi-proto",
  "indexmap 2.14.0",
  "jsonschema",
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
 ]

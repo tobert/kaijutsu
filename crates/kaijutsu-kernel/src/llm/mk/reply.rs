@@ -10,7 +10,7 @@
 //! disagrees with what the service holds as the reply.
 
 use kaijutsu_mk::Json;
-use kaijutsu_mk::council_v2::wire::{GenerationDone, ReplyToolCall};
+use gogi_proto::generation::{Finish as V2Finish, GenerationDone, ReplyToolCall};
 use kaijutsu_mk::generate::{Done, Finish, ToolCall};
 
 use crate::llm::stream::{MkUsageExtra, StreamEvent, UsageExtra};
@@ -153,10 +153,14 @@ impl Reply {
             .tool_calls
             .into_iter()
             .map(|call| match call {
-                ReplyToolCall::Parsed { id, name, arguments } => Call::Parsed { id, name, arguments },
-                ReplyToolCall::Unparsed { id, name, raw, error } => Call::Unparsed { id, name, raw, error },
+                ReplyToolCall::Parsed { id, name, arguments, .. } => {
+                    let arguments = serde_json::from_value(serde_json::Value::Object(arguments))
+                        .map_err(|e| format!("tool call {id} arguments do not decode: {e}"))?;
+                    Ok(Call::Parsed { id, name, arguments })
+                }
+                ReplyToolCall::Unparsed { id, name, raw, error, .. } => Ok(Call::Unparsed { id, name, raw, error }),
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let extra = MkUsageExtra {
             kept: done.usage.kept,
             fed: done.usage.fed,
@@ -169,7 +173,12 @@ impl Reply {
             weight_hash: weight_hash.to_string(),
         };
         let usage = (done.usage.prompt, done.usage.completion, extra);
-        self.end(&done.reasoning, &done.content, done.finish, calls, usage)
+        let finish = match done.finish {
+            V2Finish::Stop => Finish::Stop,
+            V2Finish::Length => Finish::Length,
+            V2Finish::Cancelled => Finish::Cancelled,
+        };
+        self.end(&done.reasoning, &done.content, finish, calls, usage)
     }
 
     /// Closes the open block, checks the streamed text against the reply's,

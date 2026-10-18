@@ -1,12 +1,15 @@
 # mk: the megakernel suite
 
-Design. Built: the `kaijutsu-mk` crate with `MkClient`, the council calls,
-and the `generate` and `model` modules, and the `mk` provider (steps 1 to 3
-of "Order of work"). The live probes and the seat are not done. The megakernel is the Qwen
-inference service in `~/src/megakernel-qwen38-flashnext-strixhalo`; its wire is
-`/mk/v1` (`service/openapi.json`) plus `/council/v1`
+Design. Built: the `kaijutsu-mk` crate with `MkClient`, the council v2
+calls, and the `generate` and `model` modules, and the `mk` provider (steps
+1 to 3 of "Order of work"). The live probes and the seat are not done. The
+megakernel is the Qwen inference service in
+`~/src/megakernel-qwen38-flashnext-strixhalo`; its wire is `/mk/v1`
+(`service/openapi.json`) plus `/council/v1`
 (`service/council-openapi.json`). Facts below were read at megakernel
-`3a4c342`.
+`3a4c342`. Kaijutsu's council calls speak only council v2 (gogi's
+`docs/council-api-v2.md`), which mkviolet serves; gogi's `gogi-proto` crate
+owns every council wire type, spec id, and pooling rule.
 
 ## Purpose
 
@@ -100,7 +103,7 @@ Layout, smallest first:
 
 | Module | Holds | State |
 |---|---|---|
-| `council` | `wire`, `canon`, `math`, the `/council/v1` calls | exists |
+| `council` | the council v2 calls through `MkClient::council()`: identity, context builds, snapshots, pins, specs, decisions, reads, and generations, with `GenerationEvent` and `GenerationStream`; the types are `gogi_proto`'s | exists |
 | `client` | `MkClient`: base URL, timeout, `traceparent`, request send, status-to-error mapping; `MkError` | exists |
 | `generate` | `GenerateRequest`, `Message`, `Tool`, `Sample`, `TokenEvent`, `Done`, an SSE decoder, `generate` and `generate_stream` calls | exists |
 | `model` | `GET /mk/v1/model` and `POST /mk/v1/render` | exists |
@@ -245,11 +248,14 @@ must not invent a `ToolUse` before `done`.
 
 ### Council v2
 
-When the service answers `GET /council/v2/identity` and lists `generate`,
-every streamed turn is one `POST /council/v2/generations`
-(`docs/council-api-v2.md`, "Generations") instead of render and
-`/mk/v1/generate`. The client asks for the identity once; a 404 or an
-identity without `generate` keeps the `/mk/v1` path above.
+When the service answers `GET /council/v2/identity` and lists the turn's
+model as a served model with `generate`, every streamed turn is one
+`POST /council/v2/generations` (gogi's `docs/council-api-v2.md`,
+"Generations") instead of render and `/mk/v1/generate`. The turn's model
+names the served model by its `model` or an alias, and the generation sends
+its `model`. The client asks for the identity once. A 404, or a served
+model without `generate`, keeps the `/mk/v1` path above. A model the
+server does not serve is an invalid request naming the ones it serves.
 
 - **The whole conversation goes with every turn.** The context is the
   system prompt, the history as v2 messages (`llm/mk/build.rs`,
@@ -293,17 +299,19 @@ identity without `generate` keeps the `/mk/v1` path above.
 
 ## The council module and other decision servers
 
-The council client keeps its current calls and types. Two changes:
+The `council` module is transport only. It uses `MkClient`, so generation
+and decisions share timeout, tracing, and error mapping. The request and
+response types, their validation, spec ids, and the pooling math are
+`gogi-proto`'s, so kaijutsu and every server read one definition of the
+contract. Its tests run against `gogi_fake::Server` (gogi's
+`docs/gogi-fake.md`), and the same test bodies run against a real server
+when `COUNCIL_URL` names one.
 
-- It uses `MkClient` for transport, so generation and decisions share timeout,
-  tracing, and error mapping.
-- Its calls sit behind a small trait only when a second decision server
-  exists. lfm2d already has an opinion API with a different shape
-  (`docs/council-api.md`, "Converging the two servers"); until it adopts
-  `/council/v1`, no trait is written. We do not guess the second shape.
-
-A hosted decision API (the "or" and "oai" cases Amy named) would be a new
-module that implements that trait, not a change to the gate.
+A second decision server joins by serving council v2. lfm2d has an opinion
+API with a different shape (gogi's `docs/council-api.md`, "Converging the
+two servers"); until it serves council v2, the kernel does not call it. A
+hosted decision API (the "or" and "oai" cases Amy named) would sit behind
+a small trait only when one exists, not a change to the gate.
 
 ## The seat
 
@@ -417,5 +425,5 @@ and canned results. Commands are in `llm/mk/probes.rs`.
   inference except once; a probe with several calls should confirm the order.
 - Which liveness signal does the in-flight strip get during the `tool` phase?
 
-Related: `docs/council.md`, `docs/council-api.md`, `docs/prompts.md`,
+Related: `docs/council.md`, gogi's `docs/council-api-v2.md`, `docs/prompts.md`,
 `docs/approval-identity.md`, `docs/issues.md`.

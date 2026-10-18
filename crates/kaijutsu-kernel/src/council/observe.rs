@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use approval_ledger::council::{CouncilQuestion, CouncilServer};
 use approval_ledger::council_observation::{CouncilObservationOutcome, NewCouncilObservation, insert_council_observation};
-use kaijutsu_mk::Json;
-use kaijutsu_mk::council::wire::{DecisionResponse, ReadAnswer, SpecQuestion};
+use gogi_proto::decision::{DecisionRequest, DecisionResponse, ReadAnswer};
+use gogi_proto::spec::QuestionKind;
 
 use super::sync::Prepared;
 use crate::kj::gate_policy::CouncilConfig;
@@ -86,7 +86,7 @@ pub(crate) fn spawn_observe(
     council: CouncilConfig,
     decision_id: Vec<u8>,
     labels: Vec<String>,
-    state: Json,
+    state: serde_json::Value,
 ) -> Option<tokio::task::JoinHandle<Vec<Observed>>> {
     if labels.is_empty() {
         return None;
@@ -101,7 +101,7 @@ pub(crate) async fn observe_reviewer_contexts(
     council: &CouncilConfig,
     decision_id: &[u8],
     labels: &[String],
-    state: &Json,
+    state: &serde_json::Value,
 ) -> Vec<Observed> {
     let mut observed = Vec::with_capacity(labels.len());
     for label in labels {
@@ -136,7 +136,7 @@ async fn observe_one(
     council: &CouncilConfig,
     decision_id: &[u8],
     label: &str,
-    state: &Json,
+    state: &serde_json::Value,
 ) -> NewCouncilObservation {
     let started = Instant::now();
     let mut row = NewCouncilObservation {
@@ -216,8 +216,8 @@ async fn observe_one(
 /// Why the prepared spec cannot be observed under, when it cannot: an
 /// observation reads a [`FOLLOWS`] choice.
 fn spec_lacks_follows(prepared: &Prepared) -> Option<String> {
-    match prepared.spec.questions.iter().find(|q| q.id() == FOLLOWS) {
-        Some(SpecQuestion::Choice(_)) => None,
+    match prepared.spec.questions.iter().find(|q| q.id == FOLLOWS).map(|q| &q.kind) {
+        Some(QuestionKind::Choice { .. }) => None,
         Some(_) => Some(format!("spec {DIRECTION_CHECK} has a `{FOLLOWS}` question that is not a choice")),
         None => Some(format!("spec {DIRECTION_CHECK} has no `{FOLLOWS}` choice")),
     }
@@ -227,13 +227,13 @@ fn spec_lacks_follows(prepared: &Prepared) -> Option<String> {
 /// answered, and its top option for [`FOLLOWS`].
 fn read_answer(
     prepared: &Prepared,
-    request: &kaijutsu_mk::council::wire::DecisionRequest,
+    request: &DecisionRequest,
     response: &DecisionResponse,
 ) -> Result<(Option<String>, Vec<CouncilQuestion>, String), String> {
-    kaijutsu_mk::council::math::verify(response, request)
+    gogi_proto::math::verify(response, &request.expect())
         .map_err(|mismatch| format!("the answer's numbers do not recompute ({mismatch})"))?;
     if let (Some(read), Some(asked)) = (&response.identity.spec_id, &request.spec_id)
-        && read != asked
+        && read.as_str() != asked
     {
         return Err(format!("the server read spec {read}, not the spec asked for, {asked}"));
     }
@@ -259,13 +259,14 @@ fn read_answer(
 pub(crate) mod test_support {
     //! verify()-consistent `direction-check` answers for tests.
 
-    use kaijutsu_mk::council::math::{self, Row, WeightSpec};
-    use kaijutsu_mk::council::wire::{DecisionRequest, PoolMethod, PoolWeights};
+    use gogi_proto::decision::{DecisionRequest, PoolMethod, PoolWeights};
+    use gogi_proto::math::{self, Row, WeightSpec};
 
     pub(crate) const OPTIONS: [&str; 3] = ["follows", "strays", "unclear"];
 
     /// An answer to `request` whose one read puts `logprobs` (follows,
-    /// strays, unclear) on the `follows` question.
+    /// strays, unclear) on the `follows` question. The read names its
+    /// context by index.
     pub(crate) fn follows_answer(request: &DecisionRequest, logprobs: [f64; 3]) -> serde_json::Value {
         let pool = request.pool.clone().unwrap_or_default();
         let method = pool.method.unwrap_or(PoolMethod::Linear);
@@ -278,7 +279,7 @@ pub(crate) mod test_support {
         };
         let pooled = math::pool(std::slice::from_ref(&row), method, &spec).unwrap();
         let probs = |p: &[f64]| serde_json::json!({"follows": p[0], "strays": p[1], "unclear": p[2]});
-        let context = &request.contexts.as_ref().unwrap()[0];
+        assert_eq!(request.contexts.len(), 1, "one context read");
         serde_json::json!({
             "model": "test-council",
             "answers": {"follows": {
@@ -290,8 +291,8 @@ pub(crate) mod test_support {
                 "spread": pooled.spread,
             }},
             "reads": [{
-                "context": context.id,
-                "snapshot": context.at,
+                "context": 0,
+                "snapshot": format!("snap:{}", "0".repeat(64)),
                 "answers": {"follows": {
                     "type": "choice",
                     "choice": OPTIONS[math::argmax(&row.probs)],
@@ -318,7 +319,7 @@ mod tests {
 
     use approval_ledger::council::{CouncilOutcome, NewCouncilDecision, insert_council_decision, load_council_decision};
     use approval_ledger::council_observation::list_council_observations_for_decision;
-    use kaijutsu_mk::council::wire::DecisionRequest;
+    use gogi_proto::decision::DecisionRequest;
 
     use super::super::projection::fixtures::{append_dialogue, live_context};
     use super::super::sync::mock::{Mock, reply, serve};
@@ -364,6 +365,7 @@ mod tests {
         });
         let council = CouncilConfig {
             server: mock.base.clone(),
+            model: None,
             contexts: vec!["council-system".into(), "council-amy".into()],
             pool_method: CouncilPoolMethod::LogLinear,
             pool_weights: CouncilPoolWeights::Mass,
@@ -415,7 +417,7 @@ mod tests {
         Rig { kernel, mock, council, decision, banto, _config: config }
     }
 
-    fn state() -> Json {
+    fn state() -> serde_json::Value {
         serde_json::from_str(r#"{"command": "git push --force", "statements": []}"#).unwrap()
     }
 
@@ -443,13 +445,14 @@ mod tests {
         assert_eq!(observed[0].seen, Seen::Answered("strays".into()));
         let id = observed[0].record.clone().expect("recorded");
 
-        let decisions = r.mock.bodies("/council/v1/decisions");
+        let decisions = r.mock.bodies("/council/v2/decisions");
         assert_eq!(decisions.len(), 1);
         let contexts = decisions[0]["contexts"].as_array().unwrap();
         assert_eq!(contexts.len(), 1, "only the reviewer context is read, never the decision's pool");
-        assert_eq!(contexts[0]["id"], r.banto.to_string());
+        let system = contexts[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("council context \"council-banto\""), "{system}");
         assert_eq!(decisions[0]["state"]["command"], "git push --force");
-        let specs = r.mock.bodies("/council/v1/specs");
+        let specs = r.mock.bodies("/council/v2/specs");
         assert_eq!(specs.last().unwrap()["name"], DIRECTION_CHECK);
 
         let rows = r.recorded();
@@ -502,7 +505,7 @@ mod tests {
         let Seen::Miss(cause) = &observed[0].seen else { panic!("a miss") };
         assert!(cause.contains("council-ghost"), "{cause}");
         assert_eq!(r.recorded()[0].observation.reviewer_context_id, None);
-        assert!(r.mock.bodies("/council/v1/decisions").is_empty());
+        assert!(r.mock.bodies("/council/v2/decisions").is_empty());
     }
 
     #[tokio::test]

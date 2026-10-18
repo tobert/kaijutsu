@@ -70,6 +70,15 @@ approval-ledger = { path = "crates/approval-ledger" }
 claude-code-peer = { path = "crates/claude-code-peer" }
 kaijutsu-mk = { path = "crates/kaijutsu-mk" }
 
+# The council API contract (github.com/tobert/gogi): wire types, validation,
+# spec ids, and the pooling math, plus a fake server for tests. Pinned by rev.
+# To build against a local checkout, add to this file:
+#   [patch."https://github.com/tobert/gogi"]
+#   gogi-proto = { path = "../gogi/crates/gogi-proto" }
+#   gogi-fake = { path = "../gogi/crates/gogi-fake" }
+gogi-proto = { git = "https://github.com/tobert/gogi", rev = "ee6174caf0b123bde8f21aaaa99ed430279cbd99" }
+gogi-fake = { git = "https://github.com/tobert/gogi", rev = "ee6174caf0b123bde8f21aaaa99ed430279cbd99" }
+
 # Kaish (execution engine + client) — published 0.15.
 # `subprocess` compiles in host external-command execution; whether a given
 # shell may actually use it is decided per-context at materialization

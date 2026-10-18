@@ -3483,3 +3483,23 @@ heads under `kernel-<kernel id>`, renewed every 20 minutes. On mkviolet a
 ten-inference tool loop fed 308 of its 5,912 prompt tokens, so sending
 everything costs rendering, not prefill. See `docs/mk.md`, "Council v2" and
 `docs/council.md`, "Council v2 seats".
+
+kaijutsu then dropped council v1 and its own wire types (October 18). The
+contract lives in gogi (github.com/tobert/gogi), and `gogi-proto` supplies
+every council type, request rule, spec id, and the pooling math, so kaijutsu
+and mkviolet check against one crate instead of two copies that drifted.
+kaijutsu-mk keeps only the HTTP transport. With v1 went the `PUT`, `If-Match`,
+`warm`, `persist`, and the fallback a 404 on the v2 identity used to trigger:
+a server without v2 is now a miss. Kernel tests run the real prepare and
+decide path against `gogi-fake`, and the same bodies run against a live
+server with `COUNCIL_URL`. The hand-written mocks stay where a test needs a
+scripted verdict, a forced status, or a delay; the fake cannot give those.
+
+gogi then served several models (`ee6174c`): identity lists `models`, each
+with a status, and every build, decision, read, and generation names one.
+The kernel names it from `[council] model` or a `gate` or `judge` slot's
+model, which used to be required and unread; left out, it is the server's
+only model, and the kernel sends that model's `model`, never an alias. The
+kernel never picks among several. A loading model is a miss that drops the
+cached identity, so the next decision sees it ready. Seats are held per
+served model, since a snapshot belongs to one.

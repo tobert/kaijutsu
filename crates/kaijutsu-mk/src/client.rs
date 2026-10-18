@@ -11,7 +11,8 @@ use reqwest::header::{HeaderName, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
-use crate::council::wire::{ErrorBody, ErrorDetail, ErrorType, InvalidRequest, SnapshotId, SpecId};
+use gogi_proto::{ErrorBody, ErrorDetail, ErrorType, Invalid};
+
 use crate::json::Json;
 
 /// Longest slice of a response body kept in an error.
@@ -20,9 +21,9 @@ const BODY_EXCERPT: usize = 512;
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum MkError {
-    /// A `/council/v1` route answered with an error status. `error` is the
-    /// decoded body when it matched the council contract (it carries `head`
-    /// for 409 and 412); `body` is the start of the raw text either way.
+    /// A council route answered with an error status. `error` is the decoded
+    /// body when it matched the contract's error object; `body` is the start
+    /// of the raw text either way.
     #[error("megakernel answered {status}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default())]
     Status {
         status: u16,
@@ -76,18 +77,10 @@ pub enum MkError {
     Request(String),
     /// The server held a spec under a different id than the canonical one.
     #[error("spec id disagrees: computed {computed}, server says {server}")]
-    SpecIdMismatch { computed: SpecId, server: SpecId },
+    SpecIdMismatch { computed: String, server: String },
 }
 
 impl MkError {
-    /// For a 409 or 412, the context's current head.
-    pub fn head(&self) -> Option<&SnapshotId> {
-        match self {
-            MkError::Status { error: Some(e), .. } => e.head.as_ref(),
-            _ => None,
-        }
-    }
-
     /// The HTTP status, when the server answered with one.
     pub fn status(&self) -> Option<u16> {
         match self {
@@ -108,9 +101,12 @@ impl MkError {
     }
 }
 
-impl From<InvalidRequest> for MkError {
-    fn from(e: InvalidRequest) -> Self {
-        MkError::Request(e.to_string())
+impl From<Invalid> for MkError {
+    fn from(e: Invalid) -> Self {
+        match e.param {
+            Some(param) => MkError::Request(format!("invalid request: {param}: {}", e.message)),
+            None => MkError::Request(format!("invalid request: {}", e.message)),
+        }
     }
 }
 

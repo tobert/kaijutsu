@@ -29,7 +29,7 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
 
 /// Embedded council spec for shell statements, seeded to
-/// `/config/kernel/council/shell-gate.json` (`docs/council-api.md`).
+/// `/config/kernel/council/shell-gate.json` (gogi's `docs/council-api-v2.md`).
 pub const DEFAULT_COUNCIL_SHELL_GATE: &str =
     include_str!("../../../assets/defaults/council/shell-gate.json");
 
@@ -350,22 +350,41 @@ mod tests {
         );
     }
 
-    /// The program spec decodes as a council spec, asks only choice
+    /// A seeded spec as mkviolet parses it: gogi's rules with mkviolet's
+    /// limits and no `describe` capability, so a `text` question fails.
+    fn mkviolet_spec(text: &str) -> gogi_proto::spec::Spec {
+        let value: serde_json::Value = serde_json::from_str(text).expect("the spec is JSON");
+        gogi_proto::spec::parse_spec(&value, &gogi_proto::spec::SpecRules::default()).expect("mkviolet accepts the spec")
+    }
+
+    /// The choice question `id` of `spec`: its option names, then their
+    /// meanings.
+    fn choice<'a>(spec: &'a gogi_proto::spec::Spec, id: &str) -> &'a [(String, String)] {
+        match spec.questions.iter().find(|q| q.id == id).map(|q| &q.kind) {
+            Some(gogi_proto::spec::QuestionKind::Choice { options }) => options,
+            other => panic!("{}: {id} is not a choice: {other:?}", spec.name),
+        }
+    }
+
+    fn option_names(options: &[(String, String)]) -> Vec<&str> {
+        options.iter().map(|(o, _)| o.as_str()).collect()
+    }
+
+    /// The program spec parses under mkviolet's rules, asks only choice
     /// questions (the megakernel does not answer `text`), and holds the
     /// rubric the gate decides a program from.
     #[test]
     fn council_program_gate_spec_holds_the_rubric_and_the_verdict() {
-        let spec: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(DEFAULT_COUNCIL_PROGRAM_GATE).expect("a council spec");
+        let spec = mkviolet_spec(DEFAULT_COUNCIL_PROGRAM_GATE);
         assert_eq!(spec.name, "program-gate");
-        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
+        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(ids, ["originals", "network", "verdict"]);
-        assert!(spec.questions.iter().all(|q| matches!(q, kaijutsu_mk::council::wire::SpecQuestion::Choice(_))));
-        kaijutsu_mk::council::canon::spec_id(&spec).expect("the spec canonicalizes");
+        assert!(spec.questions.iter().all(|q| matches!(q.kind, gogi_proto::spec::QuestionKind::Choice { .. })));
     }
 
     #[test]
     fn council_shell_gate_spec_is_valid_json_with_the_documented_questions() {
+        mkviolet_spec(DEFAULT_COUNCIL_SHELL_GATE);
         let v: serde_json::Value =
             serde_json::from_str(DEFAULT_COUNCIL_SHELL_GATE).expect("spec is JSON");
         assert_eq!(v["name"], "shell-gate");
@@ -395,26 +414,17 @@ mod tests {
 
     #[test]
     fn council_shell_bump_spec_names_proceed_and_two_bump_flavors() {
-        let spec: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(DEFAULT_COUNCIL_SHELL_BUMP).expect("the contract's spec shape");
+        let spec = mkviolet_spec(DEFAULT_COUNCIL_SHELL_BUMP);
         assert_eq!(spec.name, "shell-bump");
-        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
+        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(
             ids,
             ["originals", "network", "undo", "verdict"],
             "the program rubric decides, undo is read for the record, then the verdict names a bump; no text question"
         );
-        let kaijutsu_mk::council::wire::SpecQuestion::Choice(undo) = &spec.questions[2] else {
-            panic!("undo is a choice")
-        };
-        let options: Vec<&str> = undo.criteria.iter().map(|c| c.option.as_str()).collect();
+        let options = option_names(choice(&spec, "undo"));
         assert_eq!(options, ["reversible", "normal", "irreversible"], "Amy: situation normal sits between the two");
-        let kaijutsu_mk::council::wire::SpecQuestion::Choice(verdict) = &spec.questions[3] else {
-            panic!("the verdict is a choice")
-        };
-        let options: Vec<&str> = verdict.criteria.iter().map(|c| c.option.as_str()).collect();
-        assert_eq!(options, ["proceed", "try_harder", "do_less"]);
-        kaijutsu_mk::council::canon::spec_id(&spec).expect("the spec canonicalizes");
+        assert_eq!(option_names(choice(&spec, "verdict")), ["proceed", "try_harder", "do_less"]);
         assert_eq!(
             config_seed_body(&config_path("council/shell-bump.json")),
             Some(DEFAULT_COUNCIL_SHELL_BUMP)
@@ -430,16 +440,11 @@ mod tests {
     #[test]
     fn the_seeded_rubric_specs_save_backups_for_databases() {
         for text in [DEFAULT_COUNCIL_SHELL_BUMP, DEFAULT_COUNCIL_PROGRAM_GATE] {
-            let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(text).expect("the contract's spec shape");
-            let kaijutsu_mk::council::wire::SpecQuestion::Choice(originals) =
-                spec.questions.iter().find(|q| q.id() == "originals").expect("an originals question")
-            else {
-                panic!("{}: originals is a choice", spec.name)
-            };
-            let options: Vec<&str> = originals.criteria.iter().map(|c| c.option.as_str()).collect();
-            assert_eq!(options, ["reads", "changes_routine", "changes"], "{}", spec.name);
+            let spec = mkviolet_spec(text);
+            let originals = choice(&spec, "originals");
+            assert_eq!(option_names(originals), ["reads", "changes_routine", "changes"], "{}", spec.name);
             assert!(crate::council::gate::spec_lacks_rubric(&spec).is_none(), "{}", spec.name);
-            let changes = &originals.criteria[2].means;
+            let changes = &originals[2].1;
             assert!(changes.contains("/var/lib") && changes.contains(".db"), "{}: backups are for databases and system state: {changes}", spec.name);
             assert!(!text.contains("trash"), "{}", spec.name);
         }
@@ -475,9 +480,7 @@ mod tests {
         let options: Vec<&str> = criteria.iter().map(|c| c["option"].as_str().unwrap()).collect();
         assert_eq!(options, ["follows", "strays", "unclear"]);
         assert!(criteria.iter().all(|c| c["means"].as_str().is_some_and(|m| !m.is_empty())));
-        let spec: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(DEFAULT_COUNCIL_DIRECTION_CHECK).expect("the contract's spec shape");
-        kaijutsu_mk::council::canon::spec_id(&spec).expect("a spec id");
+        mkviolet_spec(DEFAULT_COUNCIL_DIRECTION_CHECK);
         assert_eq!(
             config_seed_body(&config_path("council/direction-check.json")),
             Some(DEFAULT_COUNCIL_DIRECTION_CHECK)

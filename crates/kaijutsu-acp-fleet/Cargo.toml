@@ -15,12 +15,12 @@ workspace = true
 
 # A plain ACP client: std threads and newline-delimited JSON-RPC, with no
 # kaijutsu crate underneath, so it can drive any ACP agent command. The
-# scripted council (`src/council.rs`) uses kaijutsu-mk's wire types and
-# math, so its answers carry the numbers a kernel recomputes.
+# scripted council (`src/council.rs`) uses gogi-proto's council v2 wire
+# types and math, so its answers carry the numbers a kernel recomputes.
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-kaijutsu-mk.workspace = true
+gogi-proto.workspace = true
 # openat2 with RESOLVE_NO_SYMLINKS, for host-side workspace access
 # (`src/workspace.rs`).
 rustix = { version = "0.38", features = ["fs"] }

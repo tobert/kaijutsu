@@ -44,17 +44,17 @@ use approval_ledger::council::{
     CouncilQuestion, CouncilRead, CouncilServer, CouncilThreshold as RecordedThreshold, NewCouncilDecision,
 };
 use approval_ledger::types::{AskVerdict, NewSignal, Origin, SignalSourceKind, SignalVerdict};
-use kaijutsu_mk::council::wire::{
-    ContextRef, DecisionRequest, DecisionResponse, Pool, PoolMethod, PoolWeights, PooledAnswer,
-    ReadAnswer,
+use gogi_proto::spec::{QuestionKind, Spec};
+use gogi_proto::decision::{
+    DecisionRequest, DecisionResponse, Pool, PoolMethod, PoolWeights, PooledAnswer, ReadAnswer,
 };
-use kaijutsu_mk::{Json, MkError};
+use kaijutsu_mk::MkError;
 use kaijutsu_types::{ContextId, PrincipalId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::Instrument;
 
-use super::sync::{PrepareMiss, Prepared, ServerContext, Wire, no_slot_cause};
+use super::sync::{PrepareMiss, Prepared, no_slot_cause};
 use crate::llm::endpoint::SlotWaits;
 use super::reviewer_contexts::{SkippedReviewerContext, ReviewerContextChain};
 use crate::kj::gate::GateSpec;
@@ -180,7 +180,7 @@ impl ProgramOutcome {
 /// `submission_digest` hashes and a report names.
 #[derive(Clone, Debug)]
 pub(crate) struct CaseInput {
-    pub(crate) state: Json,
+    pub(crate) state: serde_json::Value,
     pub(crate) text: String,
 }
 
@@ -204,7 +204,7 @@ pub(crate) fn elide(text: &str, programs: &[&str]) -> String {
 /// mount's access means, once, when a statement names a mount.
 /// `programs`, last, lists how each program's decision ended, so the rest
 /// of the submission is judged with them; it is left out when empty.
-pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str], programs: &[ProgramOutcome]) -> Json {
+pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str], programs: &[ProgramOutcome]) -> serde_json::Value {
     let statements = super::shell_case::statements(submission.command, submission.planned, submission.facts, judged);
     let state = CaseState {
         command: super::shell_case::clip(&elide(submission.command, judged), MAX_COMMAND),
@@ -215,10 +215,9 @@ pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str], programs:
         mount_access: statements.names_a_mount.then_some(super::shell_case::MOUNT_ACCESS),
         programs,
     };
-    // A struct serializes its fields in declaration order, and `Json` keeps
-    // the order it reads, so the round trip is the ordered object.
-    let text = serde_json::to_string(&state).expect("the case state is plain data");
-    serde_json::from_str(&text).expect("serde_json output is JSON")
+    // A struct serializes its fields in declaration order, and serde_json's
+    // `preserve_order` keeps object members in that order.
+    serde_json::to_value(&state).expect("the case state is plain data")
 }
 
 #[derive(Serialize)]
@@ -255,7 +254,7 @@ pub(crate) fn program_case_state(
     submission: &Submission<'_>,
     run: &super::programs::ProgramRun,
     text: &super::programs::ProgramText,
-) -> Json {
+) -> serde_json::Value {
     let statement = submission
         .planned
         .iter()
@@ -276,24 +275,15 @@ pub(crate) fn program_case_state(
     serde_json::from_str(&text).expect("serde_json output is JSON")
 }
 
-/// The decision request for `state` against the prepared contexts, each
-/// named as the answer's reads name it ([`Prepared::read_name`]). A v1
-/// context is pinned to the head the kernel prepared; a v2 seat goes whole
-/// when [`ask_within`] sends the request.
-pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, state: Json) -> DecisionRequest {
+/// The decision request for `state` against the prepared seats, each sent
+/// whole. The answer's reads name each seat by its index
+/// ([`Prepared::read_name`]). The thought before the answer stays closed:
+/// the request sends no `think`.
+pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, state: serde_json::Value) -> DecisionRequest {
     DecisionRequest {
-        spec_id: Some(prepared.spec_id.clone()),
-        contexts: Some(
-            prepared
-                .contexts
-                .iter()
-                .enumerate()
-                .map(|(i, c)| ContextRef {
-                    id: prepared.read_name(i),
-                    at: matches!(c.server, ServerContext::Held(_)).then(|| c.head.clone()),
-                })
-                .collect(),
-        ),
+        model: Some(prepared.identity.model.clone()),
+        spec_id: Some(prepared.spec_id.to_string()),
+        contexts: prepared.contexts.iter().map(|c| (*c.seat).clone()).collect(),
         state,
         pool: Some(Pool {
             method: Some(match council.pool_method {
@@ -429,11 +419,11 @@ pub(crate) fn classify_case(
         verdict: verdict.clone(),
         rubric: rubric.clone(),
     };
-    if let Err(mismatch) = kaijutsu_mk::council::math::verify(response, request) {
+    if let Err(mismatch) = gogi_proto::math::verify(response, &request.expect()) {
         return miss(format!("the answer's numbers do not recompute ({mismatch})"), None);
     }
     if let (Some(read), Some(asked)) = (&response.identity.spec_id, &request.spec_id)
-        && read != asked
+        && read.as_str() != asked
     {
         return miss(format!("the server read spec {read}, not the spec asked for, {asked}"), None);
     }
@@ -630,54 +620,11 @@ pub(crate) fn queue_ms(waits: &SlotWaits, server_queue_ms: Option<f64>) -> i64 {
     waits.total().as_millis() as i64 + server_queue_ms.unwrap_or(0.0).round() as i64
 }
 
-/// What a decision's failure says the server no longer holds.
-#[derive(Debug, Default, PartialEq)]
-struct Resend {
-    contexts: Vec<ContextId>,
-    spec: bool,
-}
-
-/// What to send again after a 404 or 409: the contexts and the spec it
-/// names, or, when it names neither, every prepared context, and the spec
-/// too after a 404. The server forgot what it held, and sending either
-/// again is idempotent. A 409 is about a context's snapshot, never the spec.
-/// A v2 server holds no context records, so a 404 from it is the spec.
-fn to_resend(error: &MkError, prepared: &Prepared) -> Resend {
-    let status = error.status();
-    if prepared.wire == Wire::V2 {
-        return Resend { contexts: Vec::new(), spec: status == Some(404) };
-    }
-    let Some(404 | 409) = status else { return Resend::default() };
-    let text = match error {
-        MkError::Status { error: Some(d), body, .. } => format!("{} {} {body}", d.message, d.param.as_deref().unwrap_or("")),
-        MkError::Status { body, .. } => body.clone(),
-        _ => String::new(),
-    };
-    let held: Vec<ContextId> = prepared
-        .contexts
-        .iter()
-        .filter_map(|c| match c.server {
-            ServerContext::Held(id) => Some(id),
-            ServerContext::Seat(_) => None,
-        })
-        .collect();
-    let named: Vec<ContextId> = held.iter().copied().filter(|id| text.contains(&id.to_string())).collect();
-    let not_found = status == Some(404);
-    let spec_named = not_found && text.contains(prepared.spec_id.as_str());
-    match (named.is_empty(), spec_named) {
-        (true, false) => Resend { contexts: held, spec: not_found },
-        (_, spec) => Resend { contexts: named, spec },
-    }
-}
-
-/// Forget what a decision's failure says the server no longer holds, so the
-/// next prepare sends it again.
+/// Forget a spec the server no longer holds, so the next prepare posts it
+/// again. The server holds no context records, so a decision's 404 names
+/// the spec.
 fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared) {
-    let resend = to_resend(error, prepared);
-    for context in resend.contexts {
-        kernel.council_sync().invalidate(context);
-    }
-    if resend.spec {
+    if error.status() == Some(404) {
         kernel.council_sync().invalidate_spec(&prepared.spec_id);
     }
 }
@@ -708,9 +655,8 @@ pub(crate) async fn prepare_within(
 /// Send `request` and wait for the answer until `deadline`, with the time
 /// left as the call's own timeout. The call takes a slot at the server's
 /// endpoint first, and a 429 is sent again after its cooldown
-/// (`llm::endpoint::mk_call`); slot waits are added to `waits`. A 404 or 409
-/// forgets what the server no longer holds ([`to_resend`]). Every failure is
-/// a miss cause.
+/// (`llm::endpoint::mk_call`); slot waits are added to `waits`. A 404
+/// forgets the spec ([`forget_after`]). Every failure is a miss cause.
 pub(crate) async fn ask_within(
     kernel: &crate::Kernel,
     prepared: &Prepared,
@@ -727,27 +673,9 @@ pub(crate) async fn ask_within(
         provider = "council", server = %council.server, contexts = prepared.contexts.len(),
         "llm request"
     );
-    // Council v2 takes the v1 request with each seat whole in place of its
-    // name, and no `think`: the thought before the answer stays closed, as
-    // v1 always had it.
-    let v2_request = (prepared.wire == Wire::V2).then(|| kaijutsu_mk::council_v2::wire::DecisionRequest {
-        decision: DecisionRequest { contexts: None, ..request.clone() },
-        contexts: prepared
-            .contexts
-            .iter()
-            .filter_map(|c| match &c.server {
-                ServerContext::Seat(seat) => Some((**seat).clone()),
-                ServerContext::Held(_) => None,
-            })
-            .collect(),
-        think: None,
-    });
     let decide = || async {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match &v2_request {
-            Some(v2) => prepared.client.v2().decide_traced(v2, left, traceparent.as_deref()).await,
-            None => prepared.client.decide_traced(request, left, traceparent.as_deref()).await,
-        }
+        prepared.client.council().decide_traced(request, left, traceparent.as_deref()).await
     };
     let answer = tokio::time::timeout_at(deadline, crate::llm::endpoint::mk_call(&prepared.endpoint, deadline, waits, decide)).await;
     match answer {
@@ -782,7 +710,7 @@ pub(crate) struct CouncilVerdict {
     observing: Vec<String>,
     council: CouncilConfig,
     /// The case state the decision read; the observations read it too.
-    state: Json,
+    state: serde_json::Value,
     /// For a report: the submission and each read's answer, for the
     /// `council.report` event [`Self::report`] emits.
     report: Option<ReportedAnswers>,
@@ -1264,7 +1192,7 @@ enum Seen<'a> {
 /// observation.
 struct Carried {
     chain: ReviewerContextChain,
-    state: Json,
+    state: serde_json::Value,
     /// The decision's slot waits at the council server's endpoint.
     waits: SlotWaits,
 }
@@ -1576,7 +1504,7 @@ async fn decide_inner(
     let pass = pass_option(spec.case, council.mode);
     // A shell spec that names any rubric question decides by the rubric, so
     // it must carry all of it.
-    let declares_rubric = prepared.spec.questions.iter().any(|q| RUBRIC.iter().any(|(id, _)| q.id() == *id));
+    let declares_rubric = prepared.spec.questions.iter().any(|q| RUBRIC.iter().any(|(id, _)| q.id == *id));
     if let Some(cause) = spec_lacks_pass(&prepared.spec, pass).or_else(|| match spec.case {
         CouncilCase::Shell if !declares_rubric => None,
         CouncilCase::Shell | CouncilCase::Program => spec_lacks_rubric(&prepared.spec),
@@ -1676,8 +1604,8 @@ fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
                 .spec
                 .questions
                 .iter()
-                .filter_map(|q| match read.answers.get(q.id()) {
-                    Some(ReadAnswer::Choice(c)) => Some(format!("{}={}", q.id(), c.choice)),
+                .filter_map(|q| match read.answers.get(&q.id) {
+                    Some(ReadAnswer::Choice(c)) => Some(format!("{}={}", q.id, c.choice)),
                     _ => None,
                 })
                 .collect();
@@ -1692,11 +1620,10 @@ fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
 /// a spec without one would only ever miss. A bumper's `proceed` also needs
 /// another option: every other option is a bump flavor, and a spec with
 /// none could only pass or miss.
-fn spec_lacks_pass(spec: &kaijutsu_mk::council::wire::Spec, pass: &str) -> Option<String> {
-    use kaijutsu_mk::council::wire::SpecQuestion;
-    match spec.questions.iter().find(|q| q.id() == VERDICT) {
-        Some(SpecQuestion::Choice(c)) if c.criteria.iter().any(|o| o.option == pass) => {
-            if pass == "proceed" && c.criteria.len() < 2 {
+fn spec_lacks_pass(spec: &Spec, pass: &str) -> Option<String> {
+    match spec.questions.iter().find(|q| q.id == VERDICT).map(|q| &q.kind) {
+        Some(QuestionKind::Choice { options }) if options.iter().any(|(o, _)| o == pass) => {
+            if pass == "proceed" && options.len() < 2 {
                 Some(format!("spec {} has no option to bump with besides `proceed` on its `{VERDICT}` choice", spec.name))
             } else {
                 None
@@ -1710,12 +1637,8 @@ fn spec_lacks_pass(spec: &kaijutsu_mk::council::wire::Spec, pass: &str) -> Optio
 /// What a bump tells the seat: the flavor and the guidance for it. A flavor
 /// that is a verdict option gets that option's `means` text from the spec; a
 /// rubric flavor gets guidance for each answer that held it.
-fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> String {
-    use kaijutsu_mk::council::wire::SpecQuestion;
-    let option_means = spec.questions.iter().find_map(|q| match q {
-        SpecQuestion::Choice(c) if c.id == VERDICT => c.criteria.iter().find(|o| o.option == flavor).map(|o| o.means.clone()),
-        _ => None,
-    });
+fn bump_guidance(spec: &Spec, flavor: &str) -> String {
+    let option_means = choice_means(spec, VERDICT, flavor);
     if let Some(means) = option_means {
         return means;
     }
@@ -1734,23 +1657,27 @@ fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> Strin
 /// The pooled `undo` read as a sentence: the option, its probability, and
 /// what the spec says it means. `None` when the spec or the answer has no
 /// `undo` choice.
-fn undo_sentence(spec: &kaijutsu_mk::council::wire::Spec, response: &DecisionResponse) -> Option<String> {
-    use kaijutsu_mk::council::wire::SpecQuestion;
+fn undo_sentence(spec: &Spec, response: &DecisionResponse) -> Option<String> {
     let PooledAnswer::Choice(pooled) = response.answers.get(UNDO)? else { return None };
     let p = pooled.probabilities.get(&pooled.choice).copied().unwrap_or(0.0);
-    let means = spec.questions.iter().find_map(|q| match q {
-        SpecQuestion::Choice(c) if c.id == UNDO => c.criteria.iter().find(|o| o.option == pooled.choice).map(|o| o.means.clone()),
-        _ => None,
-    })?;
+    let means = choice_means(spec, UNDO, &pooled.choice)?;
     Some(format!("The council reads it as {} (p {p:.2}): it {means}.", pooled.choice))
+}
+
+/// What the option `option` of the choice question `question` means, as
+/// the spec says. `None` when the spec has no such choice or option.
+fn choice_means(spec: &Spec, question: &str, option: &str) -> Option<String> {
+    spec.questions.iter().find_map(|q| match &q.kind {
+        QuestionKind::Choice { options } if q.id == question => options.iter().find(|(o, _)| o == option).map(|(_, means)| means.clone()),
+        _ => None,
+    })
 }
 
 /// Why a program spec cannot decide, when it cannot: the gate decides a
 /// program from the [`RUBRIC`] choices.
-pub(crate) fn spec_lacks_rubric(spec: &kaijutsu_mk::council::wire::Spec) -> Option<String> {
-    use kaijutsu_mk::council::wire::SpecQuestion;
-    RUBRIC.iter().find_map(|(id, ok)| match spec.questions.iter().find(|q| q.id() == *id) {
-        Some(SpecQuestion::Choice(c)) if ok.iter().all(|o| c.criteria.iter().any(|k| k.option == *o)) => None,
+pub(crate) fn spec_lacks_rubric(spec: &Spec) -> Option<String> {
+    RUBRIC.iter().find_map(|(id, ok)| match spec.questions.iter().find(|q| q.id == *id).map(|q| &q.kind) {
+        Some(QuestionKind::Choice { options }) if ok.iter().all(|o| options.iter().any(|(k, _)| k == o)) => None,
         Some(_) => Some(format!("spec {} has no `{id}` choice with the options {}", spec.name, ok.join(", "))),
         None => Some(format!("spec {} has no `{id}` choice", spec.name)),
     })
@@ -1774,43 +1701,55 @@ pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
     council.specs.iter().find(|s| s.case == CouncilCase::Shell)
 }
 
-/// The backend of the `role` slot in the cast `seat` resolves through (its
-/// own, else its performer's default), with that cast's id. `None` when the
-/// seat resolves no cast or the cast has no `role` slot.
+/// The backend and model of the `role` slot in the cast `seat` resolves
+/// through (its own, else its performer's default), with that cast's id.
+/// `None` when the seat resolves no cast or the cast has no `role` slot.
+#[allow(clippy::type_complexity)]
 pub(crate) fn seat_slot_backend(
     db: &crate::kernel_db::KernelDb,
     seat: &crate::kernel_db::ContextRow,
     role: &str,
-) -> crate::kernel_db::KernelDbResult<Option<(kaijutsu_types::CastId, crate::kernel_db::BackendRow)>> {
+) -> crate::kernel_db::KernelDbResult<Option<(kaijutsu_types::CastId, crate::kernel_db::BackendRow, String)>> {
     let Some(cast) = db.effective_cast(seat)? else { return Ok(None) };
     let Some(slot) = db.get_cast_slot(cast.cast_id, role)? else { return Ok(None) };
     let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id).ok_or_else(|| {
         crate::kernel_db::KernelDbError::Validation(format!("cast {} slot {role} names a backend that does not exist", cast.label))
     })?;
-    Ok(Some((cast.cast_id, backend)))
+    Ok(Some((cast.cast_id, backend, slot.model)))
 }
 
-/// The council server address a backend names: its `base_url` when its kind
-/// is `mk`. `Err` says why it names none.
-pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow) -> Result<String, String> {
+/// A council server a cast slot names, and the served model the slot names
+/// on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotServer {
+    pub(crate) server: String,
+    /// A served model's `model` or alias.
+    pub(crate) model: String,
+}
+
+/// The council server a slot on `backend` names, with the slot's `model`:
+/// the backend's `base_url` when its kind is `mk`. `Err` says why it names
+/// none.
+pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow, model: &str) -> Result<SlotServer, String> {
     match (backend.kind.as_str(), &backend.base_url) {
-        ("mk", Some(url)) => Ok(url.clone()),
+        ("mk", Some(url)) => Ok(SlotServer { server: url.clone(), model: model.to_string() }),
         ("mk", None) => Err(format!("backend {} has no base URL, so it names no council server", backend.name)),
         (kind, _) => Err(format!("backend {} is kind {kind}, not mk, so it is not a council server", backend.name)),
     }
 }
 
-/// The council server for `seat`'s gate decisions when the cast it resolves
-/// through has a [`GATE`] slot. `None` when it has no such slot, so
-/// `[council] server` decides. `Some(Err)` is a miss cause: the slot's
-/// backend is not a council server, and no other server stands in.
+/// The council server and served model for `seat`'s gate decisions when
+/// the cast it resolves through has a [`GATE`] slot. `None` when it has no
+/// such slot, so `[council] server` and `model` decide. `Some(Err)` is a
+/// miss cause: the slot's backend is not a council server, and no other
+/// server stands in.
 fn cast_council_server(
     db: &crate::kernel_db::KernelDb,
     seat: ContextId,
-) -> crate::kernel_db::KernelDbResult<Option<Result<String, String>>> {
+) -> crate::kernel_db::KernelDbResult<Option<Result<SlotServer, String>>> {
     let Some(row) = db.get_context(seat)? else { return Ok(None) };
-    let Some((_, backend)) = seat_slot_backend(db, &row, GATE)? else { return Ok(None) };
-    Ok(Some(council_address(&backend).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
+    let Some((_, backend, model)) = seat_slot_backend(db, &row, GATE)? else { return Ok(None) };
+    Ok(Some(council_address(&backend, &model).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
 }
 
 /// Where the gate's decisions for `seat` go and what they read along the
@@ -1829,7 +1768,7 @@ pub(crate) fn seat_route(
     let chain = super::reviewer_contexts::reviewer_context_chain(db, council, seat, actor);
     Ok(match cast_server {
         None => (None, chain),
-        Some(Ok(server)) => (Some(CouncilConfig { server, ..council.clone() }), chain),
+        Some(Ok(slot)) => (Some(CouncilConfig { server: slot.server, model: Some(slot.model), ..council.clone() }), chain),
         Some(Err(cause)) => (None, Err(cause)),
     })
 }
@@ -1982,8 +1921,8 @@ const MAX_PROGRAMS: usize = 8;
 pub(crate) mod test_support {
     //! verify()-consistent decision responses for tests.
 
-    use kaijutsu_mk::council::math::{self, Row, WeightSpec};
-    use kaijutsu_mk::council::wire::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
+    use gogi_proto::decision::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
+    use gogi_proto::math::{self, Row, WeightSpec};
 
     pub(crate) const OPTIONS: [&str; 3] = ["allow", "ask", "report"];
 
@@ -1995,7 +1934,7 @@ pub(crate) mod test_support {
 
     /// An answer to `request` whose reads put `logprobs[i]` (allow, ask,
     /// report) on the verdict, with every derived number computed the way
-    /// `math::verify` recomputes it.
+    /// `math::verify` recomputes it. Each read names its context by index.
     pub(crate) fn answer(request: &DecisionRequest, logprobs: &[[f64; 3]]) -> serde_json::Value {
         answer_choices(request, &[(super::VERDICT, OPTIONS, logprobs)])
     }
@@ -2012,7 +1951,7 @@ pub(crate) mod test_support {
         network: [f64; 3],
         verdict: [f64; 3],
     ) -> serde_json::Value {
-        let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+        let n = request.contexts.len();
         let (o, w, v) = (vec![originals; n], vec![network; n], vec![verdict; n]);
         answer_choices(request, &[("originals", ORIGINALS, &o), ("network", NETWORK, &w), (super::VERDICT, OPTIONS, &v)])
     }
@@ -2031,7 +1970,7 @@ pub(crate) mod test_support {
             PoolWeights::Mass => WeightSpec::Mass,
             PoolWeights::Given => WeightSpec::Given(pool.values.clone().unwrap()),
         };
-        let contexts = request.contexts.clone().unwrap_or_default();
+        let contexts = &request.contexts;
         let mut pooled_answers = serde_json::Map::new();
         let mut normalized = serde_json::Map::new();
         let mut read_answers: Vec<serde_json::Map<String, serde_json::Value>> = vec![serde_json::Map::new(); contexts.len()];
@@ -2060,13 +1999,13 @@ pub(crate) mod test_support {
             }));
             normalized.insert(id.to_string(), serde_json::json!(pooled.weights));
         }
-        let reads: Vec<serde_json::Value> = contexts
-            .iter()
-            .zip(read_answers)
-            .map(|(c, answers)| {
+        let reads: Vec<serde_json::Value> = read_answers
+            .into_iter()
+            .enumerate()
+            .map(|(i, answers)| {
                 serde_json::json!({
-                    "context": c.id,
-                    "snapshot": c.at.as_ref().map(|s| s.to_string()).unwrap_or_else(|| format!("snap:{}", "0".repeat(64))),
+                    "context": i,
+                    "snapshot": format!("snap:{i:064x}"),
                     "answers": answers,
                     "rendered_sha256": "0".repeat(64),
                 })
@@ -2097,16 +2036,19 @@ mod tests {
     use super::*;
     use crate::kj::gate_policy::CouncilThreshold;
 
-    const CTX_A: &str = "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11";
-    const CTX_B: &str = "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12";
+    fn spec_id() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
 
-    fn spec_id() -> kaijutsu_mk::council::wire::SpecId {
-        kaijutsu_mk::council::wire::SpecId::parse(format!("sha256:{}", "a".repeat(64))).unwrap()
+    /// The spec with a `text` question, `effect`, from gogi's example.
+    fn example_spec() -> gogi_proto::spec::Spec {
+        crate::council::parse_spec(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap()
     }
 
     fn council(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
         CouncilConfig {
             server: "http://127.0.0.1:1".into(),
+            model: None,
             contexts: vec!["reviewer".into(), "system-rules".into()],
             pool_method: CouncilPoolMethod::LogLinear,
             pool_weights: CouncilPoolWeights::Mass,
@@ -2128,14 +2070,11 @@ mod tests {
     }
 
     fn request() -> DecisionRequest {
-        let snap = |c: char| kaijutsu_mk::council::wire::SnapshotId::parse(format!("snap:{}", c.to_string().repeat(64))).unwrap();
+        let context = |text: &str| gogi_proto::Context { messages: vec![gogi_proto::Message::user(text)], ..Default::default() };
         DecisionRequest {
             spec_id: Some(spec_id()),
-            contexts: Some(vec![
-                ContextRef { id: CTX_A.into(), at: Some(snap('1')) },
-                ContextRef { id: CTX_B.into(), at: Some(snap('2')) },
-            ]),
-            state: Json::from("git status"),
+            contexts: vec![context("a"), context("b")],
+            state: serde_json::Value::from("git status"),
             pool: Some(Pool { method: Some(PoolMethod::Loglinear), weights: Some(PoolWeights::Mass), values: None }),
             timeout_ms: Some(700),
             ..Default::default()
@@ -2153,7 +2092,7 @@ mod tests {
     #[test]
     fn the_test_answers_verify() {
         let req = request();
-        kaijutsu_mk::council::math::verify(&decode(answer(&req, &ALLOW)), &req).expect("consistent");
+        gogi_proto::math::verify(&decode(answer(&req, &ALLOW)), &req.expect()).expect("consistent");
     }
 
     #[test]
@@ -2213,7 +2152,7 @@ mod tests {
         let thin = [[-0.001, -8.0, -9.0], [-2.0, -9.0, -9.0]];
         let c = classified(&thin, &council(0.5, -0.05, false));
         match &c.outcome {
-            Outcome::Miss(cause) => assert!(cause.starts_with("low mass") && cause.contains(CTX_B), "{cause}"),
+            Outcome::Miss(cause) => assert!(cause.starts_with("low mass") && cause.contains("the read of 1 "), "{cause}"),
             other => panic!("expected a low-mass miss, got {other:?}"),
         }
     }
@@ -2291,10 +2230,9 @@ mod tests {
 
     #[test]
     fn a_spec_without_an_allow_verdict_cannot_decide() {
-        let mut spec: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
+        let mut spec = example_spec();
         assert_eq!(spec_lacks_pass(&spec, "allow"), None);
-        spec.questions.retain(|q| q.id() != VERDICT);
+        spec.questions.retain(|q| q.id != VERDICT);
         assert!(spec_lacks_pass(&spec, "allow").unwrap().contains("no `verdict` choice"));
     }
 
@@ -2308,19 +2246,17 @@ mod tests {
     }
 
     fn prepared(contexts: &[ContextId]) -> Prepared {
-        let identity: kaijutsu_mk::council::wire::ServerIdentity = serde_json::from_value(serde_json::json!({
-            "model": "m", "weight_hash": "w1", "tokenizer_hash": "t1", "template": "x", "engine": "e1",
-            "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 8,
-                       "choice_options": 8, "default_timeout_ms": 1000},
+        let identity: gogi_proto::identity::ServedModel = serde_json::from_value(serde_json::json!({
+            "model": "m", "status": "ready", "weight_hash": "w1", "tokenizer_hash": "t1", "template": "x", "engine": "e1",
+            "limits": {"context_tokens": 1, "decision_context_tokens": 1, "snapshot_bytes": 1, "contexts_per_decision": 8,
+                       "default_timeout_ms": 1000},
             "capabilities": []})).unwrap();
-        let spec: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
+        let spec = example_spec();
         Prepared {
             client: kaijutsu_mk::MkClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
             endpoint: crate::llm::endpoint::Endpoints::default().get("http://127.0.0.1:1"),
-            wire: super::super::sync::Wire::V1,
             identity,
-            spec_id: kaijutsu_mk::council::canon::spec_id(&spec).unwrap(),
+            spec_id: gogi_proto::SpecId::parse(spec.id()).unwrap(),
             spec,
             contexts: contexts
                 .iter()
@@ -2328,8 +2264,11 @@ mod tests {
                 .map(|(i, id)| super::super::sync::PreparedContext {
                     label: format!("c{i}"),
                     context_id: *id,
-                    server: ServerContext::Held(*id),
-                    head: kaijutsu_mk::council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
+                    seat: Box::new(gogi_proto::Context {
+                        messages: vec![gogi_proto::Message::system(format!("seat {i}"))],
+                        ..Default::default()
+                    }),
+                    head: gogi_proto::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
                     house_rules: false,
                 })
                 .collect(),
@@ -2337,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn the_request_pins_each_context_to_its_prepared_head_and_carries_the_deadline() {
+    fn the_request_sends_each_seat_whole_and_carries_the_deadline() {
         let ids = [ContextId::new(), ContextId::new()];
         let p = prepared(&ids);
         let planned = kaish_kernel::plan_program("echo hi > out.txt; git push origin main").unwrap();
@@ -2353,9 +2292,9 @@ mod tests {
         req.validate().unwrap();
         let body = serde_json::to_value(&req).unwrap();
         assert_eq!(body["spec_id"], serde_json::json!(p.spec_id.to_string()));
-        assert_eq!(body["contexts"][0]["id"], serde_json::json!(ids[0].to_string()));
-        assert_eq!(body["contexts"][0]["at"], serde_json::json!(p.contexts[0].head.to_string()));
-        assert_eq!(body["contexts"][1]["at"], serde_json::json!(p.contexts[1].head.to_string()));
+        assert_eq!(body["contexts"][0], serde_json::to_value(&*p.contexts[0].seat).unwrap());
+        assert_eq!(body["contexts"][1], serde_json::to_value(&*p.contexts[1].seat).unwrap());
+        assert!(body.get("think").is_none(), "the thought before the answer stays closed: {body}");
         assert_eq!(body["timeout_ms"], serde_json::json!(700));
         assert_eq!(body["pool"], serde_json::json!({"method": "loglinear", "weights": "mass"}));
         assert!(body.get("ask").is_none() && body.get("options").is_none(), "the gate never narrows: {body}");
@@ -2500,50 +2439,6 @@ mod tests {
         assert!(first["args"][0].as_str().unwrap().ends_with("more bytes not shown]"), "{first}");
         assert_eq!(first["args_not_shown"], 101 - 48);
         assert!(state["statements_not_shown"].as_u64().unwrap() > 0, "{text}");
-    }
-
-    #[test]
-    fn a_404_naming_a_context_resends_it_and_a_409_naming_none_resends_every_context() {
-        let ids = [ContextId::new(), ContextId::new()];
-        let p = prepared(&ids);
-        let named = MkError::Status {
-            status: 404,
-            error: Some(kaijutsu_mk::council::wire::ErrorDetail {
-                r#type: kaijutsu_mk::council::wire::ErrorType::NotFound,
-                message: format!("unknown context {}", ids[1]),
-                param: None,
-                head: None,
-            }),
-            retry_after: None,
-            body: String::new(),
-        };
-        assert_eq!(to_resend(&named, &p), Resend { contexts: vec![ids[1]], spec: false });
-        let bare = MkError::Status { status: 409, error: None, retry_after: None, body: String::new() };
-        assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: false });
-        let busy = MkError::Status { status: 503, error: None, retry_after: None, body: String::new() };
-        assert_eq!(to_resend(&busy, &p), Resend::default());
-    }
-
-    /// A 404 naming the spec sends the spec again and leaves the contexts;
-    /// one naming nothing sends both.
-    #[test]
-    fn a_404_naming_the_spec_resends_only_the_spec() {
-        let ids = [ContextId::new(), ContextId::new()];
-        let p = prepared(&ids);
-        let spec = MkError::Status {
-            status: 404,
-            error: Some(kaijutsu_mk::council::wire::ErrorDetail {
-                r#type: kaijutsu_mk::council::wire::ErrorType::NotFound,
-                message: format!("unknown spec {}", p.spec_id.as_str()),
-                param: None,
-                head: None,
-            }),
-            retry_after: None,
-            body: String::new(),
-        };
-        assert_eq!(to_resend(&spec, &p), Resend { contexts: vec![], spec: true });
-        let bare = MkError::Status { status: 404, error: None, retry_after: None, body: String::new() };
-        assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: true });
     }
 
     fn program_council() -> CouncilConfig {
@@ -2693,19 +2588,16 @@ mod tests {
 
     #[test]
     fn a_bumper_spec_needs_a_proceed_option_and_a_bump_option() {
-        use kaijutsu_mk::council::wire::SpecQuestion;
-        let mut spec: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP).unwrap();
+        use gogi_proto::spec::QuestionKind;
+        let mut spec = crate::council::parse_spec(crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP).unwrap();
         assert_eq!(spec_lacks_pass(&spec, "proceed"), None);
-        let gate: kaijutsu_mk::council::wire::Spec =
-            serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
-        let cause = spec_lacks_pass(&gate, "proceed").unwrap();
+        let cause = spec_lacks_pass(&example_spec(), "proceed").unwrap();
         assert!(cause.contains("no `proceed` option") && cause.contains(VERDICT), "{cause}");
         for q in &mut spec.questions {
-            if let SpecQuestion::Choice(c) = q
-                && c.id == VERDICT
+            if let QuestionKind::Choice { options } = &mut q.kind
+                && q.id == VERDICT
             {
-                c.criteria.retain(|o| o.option == "proceed");
+                options.retain(|(o, _)| o == "proceed");
             }
         }
         let cause = spec_lacks_pass(&spec, "proceed").unwrap();

@@ -1,6 +1,6 @@
-//! Projects a kaijutsu context into the council server's context body.
+//! Projects a kaijutsu context into a council v2 context.
 //!
-//! The body is the context's guidance as the server reads it: a fixed framing
+//! The context is the context's guidance as the server reads it: a fixed framing
 //! as the system message, then the context's conversational text in document
 //! order. A block reaches the body when it is finished text a player or model
 //! wrote (`BlockKind::Text`, `Status::Done`, `Role::User` or `Role::Model`)
@@ -16,15 +16,17 @@
 //! whose first line names the sender and the context it came from. Drift
 //! stays out of every other council context.
 
-use kaijutsu_mk::council::wire::{ContextPut, Role as WireRole, Turn};
+use gogi_proto::{Context, Message, Role as WireRole};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
-/// A turn carries `snap` when its 1-based position is a multiple of this.
+/// A message after the system message carries `snap` when its index is a
+/// multiple of this.
 ///
 /// The server extends a context only from a snapshot boundary, and each
-/// boundary costs recurrent state on the server. Deriving the flag from the
-/// turn's position alone keeps every earlier boundary where it was when turns
-/// are appended, so a change at the tail re-feeds at most this many turns.
+/// boundary costs model state on the server. Deriving the flag from the
+/// message's position alone keeps every earlier boundary where it was when
+/// messages are appended, so a change at the tail re-feeds at most this many
+/// messages.
 pub(crate) const SNAP_EVERY: usize = 8;
 
 /// The prefix every character's council context label carries.
@@ -71,17 +73,17 @@ pub(crate) fn is_reviewer_context(label: &str) -> bool {
     label.starts_with(COUNCIL_CONTEXT_PREFIX) && label != SYSTEM_RULES
 }
 
-/// The server's body for the context labeled `label`, projected from its
+/// The council context for the context labeled `label`, projected from its
 /// `blocks` in document order. `Err` when a drift's source cannot be named.
-pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
+pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
     project_framed(framed(&CONTEXT_FRAMING.replace("{label}", label)), is_reviewer_context(label), blocks, names)
 }
 
-/// The server's body for a shadow, projected from the shadow's `blocks` in
+/// The council context for a shadow, projected from the shadow's `blocks` in
 /// document order. The system message is the framing, then the shadow's
 /// stance: its live system instruction blocks written by the `judge` type's
 /// rc. `Err` when the shadow has no stance.
-pub(crate) fn project_shadow(blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
+pub(crate) fn project_shadow(blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
     let stance: Vec<&str> = blocks
         .iter()
         .filter(|b| b.role == Role::System && b.kind == BlockKind::Text && !b.excluded && !b.content.trim().is_empty())
@@ -95,13 +97,13 @@ pub(crate) fn project_shadow(blocks: &[BlockSnapshot], names: &dyn Names) -> Res
     project_framed(framed(&stance.join("\n\n")), false, blocks, names)
 }
 
-fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
-    let mut turns: Vec<Turn> = Vec::new();
+fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
+    let mut turns: Vec<Message> = vec![Message::system(system)];
     // Finished thinking waiting for the model reply it belongs to.
     let mut thinking: Vec<&str> = Vec::new();
-    let push = |turns: &mut Vec<Turn>, role, content, reasoning| {
-        let snap = (turns.len() + 1) % SNAP_EVERY == 0;
-        turns.push(Turn { role, content, snap, reasoning });
+    let push = |turns: &mut Vec<Message>, role, content: String, reasoning| {
+        let snap = turns.len() % SNAP_EVERY == 0;
+        turns.push(Message { role, content: Some(content), reasoning, tool_calls: Vec::new(), tool_call_id: None, snap });
     };
     for b in blocks {
         if is_thinking(b) {
@@ -129,14 +131,7 @@ fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: 
     if !thinking.is_empty() {
         push(&mut turns, WireRole::Assistant, String::new(), Some(thinking.join("\n\n")));
     }
-    Ok(ContextPut {
-        system,
-        turns,
-        pin: None,
-        warm: None,
-        dry_run: None,
-        persist: None,
-    })
+    Ok(Context { messages: turns, ..Context::default() })
 }
 
 /// The bytes a house-rules budget allows per token: an estimate, since the
@@ -161,10 +156,11 @@ pub(crate) struct HouseRules {
 /// The house-rules context (`docs/council.md`, "House rules"), or `None`
 /// when no `AGENTS.md` was found.
 ///
-/// The body is one user turn that keeps a snapshot boundary: the file's path
-/// and its text, cut to its first `budget_tokens` worth of bytes. Nothing the
-/// seat said or did reaches it, so its body changes only when the file does.
-pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64) -> Option<ContextPut> {
+/// The context is one user message that keeps a snapshot boundary: the
+/// file's path and its text, cut to its first `budget_tokens` worth of bytes.
+/// Nothing the seat said or did reaches it, so it changes only when the file
+/// does.
+pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64) -> Option<Context> {
     let house = house?;
     let budget = usize::try_from(budget_tokens.saturating_mul(HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
     let text = match house.text.len() > budget {
@@ -172,14 +168,7 @@ pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64
         false => house.text.clone(),
     };
     let content = format!("The house rules in {}:\n\n{text}", house.path);
-    Some(ContextPut {
-        system: framed(HOUSE_RULES_FRAMING),
-        turns: vec![Turn { role: WireRole::User, content, snap: true, reasoning: None }],
-        pin: None,
-        warm: None,
-        dry_run: None,
-        persist: None,
-    })
+    Some(Context { messages: vec![Message::system(framed(HOUSE_RULES_FRAMING)), Message::user(content).snapped()], ..Context::default() })
 }
 
 /// The longest prefix of `text` within `bytes`, on a char boundary.
@@ -404,8 +393,18 @@ mod tests {
     use super::*;
     use crate::Kernel;
 
-    fn contents(p: &ContextPut) -> Vec<&str> {
-        p.turns.iter().map(|t| t.content.as_str()).collect()
+    /// The messages after the system message.
+    fn turns(p: &Context) -> &[Message] {
+        &p.messages[1..]
+    }
+
+    fn system(p: &Context) -> &str {
+        assert_eq!(p.messages[0].role, WireRole::System);
+        p.messages[0].content.as_deref().unwrap()
+    }
+
+    fn contents(p: &Context) -> Vec<&str> {
+        turns(p).iter().map(|t| t.content.as_deref().unwrap()).collect()
     }
 
     #[tokio::test]
@@ -418,8 +417,8 @@ mod tests {
         let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
         let p = project("reviewer", &blocks, &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(contents(&p), refs);
-        assert_eq!(p.turns[0].role, WireRole::User);
-        assert_eq!(p.turns[1].role, WireRole::Assistant);
+        assert_eq!(turns(&p)[0].role, WireRole::User);
+        assert_eq!(turns(&p)[1].role, WireRole::Assistant);
     }
 
     #[tokio::test]
@@ -444,8 +443,8 @@ mod tests {
         assert_eq!(contents(&p), ["keep one", "keep two", "keep three"]);
     }
 
-    fn reasonings(p: &ContextPut) -> Vec<Option<&str>> {
-        p.turns.iter().map(|t| t.reasoning.as_deref()).collect()
+    fn reasonings(p: &Context) -> Vec<Option<&str>> {
+        turns(&p).iter().map(|t| t.reasoning.as_deref()).collect()
     }
 
     /// A model's finished thinking rides on its next reply as that turn's
@@ -497,7 +496,7 @@ mod tests {
                 None,
             ]
         );
-        assert_eq!(p.turns[5].role, WireRole::Assistant, "thinking with no reply is the model's own turn");
+        assert_eq!(turns(&p)[5].role, WireRole::Assistant, "thinking with no reply is the model's own turn");
     }
 
     #[tokio::test]
@@ -509,16 +508,16 @@ mod tests {
         let ids = append_dialogue(&kernel, ctx, &refs[..16]);
         let before = project("reviewer", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
         let snapped: Vec<usize> =
-            before.turns.iter().enumerate().filter(|(_, t)| t.snap).map(|(i, _)| i).collect();
+            turns(&before).iter().enumerate().filter(|(_, t)| t.snap).map(|(i, _)| i).collect();
         assert_eq!(snapped, vec![7, 15]);
         append(&kernel, ctx, ids.last(), Role::User, BlockKind::Text, Status::Done, "t16");
         let after = project("reviewer", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
-        assert_eq!(after.turns.len(), 17);
+        assert_eq!(turns(&after).len(), 17);
         assert_eq!(
-            before.turns.iter().map(|t| t.snap).collect::<Vec<_>>(),
-            after.turns[..16].iter().map(|t| t.snap).collect::<Vec<_>>()
+            turns(&before).iter().map(|t| t.snap).collect::<Vec<_>>(),
+            turns(&after)[..16].iter().map(|t| t.snap).collect::<Vec<_>>()
         );
-        assert!(!after.turns[16].snap);
+        assert!(!turns(&after)[16].snap);
     }
 
     #[tokio::test]
@@ -526,11 +525,11 @@ mod tests {
         let kernel = Kernel::new_ephemeral("proj-empty").await;
         let ctx = live_context(&kernel, "system-rules");
         let p = project("system-rules", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
-        assert!(p.turns.is_empty());
-        assert!(p.system.contains("\"system-rules\""), "{}", p.system);
+        assert!(turns(&p).is_empty());
+        assert!(system(&p).contains("\"system-rules\""), "{}", system(&p));
     }
 
-    fn projected(kernel: &Kernel, label: &str, ctx: kaijutsu_types::ContextId) -> ContextPut {
+    fn projected(kernel: &Kernel, label: &str, ctx: kaijutsu_types::ContextId) -> Context {
         project(label, &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap()
     }
 
@@ -562,7 +561,7 @@ mod tests {
                 "after the drift",
             ]
         );
-        assert!(p.turns.iter().all(|t| t.role == WireRole::User), "a drift is a user turn");
+        assert!(turns(&p).iter().all(|t| t.role == WireRole::User), "a drift is a user turn");
     }
 
     /// The house rules alone make the context: one user turn that keeps a
@@ -577,11 +576,10 @@ mod tests {
         let rules = HouseRules { path: "/work/repo/AGENTS.md".into(), text: "Never touch prod.".into() };
         let p = project_house_rules(Some(&rules), 2000).expect("house rules make a context");
         assert_eq!(contents(&p), ["The house rules in /work/repo/AGENTS.md:\n\nNever touch prod."]);
-        assert_eq!(p.turns.iter().map(|t| (t.role, t.snap)).collect::<Vec<_>>(), [(WireRole::User, true)]);
-        assert!(p.system.starts_with(FRAMING.trim()), "{}", p.system);
-        assert!(p.system.contains("you know the house rules"), "{}", p.system);
-        assert!(p.system.contains("AGENTS.md") && p.system.contains("no permission beyond"), "{}", p.system);
-        assert!(p.pin.is_none() && p.warm.is_none() && p.dry_run.is_none());
+        assert_eq!(turns(&p).iter().map(|t| (t.role, t.snap)).collect::<Vec<_>>(), [(WireRole::User, true)]);
+        assert!(system(&p).starts_with(FRAMING.trim()), "{}", system(&p));
+        assert!(system(&p).contains("you know the house rules"), "{}", system(&p));
+        assert!(system(&p).contains("AGENTS.md") && system(&p).contains("no permission beyond"), "{}", system(&p));
     }
 
     /// Rules larger than the budget keep their start, at four bytes a token.
@@ -589,10 +587,10 @@ mod tests {
     fn rules_larger_than_the_budget_keep_their_start() {
         let long = HouseRules { path: "/AGENTS.md".into(), text: format!("START{}", "r".repeat(200)) };
         let p = project_house_rules(Some(&long), 16).unwrap();
-        assert_eq!(p.turns[0].content, format!("The house rules in /AGENTS.md:\n\n{}...", &long.text[..64]));
+        assert_eq!(turns(&p)[0].content.as_deref().unwrap(), format!("The house rules in /AGENTS.md:\n\n{}...", &long.text[..64]));
         let multi = HouseRules { path: "/AGENTS.md".into(), text: "é".repeat(100) };
         let p = project_house_rules(Some(&multi), 16).unwrap();
-        assert!(p.turns[0].content.ends_with("é..."), "a cut stays on a character boundary");
+        assert!(turns(&p)[0].content.as_deref().unwrap().ends_with("é..."), "a cut stays on a character boundary");
     }
 
     #[tokio::test]
