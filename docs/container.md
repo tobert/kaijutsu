@@ -125,6 +125,126 @@ An HTTP MCP server on the host's tailnet address works from the container
 with default networking (pasta). The host's loopback and LAN addresses are
 refused from inside; use the tailnet name in `mcp.toml`.
 
+## Agent development container (planned)
+
+This section is a plan, not a shipped setup. One container holds one
+project's kernel and workspace. A DeepSeek coder seat works there with no
+asks. A Claude session outside supervises it over MCP. Each instance takes
+the project's name, written `<project>` below.
+
+### Shape
+
+- **The kernel runs inside the container.** A context's shell runs host
+  programs where the kernel runs (`ExternalExec::Allow`, see
+  `docs/kaish-integration.md`), so the container is the boundary for
+  everything the seat runs. A host kernel that executes inside a container
+  would need a new execution path.
+- **A separate `agent-dev` image stage.** The runtime image stays minimal.
+  The agent image starts from Arch, which matches the host's glibc and ROCm
+  packages. It holds rustup, Git, kaibo, ROCm/HIP userspace, and the static
+  release binaries from the `build` stage. A fresh image is a fresh release
+  build.
+- **Host layout.** `~/kj-dev/<project>/` holds `kernel-data/`,
+  `workspace/`, `cargo/` (registry and git cache), and `secrets/`. The
+  secrets are the DeepSeek key, the Crusoe key, and kaibo's config, each
+  mounted read-only.
+- **Shared files.** `~/kj-dev/<project>/claude-workspace/` is the
+  supervisor's working directory, with its `goal.md` and `signoff.md`.
+  Its `exchange/` subdirectory mounts read-write at `/exchange`, with
+  `to-seat/`, `to-supervisor/`, and `digest/` inside. The server starts
+  with `--rw-mount /exchange` so a context's file tools can write there.
+- **SSH** publishes on `127.0.0.1:2224`. The Quadlet above uses 2223 and
+  the host kernel uses 2222.
+- **Network.** Default rootless networking (pasta) with open egress, so
+  the seat can fetch crates, clone repositories, and read docs. No SSH key
+  or forge token enters the container: the seat commits in `/workspace`
+  and a person pushes from the host.
+- **Resources on zorak** (32 threads, 125 GiB, Strix Halo):
+  `--cpuset-cpus=4-31`, `--memory=64g`, a lower CPU weight, and a high
+  `--pids-limit` for cargo. The GPU takes its memory from the same RAM the
+  host's llama servers use. Whether the container's memory limit bounds GPU
+  allocations is not yet measured. Heavy GPU jobs take
+  `~/.cache/zorak-heavy.lock`, as long council runs do.
+- **GPU.** `--device /dev/kfd --device /dev/dri --group-add keep-groups`,
+  in a per-host drop-in so the base unit carries no vendor flags. An NVIDIA
+  host uses CDI (`--device nvidia.com/gpu=all`) in its own drop-in.
+
+### Seat, gate, and supervision
+
+- Characters: a `<project>-coder` performer on the `deepseek-flash` model,
+  and `banto` as its reviewer. In the first runs the supervising Claude
+  session outside the container plays banto and drives the coder seats
+  over MCP. Later a model banto in the kernel's `director` seat can drive
+  them the same way. Asks reach banto, which is driving the loop.
+- `gate.toml` sets `[context_type.coder] uncovered = "allow"` and
+  `allow = ["shell_write"]`. Explicit `ask` keys in `[global]` still fire,
+  so the file needs an audit for this kernel. The council stays off:
+  Jev bumps need a council port to a chat backend
+  (`docs/issues.md`, "Council presets per context").
+- Recovery is Git. The seat commits often and never pushes.
+- kaibo runs inside as an `mcp.toml` stdio server with the `crusoe` cast
+  (GLM-5.3), with `/workspace` as its allowed tree.
+- The supervisor is banto: a dedicated Claude Code session with its own
+  `kaijutsu-dev` MCP entry. Its `kaijutsu-mcp` comes from the same commit
+  as the container, because the wire version must match. It drives the
+  seat with `kj drive` and `kj wait`, rotates the seat's context with a
+  handoff when it fills, and writes a daily digest into
+  `~/kj-dev/<project>/`: spend, cache hit ratio, commits, and open
+  problems.
+- A person watches with `kaijutsu-tui` attached to port 2224.
+- The coder and banto (the `director` seat) each get an environment
+  instruction from `contrib/agent-dev/rc/<type>/create/S12-environment.md`,
+  installed into this kernel's host rc next to the shipped defaults. It
+  names `/workspace`, `/exchange`, and the kernel's own state, so a seat
+  does not spend calls finding them. The text names no project.
+- A drift that arrives at a coder seat starts its turn, through a coder
+  `drift` rc script on this kernel only (`docs/drift-ux.md`, gap 2, shape
+  B). The identity problem that section names is checked against current
+  code before the script ships.
+
+### Repeating it
+
+Everything project-specific is a name and a directory:
+`~/kj-dev/<project>/`, the container name, the `kaijutsu-dev` MCP entry,
+and the supervisor's goal. The image, the Quadlet template, the GPU
+drop-in, the rc overlay in `contrib/agent-dev/`, and the bootstrap script
+take the name as an argument and stay the same across projects and hosts.
+The likely end state is one long-lived kernel in one such container, with
+each project as a workspace inside it, so nothing here should assume one
+project per kernel where a parameter costs nothing.
+
+### Before the first run
+
+1. DeepSeek provider fixes: retry transient failures mid-stream where no
+   durable block was written, treat `insufficient_system_resource` as
+   transient and `content_filter` as an error, make HTTP 402 permanent,
+   and decode an in-stream `error` chunk.
+2. Raise the DeepSeek backend's request and idle timeouts on this kernel.
+   The 600 s request timeout covers the whole stream, which a long
+   reasoning turn can exceed.
+3. Smoke test with `fleet/contained/live/council-cleanup.toml`
+   (`docs/acp-fleet.md`, "Live scenarios").
+4. Check that the request prefix is byte-stable across turns with
+   `KJ_LLM_REQUEST_DUMP` (`docs/telemetry.md`).
+5. The `agent-dev` stage, a `kaijutsu-dev.container` Quadlet, and the GPU
+   drop-in.
+6. A bootstrap script: `init`, `add-key` for the supervisor,
+   `kj backend set`, the characters, `gate.toml`, and `rc reseed`.
+7. A standalone test task: a one-page spec for a small Rust crate,
+   acceptance tests the seat cannot see, a kaibo review step, and a step
+   that writes `rocminfo` output to `GPU.md`. The supervisor runs the
+   acceptance tests in a fresh container. The task stays as a regression
+   check for the environment itself.
+
+### Open
+
+- Whether `--memory` bounds GPU memory on Strix Halo.
+- Whether an ask can be answered through `kaijutsu-mcp`, so the supervisor
+  can act as reviewer without a tui.
+- The 120 s idle timeout default and whether DeepSeek's `: keep-alive`
+  comments reset it.
+- Whether the broker's tool list order is stable across turns.
+
 ## Kubernetes later
 
 For `/tank` storage pinned to zorak, use statically created `local`
