@@ -166,8 +166,8 @@ fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLo
 
 /// Reads the judge about the call `read` names, after the council decision
 /// `decision_id` committed: `council`'s contexts and the spec's own, then the
-/// shadow, on the judge's server, under the decision's shell spec and case
-/// `state`. Records the answer, or the miss, as an observation of the
+/// shadow, on the judge's server, under the decision's shell spec and
+/// `case`. Records the answer, or the miss, as an observation of the
 /// decision, and adds an answer to the call's outcome turn.
 pub(crate) fn spawn_judge(
     kernel: Arc<crate::Kernel>,
@@ -293,7 +293,7 @@ async fn judge_one(
         head,
         house_rules: false,
     });
-    let shadow_name = prepared.read_name(prepared.contexts.len() - 1);
+    let shadow_index = (prepared.contexts.len() - 1) as u64;
     let request = super::gate::decision_request(&prepared, &council, state.clone());
     let asked = std::time::Instant::now();
     let response = match super::gate::ask_within(kernel, &prepared, &request, &council, deadline, &waits).await {
@@ -311,7 +311,7 @@ async fn judge_one(
         engine: response.identity.engine.clone(),
     };
     judged.observation.queue_ms = super::gate::queue_ms(&waits, response.queue_ms);
-    if let Some(shadow_read) = response.reads.iter().find(|r| r.context.as_deref() == Some(shadow_name.as_str())) {
+    if let Some(shadow_read) = response.reads.iter().find(|r| r.context == Some(shadow_index)) {
         judged.observation.snapshot = shadow_read.snapshot.as_ref().map(|s| s.to_string());
         judged.observation.questions =
             shadow_read.answers.iter().map(|(id, answer)| super::gate::read_question(id, answer)).collect();

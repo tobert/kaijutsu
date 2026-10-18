@@ -1,4 +1,4 @@
-//! Turns on a council v2 server (gogi's `docs/council-api-v2.md`).
+//! Turns on a council v2 server (gogi's `docs/council-api.md`).
 //!
 //! When the server's `GET /council/v2/identity` lists the turn's model as
 //! a served model with `generate`, each turn is one generation that sends the whole conversation: the system message,
@@ -64,11 +64,8 @@ impl Client {
     ) -> LlmResult<Stream> {
         let (thinking, _) = build::effort(opts.effort.as_deref())?;
         let messages = build::messages_v2(opts.system.as_deref(), &history)?;
-        let tools = build::tools(&opts.tools)?
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| LlmError::InvalidRequest(format!("mk backend '{}': a tool does not serialize: {e}", self.name)))?;
+        let tools = build::tools_v2(&opts.tools)
+            .map_err(|e| LlmError::InvalidRequest(format!("mk backend '{}': {e}", self.name)))?;
         if messages.last().is_none_or(|m| m.role == V2Role::Assistant) {
             return Err(LlmError::InvalidRequest(format!(
                 "mk backend '{}': the conversation is empty or ends with an assistant message; a generation \
@@ -85,9 +82,9 @@ impl Client {
         );
         let has_tools = !tools.is_empty();
         let request = GenerationRequest {
-            model: Some(identity.model.clone()),
+            model: identity.model.clone(),
             context: Context { thinking, tools, queue: None, messages },
-            max_tokens: Some(max_tokens),
+            max_tokens,
             sample,
             stream: None,
             decisions: Vec::new(),

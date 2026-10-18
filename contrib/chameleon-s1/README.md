@@ -199,9 +199,9 @@ It can choose, and it cannot write.
   capability. The megakernel lists `leave_one_out`, `persist`, and `warm`,
   and a spec with a `text` question gets a `400`. Even with `describe`, a
   `text` answer is a short description, not generation.
-- **Generation is out of the v1 contract.** gogi's `docs/council-api.md`, "Open
-  questions", names the megakernel's `/mk/v1/generate` as outside it. A
-  `GET` on that path answers `405`; this prototype does not use it.
+- **Generation is out of scope.** This prototype serves decisions only. A
+  `GET` on the megakernel's `/mk/v1/generate` answers `405`; this prototype
+  does not use it.
 - **Questions come from the spec, never the request.** A request may pick
   questions with `ask` and narrow a `choice` with `options`. A new idea is a
   new spec.

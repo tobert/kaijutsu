@@ -8,7 +8,7 @@ megakernel is the Qwen inference service in
 (`service/openapi.json`) plus `/council/v1`
 (`service/council-openapi.json`). Facts below were read at megakernel
 `3a4c342`. Kaijutsu's council calls speak only council v2 (gogi's
-`docs/council-api-v2.md`), which mkviolet serves; gogi's `gogi-proto` crate
+`docs/council-api.md`), which mkviolet serves; gogi's `gogi-proto` crate
 owns every council wire type, spec id, and pooling rule.
 
 ## Purpose
@@ -250,7 +250,7 @@ must not invent a `ToolUse` before `done`.
 
 When the service answers `GET /council/v2/identity` and lists the turn's
 model as a served model with `generate`, every streamed turn is one
-`POST /council/v2/generations` (gogi's `docs/council-api-v2.md`,
+`POST /council/v2/generations` (gogi's `docs/council-api.md`,
 "Generations") instead of render and `/mk/v1/generate`. The turn's model
 names the served model by its `model` or an alias, and the generation sends
 its `model`. The client asks for the identity once. A 404, or a served
@@ -268,8 +268,21 @@ server does not serve is an invalid request naming the ones it serves.
   no fork request. A fork, an exclude, or an edit sends the messages as they
   now stand, and the server reuses the prefix they share with what it holds.
   A restart costs feeding, never a wrong answer.
-- **Calls keep the server's ids.** The reply's calls carry the `id` the
-  server gave them, and the next turn's results name it.
+- **Tools and calls take Anthropic's shape.** A tool is `{name,
+  description, input_schema}` and a call is `{id, name, input}`. The
+  reply's calls carry the `id` the server gave them, and the next turn's
+  results name it. A failed result is a `tool` message with `is_error:
+  true`, where `/mk/v1` prefixes `[tool error]`.
+- **Each token names its phase.** A `token` event's `phase` is
+  `reasoning`, `content`, or `call`, and the provider sends each piece to
+  the thinking or text block its phase names; a call's pieces add no text.
+  At `done`, each block must equal `done`'s `reasoning` and `content`, or
+  the turn is an error. A `ping` and an event the contract does not name
+  are skipped; an `error` event ends the turn with its `request_id`.
+- **`finish` is the stop reason.** `end_turn`, `tool_use`, and
+  `max_tokens` pass through, and `context_full`, a reply cut at the
+  context's end, reads as `max_tokens`. `done`'s `seed` goes to the turn's
+  usage.
 - **A full context is a `413` `context_full`**, which the provider reports
   as `LlmError::ContextFull`, the same as a render with no room. The kernel
   sends a shorter conversation after `kj stage exclude` and a fork.
@@ -308,8 +321,7 @@ contract. Its tests run against `gogi_fake::Server` (gogi's
 when `COUNCIL_URL` names one.
 
 A second decision server joins by serving council v2. lfm2d has an opinion
-API with a different shape (gogi's `docs/council-api.md`, "Converging the
-two servers"); until it serves council v2, the kernel does not call it. A
+API with a different shape; until it serves council v2, the kernel does not call it. A
 hosted decision API (the "or" and "oai" cases Amy named) would sit behind
 a small trait only when one exists, not a change to the gate.
 
@@ -425,5 +437,5 @@ and canned results. Commands are in `llm/mk/probes.rs`.
   inference except once; a probe with several calls should confirm the order.
 - Which liveness signal does the in-flight strip get during the `tool` phase?
 
-Related: `docs/council.md`, gogi's `docs/council-api-v2.md`, `docs/prompts.md`,
+Related: `docs/council.md`, gogi's `docs/council-api.md`, `docs/prompts.md`,
 `docs/approval-identity.md`, `docs/issues.md`.

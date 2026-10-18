@@ -76,8 +76,8 @@ kaijutsu-mk = { path = "crates/kaijutsu-mk" }
 #   [patch."https://github.com/tobert/gogi"]
 #   gogi-proto = { path = "../gogi/crates/gogi-proto" }
 #   gogi-fake = { path = "../gogi/crates/gogi-fake" }
-gogi-proto = { git = "https://github.com/tobert/gogi", rev = "ee6174caf0b123bde8f21aaaa99ed430279cbd99" }
-gogi-fake = { git = "https://github.com/tobert/gogi", rev = "ee6174caf0b123bde8f21aaaa99ed430279cbd99" }
+gogi-proto = { git = "https://github.com/tobert/gogi", rev = "746352381d2ae428024a14579e81bbffb45fb4f5" }
+gogi-fake = { git = "https://github.com/tobert/gogi", rev = "746352381d2ae428024a14579e81bbffb45fb4f5" }
 
 # Kaish (execution engine + client) — published 0.15.
 # `subprocess` compiles in host external-command execution; whether a given

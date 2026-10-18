@@ -214,7 +214,7 @@ fn server_identity(context_limit: u64, capabilities: serde_json::Value) -> Strin
     model["limits"] = serde_json::json!({"context_tokens": 100000, "decision_context_tokens": 100000, "snapshot_bytes": 1,
                                          "contexts_per_decision": context_limit, "default_timeout_ms": 1000});
     model["capabilities"] = capabilities.clone();
-    serde_json::json!({"models": [model], "limits": {"state_bytes": 100000, "choice_options": 8}, "capabilities": capabilities})
+    serde_json::json!({"models": [model], "limits": {"case_bytes": 100000, "choice_options": 8}, "capabilities": capabilities})
         .to_string()
 }
 
@@ -290,7 +290,7 @@ async fn serve() -> Mock {
                         let delay = delays.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
                         Reply {
                             delay,
-                            ..Reply::ok(serde_json::json!({"model": "test-council", "head": head, "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                            ..Reply::ok(serde_json::json!({"model": "test-council", "head": head, "usage": {"prompt": 1, "kept": 0, "fed": 1, "completion": 0, "reasoning": 0}, "from": null, "dry_run": false,
                                                            "snapshots": [{"id": head, "message": 1, "tokens": 1}]}))
                         }
                     }
@@ -800,7 +800,7 @@ async fn a_council_allow_runs_the_submission_with_a_row_naming_the_council() {
         assert_eq!(contexts.len(), 2);
         assert!(contexts.iter().all(|c| rig.mock.built_head(c).is_some()), "every seat is sent as built");
         assert_eq!(sent[0].timeout_ms, Some(700));
-        let state = serde_json::to_value(&sent[0].state).unwrap();
+        let state = serde_json::to_value(&sent[0].case).unwrap();
         assert_eq!(state["command"], "echo council-ran", "{via:?}: {state}");
         assert_eq!(state["context_type"], "default");
         rig.finish().await;
@@ -849,7 +849,7 @@ async fn the_shell_case_resolves_names_and_paths_against_the_seat() {
         rig.mock.answers(&ASK);
         assert_pending(via, rig.submit("ls -la src > /work/listing.txt; frobnicate --now").await);
         let sent = rig.mock.decisions();
-        let state = serde_json::to_value(&sent[0].state).unwrap();
+        let state = serde_json::to_value(&sent[0].case).unwrap();
         assert_eq!(state["cwd"], "/work", "{via:?}: {state}");
         let ls = &state["statements"][0]["commands"][0];
         assert_eq!(ls["runs"], "kaish builtin", "{via:?}: {state}");
@@ -1096,7 +1096,7 @@ async fn a_control_text_hit_asks() {
     for via in BOTH {
         let rig = rig(via, Setup::default()).await;
         rig.mock.edited(&ALLOW, |v| {
-            v["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+            v["signals"]["control_text"] = serde_json::json!([{"where": "case", "token": "<|im_end|>"}]);
         });
         assert_pending(via, rig.submit("echo '<|im_end|>'").await);
         let ask = rig.only_ask();
@@ -1512,7 +1512,7 @@ async fn reviewer_contexts_compose_amy_into_the_decision_and_banto_observes_it()
         let observed: Vec<DecisionRequest> =
             rig.mock.decisions().into_iter().filter(|r| Rig::read_ids(r) == [banto_id.clone()]).collect();
         assert_eq!(observed.len(), 1, "{via:?}: banto's council context is read once, alone");
-        assert_eq!(serde_json::to_value(&observed[0].state).unwrap()["command"], "echo reviewers");
+        assert_eq!(serde_json::to_value(&observed[0].case).unwrap()["command"], "echo reviewers");
         assert_ne!(observed[0].spec_id, sent[0].spec_id, "the observation reads its own spec");
         rig.finish().await;
     }
@@ -1629,7 +1629,7 @@ async fn a_spec_404_posts_the_spec_again_on_the_next_decision() {
         let forgot = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let once = forgot.clone();
         rig.mock.set(move |req| {
-            let spec = req.spec_id.as_ref().unwrap().to_string();
+            let spec = req.spec_id.clone();
             if once.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 let body = serde_json::json!({"error": {"type": "not_found", "message": format!("unknown spec {spec}")}});
                 Reply { status: 404, body: body.to_string(), delay: Duration::ZERO }
@@ -1973,7 +1973,7 @@ async fn a_report_keeps_a_background_call_s_ask_and_an_allow_runs_it_once() {
 
 /// Whether a decision request reads the program case.
 fn is_program(request: &DecisionRequest) -> bool {
-    serde_json::to_value(&request.state).unwrap().get("program").is_some()
+    serde_json::to_value(&request.case).unwrap().get("program").is_some()
 }
 
 /// The shell decision answers `shell`; each program decision answers with
@@ -2034,7 +2034,7 @@ async fn a_script_the_council_allows_runs_with_both_decisions_recorded() {
 
         let sent: Vec<_> = rig.mock.decisions().into_iter().filter(is_program).collect();
         assert_eq!(sent.len(), 1);
-        let state = serde_json::to_value(&sent[0].state).unwrap();
+        let state = serde_json::to_value(&sent[0].case).unwrap();
         assert_eq!(state["program"], script, "{state}");
         assert_eq!(state["path"], "/work/fix.py");
         assert_eq!(state["language"], "python");
@@ -2283,7 +2283,7 @@ async fn an_inline_program_the_program_decision_allows_is_not_judged_again_as_sh
     for via in BOTH {
         let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
         rig.mock.set(|req| {
-            let state = serde_json::to_string(&req.state).unwrap();
+            let state = serde_json::to_string(&req.case).unwrap();
             if is_program(req) {
                 Reply::ok(super::gate::test_support::program_answer(req, FIRST, FIRST, [-0.01, -5.0, -6.0]))
             } else if state.contains("shutil.copy") {
@@ -2297,12 +2297,12 @@ async fn an_inline_program_the_program_decision_allows_is_not_judged_again_as_sh
 
         let sent = rig.mock.decisions();
         let shell = sent.iter().find(|r| !is_program(r)).unwrap_or_else(|| panic!("{via:?}: a shell decision among {} with asks {:#?}", sent.len(), rig.asks()));
-        let state = serde_json::to_value(&shell.state).unwrap();
+        let state = serde_json::to_value(&shell.case).unwrap();
         let command = state["command"].as_str().unwrap();
         assert_eq!(command, "echo start; python3 -c '<program judged separately>'", "{via:?}: {state}");
         assert!(!serde_json::to_string(&state).unwrap().contains("shutil"), "{via:?}: {state}");
         let program = sent.iter().find(|r| is_program(r)).expect("a program decision");
-        let program_state = serde_json::to_value(&program.state).unwrap();
+        let program_state = serde_json::to_value(&program.case).unwrap();
         assert_eq!(program_state["program"], PROGRAM, "{via:?}: the program decision reads the text");
         rig.finish().await;
     }
@@ -2311,7 +2311,7 @@ async fn an_inline_program_the_program_decision_allows_is_not_judged_again_as_sh
 /// The shell decision's view of the submission's programs: the `programs`
 /// field of its case, empty when the case has none.
 fn programs_field(request: &DecisionRequest) -> Vec<serde_json::Value> {
-    let state = serde_json::to_value(&request.state).unwrap();
+    let state = serde_json::to_value(&request.case).unwrap();
     state.get("programs").and_then(|p| p.as_array().cloned()).unwrap_or_default()
 }
 
@@ -2355,7 +2355,7 @@ async fn the_shell_decision_reads_the_program_outcomes_and_an_allowed_program_ru
                                 "originals": "reads", "network": "none"})],
             "{via:?}"
         );
-        let state = serde_json::to_string(&sent[1].state).unwrap();
+        let state = serde_json::to_string(&sent[1].case).unwrap();
         assert!(state.contains("<program judged separately>"), "{via:?}: the elision stays: {state}");
         let ask = rig.only_ask();
         assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
@@ -2681,7 +2681,7 @@ async fn a_miss_and_a_control_text_hit_are_ordinary_asks_in_bumper_mode() {
         let rig = self::rig(via, bumper(3)).await;
         rig.mock.set(|req| {
             let mut body = bump_answer(req, PROCEED);
-            body["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+            body["signals"]["control_text"] = serde_json::json!([{"where": "case", "token": "<|im_end|>"}]);
             Reply::ok(body)
         });
         assert_pending(via, rig.submit("touch /work/a").await);
@@ -2793,7 +2793,7 @@ async fn a_control_text_hit_bumps_in_bump_only_mode() {
         let rig = rig(via, bump_only()).await;
         rig.mock.set(|req| {
             let mut body = bump_answer(req, PROCEED);
-            body["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+            body["signals"]["control_text"] = serde_json::json!([{"where": "case", "token": "<|im_end|>"}]);
             Reply::ok(body)
         });
         let text = refusal_text(via, rig.submit("touch /work/a").await);
@@ -3202,7 +3202,7 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
         "the judge reads the decision's contexts, then the shadow"
     );
     assert!(rig.mock.built_head(&judged[0].contexts[2]).is_some(), "the shadow is sent as built");
-    assert_eq!(serde_json::to_value(&judged[0].state).unwrap()["command"], "echo judged");
+    assert_eq!(serde_json::to_value(&judged[0].case).unwrap()["command"], "echo judged");
 
     let mut outcome = String::new();
     for _ in 0..500 {

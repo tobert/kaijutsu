@@ -24,13 +24,16 @@ pub enum MkError {
     /// A council route answered with an error status. `error` is the decoded
     /// body when it matched the contract's error object; `body` is the start
     /// of the raw text either way.
-    #[error("megakernel answered {status}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default())]
+    #[error("megakernel answered {status}{}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default(), request_note(.request_id))]
     Status {
         status: u16,
         error: Option<ErrorDetail>,
         /// The `Retry-After` header, when it held whole seconds.
         retry_after: Option<Duration>,
         body: String,
+        /// The server's id for the request: the `request-id` header, else
+        /// the body's `request_id`.
+        request_id: Option<String>,
     },
     /// A `/mk/v1` route answered with an error status. `error` is the decoded
     /// body when it matched the service's error schema; `body` is the start of
@@ -45,16 +48,21 @@ pub enum MkError {
     },
     /// A council v2 `413` of type `context_full`: the prompt leaves no room
     /// for a reply, and nothing ran. The caller forks the context.
-    #[error("megakernel answered 413 context_full: {message}")]
+    #[error("megakernel answered 413 context_full: {message}{}", request_note(.request_id))]
     ContextFull {
         message: String,
         /// The start of the raw body, which carries the server's counts.
         body: String,
+        request_id: Option<String>,
     },
     /// The server failed after a stream began and said so in an `error` event.
     /// A 503 of type `pass_timeout_error` dropped only this request.
     #[error("megakernel failed mid-stream ({}): {}: {}", .0.code, .0.r#type, .0.message)]
     Stream(ServiceError),
+    /// A council v2 stream's `error` event: the server failed after the
+    /// stream began, and nothing more follows.
+    #[error("megakernel failed mid-stream: {:?}: {}{}", .error.r#type, .error.message, request_note(.request_id))]
+    CouncilStream { error: ErrorDetail, request_id: Option<String> },
     /// The stream ended before its `done` event. What arrived is not a reply.
     #[error("megakernel stream ended before its done event: {0}")]
     Truncated(String),
@@ -87,6 +95,13 @@ impl MkError {
             MkError::Status { status, .. } | MkError::Service { status, .. } => Some(*status),
             MkError::ContextFull { .. } => Some(413),
             MkError::Stream(e) => Some(e.code),
+            MkError::CouncilStream { error, .. } => match error.r#type {
+                ErrorType::Busy => Some(429),
+                ErrorType::Internal => Some(500),
+                ErrorType::Unavailable | ErrorType::ModelUnavailable => Some(503),
+                ErrorType::Timeout => Some(504),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -99,6 +114,11 @@ impl MkError {
             _ => None,
         }
     }
+}
+
+/// ` (request <id>)` when the server named the request.
+fn request_note(request_id: &Option<String>) -> String {
+    request_id.as_ref().map(|id| format!(" (request {id})")).unwrap_or_default()
 }
 
 impl From<Invalid> for MkError {
@@ -249,8 +269,14 @@ impl MkClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
+        let request_id = resp
+            .headers()
+            .get(gogi_proto::ids::REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| gogi_proto::ids::is_request_id(v))
+            .map(str::to_string);
         let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
-        Err(status_error(family, status, retry_after, &bytes))
+        Err(status_error(family, status, retry_after, request_id, &bytes))
     }
 }
 
@@ -272,15 +298,22 @@ pub(crate) fn require_object(value: &Json, what: &'static str) -> Result<(), MkE
     }
 }
 
-fn status_error(family: Family, status: StatusCode, retry_after: Option<Duration>, bytes: &[u8]) -> MkError {
+fn status_error(
+    family: Family,
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    request_id: Option<String>,
+    bytes: &[u8],
+) -> MkError {
     match family {
         Family::Council => {
-            let error = serde_json::from_slice::<ErrorBody>(bytes).ok().map(|b| b.error);
-            match error {
+            let decoded = serde_json::from_slice::<ErrorBody>(bytes).ok();
+            let request_id = request_id.or_else(|| decoded.as_ref().and_then(|b| b.request_id.clone()));
+            match decoded.map(|b| b.error) {
                 Some(e) if status.as_u16() == 413 && e.r#type == ErrorType::ContextFull => {
-                    MkError::ContextFull { message: e.message, body: excerpt(bytes) }
+                    MkError::ContextFull { message: e.message, body: excerpt(bytes), request_id }
                 }
-                error => MkError::Status { status: status.as_u16(), error, retry_after, body: excerpt(bytes) },
+                error => MkError::Status { status: status.as_u16(), error, retry_after, body: excerpt(bytes), request_id },
             }
         }
         Family::Mk => MkError::Service {

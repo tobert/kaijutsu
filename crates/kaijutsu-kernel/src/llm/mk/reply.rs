@@ -8,9 +8,12 @@
 //! service trims it, so the streamed blocks hold exactly `done`'s text. It
 //! checks that at the end: a difference is an error, never a block that
 //! disagrees with what the service holds as the reply.
+//!
+//! A council v2 token names its phase, so [`Reply::phased`] routes each
+//! piece by it and reads no markers.
 
 use kaijutsu_mk::Json;
-use gogi_proto::generation::{Finish as V2Finish, GenerationDone, ReplyToolCall};
+use gogi_proto::generation::{Finish as V2Finish, GenerationDone, Phase as V2Phase, ReplyToolCall};
 use kaijutsu_mk::generate::{Done, Finish, ToolCall};
 
 use crate::llm::stream::{MkUsageExtra, StreamEvent, UsageExtra};
@@ -100,6 +103,29 @@ impl Reply {
         out
     }
 
+    /// A council v2 piece in `phase`. A change of phase closes the block of
+    /// the phase before it; a call's pieces and a phase this kernel does not
+    /// know add no text.
+    pub(super) fn phased(&mut self, phase: V2Phase, piece: &str) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        let phase = match phase {
+            V2Phase::Reasoning => Phase::Think,
+            V2Phase::Content => Phase::Answer,
+            V2Phase::Call => Phase::Tool,
+            V2Phase::Unknown => return out,
+        };
+        if phase != self.phase {
+            match self.phase {
+                Phase::Think => self.think.close(&mut out),
+                Phase::Answer => self.answer.close(&mut out),
+                Phase::Tool => {}
+            }
+            self.phase = phase;
+        }
+        self.text(piece, &mut out);
+        out
+    }
+
     fn text(&mut self, text: &str, out: &mut Vec<StreamEvent>) {
         match self.phase {
             Phase::Think => self.think.push(text, out),
@@ -112,7 +138,7 @@ impl Reply {
     /// calls follow, then `Done`. `id_base` names the calls
     /// (`<id_base>-<index>`), since the service has no call ids.
     pub(super) fn done(self, done: Done, id_base: &str, timing: Timing) -> Result<Vec<StreamEvent>, String> {
-        let calls = done
+        let calls: Vec<Call> = done
             .tool_calls
             .into_iter()
             .enumerate()
@@ -136,7 +162,15 @@ impl Reply {
             weight_hash: done.model.weight_hash,
         };
         let usage = (done.usage.prompt.into(), done.usage.completion.into(), extra);
-        self.end(&done.reasoning_content, &done.content, done.finish, calls, usage)
+        let stop_reason = match done.finish {
+            Finish::Stop if !calls.is_empty() => "tool_calls",
+            Finish::Stop => "stop",
+            Finish::Length => "length",
+            Finish::Cancelled => {
+                return Err("the megakernel cancelled the generation, and the kernel did not ask it to".into());
+            }
+        };
+        self.end(&done.reasoning_content, &done.content, stop_reason, calls, usage)
     }
 
     /// The events that end a council v2 generation. Its calls keep the ids
@@ -153,8 +187,8 @@ impl Reply {
             .tool_calls
             .into_iter()
             .map(|call| match call {
-                ReplyToolCall::Parsed { id, name, arguments, .. } => {
-                    let arguments = serde_json::from_value(serde_json::Value::Object(arguments))
+                ReplyToolCall::Parsed { id, name, input, .. } => {
+                    let arguments = serde_json::from_value(serde_json::Value::Object(input))
                         .map_err(|e| format!("tool call {id} arguments do not decode: {e}"))?;
                     Ok(Call::Parsed { id, name, arguments })
                 }
@@ -168,17 +202,18 @@ impl Reply {
             decode_ms: None,
             first_token_ms: timing.first_token_ms,
             wall_ms: timing.wall_ms,
-            seed: None,
+            seed: done.seed,
             model: model.to_string(),
             weight_hash: weight_hash.to_string(),
         };
         let usage = (done.usage.prompt, done.usage.completion, extra);
-        let finish = match done.finish {
-            V2Finish::Stop => Finish::Stop,
-            V2Finish::Length => Finish::Length,
-            V2Finish::Cancelled => Finish::Cancelled,
+        // A reply cut at the context's end is cut like one at max_tokens.
+        let stop_reason = match done.finish {
+            V2Finish::EndTurn => "end_turn",
+            V2Finish::ToolUse => "tool_use",
+            V2Finish::MaxTokens | V2Finish::ContextFull => "max_tokens",
         };
-        self.end(&done.reasoning, &done.content, finish, calls, usage)
+        self.end(&done.reasoning, &done.content, stop_reason, calls, usage)
     }
 
     /// Closes the open block, checks the streamed text against the reply's,
@@ -187,7 +222,7 @@ impl Reply {
         mut self,
         reasoning: &str,
         content: &str,
-        finish: Finish,
+        stop_reason: &str,
         calls: Vec<Call>,
         (prompt, completion, extra): (u64, u64, MkUsageExtra),
     ) -> Result<Vec<StreamEvent>, String> {
@@ -202,14 +237,6 @@ impl Reply {
         if self.answer.text != content {
             return Err(mismatch("answer", &self.answer.text, content));
         }
-        let stop_reason = match finish {
-            Finish::Stop if !calls.is_empty() => "tool_calls",
-            Finish::Stop => "stop",
-            Finish::Length => "length",
-            Finish::Cancelled => {
-                return Err("the megakernel cancelled the generation, and the kernel did not ask it to".into());
-            }
-        };
         for call in calls {
             out.push(match call {
                 Call::Parsed { id, name, arguments } => StreamEvent::ToolUse {
@@ -458,6 +485,37 @@ mod tests {
         assert!(err.contains("answer differs"), "{err}");
         let err = run(true, false, &["a</think>b"], done_with(&base, "x", "b")).unwrap_err();
         assert!(err.contains("thinking differs"), "{err}");
+    }
+
+    fn v2_done(reasoning: &str, content: &str, finish: &str) -> GenerationDone {
+        serde_json::from_value(serde_json::json!({"model": "m", "content": content, "reasoning": reasoning, "tool_calls": [],
+            "finish": finish, "usage": {"prompt": 9, "kept": 4, "fed": 5, "completion": 6, "reasoning": 2},
+            "head": null, "snapshots": [], "seed": 5}))
+        .unwrap()
+    }
+
+    /// A council v2 piece goes to the block its phase names, with no
+    /// marker read: a reasoning piece that spells `</think>` stays
+    /// thinking, and a call's pieces add no text. `finish` maps to the
+    /// kernel's stop reasons, and `done`'s seed is kept.
+    ///
+    /// Falsified by routing v2 pieces through the marker split, or a
+    /// `context_full` reply that reads as a finished turn.
+    #[test]
+    fn v2_pieces_follow_their_phase_and_finish_maps_to_a_stop_reason() {
+        let mut reply = Reply::new(true, true);
+        let mut out = Vec::new();
+        for (phase, piece) in [(V2Phase::Reasoning, "why </think>"), (V2Phase::Content, " Yes"), (V2Phase::Call, "ls(")] {
+            out.extend(reply.phased(phase, piece));
+        }
+        out.extend(reply.done_v2(v2_done("why </think>", "Yes", "context_full"), "m", "w", Timing::default()).unwrap());
+        assert_eq!(texts(&out), ("why </think>".into(), "Yes".into()));
+        let StreamEvent::Done { stop_reason, extra: Some(UsageExtra::Mk(x)), .. } = out.last().unwrap() else { panic!("{out:?}") };
+        assert_eq!((stop_reason.as_deref(), x.seed), (Some("max_tokens"), Some(5)));
+        for (finish, want) in [("end_turn", "end_turn"), ("tool_use", "tool_use"), ("max_tokens", "max_tokens")] {
+            let events = Reply::new(false, false).done_v2(v2_done("", "", finish), "m", "w", Timing::default()).unwrap();
+            assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: Some(s), .. }) if s == want), "{finish}: {events:?}");
+        }
     }
 
     #[test]

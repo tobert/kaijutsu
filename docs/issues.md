@@ -119,7 +119,7 @@ WAL. Accept `-p`, or have the refusal name the fix.
 
 ## Council v2 client: what is open (2026-10-16)
 
-The council speaks only council v2 (gogi's `docs/council-api-v2.md`), and
+The council speaks only council v2 (gogi's `docs/council-api.md`), and
 the mk provider speaks it when a server's `GET /council/v2/identity` lists
 the turn's model with `generate`. mkviolet serves it. The live
 checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
@@ -139,14 +139,14 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   deadline. Linking the script into `submit` would catch them for turns a
   person starts, at one rc run per submit; nothing catches them for
   autonomous turns.
-- **mkviolet serves the one-model identity.** gogi `ee6174c` lists served
-  models under `models`, and kaijutsu reads only that shape, so every
-  decision on mkviolet is a miss ("missing field `models`") until mkviolet
-  ships gogi's `docs/disagreements.md` rows 16 to 18. A rebuilt kernel
-  waits for that. The deployed kernel's `gate` slot names model
-  `gemma-4-26b-a4b`, which is neither mkviolet's `model`
-  (`google/gemma-4-26B-A4B-it`) nor an alias; rename the slot's model or
-  give mkviolet the alias.
+- **A streamed reply is checked against its pieces.** The provider joins
+  each phase's pieces into a block and refuses a `done` whose `reasoning`
+  or `content` differs, because a streamed block cannot be taken back. Amy
+  chose (2026-10-18) to make the contract promise this: a phase's pieces
+  join to `done`'s text up to whitespace at either end. gogi is adding the
+  rule and a conformance check; delete this entry when it lands.
+- **Request ids appear only on errors.** A failed call's error and miss
+  cause name the `request-id`; a call that succeeds logs none.
 - **Reachability ignores the server and the served model.** The pin sweep
   keeps a seat that some council reads, without checking that the seat's
   server and served model are the ones that council, a cast's `gate` slot,
@@ -827,7 +827,7 @@ archive the conversation as-is.
 
 ## "Context" means two things once the council lands (2026-10-04)
 
-gogi's `docs/council-api-v2.md` uses context for a chat the client sends
+gogi's `docs/council-api.md` uses context for a chat the client sends
 whole with each request; our Terms table (`docs/writing.md`) uses it for
 kaijutsu's durable block log. Amy: "if a context is a context call it a
 context here. kaijutsu shoulda called it something else in any case." A

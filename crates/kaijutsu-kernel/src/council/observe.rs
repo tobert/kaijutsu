@@ -200,7 +200,7 @@ async fn observe_one(
         engine: response.identity.engine.clone(),
     };
     row.queue_ms = super::gate::queue_ms(&waits, response.queue_ms);
-    match read_answer(&prepared, &request, &response) {
+    match read_answer(&request, &response) {
         Ok((snapshot, questions, choice)) => {
             row.outcome = CouncilObservationOutcome::Answered;
             row.choice = Some(choice);
@@ -226,25 +226,23 @@ fn spec_lacks_follows(prepared: &Prepared) -> Option<String> {
 /// The verified read of the one context: its snapshot, every question it
 /// answered, and its top option for [`FOLLOWS`].
 fn read_answer(
-    prepared: &Prepared,
     request: &DecisionRequest,
     response: &DecisionResponse,
 ) -> Result<(Option<String>, Vec<CouncilQuestion>, String), String> {
     gogi_proto::math::verify(response, &request.expect())
         .map_err(|mismatch| format!("the answer's numbers do not recompute ({mismatch})"))?;
-    if let (Some(read), Some(asked)) = (&response.identity.spec_id, &request.spec_id)
-        && read.as_str() != asked
+    if let Some(read) = &response.identity.spec_id
+        && read.as_str() != request.spec_id
     {
-        return Err(format!("the server read spec {read}, not the spec asked for, {asked}"));
+        return Err(format!("the server read spec {read}, not the spec asked for, {}", request.spec_id));
     }
-    let reviewer = prepared.read_name(0);
     let [read] = response.reads.as_slice() else {
         return Err(format!("the answer has {} reads, not the one context asked for", response.reads.len()));
     };
-    if read.context.as_deref() != Some(reviewer.as_str()) {
+    if read.context != Some(0) {
         return Err(format!(
-            "the answer read {}, not the context asked for, {reviewer}",
-            read.context.as_deref().unwrap_or("the spec alone")
+            "the answer read {}, not the context asked for, 0",
+            read.context.map_or_else(|| "the spec alone".into(), |i| i.to_string())
         ));
     }
     let choice = match read.answers.get(FOLLOWS) {
@@ -307,6 +305,7 @@ pub(crate) mod test_support {
             "signals": {"control_text": []},
             "identity": {"model": "test-council", "weight_hash": "w1", "tokenizer_hash": "t1",
                          "template": "mk-letters-1:0", "engine": "e1", "spec_id": request.spec_id},
+            "usage": {"prompt": 10, "kept": 8, "fed": 2, "completion": 0, "reasoning": 0},
             "queue_ms": 1.0,
             "ms": 4.0,
         })
@@ -451,7 +450,7 @@ mod tests {
         assert_eq!(contexts.len(), 1, "only the reviewer context is read, never the decision's pool");
         let system = contexts[0]["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("council context \"council-banto\""), "{system}");
-        assert_eq!(decisions[0]["state"]["command"], "git push --force");
+        assert_eq!(decisions[0]["case"]["command"], "git push --force");
         let specs = r.mock.bodies("/council/v2/specs");
         assert_eq!(specs.last().unwrap()["name"], DIRECTION_CHECK);
 

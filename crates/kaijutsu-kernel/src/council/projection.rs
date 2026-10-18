@@ -103,7 +103,7 @@ fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: 
     let mut thinking: Vec<&str> = Vec::new();
     let push = |turns: &mut Vec<Message>, role, content: String, reasoning| {
         let snap = turns.len() % SNAP_EVERY == 0;
-        turns.push(Message { role, content: Some(content), reasoning, tool_calls: Vec::new(), tool_call_id: None, snap });
+        turns.push(Message { role, content: Some(content), reasoning, tool_calls: Vec::new(), tool_call_id: None, is_error: false, snap });
     };
     for b in blocks {
         if is_thinking(b) {

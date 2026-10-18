@@ -1,4 +1,4 @@
-//! The council v2 calls (gogi's `docs/council-api-v2.md`).
+//! The council v2 calls (gogi's `docs/council-api.md`).
 //!
 //! The request and response types are `gogi_proto`'s. Each call checks its
 //! request with `gogi_proto`'s rules before sending it, so a request the
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gogi_proto::context::{Context, ContextBuild, ContextBuilt};
 use gogi_proto::decision::{DecisionRequest, DecisionResponse};
-use gogi_proto::generation::{GenerationDone, GenerationRequest};
+use gogi_proto::generation::{GenerationDone, GenerationRequest, StreamEvent, TokenEvent};
 use gogi_proto::identity::ServerIdentity;
 use gogi_proto::pins::{validate_owner, PinSet, PinsPut, PinsPutResult, SnapshotDetail};
 use gogi_proto::reads::{ReadsRequest, ReadsResponse};
@@ -16,8 +16,8 @@ use gogi_proto::spec::{HeldSpec, Spec};
 use gogi_proto::{SnapshotId, SpecId};
 use reqwest::Method;
 
-use crate::client::{decode, excerpt, to_body, Family, MkClient, MkError, ServiceErrorBody};
-use crate::generate::{EventStream, Frame, StreamItem, TokenEvent};
+use crate::client::{excerpt, to_body, Family, MkClient, MkError};
+use crate::generate::{EventStream, Frame, StreamItem};
 
 /// The council v2 calls of one [`MkClient`].
 #[derive(Clone, Copy, Debug)]
@@ -32,30 +32,31 @@ impl MkClient {
     }
 }
 
-/// One event of a streamed generation. A `token` event has `/mk/v1`'s
-/// shape, which the contract leaves to the server.
+/// One event of a streamed generation. A `ping`, and an event the
+/// contract does not name, is skipped; an `error` event is
+/// [`MkError::CouncilStream`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum GenerationEvent {
     Token(TokenEvent),
     /// Always the last event.
-    Done(GenerationDone),
+    Done(Box<GenerationDone>),
 }
 
 /// A streamed `POST /council/v2/generations`.
 pub type GenerationStream = EventStream<GenerationEvent>;
 
 impl StreamItem for GenerationEvent {
-    fn decode(frame: &Frame) -> Result<Self, MkError> {
-        let data = frame.data.as_bytes();
-        match frame.event.as_str() {
-            "token" => decode(data, "token event").map(GenerationEvent::Token),
-            "done" => decode(data, "done event").map(GenerationEvent::Done),
-            "error" => Err(MkError::Stream(decode::<ServiceErrorBody>(data, "error event")?.error)),
-            other => Err(MkError::Decode {
-                what: "event stream",
-                message: format!("unknown event {other:?}"),
-                body: excerpt(data),
-            }),
+    fn decode(frame: &Frame) -> Result<Option<Self>, MkError> {
+        let event = StreamEvent::parse(&frame.event, &frame.data).map_err(|message| MkError::Decode {
+            what: "event stream",
+            message,
+            body: excerpt(frame.data.as_bytes()),
+        })?;
+        match event {
+            Some(StreamEvent::Token(t)) => Ok(Some(GenerationEvent::Token(t))),
+            Some(StreamEvent::Done(d)) => Ok(Some(GenerationEvent::Done(d))),
+            Some(StreamEvent::Error(b)) => Err(MkError::CouncilStream { error: b.error, request_id: b.request_id }),
+            Some(StreamEvent::Ping) | None => Ok(None),
         }
     }
 
@@ -78,7 +79,7 @@ impl Council<'_> {
     /// [`MkError::ContextFull`].
     pub async fn build_context(&self, model: &str, context: &Context, dry_run: bool) -> Result<ContextBuilt, MkError> {
         context.check()?;
-        let body = ContextBuild { model: Some(model.to_string()), context: context.clone(), dry_run: dry_run.then_some(true), class: None, priority: None };
+        let body = ContextBuild { model: model.to_string(), context: context.clone(), dry_run: dry_run.then_some(true), class: None, priority: None };
         self.mk
             .json(Family::Council, Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.mk.timeout, 200, "context build")
             .await
@@ -223,9 +224,9 @@ mod tests {
 
     fn greedy(context: Context) -> GenerationRequest {
         GenerationRequest {
-            model: Some(TOY.to_string()),
+            model: TOY.to_string(),
             context,
-            max_tokens: Some(24),
+            max_tokens: 24,
             sample: Some(Sample { temperature: Some(0.0), ..Sample::default() }),
             stream: None,
             decisions: Vec::new(),
@@ -246,7 +247,7 @@ mod tests {
         let (_server, c) = fake();
         let id = c.council().identity().await.unwrap();
         assert!(id.has(gogi_proto::identity::Capability::Pins));
-        let toy = id.route(None).unwrap();
+        let toy = id.route("toy").unwrap();
         assert_eq!(toy.model, TOY);
         assert!(toy.has(gogi_proto::identity::Capability::Generate) && toy.limits.context_tokens > 0);
     }
@@ -257,13 +258,14 @@ mod tests {
     async fn a_second_build_feeds_nothing() {
         let (_server, c) = fake();
         let first = c.council().build_context(TOY, &chat(), false).await.unwrap();
-        assert!(first.fed > 0 && first.from.is_none() && !first.dry_run);
+        assert!(first.usage.fed > 0 && first.from.is_none() && !first.dry_run);
+        first.usage.check().unwrap();
         let again = c.council().build_context(TOY, &chat(), false).await.unwrap();
-        assert_eq!((again.fed, &again.head), (0, &first.head));
+        assert_eq!((again.usage.fed, &again.head), (0, &first.head));
         let mut longer = chat();
         longer.messages.push(Message::assistant("fine").snapped());
         let dry = c.council().build_context(TOY, &longer, true).await.unwrap();
-        assert!(dry.dry_run && dry.kept == first.tokens && dry.fed > 0, "{dry:?}");
+        assert!(dry.dry_run && dry.usage.kept == first.usage.prompt && dry.usage.fed > 0, "{dry:?}");
     }
 
     /// A served model that is not ready answers 503 `model_unavailable`
@@ -298,15 +300,15 @@ mod tests {
         let mut other = chat();
         other.messages.push(Message::assistant("never push to main").snapped());
         let request = DecisionRequest {
-            model: Some(TOY.to_string()),
-            state: json!("git push origin main"),
-            spec_id: Some(held.spec_id.to_string()),
+            model: TOY.to_string(),
+            case: json!("git push origin main"),
+            spec_id: held.spec_id.to_string(),
             contexts: vec![chat(), other],
             ..DecisionRequest::default()
         };
         let response = c.council().decide_traced(&request, Duration::from_secs(5), Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")).await.unwrap();
         gogi_proto::math::verify(&response, &request.expect()).unwrap();
-        assert_eq!(response.reads.iter().map(|r| r.context.clone()).collect::<Vec<_>>(), [Some("0".to_string()), Some("1".to_string())]);
+        assert_eq!(response.reads.iter().map(|r| r.context.clone()).collect::<Vec<_>>(), [Some(0), Some(1)]);
         assert_eq!(response.identity.spec_id.as_ref(), Some(&held.spec_id));
     }
 
@@ -330,7 +332,7 @@ mod tests {
     async fn reads_return_one_read_per_context_and_suffix() {
         let (_server, c) = fake();
         let request = ReadsRequest {
-            model: Some(TOY.to_string()),
+            model: TOY.to_string(),
             contexts: vec![chat()],
             suffixes: vec!["a ".into(), "b ".into()],
             letters: vec!["A".into(), "B".into()],
@@ -367,7 +369,7 @@ mod tests {
         next.messages.push(done.as_message().expect("the reply made no unparsed call"));
         next.messages.push(Message::user("and then?"));
         let built = c.council().build_context(TOY, &next, false).await.unwrap();
-        assert!(built.kept > done.usage.prompt, "{built:?} after {:?}", done.usage);
+        assert!(built.usage.kept > done.usage.prompt, "{built:?} after {:?}", done.usage);
     }
 
     /// The fake calls the first tool when the last message says `CALL`; the
@@ -375,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_call_carries_its_id_into_the_next_context() {
         let (_server, c) = fake();
-        let tool = json!({"type": "function", "function": {"name": "ls", "description": "List.", "parameters": {"type": "object", "properties": {}}}});
+        let tool = gogi_proto::Tool::new("ls", json!({"type": "object", "properties": {}}));
         let context = Context { tools: vec![tool], messages: vec![Message::user("CALL ls")], ..Context::default() };
         let done = c.council().generate(&greedy(context.clone()), Duration::from_secs(5)).await.unwrap();
         let [ReplyToolCall::Parsed { id, name, .. }] = done.tool_calls.as_slice() else { panic!("{:?}", done.tool_calls) };
@@ -396,17 +398,17 @@ mod tests {
         assert!(matches!(c.council().get_pins("a/b").await, Err(MkError::Request(_))));
         let forever = PinsPut { snapshots: vec![], ttl_s: 86_401 };
         assert!(matches!(c.council().put_pins("k", &forever).await, Err(MkError::Request(_))));
-        let empty = GenerationRequest { max_tokens: Some(0), ..greedy(chat()) };
+        let empty = GenerationRequest { max_tokens: 0, ..greedy(chat()) };
         assert!(matches!(c.council().generate(&empty, Duration::from_secs(1)).await, Err(MkError::Request(_))));
-        let both = DecisionRequest { state: json!("s"), ..DecisionRequest::default() };
-        assert!(matches!(c.council().decide_traced(&both, Duration::from_secs(1), None).await, Err(MkError::Request(_))));
+        let number = DecisionRequest { model: TOY.into(), case: json!(3), spec_id: gate_spec().id(), ..DecisionRequest::default() };
+        assert!(matches!(c.council().decide_traced(&number, Duration::from_secs(1), None).await, Err(MkError::Request(_))));
         assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn a_spec_held_under_another_id_is_an_error() {
         let spec = gate_spec();
-        let held = json!({"spec_id": format!("sha256:{}", "0".repeat(64)), "spec": spec.value, "template": "t"});
+        let held = json!({"spec_id": format!("sha256:{}", "0".repeat(64)), "spec": spec.value});
         let (base, _) = serve(vec![reply(200, held.to_string())]).await;
         let err = client(&base).council().post_spec(&spec).await.unwrap_err();
         assert!(matches!(&err, MkError::SpecIdMismatch { computed, .. } if *computed == spec.id()), "{err:?}");
@@ -422,11 +424,11 @@ mod tests {
         let full = json!({"error": {"type": "context_full", "message": "the prompt takes 32760 of 32768 tokens",
                                     "prompt_tokens": 32760, "context_tokens": 32768}})
         .to_string();
-        let too_large = json!({"error": {"type": "too_large", "message": "state", "param": "state_bytes"}}).to_string();
+        let too_large = json!({"error": {"type": "too_large", "message": "case", "param": "case_bytes"}}).to_string();
         let (base, _) = serve(vec![reply(413, full.clone()), reply(413, full), reply(413, too_large)]).await;
         let c = client(&base);
         let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
-        let MkError::ContextFull { message, body } = &err else { panic!("{err:?}") };
+        let MkError::ContextFull { message, body, .. } = &err else { panic!("{err:?}") };
         assert!(message.contains("32760") && body.contains("context_tokens"), "{message} {body}");
         assert_eq!(err.status(), Some(413));
         let err = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
@@ -446,22 +448,49 @@ mod tests {
         assert!(matches!(err, MkError::ContextFull { .. }), "{err:?}");
     }
 
+    /// A stream cut before `done` is truncated. An `error` event ends it as
+    /// [`MkError::CouncilStream`] with the request id, and a `ping` or an
+    /// event the contract does not name is skipped.
+    ///
+    /// Falsified by a ping or an unknown event that ends the stream, or an
+    /// error event decoded in `/mk/v1`'s shape.
     #[tokio::test]
     async fn a_generation_cut_before_done_is_truncated_and_an_error_event_ends_it() {
-        let token = json!({"id": 1, "piece": "Fi", "phase": "answer", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
-        let token = format!("event: token\ndata: {token}\n\n");
-        let error = r#"{"error":{"code":503,"message":"spin","type":"pass_timeout_error"}}"#;
+        let token = json!({"id": 1, "piece": "Fi", "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
+        let token = format!("event: ping\ndata: {{}}\n\nevent: token\ndata: {token}\n\nevent: progress\ndata: {{}}\n\n");
+        let error = r#"{"error":{"type":"model_unavailable","message":"the model unloaded","model":"m","status":"unloaded"},"request_id":"req_7"}"#;
         let (base, _) = serve(vec![sse(token.clone()), sse(format!("{token}event: error\ndata: {error}\n\n"))]).await;
         let c = client(&base);
         for want_stream_error in [false, true] {
             let mut s = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
-            assert!(matches!(s.next().await, Some(Ok(GenerationEvent::Token(_)))));
+            let Some(Ok(GenerationEvent::Token(t))) = s.next().await else { panic!("a token first") };
+            assert_eq!(t.phase, gogi_proto::generation::Phase::Content);
             let last = s.next().await.unwrap();
             match want_stream_error {
                 false => assert!(matches!(last, Err(MkError::Truncated(_))), "{last:?}"),
-                true => assert!(matches!(last, Err(MkError::Stream(_))), "{last:?}"),
+                true => {
+                    let Err(err) = last else { panic!("{last:?}") };
+                    assert!(matches!(&err, MkError::CouncilStream { request_id: Some(id), .. } if id == "req_7"), "{err:?}");
+                    assert_eq!(err.status(), Some(503));
+                    assert!(err.to_string().contains("(request req_7)"), "{err}");
+                }
             }
             assert!(s.next().await.is_none());
+        }
+    }
+
+    /// An error status names its request by the `request-id` header, else
+    /// by the body's `request_id`.
+    #[tokio::test]
+    async fn an_error_status_names_its_request() {
+        let busy = json!({"error": {"type": "busy", "message": "full"}, "request_id": "req_body"}).to_string();
+        let with_header = crate::test_server::Reply { headers: vec![("request-id", "req_head".into())], ..reply(429, busy.clone()) };
+        let (base, _) = serve(vec![with_header, reply(429, busy)]).await;
+        let c = client(&base);
+        for want in ["req_head", "req_body"] {
+            let err = c.council().identity().await.unwrap_err();
+            assert!(matches!(&err, MkError::Status { status: 429, request_id: Some(id), .. } if id == want), "{err:?}");
+            assert!(err.to_string().ends_with(&format!("(request {want})")), "{err}");
         }
     }
 }

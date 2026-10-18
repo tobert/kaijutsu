@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use gogi_proto::context::{Context, ContextBuild, ContextBuilt, SnapshotInfo};
+use gogi_proto::context::{Context, ContextBuild, ContextBuilt, SnapshotInfo, Usage};
 use gogi_proto::decision::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
 use gogi_proto::identity::{ModelLimits, ModelStatus, ServedModel, ServerIdentity, ServerLimits};
 use gogi_proto::math::{self, Row, WeightSpec};
@@ -118,7 +118,7 @@ fn server_identity() -> ServerIdentity {
             },
             capabilities: Vec::new(),
         }],
-        limits: ServerLimits { state_bytes: 100000, choice_options: 8, questions_per_spec: None, pin_bytes: None },
+        limits: ServerLimits { case_bytes: 100000, choice_options: 8, questions_per_spec: None, pin_bytes: None },
         capabilities: Vec::new(),
         extensions: Vec::new(),
     }
@@ -140,9 +140,7 @@ fn built(context: &Context, dry_run: bool) -> Result<ContextBuilt> {
     Ok(ContextBuilt {
         model: "fleet-council".into(),
         head: head.clone(),
-        tokens,
-        kept: 0,
-        fed: tokens,
+        usage: Usage { prompt: tokens, kept: 0, fed: tokens, completion: 0, reasoning: 0 },
         from: None,
         dry_run,
         snapshots: vec![SnapshotInfo { id: head, message: tokens.saturating_sub(1), tokens, tier: None, bytes: None }],
@@ -246,8 +244,10 @@ pub fn answer(request: &DecisionRequest, spec: &Spec, verdict: Verdict, undo: Op
         .collect::<Result<_>>()?;
     let mut id = identity();
     id["spec_id"] = json!(request.spec_id);
+    let prompt: usize = request.contexts.iter().map(|c| c.messages.len()).sum();
     let body = json!({
         "model": "fleet-council",
+        "usage": {"prompt": prompt, "kept": 0, "fed": prompt, "completion": 0, "reasoning": 0},
         "answers": pooled_answers,
         "reads": reads,
         "pool": {"method": method, "weights": weights, "normalized": normalized},
@@ -487,14 +487,14 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value>
         ("POST", "/council/v2/contexts") => {
             let build: ContextBuild = serde_json::from_str(body).context("a context build does not decode")?;
             build.context.check().map_err(|e| anyhow::anyhow!("a context build is refused: {e}"))?;
-            server_identity().route(build.model.as_deref()).map_err(|e| anyhow::anyhow!("a context build is refused: {e}"))?;
+            server_identity().route(&build.model).map_err(|e| anyhow::anyhow!("a context build is refused: {e}"))?;
             Ok(serde_json::to_value(built(&build.context, build.dry_run.unwrap_or(false))?)?)
         }
         ("POST", "/council/v2/decisions") => {
             let request: DecisionRequest = serde_json::from_str(body).context("a decision request does not decode")?;
             request.validate().map_err(|e| anyhow::anyhow!("a decision request is refused: {e}"))?;
-            server_identity().route(request.model.as_deref()).map_err(|e| anyhow::anyhow!("a decision request is refused: {e}"))?;
-            let spec_id = request.spec_id.as_ref().context("a decision with no spec_id; the scripted council answers specs only")?;
+            server_identity().route(&request.model).map_err(|e| anyhow::anyhow!("a decision request is refused: {e}"))?;
+            let spec_id = &request.spec_id;
             let spec = shared
                 .specs
                 .lock()
@@ -539,7 +539,8 @@ mod tests {
         let spec_id = spec().id();
         let contexts: Vec<Value> = (0..contexts).map(context).collect();
         serde_json::from_value(json!({
-            "state": "touch x",
+            "model": "fleet-council",
+            "case": "touch x",
             "spec_id": spec_id,
             "contexts": contexts,
             "pool": {"method": "loglinear", "weights": "mass"},
@@ -681,18 +682,18 @@ mod tests {
         let (status, id) = call("GET", "/council/v2/identity", "");
         assert_eq!(status, 200, "{id}");
         let id: ServerIdentity = serde_json::from_value(id).unwrap();
-        assert_eq!(id.route(None).unwrap().model, "fleet-council");
+        assert_eq!(id.route("fleet-council").unwrap().model, "fleet-council");
         assert!(id.capabilities.is_empty(), "no pins capability, so the kernel sends no pins");
         let (status, held) = call("POST", "/council/v2/specs", SHELL_BUMP);
         assert_eq!(status, 200, "{held}");
         assert_eq!(held["spec_id"], spec().id());
-        let build = json!({"context": context(0)}).to_string();
+        let build = json!({"model": "fleet-council", "context": context(0)}).to_string();
         let (status, first) = call("POST", "/council/v2/contexts", &build);
         assert_eq!(status, 200, "{first}");
         let first: ContextBuilt = serde_json::from_value(first).unwrap();
         let again: ContextBuilt = serde_json::from_value(call("POST", "/council/v2/contexts", &build).1).unwrap();
         assert_eq!(first.head, again.head, "the same context has the same head");
-        let other = json!({"context": context(1), "dry_run": true}).to_string();
+        let other = json!({"model": "fleet-council", "context": context(1), "dry_run": true}).to_string();
         let other: ContextBuilt = serde_json::from_value(call("POST", "/council/v2/contexts", &other).1).unwrap();
         assert_ne!(first.head, other.head);
         assert!(other.dry_run);

@@ -10,7 +10,7 @@
 //! (`llm::endpoint::mk_call`), waiting no later than the caller's deadline,
 //! and a 429 is sent again after its cooldown.
 //!
-//! The server speaks council v2 (gogi's `docs/council-api-v2.md`) and keeps
+//! The server speaks council v2 (gogi's `docs/council-api.md`) and keeps
 //! no context records: a
 //! seat is its context value, the projected context as a queue seat for the
 //! decision's spec (`super::seat`). A seat is built with
@@ -63,15 +63,10 @@ impl Prepared {
         self.contexts.iter().find(|c| c.house_rules)
     }
 
-    /// The name the answer's reads give the context at `index`: its index
-    /// in the decision's `contexts`.
-    pub(crate) fn read_name(&self, index: usize) -> String {
-        index.to_string()
-    }
-
-    /// The prepared context a read names ([`Self::read_name`]).
-    pub(crate) fn read_context(&self, name: &str) -> Option<&PreparedContext> {
-        name.parse::<usize>().ok().filter(|i| i.to_string() == name).and_then(|i| self.contexts.get(i))
+    /// The prepared context a read names by its index in the decision's
+    /// `contexts`.
+    pub(crate) fn read_context(&self, index: u64) -> Option<&PreparedContext> {
+        self.contexts.get(usize::try_from(index).ok()?)
     }
 }
 
@@ -611,14 +606,18 @@ impl CouncilSync {
     }
 
     /// The served model `model` names on the server, by its `model` or an
-    /// alias; `None` names the only one. A model that is not `ready` is a
-    /// miss, and its identity is asked again on the next prepare.
+    /// alias; `None` names the only one, and every request sends its
+    /// `model`. A model that is not `ready` is a miss, and its identity is
+    /// asked again on the next prepare.
     fn served(&self, link: &Link<'_>, identity: &ServerIdentity, model: Option<&str>) -> Result<ServedModel, PrepareMiss> {
         let server = link.server;
-        let served = identity.route(model).map_err(|e| {
-            let names: Vec<&str> = identity.models.iter().map(|m| m.model.as_str()).collect();
-            PrepareMiss(format!("council server {server}: {}; it serves {}", e.message, names.join(", ")))
-        })?;
+        let names: Vec<&str> = identity.models.iter().map(|m| m.model.as_str()).collect();
+        let served = match (model, identity.models.as_slice()) {
+            (Some(name), _) => identity.route(name).map_err(|e| e.message),
+            (None, [only]) => Ok(only),
+            (None, all) => Err(format!("model is required: this server serves {} models", all.len())),
+        }
+        .map_err(|why| PrepareMiss(format!("council server {server}: {why}; it serves {}", names.join(", "))))?;
         if served.status != ModelStatus::Ready {
             self.state.lock().identities.remove(&link.key);
             return Err(PrepareMiss(format!(
@@ -1082,7 +1081,7 @@ pub(super) mod mock {
                            "limits": {"context_tokens": 1, "decision_context_tokens": 1, "snapshot_bytes": 1,
                                       "contexts_per_decision": 4, "default_timeout_ms": 1000},
                            "capabilities": capabilities}],
-               "limits": {"state_bytes": 1, "choice_options": 8},
+               "limits": {"case_bytes": 1, "choice_options": 8},
                "capabilities": capabilities})
         .to_string()
     }
@@ -1096,7 +1095,8 @@ pub(super) mod mock {
                 *builds += 1;
                 reply(
                     200,
-                    json!({"model": "m", "head": snap(*builds), "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                    json!({"model": "m", "head": snap(*builds), "usage": {"prompt": 1, "kept": 0, "fed": 1, "completion": 0, "reasoning": 0},
+                           "from": null, "dry_run": false,
                            "snapshots": [{"id": snap(*builds), "message": 1, "tokens": 1}]})
                     .to_string(),
                 )
@@ -1353,8 +1353,8 @@ mod tests {
 
         let response = answer.expect("answered");
         gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
-        assert_eq!(response.reads[0].context.as_deref(), Some("0"));
-        assert_eq!(p.read_context("0").map(|c| c.context_id), Some(r.reviewer));
+        assert_eq!(response.reads[0].context, Some(0));
+        assert_eq!(p.read_context(0).map(|c| c.context_id), Some(r.reviewer));
     }
 
     /// One council context read under two specs is two queue seats, each with its spec's answers schema, and an unchanged seat
@@ -1379,7 +1379,7 @@ mod tests {
         let built = r.mock.bodies("/council/v2/contexts");
         assert_eq!(built.len(), 2, "each seat once");
         let answers = |built: &serde_json::Value| -> Vec<String> {
-            let props = &built["context"]["tools"][0]["function"]["parameters"]["properties"]["answers"]["properties"];
+            let props = &built["context"]["tools"][0]["input_schema"]["properties"]["answers"]["properties"];
             props.as_object().unwrap().keys().cloned().collect()
         };
         assert_eq!(answers(&built[0]), ["undo", "verdict"]);
@@ -1979,7 +1979,7 @@ mod tests {
             .await
             .expect("answered");
         gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
-        assert_eq!(response.reads[0].context.as_deref(), Some("0"));
+        assert_eq!(response.reads[0].context, Some(0));
         assert_eq!(response.identity.spec_id.as_ref(), Some(&p.spec_id));
         println!(
             "decision in {} ms: answers {}",
@@ -2047,7 +2047,7 @@ mod tests {
         assert_eq!(client.council().snapshot(&p.contexts[0].head).await.unwrap().model, "b");
 
         let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
-        assert_eq!(request.model.as_deref(), Some("b"));
+        assert_eq!(request.model, "b");
         let response = super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default())
             .await
             .expect("answered");

@@ -1,6 +1,6 @@
 //! Translate kaijutsu [`Message`]s, tools, and tunables into a
 //! `/mk/v1/generate` request (`docs/mk.md`, "Request mapping"), or into
-//! council v2 messages (gogi's `docs/council-api-v2.md`).
+//! council v2 messages (gogi's `docs/council-api.md`).
 //!
 //! - The system prompt is one `system` message, first. A kernel instruction
 //!   later in the history is a `system` message at its point, which the
@@ -8,13 +8,14 @@
 //! - `/mk/v1` has no tool-call ids. Results go back as `tool` messages in
 //!   the order of the calls they answer, matched by the kernel's ids; a
 //!   history whose results do not answer exactly the preceding calls is
-//!   refused. Council v2 keeps the ids.
+//!   refused. Council v2 keeps the ids, and marks a failed result with
+//!   `is_error` where `/mk/v1` prefixes `[tool error]`.
 //! - `Reasoning` blocks go back as `reasoning_content`; the template decides
 //!   what to keep.
 //! - The service takes text only. An image becomes a visible marker.
 
 use kaijutsu_mk::Json;
-use gogi_proto::{Message as V2Message, Role as V2Role, ToolCall as V2ToolCall};
+use gogi_proto::{Message as V2Message, Role as V2Role, Tool as V2Tool, ToolCall as V2ToolCall};
 use kaijutsu_mk::generate::{Function, Message as MkMessage, ReasoningEffort, Role as MkRole, Tool, ToolCallIn};
 
 use crate::llm::{ContentBlock, LlmError, LlmResult, Message, MessageContent, Role, ToolDefinition};
@@ -55,6 +56,22 @@ pub(super) fn tools(tools: &[ToolDefinition]) -> LlmResult<Vec<Tool>> {
         .collect()
 }
 
+/// The tool definitions as council v2 tools. An input schema that is not a
+/// JSON object is refused.
+pub(super) fn tools_v2(tools: &[ToolDefinition]) -> LlmResult<Vec<V2Tool>> {
+    tools
+        .iter()
+        .map(|t| match &t.input_schema {
+            serde_json::Value::Object(schema) => Ok(V2Tool {
+                name: t.name.clone(),
+                description: (!t.description.is_empty()).then(|| t.description.clone()),
+                input_schema: schema.clone(),
+            }),
+            _ => Err(LlmError::InvalidRequest(format!("tool {:?} input schema is not a JSON object", t.name))),
+        })
+        .collect()
+}
+
 /// The system prompt and history as the service's messages.
 pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<MkMessage>> {
     Ok(walk(system, history)?
@@ -68,13 +85,14 @@ pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<V
                 reasoning_content: reasoning,
                 tool_calls: calls.into_iter().map(|(_, name, arguments)| ToolCallIn { name, arguments }).collect(),
             },
+            Walked::Tool { content, is_error: true, .. } => MkMessage::tool(format!("[tool error]\n{content}")),
             Walked::Tool { content, .. } => MkMessage::tool(content),
         })
         .collect())
 }
 
 /// The system prompt and history as council v2 messages
-/// (gogi's `docs/council-api-v2.md`, "Contexts"), with snapshot boundaries.
+/// (gogi's `docs/council-api.md`, "Contexts"), with snapshot boundaries.
 ///
 /// Calls keep the kernel's ids, and each result names the call it answers.
 /// An assistant message leaves out empty text. `snap` marks the system
@@ -95,13 +113,14 @@ pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResul
                 tool_calls: calls
                     .into_iter()
                     .map(|(id, name, arguments)| match serde_json::to_value(&arguments) {
-                        Ok(serde_json::Value::Object(arguments)) => Ok(V2ToolCall { id, name, arguments }),
+                        Ok(serde_json::Value::Object(input)) => Ok(V2ToolCall { id, name, input }),
                         _ => Err(LlmError::InvalidRequest(format!("tool call {id} arguments are not a JSON object"))),
                     })
                     .collect::<LlmResult<_>>()?,
                 ..V2Message::assistant("")
             },
-            Walked::Tool { id, content } => V2Message::tool(id, content),
+            Walked::Tool { id, content, is_error: true } => V2Message::tool_error(id, content),
+            Walked::Tool { id, content, .. } => V2Message::tool(id, content),
         }) })
         .collect::<LlmResult<_>>()?;
     for i in 0..out.len() {
@@ -122,7 +141,7 @@ enum Walked {
     User(String),
     /// Calls are `(id, name, arguments)`.
     Assistant { content: Option<String>, reasoning: Option<String>, calls: Vec<(String, String, Json)> },
-    Tool { id: String, content: String },
+    Tool { id: String, content: String, is_error: bool },
 }
 
 fn walk(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<Walked>> {
@@ -207,13 +226,12 @@ fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &m
         }
         MessageContent::Blocks(blocks) => blocks,
     };
-    let mut results: Vec<(&str, String)> = Vec::new();
+    let mut results: Vec<(&str, String, bool)> = Vec::new();
     let mut text = String::new();
     for block in blocks {
         match block {
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                let body = if *is_error { format!("[tool error]\n{content}") } else { content.clone() };
-                results.push((tool_use_id.as_str(), body));
+                results.push((tool_use_id.as_str(), content.clone(), *is_error));
             }
             ContentBlock::Text { text: t } => join(&mut text, t),
             ContentBlock::Image { hash, media_type, .. } => {
@@ -226,10 +244,11 @@ fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &m
         return Err(pairing(index, format!("{} call(s) and {} result(s)", calls.len(), results.len())));
     }
     for id in calls.drain(..) {
-        let Some(at) = results.iter().position(|(r, _)| *r == id) else {
+        let Some(at) = results.iter().position(|(r, _, _)| *r == id) else {
             return Err(pairing(index, format!("no result answers call {id}")));
         };
-        out.push(Walked::Tool { content: results.swap_remove(at).1, id });
+        let (_, content, is_error) = results.swap_remove(at);
+        out.push(Walked::Tool { content, id, is_error });
     }
     if !text.is_empty() {
         out.push(Walked::User(text));
@@ -358,10 +377,10 @@ mod tests {
                 {"role": "system", "content": "rules", "snap": true},
                 {"role": "user", "content": "look", "snap": true},
                 {"role": "assistant", "reasoning": "two calls",
-                 "tool_calls": [{"id": "a", "name": "ls", "arguments": {"path": "/"}},
-                                {"id": "b", "name": "cat", "arguments": {"path": "/x"}}]},
+                 "tool_calls": [{"id": "a", "name": "ls", "input": {"path": "/"}},
+                                {"id": "b", "name": "cat", "input": {"path": "/x"}}]},
                 {"role": "tool", "tool_call_id": "a", "content": "x"},
-                {"role": "tool", "tool_call_id": "b", "content": "[tool error]\nno such file", "snap": true},
+                {"role": "tool", "tool_call_id": "b", "content": "no such file", "is_error": true, "snap": true},
                 {"role": "user", "content": "and hurry", "snap": true},
             ])
         );

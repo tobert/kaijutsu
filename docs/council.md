@@ -3,7 +3,7 @@
 **Status: built, off by default.** The gate consults the council on both
 paths when `gate.toml` enables it for a context type, with a second decision
 for each program a submission runs; report-stop is built but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is council v2, gogi's
-`docs/council-api-v2.md` (github.com/tobert/gogi), and the kernel uses
+`docs/council-api.md` (github.com/tobert/gogi), and the kernel uses
 `gogi-proto` for its types, spec ids, and pooling math; outside source
 material is `docs/council-dossier.md`.
 
@@ -255,7 +255,7 @@ compacting."
 
 ### Council v2 seats
 
-The kernel speaks council v2 (gogi's `docs/council-api-v2.md`) and nothing
+The kernel speaks council v2 (gogi's `docs/council-api.md`) and nothing
 else. A server whose `GET /council/v2/identity` fails, a 404 included, is a
 miss for every decision on it. The server keeps no context records: there
 are no server-side context ids, and a seat is sent whole each time.
@@ -270,8 +270,14 @@ are no server-side context ids, and a seat is sent whole each time.
   identity again.
 - **A seat is its context value.** Each council context, read under a
   spec, is a queue seat: the projection as messages, a task message, and
-  calls to the `next_command` queue tool whose `answers` schema is the
-  spec's (`council/seat.rs`). One context under two specs is two seats.
+  calls to the `next_command` queue tool, `{name, description,
+  input_schema}`, whose `answers` schema is the spec's (`council/seat.rs`).
+  Each call is `{id, name, input}`. One context under two specs is two
+  seats.
+- **A decision sends its case as `case`,** with the served model's
+  `model` and the spec's `spec_id`. A failed call names the server's
+  `request-id` in its miss cause, so the server's log can be searched for
+  it.
 - **A seat is built when it changes.** The kernel builds a seat with
   `POST /council/v2/contexts` the first time and whenever its value
   changes, and remembers the head the server reported.
@@ -561,8 +567,8 @@ shipped. A fresh session resumes at the first step not marked done.
 ## Specs and cases
 
 The gate holds one spec per kind of case: the shell spec and the program
-spec. `gate.toml` refuses a second spec of one case. The shell spec is the example in gogi's `docs/council-api.md`, "A
-decision, end to end", without its `text` question; it lives at
+spec. `gate.toml` refuses a second spec of one case. The shell spec is the example in gogi's `docs/council-api.md`, "Specs",
+without its `text` question; it lives at
 `/config/kernel/council/shell-gate.json`. The kernel reads each spec with
 `gogi_proto::spec::parse_spec` under mkviolet's limits (16 questions, 26
 options per choice) with `text` questions allowed up to 4096 tokens, and a
@@ -574,7 +580,7 @@ and again after a decision's 404 or a failed call, and treats a server that
 answers with a different id as a fault. A spec change is a new spec id and
 new thresholds.
 
-The shell case's `state` is a JSON object: the submitted command whole,
+The shell case, a decision's `case`, is a JSON object: the submitted command whole,
 the seat's context type and working directory, each statement's commands
 as kaish planned them with what the kernel resolved about them, and, when
 the submission runs programs, their decisions' outcomes (`programs`, see
@@ -592,7 +598,7 @@ the submission runs programs, their decisions' outcomes (`programs`, see
 
 ## The shell case
 
-`ls -la src`, with the seat in `/home/u/src/proj`, is this `state`:
+`ls -la src`, with the seat in `/home/u/src/proj`, is this `case`:
 
 ```json
 {"command": "ls -la src", "context_type": "coder", "cwd": "/home/u/src/proj",
@@ -691,7 +697,7 @@ does, so the council reads the file too (`council/programs.rs`).
   heredoc, and a `cat > FILE` heredoc; a file operand's text was never in
   the shell case. Text the submission spells differently, such as with
   escapes, stays as written.
-- **The program case.** `state` holds `invocation` (the `command` that runs the
+- **The program case.** The `case` holds `invocation` (the `command` that runs the
   program, its `statement`, and the whole `submission`), `path`,
   `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
   `imports_not_shown`, and `program`, the text, last.
@@ -885,9 +891,10 @@ posts the spec again.
   has kind `mk` names the server for that seat's decisions ("mk bumps",
   "lfm2d bumps"); see "Configuration". A `gate` slot on a backend of any
   other kind, such as Jev through OpenRouter, is a miss.
-- **Jev through OpenRouter, for comparison only.** It speaks the Decisions
-  API, which our contract includes, but it holds no contexts, so a
-  comparison renders each context into `state` and pays for it per request.
+- **Jev through OpenRouter, for comparison only.** It speaks the gateway
+  Decisions API, which council v2 no longer accepts, and it holds no
+  contexts, so a comparison renders each context into the Decisions API's
+  `state` and pays for it per request.
 
 The kernel talks to every server through one port with one implementation
 of the wire contract, `gogi-proto`. It recomputes each pooled answer from

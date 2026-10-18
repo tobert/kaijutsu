@@ -444,15 +444,16 @@ impl MkClient {
 
 /// One decoded event of a reply stream.
 pub trait StreamItem: Sized {
-    /// Decodes one server-sent event. An `error` event is an error.
-    fn decode(frame: &Frame) -> Result<Self, MkError>;
+    /// Decodes one server-sent event. An `error` event is an error, and
+    /// `None` is an event the stream skips.
+    fn decode(frame: &Frame) -> Result<Option<Self>, MkError>;
     /// Whether this event ends the stream.
     fn is_last(&self) -> bool;
 }
 
 impl StreamItem for GenerateEvent {
-    fn decode(frame: &Frame) -> Result<Self, MkError> {
-        decode_frame(frame)
+    fn decode(frame: &Frame) -> Result<Option<Self>, MkError> {
+        decode_frame(frame).map(Some)
     }
 
     fn is_last(&self) -> bool {
@@ -481,7 +482,11 @@ impl<T: StreamItem> EventStream<T> {
                 return None;
             }
             if let Some(frame) = self.frames.pop_front() {
-                let event = T::decode(&frame);
+                let event = match T::decode(&frame) {
+                    Ok(None) => continue,
+                    Ok(Some(e)) => Ok(e),
+                    Err(e) => Err(e),
+                };
                 self.ended = match &event {
                     Ok(e) => e.is_last(),
                     Err(_) => true,

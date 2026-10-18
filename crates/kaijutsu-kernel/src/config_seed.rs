@@ -29,7 +29,7 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
 
 /// Embedded council spec for shell statements, seeded to
-/// `/config/kernel/council/shell-gate.json` (gogi's `docs/council-api-v2.md`).
+/// `/config/kernel/council/shell-gate.json` (gogi's `docs/council-api.md`).
 pub const DEFAULT_COUNCIL_SHELL_GATE: &str =
     include_str!("../../../assets/defaults/council/shell-gate.json");
 

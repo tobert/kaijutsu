@@ -193,7 +193,7 @@ pub(crate) fn elide(text: &str, programs: &[&str]) -> String {
     programs.iter().filter(|p| !p.is_empty()).fold(text.to_string(), |t, p| t.replace(p, JUDGED_SEPARATELY))
 }
 
-/// The case's `state`: the command whole, the seat's context type, the
+/// The shell case, sent as a decision's `case`: the command whole, the seat's context type, the
 /// directory relative paths resolve against, and each statement with its
 /// commands as kaish planned them and what the kernel resolved about them
 /// (`super::shell_case`), with members in that order. Each of `judged`,
@@ -245,7 +245,7 @@ struct Invocation<'a> {
     submission: &'a str,
 }
 
-/// A program case's `state`: how the program is invoked (the command, its
+/// A program case, sent as a decision's `case`: how the program is invoked (the command, its
 /// statement, and the submission), the file it was read from, its language,
 /// the seat's context type and working directory, the local imports the
 /// decision does not show, and the program text last, with members in that
@@ -275,16 +275,16 @@ pub(crate) fn program_case_state(
     serde_json::from_str(&text).expect("serde_json output is JSON")
 }
 
-/// The decision request for `state` against the prepared seats, each sent
+/// The decision request for `case` against the prepared seats, each sent
 /// whole. The answer's reads name each seat by its index
-/// ([`Prepared::read_name`]). The thought before the answer stays closed:
+/// ([`Prepared::read_context`]). The thought before the answer stays closed:
 /// the request sends no `think`.
-pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, state: serde_json::Value) -> DecisionRequest {
+pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, case: serde_json::Value) -> DecisionRequest {
     DecisionRequest {
-        model: Some(prepared.identity.model.clone()),
-        spec_id: Some(prepared.spec_id.to_string()),
+        model: prepared.identity.model.clone(),
+        spec_id: prepared.spec_id.to_string(),
         contexts: prepared.contexts.iter().map(|c| (*c.seat).clone()).collect(),
-        state,
+        case,
         pool: Some(Pool {
             method: Some(match council.pool_method {
                 CouncilPoolMethod::Linear => PoolMethod::Linear,
@@ -422,10 +422,10 @@ pub(crate) fn classify_case(
     if let Err(mismatch) = gogi_proto::math::verify(response, &request.expect()) {
         return miss(format!("the answer's numbers do not recompute ({mismatch})"), None);
     }
-    if let (Some(read), Some(asked)) = (&response.identity.spec_id, &request.spec_id)
-        && read.as_str() != asked
+    if let Some(read) = &response.identity.spec_id
+        && read.as_str() != request.spec_id
     {
-        return miss(format!("the server read spec {read}, not the spec asked for, {asked}"), None);
+        return miss(format!("the server read spec {read}, not the spec asked for, {}", request.spec_id), None);
     }
     let Some(threshold) = council.threshold_for(spec_name) else {
         return miss(format!("no threshold for spec {spec_name}; declare one in gate.toml"), None);
@@ -465,7 +465,7 @@ pub(crate) fn classify_case(
                 }
                 _ => {
                     return miss(
-                        format!("the read of {} has no `{question}` choice", read.context.as_deref().unwrap_or("the spec")),
+                        format!("the read of {} has no `{question}` choice", read_of(read)),
                         Some(threshold),
                     )
                 }
@@ -475,7 +475,7 @@ pub(crate) fn classify_case(
                     format!(
                         "low mass: the read of {} put log probability {mass:.4} on the options of `{question}`, \
                          below the floor {}",
-                        read.context.as_deref().unwrap_or("the spec"),
+                        read_of(read),
                         threshold.mass_floor
                     ),
                     Some(threshold),
@@ -581,15 +581,21 @@ pub(crate) async fn bump_message(kernel: &crate::Kernel, bump: &BumpReason, atte
     }
 }
 
+/// What a read read, for a miss cause: its context's index, or the spec
+/// alone.
+fn read_of(read: &gogi_proto::decision::Read) -> String {
+    read.context.map_or_else(|| "the spec".into(), |i| i.to_string())
+}
+
 /// A council failure that produced no response, in plain words.
 pub(crate) fn failure_cause(error: &MkError, deadline_ms: u64) -> String {
     match error {
         MkError::Timeout => format!("no answer within the {deadline_ms} ms deadline"),
-        MkError::Status { status, error: Some(detail), .. } => {
-            format!("the council server answered {status} ({:?}: {})", detail.r#type, detail.message)
+        MkError::Status { status, error: Some(detail), request_id, .. } => {
+            format!("the council server answered {status} ({:?}: {}){}", detail.r#type, detail.message, request_note(request_id))
         }
-        MkError::Status { status, body, .. } => {
-            format!("the council server answered {status}: {}", body.chars().take(200).collect::<String>())
+        MkError::Status { status, body, request_id, .. } => {
+            format!("the council server answered {status}: {}{}", body.chars().take(200).collect::<String>(), request_note(request_id))
         }
         MkError::Transport(e) => format!("the council server could not be reached: {e}"),
         MkError::Decode { what, message, .. } => format!("the answer is outside the schema ({what}): {message}"),
@@ -599,10 +605,20 @@ pub(crate) fn failure_cause(error: &MkError, deadline_ms: u64) -> String {
         }
         // Only `/mk/v1` routes and generations produce these; a decision
         // never does.
-        other @ (MkError::Service { .. } | MkError::Stream(_) | MkError::Truncated(_) | MkError::ContextFull { .. }) => {
+        other @ (MkError::Service { .. }
+        | MkError::Stream(_)
+        | MkError::CouncilStream { .. }
+        | MkError::Truncated(_)
+        | MkError::ContextFull { .. }) => {
             format!("the megakernel failed outside the council contract: {other}")
         }
     }
+}
+
+/// ` (request <id>)` when the server named the request, so a miss cause
+/// can be found in the server's log.
+fn request_note(request_id: &Option<String>) -> String {
+    request_id.as_ref().map(|id| format!(" (request {id})")).unwrap_or_default()
 }
 
 /// The miss cause for a decision stopped at its deadline during `phase`,
@@ -1246,16 +1262,13 @@ fn build_verdict(
                 .iter()
                 .map(|read| {
                     let prepared_context =
-                        read.context.as_deref().and_then(|id| prepared.read_context(id));
+                        read.context.and_then(|i| prepared.read_context(i));
                     let expected = prepared_context.map(|c| c.head.to_string());
                     // The record names the kaijutsu context, not the id
                     // the server holds its seat under.
                     let context_id = match prepared_context {
                         Some(c) => Some(c.context_id.as_bytes().to_vec()),
-                        None => read
-                            .context
-                            .as_deref()
-                            .map(|id| ContextId::parse(id).map(|c| c.as_bytes().to_vec()).unwrap_or_else(|_| id.as_bytes().to_vec())),
+                        None => read.context.map(|i| i.to_string().into_bytes()),
                     };
                     CouncilRead {
                         context_id,
@@ -1553,9 +1566,7 @@ async fn decide_inner(
             .reads
             .iter()
             .map(|read| {
-                let label = read.context.as_deref().and_then(|id| {
-                    prepared.read_context(id).map(|c| c.label.clone())
-                });
+                let label = read.context.and_then(|i| prepared.read_context(i).map(|c| c.label.clone()));
                 let probabilities = match read.answers.get(VERDICT) {
                     Some(ReadAnswer::Choice(c)) => serde_json::json!(c.probabilities),
                     _ => serde_json::Value::Null,
@@ -1597,9 +1608,8 @@ fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
         .map(|read| {
             let label = read
                 .context
-                .as_deref()
-                .and_then(|id| prepared.read_context(id).map(|c| c.label.clone()))
-                .unwrap_or_else(|| read.context.clone().unwrap_or_else(|| "spec".into()));
+                .and_then(|i| prepared.read_context(i).map(|c| c.label.clone()))
+                .unwrap_or_else(|| read.context.map_or_else(|| "spec".into(), |i| i.to_string()));
             let answers: Vec<String> = prepared
                 .spec
                 .questions
@@ -2020,6 +2030,7 @@ pub(crate) mod test_support {
             "pool": {"method": method, "weights": weights, "normalized": normalized},
             "signals": {"control_text": []},
             "identity": id,
+            "usage": {"prompt": 10, "kept": 8, "fed": 2, "completion": 0, "reasoning": 0},
             "queue_ms": 1.0,
             "ms": 4.0,
         })
@@ -2072,9 +2083,10 @@ mod tests {
     fn request() -> DecisionRequest {
         let context = |text: &str| gogi_proto::Context { messages: vec![gogi_proto::Message::user(text)], ..Default::default() };
         DecisionRequest {
-            spec_id: Some(spec_id()),
+            model: "test-council".into(),
+            spec_id: spec_id(),
             contexts: vec![context("a"), context("b")],
-            state: serde_json::Value::from("git status"),
+            case: serde_json::Value::from("git status"),
             pool: Some(Pool { method: Some(PoolMethod::Loglinear), weights: Some(PoolWeights::Mass), values: None }),
             timeout_ms: Some(700),
             ..Default::default()
@@ -2161,7 +2173,7 @@ mod tests {
     fn a_control_text_hit_asks_whatever_the_numbers_say() {
         let req = request();
         let mut value = answer(&req, &ALLOW);
-        value["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+        value["signals"]["control_text"] = serde_json::json!([{"where": "case", "token": "<|im_end|>"}]);
         let c = classify(&req, &decode(value), &council(0.98, -0.05, true), "shell-gate");
         assert_eq!(c.outcome, Outcome::Ask);
     }
@@ -2239,8 +2251,10 @@ mod tests {
     #[test]
     fn failures_read_as_plain_causes() {
         assert_eq!(failure_cause(&MkError::Timeout, 700), "no answer within the 700 ms deadline");
-        let status = MkError::Status { status: 503, error: None, retry_after: None, body: "busy".into() };
+        let status = MkError::Status { status: 503, error: None, retry_after: None, body: "busy".into(), request_id: None };
         assert!(failure_cause(&status, 700).contains("503"));
+        let named = MkError::Status { status: 503, error: None, retry_after: None, body: "busy".into(), request_id: Some("req_9".into()) };
+        assert!(failure_cause(&named, 700).ends_with("(request req_9)"), "{}", failure_cause(&named, 700));
         let transport = MkError::Transport("connection refused".into());
         assert!(failure_cause(&transport, 700).contains("could not be reached"));
     }
@@ -2298,7 +2312,7 @@ mod tests {
         assert_eq!(body["timeout_ms"], serde_json::json!(700));
         assert_eq!(body["pool"], serde_json::json!({"method": "loglinear", "weights": "mass"}));
         assert!(body.get("ask").is_none() && body.get("options").is_none(), "the gate never narrows: {body}");
-        let text = serde_json::to_string(&req.state).unwrap();
+        let text = serde_json::to_string(&req.case).unwrap();
         let order: Vec<usize> = ["\"command\"", "\"context_type\"", "\"cwd\"", "\"statements\"", "\"mount_access\""]
             .iter()
             .map(|k| text.find(k).unwrap_or_else(|| panic!("{k} missing from {text}")))
@@ -2568,7 +2582,7 @@ mod tests {
     fn control_text_and_a_thin_read_keep_their_fallback_in_bumper_mode() {
         let req = request();
         let mut value = test_support::answer_choices(&req, &[(VERDICT, BUMP_OPTIONS, &PROCEED)]);
-        value["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+        value["signals"]["control_text"] = serde_json::json!([{"where": "case", "token": "<|im_end|>"}]);
         let c = classify(&req, &decode(value), &bumper(0.98, -0.05, true), "shell-gate");
         assert_eq!(c.outcome, Outcome::Ask);
         let thin = [[-0.001, -8.0, -9.0], [-2.0, -9.0, -9.0]];

@@ -1,5 +1,5 @@
 //! A council context as a council v2 queue seat: an agent loop whose queue
-//! tool brings each case (gogi's `docs/council-api-v2.md`, "Decisions").
+//! tool brings each case (gogi's `docs/council-api.md`, "Decisions").
 //!
 //! The seat is the projected context (its system message, then its turns),
 //! a task message, and a first call to the queue tool. Each worked example
@@ -23,7 +23,7 @@
 use std::sync::OnceLock;
 
 use gogi_proto::spec::{Question, QuestionKind, Spec};
-use gogi_proto::{Context, Message, Role, ToolCall};
+use gogi_proto::{Context, Message, Role, Tool, ToolCall};
 use serde_json::json;
 
 use super::gate::{Submission, case_state, program_case_state};
@@ -194,7 +194,7 @@ fn letter(i: usize) -> String {
 /// The queue tool for `spec`: `answers` holds one property per question,
 /// its `enum` the letters of its options in order, and its description the
 /// question's instructions followed by each letter's option.
-fn queue_tool(questions: &[(&Question, Vec<(String, String)>)]) -> serde_json::Value {
+fn queue_tool(questions: &[(&Question, Vec<(String, String)>)]) -> Tool {
     let mut props = serde_json::Map::new();
     for (q, opts) in questions {
         let mut description = q.instructions.clone();
@@ -207,14 +207,11 @@ fn queue_tool(questions: &[(&Question, Vec<(String, String)>)]) -> serde_json::V
         let letters: Vec<String> = (0..opts.len()).map(letter).collect();
         props.insert(q.id.clone(), json!({"type": "string", "enum": letters, "description": description}));
     }
-    json!({"type": "function", "function": {
-        "name": QUEUE_TOOL,
-        "description": QUEUE_TOOL_DESCRIPTION,
-        "parameters": {
-            "type": "object",
-            "properties": {"answers": {"type": "object", "description": ANSWERS_DESCRIPTION, "properties": props}},
-        },
-    }})
+    let schema = json!({
+        "type": "object",
+        "properties": {"answers": {"type": "object", "description": ANSWERS_DESCRIPTION, "properties": props}},
+    });
+    Tool { description: Some(QUEUE_TOOL_DESCRIPTION.to_string()), ..Tool::new(QUEUE_TOOL, schema) }
 }
 
 /// The example's answers to `spec` as letters, keyed by question id in
@@ -239,13 +236,14 @@ fn example_answers(
 }
 
 /// An assistant message that calls the queue tool once.
-fn queue_call(id: String, arguments: serde_json::Map<String, serde_json::Value>) -> Message {
+fn queue_call(id: String, input: serde_json::Map<String, serde_json::Value>) -> Message {
     Message {
         role: Role::Assistant,
         content: None,
         reasoning: None,
-        tool_calls: vec![ToolCall { id, name: QUEUE_TOOL.to_string(), arguments }],
+        tool_calls: vec![ToolCall { id, name: QUEUE_TOOL.to_string(), input }],
         tool_call_id: None,
+        is_error: false,
         snap: false,
     }
 }
@@ -265,9 +263,9 @@ pub(crate) fn queue_seat(body: Context, spec: &Spec) -> Result<Context, String> 
         let state = state.as_ref().map_err(|e| format!("a worked example has no case: {e}"))?;
         seat.messages.push(Message::tool(format!("c{call}"), state.clone()));
         call += 1;
-        let mut arguments = serde_json::Map::new();
-        arguments.insert("answers".into(), answers.into());
-        seat.messages.push(queue_call(format!("c{call}"), arguments));
+        let mut input = serde_json::Map::new();
+        input.insert("answers".into(), answers.into());
+        seat.messages.push(queue_call(format!("c{call}"), input));
     }
     if let Some(last) = seat.messages.last_mut() {
         last.snap = true;
@@ -324,9 +322,9 @@ mod tests {
             let seat = value(&queue_seat(body(), &spec).unwrap());
             assert_eq!(seat["queue"], QUEUE_TOOL);
             let tool = &seat["tools"][0];
-            assert_eq!(tool["type"], "function");
-            assert_eq!(tool["function"]["name"], QUEUE_TOOL);
-            let props = tool["function"]["parameters"]["properties"]["answers"]["properties"].as_object().unwrap();
+            assert_eq!(tool["name"], QUEUE_TOOL);
+            assert!(tool.get("type").is_none() && tool.get("function").is_none(), "{tool}");
+            let props = tool["input_schema"]["properties"]["answers"]["properties"].as_object().unwrap();
             assert_eq!(props.len(), spec.questions.len(), "{}", spec.name);
             for q in &spec.questions {
                 let n = options(q).unwrap().len();
@@ -335,7 +333,7 @@ mod tests {
             }
         }
         let seat = value(&queue_seat(body(), &shell_bump()).unwrap());
-        let verdict = seat["tools"][0]["function"]["parameters"]["properties"]["answers"]["properties"]["verdict"]["description"]
+        let verdict = seat["tools"][0]["input_schema"]["properties"]["answers"]["properties"]["verdict"]["description"]
             .as_str()
             .unwrap();
         assert!(verdict.starts_with("What happens with it. A: proceed, every program"), "{verdict}");
@@ -358,16 +356,16 @@ mod tests {
         assert_eq!(messages[2]["reasoning"], "noted");
         assert_eq!(messages[3]["snap"], true, "the task keeps a boundary");
         assert!(messages[3]["content"].as_str().unwrap().starts_with("Commands from a coding agent wait in a queue."));
-        assert_eq!(messages[4]["tool_calls"], json!([{"id": "c0", "name": QUEUE_TOOL, "arguments": {}}]));
+        assert_eq!(messages[4]["tool_calls"], json!([{"id": "c0", "name": QUEUE_TOOL, "input": {}}]));
         assert_eq!(messages[5]["tool_call_id"], "c0");
         assert_eq!(
-            messages[6]["tool_calls"][0]["arguments"],
+            messages[6]["tool_calls"][0]["input"],
             json!({"answers": {"network": "A", "originals": "A", "undo": "A", "verdict": "A"}})
         );
         assert_eq!(messages[7]["tool_call_id"], "c1");
         assert_eq!(
             messages[8]["tool_calls"][0],
-            json!({"id": "c2", "name": QUEUE_TOOL, "arguments": {"answers": {"network": "A", "originals": "B", "undo": "B", "verdict": "A"}}})
+            json!({"id": "c2", "name": QUEUE_TOOL, "input": {"answers": {"network": "A", "originals": "B", "undo": "B", "verdict": "A"}}})
         );
         let last = messages.last().unwrap();
         assert_eq!(last["snap"], true);
@@ -403,7 +401,7 @@ mod tests {
         assert_eq!(keys, ["invocation", "language", "context_type", "cwd", "program"]);
         assert_eq!(case["program"], r#"import json; print(json.load(open("package.json"))["version"])"#);
         assert_eq!(
-            messages[6]["tool_calls"][0]["arguments"],
+            messages[6]["tool_calls"][0]["input"],
             json!({"answers": {"network": "A", "originals": "A", "verdict": "A"}})
         );
     }

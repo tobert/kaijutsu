@@ -324,6 +324,7 @@ fn to_llm(name: &str, e: MkError) -> LlmError {
         )),
         MkError::Service { .. }
         | MkError::Stream(_)
+        | MkError::CouncilStream { .. }
         | MkError::Truncated(_)
         | MkError::Decode { .. }
         | MkError::Status { .. }
@@ -392,7 +393,9 @@ enum Inner {
 enum Event {
     Token(String),
     Done(kaijutsu_mk::generate::Done),
-    V2Done(gogi_proto::generation::GenerationDone),
+    /// A council v2 token, which names its phase.
+    V2Token(gogi_proto::generation::TokenEvent),
+    V2Done(Box<gogi_proto::generation::GenerationDone>),
 }
 
 impl Inner {
@@ -404,7 +407,7 @@ impl Inner {
                 Err(e) => return Some(Err(e)),
             },
             Inner::V2(s) => match s.next().await? {
-                Ok(GenerationEvent::Token(t)) => Event::Token(t.piece),
+                Ok(GenerationEvent::Token(t)) => Event::V2Token(t),
                 Ok(GenerationEvent::Done(d)) => Event::V2Done(d),
                 Err(e) => return Some(Err(e)),
             },
@@ -439,6 +442,11 @@ impl Stream {
                         let reply = self.reply.as_mut().expect("the reply lives until done");
                         self.pending.extend(reply.piece(&piece));
                     }
+                    Some(Ok(Event::V2Token(token))) => {
+                        self.first_token.get_or_insert_with(|| self.started.elapsed());
+                        let reply = self.reply.as_mut().expect("the reply lives until done");
+                        self.pending.extend(reply.phased(token.phase, &token.piece));
+                    }
                     Some(Ok(Event::V2Done(done))) => {
                         self.finished = true;
                         self.inner = None;
@@ -451,7 +459,7 @@ impl Stream {
                         };
                         let identity = self.v2.take().expect("a council v2 stream names its server");
                         let reply = self.reply.take().expect("done comes once");
-                        match reply.done_v2(done, &identity.model, &identity.weight_hash, timing) {
+                        match reply.done_v2(*done, &identity.model, &identity.weight_hash, timing) {
                             Ok(events) => self.pending.extend(events),
                             Err(e) => return Some(StreamEvent::Error(StreamError::new(
                                 StreamErrorKind::Protocol,
@@ -576,7 +584,7 @@ mod tests {
                                "limits": {"context_tokens": 32768, "decision_context_tokens": 3072, "snapshot_bytes": 1,
                                           "contexts_per_decision": 8, "default_timeout_ms": 2000},
                                "capabilities": capabilities}],
-                   "limits": {"state_bytes": 1000, "choice_options": 26},
+                   "limits": {"case_bytes": 1000, "choice_options": 26},
                    "capabilities": []})
             .to_string(),
         )
@@ -600,12 +608,13 @@ mod tests {
     fn generation(content: &str, calls: serde_json::Value, head: u64) -> kaijutsu_mk::test_server::Reply {
         let mut out = String::new();
         if !content.is_empty() {
-            let t = json!({"id": 1, "piece": content, "phase": "answer", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
+            let t = json!({"id": 1, "piece": content, "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
             out.push_str(&format!("event: token\ndata: {t}\n\n"));
         }
         let head = if head == 0 { json!(null) } else { json!(snap_id(head)) };
-        let done = json!({"model": "gemma-4", "content": content, "reasoning": "", "tool_calls": calls, "finish": "stop",
-                          "usage": {"prompt": 47, "kept": 40, "fed": 7, "completion": 3}, "head": head,
+        let finish = if calls.as_array().is_some_and(|c| !c.is_empty()) { "tool_use" } else { "end_turn" };
+        let done = json!({"model": "gemma-4", "content": content, "reasoning": "", "tool_calls": calls, "finish": finish,
+                          "usage": {"prompt": 47, "kept": 40, "fed": 7, "completion": 3, "reasoning": 0}, "head": head, "seed": 11,
                           "snapshots": [{"id": snap_id(1), "message": 1, "tokens": 15}]});
         out.push_str(&format!("event: done\ndata: {done}\n\n"));
         sse(out)
@@ -654,7 +663,7 @@ mod tests {
     async fn a_v2_turn_sends_the_whole_conversation_and_no_put() {
         let (base, seen) = serve(vec![
             v2_identity(json!(["generate", "pins"])),
-            generation("", json!([{"id": "c0", "name": "ls", "arguments": {"path": "/tmp"}}]), 0),
+            generation("", json!([{"id": "c0", "name": "ls", "input": {"path": "/tmp"}}]), 0),
             generation("Two files.", json!([]), 3),
         ])
         .await;
@@ -671,7 +680,7 @@ mod tests {
         let Some(StreamEvent::Done { stop_reason, input_tokens, extra: Some(crate::llm::UsageExtra::Mk(x)), .. }) = first.last() else {
             panic!("{first:?}")
         };
-        assert_eq!((stop_reason.as_deref(), *input_tokens, x.kept, x.seed, x.model.as_str()), (Some("tool_calls"), Some(47), 40, None, "gemma-4"));
+        assert_eq!((stop_reason.as_deref(), *input_tokens, x.kept, x.seed, x.model.as_str()), (Some("tool_use"), Some(47), 40, Some(11), "gemma-4"));
 
         history.push(Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::ToolUse { id, name, input: json!({"path": "/tmp"}) }]) });
         history.push(Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "c0".into(), content: "a\nb".into(), is_error: false }]));
@@ -680,7 +689,7 @@ mod tests {
 
         assert_eq!(paths(), ["GET /council/v2/identity", "POST /council/v2/generations", "POST /council/v2/generations"]);
         let gens = bodies(&seen, "/council/v2/generations");
-        let tools = json!([{"type": "function", "function": {"name": "ls", "description": "List.", "parameters": {"type": "object"}}}]);
+        let tools = json!([{"name": "ls", "description": "List.", "input_schema": {"type": "object"}}]);
         assert_eq!(
             gens[0],
             json!({"model": "gemma-4", "context": {"thinking": false, "tools": tools,
@@ -692,7 +701,7 @@ mod tests {
             gens[1]["context"]["messages"],
             json!([{"role": "system", "content": "rules", "snap": true},
                    {"role": "user", "content": "list /tmp", "snap": true},
-                   {"role": "assistant", "tool_calls": [{"id": "c0", "name": "ls", "arguments": {"path": "/tmp"}}]},
+                   {"role": "assistant", "tool_calls": [{"id": "c0", "name": "ls", "input": {"path": "/tmp"}}]},
                    {"role": "tool", "tool_call_id": "c0", "content": "a\nb", "snap": true}])
         );
         assert_eq!(gens[1]["context"]["tools"], tools);
