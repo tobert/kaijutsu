@@ -1,110 +1,90 @@
 # Approval identity
 
-The character responsible for the context above the work reviews it.
-Delegation is explicit. The character performing an operation cannot approve
-it, from any context — except the self-confirmation whose assigned reviewer
-IS that character, which nobody else may answer. The assigned reviewer may be
-a root character such as Amy, a directing model, or a separate adjudicator
-character. There is no configured default reviewer.
+Every context that does work answers to one other context: its **senpai**. The holder of the senpai context
+reviews the work. The character performing an operation cannot approve it, from any context, except the
+self-confirmation at a root context, which nobody else may answer. The design and its decisions are in
+`docs/senpai-kohai.md`; this file is the approval contract that follows from it. There is no configured default
+reviewer, no per-context override, and no grant that moves review from one character to another.
 
 ```sh
 kj character create coder
-kj context create repair --type coder --as coder
-kj context info repair
+kj kohai create repair --type coder --as coder
+kj senpai show repair
 ```
 
-The caller's acting character becomes the context's director. Creating or
-directing a context does not grant review authority. Run from Amy's root
-context, `repair` is a child of it, so without an explicit assignment or
-delegation Amy reviews coder. Run from banto's seat, banto reviews coder.
+`kj kohai create` makes `repair` a kohai of the calling context. Run from Amy's root context, Amy's console is
+its senpai and Amy reviews coder. Run from banto's seat, banto's seat is its senpai and banto reviews coder.
+Creating a context does not grant review authority to anyone beyond what the senpai edge gives.
 
-Every reviewer must resolve to a live character; a missing or retired
-character is an error, never a reason to substitute the caller.
-`kj context info` keeps the context's metadata visible and reports a reviewer
-error when its assignment cannot resolve. Direct client commands remain
-available for inspection and repair; the gate refuses an ask with no valid
-reviewer.
+## The senpai edge
 
-Reviewer resolution takes the acting character (the actor) and the
-context, and follows this order:
+`contexts.senpai_ctx` names the senpai context. It is null only for a root context (a root character's console)
+and for the system contexts that have no parent (scratch, the handoff log, the drift queue, lost+found, the beat
+score). The edge points at a context, not at a character, so the same seat can be reached again after a rotation.
 
-1. Explicit reviewer override on the context.
-2. Explicit delegation for its director character.
-3. The responsible character of the nearest context at or above the ask's
-   own, walking `forked_from` upward, that is live and is not the actor. A
-   context's responsible character is its performer, or its director when
-   no performer is set. Starting at the ask's own context is how a context
-   with no parent still resolves through its own director; a model turn's
-   performer is that context's own responsible character, so the walk
-   immediately climbs past it. Archived ancestors are walked through, a
-   retired responsible character refuses by name, and a `forked_from`
-   pointing at no row is an error (`docs/character.md`, "Roots and
-   rotation").
+- The **holder** of a context is the character that answers for it: its performer (`played_by`), or, for a root
+  context, the root character that owns it (`characters.root_ctx`). A context with neither has no holder, and an
+  edge that points at it is refused.
+- The **kohai** of a context are the live contexts whose `senpai_ctx` is that context.
+- The chain never has a cycle. Setting an edge that would close one is refused.
 
-When every layer is exhausted and the actor is a live root character, the
-actor is at its own root: the ask is raised with the actor as its reviewer,
-the actor alone may answer it, and the ledger records the answer as a
-self-confirmation. When the actor is not a root character, resolution
-refuses and names the actor and the context; assign a reviewer with
-`kj context set <context> --reviewer <character>`. A model turn refuses
-to start when its performer resolves as its own reviewer, and a root can
-never be a performer, so self-confirmation is a human's act. An explicit
-override or delegation that names the actor resolves the same way, as a
-self-confirmation, since the human set it up. Escalation runs the same walk
-past the context that yielded the current reviewer, and refuses at a root,
-naming it.
+`kj senpai show [<ctx>]` prints the senpai (label and id), its holder, the lineage root, and who would review an ask
+by the context's performer. `kj kohai list [<ctx>]` lists the live kohai with type and performer.
 
-Any live root character can delegate review across a director's coder
-contexts:
+## Routing
 
-```sh
-kj ledger delegation grant banto --to banto
-kj ledger delegation list
-kj ledger delegation revoke banto
+The reviewer of an ask raised in context K by actor A:
+
+1. Let S be `senpai_ctx(K)`. If S is null and A is a live root character, the ask is a self-confirmation. If S is
+   null and A is anyone else, resolution refuses and names A and K.
+2. The reviewer is `holder(S)` when it is live and is not A.
+3. When `holder(S)` is A, climb: K becomes S, and repeat from 1. A banto that forks itself answers to the banto's
+   own senpai.
+4. A retired holder refuses by name. It never substitutes another character.
+
+One resolver does this. Every ask, the model-turn check, `kj senpai show` and `kj ledger escalate` use it.
+
+```
+coder lane ──senpai──► banto seat ──senpai──► amy (root console)
+  ask by coder          holder: banto           holder: amy
+  reviewer: banto       ask by banto            ask by amy
+                        reviewer: amy           self-confirmation
 ```
 
-The target can instead be a distinct adjudicator character. Delegation does
-not create a model, select its inference provider, or start a review context.
-It applies across that director's contexts without overriding explicit
-context assignments. A director cannot grant this authority to itself.
-Changing or revoking a delegation refuses while affected contexts have
-pending asks. Settle or cancel those asks first. The lineage root of an ask's
-context can reclaim it from an unavailable reviewer, settle it, then revoke
-the delegation.
+**Self-confirmation.** At a root context the actor is its own holder. The ask is raised with the actor as its
+reviewer, the actor alone may answer it, and the ledger records the answer as a self-confirmation. A root character
+can never be cast, so self-confirmation is a human's act. A model turn refuses to start when its performer would
+review itself.
 
-A context's **lineage root** is the character responsible for the context at
-the top of its `forked_from` chain. It must be a live root character; a
-lineage that ends anywhere else refuses. The lineage root changes approval
-routing on its contexts. For an explicit context assignment, Amy runs, from
-a context in her lineage:
+**Escalation** runs the same climb past the context that yielded the current reviewer, and refuses at a context
+with no senpai, naming it.
 
-```sh
-kj context set repair --as coder --reviewer banto
-```
+**Lineage root.** The holder at the top of the senpai chain. It must be a live root character, or the lookup
+refuses with the reason.
 
-`--clear-reviewer` removes that override and restores policy resolution.
-`--director <character>` changes the director relationship; it does not itself
-grant review authority. Assignment changes refuse while the context has
-pending asks. Both performer and effective reviewer must resolve to live,
-distinct characters. Ordinary forks preserve the director and explicit
-override. Regular client creation leaves the performer unset, so model work
-still needs an explicit performing character.
+## Authority
 
-`kj context set <ctx> --as <character>` is allowed for a caller who is not
-the target's resolved reviewer when the caller's actor directs the target,
-which a fork or a create from the caller's own context records as
-`director_id` (guidance, Amy 2026-09-15, "yes banto can cast its own
-children"). Casting is what makes the cast character accountable to the
-caller in that context; no sheet relation is consulted, and a root
-character cannot be cast, by any caller, through `create --as` or
-`set --as`. `kj context create --as` is the same act at birth: it needs the
-Operator capability and a live character caller, who becomes the new
-context's director. It raises no ask; a caller without that authority is
-refused. This is a second way to earn `--as` authority,
-not a change to reviewer authority: it does not let a director assign
-`--reviewer` or `--director`, which still require the lineage root,
-and the performer still cannot review its own work. The lineage root may
-also assign `--as` on any context in its lineage.
+One rule: **the holder of a context's senpai, or its lineage root**, may
+
+- cast or recast its performer (`kj context set <ctx> --as <character>`);
+- move it to another senpai (`kj senpai set <ctx> <senpai-ctx>`);
+- escalate its asks;
+- rotate it (its own performer may also rotate it, with no ask);
+- archive it.
+
+A refusal names the rule: "only <ctx>'s senpai (<holder>) or its lineage root (<root>) may <act>". Also true:
+
+- A root character can never be cast, by any caller.
+- `kj kohai create --as` needs the Operator capability and a live character caller, and raises no ask. The new
+  context's senpai is the caller's context, or the `--senpai <ctx>` the caller has authority over.
+- A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own
+  senpai (`docs/egress.md`).
+- An assignment change refuses while the context has pending asks. Performer and reviewer must resolve to live,
+  distinct characters.
+
+Fork, rotate and create set the edge: `kj fork` makes the forking context the fork's senpai; `kj context rotate`
+gives the successor the predecessor's senpai and moves the predecessor's kohai to the successor. Regular client
+creation leaves the performer unset, so model work still needs an explicit performing character.
 
 ## Three identities
 
@@ -112,17 +92,16 @@ also assign `--as` on any context in its lineage.
 |---|---|
 | `principal_id` | Authenticated requester; retained for capability and redemption scope |
 | `actor_id` | Character performing this invocation; the context's `played_by` for kernel model work |
-| `reviewer_id` | Effective reviewer snapshotted on the invocation or ask |
+| `reviewer_id` | Effective reviewer snapshotted on the invocation or ask (a field of the ask, not a column of the context) |
 
-The context row's nullable `reviewer_id` is the explicit override; an unset
-override means resolve policy, not copy `created_by`. Its `director_id`
-records the directing character independently of requester and performer.
+The context row carries `senpai_ctx`, the edge the reviewer is resolved from; it
+records no reviewer of its own, so nothing is copied from `created_by`.
 
 The kernel resolves a model turn's identity before it starts. Tools,
 read-only and writable shells, nested `kj` commands, and hook bodies preserve
 its requester and performer. When a new ask is recorded, the gate resolves
-the current reviewer under the same lock that serializes delegation changes.
-Revoking a grant therefore affects new asks even from an already running turn.
+the current reviewer from the context's senpai edge. Moving the edge
+therefore affects new asks even from an already running turn.
 Provider text, reasoning, and tool calls are authored
 by the performer. User prompts keep their requester; kernel-produced tool
 results keep kernel authorship.
@@ -153,8 +132,8 @@ kaijutsu-acp --character coder
 
 `--parent <label>` names the context new sessions are created under; without
 it, the kernel's only live root context is used. The connected character
-becomes its director; the reviewer follows the same
-policy as other creation paths. Without `--character`, use ACP session loading
+becomes the performer, the new context is a kohai of the context that
+creates it, and the reviewer follows the senpai edge. Without `--character`, use ACP session loading
 to attach to an already configured context. The flag selects a character;
 `--context-type` still selects the rc bundle.
 
@@ -171,8 +150,8 @@ kj ledger cancel <request-id>
 An ask snapshots its requester, performer, and reviewer. `show` reports all
 three plus the deciding character. The assigned reviewer may allow or deny.
 The assigned reviewer or the lineage root of the ask's context may
-explicitly reassign a pending ask with `escalate`. This lets Amy reclaim a
-delegated ask in her lineage when its reviewer is unavailable. Escalation records both reviewer identities
+explicitly reassign a pending ask with `escalate`. This lets Amy reclaim an
+ask in her lineage when its reviewer is unavailable. Escalation records both reviewer identities
 and the actual caller, and refuses to assign the performer. The requester or
 performer may cancel a pending ask. Cancellation runs nothing; it does not
 undo an executed action.
@@ -209,7 +188,7 @@ same eligibility rule; the kernel remains authoritative if the assignment
 changes while a prompt is open. Timeouts, cancelled ACP prompts, and transport
 errors leave the ask pending; only an explicit decision records a verdict.
 
-A directing model reads the coder's response and `kj ledger list|show` to
+A senpai model reads the kohai's response and `kj ledger list|show` to
 evaluate its asks. Reviewer assignment does not automatically schedule a
 turn in one of that character's contexts.
 
@@ -231,15 +210,14 @@ every context it performs in, and to no other character. Scope `session`
 covers the asking context and requester; scope `always` covers everyone.
 
 A character allow covers a `kj` call that acts on a context only when the
-character directs the target, that is, the target's `director_id` is the
-character. It covers these verbs:
+character holds the target's senpai. It covers these verbs:
 
 | Verb | Target | Not covered |
 |---|---|---|
 | `kj drive [<target>]` | the target, default the current context | |
 | `kj interrupt <target>` | the target | |
 | `kj context archive [<context>]` | the context, default the current context | `--children` |
-| `kj context create [--parent <p>]` | `--parent`; without it, the new child is the caller's to direct | `--top` |
+| `kj kohai create [--senpai <c>]` | `--senpai`; without it, the new context is the caller's own kohai | |
 
 The gate resolves the target the way the verb does (label, id, `.`,
 `.parent`). Every argument must be a literal word, because an expanded
@@ -258,16 +236,19 @@ an exact rule for scripts. A
 character deny applies without the target condition.
 
 The gate checks the target when it decides, and the verbs do not check
-it again. A director change that lands between the decision and the run
+it again. A senpai change that lands between the decision and the run
 is not seen by that call.
 
 For example, Amy answers banto's ask for `kj drive lane-1 --prompt ...`
-with `--remember character --family`. Banto then drives any lane it
-directs with no ask. It still asks to drive a context Amy directs,
-including its own seat, and the rule does not reach another character.
-An exact rule (`--remember character` without `--family`) checks the
-target too, so the same statement asks again after its target gets
-another director.
+with `--remember character --family`. Banto then drives any lane whose senpai it holds with no ask. It still
+asks to drive a context whose senpai Amy holds, including its own seat, and
+the rule does not reach another character. An exact rule (`--remember
+character` without `--family`) checks the target too, so the same statement
+asks again after its target gets another senpai.
+
+To be decided in step 2: `docs/senpai-kohai.md` does not say how the standing-rule target
+condition reads once `director_id` is gone. This section assumes "the character holds the
+target's senpai", the first half of the authority rule.
 
 Commands other than `kj` carry no target that the gate reads. A
 character family rule for them applies wherever the character performs,
@@ -299,11 +280,11 @@ match, and an established pair or owner cannot be replaced. Receipt lookup
 through the original ask survives later result-review asks.
 
 Old asks with no recorded performer/reviewer remain audit history and cannot
-be approved through a guessed identity. The policy migration removes old
-automatic reviewer assignments from contexts; it does not manufacture
-director relationships or grants from requester identity. Existing contexts
-therefore resolve through the walk unless explicitly reassigned. A missing
-performer still requires assignment before kernel model work.
+be approved through a guessed identity. The senpai migration
+(`docs/senpai-kohai.md`, "Migration") maps each live context to a senpai from how it
+was routed, reports every mapping that was not the nearest-ancestor case, and
+refuses to run rather than guess. It never derives a senpai from requester
+identity. A missing performer still requires assignment before kernel model work.
 
 ## Continuation windows and async work
 
@@ -324,7 +305,7 @@ refreshes that time. Yielding, polling, and tool activity do not. `kj handoff
 signoff <note>` closes the window immediately. `kj interrupt <target>` (and
 the RPC `interruptContext`) records a separate, independent fact —
 `interrupted_at`/`interrupted_by` on the epoch — that also closes the
-window; unlike signoff, this is a reviewer or director stopping the loop
+window; unlike signoff, this is a senpai or reviewer stopping the loop
 from outside, not the performer's own handoff close, and it does not set
 `signed_off_at`. Stopping the running turn alone is not enough: every turn
 end records a yield even when cancelled, so without this fact a later async
@@ -339,7 +320,7 @@ turn preparation rechecks the performer before opening an epoch.
 
 Signoff, interrupt, and a newer explicit drive only close automatic
 resumption. Already accepted turns can finish, but their requests do not
-refresh a closed window or a newer epoch. Reviewer-only changes preserve the
+refresh a closed window or a newer epoch. Senpai changes preserve the
 performer's continuation. Opening a new epoch (`kj drive`) clears a prior
 interrupt along with the rest of the epoch's state.
 
@@ -418,28 +399,18 @@ superseded request need explicit linkage so rotation does not duplicate work.
   Having no default expiry does not change those policies. Restart survival and
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.
-- Reviewer resolution takes the actor and the context and walks
-  `forked_from` (`KernelDb::responsible_character_above`; guidance from
-  Amy, 2026-09-15, and `docs/character.md`, "Roots and rotation").
-  Explicit override and delegation resolve as configured even when they
-  name the actor; the walk itself never returns the actor. A retired
-  responsible character on an ancestor refuses, naming it, rather than
-  being skipped. `kj ledger escalate` without `--to` runs the same walk
-  excluding the current reviewer and refuses at a root.
-- Self-confirmation: an ask whose reviewer is its own actor is answerable
-  only by that actor, and the decision is recorded as a self-confirmation.
-  An exhausted walk self-confirms only for a live root character
-  (`CharacterRow::root`) and refuses for anyone else. The
-  performer-cannot-approve rule holds for every other ask.
-- Character rules: `approval_rules` and `approval_rule_families` record
-  the ask's `actor_id`, and scope `character` matches it. The kernel
-  decides the target condition per command
-  (`kj::gate_policy::serves_character`) and passes it to the ledger's
-  match (`approval_ledger::rules::RuleMatch`); `kj ledger allow` refuses
-  a character allow over a `kj` call the condition does not read
-  (`gate_policy::character_rule_refusal`).
-- Authority: `KernelDb::lineage_root` finds the root character at the top
-  of a context's `forked_from` chain. It gates `kj context set --reviewer`,
-  `--director`, and `--clear-reviewer`, and `kj ledger escalate` by someone
-  other than the assigned reviewer. `kj ledger delegation grant|revoke`
-  requires any live root character.
+- Reviewer resolution is one function over `contexts.senpai_ctx` (the climb above). It replaces
+  `KernelDb::effective_approval_reviewer` and `Kernel::resolve_review_assignment`. A retired holder
+  refuses by name. `kj ledger escalate` without `--to` runs the same climb past the current reviewer
+  and refuses at a context with no senpai.
+- Self-confirmation: an ask whose reviewer is its own actor is answerable only by that actor, and the
+  decision is recorded as a self-confirmation. A context with no senpai self-confirms only for a live
+  root character (`CharacterRow::root`) and refuses for anyone else. The performer-cannot-approve rule
+  holds for every other ask.
+- Character rules: `approval_rules` and `approval_rule_families` record the ask's `actor_id`, and scope
+  `character` matches it. The kernel decides the target condition per command
+  (`kj::gate_policy::serves_character`) and passes it to the ledger's match
+  (`approval_ledger::rules::RuleMatch`); `kj ledger allow` refuses a character allow over a `kj` call
+  the condition does not read (`gate_policy::character_rule_refusal`).
+- Authority: the one rule above, checked at each act it governs. The lineage root is the holder at the top of
+  the senpai chain.
