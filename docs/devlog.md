@@ -3503,3 +3503,18 @@ only model, and the kernel sends that model's `model`, never an alias. The
 kernel never picks among several. A loading model is a miss that drops the
 cached identity, so the next decision sees it ready. Seats are held per
 served model, since a snapshot belongs to one.
+
+The contract then dropped the gateway Decisions API (`case`, a required
+`spec_id`), took Anthropic's tool and call shapes, and gave every response
+one `usage` and a request id. One question it had left open mattered to
+us: the contract called a streamed piece display text only, but the
+provider writes pieces into durable blocks as they arrive and cannot take
+one back. Amy chose to make the contract promise it instead: a phase's
+pieces join to `done`'s text, up to edge whitespace (gogi `b007a09`), and
+conformance checks every streamed generation. mkviolet broke that promise
+in one place, a thought channel the model opens itself, and now keeps it.
+The work ran as three sessions, one per repo: gogi's session owned the
+contract tree, and the other two asked it for changes instead of editing
+it, after two of us wrote the same `check_ask` at the same moment. The
+servers pin gogi by git rev, so one session's work in progress no longer
+breaks another's build.
