@@ -230,17 +230,17 @@ deny = [
 
 [context_type.toolie]
 deny = [
-  "kj context create",   # a toolie uses tools; lifecycle belongs to its parent
+  "kj kohai create",     # a toolie uses tools; lifecycle belongs to its senpai
 ]
 [context_type.mcp]
 allow = [
-  "kj context create",   # an mcp seat spins up coders; recoverable: archive it
+  "kj kohai create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
 
 [context_type.director]
 allow = [
-  "kj context create",   # a director creates its lanes, `--type coder --as coder`
+  "kj kohai create",     # a director creates its kohai lanes, `--type coder --as coder`
   "kj fork",             # a fork copies this seat's own performer and type
   "kj drive",            # runs a turn on a lane this seat directs
 ]
@@ -253,7 +253,7 @@ not ship.
 
 **A `[context_type.<name>]` section must name a live context type**, one
 with an rc bucket under `/config/rc` (`kj::rc::known_context_types`, the
-list `kj context create --type` validates against). A section naming no live
+list `kj kohai create --type` validates against). A section naming no live
 type applies to nobody, so a typo'd `ask` tier leaves its type on whatever
 `[global]` said — fail-open for exactly the role the operator meant to
 protect. The refusal names the section and lists the known types, and it
@@ -382,7 +382,7 @@ tests, not discovered later.
 **Character rules.** Scope `character` binds a rule, exact or family, to
 the performer of the ask it was learned from, in every context that
 character performs in. Its allow covers a context-targeting `kj` verb
-only when that character directs the resolved target
+only when that character holds the resolved target's senpai
 (`gate_policy::serves_character`); the ledger matches the actor and takes
 the kernel's answer as `RuleMatch::character_allows`, so a failed
 condition leaves the call to the layers below and a character deny still
@@ -431,7 +431,7 @@ verb's effect:
   part of the verb to a seat; moltar denies coders `kj ledger list` and
   `kj ledger show` and leaves `kj ledger cancel` open. People answer through
   the typed ledger RPCs (`listAsks`, `decideAsk`; `docs/approval-identity.md`),
-  which take no context and never meet a gate. Reviewer assignment, enforced
+  which take no context and never meet a gate. The senpai edge, enforced
   in the ledger, decides who may answer.
 - **The `--help` rule** is a flag pattern (last word `--help`/`-h`, no
   intervening flag), not a verb. It moves into the evaluator as a
@@ -587,8 +587,8 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   there, and a remembered deny refuses with nobody asked.
 - **A config allow that cannot cover a command decides nothing.** When a
   redirect or an argv that does not classify keeps an allow from covering,
-  the builtin layer still decides, so `kj context create --help` stays help
-  under an allow for `kj context create`.
+  the builtin layer still decides, so `kj kohai create --help` stays help
+  under an allow for `kj kohai create`.
 
 ## Open questions
 - **shell-guard's interpreter lists.** They are opacity rules, not risk
@@ -602,6 +602,24 @@ name `gate_policy` is the sanctioned exception, visible only in source.
 - **Composed-view caching.** v1 composes at check time (one SQLite read
   that `redeem` already pays, plus an mtime-cached file read). A per-context
   materialized cache is a follow-up if measurement ever asks for it.
+
+## Senpai, the gate's model, and the director tier (senpai/kohai stack)
+
+`docs/senpai-kohai.md` changes three things around the gate.
+
+- **Drift along the senpai edge needs no ask.** `kj drift push` from a kohai to its senpai, or from a
+  senpai to its own kohai, runs with no ask, and `kj senpai report "<text>"` is the same act. This replaces
+  the per-context `kj ledger allow --remember session --family` rule that the 2026-10-18 nagaya run had to
+  teach by hand. Any other drift target keeps the tier it has here; a drift to a sibling still asks.
+- **The gate's model comes from its own cast** (step 7). Today the `gate` slot of a seat's cast names the
+  council server and served model that decide its gate (`docs/council.md`, "Configuration"). The reserved
+  `gate` role leaves `cast_slots`, and the gate gets a cast of its own, as kaibo's config does.
+  To be decided in step 7: the config shape (a key in `gate.toml` or a separate cast), and whether one gate
+  cast serves every seat or one is chosen per `[context_type.<type>]`.
+- **The director tier** (`[context_type.director]` above) is keyed by the context type, which step 6 reworks
+  or replaces. The tier's contents (allow `kj kohai create`, `kj fork`, `kj drive`) do not change.
+  To be decided in step 6: the new type name; the section is renamed with it, and a section naming no live
+  type is refused loudly as it is today.
 
 ## Out of scope
 

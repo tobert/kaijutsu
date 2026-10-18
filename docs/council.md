@@ -421,7 +421,7 @@ grows with the gate.
   bumps", and "Jev bumps" become casts. A seat with no cast of its own
   uses its performer's default cast (`kj character set coder --cast
   mk-judge`), so every seat a `coder` character plays gets the judge with
-  nothing to turn on per seat; `kj context create --cast` pins another.
+  nothing to turn on per seat; to give a seat another cast, cast a character that has it.
 - **Outward actions only.** Council time is limited on our hardware, so a
   shadow records what the seat does to the world, not what it reads. The
   gate already draws that line: the read-only `shell` tool runs no gate,
@@ -835,9 +835,11 @@ model and replaces `[council] model`; the served model's identity is
 recorded with each decision. The role is `gate`, not `council`, because `council` is a
 context type: a council context playing a cast with a `council` slot
 would take that slot as its chat model. `gate` is a reserved role: no
-context resolves its chat model from a `gate` slot, and `kj context
+context resolves its chat model from a `gate` slot, and `kj kohai
 create` and `kj context set` refuse `--type gate` as a cast role, not a
-context type. The cast chooses only the server and its served model;
+context type. Step 7 of `docs/senpai-kohai.md` moves the gate to its own cast
+and removes the reserved role; to be decided in step 7: how the gate's cast
+is chosen. This section describes the `gate` slot until then. The cast chooses only the server and its served model;
 whether a type gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program
 decisions included, and the observing reviewer contexts read after it go to

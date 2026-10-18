@@ -67,8 +67,7 @@ reviewer. See `docs/approval-identity.md` for their authorization roles.
 | `actor.id` | Character performing the work |
 | `reviewer.id` | Character assigned to review that work |
 | `actor.name`, `reviewer.name` | Character names resolved at model-turn start |
-| `director.id` | Director character associated with the context or delegation |
-| `review.source` | Effective reviewer selected by `default`, `delegation`, or `explicit` policy |
+| `review.source` | How the reviewer was chosen. The senpai edge replaces the old `default`, `delegation` and `explicit` policies, and `director.id` is gone with the director column. To be decided in step 2: the new values (for example senpai holder, climbed, self-confirmation) |
 | `context.id` | Context in which the work runs |
 | `ask.id` | Durable approval request |
 | `decision.actor.id` | Character attempting the decision, cancellation, or escalation |

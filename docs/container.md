@@ -151,10 +151,11 @@ overlay.
 - **Models.** `/tank/ml/models` mounts read-only at the same path, so GPU tests read weights where the
   engine's own docs name them. `check.sh` probes it.
 - **Seats.** banto plays a `director` context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
-  supervising Claude session, which connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`). banto starts
+  supervising Claude session's context, whose holder connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`).
+  banto's asks go to senpai, and a drift between banto and senpai (`kj senpai report`) needs no ask. banto starts
   coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.
 - **Gate.** Coders run with `uncovered = "allow"`. The `mcp` type does too, so the supervisor's `kj` verbs do not
-  wait on Amy. `root` allows `kj context create`, which MCP registration runs under Amy's root.
+  wait on Amy. `root` allows `kj kohai create`, which MCP registration runs under Amy's root.
 - **CPU.** `--cpuset-cpus=4-31 --cpu-shares=512`, so cores 0-3 stay free for the host. Pinning needs the `cpuset`
   controller, which systemd does not delegate to a user session by default. On zorak,
   `/etc/systemd/system/user@.service.d/delegate.conf` sets `Delegate=cpu cpuset io memory pids`; it took effect
@@ -207,10 +208,12 @@ overlay.
 ### Seat, gate, and supervision
 
 - Characters: a `<project>-coder` performer on the `deepseek-flash` model,
-  and `banto` as its reviewer. In the first runs the supervising Claude
-  session outside the container plays banto and drives the coder seats
-  over MCP. Later a model banto in the kernel's `director` seat can drive
-  them the same way. Asks reach banto, which is driving the loop.
+  and `banto`. Each coder context is a kohai of banto's seat, so its asks reach
+  banto, which is driving the loop; banto's seat is a kohai of the supervising
+  Claude session's context. The bootstrap creates both with `kj kohai create`.
+  In the first runs the supervising Claude session outside the container can
+  hold the banto seat itself and drive the coder seats over MCP. Later a model
+  banto in the kernel's `director` seat drives them the same way.
 - `gate.toml` sets `[context_type.coder] uncovered = "allow"` and
   `allow = ["shell_write"]`. Explicit `ask` keys in `[global]` still fire,
   so the file needs an audit for this kernel. The council stays off:
@@ -219,7 +222,7 @@ overlay.
 - Recovery is Git. The seat commits often and never pushes.
 - kaibo runs inside as an `mcp.toml` stdio server with the `crusoe` cast
   (GLM-5.3), with `/workspace` as its allowed tree.
-- The supervisor is banto: a dedicated Claude Code session with its own
+- The supervisor (banto in the first runs, senpai once banto is a `director` seat): a dedicated Claude Code session with its own
   `kaijutsu-dev` MCP entry. Its `kaijutsu-mcp` comes from the same commit
   as the container, because the wire version must match. It drives the
   seat with `kj drive` and `kj wait`, rotates the seat's context with a
@@ -231,7 +234,8 @@ overlay.
   instruction from `contrib/agent-dev/rc/<type>/create/S12-environment.md`,
   installed into this kernel's host rc next to the shipped defaults. It
   names `/workspace`, `/exchange`, and the kernel's own state, so a seat
-  does not spend calls finding them. The text names no project.
+  does not spend calls finding them. The text names no project and does not say who the
+  senpai is: the seat reads that from the `<senpai>` fact in its `<situation>` block.
 - A drift that arrives at a coder seat starts its turn, through a coder
   `drift` rc script on this kernel only (`docs/drift-ux.md`, gap 2, shape
   B). The identity problem that section names is checked against current
@@ -264,7 +268,7 @@ project per kernel where a parameter costs nothing.
 5. The `agent-dev` stage, a `kaijutsu-dev.container` Quadlet, and the GPU
    drop-in.
 6. A bootstrap script: `init`, `add-key` for the supervisor,
-   `kj backend set`, the characters, `gate.toml`, and `rc reseed`.
+   `kj backend set`, the characters and their contexts (`kj kohai create`), `gate.toml`, and `rc reseed`.
 7. A standalone test task: a one-page spec for a small Rust crate,
    acceptance tests the seat cannot see, a kaibo review step, and a step
    that writes `rocminfo` output to `GPU.md`. The supervisor runs the

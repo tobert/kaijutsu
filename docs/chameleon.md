@@ -216,7 +216,7 @@ players whose work is not quantized.
 
 ## Starting a jam
 
-1. Create the track and player: `kj context create --type musician --name
+1. Create the track and player: `kj kohai create --type musician --name
    <track>` (the create rc attaches it to the track, stopped).
 2. Set the tempo: read it off the gear (or a rack's clock module) →
    `kj transport tempo --track <track> <bpm>`; verify with `kj audio beats`

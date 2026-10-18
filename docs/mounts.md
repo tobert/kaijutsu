@@ -31,7 +31,7 @@ directories and stops at `/config`, `/run`, `/v`, `/r`, and `/dev`; see
 
 A context's cwd is where its relative paths resolve, and nothing more. It
 may be read-only: a seat started in a directory it should only read is
-told where to write. `kj context create --cwd` does not check that the
+told where to write. `kj kohai create --cwd` does not check that the
 directory is writable. Amy, 2026-10-10: "cwd is just cwd, it's where the
 model's paths return to."
 

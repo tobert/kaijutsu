@@ -9,7 +9,7 @@ The server binary runs any `kj` verb against a stopped kernel:
 systemctl --user stop kaijutsu-server
 kaijutsu-server kj -- character create bob --root
 kaijutsu-server kj -- backend set deepseek --api-key-file ~/.deepseek-key
-kaijutsu-server kj --as amy -- context create banto --type director --as banto
+kaijutsu-server kj --as amy -- kohai create banto --type director --as banto
 systemctl --user start kaijutsu-server
 ```
 

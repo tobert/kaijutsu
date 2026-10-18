@@ -50,10 +50,9 @@ host on the list of each context it gates, or fail closed without it.
 
 `kj context set <context> --egress-allow <host>` adds a row and
 `--egress-deny <host>` removes one. Both repeat. The caller must hold the same
-authority a performer assignment needs: the target's lineage root, its
-effective reviewer, or its director (`kj/context.rs`, `context_set` and
-`caller_may_assign_performer`). A model-played context is none of those for
-itself, so it cannot widen its own list. `kj context info` shows the list.
+authority a performer assignment needs: the holder of the target's senpai, or
+its lineage root (`docs/approval-identity.md`, "Authority"). A model-played
+context is neither for itself, so it cannot widen its own list. `kj context info` shows the list.
 
 An rc create script's `kj` acts as the context's creator, so a script may
 set the list when the creator holds that authority. The benchmark adapter
@@ -61,7 +60,7 @@ opens egress this way (`docs/benchmarks.md`, `egress_allow`); kaijutsu ships no
 such script.
 
 `kj fork` copies the parent's rows to the child, so a child starts with what
-its parent had and no more. `kj context create` starts with an empty list.
+its parent had and no more. `kj kohai create` starts with an empty list.
 
 The shell reads the rows when it is built, and a context shell is built for
 each use, so a change applies to the next command. A running `curl` keeps the
