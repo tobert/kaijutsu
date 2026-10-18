@@ -644,21 +644,7 @@ fn the_create_lifecycle_runs_in_the_session_cwd() {
     let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
     assert_eq!(status.code(), Some(0), "a clean exit checkpoints the db\n--- stderr ---\n{}", agent.stderr());
 
-    let context_id = kaijutsu_types::ContextId::parse(&session)
-        .unwrap_or_else(|e| panic!("session id {session:?} is not a context id: {e}"));
-    let db = Arc::new(parking_lot::Mutex::new(
-        kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
-            .expect("reopen the kernel db the binary just closed"),
-    ));
-    let blocks = kaijutsu_kernel::block_store::shared_block_store_with_db(
-        db,
-        kaijutsu_types::WorkspaceId::new(),
-        kaijutsu_types::PrincipalId::system(),
-    );
-    blocks.load_from_db().expect("load documents from the reopened db");
-    let snapshots = blocks
-        .block_snapshots(context_id)
-        .unwrap_or_else(|e| panic!("read blocks for context {context_id}: {e}"));
+    let snapshots = session_blocks(&state, &session);
     let orientation = snapshots
         .iter()
         .find(|b| b.content.starts_with("Orientation of the working directory"))
@@ -672,6 +658,92 @@ fn the_create_lifecycle_runs_in_the_session_cwd() {
         "orientation must describe the session cwd:\n{}",
         orientation.content
     );
+}
+
+/// The blocks of a session's context, read from the kernel db that a cleanly
+/// exited agent left in `state`.
+fn session_blocks(state: &Path, session: &str) -> Vec<kaijutsu_types::BlockSnapshot> {
+    let context_id = kaijutsu_types::ContextId::parse(session)
+        .unwrap_or_else(|e| panic!("session id {session:?} is not a context id: {e}"));
+    let db = Arc::new(parking_lot::Mutex::new(
+        kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
+            .expect("reopen the kernel db the binary just closed"),
+    ));
+    let blocks = kaijutsu_kernel::block_store::shared_block_store_with_db(
+        db,
+        kaijutsu_types::WorkspaceId::new(),
+        kaijutsu_types::PrincipalId::system(),
+    );
+    blocks.load_from_db().expect("load documents from the reopened db");
+    blocks
+        .block_snapshots(context_id)
+        .unwrap_or_else(|e| panic!("read blocks for context {context_id}: {e}"))
+}
+
+/// Opens one session in `cwd`, exits cleanly, and returns the context's
+/// house-rules block, if the create lifecycle wrote one.
+fn house_rules_block(label: &str, cwd: &Path) -> Option<kaijutsu_types::BlockSnapshot> {
+    let state = scratch_dir(label).join("state");
+    let mut agent = spawn_mock_with("chat", &["--state-dir", state.to_str().expect("utf-8 state path")]);
+    agent.initialize().expect("initialize");
+    let session = agent.new_session(cwd).expect("session/new");
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0), "a clean exit checkpoints the db\n--- stderr ---\n{}", agent.stderr());
+    session_blocks(&state, &session).into_iter().find(|b| b.content.starts_with("House rules from "))
+}
+
+/// A coder created in a project with an `AGENTS.md` gets the file as a cached
+/// system instruction, the way other coding harnesses read it.
+#[test]
+fn a_coder_reads_the_agents_md_in_its_cwd() {
+    let cwd = scratch_dir("house-rules-cwd");
+    std::fs::write(cwd.join("AGENTS.md"), "# Rules\n\nhouse-rule-marker-7f3a: commit small steps.\n")
+        .expect("write AGENTS.md");
+    let block = house_rules_block("house-rules-state", &cwd)
+        .unwrap_or_else(|| panic!("no house-rules block for a cwd with AGENTS.md"));
+    assert_eq!(block.role, kaijutsu_types::Role::System, "house rules are a system block");
+    assert_eq!(block.kind, kaijutsu_types::BlockKind::Text, "house rules are an instruction, not a notification");
+    assert!(
+        block.content.contains("house-rule-marker-7f3a") && block.content.contains(&cwd.join("AGENTS.md").display().to_string()),
+        "the block names the file and holds its text:\n{}",
+        block.content
+    );
+}
+
+/// From a subdirectory, the nearest `AGENTS.md` up to the repository root
+/// applies; one above the repository belongs to another project.
+#[test]
+fn a_coder_reads_agents_md_up_to_the_repository_root_and_no_further() {
+    let outer = scratch_dir("house-rules-outer");
+    std::fs::write(outer.join("AGENTS.md"), "outer-marker-c41d\n").expect("write the outer AGENTS.md");
+    let repo = outer.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("create the repo's .git");
+    let sub = repo.join("crates").join("one");
+    std::fs::create_dir_all(&sub).expect("create the subdirectory");
+    assert!(
+        house_rules_block("house-rules-none-in-repo", &sub).is_none(),
+        "an AGENTS.md above the repository root must not apply"
+    );
+
+    std::fs::write(repo.join("AGENTS.md"), "repo-marker-9be2\n").expect("write the repo AGENTS.md");
+    let block = house_rules_block("house-rules-repo-root", &sub)
+        .unwrap_or_else(|| panic!("no house-rules block from a subdirectory of a repo with AGENTS.md"));
+    assert!(
+        block.content.contains("repo-marker-9be2") && !block.content.contains("outer-marker-c41d"),
+        "the repository's AGENTS.md applies, not the outer one:\n{}",
+        block.content
+    );
+}
+
+/// A long `AGENTS.md` is cut at the cap, and the block says so.
+#[test]
+fn a_long_agents_md_is_cut_and_says_so() {
+    let cwd = scratch_dir("house-rules-long");
+    std::fs::write(cwd.join("AGENTS.md"), "x".repeat(40_000)).expect("write a long AGENTS.md");
+    let block = house_rules_block("house-rules-long-state", &cwd)
+        .unwrap_or_else(|| panic!("no house-rules block for a long AGENTS.md"));
+    assert!(block.content.len() < 33_000, "the block is bounded: {} bytes", block.content.len());
+    assert!(block.content.contains("[house rules cut at 32000 characters]"), "the cut is visible");
 }
 
 /// A session cwd the kernel host does not have is the client's mistake:

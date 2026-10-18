@@ -6,6 +6,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Eight `solo_acp_stdio` turn tests exhaust their mock script (2026-10-18)
+
+On zorak at `f70bba30`, `cargo test -p kaijutsu-solo-acp --features test-mock
+--test solo_acp_stdio` fails 8 of 30. Each failing test runs a prompt; the
+agentic loop calls `stream()` once more than the script gives, and the turn
+panics: "MockClient script for model 'solo-mock' exhausted after 2 turn(s)"
+(`crates/kaijutsu-kernel/src/llm/mod.rs:1170`). The failures are the same with
+and without `S36-house-rules.kai`, so they predate it. Find which change added
+the extra call, then fix the scripts or the loop.
+
 ## Anticipation and commitment — iteration order
 
 The kernel coordinates anticipation and commitment on the shared pulse.

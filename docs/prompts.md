@@ -139,6 +139,23 @@ excluded, ephemeral, draft, and empty instruction blocks. A failed block read
 stops both preview and live turn preparation. An existing context with no
 instruction sections remains valid.
 
+## Project house rules
+
+`coder/create/S36-house-rules.kai` gives a new coder its project's
+`AGENTS.md` as a `(System, Text)` block that opens
+`House rules from <path>, read at context create.` It reads the file in the
+working directory, or the nearest one above it up to the repository root (a
+`.git` file or directory). An `AGENTS.md` above the root belongs to another
+project and does not apply. Other coding harnesses read `AGENTS.md` the same
+way, so a project writes its rules once for every harness.
+
+The file is a standing instruction, not an observation, so the block is
+cached system text, unlike the orientation notification. It is read at create
+and does not update when the file changes; a rotated or new context reads it
+again. The block is cut at 32000 characters and says so. No working directory,
+or no `AGENTS.md`, writes no block. Tests:
+`crates/kaijutsu-solo-acp/tests/solo_acp_stdio.rs`, the `agents_md` cases.
+
 ## Explicit instruction scripts
 
 ```sh

@@ -1,0 +1,48 @@
+# Give a new coder its project's house rules: the AGENTS.md in its working
+# directory, or the nearest one above it inside the same git repository.
+#
+# Rules this script follows (docs/prompts.md, "Project house rules"):
+#
+#  - (System, Text), never a notification. AGENTS.md holds the project's
+#    standing rules, so it belongs in the cached system prompt. It is read at
+#    create and does not update as the file changes.
+#  - The search stops at the repository root (a .git file or directory). An
+#    AGENTS.md above it belongs to another project.
+#  - Builtins and kj only, as in S35-orient, so it works under any loadout.
+#  - Bounded. A file past the cap is cut, and the block says so.
+#  - Silent where there is nothing: no cwd, or no AGENTS.md, writes no block.
+
+cap=32000
+
+cwd="$(kj context info --json | jq -r '.cwd // empty')"
+if test -z "$cwd" || test ! -d "$cwd"; then
+  echo "house-rules: no working directory; skipped"
+  exit 0
+fi
+
+found=""
+dir="$cwd"
+while true; do
+  if test -f "$dir/AGENTS.md"; then
+    found="$dir/AGENTS.md"
+    break
+  fi
+  if test -e "$dir/.git" || test "$dir" = "/"; then
+    break
+  fi
+  dir="$(dirname "$dir")"
+done
+
+if test -z "$found"; then
+  echo "house-rules: no AGENTS.md at or above $cwd"
+  exit 0
+fi
+
+out="House rules from $found, read at context create. They are this project's standing instructions.
+
+$(cat "$found")"
+out="$(jq -n -r --arg s "$out" --argjson cap "$cap" 'if ($s | length) > $cap then $s[:$cap] + "\n[house rules cut at \($cap) characters]" else $s end')"
+
+kj block create --role system --kind text --content-type text/markdown --content "$out"
+echo "house-rules: $(jq -n -r --arg s "$out" '$s | length') characters from $found"
+exit 0
