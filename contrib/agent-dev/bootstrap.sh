@@ -25,7 +25,7 @@ if [[ -e "$base/kernel-data/data" || -e "$base/kernel-data/config" ]]; then
   exit 1
 fi
 
-mkdir -p "$base"/{kernel-data,workspace,cargo} "$base"/claude-workspace/exchange/{to-seat,to-supervisor,digest}
+mkdir -p "$base"/{kernel-data,workspace,cargo,cargo-target} "$base"/claude-workspace/exchange/{to-seat,to-supervisor,digest}
 
 # senpai's key: a key of its own, so the kernel can tell senpai from Amy.
 if [[ ! -f "$senpai_key" ]]; then

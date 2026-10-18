@@ -28,6 +28,8 @@ Volume=%h/kj-dev/%i/kernel-data:/var/lib/kaijutsu
 Volume=%h/kj-dev/%i/workspace:/workspace
 Volume=%h/kj-dev/%i/claude-workspace/exchange:/exchange
 Volume=%h/kj-dev/%i/cargo:%h/.cargo
+# The default rc points CARGO_TARGET_DIR here; the root file system is read-only, so it needs a volume.
+Volume=%h/kj-dev/%i/cargo-target:%h/.cache/kaijutsu/cargo-target
 
 # Every source tree is readable at its host path; only the project is writable.
 Volume=%h/src:%h/src:ro
