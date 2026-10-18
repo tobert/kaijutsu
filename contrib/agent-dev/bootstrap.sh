@@ -124,6 +124,11 @@ python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel
 kj context create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo"
 kj context create "$project-coder" --type coder --as "$project-coder" --cwd /workspace
 kj context set "$project-coder" --reviewer banto
+# The kernel passes only HOME, PATH and context exports to the programs a seat runs, so set the locale here.
+# Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
+for seat in "$project-banto" "$project-coder"; do
+  kj context set "$seat" --env LANG=C.UTF-8
+done
 kj context list
 
 echo
