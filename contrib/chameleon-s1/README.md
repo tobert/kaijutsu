@@ -67,7 +67,7 @@ with the next root's chromatic neighbor instead: Dm7 to G7 walks `D E F F#`.
 The council reads non-text questions independently. "Each `choice`, `score`,
 and `noul` question is read after the `text` answers before it in the spec's
 order, and its own answer never enters the text any later question is read
-after" (`docs/council-api.md`, "Specs"). This server has no `text`
+after" (gogi's `docs/council-api.md`, "Specs"). This server has no `text`
 questions, so every answer in a decision is read on its own, and the client
 samples each answer on its own. I compared three spec shapes:
 
@@ -191,7 +191,7 @@ It can choose, and it cannot write.
 
 - **Choices with probabilities: yes.** `choice` (2 to 26 options on this
   server, `choice_options`), `score` (2 to 10 ordered levels), and `noul`
-  (probability of yes). See `docs/council-api.md`, "Specs".
+  (probability of yes). See gogi's `docs/council-api.md`, "Specs".
 - **Answers within one decision are independent.** Only `text` answers
   condition later questions. A musical dependency has to be one option in a
   joint menu, as `plan` does, or the input to a second decision.
@@ -199,7 +199,7 @@ It can choose, and it cannot write.
   capability. The megakernel lists `leave_one_out`, `persist`, and `warm`,
   and a spec with a `text` question gets a `400`. Even with `describe`, a
   `text` answer is a short description, not generation.
-- **Generation is out of the contract.** `docs/council-api.md`, "Open
+- **Generation is out of the v1 contract.** gogi's `docs/council-api.md`, "Open
   questions", names the megakernel's `/mk/v1/generate` as outside it. A
   `GET` on that path answers `405`; this prototype does not use it.
 - **Questions come from the spec, never the request.** A request may pick

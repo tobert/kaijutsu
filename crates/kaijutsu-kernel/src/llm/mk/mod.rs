@@ -22,9 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kaijutsu_mk::council::wire::ServerIdentity;
-use kaijutsu_mk::council_v2::GenerationStream;
-use kaijutsu_mk::council_v2::wire::GenerationEvent;
+use gogi_proto::identity::ServerIdentity;
+use kaijutsu_mk::council::{GenerationEvent, GenerationStream};
 use kaijutsu_mk::generate::{
     Finish, GenerateEvent, GenerateRequest, GenerateStream, Message as MkMessage, Sample, Source, MAX_TOKENS_LIMIT,
 };
@@ -362,7 +361,7 @@ enum Inner {
 enum Event {
     Token(String),
     Done(kaijutsu_mk::generate::Done),
-    V2Done(kaijutsu_mk::council_v2::wire::GenerationDone),
+    V2Done(gogi_proto::generation::GenerationDone),
 }
 
 impl Inner {

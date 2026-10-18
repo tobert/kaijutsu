@@ -1,6 +1,6 @@
 //! Translate kaijutsu [`Message`]s, tools, and tunables into a
 //! `/mk/v1/generate` request (`docs/mk.md`, "Request mapping"), or into
-//! council v2 messages (`docs/council-api-v2.md`).
+//! council v2 messages (gogi's `docs/council-api-v2.md`).
 //!
 //! - The system prompt is one `system` message, first. A kernel instruction
 //!   later in the history is a `system` message at its point, which the
@@ -14,7 +14,7 @@
 //! - The service takes text only. An image becomes a visible marker.
 
 use kaijutsu_mk::Json;
-use kaijutsu_mk::council_v2::wire::{Message as V2Message, Role as V2Role, ToolCall as V2ToolCall};
+use gogi_proto::{Message as V2Message, Role as V2Role, ToolCall as V2ToolCall};
 use kaijutsu_mk::generate::{Function, Message as MkMessage, ReasoningEffort, Role as MkRole, Tool, ToolCallIn};
 
 use crate::llm::{ContentBlock, LlmError, LlmResult, Message, MessageContent, Role, ToolDefinition};
@@ -74,7 +74,7 @@ pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<V
 }
 
 /// The system prompt and history as council v2 messages
-/// (`docs/council-api-v2.md`, "Contexts"), with snapshot boundaries.
+/// (gogi's `docs/council-api-v2.md`, "Contexts"), with snapshot boundaries.
 ///
 /// Calls keep the kernel's ids, and each result names the call it answers.
 /// An assistant message leaves out empty text. `snap` marks the system
@@ -86,18 +86,24 @@ pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<V
 pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<V2Message>> {
     let mut out: Vec<V2Message> = walk(system, history)?
         .into_iter()
-        .map(|m| match m {
+        .map(|m| -> LlmResult<V2Message> { Ok(match m {
             Walked::System(text) => V2Message::system(text),
             Walked::User(text) => V2Message::user(text),
             Walked::Assistant { content, reasoning, calls } => V2Message {
                 content: content.filter(|c| !c.is_empty()),
                 reasoning,
-                tool_calls: calls.into_iter().map(|(id, name, arguments)| V2ToolCall { id, name, arguments }).collect(),
+                tool_calls: calls
+                    .into_iter()
+                    .map(|(id, name, arguments)| match serde_json::to_value(&arguments) {
+                        Ok(serde_json::Value::Object(arguments)) => Ok(V2ToolCall { id, name, arguments }),
+                        _ => Err(LlmError::InvalidRequest(format!("tool call {id} arguments are not a JSON object"))),
+                    })
+                    .collect::<LlmResult<_>>()?,
                 ..V2Message::assistant("")
             },
             Walked::Tool { id, content } => V2Message::tool(id, content),
-        })
-        .collect();
+        }) })
+        .collect::<LlmResult<_>>()?;
     for i in 0..out.len() {
         let next = out.get(i + 1).map(|m| m.role);
         out[i].snap = match out[i].role {

@@ -56,6 +56,7 @@ approval-ledger.workspace = true
 
 # The megakernel client: the council gate's decision calls (docs/mk.md).
 kaijutsu-mk.workspace = true
+gogi-proto.workspace = true
 
 # Claude Code's per-session peer messaging socket: registry scan, liveness
 # guard, attribution envelope, frames, delivery (docs/cc-peer.md). Protocol
@@ -198,6 +199,7 @@ tracing-subscriber = { workspace = true }
 kaijutsu-hyoushigi = { workspace = true, features = ["test-util"] }
 # The megakernel client's scripted HTTP server, for the `mk` provider's tests.
 kaijutsu-mk = { workspace = true, features = ["test-util"] }
+gogi-fake = { workspace = true }
 # Self-dependency so this crate's OWN `test-util` feature (KernelDb::temporary())
 # is enabled when building its integration tests under `tests/` — that build
 # links the lib as an ordinary dependency (no `cfg(test)`), so without this the

@@ -1,4 +1,4 @@
-//! Turns on a council v2 server (`docs/council-api-v2.md`).
+//! Turns on a council v2 server (gogi's `docs/council-api-v2.md`).
 //!
 //! When the server's `GET /council/v2/identity` lists `generate`, each turn
 //! is one generation that sends the whole conversation: the system message,
@@ -9,9 +9,9 @@
 //! messages, and a fork or an exclude reuses the prefix it keeps. The
 //! client keeps nothing between turns: the kernel's history is the context.
 
-use kaijutsu_mk::council::wire::{Capability, ServerIdentity};
-use kaijutsu_mk::council_v2::wire::{Context, GenerationRequest, Role as V2Role};
-use kaijutsu_mk::generate::Sample;
+use gogi_proto::generation::{GenerationRequest, Sample};
+use gogi_proto::identity::{Capability, ServerIdentity};
+use gogi_proto::{Context, Role as V2Role};
 
 use super::reply::Reply;
 use super::{build, Client, Inner, Stream, Turn};
@@ -33,7 +33,7 @@ impl Client {
             .get_or_try_init(|| async {
                 let (_slot, identity) = self
                     .call(turn, false, |_| async {
-                        match self.mk.v2().identity().await {
+                        match self.mk.council().identity().await {
                             Ok(identity) => Ok(Some(identity)),
                             Err(e) if matches!(e.status(), Some(404 | 405 | 501)) => Ok(None),
                             Err(e) => Err(e),
@@ -59,7 +59,11 @@ impl Client {
     ) -> LlmResult<Stream> {
         let (thinking, _) = build::effort(opts.effort.as_deref())?;
         let messages = build::messages_v2(opts.system.as_deref(), &history)?;
-        let tools = build::tools(&opts.tools)?;
+        let tools = build::tools(&opts.tools)?
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LlmError::InvalidRequest(format!("mk backend '{}': a tool does not serialize: {e}", self.name)))?;
         if messages.last().is_none_or(|m| m.role == V2Role::Assistant) {
             return Err(LlmError::InvalidRequest(format!(
                 "mk backend '{}': the conversation is empty or ends with an assistant message; a generation \
@@ -79,9 +83,11 @@ impl Client {
             context: Context { thinking, tools, queue: None, messages },
             max_tokens: Some(max_tokens),
             sample,
+            stream: None,
+            decisions: Vec::new(),
         };
         let started = std::time::Instant::now();
-        let (slot, inner) = self.call(&turn, true, |_| async { self.mk.v2().generate_stream(&request, self.timeout).await }).await?;
+        let (slot, inner) = self.call(&turn, true, |_| async { self.mk.council().generate_stream(&request, self.timeout).await }).await?;
         Ok(Stream {
             name: self.name.clone(),
             inner: Some(Inner::V2(inner)),

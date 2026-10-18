@@ -170,7 +170,7 @@ pub(crate) fn spawn_judge(
     kernel: Arc<crate::Kernel>,
     council: crate::kj::gate_policy::CouncilConfig,
     decision_id: Vec<u8>,
-    state: kaijutsu_mk::Json,
+    state: serde_json::Value,
     read: JudgeRead,
 ) {
     tokio::spawn(async move {
@@ -207,12 +207,12 @@ async fn judge_one(
     kernel: &crate::Kernel,
     mut council: crate::kj::gate_policy::CouncilConfig,
     decision_id: &[u8],
-    state: &kaijutsu_mk::Json,
+    state: &serde_json::Value,
     read: &JudgeRead,
 ) -> Judged {
     use approval_ledger::council::CouncilServer;
     use approval_ledger::council_observation::{CouncilObservationOutcome, NewCouncilObservation};
-    use kaijutsu_mk::council::wire::PooledAnswer;
+    use gogi_proto::decision::PooledAnswer;
 
     let started = std::time::Instant::now();
     let label = shadow_label(&read.seat_name);
@@ -269,7 +269,7 @@ async fn judge_one(
     };
     let primed =
         kernel.council_sync().prime_shadow(kernel, &server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
-    let (server_context, head) = match tokio::time::timeout_at(deadline, primed).await {
+    let (shadow_seat, head) = match tokio::time::timeout_at(deadline, primed).await {
         Ok(Ok(primed)) => primed,
         Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
         Err(_) => {
@@ -285,7 +285,7 @@ async fn judge_one(
     prepared.contexts.push(super::sync::PreparedContext {
         label: label.clone(),
         context_id: read.shadow,
-        server: server_context,
+        seat: shadow_seat,
         head,
         house_rules: false,
     });
@@ -296,7 +296,7 @@ async fn judge_one(
         Ok(response) => response,
         Err(cause) => return miss(judged, cause),
     };
-    if let Err(mismatch) = kaijutsu_mk::council::math::verify(&response, &request) {
+    if let Err(mismatch) = gogi_proto::math::verify(&response, &request.expect()) {
         return miss(judged, format!("the answer's numbers do not recompute ({mismatch})"));
     }
     judged.observation.server = CouncilServer {

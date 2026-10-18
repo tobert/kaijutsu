@@ -119,8 +119,9 @@ WAL. Accept `-p`, or have the refusal name the fix.
 
 ## Council v2 client: what is open (2026-10-16)
 
-The mk provider and the council speak `docs/council-api-v2.md` when a
-server answers `GET /council/v2/identity`. mkviolet serves it. The live
+The council speaks only council v2 (gogi's `docs/council-api-v2.md`), and
+the mk provider speaks it when a server's `GET /council/v2/identity` lists
+`generate`. mkviolet serves it. The live
 checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
 (`COUNCIL_URL`) and the mk probes and `live_mk_tool_loop` (`MK_URL`).
 
@@ -151,6 +152,23 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   `/mk/v1/model`, and a model row's `context_window` smaller than the
   server's `context_tokens` is not enforced on the v2 path: there is no
   render to count the prompt, so the server's `context_full` is the check.
+- **A server restart leaves seat records stale.** Each decision sends its
+  seats whole, so it still works, but the kernel keeps each seat's old head:
+  it records that head as a read's `expected_head` and keeps it in the pin
+  set until a pin `PUT` reports `held: false`. On a server without `pins`
+  nothing corrects it. A decision's 404 forgets only the spec
+  (`gate::forget_after`), and `Prepared` does not carry the origin key the
+  seat records are keyed by. (Kaibo review, 2026-10-18.)
+- **The judge read skips the spec-id check.** `shadow::judge_one` verifies
+  the numbers but not that `identity.spec_id` is the spec asked for, and it
+  records `Answered` from the pooled verdict even when no read names the
+  shadow; the gate and `observe` check both. The answer is written into the
+  shadow's dialogue, so a wrong one feeds the next judge read. (Kaibo review,
+  2026-10-18.)
+- **Server limits beyond contexts are not checked at prepare.** Only
+  `contexts_per_decision` and `context_tokens` are read; a spec over the
+  server's `choice_options` or `questions_per_spec` fails at the decision,
+  not as a prepare miss that names the limit.
 - **Questions for the spec.** Snapshot ids keep v1's `snap:` form; tokens
   and stream errors are `/mk/v1`'s; the `reads` reply shape; whether a
   generation can mark its reply `snap`; and
@@ -254,18 +272,13 @@ over time)."
 
 - **The seat can edit its own house rules.** The context reads the
   `AGENTS.md` in the seat's workspace, and a seat with `file:write` there
-  can change it. The decision pins the head at submission, so a rewrite
+  can change it. The decision reads the file at submission, so a rewrite
   reaches the next decision, not the one it rides on. Decide whether the
   council should read a copy the kernel holds, or whether the
   `council-system` rule that changing `AGENTS.md` needs Amy is enough.
 - **The budget is bytes.** `house_rules_tokens` is estimated at four bytes a
   token; the server's tokenizer may disagree. A file larger than the budget
   keeps only its start.
-- **Superseded house-rules ids stay on a v1 server.** An edited
-  `AGENTS.md` is a new id, and a v1 server keeps the old id's snapshots.
-  The kernel remembers one body per file. `DELETE` an id the kernel no
-  longer produces, or let the server age it out. On v2 the old seat leaves
-  the pin set and the server's expiry decides.
 - **The home directory fallback.** A seat with no working directory looks
   for `AGENTS.md` from the kernel host's home directory upward, so a
   benchmark seat that never set one reads the host's file if it has one.
@@ -278,12 +291,6 @@ over time)."
 - **Elided program text depends on spelling.** The shell case elides a
   judged program's text only where it appears verbatim; `-c` text with
   escapes stays, and the shell decision may still ask about it.
-- **Flaky test.** `council::sync::tests::a_prepare_dropped_during_a_put_sends_the_context_fresh_next_time`
-  failed 2 of 3 runs once, then passed 8 in a row; origin/main passed 4 of
-  4. The panic was the mock's "client closed before sending a request",
-  which kills the mock's accept loop. A likely cause: a prepare dropped at
-  100 ms while still connecting closes a connection empty. Let the mock
-  ignore an empty connection.
 
 ## Council bump protocol: pass or bump instead of allow or ask (2026-10-05)
 
@@ -670,12 +677,6 @@ against `council-system` and `council-amy` on the megakernel.
   and the first decision missed ("cannot be read"). They were copied by hand
   from `assets/defaults/council/`. Seed them, or name them in
   `docs/operating.md`'s deploy steps.
-- **The first decision after a context change misses.** Sync is lazy: the
-  first decision PUTs both contexts (1108 and 396 tokens) and builds each
-  spec layer inside the deadline. With a 3000 ms deadline it missed during
-  prepare, then during the decision. The megakernel declares no `warm`, so
-  the kernel should send contexts and build spec layers off the hot path, at
-  enable time and after each change.
 - **Warm decisions take 1.4-3.3 s** on zorak's shared GPU (direct timing,
   two contexts). The deadline is now 8000 ms on zorak.
 - **The mass floor discards a useful read.** On the chmod, council-system
@@ -701,7 +702,7 @@ top level beside it.
 The bass prototype (`contrib/chameleon-s1/`) chose one bass cell per bar
 from the megakernel in about 250 ms (median, client wall time, one choice
 question), while moltar's gate decisions ran on the same server. The
-response has no `queue_ms`, although `docs/council-api.md` lists it, so a
+response has no `queue_ms`, although gogi's `docs/council-api.md` lists it, so a
 1475 ms outlier has no recorded cause. Before a second musician joins, the
 band's decisions and the gate need a priority or admission story, and a
 producer measuring council latency must use its own wall time.
@@ -767,17 +768,6 @@ council create rc; the guidance was loaded again from
 `contrib/council/director/`. Also, `kj block inspect` does not show whether a block is
 excluded, so there is no CLI way to confirm what a council context sends.
 
-## The shell spec is not named in a council `warm` (2026-10-06)
-
-`CouncilSync::hold` hashes a context's body before adding `warm` and skips
-the `PUT` when the hash matches (`crates/kaijutsu-kernel/src/council/sync.rs`).
-A submission's program decisions run first and send each shared context
-with `warm` naming the program spec, so the shell decision finds the head
-held and never names its spec. Per `docs/council-api.md`, the first shell
-read after a context change then rebuilds its spec layer inside that
-decision's deadline. No test covers `warm`. Found in the kaibo review of
-49b6f839.
-
 ## `CancelOnDrop` also fires after a delivered score (2026-10-06)
 
 `ModelOutput::resolve` moves `CancelOnDrop` into its future
@@ -823,13 +813,14 @@ archive the conversation as-is.
 
 ## "Context" means two things once the council lands (2026-10-04)
 
-`docs/council-api.md` uses context for a held model context, as the
-megakernel and lfm2d do; our Terms table (`docs/writing.md`) uses it for
+gogi's `docs/council-api-v2.md` uses context for a chat the client sends
+whole with each request; our Terms table (`docs/writing.md`) uses it for
 kaijutsu's durable block log. Amy: "if a context is a context call it a
 context here. kaijutsu shoulda called it something else in any case." A
-council context is a kaijutsu context held on the server under the same id,
-so the two mostly coincide. Renaming kaijutsu's term is open; until then,
-say "held context" when the server's copy is meant.
+council context is a kaijutsu context the kernel projects into a council v2
+context each time it builds a seat, so the two mostly coincide. Renaming
+kaijutsu's term is open; until then, say "seat" when the projected value
+sent to the server is meant.
 
 ## Architecture cleanup plan
 

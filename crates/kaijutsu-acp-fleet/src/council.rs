@@ -1,11 +1,11 @@
 //! A scripted council server for one scenario run (`docs/acp-fleet.md`,
 //! "Council scenarios").
 //!
-//! It serves the council contract on 127.0.0.1 well enough for a kernel's
-//! gate: it reports an identity, holds the specs and contexts it is sent,
-//! and answers each decision with the scenario's next verdict. Every answer
-//! carries numbers `math::verify` recomputes, so the kernel reads it as a
-//! real council's. One verdict answers one decision, in order, and the last
+//! It serves council v2 on 127.0.0.1 well enough for a kernel's gate: it
+//! reports an identity, holds the specs it is sent, builds the contexts it
+//! is sent, and answers each decision with the scenario's next verdict.
+//! Every answer carries numbers `gogi_proto::math::verify` recomputes, so
+//! the kernel reads it as a real council's. One verdict answers one decision, in order, and the last
 //! one repeats. [`ScriptedCouncil::restart`] replaces the verdicts between
 //! prompts.
 
@@ -18,8 +18,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use kaijutsu_mk::council::math::{self, Row, WeightSpec};
-use kaijutsu_mk::council::wire::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights, Spec, SpecQuestion};
+use gogi_proto::context::{Context, ContextBuild, ContextBuilt, SnapshotInfo};
+use gogi_proto::decision::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
+use gogi_proto::identity::{Limits, ServerIdentity};
+use gogi_proto::math::{self, Row, WeightSpec};
+use gogi_proto::spec::{QuestionKind, Spec, SpecRules};
+use gogi_proto::{SnapshotId, sha256_hex};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -90,18 +94,63 @@ fn identity() -> Value {
            "engine": "acp-fleet"})
 }
 
-fn server_identity() -> Value {
-    let mut id = identity();
-    id["limits"] = json!({"context_tokens": 100000, "state_bytes": 100000, "contexts_per_decision": 8,
-                          "choice_options": 8, "default_timeout_ms": 1000});
-    id["capabilities"] = json!([]);
-    id
+/// The identity `GET /council/v2/identity` answers. It lists no
+/// capabilities, so a kernel sends it no pins.
+fn server_identity() -> ServerIdentity {
+    ServerIdentity {
+        model: "fleet-council".into(),
+        aliases: None,
+        weight_hash: "fleet".into(),
+        tokenizer_hash: "fleet".into(),
+        template: TEMPLATE.into(),
+        engine: "acp-fleet".into(),
+        device: None,
+        text_stop: None,
+        limits: Limits {
+            context_tokens: 100000,
+            state_bytes: 100000,
+            contexts_per_decision: gogi_proto::decision::MAX_CONTEXTS as u64,
+            choice_options: 8,
+            default_timeout_ms: 1000,
+            questions_per_spec: None,
+            text_tokens: None,
+            pin_bytes: None,
+            snapshot_bytes: None,
+            decision_context_tokens: None,
+        },
+        capabilities: Vec::new(),
+        extensions: None,
+    }
+}
+
+/// The head snapshot the scripted council reports for `context`: `snap:`
+/// and the sha256 of its JSON, so the same context always has the same
+/// head.
+fn head_of(context: &Context) -> Result<SnapshotId> {
+    let text = serde_json::to_string(context).context("a context does not encode")?;
+    SnapshotId::parse(format!("snap:{}", sha256_hex(text.as_bytes()))).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The response to building `context`: its head, one token per message,
+/// all of them fed, and one snapshot at its end.
+fn built(context: &Context, dry_run: bool) -> Result<ContextBuilt> {
+    let head = head_of(context)?;
+    let tokens = context.messages.len() as u64;
+    Ok(ContextBuilt {
+        head: head.clone(),
+        tokens,
+        kept: 0,
+        fed: tokens,
+        from: None,
+        dry_run,
+        snapshots: vec![SnapshotInfo { id: head, message: tokens.saturating_sub(1), tokens, tier: None, bytes: None }],
+    })
 }
 
 /// The options of `spec`'s choice question `id`, in the spec's order.
 fn choice_options<'a>(spec: &'a Spec, id: &str) -> Result<Vec<&'a str>> {
-    match spec.questions.iter().find(|q| q.id() == id) {
-        Some(SpecQuestion::Choice(q)) => Ok(q.criteria.iter().map(|c| c.option.as_str()).collect()),
+    match spec.questions.iter().find(|q| q.id == id).map(|q| &q.kind) {
+        Some(QuestionKind::Choice { options }) => Ok(options.iter().map(|(o, _)| o.as_str()).collect()),
         Some(_) => bail!("spec {:?} question {id:?} is not a choice question", spec.name),
         None => bail!("spec {:?} has no {id:?} question for the scripted council to answer", spec.name),
     }
@@ -123,7 +172,7 @@ pub fn answer(request: &DecisionRequest, spec: &Spec, verdict: Verdict, undo: Op
             }
         }
     }
-    let contexts = request.contexts.clone().unwrap_or_default();
+    let contexts = &request.contexts;
     if contexts.is_empty() {
         bail!("the decision names no council context; the scripted council answers one read per context");
     }
@@ -183,15 +232,16 @@ pub fn answer(request: &DecisionRequest, spec: &Spec, verdict: Verdict, undo: Op
     let reads: Vec<Value> = contexts
         .iter()
         .zip(read_answers)
-        .map(|(c, answers)| {
-            json!({
-                "context": c.id,
-                "snapshot": c.at.as_ref().map(|s| s.to_string()).unwrap_or_else(|| format!("snap:{}", "0".repeat(64))),
+        .enumerate()
+        .map(|(i, (c, answers))| {
+            Ok(json!({
+                "context": i,
+                "snapshot": head_of(c)?,
                 "answers": answers,
                 "rendered_sha256": "0".repeat(64),
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let mut id = identity();
     id["spec_id"] = json!(request.spec_id);
     let body = json!({
@@ -205,7 +255,7 @@ pub fn answer(request: &DecisionRequest, spec: &Spec, verdict: Verdict, undo: Op
         "ms": 1.0,
     });
     let decoded: DecisionResponse = serde_json::from_value(body.clone()).context("the scripted answer does not decode")?;
-    math::verify(&decoded, request).map_err(|m| anyhow::anyhow!("the scripted answer fails math::verify: {m}"))?;
+    math::verify(&decoded, &request.expect()).map_err(|m| anyhow::anyhow!("the scripted answer fails math::verify: {m}"))?;
     Ok(body)
 }
 
@@ -235,7 +285,6 @@ struct Shared {
     errors: Mutex<Vec<String>>,
     /// Errors past [`ERROR_LIMIT`], counted.
     errors_dropped: AtomicU64,
-    puts: AtomicU64,
 }
 
 /// A council server on 127.0.0.1, alive until dropped.
@@ -316,21 +365,21 @@ impl Drop for ScriptedCouncil {
     }
 }
 
-/// A request the server refuses for its size, with the HTTP status it
-/// answers.
+/// A request the server refuses for its size or its route, with the HTTP
+/// status it answers.
 #[derive(Debug)]
-struct TooLarge(u16, String);
+struct Refusal(u16, String);
 
-impl std::fmt::Display for TooLarge {
+impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.1)
     }
 }
 
-impl std::error::Error for TooLarge {}
+impl std::error::Error for Refusal {}
 
 /// One HTTP request: method, path, body. A head past [`HEAD_LIMIT`] or a
-/// body past [`BODY_LIMIT`] is refused with [`TooLarge`] before it is read.
+/// body past [`BODY_LIMIT`] is refused with [`Refusal`] before it is read.
 fn read_request(sock: &mut TcpStream) -> Result<(String, String, String)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -350,12 +399,12 @@ fn read_request(sock: &mut TcpStream) -> Result<(String, String, String)> {
                 None => 0,
             };
             if len > BODY_LIMIT {
-                return Err(TooLarge(413, format!("a request body of {len} bytes, larger than the {BODY_LIMIT} the scripted council reads")).into());
+                return Err(Refusal(413, format!("a request body of {len} bytes, larger than the {BODY_LIMIT} the scripted council reads")).into());
             }
             break (i + 4, len);
         }
         if buf.len() > HEAD_LIMIT {
-            return Err(TooLarge(431, format!("a request head larger than the {HEAD_LIMIT} bytes the scripted council reads")).into());
+            return Err(Refusal(431, format!("a request head larger than the {HEAD_LIMIT} bytes the scripted council reads")).into());
         }
     };
     while buf.len() < head_end + len {
@@ -396,21 +445,18 @@ fn record_error(shared: &Shared, message: &str) {
 fn serve_one(mut sock: TcpStream, shared: &Shared) {
     let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
     let request = read_request(&mut sock);
-    let (status, body) = match request.and_then(|(method, path, body)| {
-        // The scripted council speaks council v1. A client asks for v2
-        // first and takes a 404 as v1, so it is not an error.
-        if path.starts_with("/council/v2/") {
-            return Ok(None);
-        }
-        route(&method, &path, &body, shared).map(Some)
-    }) {
-        Ok(Some(body)) => (200, body.to_string()),
-        Ok(None) => (404, json!({"error": {"type": "not_found", "message": "the scripted council speaks council v1"}}).to_string()),
+    let (status, body) = match request.and_then(|(method, path, body)| route(&method, &path, &body, shared)) {
+        Ok(body) => (200, body.to_string()),
         Err(error) => {
-            let status = error.downcast_ref::<TooLarge>().map_or(500, |t| t.0);
+            let status = error.downcast_ref::<Refusal>().map_or(500, |r| r.0);
+            let kind = match status {
+                404 => "not_found",
+                413 | 431 => "too_large",
+                _ => "internal",
+            };
             let message = format!("{error:#}");
             record_error(shared, &message);
-            (status, json!({"error": {"type": "internal", "message": message}}).to_string())
+            (status, json!({"error": {"type": kind, "message": message}}).to_string())
         }
     };
     let out = format!(
@@ -423,11 +469,12 @@ fn serve_one(mut sock: TcpStream, shared: &Shared) {
 
 fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value> {
     match (method, path) {
-        ("GET", "/council/v1/identity") => Ok(server_identity()),
-        ("POST", "/council/v1/specs") => {
-            let spec: Spec = serde_json::from_str(body).context("a posted spec does not decode")?;
-            let id = kaijutsu_mk::council::canon::spec_id(&spec).context("a posted spec has no canonical id")?;
-            let held = json!({"spec_id": id, "spec": spec, "template": TEMPLATE});
+        ("GET", "/council/v2/identity") => Ok(serde_json::to_value(server_identity())?),
+        ("POST", "/council/v2/specs") => {
+            let value: Value = serde_json::from_str(body).context("a posted spec is not JSON")?;
+            let spec = gogi_proto::spec::parse_spec(&value, &SpecRules::default()).map_err(|e| anyhow::anyhow!("a posted spec is refused: {e}"))?;
+            let id = spec.id();
+            let held = json!({"spec_id": id, "spec": value, "template": TEMPLATE});
             let mut specs = shared.specs.lock().map_err(|_| anyhow::anyhow!("the spec table is poisoned"))?;
             if specs.len() >= SPEC_LIMIT && !specs.contains_key(id.as_str()) {
                 bail!("the scripted council holds at most {SPEC_LIMIT} specs");
@@ -435,14 +482,14 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value>
             specs.insert(id.to_string(), spec);
             Ok(held)
         }
-        ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
-            let n = shared.puts.fetch_add(1, Ordering::SeqCst) + 1;
-            let id = p.rsplit('/').next().unwrap_or("");
-            Ok(json!({"id": id, "head": format!("snap:{n:064x}"), "tokens": 1, "kept": 0, "fed": 1,
-                      "dry_run": false, "snapshots": []}))
+        ("POST", "/council/v2/contexts") => {
+            let build: ContextBuild = serde_json::from_str(body).context("a context build does not decode")?;
+            build.context.check().map_err(|e| anyhow::anyhow!("a context build is refused: {e}"))?;
+            Ok(serde_json::to_value(built(&build.context, build.dry_run.unwrap_or(false))?)?)
         }
-        ("POST", "/council/v1/decisions") => {
+        ("POST", "/council/v2/decisions") => {
             let request: DecisionRequest = serde_json::from_str(body).context("a decision request does not decode")?;
+            request.validate().map_err(|e| anyhow::anyhow!("a decision request is refused: {e}"))?;
             let spec_id = request.spec_id.as_ref().context("a decision with no spec_id; the scripted council answers specs only")?;
             let spec = shared
                 .specs
@@ -462,7 +509,7 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value>
             });
             Ok(reply)
         }
-        _ => bail!("the scripted council does not serve {method} {path}"),
+        _ => Err(Refusal(404, format!("the scripted council does not serve {method} {path}")).into()),
     }
 }
 
@@ -472,15 +519,21 @@ mod tests {
 
     const SHELL_BUMP: &str = include_str!("../../../assets/defaults/council/shell-bump.json");
 
-    fn spec() -> Spec {
+    fn spec_value() -> Value {
         serde_json::from_str(SHELL_BUMP).unwrap()
     }
 
+    fn spec() -> Spec {
+        gogi_proto::spec::parse_spec(&spec_value(), &SpecRules::default()).unwrap()
+    }
+
+    fn context(i: usize) -> Value {
+        json!({"messages": [{"role": "user", "content": format!("seat {i}")}]})
+    }
+
     fn request(contexts: usize) -> DecisionRequest {
-        let spec_id = kaijutsu_mk::council::canon::spec_id(&spec()).unwrap();
-        let contexts: Vec<Value> = (0..contexts)
-            .map(|i| json!({"id": format!("0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b1{i}"), "at": format!("snap:{:064x}", i + 1)}))
-            .collect();
+        let spec_id = spec().id();
+        let contexts: Vec<Value> = (0..contexts).map(context).collect();
         serde_json::from_value(json!({
             "state": "touch x",
             "spec_id": spec_id,
@@ -517,7 +570,7 @@ mod tests {
     fn a_body_over_the_limit_gets_413_and_is_recorded() {
         let council = council();
         let addr = &council.base()["http://".len()..];
-        let head = format!("POST /council/v1/specs HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n", BODY_LIMIT + 1);
+        let head = format!("POST /council/v2/specs HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n", BODY_LIMIT + 1);
         let (status, _) = send_raw(addr, head.as_bytes());
         assert_eq!(status, 413);
         let errors = council.errors();
@@ -529,7 +582,7 @@ mod tests {
     fn a_head_over_the_limit_is_refused_and_recorded() {
         let council = council();
         let addr = &council.base()["http://".len()..];
-        let head = format!("GET /council/v1/identity HTTP/1.1\r\nx-pad: {}", "a".repeat(HEAD_LIMIT + 1));
+        let head = format!("GET /council/v2/identity HTTP/1.1\r\nx-pad: {}", "a".repeat(HEAD_LIMIT + 1));
         let (status, _) = send_raw(addr, head.as_bytes());
         assert_eq!(status, 431);
         assert_eq!(council.errors().len(), 1, "{:?}", council.errors());
@@ -539,9 +592,9 @@ mod tests {
     fn errors_are_kept_short_and_counted_past_the_limit() {
         let council = council();
         let addr = &council.base()["http://".len()..];
-        let long = format!("/council/v1/{}", "x".repeat(ERROR_TEXT_LIMIT * 4));
+        let long = format!("/council/v2/{}", "x".repeat(ERROR_TEXT_LIMIT * 4));
         for _ in 0..ERROR_LIMIT + 5 {
-            assert_eq!(post(addr, &long, "").0, 500);
+            assert_eq!(post(addr, &long, "").0, 404);
         }
         let errors = council.errors();
         assert_eq!(errors.len(), ERROR_LIMIT + 1, "{errors:?}");
@@ -554,14 +607,14 @@ mod tests {
         let council = council();
         let addr = &council.base()["http://".len()..];
         for n in 0..SPEC_LIMIT {
-            let mut spec = spec();
-            spec.name = format!("fleet-spec-{n}");
-            let (status, body) = post(addr, "/council/v1/specs", &serde_json::to_string(&spec).unwrap());
+            let mut spec = spec_value();
+            spec["name"] = json!(format!("fleet-spec-{n}"));
+            let (status, body) = post(addr, "/council/v2/specs", &spec.to_string());
             assert_eq!(status, 200, "{body}");
         }
-        let mut spec = spec();
-        spec.name = "one-too-many".into();
-        assert_eq!(post(addr, "/council/v1/specs", &serde_json::to_string(&spec).unwrap()).0, 500);
+        let mut spec = spec_value();
+        spec["name"] = json!("one-too-many");
+        assert_eq!(post(addr, "/council/v2/specs", &spec.to_string()).0, 500);
         assert!(council.errors().iter().any(|e| e.contains("at most")), "{:?}", council.errors());
     }
 
@@ -581,6 +634,7 @@ mod tests {
             assert!(p > 0.99, "{verdict:?}: pooled p {p} must clear a 0.98 threshold");
             assert!(body["answers"].get("originals").is_none(), "the rubric stays unanswered, so the verdict decides");
             assert_eq!(body["reads"].as_array().unwrap().len(), 2, "one read per context");
+            assert_eq!(body["reads"][1]["context"], 1, "a read names its context by index");
         }
     }
 
@@ -594,7 +648,7 @@ mod tests {
     #[test]
     fn a_spec_without_the_scripted_question_is_an_error() {
         let mut spec = spec();
-        spec.questions.retain(|q| q.id() != "undo");
+        spec.questions.retain(|q| q.id != "undo");
         let error = format!("{:#}", answer(&request(1), &spec, Verdict::Proceed, Some(Undo::Normal)).unwrap_err());
         assert!(error.contains("no \"undo\" question"), "{error}");
     }
@@ -620,24 +674,40 @@ mod tests {
             let body = out.split_once("\r\n\r\n").unwrap().1;
             (status, serde_json::from_str(body).unwrap())
         };
-        assert_eq!(call("GET", "/council/v1/identity", "").1["model"], "fleet-council");
-        let (status, held) = call("POST", "/council/v1/specs", SHELL_BUMP);
+        let (status, id) = call("GET", "/council/v2/identity", "");
+        assert_eq!(status, 200, "{id}");
+        let id: ServerIdentity = serde_json::from_value(id).unwrap();
+        assert_eq!(id.model, "fleet-council");
+        assert!(id.capabilities.is_empty(), "no pins capability, so the kernel sends no pins");
+        let (status, held) = call("POST", "/council/v2/specs", SHELL_BUMP);
         assert_eq!(status, 200, "{held}");
-        assert_eq!(call("PUT", "/council/v1/contexts/0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b10", "{}").0, 200);
+        assert_eq!(held["spec_id"], spec().id());
+        let build = json!({"context": context(0)}).to_string();
+        let (status, first) = call("POST", "/council/v2/contexts", &build);
+        assert_eq!(status, 200, "{first}");
+        let first: ContextBuilt = serde_json::from_value(first).unwrap();
+        let again: ContextBuilt = serde_json::from_value(call("POST", "/council/v2/contexts", &build).1).unwrap();
+        assert_eq!(first.head, again.head, "the same context has the same head");
+        let other = json!({"context": context(1), "dry_run": true}).to_string();
+        let other: ContextBuilt = serde_json::from_value(call("POST", "/council/v2/contexts", &other).1).unwrap();
+        assert_ne!(first.head, other.head);
+        assert!(other.dry_run);
         let decision = serde_json::to_string(&request(1)).unwrap();
-        let verdicts: Vec<String> =
-            (0..3).map(|_| pooled_choice(&call("POST", "/council/v1/decisions", &decision).1, "verdict")).collect();
+        let (status, reply) = call("POST", "/council/v2/decisions", &decision);
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["reads"][0]["snapshot"], first.head.as_str(), "a read reports its context's head");
+        let verdicts: Vec<String> = std::iter::once(pooled_choice(&reply, "verdict"))
+            .chain((0..2).map(|_| pooled_choice(&call("POST", "/council/v2/decisions", &decision).1, "verdict")))
+            .collect();
         assert_eq!(verdicts, ["try_harder", "do_less", "do_less"]);
         assert_eq!(council.answered(), ["try_harder", "do_less", "do_less"]);
         council.restart(vec![Verdict::Proceed, Verdict::TryHarder]).unwrap();
         let verdicts: Vec<String> =
-            (0..3).map(|_| pooled_choice(&call("POST", "/council/v1/decisions", &decision).1, "verdict")).collect();
+            (0..3).map(|_| pooled_choice(&call("POST", "/council/v2/decisions", &decision).1, "verdict")).collect();
         assert_eq!(verdicts, ["proceed", "try_harder", "try_harder"], "a restart answers from its first verdict");
         assert!(council.errors().is_empty(), "{:?}", council.errors());
-        assert_eq!(call("GET", "/council/v2/identity", "").0, 404, "a v1 server, which a client probes for v2");
-        assert!(council.errors().is_empty(), "the v2 probe is not an error: {:?}", council.errors());
-        let (status, _) = call("POST", "/council/v1/nowhere", "");
-        assert_eq!(status, 500);
-        assert_eq!(council.errors().len(), 1, "an unserved request is recorded");
+        assert_eq!(call("GET", "/council/v1/identity", "").0, 404, "council v1 is gone");
+        assert_eq!(call("POST", "/council/v2/nowhere", "").0, 404);
+        assert_eq!(council.errors().len(), 2, "each unserved request is recorded: {:?}", council.errors());
     }
 }

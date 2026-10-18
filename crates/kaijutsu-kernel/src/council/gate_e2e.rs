@@ -14,7 +14,8 @@ use approval_ledger::council_observation::{
     CouncilObservation, CouncilObservationOutcome, list_council_observations_for_decision, list_council_reviewer_skips,
 };
 use approval_ledger::types::{ApprovalRow, ApprovalStatus, SignalRow, SignalSourceKind, SignalVerdict};
-use kaijutsu_mk::council::wire::DecisionRequest;
+use gogi_proto::Context;
+use gogi_proto::decision::DecisionRequest;
 use kaijutsu_types::{PrincipalId, RefusalKind, SessionId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -30,13 +31,41 @@ use crate::mcp::{
     Broker, CallContext, InstanceId, InstancePolicy, KernelCallParams, McpError, ShellHookVerdict,
 };
 
-/// The docs' shell spec without its `text` question, as the shipped default
-/// holds it while the server does not declare `describe`.
+/// gogi's example shell spec without its `text` question, as the shipped
+/// default holds it while the server does not declare `describe`.
 fn spec_text() -> String {
-    let mut spec: kaijutsu_mk::council::wire::Spec =
-        serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
-    spec.questions.retain(|q| !matches!(q, kaijutsu_mk::council::wire::SpecQuestion::Text(_)));
-    serde_json::to_string(&spec).unwrap()
+    let mut spec: serde_json::Value = serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
+    spec["questions"].as_array_mut().unwrap().retain(|q| q["type"] != "text");
+    spec.to_string()
+}
+
+/// The name a seat goes by in these tests: the label of the council context
+/// its system message names, `house-rules` for the house rules, and
+/// `shadow` for a judge's shadow.
+fn seat_name(seat: &Context) -> String {
+    let system = seat.messages.first().and_then(|m| m.content.as_deref()).unwrap_or("");
+    if let Some(rest) = system.split("This conversation is the council context \"").nth(1) {
+        return rest.split('"').next().unwrap().to_string();
+    }
+    match system.contains("you know the house rules") {
+        true => "house-rules".into(),
+        false => "shadow".into(),
+    }
+}
+
+/// A built seat as the projection made it: its system message, then the
+/// content of each message after it.
+#[derive(Clone, Debug)]
+struct Built {
+    system: String,
+    turns: Vec<String>,
+}
+
+impl Built {
+    fn of(seat: &Context) -> Built {
+        let text = |i: usize| seat.messages.get(i).and_then(|m| m.content.clone()).unwrap_or_default();
+        Built { system: text(0), turns: (1..seat.messages.len()).map(text).collect() }
+    }
 }
 
 /// Two confident reads of allow.
@@ -76,20 +105,16 @@ struct Mock {
     behavior: Arc<Mutex<Behavior>>,
     /// Every request's method and path, in arrival order.
     calls: Arc<Mutex<Vec<(String, String)>>>,
-    /// Delays for the next `PUT`s, one each, in order.
-    put_delays: Arc<Mutex<VecDeque<Duration>>>,
+    /// Delays for the next seat builds, one each, in order.
+    build_delays: Arc<Mutex<VecDeque<Duration>>>,
     /// Holds the next decision until the test releases it.
     hold: Arc<Mutex<Option<Hold>>>,
-    /// Every context `PUT`: the context id and its body, in arrival order.
-    puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>>,
     /// The identity's `contexts_per_decision`.
     context_limit: Arc<std::sync::atomic::AtomicU64>,
-    /// Whether the server speaks council v2. The kernel caches the
-    /// identity, so set it before the first call.
-    v2: Arc<std::sync::atomic::AtomicBool>,
-    /// v2: every context built, and every decision's body, in arrival order.
-    built: Arc<Mutex<Vec<serde_json::Value>>>,
-    v2_decisions: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// Every seat build's body and the head it was given, and every
+    /// decision's body, in arrival order.
+    built: Arc<Mutex<Vec<(serde_json::Value, String)>>>,
+    decision_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl Mock {
@@ -98,9 +123,10 @@ impl Mock {
         self.calls.lock().unwrap().iter().filter(|(m, p)| m == method && p.starts_with(path)).count()
     }
 
-    /// Hold each of the next `PUT`s for the given delay before it answers.
-    fn delay_puts(&self, delays: &[Duration]) {
-        self.put_delays.lock().unwrap().extend(delays.iter().copied());
+    /// Hold each of the next seat builds for the given delay before it
+    /// answers.
+    fn delay_builds(&self, delays: &[Duration]) {
+        self.build_delays.lock().unwrap().extend(delays.iter().copied());
     }
 
     /// Hold the next decision: the first receiver fires when the server has
@@ -118,14 +144,21 @@ impl Mock {
         self.context_limit.store(limit, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// v2: the contexts built with `POST /council/v2/contexts`, in order.
+    /// The bodies of the seat builds, `POST /council/v2/contexts`, in order.
     fn built(&self) -> Vec<serde_json::Value> {
-        self.built.lock().unwrap().clone()
+        self.built.lock().unwrap().iter().map(|(body, _)| body.clone()).collect()
     }
 
-    /// v2: each decision's body, in order.
-    fn v2_decisions(&self) -> Vec<serde_json::Value> {
-        self.v2_decisions.lock().unwrap().clone()
+    /// The head the last build of `seat` was given, or `None` when it was
+    /// never built.
+    fn built_head(&self, seat: &Context) -> Option<String> {
+        let seat = serde_json::to_value(seat).unwrap();
+        self.built.lock().unwrap().iter().rev().find(|(body, _)| body["context"] == seat).map(|(_, head)| head.clone())
+    }
+
+    /// Each decision's body, in order.
+    fn decision_bodies(&self) -> Vec<serde_json::Value> {
+        self.decision_bodies.lock().unwrap().clone()
     }
 
     fn set(&self, behavior: impl Fn(&DecisionRequest) -> Reply + Send + Sync + 'static) {
@@ -148,22 +181,28 @@ impl Mock {
         self.decisions.lock().unwrap().clone()
     }
 
-    /// The bodies `PUT` for `context`, in arrival order.
-    fn puts_for(&self, context: kaijutsu_types::ContextId) -> Vec<kaijutsu_mk::council::wire::ContextPut> {
-        let id = context.to_string();
-        self.puts.lock().unwrap().iter().filter(|(c, _)| *c == id).map(|(_, body)| body.clone()).collect()
+    /// The seats built for the seat named `name` ([`seat_name`]), in
+    /// arrival order.
+    fn builds_for(&self, name: &str) -> Vec<Built> {
+        self.built()
+            .iter()
+            .map(|body| serde_json::from_value::<Context>(body["context"].clone()).unwrap())
+            .filter(|seat| seat_name(seat) == name)
+            .map(|seat| Built::of(&seat))
+            .collect()
     }
 
-    /// Waits until `context` has had `want` `PUT`s, and returns them.
-    async fn wait_for_puts(&self, context: kaijutsu_types::ContextId, want: usize) -> Vec<kaijutsu_mk::council::wire::ContextPut> {
+    /// Waits until the seat named `name` has been built `want` times, and
+    /// returns the builds.
+    async fn wait_for_builds(&self, name: &str, want: usize) -> Vec<Built> {
         for _ in 0..500 {
-            let puts = self.puts_for(context);
-            if puts.len() >= want {
-                return puts;
+            let builds = self.builds_for(name);
+            if builds.len() >= want {
+                return builds;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("{context} had {} PUTs, not {want}", self.puts_for(context).len());
+        panic!("{name} was built {} times, not {want}", self.builds_for(name).len());
     }
 }
 
@@ -214,80 +253,52 @@ async fn serve() -> Mock {
     let decisions: Arc<Mutex<Vec<DecisionRequest>>> = Arc::default();
     let behavior: Arc<Mutex<Behavior>> = Arc::new(Mutex::new(Arc::new(|req: &DecisionRequest| Reply::ok(answer(req, &ALLOW)))));
     let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
-    let put_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
+    let build_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
     let hold: Arc<Mutex<Option<Hold>>> = Arc::default();
-    let puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>> = Arc::default();
     let context_limit = Arc::new(std::sync::atomic::AtomicU64::new(8));
-    let v2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let built: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
-    let v2_decisions: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
-    let (log, how, seen, held) = (decisions.clone(), behavior.clone(), calls.clone(), put_delays.clone());
-    let (holding, bodies, limit) = (hold.clone(), puts.clone(), context_limit.clone());
-    let (speaks_v2, builds, v2_log) = (v2.clone(), built.clone(), v2_decisions.clone());
+    let built: Arc<Mutex<Vec<(serde_json::Value, String)>>> = Arc::default();
+    let decision_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let (log, how, seen, delays) = (decisions.clone(), behavior.clone(), calls.clone(), build_delays.clone());
+    let (holding, limit, builds, bodies) = (hold.clone(), context_limit.clone(), built.clone(), decision_bodies.clone());
     tokio::spawn(async move {
-        let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
-            let (log, how, puts, seen, held) = (log.clone(), how.clone(), puts.clone(), seen.clone(), held.clone());
-            let (holding, bodies, limit) = (holding.clone(), bodies.clone(), limit.clone());
-            let (speaks_v2, builds, v2_log) = (speaks_v2.clone(), builds.clone(), v2_log.clone());
+            let (log, how, count, seen, delays) = (log.clone(), how.clone(), count.clone(), seen.clone(), delays.clone());
+            let (holding, limit, builds, bodies) = (holding.clone(), limit.clone(), builds.clone(), bodies.clone());
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
                 seen.lock().unwrap().push((method.clone(), path.clone()));
-                let v2 = speaks_v2.load(std::sync::atomic::Ordering::SeqCst);
                 let reply = match (method.as_str(), path.as_str()) {
-                    ("GET", "/council/v1/identity") => {
-                        let limit = limit.load(std::sync::atomic::Ordering::SeqCst);
-                        Reply { status: 200, body: server_identity(limit, serde_json::json!(["leave_one_out"])), delay: Duration::ZERO }
-                    },
-                    ("GET", "/council/v2/identity") if v2 => {
+                    ("GET", "/council/v2/identity") => {
                         let limit = limit.load(std::sync::atomic::Ordering::SeqCst);
                         Reply { status: 200, body: server_identity(limit, serde_json::json!(["leave_one_out", "pins"])), delay: Duration::ZERO }
                     }
-                    ("POST", "/council/v2/specs") if v2 => {
-                        let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(&body).unwrap();
-                        let id = kaijutsu_mk::council::canon::spec_id(&spec).unwrap();
+                    ("POST", "/council/v2/specs") => {
+                        let spec: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        let id = gogi_proto::spec_id_of(&spec).unwrap();
                         Reply::ok(serde_json::json!({"spec_id": id, "spec": spec, "template": "mk-letters-1:0123456789abcdef"}))
                     }
-                    ("POST", "/council/v2/contexts") if v2 => {
-                        let n = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        builds.lock().unwrap().push(serde_json::from_str(&body).unwrap());
+                    ("POST", "/council/v2/contexts") => {
+                        let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let head = format!("snap:{n:064x}");
-                        Reply::ok(serde_json::json!({"head": head, "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
-                                                     "snapshots": [{"id": head, "message": 1, "tokens": 1}]}))
+                        builds.lock().unwrap().push((serde_json::from_str(&body).unwrap(), head.clone()));
+                        let delay = delays.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
+                        Reply {
+                            delay,
+                            ..Reply::ok(serde_json::json!({"head": head, "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                                                           "snapshots": [{"id": head, "message": 1, "tokens": 1}]}))
+                        }
                     }
-                    ("PUT", p) if v2 && p.starts_with("/council/v2/pins/") => {
+                    ("PUT", p) if p.starts_with("/council/v2/pins/") => {
                         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
                         let held: Vec<serde_json::Value> =
                             body["snapshots"].as_array().unwrap().iter().map(|id| serde_json::json!({"id": id, "held": true})).collect();
                         Reply::ok(serde_json::json!({"owner": p.rsplit('/').next().unwrap(), "snapshots": held, "expires_in_s": body["ttl_s"]}))
                     }
-                    ("POST", "/council/v2/decisions") if v2 => {
-                        let request: kaijutsu_mk::council_v2::wire::DecisionRequest = serde_json::from_str(&body).unwrap();
-                        v2_log.lock().unwrap().push(serde_json::from_str(&body).unwrap());
-                        let view = request.by_index();
-                        log.lock().unwrap().push(view.clone());
-                        let behavior = how.lock().unwrap().clone();
-                        behavior(&view)
-                    }
-                    ("POST", "/council/v1/specs") => {
-                        let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(&body).unwrap();
-                        let id = kaijutsu_mk::council::canon::spec_id(&spec).unwrap();
-                        Reply::ok(serde_json::json!({"spec_id": id, "spec": spec, "template": "mk-letters-1:0123456789abcdef"}))
-                    }
-                    ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
-                        let n = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        let id = p.rsplit('/').next().unwrap().to_string();
-                        bodies.lock().unwrap().push((id, serde_json::from_str(&body).unwrap()));
-                        let delay = held.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
-                        Reply {
-                            delay,
-                            ..Reply::ok(serde_json::json!({"id": p.rsplit('/').next().unwrap(), "head": format!("snap:{n:064x}"),
-                                                           "tokens": 1, "kept": 0, "fed": 1, "dry_run": false, "snapshots": []}))
-                        }
-                    }
-                    ("POST", "/council/v1/decisions") => {
+                    ("POST", "/council/v2/decisions") => {
                         let request: DecisionRequest = serde_json::from_str(&body).unwrap();
+                        bodies.lock().unwrap().push(serde_json::from_str(&body).unwrap());
                         log.lock().unwrap().push(request.clone());
                         let behavior = how.lock().unwrap().clone();
                         let reply = behavior(&request);
@@ -298,9 +309,7 @@ async fn serve() -> Mock {
                         }
                         reply
                     }
-                    // A council v1 server has no v2 routes.
-                    (_, p) if p.starts_with("/council/v2/") => Reply { status: 404, body: "{}".into(), delay: Duration::ZERO },
-                    _ => Reply { status: 500, body: "unexpected".into(), delay: Duration::ZERO },
+                    _ => Reply { status: 404, body: "{}".into(), delay: Duration::ZERO },
                 };
                 tokio::time::sleep(reply.delay).await;
                 // The megakernel answers a 429 with `Retry-After: 1` (`docs/mk-admission.md`).
@@ -316,7 +325,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior, calls, put_delays, hold, puts, context_limit, v2, built, v2_decisions }
+    Mock { base, decisions, behavior, calls, build_delays, hold, context_limit, built, decision_bodies }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,8 +362,6 @@ struct Setup {
     no_bump_template: bool,
     /// `mode = "bump-only"`, reading the `shell-bump` spec.
     bump_only: bool,
-    /// The server speaks council v2.
-    v2: bool,
     /// `[council] escalate`: bumps in a row, within minutes.
     escalate: Option<(u64, u64)>,
 }
@@ -374,7 +381,6 @@ impl Default for Setup {
             no_bump_template: false,
             bump_only: false,
             escalate: None,
-            v2: false,
         }
     }
 }
@@ -463,7 +469,6 @@ async fn rig(via: Via, setup: Setup) -> Rig {
         .await
         .unwrap();
     let mock = serve().await;
-    mock.v2.store(setup.v2, std::sync::atomic::Ordering::SeqCst);
     let server = setup.server.clone().unwrap_or_else(|| mock.base.clone());
     let vfs = d.kernel().vfs();
     vfs.write_all(std::path::Path::new("/config/kernel/gate.toml"), gate_toml(&server, &setup).as_bytes())
@@ -677,16 +682,19 @@ impl Rig {
         self.d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
-    /// The id of the live context labeled `label`.
+    /// The name the seat of the live context labeled `label` goes by in a
+    /// decision ([`seat_name`]): its label.
     fn context_of(&self, label: &str) -> String {
         let db = self.d.kernel_db();
         let db = db.lock();
-        db.find_context_by_label(label).unwrap().unwrap_or_else(|| panic!("no context {label}")).context_id.to_string()
+        db.find_context_by_label(label).unwrap().unwrap_or_else(|| panic!("no context {label}"));
+        label.to_string()
     }
 
-    /// The ids a decision request read, in order.
+    /// The names of the seats a decision request read ([`seat_name`]), in
+    /// order.
     fn read_ids(request: &DecisionRequest) -> Vec<String> {
-        request.contexts.iter().flatten().map(|c| c.id.clone()).collect()
+        request.contexts.iter().map(seat_name).collect()
     }
 
     /// Every decision request except the reads of the council context `observed` alone.
@@ -724,7 +732,7 @@ impl Rig {
 
 /// A confident allow from each context the request reads.
 fn allow_each(request: &DecisionRequest) -> Reply {
-    let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+    let n = request.contexts.len();
     Reply::ok(answer(request, &vec![[-0.001, -8.0, -9.0]; n]))
 }
 
@@ -752,8 +760,8 @@ fn council_signal(rig: &Rig, ask: &ApprovalRow) -> SignalRow {
 
 /// A council allow runs the submission, leaves an auto-decided row whose
 /// reason names the council, a signal, and a decision record linked to it.
-/// The request pins both contexts to their prepared heads and carries the
-/// deadline and the submission.
+/// The request sends both seats as built and carries the deadline and the
+/// submission.
 ///
 /// Falsified by dropping the council's verdict before `run_gate_recorded`:
 /// the submission asks.
@@ -784,9 +792,9 @@ async fn a_council_allow_runs_the_submission_with_a_row_naming_the_council() {
 
         let sent = rig.mock.decisions();
         assert_eq!(sent.len(), 1, "{via:?}: one decision per submission");
-        let contexts = sent[0].contexts.clone().unwrap();
+        let contexts = sent[0].contexts.clone();
         assert_eq!(contexts.len(), 2);
-        assert!(contexts.iter().all(|c| c.at.is_some()), "every context is pinned to its head");
+        assert!(contexts.iter().all(|c| rig.mock.built_head(c).is_some()), "every seat is sent as built");
         assert_eq!(sent[0].timeout_ms, Some(700));
         let state = serde_json::to_value(&sent[0].state).unwrap();
         assert_eq!(state["command"], "echo council-ran", "{via:?}: {state}");
@@ -1383,7 +1391,7 @@ fn latest_decision(rig: &Rig) -> CouncilDecision {
 /// sends (the decision builds again, or sends other contexts).
 #[tokio::test]
 async fn a_seat_s_create_lifecycle_builds_its_dependent_seats_before_the_first_decision() {
-    let setup = Setup { v2: true, reviewer_contexts: true, chain: true, house_rules: true, ..Setup::default() };
+    let setup = Setup { reviewer_contexts: true, chain: true, house_rules: true, ..Setup::default() };
     let rig = rig(Via::Tool, setup).await;
     let amy = live_context(rig.d.kernel(), "council-amy");
     append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
@@ -1433,7 +1441,7 @@ async fn a_seat_s_create_lifecycle_builds_its_dependent_seats_before_the_first_d
     assert!(first_text(&built[3]).contains("council-banto"), "{}", first_text(&built[3]));
 
     rig.mock.set(|req| {
-        if req.contexts.as_ref().map(Vec::len) == Some(1) {
+        if req.contexts.len() == 1 {
             Reply::ok(follows_answer(req, [-2.0, -0.2, -3.0]))
         } else {
             allow_each(req)
@@ -1443,7 +1451,7 @@ async fn a_seat_s_create_lifecycle_builds_its_dependent_seats_before_the_first_d
     let decision = rig.decisions().into_iter().next().expect("a decision");
     rig.observations(&decision.decision_id, 1).await;
 
-    let sent = rig.mock.v2_decisions();
+    let sent = rig.mock.decision_bodies();
     assert_eq!(sent.len(), 2, "the shell decision and banto's observation");
     let contexts = |i: usize| sent[i]["contexts"].as_array().unwrap().clone();
     let seats = |range: std::ops::Range<usize>| built[range].iter().map(|b| b["context"].clone()).collect::<Vec<_>>();
@@ -1468,7 +1476,7 @@ async fn reviewer_contexts_compose_amy_into_the_decision_and_banto_observes_it()
         append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
         let banto = live_context(rig.d.kernel(), "council-banto");
         append_dialogue(rig.d.kernel(), banto, &["only touch the parser crate"]);
-        let banto_id = banto.to_string();
+        let banto_id = rig.context_of("council-banto");
         let observed = banto_id.clone();
         rig.mock.set(move |req| {
             if Rig::read_ids(req) == [observed.clone()] {
@@ -1532,7 +1540,8 @@ async fn an_observation_that_fails_leaves_the_gate_alone() {
     for via in BOTH {
         let rig = rig(via, Setup { reviewer_contexts: true, chain: true, ..Setup::default() }).await;
         live_context(rig.d.kernel(), "council-amy");
-        let banto = live_context(rig.d.kernel(), "council-banto").to_string();
+        live_context(rig.d.kernel(), "council-banto");
+        let banto = rig.context_of("council-banto");
         let observed = banto.clone();
         rig.mock.set(move |req| {
             if Rig::read_ids(req) == [observed.clone()] {
@@ -1628,12 +1637,12 @@ async fn a_spec_404_posts_the_spec_again_on_the_next_decision() {
         let first = latest_decision(&rig);
         assert_eq!(first.decision.outcome, CouncilOutcome::Miss, "{via:?}");
         assert!(first.decision.miss_cause.as_deref().unwrap().contains("404"), "{first:?}");
-        assert_eq!(rig.mock.count("POST", "/council/v1/specs"), 1);
-        let puts = rig.mock.count("PUT", "/council/v1/contexts/");
+        assert_eq!(rig.mock.count("POST", "/council/v2/specs"), 1);
+        let builds = rig.mock.count("POST", "/council/v2/contexts");
 
         rig.submit("echo second").await.unwrap_or_else(|e| panic!("{via:?}: the second decision allows: {e:?}"));
-        assert_eq!(rig.mock.count("POST", "/council/v1/specs"), 2, "{via:?}: the spec is posted again");
-        assert_eq!(rig.mock.count("PUT", "/council/v1/contexts/"), puts, "{via:?}: the contexts are still held");
+        assert_eq!(rig.mock.count("POST", "/council/v2/specs"), 2, "{via:?}: the spec is posted again");
+        assert_eq!(rig.mock.count("POST", "/council/v2/contexts"), builds, "{via:?}: the seats are still held");
         rig.finish().await;
     }
 }
@@ -1652,7 +1661,7 @@ async fn one_deadline_bounds_prepare_and_the_decision_together() {
     for via in BOTH {
         let rig = rig(via, Setup { deadline_ms: DEADLINE, ..Setup::default() }).await;
         rig.mock.answers(&ALLOW);
-        rig.mock.delay_puts(&[Duration::from_millis(900), Duration::from_millis(900)]);
+        rig.mock.delay_builds(&[Duration::from_millis(900), Duration::from_millis(900)]);
         let started = std::time::Instant::now();
         assert_pending(via, rig.submit("touch slow.txt").await);
         let took = started.elapsed();
@@ -1665,7 +1674,7 @@ async fn one_deadline_bounds_prepare_and_the_decision_together() {
 
         let rig = self::rig(via, Setup { deadline_ms: DEADLINE, ..Setup::default() }).await;
         rig.mock.set(|req| Reply { delay: Duration::from_millis(900), ..Reply::ok(answer(req, &ALLOW)) });
-        rig.mock.delay_puts(&[Duration::from_millis(300), Duration::from_millis(300)]);
+        rig.mock.delay_builds(&[Duration::from_millis(300), Duration::from_millis(300)]);
         let started = std::time::Instant::now();
         assert_pending(via, rig.submit("touch slow.txt").await);
         let took = started.elapsed();
@@ -2181,9 +2190,8 @@ async fn a_spec_reads_its_own_contexts_and_no_other_spec_does() {
 
 /// With `[council] house_rules` on, a seat whose working directory has an
 /// `AGENTS.md` above it makes the shell decision and each program decision
-/// read `house-rules` after the configured contexts, under an id derived
-/// from the file's text (not the seat's context id) and pinned at the head
-/// the kernel prepared. With no `AGENTS.md` the decision reads no extra
+/// read `house-rules` after the configured contexts, as a seat built for
+/// the decision's spec. With no `AGENTS.md` the decision reads no extra
 /// context, as in a task container. Each decision records the head it read,
 /// and its info log line and read note say whether it read one.
 ///
@@ -2225,24 +2233,24 @@ async fn the_house_rules_context_joins_the_shell_and_program_decisions() {
         rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
         let sent: Vec<_> = rig.mock.decisions().into_iter().skip(first.len()).collect();
         assert_eq!(sent.len(), 2, "{via:?}: a shell and a program decision");
-        let seat = rig.ctx.context_id.to_string();
-        let held = Rig::read_ids(&sent[0])[2].clone();
-        assert_ne!(held, seat, "{via:?}: the id comes from the text, not the seat");
+        let mut built_heads = Vec::new();
         for request in &sent {
             assert_eq!(
                 Rig::read_ids(request),
-                [rig.context_of("reviewer"), rig.context_of("system-rules"), held.clone()],
+                [rig.context_of("reviewer"), rig.context_of("system-rules"), "house-rules".to_string()],
                 "{via:?}: program={}",
                 is_program(request)
             );
-            let at = request.contexts.as_ref().unwrap()[2].at.as_ref().expect("the house rules are pinned");
-            assert_eq!(at, sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap(), "{via:?}: one head for both");
+            built_heads.push(rig.mock.built_head(&request.contexts[2]).expect("the house rules are sent as built"));
         }
-        let head = sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap().to_string();
+        assert_ne!(built_heads[0], built_heads[1], "{via:?}: each spec has its own house-rules seat");
         let decisions = rig.decisions();
-        let heads: Vec<Option<&str>> = decisions.iter().map(|d| d.decision.house_rules_head.as_deref()).collect();
+        let mut heads: Vec<Option<&str>> = decisions.iter().map(|d| d.decision.house_rules_head.as_deref()).collect();
         assert_eq!(heads.len(), 3, "{via:?}: {heads:?}");
-        assert_eq!(heads.iter().filter(|h| **h == Some(head.as_str())).count(), 2, "{via:?}: {heads:?}");
+        heads.sort();
+        let mut want = vec![None, Some(built_heads[0].as_str()), Some(built_heads[1].as_str())];
+        want.sort();
+        assert_eq!(heads, want, "{via:?}: the first read no house rules, then each decision its seat's head");
         assert_eq!(heads.iter().filter(|h| h.is_none()).count(), 1, "{via:?}: the first read no house rules: {heads:?}");
 
         let events = seen.events.lock().unwrap();
@@ -2251,7 +2259,7 @@ async fn the_house_rules_context_joins_the_shell_and_program_decisions() {
             .filter(|(_, f)| field(f, "outcome").is_some() && field(f, "spec").is_some())
             .filter_map(|(_, f)| field(f, "house_rules_head"))
             .collect();
-        assert_eq!(logged.iter().filter(|h| **h == head).count(), 2, "{via:?}: {logged:?}");
+        assert_eq!(logged.iter().filter(|h| built_heads.iter().any(|b| b == *h)).count(), 2, "{via:?}: {logged:?}");
         assert_eq!(logged.iter().filter(|h| **h == "none").count(), 1, "{via:?}: {logged:?}");
         drop(events);
         rig.finish().await;
@@ -2401,7 +2409,7 @@ const DO_LESS: [f64; 3] = [-6.0, -3.0, -0.04];
 /// Every read of a bumper shell decision puts these log probabilities on
 /// proceed, try_harder, do_less.
 fn bump_answer(request: &DecisionRequest, logprobs: [f64; 3]) -> serde_json::Value {
-    let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+    let n = request.contexts.len();
     super::gate::test_support::answer_choices(request, &[("verdict", BUMP_OPTIONS, &vec![logprobs; n])])
 }
 
@@ -2481,7 +2489,7 @@ const IRREVERSIBLE: [f64; 3] = [-5.0, -3.0, -0.06];
 
 /// Every read answers the verdict and the `undo` read.
 fn bump_answer_with_undo(request: &DecisionRequest, verdict: [f64; 3], undo: [f64; 3]) -> serde_json::Value {
-    let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+    let n = request.contexts.len();
     super::gate::test_support::answer_choices(
         request,
         &[("verdict", BUMP_OPTIONS, &vec![verdict; n]), ("undo", UNDO_OPTIONS, &vec![undo; n])],
@@ -3092,7 +3100,7 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     assert_eq!(turns[3].1, "ran");
     assert_eq!(turns[4].1, "shell_write: rm /work/marker");
     assert_eq!(turns[5].1, "asked the reviewer");
-    assert!(rig.mock.puts_for(shadow.context_id).is_empty(), "a judge on a chat backend is hydrated whole, never primed");
+    assert!(rig.mock.builds_for("shadow").is_empty(), "a judge on a chat backend is hydrated whole, never primed");
     assert_eq!(rig.mock.decisions().len(), 2, "only the gate's two decisions: a chat judge is not asked yet");
     rig.finish().await;
 }
@@ -3135,18 +3143,18 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let base = rig.mock.base.clone();
     give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
     rig.submit("echo one").await.unwrap();
-    let shadow = judge_shadows(&rig)[0].context_id;
-    let puts = rig.mock.wait_for_puts(shadow, 1).await;
+    assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
+    let puts = rig.mock.wait_for_builds("shadow", 1).await;
     // Priming runs on its own task, so it may read the outcome turn too.
-    let turns: Vec<&str> = puts[0].turns.iter().map(|t| t.content.as_str()).collect();
+    let turns: Vec<&str> = puts[0].turns.iter().map(String::as_str).collect();
     assert_eq!(turns[0], "shell_write: echo one", "{turns:?}");
     assert!(puts[0].system.contains("Unwind the command before you judge it"), "the council framing opens it: {}", puts[0].system);
     assert!(puts[0].system.contains("You are a tool interpreter."), "the judge stance follows: {}", puts[0].system);
     assert!(!puts[0].system.contains("seat"), "the system message names no seat: {}", puts[0].system);
 
     rig.submit("echo two").await.unwrap();
-    let puts = rig.mock.wait_for_puts(shadow, 2).await;
-    let turns: Vec<&str> = puts[1].turns.iter().map(|t| t.content.as_str()).collect();
+    let puts = rig.mock.wait_for_builds("shadow", 2).await;
+    let turns: Vec<&str> = puts[1].turns.iter().map(String::as_str).collect();
     assert_eq!(turns[..3], ["shell_write: echo one", "ran", "shell_write: echo two"], "{turns:?}");
     assert!(rig.mock.decisions().is_empty(), "a call no council decided is recorded, not judged");
     rig.finish().await;
@@ -3186,10 +3194,10 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     assert_eq!(judged.len(), 1, "one judge read");
     assert_eq!(
         Rig::read_ids(&judged[0]),
-        [rig.context_of("reviewer"), rig.context_of("system-rules"), shadow.to_string()],
+        [rig.context_of("reviewer"), rig.context_of("system-rules"), "shadow".to_string()],
         "the judge reads the decision's contexts, then the shadow"
     );
-    assert!(judged[0].contexts.as_ref().unwrap()[2].at.is_some(), "the shadow is pinned");
+    assert!(rig.mock.built_head(&judged[0].contexts[2]).is_some(), "the shadow is sent as built");
     assert_eq!(serde_json::to_value(&judged[0].state).unwrap()["command"], "echo judged");
 
     let mut outcome = String::new();
@@ -3249,10 +3257,10 @@ async fn a_shadow_without_its_stance_is_not_primed() {
     let base = rig.mock.base.clone();
     give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
     rig.submit("echo one").await.unwrap();
-    let shadow = judge_shadows(&rig)[0].context_id;
+    assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     rig.submit("echo two").await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(rig.mock.puts_for(shadow).is_empty(), "no PUT without the stance");
+    assert!(rig.mock.builds_for("shadow").is_empty(), "no PUT without the stance");
     rig.finish().await;
 }
 
@@ -3343,7 +3351,7 @@ async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observation
         append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
         let banto = live_context(rig.d.kernel(), "council-banto");
         append_dialogue(rig.d.kernel(), banto, &["only touch the parser crate"]);
-        let banto_id = banto.to_string();
+        let banto_id = rig.context_of("council-banto");
         let server_b = serve().await;
         let observed = banto_id.clone();
         server_b.set(move |req| {
@@ -3399,17 +3407,17 @@ async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() 
     let rows = rig.observations(&decision.decision_id, 1).await;
     assert_eq!(rows[0].observation.outcome, CouncilObservationOutcome::Answered, "{:?}", rows[0].observation);
 
-    let shadow = judge_shadows(&rig)[0].context_id;
+    assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     let gate: Vec<Vec<String>> = rig.mock.decisions().iter().map(Rig::read_ids).collect();
     assert_eq!(gate, [[rig.context_of("reviewer"), rig.context_of("system-rules")]], "only the gate decides on [council] server");
-    assert!(rig.mock.puts_for(shadow).is_empty(), "the shadow is not primed on [council] server");
+    assert!(rig.mock.builds_for("shadow").is_empty(), "the shadow is not primed on [council] server");
     let judged: Vec<Vec<String>> = judge_server.decisions().iter().map(Rig::read_ids).collect();
     assert_eq!(
         judged,
-        [[rig.context_of("reviewer"), rig.context_of("system-rules"), shadow.to_string()]],
+        [[rig.context_of("reviewer"), rig.context_of("system-rules"), "shadow".to_string()]],
         "the judge reads on its slot's server"
     );
-    assert!(!judge_server.puts_for(shadow).is_empty(), "the shadow is primed on the judge's server");
+    assert!(!judge_server.builds_for("shadow").is_empty(), "the shadow is primed on the judge's server");
     rig.finish().await;
 }
 

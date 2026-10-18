@@ -2,9 +2,10 @@
 
 **Status: built, off by default.** The gate consults the council on both
 paths when `gate.toml` enables it for a context type, with a second decision
-for each program a submission runs; report-stop is built but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is `docs/council-api.md`
-(with `docs/council-api.openapi.yaml`); outside source material is
-`docs/council-dossier.md`.
+for each program a submission runs; report-stop is built but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is council v2, gogi's
+`docs/council-api-v2.md` (github.com/tobert/gogi), and the kernel uses
+`gogi-proto` for its types, spec ids, and pooling math; outside source
+material is `docs/council-dossier.md`.
 
 The council is a fast model check on each shell submission whose statements
 the static gate rules leave uncovered. It reads the submission after several
@@ -165,10 +166,10 @@ change: `approval_signals` holds one label and score per source
 
 ## Council contexts are kaijutsu contexts
 
-A council context is a kaijutsu context held on the council server: on v1
-under its own context id, on v2 as the snapshots of its seats ("Council v2
-seats"). The server keeps its snapshots; kaijutsu keeps the identity, the
-blocks, and the history. Below, "held context" means the server's copy.
+A council context is a kaijutsu context whose seats the council server
+holds as snapshots ("Council v2 seats"). The server keeps only snapshots and
+specs; kaijutsu keeps the identity, the blocks, and the history, and sends
+each seat whole with every decision.
 
 Amy: "I am thinking 3 context feeds for the adjudicator contexts: a shadow
 context that has my prompts + additional ones I put in or banto drifts in.
@@ -234,32 +235,30 @@ compacting."
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
-- **A change reaches the server as a whole-context `PUT`.** The kernel
-  projects the context (its framing as the system message, its blocks as
-  turns, excluded blocks left out, and a model's thinking as its reply's
-  `reasoning`) and sends it with `If-Match` on the head
-  it last saw and `warm` naming the gate's specs. The server feeds only what
-  changed, then rebuilds the spec layer, so the next decision starts from a
-  held snapshot.
-- **Snapshots are a budget.** A server extends a context only from a turn
-  marked `snap`, so a `PUT` re-feeds every turn since the last one, and each
-  snapshot costs `identity.limits.snapshot_bytes` (on the megakernel about
-  112 MiB of recurrent state). The projection marks `snap` at boundaries we
-  expect to keep, such as every few guidance blocks and each handoff, and
-  reads the cost of a `PUT` with `dry_run` before choosing more.
-- **After a restart, the next decision sends each context it reads again.**
-  Nothing is sent at boot. The `PUT` is idempotent; a server with `park`
-  answers it from disk.
-- **A context's id is resolved from its label at decision time.** A label
-  that resolves to nothing is a council miss with that cause, not a gate
-  refusal, so a missing context cannot stop every seat.
+- **A change reaches the server as a new seat.** The kernel projects the
+  context (its framing as the system message, its blocks as turns, excluded
+  blocks left out, and a model's thinking as its reply's `reasoning`) and
+  builds the seats made from it ("Council v2 seats"). The server starts from
+  the longest snapshot it holds along the seat and feeds only the rest.
+- **Snapshots are a budget.** The server holds a snapshot only at a message
+  marked `snap`, so a build feeds every turn since the last held one, and
+  each snapshot costs `identity.limits.snapshot_bytes` per token. The
+  projection marks `snap` on every eighth turn by position.
+- **After a kernel restart, the next decision builds each seat it reads
+  again.** A serving kernel also builds its configured seats at startup.
+  After a server restart the kernel keeps its record of each seat until a
+  pin `PUT` reports the head `held: false`; decisions still work, since each
+  sends its seats whole.
+- **A context is resolved from its label at decision time.** A label that
+  resolves to nothing is a council miss with that cause, not a gate refusal,
+  so a missing context cannot stop every seat.
 
 ### Council v2 seats
 
-A server that answers `GET /council/v2/identity` is spoken to in council v2
-(`docs/council-api-v2.md`). The bullets above describe v1; on v2 the
-server keeps no context records, so the context ids, `If-Match`, `warm`,
-and `persist` do not apply.
+The kernel speaks council v2 (gogi's `docs/council-api-v2.md`) and nothing
+else. A server whose `GET /council/v2/identity` fails, a 404 included, is a
+miss for every decision on it. The server keeps no context records: there
+are no server-side context ids, and a seat is sent whole each time.
 
 - **A seat is its context value.** Each council context, read under a
   spec, is a queue seat: the projection as messages, a task message, and
@@ -270,7 +269,7 @@ and `persist` do not apply.
   changes, and remembers the head the server reported.
 - **A decision sends every seat whole.** The answer names each read by its
   index in `contexts`, which the kernel maps back to the council context.
-  A `404` from a v2 decision is the spec, which the next decision posts
+  A `404` from a decision names the spec, which the next decision posts
   again.
 - **Seats are built at startup.** A serving kernel builds the seats its
   gate config names when it starts: for each council and spec,
@@ -336,26 +335,23 @@ context holds those rules and nothing the seat said or did.
 - **It votes.** It is pooled with the other reads. With `require_agree`,
   every read must top allow on its own, so the rules cannot turn another
   read's ask into an allow.
-- **Shared by content.** Its id is a UUIDv5 over the sha256 of the projected
-  body, in a namespace fixed in `council/sync.rs`. Every seat under one
-  `AGENTS.md` shares one held context and its snapshots, and an edited file
-  is a new id. The kernel sends a body only when it changed from the last one
-  it sent under that id, so a seat's work sends nothing. It remembers one
-  body per file, so an edit replaces the old id. A v1 server keeps the
-  snapshots of an id the file no longer produces; `docs/issues.md`,
-  "Council house rules: what is open", records that.
-- **It is pinned and counted.** The decision pins it with `at`, like every
-  context, so it reads the rules as of the submission. `[council] contexts`,
+- **Shared by content.** Every seat under one `AGENTS.md` sends the same
+  house-rules context, so they share its snapshots on the server. Its id in
+  kaijutsu's records is a UUIDv5 over the sha256 of the projected body, in a
+  namespace fixed in `council/sync.rs`, so an edited file is a new id. The
+  kernel builds the context only when its body changed from the last one it
+  built for that file and token budget, so a seat's work builds nothing. An
+  edit replaces the file's seat in the pin set ("Council v2 seats").
+- **It is sent whole and counted.** The decision sends it whole, like every
+  seat, so it reads the rules as of the submission. `[council] contexts`,
   the voting reviewer contexts, and the house-rules context together must fit
   `identity.limits.contexts_per_decision`; a miss names the limit.
-- **It is ephemeral on the server.** When the server lists the `persist`
-  capability (council API 0.2.5), the kernel sends a house-rules context with
-  `persist: false`: it sends the context again after a restart, so the
-  server need not park it to disk. `council-system` and the reviewer contexts stay
-  persistent. Amy, 2026-10-05: "we will have councils over time that are
-  ephemeral in nature and our hardware is limited." A capability the kernel
-  does not know is ignored, so a server can add one without breaking older
-  kernels.
+- **It is ephemeral on the server.** A house-rules seat is pinned only while
+  it is current; once its file is edited or gone, it leaves the pin set and
+  the server's own expiry decides when it goes. Amy, 2026-10-05: "we will
+  have councils over time that are ephemeral in nature and our hardware is
+  limited." A capability the kernel does not know is ignored, so a server
+  can add one without breaking older kernels.
 - **The record.** `council_decisions.house_rules_head` names the head the
   decision read, NULL when it read none. The info-level outcome line and the
   `council.decide` span carry `house_rules_head`, or `none`.
@@ -435,17 +431,17 @@ grows with the gate.
 - **Each model is fed the way its API works.** The stored dialogue is the
   same; hydration differs by backend.
   - A council server (megakernel, lfm2d) gets each call as it arrives: the
-    kernel `PUT`s the new tail with `warm` off the hot path, so the held
-    snapshot is primed when the question comes.
+    kernel builds the shadow's seat off the hot path, so the server holds
+    its snapshot when the question comes.
   - A chat model (Jev) is hydrated whole for each request: the dialogue is
     rendered as one script-like transcript in a single prompt, with the
     question about its last call.
 - **Append-only keeps a council server cheap.** `snap` falls on every
   eighth turn by position, so each new turn re-feeds at most eight turns.
-  Each snapshot costs `snapshot_bytes`, about 112 MiB on the megakernel.
-  Kaijutsu manages the bulk of that cache itself, choosing what to keep,
-  park, and drop, rather than leaving it to the server's eviction. No cap
-  or compaction until measurements call for one.
+  Each snapshot costs `snapshot_bytes` per token. Kaijutsu chooses what the
+  server keeps by pinning only current seats ("Council v2 seats"), and
+  leaves the rest to the server's eviction. No cap or compaction until
+  measurements call for one.
 - **The record.** Each judge answer is a `council_observations` row on
   the gate's decision: the choice, each question's answer from the
   shadow's read, the head it read, and the time it took. Comparing its
@@ -488,11 +484,11 @@ shipped. A fresh session resumes at the first step not marked done.
    is an original, a resend after a bump is a new attempt, and earlier
    answers are not repeated for their own sake.
 2. **Done: priming a council server.** A `judge` slot whose backend has
-   kind `mk` names the server by its `base_url` (the megakernel serves
-   `/council/v1` at the same address). After each recorded call, a task
-   of its own `PUT`s the shadow whole (`CouncilSync::prime_shadow`), under
-   its stance (1d), warming the seat's shell
-   spec from `gate.toml`; a seat type with no council there is not primed
+   kind `mk` names the server by its `base_url` (the server answers
+   `/council/v2` at the same address). After each recorded call, a task
+   of its own builds the shadow as a seat under the seat's shell spec from
+   `gate.toml` (`CouncilSync::prime_shadow`), under its stance (1d); a
+   seat type with no council there is not primed
    (logged). Priming has its own lock and a 30 s timeout, so it never
    holds up a decision. A judge on any other backend is not primed. Test:
    `a_judge_on_a_council_server_is_primed_with_each_call`.
@@ -557,11 +553,16 @@ shipped. A fresh session resumes at the first step not marked done.
 ## Specs and cases
 
 The gate holds one spec per kind of case: the shell spec and the program
-spec. `gate.toml` refuses a second spec of one case. The shell spec is the example in `docs/council-api.md`, "A
-decision, end to end", without its `text` question while the megakernel
-does not declare `describe`; it lives at `/config/kernel/council/shell-gate.json`.
-The kernel computes each spec's id itself (RFC 8785, then sha256), `POST`s
-the spec at boot and whenever the file changes, and treats a server that
+spec. `gate.toml` refuses a second spec of one case. The shell spec is the example in gogi's `docs/council-api.md`, "A
+decision, end to end", without its `text` question; it lives at
+`/config/kernel/council/shell-gate.json`. The kernel reads each spec with
+`gogi_proto::spec::parse_spec` under mkviolet's limits (16 questions, 26
+options per choice) with `text` questions allowed up to 4096 tokens, and a
+spec with a `text` question is a miss on a server that does not
+declare `describe`. The kernel computes each spec's id itself (RFC 8785,
+then sha256, in `gogi-proto`), `POST`s
+it once per server and spec id, at startup or before its first decision,
+and again after a decision's 404 or a failed call, and treats a server that
 answers with a different id as a fault. A spec change is a new spec id and
 new thresholds.
 
@@ -715,7 +716,7 @@ does, so the council reads the file too (`council/programs.rs`).
   program went from 0.82 without the field to 0.98 with it, and a program
   that asked or reported took the shell decision from allow (0.97) to ask
   or report. The same facts as an extra council context did not help (0.86)
-  and cost a `PUT`. The combine rule is unchanged: the submission is
+  and cost another context to build. The combine rule is unchanged: the submission is
   council-allowed only when the shell decision and every program decision
   allow.
 - **The record.** Each program decision is a `council_decisions` row linked
@@ -857,19 +858,19 @@ need it.
 The council's settings live only here. One `deadline_ms` bounds the whole
 decision, preparing the contexts and spec included: the kernel sends it as
 `timeout_ms` and stops waiting when it passes, and the miss names the phase
-it passed in. A 404 naming the spec makes the next decision post the spec
-again; a 404 naming a context sends that context again.
+it passed in. A 404 from a decision names the spec, and the next decision
+posts the spec again.
 
 ## Servers
 
-- **Megakernel first.** Qwen3.8-Flash-Next on zorak has given more
-  consistent reads than lfm2d. Amy, 2026-10-04: "mk seems to be overall
-  better". It serves `/council/v1/` (megakernel `docs/council-v1.md`) with
-  the `leave_one_out` capability; context records are not parked yet, so
-  the kernel sends every council context again after the server restarts.
-  Long runs against it on zorak take the heavy lock
+- **A server speaks council v2.** mkviolet (Gemma 4) serves it. A server
+  that serves only `/council/v1/` is a miss.
+- **Megakernel.** Qwen3.8-Flash-Next on zorak has given more consistent
+  reads than lfm2d. Amy, 2026-10-04: "mk seems to be overall better". It
+  served the council over `/council/v1/`, so it serves it again only once
+  it serves council v2. Long runs against it on zorak take the heavy lock
   (`flock -w 900 ~/.cache/zorak-heavy.lock`).
-- **lfm2d second,** behind the same port once it serves `/council/v1/`.
+- **lfm2d,** behind the same port once it serves council v2.
 - **A seat's cast can choose the server.** A `gate` slot whose backend
   has kind `mk` names the server for that seat's decisions ("mk bumps",
   "lfm2d bumps"); see "Configuration". A `gate` slot on a backend of any
@@ -879,9 +880,9 @@ again; a 404 naming a context sends that context again.
   comparison renders each context into `state` and pays for it per request.
 
 The kernel talks to every server through one port with one implementation
-of the wire contract. It recomputes each pooled answer from the reads'
-`logprobs` and `mass` and checks it against the server's within 1e-9; a
-mismatch is a miss, never an answer.
+of the wire contract, `gogi-proto`. It recomputes each pooled answer from
+the reads' `logprobs` and `mass` (`gogi_proto::math::verify`) and checks it
+against the server's within 1e-9; a mismatch is a miss, never an answer.
 
 The council server sits inside our one trust boundary (`docs/instrument-design.md`,
 "Many hands, one trust boundary"), on the tailnet, with no auth of its own.
@@ -905,14 +906,14 @@ would put an authority decision in a script.
 
 ## Rollout, smallest first
 
-1. **The contract.** These docs, the OpenAPI file, and a conformance suite
-   both servers run. The megakernel serves `/council/v1/`.
+1. **The contract.** gogi holds it: its documents, `gogi-proto`, and the
+   `gogi-conformance` suite a server runs. mkviolet serves council v2.
 2. **The gate, enforcing.** The parser change, the kernel port, the record
    tables, one spec, the system-rules context and Amy's council context sent before a
    decision that reads them, traces, the report event, and a report interrupting an
    autonomous seat's turn. Deployed on zorak against
    the megakernel, with coder seats moved back to `uncovered = "ask"`.
-3. **Live contexts.** Change-feed sync with `warm`, so tuning by chat lands
+3. **Live contexts.** Change-feed sync, so tuning by chat lands
    on the next decision. Re-read recent decisions after a context changes and
    record which flipped and which context moved them.
 4. **Programs.** The program spec and the second decision. Built; the

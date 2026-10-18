@@ -1,5 +1,5 @@
 //! A council context as a council v2 queue seat: an agent loop whose queue
-//! tool brings each case (`docs/council-api-v2.md`, "Decisions").
+//! tool brings each case (gogi's `docs/council-api-v2.md`, "Decisions").
 //!
 //! The seat is the projected context (its system message, then its turns),
 //! a task message, and a first call to the queue tool. Each worked example
@@ -22,10 +22,8 @@
 
 use std::sync::OnceLock;
 
-use kaijutsu_mk::council::wire::{ContextPut, Spec, SpecQuestion};
-use kaijutsu_mk::council_v2::wire::{Context, Message, Role, ToolCall};
-use kaijutsu_mk::generate::{Function, Tool};
-use kaijutsu_mk::Json;
+use gogi_proto::spec::{Question, QuestionKind, Spec};
+use gogi_proto::{Context, Message, Role, ToolCall};
 use serde_json::json;
 
 use super::gate::{Submission, case_state, program_case_state};
@@ -157,26 +155,18 @@ fn example_state(case: &ExampleCase) -> Result<String, String> {
 
 const LETTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-/// A question's instructions as the model reads them.
-fn instructions_text(instructions: &Json) -> String {
-    match instructions.as_str() {
-        Some(text) => text.to_string(),
-        None => serde_json::to_string(instructions).unwrap_or_default(),
-    }
-}
-
 /// A question's answer keys in order, each with the text that describes
 /// it. `Err` for a `text` question, which a queue seat cannot answer with
 /// a letter.
-fn options(question: &SpecQuestion) -> Result<Vec<(String, String)>, String> {
-    Ok(match question {
-        SpecQuestion::Choice(q) => q.criteria.iter().map(|c| (c.option.clone(), format!("{}, {}", c.option, c.means))).collect(),
-        SpecQuestion::Score(q) => q.criteria.iter().map(|level| (level.clone(), level.clone())).collect(),
-        SpecQuestion::Noul(_) => vec![("yes".into(), "yes".into()), ("no".into(), "no".into())],
-        SpecQuestion::Text(q) => {
+fn options(question: &Question) -> Result<Vec<(String, String)>, String> {
+    Ok(match &question.kind {
+        QuestionKind::Choice { options } => options.iter().map(|(option, means)| (option.clone(), format!("{option}, {means}"))).collect(),
+        QuestionKind::Score { levels } => levels.iter().map(|level| (level.clone(), level.clone())).collect(),
+        QuestionKind::Noul { .. } => vec![("yes".into(), "yes".into()), ("no".into(), "no".into())],
+        QuestionKind::Text { .. } => {
             return Err(format!(
                 "the spec's text question `{}` has no letters for a council v2 queue seat to answer",
-                q.id
+                question.id
             ));
         }
     })
@@ -184,16 +174,16 @@ fn options(question: &SpecQuestion) -> Result<Vec<(String, String)>, String> {
 
 /// The spec's questions sorted by id, the order the server reads a queue
 /// seat's answers in, each with its options.
-fn questions(spec: &Spec) -> Result<Vec<(&SpecQuestion, Vec<(String, String)>)>, String> {
+fn questions(spec: &Spec) -> Result<Vec<(&Question, Vec<(String, String)>)>, String> {
     let mut out = Vec::with_capacity(spec.questions.len());
     for q in &spec.questions {
         let opts = options(q)?;
         if opts.len() > LETTERS.len() {
-            return Err(format!("question `{}` has {} options; a letter answers at most {}", q.id(), opts.len(), LETTERS.len()));
+            return Err(format!("question `{}` has {} options; a letter answers at most {}", q.id, opts.len(), LETTERS.len()));
         }
         out.push((q, opts));
     }
-    out.sort_by(|a, b| a.0.id().cmp(b.0.id()));
+    out.sort_by(|a, b| a.0.id.cmp(&b.0.id));
     Ok(out)
 }
 
@@ -204,37 +194,27 @@ fn letter(i: usize) -> String {
 /// The queue tool for `spec`: `answers` holds one property per question,
 /// its `enum` the letters of its options in order, and its description the
 /// question's instructions followed by each letter's option.
-fn queue_tool(questions: &[(&SpecQuestion, Vec<(String, String)>)]) -> Result<Tool, String> {
+fn queue_tool(questions: &[(&Question, Vec<(String, String)>)]) -> serde_json::Value {
     let mut props = serde_json::Map::new();
     for (q, opts) in questions {
-        let (instructions, noul_criteria) = match q {
-            SpecQuestion::Choice(q) => (&q.instructions, None),
-            SpecQuestion::Score(q) => (&q.instructions, None),
-            SpecQuestion::Noul(q) => (&q.instructions, q.criteria.as_ref()),
-            SpecQuestion::Text(q) => (&q.instructions, None),
-        };
-        let mut description = instructions_text(instructions);
-        if let Some(criteria) = noul_criteria {
-            description = format!("{description} {}", instructions_text(criteria));
+        let mut description = q.instructions.clone();
+        if let QuestionKind::Noul { criteria: Some(criteria) } = &q.kind {
+            description = format!("{description} {criteria}");
         }
         for (i, (_, text)) in opts.iter().enumerate() {
             description = format!("{description} {}: {text}.", letter(i));
         }
         let letters: Vec<String> = (0..opts.len()).map(letter).collect();
-        props.insert(q.id().to_string(), json!({"type": "string", "enum": letters, "description": description}));
+        props.insert(q.id.clone(), json!({"type": "string", "enum": letters, "description": description}));
     }
-    let parameters = json!({
-        "type": "object",
-        "properties": {"answers": {"type": "object", "description": ANSWERS_DESCRIPTION, "properties": props}},
-    });
-    let parameters: Json = serde_json::from_value(parameters).map_err(|e| format!("the queue tool's schema is not JSON: {e}"))?;
-    Ok(Tool::Function {
-        function: Function {
-            name: QUEUE_TOOL.to_string(),
-            description: Some(QUEUE_TOOL_DESCRIPTION.to_string()),
-            parameters: Some(parameters),
+    json!({"type": "function", "function": {
+        "name": QUEUE_TOOL,
+        "description": QUEUE_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {"answers": {"type": "object", "description": ANSWERS_DESCRIPTION, "properties": props}},
         },
-    })
+    }})
 }
 
 /// The example's answers to `spec` as letters, keyed by question id in
@@ -243,85 +223,83 @@ fn queue_tool(questions: &[(&SpecQuestion, Vec<(String, String)>)]) -> Result<To
 fn example_answers(
     example: &Example,
     spec: &Spec,
-    questions: &[(&SpecQuestion, Vec<(String, String)>)],
+    questions: &[(&Question, Vec<(String, String)>)],
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let (_, named) = example.answers.iter().find(|(name, _)| *name == spec.name)?;
     let mut answers = serde_json::Map::new();
     for (q, opts) in questions {
-        let picked = named.iter().find(|(id, _)| *id == q.id()).map(|(_, option)| *option);
+        let picked = named.iter().find(|(id, _)| *id == q.id).map(|(_, option)| *option);
         let Some(i) = picked.and_then(|option| opts.iter().position(|(key, _)| key == option)) else {
-            tracing::warn!(spec = %spec.name, question = q.id(), "a worked example does not answer this question with one of its options; the seat leaves the example out");
+            tracing::warn!(spec = %spec.name, question = %q.id, "a worked example does not answer this question with one of its options; the seat leaves the example out");
             return None;
         };
-        answers.insert(q.id().to_string(), json!(letter(i)));
+        answers.insert(q.id.clone(), json!(letter(i)));
     }
     Some(answers)
 }
 
 /// An assistant message that calls the queue tool once.
-fn queue_call(id: String, arguments: serde_json::Value) -> Result<Message, String> {
-    let arguments: Json = serde_json::from_value(arguments).map_err(|e| format!("a queue call's arguments are not JSON: {e}"))?;
-    Ok(Message {
+fn queue_call(id: String, arguments: serde_json::Map<String, serde_json::Value>) -> Message {
+    Message {
         role: Role::Assistant,
         content: None,
         reasoning: None,
         tool_calls: vec![ToolCall { id, name: QUEUE_TOOL.to_string(), arguments }],
         tool_call_id: None,
         snap: false,
-    })
+    }
 }
 
 /// `body`, a projected council context, as a council v2 queue seat for
 /// `spec`. `Err` when the spec holds a question a queue seat cannot
-/// answer, or the body has no council v2 form.
-pub(crate) fn queue_seat(body: ContextPut, spec: &Spec) -> Result<Context, String> {
+/// answer, or the seat breaks the contract.
+pub(crate) fn queue_seat(body: Context, spec: &Spec) -> Result<Context, String> {
     let questions = questions(spec)?;
-    let tool = queue_tool(&questions)?;
-    let mut seat = Context::from_v1(body).map_err(|e| e.to_string())?;
+    let tool = queue_tool(&questions);
+    let mut seat = body;
     seat.messages.push(Message::user(task(&spec.name)).snapped());
-    seat.messages.push(queue_call("c0".into(), json!({}))?);
+    seat.messages.push(queue_call("c0".into(), serde_json::Map::new()));
     let mut call = 0;
     for (example, state) in EXAMPLES.iter().zip(example_states()) {
         let Some(answers) = example_answers(example, spec, &questions) else { continue };
         let state = state.as_ref().map_err(|e| format!("a worked example has no case: {e}"))?;
         seat.messages.push(Message::tool(format!("c{call}"), state.clone()));
         call += 1;
-        seat.messages.push(queue_call(format!("c{call}"), json!({"answers": answers}))?);
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("answers".into(), answers.into());
+        seat.messages.push(queue_call(format!("c{call}"), arguments));
     }
     if let Some(last) = seat.messages.last_mut() {
         last.snap = true;
     }
     seat.tools = vec![tool];
     seat.queue = Some(QUEUE_TOOL.to_string());
-    seat.validate().map_err(|e| format!("the seat is not a council v2 context: {e}"))?;
+    seat.check().map_err(|e| format!("the seat is not a council v2 context: {e}"))?;
+    let asked: Vec<(&str, usize)> = questions.iter().map(|(q, opts)| (q.id.as_str(), opts.len())).collect();
+    gogi_proto::decision::check_queue_schema(&seat, &asked).map_err(|e| format!("the seat's queue tool breaks the contract: {e}"))?;
     Ok(seat)
 }
 
 #[cfg(test)]
 mod tests {
-    use kaijutsu_mk::council::wire::{Role as WireRole, Turn};
-
     use super::*;
 
     fn spec(text: &str) -> Spec {
-        serde_json::from_str(text).unwrap()
+        crate::council::parse_spec(text).unwrap()
     }
 
     fn shell_bump() -> Spec {
         spec(crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP)
     }
 
-    fn body() -> ContextPut {
-        ContextPut {
-            system: "framing\n\nThis conversation is the council context \"council-system\".".into(),
-            turns: vec![
-                Turn { role: WireRole::User, content: "never push to main".into(), snap: false, reasoning: None },
-                Turn { role: WireRole::Assistant, content: "understood".into(), snap: false, reasoning: Some("noted".into()) },
+    fn body() -> Context {
+        Context {
+            messages: vec![
+                Message::system("framing\n\nThis conversation is the council context \"council-system\"."),
+                Message::user("never push to main"),
+                Message { reasoning: Some("noted".into()), ..Message::assistant("understood") },
             ],
-            pin: None,
-            warm: None,
-            dry_run: None,
-            persist: None,
+            ..Context::default()
         }
     }
 
@@ -353,7 +331,7 @@ mod tests {
             for q in &spec.questions {
                 let n = options(q).unwrap().len();
                 let want: Vec<String> = (0..n).map(letter).collect();
-                assert_eq!(props[q.id()]["enum"], json!(want), "{}: {}", spec.name, q.id());
+                assert_eq!(props[&q.id]["enum"], json!(want), "{}: {}", spec.name, q.id);
             }
         }
         let seat = value(&queue_seat(body(), &shell_bump()).unwrap());
@@ -456,10 +434,10 @@ mod tests {
     /// example rather than teach a wrong letter.
     #[test]
     fn an_example_that_names_a_missing_option_is_left_out() {
-        let mut spec = shell_bump();
-        if let SpecQuestion::Choice(q) = &mut spec.questions[3] {
-            q.criteria[0].option = "go".into();
-        }
+        let mut value = shell_bump().value;
+        value["questions"][3]["criteria"][0]["option"] = json!("go");
+        let spec = gogi_proto::spec::parse_spec(&value, &crate::council::SPEC_RULES).unwrap();
+        assert_eq!(spec.questions[3].id, "verdict");
         let seat = queue_seat(body(), &spec).unwrap();
         assert_eq!(seat.messages.iter().filter(|m| m.role == Role::Tool).count(), 0);
     }

@@ -3483,3 +3483,14 @@ heads under `kernel-<kernel id>`, renewed every 20 minutes. On mkviolet a
 ten-inference tool loop fed 308 of its 5,912 prompt tokens, so sending
 everything costs rendering, not prefill. See `docs/mk.md`, "Council v2" and
 `docs/council.md`, "Council v2 seats".
+
+kaijutsu then dropped council v1 and its own wire types (October 18). The
+contract lives in gogi (github.com/tobert/gogi), and `gogi-proto` supplies
+every council type, request rule, spec id, and the pooling math, so kaijutsu
+and mkviolet check against one crate instead of two copies that drifted.
+kaijutsu-mk keeps only the HTTP transport. With v1 went the `PUT`, `If-Match`,
+`warm`, `persist`, and the fallback a 404 on the v2 identity used to trigger:
+a server without v2 is now a miss. Kernel tests run the real prepare and
+decide path against `gogi-fake`, and the same bodies run against a live
+server with `COUNCIL_URL`. The hand-written mocks stay where a test needs a
+scripted verdict, a forced status, or a delay; the fake cannot give those.
