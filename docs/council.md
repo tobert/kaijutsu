@@ -223,8 +223,8 @@ compacting."
 - **`council-system` is reserved.** A character named `system` would collide
   with it, so the chain walk fails loudly on one.
 - **Reviewer contexts count against the server's limit.** The system context
-  plus the voting reviewer contexts must fit `identity.limits.contexts_per_decision` (8 on the
-  megakernel); a longer chain is a miss naming the limit, not a silent cut.
+  plus the voting reviewer contexts must fit the served model's
+  `limits.contexts_per_decision` (8 on the megakernel); a longer chain is a miss naming the limit, not a silent cut.
 - **A worked example keeps its thinking.** A model's finished thinking rides
   on its next reply as that turn's `reasoning` (council API 0.2.2), so a
   council context can hold examples the way a stronger model reasoned them.
@@ -242,7 +242,7 @@ compacting."
   the longest snapshot it holds along the seat and feeds only the rest.
 - **Snapshots are a budget.** The server holds a snapshot only at a message
   marked `snap`, so a build feeds every turn since the last held one, and
-  each snapshot costs `identity.limits.snapshot_bytes` per token. The
+  each snapshot costs the served model's `limits.snapshot_bytes` per token. The
   projection marks `snap` on every eighth turn by position.
 - **After a kernel restart, the next decision builds each seat it reads
   again.** A serving kernel also builds its configured seats at startup.
@@ -260,6 +260,14 @@ else. A server whose `GET /council/v2/identity` fails, a 404 included, is a
 miss for every decision on it. The server keeps no context records: there
 are no server-side context ids, and a seat is sent whole each time.
 
+- **A decision runs on one served model.** `[council] model`, or a `gate`
+  slot's model, names it by its `model` or an alias; left out, it is the
+  server's only served model. Every build and decision sends the served
+  model's `model`, and a seat is held per served model. A name the server
+  does not serve is a miss naming the models it serves, and so is leaving
+  the name out on a server that serves several. A model that is not
+  `ready` is a miss naming its status, and the next decision asks for the
+  identity again.
 - **A seat is its context value.** Each council context, read under a
   spec, is a queue seat: the projection as messages, a task message, and
   calls to the `next_command` queue tool whose `answers` schema is the
@@ -345,7 +353,7 @@ context holds those rules and nothing the seat said or did.
 - **It is sent whole and counted.** The decision sends it whole, like every
   seat, so it reads the rules as of the submission. `[council] contexts`,
   the voting reviewer contexts, and the house-rules context together must fit
-  `identity.limits.contexts_per_decision`; a miss names the limit.
+  the served model's `limits.contexts_per_decision`; a miss names the limit.
 - **It is ephemeral on the server.** A house-rules seat is pinned only while
   it is current; once its file is edited or gone, it leaves the pin set and
   the server's own expiry decides when it goes. Amy, 2026-10-05: "we will
@@ -777,6 +785,7 @@ before any host file gains these lines.
 ```toml
 [council]
 server = "http://zorak:8090"
+model = "gemma-4"              # a served model's name or alias; optional when the server serves one
 contexts = ["council-system"]  # read for every decision
 reviewer_contexts = true        # compose council-<character> along the reviewer chain
 house_rules = true             # read the AGENTS.md above the seat's cwd; off by default
@@ -806,22 +815,23 @@ enabled = true
 contexts = ["council-amy", "council-banto"]
 ```
 
-`kj cast slot set mk-bumps gate --backend mk-zorak --model mk` sends the
-gate decisions of every seat that resolves through cast `mk-bumps` to the
-council server at backend `mk-zorak`'s `base_url`. A seat resolves its cast
+`kj cast slot set mk-bumps gate --backend mk-zorak --model gemma-4` sends
+the gate decisions of every seat that resolves through cast `mk-bumps` to
+the served model `gemma-4` on the council server at backend `mk-zorak`'s
+`base_url`. A seat resolves its cast
 the way the judge does: its own cast, else its performer's default cast
 (`kj character set coder --cast mk-bumps`). A seat whose cast has no `gate`
 slot, or that resolves no cast, decides on `[council] server`. The slot's
 backend must have kind `mk` and a `base_url`; any other backend makes
 every decision on the submission a miss that names the backend, and no
-other server is asked in its place. The slot's `--model` is required by
-`kj cast slot set` and is not read; the server's identity is recorded with
-each decision. The role is `gate`, not `council`, because `council` is a
+other server is asked in its place. The slot's `--model` names the served
+model and replaces `[council] model`; the served model's identity is
+recorded with each decision. The role is `gate`, not `council`, because `council` is a
 context type: a council context playing a cast with a `council` slot
 would take that slot as its chat model. `gate` is a reserved role: no
 context resolves its chat model from a `gate` slot, and `kj context
 create` and `kj context set` refuse `--type gate` as a cast role, not a
-context type. The cast chooses only the server;
+context type. The cast chooses only the server and its served model;
 whether a type gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program
 decisions included, and the observing reviewer contexts read after it go to

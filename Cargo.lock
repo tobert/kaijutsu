@@ -5473,7 +5473,7 @@ dependencies = [
 [[package]]
 name = "gogi-fake"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=5d3cc015a213f4f58e00319004f3aefbb48cf9ba#5d3cc015a213f4f58e00319004f3aefbb48cf9ba"
+source = "git+https://github.com/tobert/gogi?rev=ee6174caf0b123bde8f21aaaa99ed430279cbd99#ee6174caf0b123bde8f21aaaa99ed430279cbd99"
 dependencies = [
  "gogi-proto",
  "indexmap 2.14.0",
@@ -5485,7 +5485,7 @@ dependencies = [
 [[package]]
 name = "gogi-proto"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=5d3cc015a213f4f58e00319004f3aefbb48cf9ba#5d3cc015a213f4f58e00319004f3aefbb48cf9ba"
+source = "git+https://github.com/tobert/gogi?rev=ee6174caf0b123bde8f21aaaa99ed430279cbd99#ee6174caf0b123bde8f21aaaa99ed430279cbd99"
 dependencies = [
  "indexmap 2.14.0",
  "serde",

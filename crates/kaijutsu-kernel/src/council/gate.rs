@@ -281,6 +281,7 @@ pub(crate) fn program_case_state(
 /// the request sends no `think`.
 pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, state: serde_json::Value) -> DecisionRequest {
     DecisionRequest {
+        model: Some(prepared.identity.model.clone()),
         spec_id: Some(prepared.spec_id.to_string()),
         contexts: prepared.contexts.iter().map(|c| (*c.seat).clone()).collect(),
         state,
@@ -1700,43 +1701,55 @@ pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
     council.specs.iter().find(|s| s.case == CouncilCase::Shell)
 }
 
-/// The backend of the `role` slot in the cast `seat` resolves through (its
-/// own, else its performer's default), with that cast's id. `None` when the
-/// seat resolves no cast or the cast has no `role` slot.
+/// The backend and model of the `role` slot in the cast `seat` resolves
+/// through (its own, else its performer's default), with that cast's id.
+/// `None` when the seat resolves no cast or the cast has no `role` slot.
+#[allow(clippy::type_complexity)]
 pub(crate) fn seat_slot_backend(
     db: &crate::kernel_db::KernelDb,
     seat: &crate::kernel_db::ContextRow,
     role: &str,
-) -> crate::kernel_db::KernelDbResult<Option<(kaijutsu_types::CastId, crate::kernel_db::BackendRow)>> {
+) -> crate::kernel_db::KernelDbResult<Option<(kaijutsu_types::CastId, crate::kernel_db::BackendRow, String)>> {
     let Some(cast) = db.effective_cast(seat)? else { return Ok(None) };
     let Some(slot) = db.get_cast_slot(cast.cast_id, role)? else { return Ok(None) };
     let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id).ok_or_else(|| {
         crate::kernel_db::KernelDbError::Validation(format!("cast {} slot {role} names a backend that does not exist", cast.label))
     })?;
-    Ok(Some((cast.cast_id, backend)))
+    Ok(Some((cast.cast_id, backend, slot.model)))
 }
 
-/// The council server address a backend names: its `base_url` when its kind
-/// is `mk`. `Err` says why it names none.
-pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow) -> Result<String, String> {
+/// A council server a cast slot names, and the served model the slot names
+/// on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotServer {
+    pub(crate) server: String,
+    /// A served model's `model` or alias.
+    pub(crate) model: String,
+}
+
+/// The council server a slot on `backend` names, with the slot's `model`:
+/// the backend's `base_url` when its kind is `mk`. `Err` says why it names
+/// none.
+pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow, model: &str) -> Result<SlotServer, String> {
     match (backend.kind.as_str(), &backend.base_url) {
-        ("mk", Some(url)) => Ok(url.clone()),
+        ("mk", Some(url)) => Ok(SlotServer { server: url.clone(), model: model.to_string() }),
         ("mk", None) => Err(format!("backend {} has no base URL, so it names no council server", backend.name)),
         (kind, _) => Err(format!("backend {} is kind {kind}, not mk, so it is not a council server", backend.name)),
     }
 }
 
-/// The council server for `seat`'s gate decisions when the cast it resolves
-/// through has a [`GATE`] slot. `None` when it has no such slot, so
-/// `[council] server` decides. `Some(Err)` is a miss cause: the slot's
-/// backend is not a council server, and no other server stands in.
+/// The council server and served model for `seat`'s gate decisions when
+/// the cast it resolves through has a [`GATE`] slot. `None` when it has no
+/// such slot, so `[council] server` and `model` decide. `Some(Err)` is a
+/// miss cause: the slot's backend is not a council server, and no other
+/// server stands in.
 fn cast_council_server(
     db: &crate::kernel_db::KernelDb,
     seat: ContextId,
-) -> crate::kernel_db::KernelDbResult<Option<Result<String, String>>> {
+) -> crate::kernel_db::KernelDbResult<Option<Result<SlotServer, String>>> {
     let Some(row) = db.get_context(seat)? else { return Ok(None) };
-    let Some((_, backend)) = seat_slot_backend(db, &row, GATE)? else { return Ok(None) };
-    Ok(Some(council_address(&backend).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
+    let Some((_, backend, model)) = seat_slot_backend(db, &row, GATE)? else { return Ok(None) };
+    Ok(Some(council_address(&backend, &model).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
 }
 
 /// Where the gate's decisions for `seat` go and what they read along the
@@ -1755,7 +1768,7 @@ pub(crate) fn seat_route(
     let chain = super::reviewer_contexts::reviewer_context_chain(db, council, seat, actor);
     Ok(match cast_server {
         None => (None, chain),
-        Some(Ok(server)) => (Some(CouncilConfig { server, ..council.clone() }), chain),
+        Some(Ok(slot)) => (Some(CouncilConfig { server: slot.server, model: Some(slot.model), ..council.clone() }), chain),
         Some(Err(cause)) => (None, Err(cause)),
     })
 }
@@ -2035,6 +2048,7 @@ mod tests {
     fn council(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
         CouncilConfig {
             server: "http://127.0.0.1:1".into(),
+            model: None,
             contexts: vec!["reviewer".into(), "system-rules".into()],
             pool_method: CouncilPoolMethod::LogLinear,
             pool_weights: CouncilPoolWeights::Mass,
@@ -2232,10 +2246,10 @@ mod tests {
     }
 
     fn prepared(contexts: &[ContextId]) -> Prepared {
-        let identity: gogi_proto::identity::ServerIdentity = serde_json::from_value(serde_json::json!({
-            "model": "m", "weight_hash": "w1", "tokenizer_hash": "t1", "template": "x", "engine": "e1",
-            "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 8,
-                       "choice_options": 8, "default_timeout_ms": 1000},
+        let identity: gogi_proto::identity::ServedModel = serde_json::from_value(serde_json::json!({
+            "model": "m", "status": "ready", "weight_hash": "w1", "tokenizer_hash": "t1", "template": "x", "engine": "e1",
+            "limits": {"context_tokens": 1, "decision_context_tokens": 1, "snapshot_bytes": 1, "contexts_per_decision": 8,
+                       "default_timeout_ms": 1000},
             "capabilities": []})).unwrap();
         let spec = example_spec();
         Prepared {

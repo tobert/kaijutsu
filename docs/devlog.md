@@ -3494,3 +3494,12 @@ a server without v2 is now a miss. Kernel tests run the real prepare and
 decide path against `gogi-fake`, and the same bodies run against a live
 server with `COUNCIL_URL`. The hand-written mocks stay where a test needs a
 scripted verdict, a forced status, or a delay; the fake cannot give those.
+
+gogi then served several models (`ee6174c`): identity lists `models`, each
+with a status, and every build, decision, read, and generation names one.
+The kernel names it from `[council] model` or a `gate` or `judge` slot's
+model, which used to be required and unread; left out, it is the server's
+only model, and the kernel sends that model's `model`, never an alias. The
+kernel never picks among several. A loading model is a miss that drops the
+cached identity, so the next decision sees it ready. Seats are held per
+served model, since a snapshot belongs to one.

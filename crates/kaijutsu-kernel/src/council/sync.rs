@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use gogi_proto::identity::{Capability, ServerIdentity};
+use gogi_proto::identity::{Capability, ModelStatus, ServedModel, ServerIdentity};
 use gogi_proto::pins::PinsPut;
 use gogi_proto::spec::{QuestionKind, Spec};
 use gogi_proto::{Context, SnapshotId, SpecId};
@@ -48,7 +48,8 @@ pub(crate) struct Prepared {
     pub(crate) client: MkClient,
     /// The server's endpoint, which each call takes a slot from.
     pub(crate) endpoint: Arc<Endpoint>,
-    pub(crate) identity: ServerIdentity,
+    /// The served model the decision runs on, which was `ready`.
+    pub(crate) identity: ServedModel,
     pub(crate) spec: Spec,
     pub(crate) spec_id: SpecId,
     /// In the order the labels were given, then the house-rules context when
@@ -146,6 +147,9 @@ struct Link<'a> {
     waits: &'a SlotWaits,
     /// The owner of this kernel's pins ([`pin_owner`]).
     owner: String,
+    /// The served model's `model`, which every build names. Empty until
+    /// the identity names it.
+    model: String,
 }
 
 impl Link<'_> {
@@ -167,6 +171,17 @@ fn endpoint_of(kernel: &crate::Kernel, server: &str) -> Result<(Arc<Endpoint>, S
     let missed = |e: String| PrepareMiss(format!("council server {server}: {e}"));
     let key = crate::llm::endpoint::origin(server).map_err(missed)?;
     Ok((kernel.endpoints().for_url(server).map_err(missed)?, key))
+}
+
+/// A served model's status as identity spells it.
+pub(crate) fn status_word(status: ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::Ready => "ready",
+        ModelStatus::Loading => "loading",
+        ModelStatus::Draining => "draining",
+        ModelStatus::Unloaded => "unloaded",
+        ModelStatus::Unknown => "in a status this kernel does not know",
+    }
 }
 
 /// Why the council cannot be asked right now, in plain words; the gate
@@ -197,9 +212,9 @@ enum Slot {
     Shadow(ContextId),
 }
 
-/// A seat the server holds: the server's origin, the slot, and the spec
-/// the seat serves.
-type HeldKey = (String, Slot, String);
+/// A seat the server holds: the server's origin, the served model, the
+/// slot, and the spec the seat serves.
+type HeldKey = (String, String, Slot, String);
 
 /// Keyed by each server's origin.
 #[derive(Default)]
@@ -216,7 +231,7 @@ impl State {
     fn seat_heads(&self, key: &str) -> BTreeSet<String> {
         self.contexts
             .iter()
-            .filter(|((server, _, _), _)| server == key)
+            .filter(|((server, _, _, _), _)| server == key)
             .map(|(_, held)| held.head.to_string())
             .collect()
     }
@@ -341,18 +356,30 @@ impl CouncilSync {
         let client = MkClient::new(server, Duration::from_millis(council.deadline_ms))
             .map_err(|e| self.failed(&key, server, "client", e))?;
         let owner = pin_owner(kernel.id());
-        let link = Link { client: &client, server, key, endpoint: endpoint.clone(), deadline, deadline_ms: council.deadline_ms, waits, owner };
+        let mut link = Link {
+            client: &client,
+            server,
+            key,
+            endpoint: endpoint.clone(),
+            deadline,
+            deadline_ms: council.deadline_ms,
+            waits,
+            owner,
+            model: String::new(),
+        };
 
-        let identity = self.identity(&link).await?;
+        let server_identity = self.identity(&link).await?;
+        let identity = self.served(&link, &server_identity, council.model.as_deref())?;
+        link.model = identity.model.clone();
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
         if let Some(text) = spec_body.questions.iter().find(|q| matches!(q.kind, QuestionKind::Text { .. }))
-            && !identity.capabilities.contains(&Capability::Describe)
+            && !identity.has(Capability::Describe)
         {
             return Err(PrepareMiss(format!(
-                "spec {spec_name} holds the text question `{}`, and council server {server} lacks the \
-                 `describe` capability that answers one; remove the question from \
+                "spec {spec_name} holds the text question `{}`, and model {} on council server {server} \
+                 lacks the `describe` capability that answers one; remove the question from \
                  /config/kernel/council/{spec_name}.json",
-                text.id
+                text.id, identity.model
             )));
         }
         if let Some((i, label)) = labels.iter().enumerate().find(|(i, l)| labels[..*i].contains(l)) {
@@ -382,9 +409,10 @@ impl CouncilSync {
             }
             named.extend(added.iter().cloned());
             return Err(PrepareMiss(format!(
-                "a decision on spec {spec_name} reads {reads} contexts ({}), and council server {server} \
-                 reads at most {} per decision (identity.limits.contexts_per_decision)",
+                "a decision on spec {spec_name} reads {reads} contexts ({}), and model {} on council \
+                 server {server} reads at most {} per decision (limits.contexts_per_decision)",
                 named.join(", "),
+                identity.model,
                 identity.limits.contexts_per_decision
             )));
         }
@@ -406,15 +434,15 @@ impl CouncilSync {
             let (seat, head) = self.hold(&link, &spec_body, slot, HOUSE_RULES_LABEL, context_id, body).await?;
             contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, seat, head, house_rules: true });
         }
-        self.pin_seats(&link, &identity);
+        self.pin_seats(&link, &server_identity);
 
         let spec = spec_body;
         drop(link);
         Ok(Prepared { client, endpoint, identity, spec, spec_id, contexts })
     }
 
-    /// Builds the shadow `shadow` of the seat labeled `seat` on `server` as
-    /// a queue seat for the spec named `spec_name`, so the server holds its
+    /// Builds the shadow `shadow` of the seat labeled `seat` on `server`'s
+    /// served model `model` as a queue seat for the spec named `spec_name`, so the server holds its
     /// dialogue before the next question about it, and returns the seat and
     /// its head. Sends nothing when the server already holds this seat. Each call waits for a slot
     /// no later than `deadline`, adding its wait to `waits`.
@@ -423,6 +451,7 @@ impl CouncilSync {
         &self,
         kernel: &crate::Kernel,
         server: &str,
+        model: Option<&str>,
         spec_name: &str,
         shadow: ContextId,
         seat: &str,
@@ -433,8 +462,10 @@ impl CouncilSync {
         let (endpoint, key) = endpoint_of(kernel, server)?;
         let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
         let deadline_ms = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
-        let link = Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()) };
+        let mut link =
+            Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()), model: String::new() };
         let identity = self.identity(&link).await?;
+        link.model = self.served(&link, &identity, model)?.model;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
         self.ensure_spec(&link, &spec_body, &spec_id).await?;
         let blocks = kernel
@@ -467,14 +498,14 @@ impl CouncilSync {
             PrepareMiss(format!("council context \"{label}\" has no council v2 seat for spec {}: {e}", spec.name))
         })?;
         let hash = body_hash(&seat)?;
-        let key = (link.key.clone(), slot, spec.name.clone());
+        let key = (link.key.clone(), link.model.clone(), slot, spec.name.clone());
         let held =
             self.state.lock().contexts.get(&key).filter(|h| h.id == context_id && h.body == hash).map(|h| h.head.clone());
         if let Some(head) = held {
             return Ok((Box::new(seat), head));
         }
         let built = link
-            .send(|| async { link.client.council().build_context(&seat, false).await })
+            .send(|| async { link.client.council().build_context(&link.model, &seat, false).await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, &format!("build of context \"{label}\""), e))?;
         self.state.lock().contexts.insert(key, Held { id: context_id, body: hash, head: built.head.clone() });
@@ -577,6 +608,26 @@ impl CouncilSync {
             .map_err(|e| self.failed(&link.key, link.server, "council v2 identity", e))?;
         self.state.lock().identities.insert(link.key.clone(), identity.clone());
         Ok(identity)
+    }
+
+    /// The served model `model` names on the server, by its `model` or an
+    /// alias; `None` names the only one. A model that is not `ready` is a
+    /// miss, and its identity is asked again on the next prepare.
+    fn served(&self, link: &Link<'_>, identity: &ServerIdentity, model: Option<&str>) -> Result<ServedModel, PrepareMiss> {
+        let server = link.server;
+        let served = identity.route(model).map_err(|e| {
+            let names: Vec<&str> = identity.models.iter().map(|m| m.model.as_str()).collect();
+            PrepareMiss(format!("council server {server}: {}; it serves {}", e.message, names.join(", ")))
+        })?;
+        if served.status != ModelStatus::Ready {
+            self.state.lock().identities.remove(&link.key);
+            return Err(PrepareMiss(format!(
+                "council server {server}: model {} is {}, not ready",
+                served.model,
+                status_word(served.status)
+            )));
+        }
+        Ok(served.clone())
     }
 
     async fn ensure_spec(&self, link: &Link<'_>, spec: &Spec, spec_id: &SpecId) -> Result<(), PrepareMiss> {
@@ -693,7 +744,7 @@ impl Pinner {
             return;
         }
         let Some(state) = self.state.upgrade() else { return };
-        state.lock().contexts.retain(|(server, _, _), held| !(*server == self.key && gone.iter().any(|g| g == held.head.as_str())));
+        state.lock().contexts.retain(|(server, _, _, _), held| !(*server == self.key && gone.iter().any(|g| g == held.head.as_str())));
     }
 }
 
@@ -813,10 +864,10 @@ pub(crate) async fn plan_context_seats(
     }
     let judge = super::shadow::judge_server(&db, &row)
         .map_err(|e| format!("the judge slot of context {} cannot be read: {e}", context.short()))?;
-    if let (Some(server), Some(spec)) = (judge, shell) {
+    if let (Some(judge), Some(spec)) = (judge, shell) {
         let seat_name = row.label.clone().unwrap_or_else(|| context.short());
         builds.push(SeatBuild {
-            council: CouncilConfig { server, ..long.clone() },
+            council: CouncilConfig { server: judge.server, model: Some(judge.model), ..long.clone() },
             spec: spec.name.clone(),
             labels: super::shadow::judge_labels(council, spec),
             seat,
@@ -862,7 +913,7 @@ pub(crate) async fn build_context_seats(kernel: &crate::Kernel, context: Context
 /// - a shadow is not archived.
 async fn reachable(kernel: &crate::Kernel, config: &crate::kj::gate_policy::GateConfig, key: &HeldKey, id: ContextId) -> bool {
     use crate::vfs::VfsOps;
-    let (_, slot, spec) = key;
+    let (_, _, slot, spec) = key;
     let councils: Vec<&CouncilConfig> = config.councils().collect();
     let reviewer_contexts = councils.iter().any(|c| c.reviewer_contexts);
     if !councils.iter().any(|c| c.specs.iter().any(|s| s.name == *spec))
@@ -1023,16 +1074,15 @@ pub(super) mod mock {
         format!("snap:{n:064x}")
     }
 
-    pub(crate) fn identity_json() -> String {
-        identity_listing(json!(["leave_one_out"]))
-    }
-
-    /// The mock's identity with `capabilities`.
+    /// The mock's identity: one served model, `m`, ready. The server and
+    /// its model both list `capabilities`.
     pub(crate) fn identity_listing(capabilities: serde_json::Value) -> String {
-        json!({"model": "m", "weight_hash": "w", "tokenizer_hash": "t", "template": "tpl",
-               "engine": "e",
-               "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 4,
-                          "choice_options": 8, "default_timeout_ms": 1000},
+        json!({"models": [{"model": "m", "status": "ready", "weight_hash": "w", "tokenizer_hash": "t", "template": "tpl",
+                           "engine": "e",
+                           "limits": {"context_tokens": 1, "decision_context_tokens": 1, "snapshot_bytes": 1,
+                                      "contexts_per_decision": 4, "default_timeout_ms": 1000},
+                           "capabilities": capabilities}],
+               "limits": {"state_bytes": 1, "choice_options": 8},
                "capabilities": capabilities})
         .to_string()
     }
@@ -1046,7 +1096,7 @@ pub(super) mod mock {
                 *builds += 1;
                 reply(
                     200,
-                    json!({"head": snap(*builds), "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                    json!({"model": "m", "head": snap(*builds), "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
                            "snapshots": [{"id": snap(*builds), "message": 1, "tokens": 1}]})
                     .to_string(),
                 )
@@ -1151,7 +1201,7 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::mock::{Mock, identity_json, reply, serve, serve_pinning, snap};
+    use super::mock::{Mock, reply, serve, serve_pinning, snap};
     use super::super::projection::fixtures::{append_dialogue, live_context};
     use super::*;
 
@@ -1197,6 +1247,7 @@ mod tests {
         let spec = CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None };
         let council = CouncilConfig {
             server: mock.base.clone(),
+            model: None,
             contexts: vec!["reviewer".into()],
             pool_method: CouncilPoolMethod::Linear,
             pool_weights: CouncilPoolWeights::Uniform,
@@ -1294,7 +1345,8 @@ mod tests {
         assert_eq!(r.mock.calls("GET"), ["/council/v2/identity"]);
         assert_eq!(r.mock.calls("POST"), ["/council/v2/specs", "/council/v2/contexts", "/council/v2/decisions"]);
         let built = r.mock.builds();
-        assert_eq!(built, [json!({"context": sent[0]["contexts"][0]})], "the decision sends the seat it built, and nothing else");
+        assert_eq!(built, [json!({"model": "m", "context": sent[0]["contexts"][0]})], "the decision sends the seat it built, and nothing else");
+        assert_eq!(sent[0]["model"], "m", "the decision names the served model");
         assert_eq!(sent[0]["contexts"].as_array().unwrap().len(), 1);
         assert_eq!(p.contexts[0].context_id, r.reviewer);
         assert_eq!(p.contexts[0].head.as_str(), snap(1), "the head the build reported");
@@ -1564,9 +1616,7 @@ mod tests {
     }
 
     fn identity_with(capabilities: serde_json::Value) -> String {
-        let mut id: serde_json::Value = serde_json::from_str(&identity_json()).unwrap();
-        id["capabilities"] = capabilities;
-        id.to_string()
+        super::mock::identity_listing(capabilities)
     }
 
     #[tokio::test]
@@ -1878,6 +1928,7 @@ mod tests {
     async fn house_rules_edit_replaces_the_pinned_seat(server: String) {
         let mut r = rig_on(serve_pinning().await).await;
         r.council.server = server.clone();
+        r.council.model = std::env::var("COUNCIL_MODEL").ok();
         r.council.deadline_ms = 120_000;
         r.council.house_rules = true;
         let owner = pin_owner(r.kernel.id());
@@ -1905,6 +1956,7 @@ mod tests {
     async fn seat_is_pinned_and_read_whole(server: String) {
         let mut r = rig_on(serve_pinning().await).await;
         r.council.server = server.clone();
+        r.council.model = std::env::var("COUNCIL_MODEL").ok();
         r.council.deadline_ms = 120_000;
         converse(&r);
         let owner = pin_owner(r.kernel.id());
@@ -1958,9 +2010,55 @@ mod tests {
         house_rules_edit_replaces_the_pinned_seat(fake.url()).await;
     }
 
+    /// On a server that serves several models, the council names one. With
+    /// no `[council] model` it is a miss naming the served models. A model
+    /// that is loading is a miss naming its status, and the next prepare
+    /// asks the identity again. Named by its alias, the model takes every
+    /// build and the decision, and each answer names it by its `model`.
+    ///
+    /// Falsified by a build or decision that leaves `model` out, or an
+    /// identity cached while its model was loading.
+    #[tokio::test]
+    async fn against_the_fake_the_council_names_its_served_model() {
+        let b = gogi_fake::FakeModel { aliases: vec!["bee".into()], ..gogi_fake::FakeModel::ready("b", 1) };
+        let config = gogi_fake::Config {
+            models: vec![gogi_fake::FakeModel::ready("a", 0), b],
+            context_tokens: 1 << 20,
+            decision_context_tokens: 1 << 20,
+            pin_bytes: 1 << 34,
+            ..gogi_fake::Config::default()
+        };
+        let fake = gogi_fake::Server::start(config).expect("the fake council starts");
+        let mut r = rig_on(serve_pinning().await).await;
+        r.council.server = fake.url();
+        r.council.deadline_ms = 120_000;
+        converse(&r);
+        let miss = r.prepare().await.err().expect("no model is named");
+        assert!(miss.0.contains("model is required") && miss.0.contains("it serves a, b"), "{}", miss.0);
+
+        r.council.model = Some("bee".into());
+        fake.set_status("b", gogi_fake::ModelStatus::Loading).unwrap();
+        let miss = r.prepare().await.err().expect("b is loading");
+        assert!(miss.0.contains("model b is loading, not ready"), "{}", miss.0);
+        fake.set_status("b", gogi_fake::ModelStatus::Ready).unwrap();
+        let p = r.prepare().await.expect("prepared once b is ready");
+        assert_eq!(p.identity.model, "b");
+        let client = MkClient::new(&fake.url(), Duration::from_secs(30)).unwrap();
+        assert_eq!(client.council().snapshot(&p.contexts[0].head).await.unwrap().model, "b");
+
+        let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
+        assert_eq!(request.model.as_deref(), Some("b"));
+        let response = super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default())
+            .await
+            .expect("answered");
+        gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
+        assert_eq!(response.identity.model, "b");
+    }
+
     /// Live, by hand: [`house_rules_edit_replaces_the_pinned_seat`] against
     /// a real server.
     /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
+    /// Set `COUNCIL_MODEL` on a server that serves several models.
     #[tokio::test]
     #[ignore = "needs a council v2 server at COUNCIL_URL"]
     async fn live_council_v2_house_rules_edit_replaces_the_pinned_seat() {
@@ -1970,6 +2068,7 @@ mod tests {
     /// Live, by hand: [`seat_is_pinned_and_read_whole`] against a real
     /// server.
     /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
+    /// Set `COUNCIL_MODEL` on a server that serves several models.
     #[tokio::test]
     #[ignore = "needs a council v2 server at COUNCIL_URL"]
     async fn live_council_v2_seat_is_pinned_and_read_whole() {

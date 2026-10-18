@@ -365,6 +365,7 @@ mod tests {
         });
         let council = CouncilConfig {
             server: mock.base.clone(),
+            model: None,
             contexts: vec!["council-system".into(), "council-amy".into()],
             pool_method: CouncilPoolMethod::LogLinear,
             pool_weights: CouncilPoolWeights::Mass,

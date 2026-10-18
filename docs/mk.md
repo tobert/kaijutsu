@@ -248,11 +248,14 @@ must not invent a `ToolUse` before `done`.
 
 ### Council v2
 
-When the service answers `GET /council/v2/identity` and lists `generate`,
-every streamed turn is one `POST /council/v2/generations`
-(gogi's `docs/council-api-v2.md`, "Generations") instead of render and
-`/mk/v1/generate`. The client asks for the identity once; a 404 or an
-identity without `generate` keeps the `/mk/v1` path above.
+When the service answers `GET /council/v2/identity` and lists the turn's
+model as a served model with `generate`, every streamed turn is one
+`POST /council/v2/generations` (gogi's `docs/council-api-v2.md`,
+"Generations") instead of render and `/mk/v1/generate`. The turn's model
+names the served model by its `model` or an alias, and the generation sends
+its `model`. The client asks for the identity once. A 404, or a served
+model without `generate`, keeps the `/mk/v1` path above. A model the
+server does not serve is an invalid request naming the ones it serves.
 
 - **The whole conversation goes with every turn.** The context is the
   system prompt, the history as v2 messages (`llm/mk/build.rs`,

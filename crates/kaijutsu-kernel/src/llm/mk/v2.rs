@@ -1,7 +1,7 @@
 //! Turns on a council v2 server (gogi's `docs/council-api-v2.md`).
 //!
-//! When the server's `GET /council/v2/identity` lists `generate`, each turn
-//! is one generation that sends the whole conversation: the system message,
+//! When the server's `GET /council/v2/identity` lists the turn's model as
+//! a served model with `generate`, each turn is one generation that sends the whole conversation: the system message,
 //! the history with `snap` on the end of each user turn and run of tool
 //! results, the tools, and whether the model thinks. The server keeps no
 //! record of the chat. It starts from the longest snapshot it holds along
@@ -10,7 +10,7 @@
 //! client keeps nothing between turns: the kernel's history is the context.
 
 use gogi_proto::generation::{GenerationRequest, Sample};
-use gogi_proto::identity::{Capability, ServerIdentity};
+use gogi_proto::identity::{Capability, ServedModel, ServerIdentity};
 use gogi_proto::{Context, Role as V2Role};
 
 use super::reply::Reply;
@@ -25,9 +25,13 @@ pub(super) struct ReplyIdentity {
 }
 
 impl Client {
-    /// The server's council v2 identity when it lists `generate`, read once.
-    /// A server without v2 answers 404 and keeps the `/mk/v1` path.
-    pub(super) async fn council_v2(&self, turn: &Turn) -> LlmResult<Option<ServerIdentity>> {
+    /// The served model `model` names on a council v2 server, when it lists
+    /// `generate`. The identity is read once. A server without v2 answers
+    /// 404, and it and a model without `generate` keep the `/mk/v1` path. A
+    /// v2 server that serves no model by that name or alias is an error
+    /// naming the ones it serves. The server answers a model that is not
+    /// ready.
+    pub(super) async fn council_v2(&self, turn: &Turn, model: &str) -> LlmResult<Option<ServedModel>> {
         let identity = self
             .v2
             .get_or_try_init(|| async {
@@ -40,12 +44,13 @@ impl Client {
                         }
                     })
                     .await?;
-                let usable = identity.filter(|i| i.capabilities.contains(&Capability::Generate));
-                tracing::info!(backend = %self.name, council_v2 = usable.is_some(), "mk: turns are council v2 generations when council v2 lists generate");
-                Ok::<_, LlmError>(usable)
+                tracing::info!(backend = %self.name, council_v2 = identity.is_some(), "mk: turns are council v2 generations when council v2 lists the model with generate");
+                Ok::<_, LlmError>(identity)
             })
             .await?;
-        Ok(identity.clone())
+        let Some(identity) = identity else { return Ok(None) };
+        let served = served(&self.name, identity, model)?;
+        Ok(served.has(Capability::Generate).then(|| served.clone()))
     }
 
     /// A streamed turn as a council v2 generation after the whole
@@ -54,7 +59,7 @@ impl Client {
         &self,
         opts: BuildOpts,
         history: Vec<Message>,
-        identity: ServerIdentity,
+        identity: ServedModel,
         turn: Turn,
     ) -> LlmResult<Stream> {
         let (thinking, _) = build::effort(opts.effort.as_deref())?;
@@ -80,11 +85,14 @@ impl Client {
         );
         let has_tools = !tools.is_empty();
         let request = GenerationRequest {
+            model: Some(identity.model.clone()),
             context: Context { thinking, tools, queue: None, messages },
             max_tokens: Some(max_tokens),
             sample,
             stream: None,
             decisions: Vec::new(),
+            class: None,
+            priority: None,
         };
         let started = std::time::Instant::now();
         let (slot, inner) = self.call(&turn, true, |_| async { self.mk.council().generate_stream(&request, self.timeout).await }).await?;
@@ -101,6 +109,18 @@ impl Client {
             v2: Some(ReplyIdentity { model: identity.model, weight_hash: identity.weight_hash }),
         })
     }
+}
+
+/// The served model `model` names, by its `model` or an alias.
+fn served<'a>(name: &str, identity: &'a ServerIdentity, model: &str) -> LlmResult<&'a ServedModel> {
+    identity.models.iter().find(|m| m.is_named(model)).ok_or_else(|| {
+        let names: Vec<&str> = identity.models.iter().map(|m| m.model.as_str()).collect();
+        LlmError::InvalidRequest(format!(
+            "mk backend '{name}': the council server serves no model named {model:?}; it serves {}. \
+             Name one of them, or an alias, as the model",
+            names.join(", ")
+        ))
+    })
 }
 
 /// The `max_tokens` a generation sends: the asked-for amount, no more than

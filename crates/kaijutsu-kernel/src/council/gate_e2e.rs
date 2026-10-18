@@ -206,12 +206,16 @@ impl Mock {
     }
 }
 
+/// One served model, ready. The server and its model both list
+/// `capabilities`.
 fn server_identity(context_limit: u64, capabilities: serde_json::Value) -> String {
-    let mut id = identity();
-    id["limits"] = serde_json::json!({"context_tokens": 100000, "state_bytes": 100000, "contexts_per_decision": context_limit,
-                                      "choice_options": 8, "default_timeout_ms": 1000});
-    id["capabilities"] = capabilities;
-    id.to_string()
+    let mut model = identity();
+    model["status"] = serde_json::json!("ready");
+    model["limits"] = serde_json::json!({"context_tokens": 100000, "decision_context_tokens": 100000, "snapshot_bytes": 1,
+                                         "contexts_per_decision": context_limit, "default_timeout_ms": 1000});
+    model["capabilities"] = capabilities.clone();
+    serde_json::json!({"models": [model], "limits": {"state_bytes": 100000, "choice_options": 8}, "capabilities": capabilities})
+        .to_string()
 }
 
 async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(String, String, String)> {
@@ -286,7 +290,7 @@ async fn serve() -> Mock {
                         let delay = delays.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
                         Reply {
                             delay,
-                            ..Reply::ok(serde_json::json!({"head": head, "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                            ..Reply::ok(serde_json::json!({"model": "test-council", "head": head, "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
                                                            "snapshots": [{"id": head, "message": 1, "tokens": 1}]}))
                         }
                     }
@@ -3141,7 +3145,7 @@ async fn a_seat_without_a_judge_slot_gets_no_shadow() {
 async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
     let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
     rig.submit("echo one").await.unwrap();
     assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     let puts = rig.mock.wait_for_builds("shadow", 1).await;
@@ -3173,7 +3177,7 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     const JUDGE_ASKS: [[f64; 3]; 3] = [[-4.0, -0.03, -5.0], [-3.5, -0.04, -5.0], [-4.0, -0.02, -6.0]];
     let rig = rig(Via::Tool, Setup::default()).await;
     let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
     rig.mock.set(|req| {
         if Rig::read_ids(req).len() == 3 { Reply::ok(answer(req, &JUDGE_ASKS)) } else { allow_each(req) }
     });
@@ -3255,7 +3259,7 @@ async fn a_shadow_without_its_stance_is_not_primed() {
         rig.d.kernel().vfs().unlink(std::path::Path::new(path)).await.unwrap();
     }
     let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
     rig.submit("echo one").await.unwrap();
     assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     rig.submit("echo two").await.unwrap();
@@ -3286,7 +3290,7 @@ async fn a_seat_whose_cast_names_a_council_server_decides_there() {
         rig.mock.answers(&ALLOW);
         server_b.answers(&ALLOW);
         let base_b = server_b.base.clone();
-        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "mk", "council-b", "mk", Some(&base_b));
+        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "test-council", "council-b", "mk", Some(&base_b));
         let plain = rig.other_seat("plain-seat").await;
 
         rig.submit("touch /work/cast").await.unwrap_or_else(|e| panic!("{via:?}: server B allows: {e:?}"));
@@ -3337,6 +3341,28 @@ async fn a_gate_slot_that_names_no_council_server_is_a_miss_naming_it() {
     }
 }
 
+/// A `gate` slot names the served model its decisions run on. One the
+/// server does not serve is a miss naming the model and the ones it
+/// serves; no decision is sent.
+///
+/// Falsified by ignoring the slot's model, so the server's only served
+/// model decides.
+#[tokio::test]
+async fn a_gate_slot_naming_a_model_the_server_lacks_is_a_miss_naming_it() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        let server_b = serve().await;
+        server_b.answers(&ALLOW);
+        let base_b = server_b.base.clone();
+        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "gemma-4", "council-b", "mk", Some(&base_b));
+        assert_pending(via, rig.submit("touch /work/slot").await);
+        assert!(server_b.decisions().is_empty(), "{via:?}: no decision runs on another model");
+        let recorded = the_decision(&rig, &rig.only_ask()).decision.miss_cause.clone().unwrap();
+        assert!(recorded.contains("gemma-4") && recorded.contains("it serves test-council"), "{via:?}: {recorded}");
+        rig.finish().await;
+    }
+}
+
 /// A seat whose cast names a council server sends every decision on a
 /// submission there, and the reviewer contexts' observing reads after it:
 /// the shell decision, each program decision, and banto's observation.
@@ -3363,7 +3389,7 @@ async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observation
                 allow_each(req)
             }
         });
-        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "mk", "council-b", "mk", Some(&server_b.base));
+        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "test-council", "council-b", "mk", Some(&server_b.base));
         rig.write("/work/fix.py", "print('fixed')\n").await;
         rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: server B allows: {e:?}"));
 
@@ -3401,7 +3427,7 @@ async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() 
     let judge_server = serve().await;
     judge_server.set(allow_each);
     rig.mock.set(allow_each);
-    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&judge_server.base));
+    give_judge_cast_on(&rig, "test-council", "mk", Some(&judge_server.base));
     rig.submit("echo two-servers").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
     let rows = rig.observations(&decision.decision_id, 1).await;
@@ -3434,7 +3460,7 @@ async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
     rig.mock.limit_contexts(2);
     rig.mock.set(allow_each);
     let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
     rig.submit("echo at-limit").await.unwrap_or_else(|e| panic!("a decision at the limit still allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
     assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
@@ -3459,7 +3485,7 @@ async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
 async fn a_judge_slot_with_no_council_address_records_a_miss_naming_it() {
     let rig = rig(Via::Tool, Setup::default()).await;
     rig.mock.set(allow_each);
-    give_judge_cast_on(&rig, "mk-judge", "mk", None);
+    give_judge_cast_on(&rig, "test-council", "mk", None);
     rig.submit("echo no-address").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
     assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);

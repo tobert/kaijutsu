@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use gogi_proto::context::{Context, ContextBuild, ContextBuilt, SnapshotInfo};
 use gogi_proto::decision::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
-use gogi_proto::identity::{Limits, ServerIdentity};
+use gogi_proto::identity::{ModelLimits, ModelStatus, ServedModel, ServerIdentity, ServerLimits};
 use gogi_proto::math::{self, Row, WeightSpec};
 use gogi_proto::spec::{QuestionKind, Spec, SpecRules};
 use gogi_proto::{SnapshotId, sha256_hex};
@@ -86,7 +86,7 @@ impl Script {
 /// clears any mass floor a fleet gate sets.
 const CHOSEN: f64 = -0.001;
 
-/// The template the scripted council reports in its identity and specs.
+/// The template the scripted council reports in its identity and decisions.
 const TEMPLATE: &str = "mk-letters-1:0123456789abcdef";
 
 fn identity() -> Value {
@@ -94,32 +94,33 @@ fn identity() -> Value {
            "engine": "acp-fleet"})
 }
 
-/// The identity `GET /council/v2/identity` answers. It lists no
-/// capabilities, so a kernel sends it no pins.
+/// The identity `GET /council/v2/identity` answers: one served model,
+/// `fleet-council`. It lists no capabilities, so a kernel sends it no pins.
 fn server_identity() -> ServerIdentity {
     ServerIdentity {
-        model: "fleet-council".into(),
-        aliases: None,
-        weight_hash: "fleet".into(),
-        tokenizer_hash: "fleet".into(),
-        template: TEMPLATE.into(),
-        engine: "acp-fleet".into(),
-        device: None,
-        text_stop: None,
-        limits: Limits {
-            context_tokens: 100000,
-            state_bytes: 100000,
-            contexts_per_decision: gogi_proto::decision::MAX_CONTEXTS as u64,
-            choice_options: 8,
-            default_timeout_ms: 1000,
-            questions_per_spec: None,
-            text_tokens: None,
-            pin_bytes: None,
-            snapshot_bytes: None,
-            decision_context_tokens: None,
-        },
+        models: vec![ServedModel {
+            model: "fleet-council".into(),
+            aliases: Vec::new(),
+            status: ModelStatus::Ready,
+            weight_hash: "fleet".into(),
+            tokenizer_hash: "fleet".into(),
+            template: TEMPLATE.into(),
+            engine: "acp-fleet".into(),
+            device: None,
+            text_stop: None,
+            limits: ModelLimits {
+                context_tokens: 100000,
+                decision_context_tokens: 100000,
+                snapshot_bytes: 1,
+                contexts_per_decision: gogi_proto::decision::MAX_CONTEXTS as u64,
+                default_timeout_ms: 1000,
+                text_tokens: None,
+            },
+            capabilities: Vec::new(),
+        }],
+        limits: ServerLimits { state_bytes: 100000, choice_options: 8, questions_per_spec: None, pin_bytes: None },
         capabilities: Vec::new(),
-        extensions: None,
+        extensions: Vec::new(),
     }
 }
 
@@ -137,6 +138,7 @@ fn built(context: &Context, dry_run: bool) -> Result<ContextBuilt> {
     let head = head_of(context)?;
     let tokens = context.messages.len() as u64;
     Ok(ContextBuilt {
+        model: "fleet-council".into(),
         head: head.clone(),
         tokens,
         kept: 0,
@@ -474,7 +476,7 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value>
             let value: Value = serde_json::from_str(body).context("a posted spec is not JSON")?;
             let spec = gogi_proto::spec::parse_spec(&value, &SpecRules::default()).map_err(|e| anyhow::anyhow!("a posted spec is refused: {e}"))?;
             let id = spec.id();
-            let held = json!({"spec_id": id, "spec": value, "template": TEMPLATE});
+            let held = json!({"spec_id": id, "spec": value});
             let mut specs = shared.specs.lock().map_err(|_| anyhow::anyhow!("the spec table is poisoned"))?;
             if specs.len() >= SPEC_LIMIT && !specs.contains_key(id.as_str()) {
                 bail!("the scripted council holds at most {SPEC_LIMIT} specs");
@@ -485,11 +487,13 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value>
         ("POST", "/council/v2/contexts") => {
             let build: ContextBuild = serde_json::from_str(body).context("a context build does not decode")?;
             build.context.check().map_err(|e| anyhow::anyhow!("a context build is refused: {e}"))?;
+            server_identity().route(build.model.as_deref()).map_err(|e| anyhow::anyhow!("a context build is refused: {e}"))?;
             Ok(serde_json::to_value(built(&build.context, build.dry_run.unwrap_or(false))?)?)
         }
         ("POST", "/council/v2/decisions") => {
             let request: DecisionRequest = serde_json::from_str(body).context("a decision request does not decode")?;
             request.validate().map_err(|e| anyhow::anyhow!("a decision request is refused: {e}"))?;
+            server_identity().route(request.model.as_deref()).map_err(|e| anyhow::anyhow!("a decision request is refused: {e}"))?;
             let spec_id = request.spec_id.as_ref().context("a decision with no spec_id; the scripted council answers specs only")?;
             let spec = shared
                 .specs
@@ -677,7 +681,7 @@ mod tests {
         let (status, id) = call("GET", "/council/v2/identity", "");
         assert_eq!(status, 200, "{id}");
         let id: ServerIdentity = serde_json::from_value(id).unwrap();
-        assert_eq!(id.model, "fleet-council");
+        assert_eq!(id.route(None).unwrap().model, "fleet-council");
         assert!(id.capabilities.is_empty(), "no pins capability, so the kernel sends no pins");
         let (status, held) = call("POST", "/council/v2/specs", SHELL_BUMP);
         assert_eq!(status, 200, "{held}");

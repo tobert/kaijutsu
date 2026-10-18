@@ -121,7 +121,7 @@ WAL. Accept `-p`, or have the refusal name the fix.
 
 The council speaks only council v2 (gogi's `docs/council-api-v2.md`), and
 the mk provider speaks it when a server's `GET /council/v2/identity` lists
-`generate`. mkviolet serves it. The live
+the turn's model with `generate`. mkviolet serves it. The live
 checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
 (`COUNCIL_URL`) and the mk probes and `live_mk_tool_loop` (`MK_URL`).
 
@@ -139,9 +139,21 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   deadline. Linking the script into `submit` would catch them for turns a
   person starts, at one rc run per submit; nothing catches them for
   autonomous turns.
-- **Reachability ignores the server.** The pin sweep keeps a seat that some
-  council reads, without checking that the seat's server is the one that
-  council, a cast's `gate` slot, or a judge routes to.
+- **mkviolet serves the one-model identity.** gogi `ee6174c` lists served
+  models under `models`, and kaijutsu reads only that shape, so every
+  decision on mkviolet is a miss ("missing field `models`") until mkviolet
+  ships gogi's `docs/disagreements.md` rows 16 to 18. A rebuilt kernel
+  waits for that. The deployed kernel's `gate` slot names model
+  `gemma-4-26b-a4b`, which is neither mkviolet's `model`
+  (`google/gemma-4-26B-A4B-it`) nor an alias; rename the slot's model or
+  give mkviolet the alias.
+- **Reachability ignores the server and the served model.** The pin sweep
+  keeps a seat that some council reads, without checking that the seat's
+  server and served model are the ones that council, a cast's `gate` slot,
+  or a judge routes to.
+- **Requests send no `class` or `priority`.** Gate decisions are
+  interactive and seat builds ahead could be `batch`; nothing sends either
+  yet, and no server lists `classes`.
 - **Thinking markers in a thinking-off answer.** On mkviolet, a
   `thinking: false` generation after a tool result answered with
   `<|channel>thought\n<channel|>` at the start of `content`

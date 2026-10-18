@@ -72,12 +72,13 @@ impl Council<'_> {
             .await
     }
 
-    /// `POST /council/v2/contexts`: builds `context` and holds its
-    /// snapshots, or, with `dry_run`, reports what a build would reuse
-    /// without feeding. A context with no room is [`MkError::ContextFull`].
-    pub async fn build_context(&self, context: &Context, dry_run: bool) -> Result<ContextBuilt, MkError> {
+    /// `POST /council/v2/contexts`: builds `context` on the served model
+    /// `model` and holds its snapshots, or, with `dry_run`, reports what a
+    /// build would reuse without feeding. A context with no room is
+    /// [`MkError::ContextFull`].
+    pub async fn build_context(&self, model: &str, context: &Context, dry_run: bool) -> Result<ContextBuilt, MkError> {
         context.check()?;
-        let body = ContextBuild { context: context.clone(), dry_run: dry_run.then_some(true) };
+        let body = ContextBuild { model: Some(model.to_string()), context: context.clone(), dry_run: dry_run.then_some(true), class: None, priority: None };
         self.mk
             .json(Family::Council, Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.mk.timeout, 200, "context build")
             .await
@@ -197,7 +198,7 @@ mod tests {
     use gogi_fake::{Config, Server};
     use gogi_proto::generation::{ReplyToolCall, Sample};
     use gogi_proto::spec::{parse_spec, SpecRules};
-    use gogi_proto::{Message, Tier};
+    use gogi_proto::{ErrorType, Message, Tier};
     use serde_json::json;
 
     use super::*;
@@ -217,13 +218,19 @@ mod tests {
         Context { messages: vec![Message::system("s"), Message::user("how did it go?").snapped()], ..Context::default() }
     }
 
+    /// The fake's one served model.
+    const TOY: &str = "gogi-toy-1";
+
     fn greedy(context: Context) -> GenerationRequest {
         GenerationRequest {
+            model: Some(TOY.to_string()),
             context,
             max_tokens: Some(24),
             sample: Some(Sample { temperature: Some(0.0), ..Sample::default() }),
             stream: None,
             decisions: Vec::new(),
+            class: None,
+            priority: None,
         }
     }
 
@@ -238,8 +245,10 @@ mod tests {
     async fn the_fake_reports_its_identity() {
         let (_server, c) = fake();
         let id = c.council().identity().await.unwrap();
-        assert!(id.has(gogi_proto::identity::Capability::Generate) && id.has(gogi_proto::identity::Capability::Pins));
-        assert!(id.limits.context_tokens > 0);
+        assert!(id.has(gogi_proto::identity::Capability::Pins));
+        let toy = id.route(None).unwrap();
+        assert_eq!(toy.model, TOY);
+        assert!(toy.has(gogi_proto::identity::Capability::Generate) && toy.limits.context_tokens > 0);
     }
 
     /// The second build of the same context reuses the first one's
@@ -247,14 +256,27 @@ mod tests {
     #[tokio::test]
     async fn a_second_build_feeds_nothing() {
         let (_server, c) = fake();
-        let first = c.council().build_context(&chat(), false).await.unwrap();
+        let first = c.council().build_context(TOY, &chat(), false).await.unwrap();
         assert!(first.fed > 0 && first.from.is_none() && !first.dry_run);
-        let again = c.council().build_context(&chat(), false).await.unwrap();
+        let again = c.council().build_context(TOY, &chat(), false).await.unwrap();
         assert_eq!((again.fed, &again.head), (0, &first.head));
         let mut longer = chat();
         longer.messages.push(Message::assistant("fine").snapped());
-        let dry = c.council().build_context(&longer, true).await.unwrap();
+        let dry = c.council().build_context(TOY, &longer, true).await.unwrap();
         assert!(dry.dry_run && dry.kept == first.tokens && dry.fed > 0, "{dry:?}");
+    }
+
+    /// A served model that is not ready answers 503 `model_unavailable`
+    /// naming itself and its status, and the error keeps both.
+    #[tokio::test]
+    async fn a_model_that_is_not_ready_is_a_503_naming_it() {
+        let (server, c) = fake();
+        server.set_status(TOY, gogi_fake::ModelStatus::Loading).unwrap();
+        let err = c.council().build_context(TOY, &chat(), false).await.unwrap_err();
+        let MkError::Status { status: 503, error: Some(e), .. } = &err else { panic!("{err:?}") };
+        assert_eq!((e.r#type, e.model.as_deref(), e.status), (ErrorType::ModelUnavailable, Some(TOY), Some(gogi_fake::ModelStatus::Loading)));
+        server.set_status(TOY, gogi_fake::ModelStatus::Ready).unwrap();
+        c.council().build_context(TOY, &chat(), false).await.unwrap();
     }
 
     #[tokio::test]
@@ -265,7 +287,6 @@ mod tests {
         assert_eq!(held.spec_id.as_str(), spec.id());
         let again = c.council().get_spec(&held.spec_id).await.unwrap();
         assert_eq!(again.spec, spec.value);
-        assert_eq!(again.template, c.council().identity().await.unwrap().template);
     }
 
     /// A decision that sends its contexts whole comes back with reads named
@@ -277,6 +298,7 @@ mod tests {
         let mut other = chat();
         other.messages.push(Message::assistant("never push to main").snapped());
         let request = DecisionRequest {
+            model: Some(TOY.to_string()),
             state: json!("git push origin main"),
             spec_id: Some(held.spec_id.to_string()),
             contexts: vec![chat(), other],
@@ -293,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn pins_hold_list_and_drop() {
         let (_server, c) = fake();
-        let head = c.council().build_context(&chat(), false).await.unwrap().head;
+        let head = c.council().build_context(TOY, &chat(), false).await.unwrap().head;
         let put = c.council().put_pins("kernel 1", &PinsPut { snapshots: vec![head.to_string()], ttl_s: 60 }).await.unwrap();
         assert!(put.snapshots[0].held && put.expires_in_s.is_some());
         assert_eq!(c.council().get_pins("kernel 1").await.unwrap().snapshots, [head.to_string()]);
@@ -307,7 +329,15 @@ mod tests {
     #[tokio::test]
     async fn reads_return_one_read_per_context_and_suffix() {
         let (_server, c) = fake();
-        let request = ReadsRequest { contexts: vec![chat()], suffixes: vec!["a ".into(), "b ".into()], letters: vec!["A".into(), "B".into()], top: Some(3) };
+        let request = ReadsRequest {
+            model: Some(TOY.to_string()),
+            contexts: vec![chat()],
+            suffixes: vec!["a ".into(), "b ".into()],
+            letters: vec!["A".into(), "B".into()],
+            top: Some(3),
+            class: None,
+            priority: None,
+        };
         let r = c.council().reads(&request, Duration::from_secs(5)).await.unwrap();
         assert_eq!(r.reads.iter().map(|r| (r.context, r.suffix)).collect::<Vec<_>>(), [(0, 0), (0, 1)]);
         assert_eq!(r.reads[0].logprobs.keys().collect::<Vec<_>>(), ["A", "B"]);
@@ -336,7 +366,7 @@ mod tests {
         let mut next = chat();
         next.messages.push(done.as_message().expect("the reply made no unparsed call"));
         next.messages.push(Message::user("and then?"));
-        let built = c.council().build_context(&next, false).await.unwrap();
+        let built = c.council().build_context(TOY, &next, false).await.unwrap();
         assert!(built.kept > done.usage.prompt, "{built:?} after {:?}", done.usage);
     }
 
@@ -353,7 +383,7 @@ mod tests {
         let mut next = context;
         next.messages.push(done.as_message().unwrap());
         next.messages.push(Message::tool(id.clone(), "a b c"));
-        c.council().build_context(&next, false).await.unwrap();
+        c.council().build_context(TOY, &next, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -361,8 +391,8 @@ mod tests {
         let (base, seen) = serve(vec![]).await;
         let c = client(&base);
         let user_reasoning = Context { messages: vec![Message { reasoning: Some("r".into()), ..Message::user("u") }], ..Context::default() };
-        assert!(matches!(c.council().build_context(&user_reasoning, false).await, Err(MkError::Request(_))));
-        assert!(matches!(c.council().build_context(&Context::default(), false).await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().build_context(TOY, &user_reasoning, false).await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().build_context(TOY, &Context::default(), false).await, Err(MkError::Request(_))));
         assert!(matches!(c.council().get_pins("a/b").await, Err(MkError::Request(_))));
         let forever = PinsPut { snapshots: vec![], ttl_s: 86_401 };
         assert!(matches!(c.council().put_pins("k", &forever).await, Err(MkError::Request(_))));

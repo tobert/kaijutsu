@@ -34,6 +34,8 @@ use crate::kernel_db::{ContextRow, KernelDbError, KernelDbResult};
 use crate::kj::gate::{GateOutcome, GateSpec, GateVerdict};
 use crate::kj::gate_policy::GateConfigLoad;
 
+use super::gate::SlotServer;
+
 /// The context_type, and the cast slot role, of a judge shadow.
 pub(crate) const JUDGE: &str = "judge";
 
@@ -70,8 +72,9 @@ pub(crate) struct JudgeRead {
     seat_name: String,
     shadow: ContextId,
     call: BlockId,
-    /// The judge's council server, or why its `mk` backend names none.
-    server: Result<String, String>,
+    /// The judge's council server and served model, or why its `mk`
+    /// backend names none.
+    server: Result<SlotServer, String>,
 }
 
 /// A seat's judge shadow and where its model is served.
@@ -81,9 +84,9 @@ struct Judge {
     seat_name: String,
     seat_type: String,
     /// The council server that holds the shadow: the `judge` slot's backend
-    /// address when its kind is `mk`, or why that backend names none.
-    /// `None` for a chat backend.
-    server: Option<Result<String, String>>,
+    /// address and model when its kind is `mk`, or why that backend names
+    /// none. `None` for a chat backend.
+    server: Option<Result<SlotServer, String>>,
 }
 
 /// Appends the call `spec` describes to the judge shadow of `seat`, creating
@@ -134,7 +137,7 @@ pub(crate) async fn record_call(
 /// under the seat's shell spec from `gate.toml`; a seat whose type has no
 /// council there is not primed.
 fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLoad) {
-    let Some(Ok(server)) = judge.server.clone() else { return };
+    let Some(Ok(SlotServer { server, model })) = judge.server.clone() else { return };
     let spec_name = config
         .as_ref()
         .ok()
@@ -150,7 +153,7 @@ fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLo
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + super::sync::SHADOW_PRIME_TIMEOUT;
         let waits = crate::llm::endpoint::SlotWaits::default();
-        match kernel.council_sync().prime_shadow(&kernel, &server, &spec_name, shadow, &seat_name, deadline, &waits).await {
+        match kernel.council_sync().prime_shadow(&kernel, &server, Some(&model), &spec_name, shadow, &seat_name, deadline, &waits).await {
             Ok((_, head)) => tracing::info!(
                 target: "kaijutsu::council",
                 %shadow, %server, head = %head, elapsed_ms = started.elapsed().as_millis() as u64,
@@ -251,13 +254,14 @@ async fn judge_one(
         judged
     };
     let server = match &read.server {
-        Ok(server) => server.clone(),
+        Ok(slot) => slot.clone(),
         Err(why) => return miss(judged, format!("the seat's cast slot `{JUDGE}` names {why}")),
     };
     let Some(spec) = spec else {
         return miss(judged, "gate.toml declares no council shell spec for the seat's type".into());
     };
-    council.server = server.clone();
+    council.server = server.server.clone();
+    council.model = Some(server.model.clone());
     council.deadline_ms = JUDGE_DEADLINE.as_millis() as u64;
     let deadline = tokio::time::Instant::now() + JUDGE_DEADLINE;
     let labels = judge_labels(&council, &spec);
@@ -268,7 +272,7 @@ async fn judge_one(
         Err(cause) => return miss(judged, cause),
     };
     let primed =
-        kernel.council_sync().prime_shadow(kernel, &server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
+        kernel.council_sync().prime_shadow(kernel, &server.server, Some(&server.model), &spec.name, read.shadow, &read.seat_name, deadline, &waits);
     let (shadow_seat, head) = match tokio::time::timeout_at(deadline, primed).await {
         Ok(Ok(primed)) => primed,
         Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
@@ -480,25 +484,26 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
 }
 
 /// The seat's judge slot: the cast it resolves through, and the council
-/// server the judge reads on, its backend's address when its kind is `mk`,
-/// or why that backend names none. `None` for the server is a chat
-/// backend, whose judge is not read yet. `None` overall: the seat's cast
-/// has no [`JUDGE`] slot.
+/// server and served model the judge reads on, its backend's address and
+/// the slot's model when its kind is `mk`, or why that backend names none.
+/// `None` for the server is a chat backend, whose judge is not read yet.
+/// `None` overall: the seat's cast has no [`JUDGE`] slot.
+#[allow(clippy::type_complexity)]
 fn judge_slot(
     db: &crate::kernel_db::KernelDb,
     seat: &ContextRow,
-) -> KernelDbResult<Option<(kaijutsu_types::CastId, Option<Result<String, String>>)>> {
-    let Some((cast_id, backend)) = super::gate::seat_slot_backend(db, seat, JUDGE)? else { return Ok(None) };
+) -> KernelDbResult<Option<(kaijutsu_types::CastId, Option<Result<SlotServer, String>>)>> {
+    let Some((cast_id, backend, model)) = super::gate::seat_slot_backend(db, seat, JUDGE)? else { return Ok(None) };
     let server = match backend.kind.as_str() {
-        "mk" => Some(super::gate::council_address(&backend)),
+        "mk" => Some(super::gate::council_address(&backend, &model)),
         _ => None,
     };
     Ok(Some((cast_id, server)))
 }
 
-/// The council server a seat's judge reads on, when its cast has a
-/// [`JUDGE`] slot on an `mk` backend with an address.
-pub(crate) fn judge_server(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbResult<Option<String>> {
+/// The council server and served model a seat's judge reads on, when its
+/// cast has a [`JUDGE`] slot on an `mk` backend with an address.
+pub(crate) fn judge_server(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbResult<Option<SlotServer>> {
     Ok(judge_slot(db, seat)?.and_then(|(_, server)| server).and_then(Result::ok))
 }
 
