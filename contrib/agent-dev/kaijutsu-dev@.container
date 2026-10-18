@@ -1,0 +1,53 @@
+# Rootless Podman Quadlet for one project's agent development kernel. The instance name is the project:
+#   cp contrib/agent-dev/kaijutsu-dev@.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload && systemctl --user start kaijutsu-dev@nagaya
+# bootstrap.sh prepares ~/kj-dev/<project>/ first. See docs/container.md, "Agent development container".
+[Unit]
+Description=Kaijutsu agent development kernel for %i
+
+[Container]
+Image=localhost/kaijutsu-agent-dev:latest
+ContainerName=kaijutsu-dev-%i
+# The host user is the same user inside, so files written in the project are the host user's.
+UserNS=keep-id
+# 28 CPUs of time at a lower weight than the host's own work. Pinning to cores 4-31 (--cpuset-cpus) needs the
+# cpuset controller, which systemd does not delegate to a user session by default.
+PodmanArgs=--init --group-add=keep-groups --cpus=28 --cpu-shares=512 --memory=64g --pids-limit=8192
+DropCapability=all
+NoNewPrivileges=true
+ReadOnly=true
+Tmpfs=/tmp:rw,nosuid,nodev,size=8g
+PublishPort=127.0.0.1:2224:2222
+
+# The GPU (ROCm). The devices are world-readable on the host.
+AddDevice=/dev/kfd
+AddDevice=/dev/dri
+
+# Kernel state, the seat's scratch repository, and the files shared with the supervisor.
+Volume=%h/kj-dev/%i/kernel-data:/var/lib/kaijutsu
+Volume=%h/kj-dev/%i/workspace:/workspace
+Volume=%h/kj-dev/%i/claude-workspace/exchange:/exchange
+Volume=%h/kj-dev/%i/cargo:%h/.cargo
+
+# Every source tree is readable at its host path; only the project is writable.
+Volume=%h/src:%h/src:ro
+Volume=%h/src/%i:%h/src/%i:rw
+
+# Private keys that live under ~/src stay out of reach.
+Volume=/dev/null:%h/src/old/automaton/github/id_rsa:ro
+Volume=/dev/null:%h/src/wringer/certs/key.pem:ro
+
+# Provider keys and kaibo's config, read-only, at the paths their configs name.
+Volume=%h/.deepseek-key:%h/.deepseek-key:ro
+Volume=%h/.anthropic-key.txt:%h/.anthropic-key.txt:ro
+Volume=%h/.crusoe-api-key.txt:%h/.crusoe-api-key.txt:ro
+Volume=%h/.config/kaibo:%h/.config/kaibo:ro
+
+Exec=--port 2222 --headless --rw-mount /workspace --rw-mount /exchange --rw-mount %h/src/%i
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

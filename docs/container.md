@@ -125,12 +125,40 @@ An HTTP MCP server on the host's tailnet address works from the container
 with default networking (pasta). The host's loopback and LAN addresses are
 refused from inside; use the tailnet name in `mcp.toml`.
 
-## Agent development container (planned)
+## Agent development container
 
-This section is a plan, not a shipped setup. One container holds one
+Built on zorak on 2026-10-18 for nagaya; "As built" below lists where it differs from the plan. One container holds one
 project's kernel and workspace. A DeepSeek coder seat works there with no
 asks. A Claude session outside supervises it over MCP. Each instance takes
 the project's name, written `<project>` below.
+
+### As built (2026-10-18, zorak, nagaya)
+
+The files are in `contrib/agent-dev/`: `build.sh` and `Containerfile` (the image), `kaijutsu-dev@.container` (a
+Quadlet template; the instance name is the project), `bootstrap.sh <project>` (the kernel), and the `rc/`
+overlay.
+
+- **Image.** `localhost/kaijutsu-agent-dev` builds on `localhost/arch-rocm` from `~/src/homelab-arch-containers`,
+  which holds zorak's exact package versions. Thus the host's release binaries of the kernel, its bridges and kaibo
+  run in it unchanged, and the build needs no network. The image label names the kaijutsu commit; `build.sh`
+  refuses a tree with uncommitted changes under `crates/` or `assets/`.
+- **Mounts.** `~/src` is read-only at its host path and `~/src/<project>` is read-write over it, so the project
+  repository is the seat's working tree and other projects are there to read. `/workspace` is a scratch
+  repository for small tasks. Two private keys under `~/src` are masked with `/dev/null`.
+- **Seats.** banto plays a `director` context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
+  supervising Claude session, which connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`). banto starts
+  coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.
+- **Gate.** Coders run with `uncovered = "allow"`. The `mcp` type does too, so the supervisor's `kj` verbs do not
+  wait on Amy. `root` allows `kj context create`, which MCP registration runs under Amy's root.
+- **CPU.** `--cpus=28 --cpu-shares=512`. Pinning (`--cpuset-cpus=4-31`) needs the `cpuset` controller, which
+  systemd does not delegate to a user session by default (`Delegate=` on `user@.service`, a root change).
+- **kaibo** runs from `~/src/kaibo` at release, with `--cast crusoe`. Its own config is the host's, read-only,
+  through `XDG_CONFIG_HOME`; the container's XDG paths point at kernel state.
+- **Git** in the container uses `GIT_CONFIG_GLOBAL` in kernel state, with the host user's name and email. The
+  host's gitconfig requires git-lfs, which the image lacks.
+- **Smoke test.** banto answered on Haiku and listed `/exchange/to-seat`. The coder got its `AGENTS.md` as house
+  rules (`S36-house-rules.kai`), saw `gfx1151` with `rocminfo`, wrote in the project, and was refused in another
+  repository under `~/src`.
 
 ### Shape
 

@@ -1,0 +1,26 @@
+# The agent development image: a Kaijutsu kernel, its bridges, and kaibo, on Arch with ROCm and build tools.
+# The base is localhost/arch-rocm from ~/src/homelab-arch-containers, at the host's exact package versions, so
+# binaries built on the host run here unchanged. build.sh stages them into the build context.
+ARG BASE=localhost/arch-rocm:latest
+FROM ${BASE}
+ARG USER_NAME
+ARG KAIJUTSU_COMMIT
+
+COPY kaijutsu-server kaijutsu-mcp kaijutsu-acp kaibo /usr/local/bin/
+
+# The kernel's state is a mount at /var/lib/kaijutsu. HOME stays the host user's home, so `~/src/...` paths in
+# project docs resolve to the read-only ~/src mount.
+ENV HOME=/home/${USER_NAME} \
+    XDG_CACHE_HOME=/var/lib/kaijutsu/cache \
+    XDG_CONFIG_HOME=/var/lib/kaijutsu/config \
+    XDG_DATA_HOME=/var/lib/kaijutsu/data \
+    XDG_STATE_HOME=/var/lib/kaijutsu/state \
+    XDG_RUNTIME_DIR=/tmp/kaijutsu-runtime \
+    GIT_CONFIG_GLOBAL=/var/lib/kaijutsu/gitconfig
+LABEL kaijutsu.commit="${KAIJUTSU_COMMIT}"
+
+USER ${USER_NAME}
+WORKDIR /workspace
+EXPOSE 2222
+ENTRYPOINT ["/usr/local/bin/kaijutsu-server"]
+CMD ["--port", "2222"]
