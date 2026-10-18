@@ -57,13 +57,19 @@ amounts of 日本語 (nihongo) mixed in. A person's
 own prompts may use any language. No stance branches on the model name;
 per-model specializations wait for comparative evidence.
 
-The kernel adds runtime facts, including the performing character and its
-assigned reviewer (stable IDs and names); rc supplies the instruction
+The kernel adds runtime facts in a `<situation>` block, including the performing
+character and the context's senpai (stable IDs and names):
+`<senpai context="<label>" id="<id>" character="<name>"/>`, beside the performer. The senpai
+replaces the old `<reviewer>` fact. The reviewer of the seat's own asks is the senpai's
+holder, or the climb past it; `kj senpai show` prints it. rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
 
 Director is the operator's seat. Its `S00-stance.kai` writes one line naming
-the system and the character recorded in `played_by` (below), then reads its
-companion. `S06-kj-help.kai` reads `S06-kj-help.md`: a short narrative of kj
+the system, the character recorded in `played_by` (below) and the senpai from the kernel
+fact, then reads its companion, which says "our senpai". Persona text belongs to the
+character that plays the seat, not to the context type. To be decided in step 6: where
+the sheet stores it, and the new name of the `director` type, which predates characters
+(`docs/senpai-kohai.md`, follow-ups 6). Until then the persona stays in this file. `S06-kj-help.kai` reads `S06-kj-help.md`: a short narrative of kj
 (contexts, turns, forks, drift, asks) and the operator's most-used commands,
 each with when to use it. Verb detail stays in `kj <verb> --help`, run on
 demand. The stance and narrative together are about 4.5 KB; they replaced a
@@ -97,8 +103,8 @@ instructions or the `shell` tool description.
 The council type is a chat context for council guidance. Its own stance asks
 the model to think about submitted guidance and acknowledge it in one or two
 sentences. Its loadout grants compose input, capture, and editor access, with
-no model tools. Assign a live performer, a distinct reviewer, and a model
-before chatting. Finished thinking and replies become council guidance;
+no model tools. Assign a live performer (whose senpai's holder is a distinct,
+live character) and cast a character with a model before chatting. Finished thinking and replies become council guidance;
 see `docs/council.md`, "Council contexts are kaijutsu contexts".
 
 The judge type is a seat's shadow: the kernel creates it, runs its `create`
@@ -110,7 +116,7 @@ The executable filename controls order. Default handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a
 spine branch that interprets.
 
-`kj context create --type <type>` refuses before committing a row when
+`kj kohai create --type <type>` refuses before committing a row when
 `<type>`'s `create` bucket (`/config/rc/<type>/create`) is missing or holds no
 runnable `.kai` script — naming the type, the expected bucket path, and `rc
 reseed` as the fix. A missing or empty bucket for any other verb (`fork`,
@@ -182,13 +188,12 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 
-`kj context create banto --type director --cast ops --as banto` records
+`kj kohai create banto --type director --as banto` records
 Banto's principal in `played_by`, while `created_by` remains the requester.
 The character must exist and be live; unknown or retired names fail before
 creating a context. Omitting `--as` leaves `played_by` unset on this `kj` path.
-The caller's acting character becomes its director. The reviewer follows
-explicit context assignment, explicit director-wide delegation, then the walk
-up `forked_from` (`docs/approval-identity.md`). Model output and tools use the performer;
+The caller's context becomes its senpai, and the reviewer follows that edge
+(`docs/approval-identity.md`). Model output and tools use the performer;
 the model turn refuses missing or self-reviewing identities. This does not
 load a character rc bundle. See `docs/character.md`, "Current implementation".
 
@@ -267,7 +272,7 @@ characters and says so. Measured on this repository it is about 2000
 characters; a two-file directory is about 350.
 
 Every client that knows its working directory must create the context with
-`kj context create --cwd`, so the create lifecycle runs there. ACP
+`kj kohai create --cwd`, so the create lifecycle runs there. ACP
 `session/new` does, and refuses a directory the kernel cannot see. The tui
 (`--context` naming a new label) and kaijutsu-mcp (`register_session`) pass
 their own directory through `ActorHandle::create_context_in_client_cwd`: the
@@ -294,12 +299,12 @@ and the handoff block carries the command. Rotating a cold seat therefore
 needs no turn from it. In the TUI, `Ctrl+A r` prefills `kj context rotate `
 and follows the successor. Rotation never prompts: the successor runs
 `create` rc and waits for its first prompt. When the predecessor left no
-note, the successor still has the predecessor excerpt below, and a director
+note, the successor still has the predecessor excerpt below, and a senpai
 may read the archived seat's blocks.
 
 `kj context rotate` creates a successor from the predecessor's own parent. It
-copies the type, cast, performer, director, reviewer override, model, system
-prompt, workspace, env, and cwd, sets `ROTATED_FROM` to the
+copies the type, performer, senpai, system prompt, workspace, env, and cwd,
+moves the predecessor's kohai to itself, sets `ROTATED_FROM` to the
 predecessor's id, and runs the `create` lifecycle. The hydration window is not
 copied; a musician's create lifecycle sets its own. When the successor has a
 usable loadout, the predecessor's `archive` lifecycle runs, then one
@@ -307,14 +312,14 @@ transaction archives the predecessor and gives the
 successor its label, ring seat, and any character's `root_ctx` pointer. When
 it has none, the predecessor stays live, and the error names the unlabeled
 successor so you can read its Error blocks and remove it. The character that
-plays the context or its lineage root may rotate it. A root context rotates
+plays the context, the holder of its senpai, or its lineage root may rotate it. A root context rotates
 the same way.
 
-Rotation copies a pinned model, not a resolved one. A context with no
-`provider` and `model` of its own resolves the cast or the global default each
-time, and so does its successor. Pin one with
-`kj context set banto --model tenchi/qwen3.8-27b`; every later successor keeps
-it. A context made with `kj context create` starts unpinned.
+A context's model is its performer's cast slot for the context's type, so a
+successor with the same performer runs the same model. To run another model,
+cast a character whose cast has it. (Today a context can still pin its own model
+with `kj context set`; step 5 of `docs/senpai-kohai.md` removes that override
+once each turn records its model.)
 
 `ROTATED_FROM` names the predecessor. `S17-predecessor.kai` reads
 up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes
@@ -460,7 +465,7 @@ durable user block, the way `drift` fires after a drift block lands
 anything a script writes is durable before `submitInput` returns.
 
 A submit either commits or fails with nothing changed (`prompt::submit`).
-A context with no performer or no reviewer is refused before the draft
+A context with no performer, or whose senpai has no live holder, is refused before the draft
 commits, so the draft stays as typed. Once the input commits, `submitInput`
 returns its block; a turn that then fails to start is recorded once in the
 transcript and published as a turn failure, not returned as a submit error.
@@ -489,7 +494,7 @@ conversation than the log tail. See `docs/prompts.md`, "The submit verb" for the
 ## Migration and comparison
 
 Deploy the `--as` implementation and metadata-reading director/handoff scripts
-together. A kernel that lacks the flag cannot create the intended performer
+together, and the `kj kohai` verbs with the rc and contrib scripts that call them. A kernel that lacks the flag cannot create the intended performer
 relationship. Replace contexts using the old `KJ_CHARACTER` bridge with verified
 successors as described above; changing the seed does not rewrite their stored
 instructions or assign their performer retroactively.

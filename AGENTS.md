@@ -80,22 +80,24 @@ character.
 
 We keep requester, performer, context type, and cast distinct. `created_by`
 names the requester who created a context; `played_by` records its performer
-when set. A `context_type` selects the role's rc bundle; a cast selects models
-for roles. `kj context create --as <character>` sets the performer explicitly;
-omitting it leaves the performer unset on this path. Model turns require a
-live performer and a distinct reviewer. Provider output and tools carry the
-performer; the connection keeps its own identity.
-`kj context set <context> --as <character> --reviewer <director>` assigns
-them; the reviewer controls reassignment, and the creator makes an initial
-assignment when no reviewer is set. See `docs/approval-identity.md`.
-Composition with character rc remains planned. A sheet's default cast is
-used by contexts the character plays that have no cast of their own.
-Accountable-to, rc directory, and memory root are planned sheet fields.
-See `docs/character.md`, "Current implementation" and "Rollout, smallest
-first".
+when set. A `context_type` selects the seat's rc bundle and gate tier; a cast
+selects models for types, and a context's model is its performer's cast slot
+for its type. `kj kohai create --as <character>` sets the performer
+explicitly; omitting it leaves the performer unset on this path. Every working
+context has one **senpai** context (`kj senpai show`), and its asks, reports and
+escalations go to the holder of that senpai; the holder of the senpai, or the
+lineage root, casts, moves, rotates and archives it. Model turns require a live
+performer and a distinct reviewer. Provider output and tools carry the
+performer; the connection keeps its own identity. `forked_from` is provenance
+only. There is no reviewer override and no delegation. See
+`docs/senpai-kohai.md` and `docs/approval-identity.md`.
+Composition with character rc remains planned. Rc directory and memory root
+are planned sheet fields. Persona text moves onto the character in the
+senpai/kohai stack (step 6); see `docs/character.md`, "Current implementation"
+and "Rollout, smallest first".
 
-Banto uses the existing `director` type and plays the head clerk of the house.
-Its context is created with `--as banto`; director instructions and handoff
+Banto is a character that plays the `director` type, which is reworked in that
+stack. Its context is created with `--as banto`; director instructions and handoff
 injection read the performer metadata. The old `KJ_CHARACTER` environment
 bridge did not set identity and is no longer read by the shipped scripts.
 `kj context rotate` replaces a seat and sets `ROTATED_FROM`, which loads
