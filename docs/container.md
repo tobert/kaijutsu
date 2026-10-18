@@ -150,8 +150,10 @@ overlay.
   coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.
 - **Gate.** Coders run with `uncovered = "allow"`. The `mcp` type does too, so the supervisor's `kj` verbs do not
   wait on Amy. `root` allows `kj context create`, which MCP registration runs under Amy's root.
-- **CPU.** `--cpus=28 --cpu-shares=512`. Pinning (`--cpuset-cpus=4-31`) needs the `cpuset` controller, which
-  systemd does not delegate to a user session by default (`Delegate=` on `user@.service`, a root change).
+- **CPU.** `--cpuset-cpus=4-31 --cpu-shares=512`, so cores 0-3 stay free for the host. Pinning needs the `cpuset`
+  controller, which systemd does not delegate to a user session by default. On zorak,
+  `/etc/systemd/system/user@.service.d/delegate.conf` sets `Delegate=cpu cpuset io memory pids`; it took effect
+  after `systemctl daemon-reload`, with no new login.
 - **kaibo** runs from `~/src/kaibo` at release, with `--cast crusoe`. Its own config is the host's, read-only,
   through `XDG_CONFIG_HOME`; the container's XDG paths point at kernel state.
 - **Git** in the container uses `GIT_CONFIG_GLOBAL` in kernel state, with the host user's name and email. The

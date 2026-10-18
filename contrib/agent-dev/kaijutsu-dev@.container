@@ -10,9 +10,9 @@ Image=localhost/kaijutsu-agent-dev:latest
 ContainerName=kaijutsu-dev-%i
 # The host user is the same user inside, so files written in the project are the host user's.
 UserNS=keep-id
-# 28 CPUs of time at a lower weight than the host's own work. Pinning to cores 4-31 (--cpuset-cpus) needs the
-# cpuset controller, which systemd does not delegate to a user session by default.
-PodmanArgs=--init --group-add=keep-groups --cpus=28 --cpu-shares=512 --memory=64g --pids-limit=8192
+# Cores 0-3 stay free for the host's housekeeping. Pinning needs the cpuset controller delegated to the user
+# session: Delegate=cpu cpuset io memory pids in /etc/systemd/system/user@.service.d/delegate.conf (root).
+PodmanArgs=--init --group-add=keep-groups --cpuset-cpus=4-31 --cpu-shares=512 --memory=64g --pids-limit=8192
 DropCapability=all
 NoNewPrivileges=true
 ReadOnly=true
