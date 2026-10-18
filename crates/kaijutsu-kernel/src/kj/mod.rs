@@ -474,6 +474,11 @@ impl KjDispatcher {
 
         let cmd = argv[0].as_str();
 
+        // Handlers whose futures exceed 8 KB are awaited through their own
+        // boxed async block: an unoptimized build gives every awaited
+        // handler future a slot in this frame, and `dispatch` is re-entered
+        // from rc scripts, so the slots would stack up on a 2 MB thread.
+        // `dispatch_future_stays_small` pins the sizes.
         // Commands that don't strictly require an active context
         if cmd == "help" || cmd == "--help" || cmd == "-h" {
             return KjResult::ok_ephemeral(self.help_for(caller), ContentType::Markdown);
@@ -514,7 +519,7 @@ impl KjDispatcher {
 
         // Most context/workspace/preset subcommands work without an active context
         if cmd == "context" || cmd == "ctx" {
-            return self.dispatch_context(&argv[1..], caller).await;
+            return Box::pin(async { self.dispatch_context(&argv[1..], caller).await }).await;
         }
         if cmd == "workspace" || cmd == "ws" {
             return self.dispatch_workspace(&argv[1..], caller);
@@ -538,7 +543,7 @@ impl KjDispatcher {
         // `kj character` addresses the sheet table by name, never a
         // context — same exemption rationale as `kj cast`/`kj backend`.
         if cmd == "character" {
-            return self.dispatch_character(&argv[1..], caller).await;
+            return Box::pin(async { self.dispatch_character(&argv[1..], caller).await }).await;
         }
         // `kj handoff` addresses a character's log by name, never a
         // context — same exemption rationale as `kj character`.
@@ -575,7 +580,7 @@ impl KjDispatcher {
         // `send` additionally blocks on the approval ledger (`kj/gate.rs`),
         // hence the async dispatch.
         if cmd == "cc" {
-            return self.dispatch_cc(&argv[1..], caller).await;
+            return Box::pin(async { self.dispatch_cc(&argv[1..], caller).await }).await;
         }
         // `kj ledger` answers approval-ledger asks — it reads the kernel
         // DB, not a context, and a human must be able to reach it from a
@@ -641,7 +646,7 @@ impl KjDispatcher {
         // servers from mcp.toml), not scoped to any context — same
         // exemption rationale as `kj policy`/`kj config`.
         if cmd == "mcp" {
-            return self.dispatch_mcp(&argv[1..], caller).await;
+            return Box::pin(async { self.dispatch_mcp(&argv[1..], caller).await }).await;
         }
         // `kj hook` administers the broker's hook tables directly
         // (`Broker::persist_hook_insert`/`persist_hook_delete` + the
@@ -669,7 +674,7 @@ impl KjDispatcher {
         // `kj context switch`, the user need not have an active context
         // to attach to one.
         if cmd == "attach" {
-            return self.dispatch_attach(&argv[1..], caller).await;
+            return Box::pin(async { self.dispatch_attach(&argv[1..], caller).await }).await;
         }
         // `kj transport <play|pause|stop|tempo|ooda>` controls a context's beat.
         // Exempt from the active-context gate so `--context <ref>` works from a
@@ -701,13 +706,13 @@ impl KjDispatcher {
         }
 
         match cmd {
-            "fork" => self.dispatch_fork(&argv[1..], caller).await,
+            "fork" => Box::pin(async { self.dispatch_fork(&argv[1..], caller).await }).await,
             "drive" => self.dispatch_drive(&argv[1..], caller).await,
             "system" => self.dispatch_system(&argv[1..], caller).await,
             "wait" => self.dispatch_wait(&argv[1..], caller).await,
             "interrupt" => self.dispatch_interrupt(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
-            "drift" => self.dispatch_drift(&argv[1..], caller).await,
+            "drift" => Box::pin(async { self.dispatch_drift(&argv[1..], caller).await }).await,
             "cache" => self.dispatch_cache(&argv[1..], caller),
             "council" => self.dispatch_council(&argv[1..], caller).await,
             other => KjResult::Err(format!(
@@ -2214,6 +2219,34 @@ mod destroy_latches_at_dispatch_tests {
             "{} Destroy clause(s) did not latch unconfirmed (a handler ran):\n{}",
             failed.len(),
             failed.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_size_tests {
+    //! `dispatch` is re-entered from rc scripts through kaish, so its frame
+    //! repeats on one thread's stack (2 MB for a test thread or a tokio
+    //! worker).
+
+    use super::test_helpers::*;
+
+    /// Bound on the `dispatch` future. When this trips, await the new large
+    /// handler through `Box::pin(async { ... })` as `dispatch` does for
+    /// `context` and `fork`, instead of raising the bound.
+    const DISPATCH_FUTURE_MAX_BYTES: usize = 8 * 1024;
+
+    #[tokio::test]
+    async fn dispatch_future_stays_small() {
+        let d = test_dispatcher().await;
+        let caller = test_caller();
+        let argv: Vec<String> = Vec::new();
+        let future = d.dispatch(&argv, &caller);
+        let size = std::mem::size_of_val(&future);
+        assert!(
+            size <= DISPATCH_FUTURE_MAX_BYTES,
+            "the kj dispatch future is {size} bytes, over {DISPATCH_FUTURE_MAX_BYTES}; \
+             await the new large handler through Box::pin(async {{ ... }}) in dispatch"
         );
     }
 }
