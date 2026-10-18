@@ -1,8 +1,9 @@
 # Character — the persistent someone a name resolves to
 
-> Design + rollout plan, 2026-09-05, revised 2026-09-06.
+> Design + rollout plan, 2026-09-05, revised 2026-10-18 for senpai/kohai.
 > **Slices 0a–4 are built; slices 5–8 remain planned.**
-> Read "Current implementation" first; historical line references need rechecking.
+> The review-routing, persona and cast parts describe the system once
+> `docs/senpai-kohai.md` lands (steps 1-7 of that branch).
 > Amy's statements are guidance, not rulings.
 
 ## Current implementation
@@ -11,32 +12,31 @@ Read this section for current behavior; the design below also describes work
 that has not shipped. `AGENTS.md` links here so the roadmap does not become
 an instruction to use nonexistent features.
 
-| Part | Implemented contract |
+| Part | Contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, and `root_ctx`; `kj character create [--root]\|list\|show\|set --root\|--no-root\|retire` |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, and an optional default cast; `kj character create [--root]\|list\|show\|set --root\|--no-root\|--cast\|retire`. Persona text moves onto the sheet in step 6 |
 | Bootstrap | `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
-| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
+| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no senpai. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Performer | `kj context create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
-| Client creation | There is no create RPC. A client runs `kj context create` through `executeKj` from an existing context, which becomes the parent. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer, except a root character, which cannot be cast |
-| Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`. There is no configured default. An exhausted walk is a self-confirmation for a live root character and an error for anyone else. The lineage root, the root character at the top of a context's `forked_from` chain, controls its reviewer and director overrides; any live root grants and revokes delegation. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
+| Performer | `kj kohai create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, the performer is unset. Fork copies it. `kj context set <ctx> --as <character>` recasts, for the holder of the context's senpai or its lineage root |
+| Client creation | There is no create RPC. A client runs `kj kohai create` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. MCP session registration records the credential character as performer, except a root character, which cannot be cast |
+| Senpai edge | Every working context has one senpai context (`contexts.senpai_ctx`); the holder of the senpai reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
-| Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation whose reviewer IS its performer. See `docs/approval-identity.md` |
-| Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts that character directs. See `docs/approval-identity.md`, "Standing rules for a character" |
-| Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired character responsible for an ancestor context refuses reviewer resolution below it, by name |
+| Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation at a root context. See `docs/approval-identity.md` |
+| Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj kohai create` only on contexts whose senpai that character holds. See `docs/approval-identity.md`, "Standing rules for a character" |
+| Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired holder of a senpai context refuses reviewer resolution below it, by name |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
-| Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
-| Rotation | `kj context rotate [<context>]` creates a successor from the predecessor's parent that copies its configuration, env, and cwd, sets `ROTATED_FROM` to the predecessor's id, and runs `create` rc. Only a successor with a loadout takes over: the predecessor's `archive` rc runs, then one transaction archives the predecessor and moves its label, ring seat, and any `root_ctx` pointer. The performer or the lineage root may rotate. See `docs/prompts.md`, "Rotating a context" |
-| Accountability | A relation between contexts: `forked_from`, set by fork and by `kj context create` from inside a context; the responsible character is the performer, or the director when unset. Reviewer resolution and `kj ledger escalate` both walk it (`KernelDb::responsible_character_above`; `docs/approval-identity.md`). The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
+| Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer and the senpai from context metadata |
+| Rotation | `kj context rotate [<context>]` creates a successor from the predecessor's parent that copies its configuration, env, and cwd, keeps its senpai, sets `ROTATED_FROM` to the predecessor's id, and runs `create` rc. Only a successor with a loadout takes over: the predecessor's `archive` rc runs, then one transaction archives the predecessor and moves its label, ring seat, its kohai, and any `root_ctx` pointer. The performer, the holder of its senpai, or the lineage root may rotate. See `docs/prompts.md`, "Rotating a context" |
+| Accountability | The senpai edge, not `forked_from`. `forked_from` is provenance only; fork sets the fork's senpai to the forking context. The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
 
-Sources: `kernel_db.rs::CharacterRow`, `kernel_db.rs::effective_approval_reviewer`,
-`kj/context.rs::context_create`,
-`kj/character.rs`, `kj/handoff.rs`, `rc/mod.rs::load_scripts` in
-`crates/kaijutsu-kernel/src/`; `crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
+Sources: `kernel_db.rs::CharacterRow`, `kj/context.rs`, `kj/character.rs`, `kj/handoff.rs`,
+`rc/mod.rs::load_scripts` in `crates/kaijutsu-kernel/src/`;
+`crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
 `assets/defaults/rc/director/create/S00-stance.kai` and
 `assets/defaults/rc/lib/create/S16-handoff.kai`.
 
-Banto is a character using the `director` context type. It does not need a new
+Banto is a character that plays the `director` context type. It does not need a new
 type to have its own identity and handoff. `KJ_CHARACTER` was a temporary rc
 name/handoff selector; it never set `played_by`. New instructions read performer
 metadata instead. Existing contexts that used the bridge remain unassigned:
@@ -50,6 +50,20 @@ scheduled janitor/proctor work (slice 8). The sheet still has no
 is a context, not a transport track. Requester and performer remain separate;
 setting `played_by` changes subsequent model invocation and output attribution;
 it never changes credentials or rewrites existing asks and block authors.
+
+### What moves on this branch
+
+`docs/senpai-kohai.md` lands as one stack. After it:
+
+- **Persona lives on the character** (step 6). The sheet carries the persona text, and the context type says only
+  what the seat does. The `director` type, which predates characters, is reworked or replaced, and its persona
+  file (`S00-stance`) moves to the character that plays the seat.
+  To be decided in step 6: how the sheet stores the persona (a column, or a context or directory the sheet points
+  at, as the "pointers, not content" rule below prefers) and the new name of the `director` type.
+- **No cast on the context** (step 5). A context's model is its performer's cast slot for the context's type.
+  To run another model, cast a character whose cast has it. Each turn writes a durable record (turn id, context,
+  performer, cast, role, provider, model, token counts), so the model of any past turn is traceable.
+- **The gate has its own cast** (step 7). The reserved `gate` role leaves `cast_slots`.
 
 ## The problem, in one paragraph
 
@@ -95,21 +109,21 @@ Two things follow, and they are the ones to check a change against:
   Opaque UUIDv7 id in records and `.data`; given name in the UI and as the
   drift address. The word fits the cast vocabulary kaijutsu already uses: a
   character is what an actor is cast *as*, and a context is one performance.
-- **A character has a default cast.** A gig may pin another. Built: `kj
-  character set <name> --cast <cast>` (`--no-cast` clears it), shown by `kj
-  character show`. A context with no cast of its own resolves its models
-  through its performer's default cast, so the order is the context's
-  model, the context's cast, the performer's default cast, then the
-  registry default (`KernelDb::effective_cast`, `model_resolution.rs`).
-  `kj context create --cast` pins another. One cast covers every type a
-  character plays, since a cast holds one slot per role; a `judge` slot
-  gives the seats it plays a judge shadow (`docs/council.md`, "Shadow
-  context"), and a `gate` slot names the council server their gate
-  decisions run on (`docs/council.md`, "Configuration").
+- **A character has a cast.** Built: `kj character set <name> --cast <cast>`
+  (`--no-cast` clears it), shown by `kj character show`. A context's model
+  comes from its performer's cast slot for the context's type (the slot is
+  named by the type string). One cast covers every type a character plays,
+  since a cast holds one slot per type; a `judge` slot gives the seats it plays
+  a judge shadow (`docs/council.md`, "Shadow context"). Today a context may
+  also carry its own cast or a provider/model override, which wins over the
+  performer's cast (`KernelDb::effective_cast`, `model_resolution.rs`); step 5
+  of `docs/senpai-kohai.md` removes both once each turn records its model.
+  The reserved `gate` slot, which names the council server a seat's gate
+  decisions run on (`docs/council.md`, "Configuration"), moves to the gate's
+  own cast in step 7.
 - **Accountability replaces any group concept.** Every model character
-  answers to a character above it; a human is a root. No party. Superseded
-  in shape by "Roots and rotation": the relation is between contexts, not
-  between sheets.
+  answers to a character above it; a human is a root. No party. The relation is
+  between contexts, not between sheets: see "Roots and rotation".
 - **rc is a union.** A context runs its `context_type` rc and its
   character's rc, merged by the `SXX-name` ordering rc already sorts on. A
   character script chooses what comes through per type in kaish code.
@@ -127,22 +141,21 @@ Two things follow, and they are the ones to check a change against:
   availability field.
 - **Kaijutsu stays bespoke** for Amy and the fleet. Open source, so who knows.
 
-## Roots and rotation (guidance, Amy, 2026-09-15)
+## Roots and rotation (guidance, Amy, 2026-09-15; senpai edge 2026-10-18)
 
 - **Accountability is a relation between performances, not between
-  sheets.** A context is accountable to the context it was forked or
-  created from: `forked_from` on the context row, set by `kj fork` and by
-  `kj context create` run from inside a context. The character responsible
-  for a context is its performer, or its director when no performer is
-  set. So a coder lane banto creates is accountable to that banto seat, not
-  to "banto" in general, and two bantos never collide. There is no
+  sheets.** A context answers to its **senpai**, another context
+  (`contexts.senpai_ctx`); the character that holds that context reviews its
+  work. A coder lane banto creates answers to that banto seat, not to
+  "banto" in general, and two bantos never collide. There is no
   `accountable_to` on the character sheet; Amy: "accountable_to is a
   relation at runtime, so if banto forks a coder, that coder is accountable
-  to the precise banto that forked it, not any banto."
-- **A root context has no `forked_from`.** A root character's console is a
-  root of the forest, and `kj context create` always names a parent
-  (`docs/fork-and-create.md`, "Where a created context sits"). Its
-  responsible character is a root character.
+  to the precise banto that forked it, not any banto." The edge, its
+  routing, and the one authority rule are in `docs/senpai-kohai.md` and
+  `docs/approval-identity.md`. `forked_from` is provenance only.
+- **A root context has no senpai.** A root character's console is a
+  root of the forest. `kj kohai create` always has a senpai: the caller's
+  context, or the `--senpai` it has authority over. A root confirms itself.
 - **A root character has no model.** The sheet carries a `root` flag set at
   create; a root has no cast and turn identity refuses it as a performer. A
   root is a place with hands on it: Amy fools around there, and during
@@ -156,58 +169,43 @@ Two things follow, and they are the ones to check a change against:
 - **Rotation replaces a context, not a character.** Amy, 2026-09-17:
   rotate a context, and move a character's `root_ctx` pointer only when it
   named that context. The successor is created from the predecessor's own
-  parent, copies its whole configuration including env, sets
-  `ROTATED_FROM`, and takes the label, ring seat, and pointer as the
-  predecessor archives. The label follows the live holder. A root rotates
-  too, when its history goes stale; a root confirms itself, so no one else
-  is asked. The performer or the lineage root may rotate.
+  parent, copies its whole configuration including env, keeps its senpai,
+  sets `ROTATED_FROM`, and takes the label, ring seat, pointer, and the
+  predecessor's kohai as the predecessor archives. The label follows the live
+  holder. A root rotates too, when its history goes stale; a root confirms
+  itself, so no one else is asked. The performer, the holder of its senpai,
+  or the lineage root may rotate.
 - **banto starts from `ROOT`.** Its home seat is created from the root
-  context, so its lineage, and its accountability, begin there. The seat
-  takes the character's name as its label. The old arrangement, where
-  `ROOT` named banto's director seat, ends: `ROOT` is Amy's, banto's seat
-  is `banto`.
-- **The reviewer is the nearest responsible character that is not the
-  actor.** Resolution takes the actor and the context: an explicit
-  override on the context, then the director's delegation, then the walk
-  up `forked_from` to the first context whose responsible character is
-  live and is not the actor. There is no configured default. The walk
-  starts at the context itself, which is how a context with no parent
-  still resolves through its own director. Archived ancestors are walked
-  through; what matters is who is responsible for them. When the walk
-  ends without finding anyone else and the actor is a live root
-  character, the actor is at its own root and the ask is a
-  **self-confirmation**: the row is raised with the actor as its reviewer,
-  the actor alone may answer it, and the ledger records the answer as a
-  self-confirmation. A non-root actor with nobody above it has no
-  reviewer, and the ask refuses. Every other ask has a reviewer who is not
-  its actor, so an ask nobody can answer cannot exist. Escalation runs the
-  same walk past the context that yielded the current reviewer, and
-  refuses at a root. See `docs/approval-identity.md`.
-- **A director casts its children.** `kj context set <ctx> --as <character>`
-  is allowed when the caller is the context's resolved reviewer, or when
-  the caller's actor directs the context, which a fork or create from the
-  caller's own context records. Casting is what makes the cast character
-  accountable to the caller there; no sheet relation is consulted. Roots
-  cannot be cast, since they have no model.
+  context, so its senpai is Amy's console. The seat takes the character's
+  name as its label. `ROOT` is Amy's, banto's seat is `banto`.
+- **The reviewer is the holder of the senpai, climbing past the actor.**
+  Resolution takes the actor and the context: the holder of the context's
+  senpai, or, when that holder is the actor, the holder of the senpai's
+  senpai, and so on. A root console self-confirms. There is no configured
+  default and no override. See `docs/approval-identity.md`, "Routing".
+- **The holder of the senpai casts its kohai.** `kj context set <ctx> --as
+  <character>` is allowed for the holder of the context's senpai and for its
+  lineage root. Casting is what makes the cast character accountable to the
+  caller there. Roots cannot be cast, since they have no model.
 - **A model rotates itself with `kj context rotate`.** Amy, 2026-09-17:
   the performer may rotate its own seat, so no ask is needed.
-  `kj context create --as` follows `set --as` instead: Operator and a live
-  character caller, who directs what it casts, with no ask.
+  `kj kohai create --as` follows the same shape: Operator and a live
+  character caller, with no ask.
 
 ### A session, inside kaijutsu
 
 How a day like 2026-09-15 runs once the pieces above exist. Amy gives
-prompts, banto directs lanes, and the lanes are contexts.
+prompts, banto supervises lanes, and the lanes are contexts.
 
 1. Amy sits in banto's seat, not `ROOT`. `ROOT` is where she runs `kj` by
    hand. She attaches the tui to `banto` and types; the draft is hers, submit
    authors a user block as amy, and the turn runs with banto as actor and amy
    as reviewer.
-2. banto creates lanes with `kj context create --type coder --as coder`,
+2. banto creates lanes with `kj kohai create --type coder --as coder`,
    each with a label, a territory, and a worktree under `~/src/wt/`.
 3. Lanes run as driven turns. banto drives and waits. A lane's gated
-   statement walks the chain to banto; banto's own, such as a commit, walks to
-   amy. Static allow tiers pass the routine ones; the rest reach Amy's asks
+   statement goes to banto, the holder of its senpai; banto's own, such as a
+   commit, goes to amy. Static allow tiers pass the routine ones; the rest reach Amy's asks
    pane.
 4. Review is a tool call: kaibo mounts as an MCP server in banto's loadout,
    and the review is a tool-result block in the seat, with a fix lane forked
@@ -527,8 +525,8 @@ inert one would deadlock the whole tree beneath it.
 label is the character's name, the character plays it, and it has no parent.
 The `root` rc bundle grants the operator authority (`admin`, `config-write`,
 `operator`, `exec`, the shell facades) and composes no instruction blocks.
-Seats a root starts, such as banto's, are created from it, so their lineage
-and accountability begin there.
+Seats a root starts, such as banto's, are created from it, so their senpai
+is the root context.
 
 **Roots are equal, and one is typical.** A second person joins through a
 root: `kj character create bob --root` creates bob and bob's root context,
@@ -558,7 +556,7 @@ So the server CLI is four verbs: `init`, `add-key --as`, `list-keys`, and
 ALTER TABLE contexts ADD COLUMN played_by BLOB;  -- principal_id; NULL = nobody (score ctx, file doc)
 ```
 
-Set explicitly with `kj context create --as <character>`; omitting it leaves
+Set explicitly with `kj kohai create --as <character>`; omitting it leaves
 `played_by` unset on the kj path. Fork copies it. Server client creation
 defaults to the creating principal's character, when present. Automatic
 inheritance from a calling model context remains a design question.
@@ -754,8 +752,8 @@ esac
 
 Type specializations compose the same way from the type side, with the
 symlink pattern rc already has (`docs/rc-on-disk.md`). **Directives do not
-compose up the accountability chain automatically.** A character script
-that wants its accountable character's stance reads it explicitly; a
+compose up the senpai chain automatically.** A character script
+that wants its senpai's stance reads it explicitly; a
 recursive merge would bring graph-ordering, cycle and provenance questions
 before the two-directory case has proven itself. rc output keeps its
 current author, the context's `created_by` (`rc/mod.rs`);
@@ -852,121 +850,45 @@ context states and can target a context other than the authorizing caller
 
 Each slice is independently shippable and leaves the tree green.
 
-0. **Terms and docs.** This file; Terms table rows; devlog chapter. Done
-   with this commit.
-0a. **Prework, no kernel code** (2026-09-05). **Landed; each item
-   re-verified 2026-09-06.** The `PrincipalId` consumer audit; one
-   `actor_principal` binding threaded through the turn path with no
-   behavior change (`llm_stream.rs:1404`, pinned by a source test at
-   `:4409` asserting exactly six provider-output sites); `--distill-model`
-   on pull and merge with the caller-versus-source refusal (`kj/mod.rs:757`);
-   push and pull on one resolver (`kj/drift.rs:316`, `:456`, `:582`); the
-   hook-listener `session.end` guard (`hook_listener.rs:232`); the roster's
-   periodic refresh wired into the server (`rpc.rs:2990`);
-   `KJ_CONTEXT_TYPE` seeded for rc (`rc/mod.rs`); and the bridge
-   identity above (`kaijutsu-mcp/src/main.rs:88–103`).
+0. **Terms and docs.** Done.
+0a. **Prework, no kernel code** (2026-09-05). Landed: the `PrincipalId` consumer audit, one
+   `actor_principal` binding threaded through the turn path, `--distill-model` on pull and
+   merge with the caller-versus-source refusal, push and pull on one resolver, the hook-listener
+   `session.end` guard, the roster's periodic refresh, `KJ_CONTEXT_TYPE` seeded for rc, and
+   the bridge identity above.
 1. **The sheet. Shipped 2026-09-06.** `characters` with its first four columns;
-   `contexts.played_by`, copied by fork; `kj character
-   create|list|show|retire`, where `create` mints the principal id and
-   `retire` concludes and archives every context the character plays;
-   optional `played_by` and the name in context metadata. No attribution
-   change — every block is stamped exactly as it is today. First rows by
-   hand: `amy` (the existing principal) and `kaijutsu-lead`.
-   Tests: NULL `played_by` preserves today's behavior; fork copies it;
-   retiring archives the live contexts and leaves blocks and their authors
-   intact; an unmapped character fails loudly.
-2. **The keyring melt. Shipped 2026-09-06; the migration ran on zorak
-   2026-09-07** after a full rehearsal on a snapshot: six principals became
-   six characters, `hajime` was seeded as a seventh, and no key binding
-   moved. Found while checking whether an unmigrated restart was safe: it
-   is not, and it does not announce itself, because `CREATE TABLE IF NOT
-   EXISTS` is a no-op against the old table and only a later principal
-   mint hits the legacy `NOT NULL username`. The server now refuses to
-   start on a pre-melt `auth.db` (`tests/auth_db_premelt_guard.rs`). The
-   `principals`/FK-cascade findings above are from this pass. `auth.db`
-   drops `username` and `display_name` and
-   gains `PRAGMA journal_mode = WAL`; `authenticate` returns a
-   `PrincipalId`; `Principal` loses its name fields; `add-key --as
-   <character>` binds, never mints, and refuses an already-bound
-   fingerprint without `--rebind`; `--nick`, `set-nick`,
-   `set_display_name`, `add_key_auto_principal` and
-   `import_authorized_keys` are removed; `kaijutsu-server list-characters`
-   reads `kernel.db` read-only; a fresh kernel seeds `hajime` with a minted
-   id and the empty-auth log line names it; anonymous auto-register
-   (`ssh.rs:1111`) binds to `hajime` rather than minting;
-   `name_for(PrincipalId)` resolves sentinels then the sheet; the three
-   compile-time name reads — `answerer_name` (`rpc.rs:483`), `whoami`'s
-   `Identity` fill (`:3077`), and `materialize_context_shell_for`
-   (`:9307`, which wants `id.short()`) — land in this change; `ssh.rs`,
-   `share.rs` and `sftp.rs` log lines and `tracing` fields take
-   `id.short()`.
-   **This slice follows the sheet immediately** because between the two
-   there are two minting paths for one name, and `add-key --nick <name>`
-   would quietly create a second principal beside the character.
-   Tests: a bound key authenticates to the character's principal; a name
-   renders identically from the wire before and after; a fingerprint with
-   no character fails loudly rather than rendering blank; re-adding a bound
-   fingerprint refuses and names the current binding; `--rebind` moves it;
-   a fresh kernel seeds exactly one character and `list-characters` finds
-   it with the service stopped; the migration
-   (`kaijutsu-server::migrate_keyring`) turns pre-existing principals into
-   characters carrying their old usernames, against a fixture mimicking a
-   real `auth.db`, never against anything real; anonymous auto-register
-   binds to `hajime` and mints nothing. (2026-09-16: `init` replaced
-   `hajime` and anonymous auth; see "Bootstrap: the person creates
-   themself".)
-3. **Attribution. Shipped.** Create-time performer selection
-   (`kj context create --as`) landed separately. Turn-start resolution of
-   `played_by` to the effective actor, and provider-emitted blocks authored
-   by it, is `turn_identity::resolve`
-   (`crates/kaijutsu-kernel/src/runtime/turn_identity.rs`), stamped at the
-   tool-call and tool-result sites in
-   `crates/kaijutsu-kernel/src/runtime/llm_stream.rs`. This was the slice
-   that changed `BlockId` lanes; it shipped alone.
-   Tests: a model block's author is the character and differs from the
-   requester; the prompt's author is still the requester; a tool call is
-   actor-authored while its result stays `system`; appends use the inserted
-   block's principal; `TurnFlow` still names the requester; approval
-   redemption still uses the ask's original requester; the app's draft
-   owner is still the session principal; the multi-producer beat path
-   routing a cell failure to its own producer has no test covering it today
-   (`beat.rs:1464` `producer_ctx_for`).
-4. **Handoff context.** `handoff` type, `kj handoff note|tail`, hydration
-   policy set at creation, `S16-handoff.kai` in the `coder` and `mcp` create
-   bundles, `register_session` sets `played_by`. `characters.handoff_ctx`
-   arrives here. This is the slice that changes tomorrow morning, and it
-   needs only slice 1 — if the morning is worth more than closing the
-   double-mint window early, it can swap with slice 2, as long as nobody
-   runs `add-key --nick` in between.
-   **Shipped 2026-09-07**, verified in two real create lifecycles. The
-   decisions, all reversible: `note --for <character>` writes into another
-   character's log under the caller's name, which makes "the message board
-   is this log read by someone else" true before slice 7's addressing
-   exists; `tail` never mints, because a read-only verb's whole flag
-   surface must be incapable of a write (the verb declares `Effect::Read`
-   and the class match is exhaustive, `kj/effect.rs`); `note` is not
-   `ConfigWrite`-gated, since leaving a note is ordinary authoring and the
-   gate would route every handoff through an ask; no
-   character fails loudly and names `kj character create`; `played_by`
-   is set by `register_session` with `kj context create --as`, except for a
-   root character, which cannot be cast. The window
-   is 50, set on the first note (a marker needs a block to anchor on).
-   `S16-handoff.kai` guards `kj handoff tail` inside the substitution, where
-   the guard reacts at the failing command itself: under `set -e` a failing
-   substitution aborts the script, so a principal with no character got an
-   Error block on every create until the guard moved. When that guard moved,
-   kaish also ignored a trailing `||` on the assignment; the linked kaish
-   (0.17.2, ad293823) fires it, verified live 2026-10-01. The inner placement
-   stays — it is the narrower guard — pinned by the kernel test
-   `set_e_substitution_guards_behave_as_rc_scripts_place_them`.
+   `contexts.played_by`, copied by fork; `kj character create|list|show|retire`, where `create`
+   mints the principal id and `retire` concludes and archives every context the character plays.
+   Tests: NULL `played_by` preserves today's behavior; fork copies it; retiring archives the live
+   contexts and leaves blocks and their authors intact; an unmapped character fails loudly.
+2. **The keyring melt. Shipped 2026-09-06; the migration ran on zorak 2026-09-07.** `auth.db` drops
+   `username` and `display_name` and gains WAL; `authenticate` returns a `PrincipalId`;
+   `add-key --as <character>` binds, never mints, and refuses an already-bound fingerprint without
+   `--rebind`; `--nick`, `set-nick`, `set_display_name`, `add_key_auto_principal` and
+   `import_authorized_keys` are removed; `name_for(PrincipalId)` resolves sentinels then the sheet.
+   The server refuses to start on a pre-melt `auth.db` (`tests/auth_db_premelt_guard.rs`). 2026-09-16:
+   `init` replaced the seeded `hajime` and anonymous auth ("Bootstrap: the person creates themself").
+3. **Attribution. Shipped.** Turn-start resolution of `played_by` to the effective actor, and
+   provider-emitted blocks authored by it, is `turn_identity::resolve`
+   (`crates/kaijutsu-kernel/src/runtime/turn_identity.rs`), stamped at the tool-call and tool-result
+   sites in `crates/kaijutsu-kernel/src/runtime/llm_stream.rs`. This slice changed `BlockId` lanes.
+   Tests: a model block's author is the character and differs from the requester; the prompt's author
+   is still the requester; a tool call is actor-authored while its result stays `system`; `TurnFlow`
+   still names the requester; approval redemption still uses the ask's original requester.
+4. **Handoff context. Shipped 2026-09-07.** `handoff` type, `kj handoff note|tail`, hydration policy
+   set at creation, `S16-handoff.kai` in the `coder` and `mcp` create bundles, `register_session` sets
+   `played_by`, `characters.handoff_ctx`. Decisions, all reversible: `note --for <character>` writes
+   into another character's log under the caller's name; `tail` never mints, because a read-only
+   verb must be incapable of a write; `note` is not `ConfigWrite`-gated, since leaving a note is
+   ordinary authoring; the window is 50, set on the first note. `S16-handoff.kai` guards `kj handoff
+   tail` inside the substitution; the kernel test
+   `set_e_substitution_guards_behave_as_rc_scripts_place_them` pins the placement.
 5. **rc union.** Two directories, one sorted list, collision is an error,
    `KJ_CONTEXT_TYPE` and `KJ_CHARACTER` seeded; `characters.rc_dir` arrives.
    Reseed leaves character dirs alone (they are not shipped defaults).
 6. **Roster inversion.** `kj roster` groups rows by character, presence
-   specified as the aggregation above. The periodic refresh is already wired:
-   `create_shared_kernel` spawns it every 10 s under the server's shutdown
-   token (`kaijutsu-server/src/rpc.rs:2984`; `roster_sources.rs:67`). A stale
-   doc comment said otherwise until 2026-09-05.
+   specified as the aggregation above. The periodic refresh is already wired
+   (`kaijutsu-server/src/rpc.rs:2984`; `roster_sources.rs:67`).
 7. **Drift to a character.** `@name` addressing; one resolver.
 8. **Janitor, then proctor.** The `yakin` character, its track, its tick rc;
    the distill-cast refusal and `--distill-model` on pull.
@@ -1004,4 +926,3 @@ it.
 - **The desk character** (受付, Uketsuke): an automode context that answers
   some asks by policy and escalates fewer to Amy. `docs/issues.md` "The
   escalation seat" is the earlier sketch of the same idea.
-
