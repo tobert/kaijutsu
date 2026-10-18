@@ -387,6 +387,9 @@ the model under observation has tried."
 
 ## A banto's own kj work asks its reviewer for each verb (2026-10-10)
 
+Partly superseded by docs/senpai-kohai.md (branch feat/senpai-kohai): a drift along the
+senpai edge needs no ask, and the verb is now `kj kohai create`. The rest stays open.
+
 A `director` seat played by banto on moltar (`banto-shadow`) raised about
 17 asks to Amy in two small tasks: `kj context create ... --as coder`,
 `kj drive <child>`, `kj context archive <child> --confirm`, and read-only
@@ -396,8 +399,8 @@ kaijutsu", and she chose a standing rule in the ledger first.
 
 Shipped: `kj ledger allow <id> --remember character [--family]`, a rule
 bound to the performer that covers the context-targeting verbs only on
-contexts that character directs (`docs/approval-identity.md`, "Standing
-rules for a character"). Open:
+contexts whose senpai that character holds (`docs/approval-identity.md`,
+"Standing rules for a character"). Open:
 
 - Character rc (option b) for what can be granted statically, without a
   first ask; it waits on character rc composition (`docs/character.md`).
@@ -558,6 +561,9 @@ from the selection read through the full path too.
 ---
 
 ## Context verbs read a lineage-root fault as "not the root" (2026-10-11)
+
+Still open under the senpai model (docs/senpai-kohai.md, branch feat/senpai-kohai): the authority rule keeps the lineage root, and its
+lookup must propagate a fault. Read `forked_from` below as the senpai chain once the branch lands.
 
 `kj/context.rs` checks review and egress authority with
 `matches!(db.lineage_root(target), Ok(root) if root == caller)`, so a
@@ -987,7 +993,7 @@ covering 2026-09-22. Open, most costly first:
   went to banto; nothing woke it, and the coder spun to the 50-iteration cap.
   A reviewer blocked in `kj wait <lane>` now returns on the lane's ask for it;
   a reviewer whose turn has ended still hears nothing. Design direction to
-  discuss: a model reviewer passes the ask up the walk with its opinion
+  discuss: a model reviewer passes the ask up the senpai climb with its opinion
   attached rather than holding it.
 - **One inert statement escalates a whole program.** Banto ran
   `kj ledger allow <id>; echo "allow_exit=$?"`. The ledger answer has a
@@ -1289,23 +1295,19 @@ Read by the lead; each line re-checked before it went here.
 
 ## Accountability at the handoff log (Amy, 2026-09-15)
 
-Reviewer resolution walks `forked_from`, so every path that mints a context
-decides who reviews. Fork and `kj context create` from inside a context are
-covered; nothing re-parents a context. This is not:
+The walk and the open question at the end of this entry are superseded by docs/senpai-kohai.md (branch feat/senpai-kohai): reviewer
+resolution climbs `senpai_ctx`, so a human's command in a model's lane is reviewed by the
+lane's senpai holder. What stays open is item 1 below: a context with no senpai.
+
+Every path that mints a context decides who reviews. Fork and `kj kohai create` from inside a
+context set the senpai; nothing re-parents a context except `kj senpai set`. This is not covered:
 
 1. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a
    parentless context played by a model. The kernel must not guess a root
-   (Amy, 2026-09-16), so it needs an explicit parent. Since the default
-   reviewer went away, an ask raised there refuses (nobody is above its
-   model performer) and it has no lineage root. Amy decides its parent.
-
-Open question from the lane: the walk starts at the ask's own context,
-so an actor who is not that context's performer, a human typing in a
-lane coder plays, resolves to coder. Starting at the parent would give
-banto. Both are models. Neither the docs nor a test pins it; Amy decides
-whether a human's command in a model's lane is reviewed by that model,
-by its parent, or walks to the nearest root.
+   (Amy, 2026-09-16), so it needs an explicit senpai. An ask raised there refuses
+   (no senpai, and a model performer is not a root) and it has no lineage root.
+   Amy decides its senpai.
 
 ## Roots, bootstrap, and rotation: what stays open (2026-09-17)
 
@@ -2204,7 +2206,7 @@ app is refused for the same reason (self-approval is barred by the
 2026-09-12 approval-identity work). The ask is then stuck pending until it
 expires. So the app's own shell cannot run any gated command today. The fix
 is an identity decision, not app UI: the app should attach as a distinct
-performer character (`kj context create --as`, or a dedicated app
+performer character (`kj kohai create --as`, or a dedicated app
 character) with Amy as the reviewer, or a non-Amy reviewer must be
 configured for the app's context. Coordinate with the approval-identity
 work (commits dcb5fc8b, fd27b822). Probe ask `01a096d2-358d-…` was left
@@ -2425,20 +2427,22 @@ joined in-process. Found by kaibo (DeepSeek) reviewing 730a9ed8, 2026-09-22.
 
 ## Parentless contexts outside the root consoles
 
-`kj context create` and `kj fork` always name a parent (fe187fe5), but
-these paths still insert `forked_from: None` rows: `kj context scratch`
+`kj kohai create` and `kj fork` always set a senpai (fe187fe5 made them name a parent), but
+these paths still insert `forked_from: None` rows with a null `senpai_ctx`: `kj context scratch`
 (`kj/context.rs`, `context_scratch`), the handoff log (`kj/handoff.rs`,
 already filed under "Handoff logs are parentless"), the beat's score
 context (`kaijutsu-server/src/beat.rs`), the cold-start document bootstrap
 (`kaijutsu-server/src/rpc.rs`, `bootstrap_discovered_context`), the drift
 queue and lost+found (`drift.rs`, `kj/drift.rs`, via
 `insert_well_known_context`). Each is its own tree in the forest with no
-root character above it, so a reviewer walk from inside one ends at nobody.
-Decide per path: parent it under the caller's lineage root, or state that
+root character above it, so reviewer resolution from inside one refuses at its first step.
+Decide per path: give it a senpai under the caller's lineage root, or state that
 it is a registry-owned well-known context that never hosts a gated turn.
 Found by kaibo (DeepSeek) reviewing fe187fe5, 2026-09-22.
 
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
+
+Written before the hard cut: the verb is now `kj kohai create`; the symptom is not known to be fixed.
 
 From an `mcp` seat with `[context_type.mcp] allow = ["kj context create"]`
 live, `kj context create x --type director` auto-allowed and
@@ -2784,10 +2788,9 @@ still missing:
 - **A waiting block still gets a generic status label.** The conversation
   does not say "this turn is waiting on an ask", only the hints line's `!n`
   and the sheet do.
-- **Context creation and review assignment have no app UI.** Use
-  `kj context create --as` so the performer exists before rc. The connected
-  character is the director; reviewer assignment follows explicit delegation
-  or the Amy default.
+- **Context creation and senpai assignment have no app UI.** Use
+  `kj kohai create --as` so the performer exists before rc. The new context's
+  senpai is the caller's context; there is no reviewer assignment to make.
 - **The PLAN block renders a flat statement list**, which is all
   the ledger's `AskSummary` carries. A plan tree and per-statement verdicts would
   need kernel fields first; the block is shaped to take them.
