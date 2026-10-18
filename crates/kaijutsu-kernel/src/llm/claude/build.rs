@@ -147,6 +147,7 @@ pub fn build_request(
         .map(|(index, message)| build_message(index, message, dialect))
         .collect::<Result<Vec<_>, _>>()?;
     apply_message_breakpoints(&mut request_messages, &plan.message_indices);
+    let cache_control = auto_tail_cache(&plan, request_messages.len(), dialect);
 
     Ok(MessagesRequest {
         model: opts.model.clone(),
@@ -161,7 +162,25 @@ pub fn build_request(
         thinking: None, // apply_thinking() fills this in after build_request
         output_config: None, // and this, when the adaptive tier carries effort
         stop_sequences: vec![],
+        cache_control,
     })
+}
+
+/// Decide the top-level automatic breakpoint for the conversation tail.
+///
+/// The rc's explicit breakpoints cover the tools and the system prompt. The
+/// conversation after them is cached only by a breakpoint near its end, so an
+/// agent loop without one re-reads its whole history uncached on each request.
+/// The automatic field asks the API to place that breakpoint on the last block
+/// and move it forward. It applies only when the caller asked for caching, only
+/// on Anthropic's API (the DeepSeek dialect is another server), only when a slot
+/// is free, and never with an explicit marker on the last message (a different
+/// TTL there is a 400, and the same TTL makes the field a no-op).
+fn auto_tail_cache(plan: &CachePlan, messages: usize, dialect: Dialect) -> Option<CacheControl> {
+    let used = usize::from(plan.tools.is_some()) + usize::from(plan.system.is_some()) + plan.message_indices.len();
+    let marks_last = plan.message_indices.iter().any(|(index, _)| index + 1 == messages);
+    (dialect == Dialect::Anthropic && used > 0 && used < MAX_CACHE_BREAKPOINTS && messages > 0 && !marks_last)
+        .then(CacheControl::ephemeral)
 }
 
 /// Resolve `opts`'s thinking tunables (`thinking_style` / `thinking_budget` /
@@ -891,6 +910,72 @@ mod tests {
         let o = opts("claude-haiku-4-5").with_system("");
         let req = build_request(&o, &[Message::user("hi")], false);
         assert!(req.system.is_none(), "empty system must skip-serialize");
+    }
+
+    // ------------------------------------------------------------------
+    // Top-level automatic caching (the conversation tail)
+    // ------------------------------------------------------------------
+
+    fn tools_and_system(o: BuildOpts) -> BuildOpts {
+        let mut o = o.with_system("sys").with_tools(vec![tool("t")]);
+        o.cache_breakpoints = vec![
+            CacheTarget::Tools(CacheTtl::Extended),
+            CacheTarget::System(CacheTtl::Ephemeral),
+        ];
+        o
+    }
+
+    /// The default rc places tools and system breakpoints only, so without
+    /// the top-level field a long agent loop re-reads its whole history
+    /// uncached on every request.
+    #[test]
+    fn a_cached_anthropic_request_auto_caches_the_tail() {
+        let o = tools_and_system(opts("claude-haiku-5-5"));
+        let msgs = [Message::user("a"), Message::assistant("b"), Message::user("c")];
+        let req = build_request(&o, &msgs, true);
+        assert_eq!(req.cache_control, Some(CacheControl::ephemeral()));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["cache_control"], serde_json::json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn a_request_without_breakpoints_does_not_auto_cache() {
+        let req = build_request(&opts("claude-haiku-5-5"), &[Message::user("a")], true);
+        assert!(req.cache_control.is_none());
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("cache_control").is_none(), "the field is omitted: {json}");
+    }
+
+    /// DeepSeek speaks the Messages dialect but is not Anthropic's API.
+    #[test]
+    fn the_deepseek_dialect_does_not_auto_cache() {
+        let o = tools_and_system(opts("deepseek-flash"));
+        let req = super::build_request(&o, &[Message::user("a")], true, Dialect::DeepSeek).unwrap();
+        assert!(req.cache_control.is_none());
+    }
+
+    /// The automatic breakpoint takes a slot; with all 4 taken the API 400s.
+    #[test]
+    fn four_explicit_breakpoints_leave_no_slot_for_auto() {
+        let mut o = opts("claude-haiku-5-5").with_system("sys").with_tools(vec![tool("t")]);
+        o.cache_breakpoints = vec![
+            CacheTarget::Tools(CacheTtl::Ephemeral),
+            CacheTarget::System(CacheTtl::Ephemeral),
+            CacheTarget::MessageIndex(0, CacheTtl::Ephemeral),
+            CacheTarget::MessageIndex(1, CacheTtl::Ephemeral),
+        ];
+        let msgs = [Message::user("a"), Message::assistant("b"), Message::user("c")];
+        assert!(build_request(&o, &msgs, true).cache_control.is_none());
+    }
+
+    /// An explicit marker on the last message with another TTL is a 400, and
+    /// one with the same TTL makes the automatic field a no-op.
+    #[test]
+    fn an_explicit_marker_on_the_last_message_leaves_auto_off() {
+        let mut o = tools_and_system(opts("claude-haiku-5-5"));
+        o.cache_breakpoints.push(CacheTarget::MessageIndex(2, CacheTtl::Extended));
+        let msgs = [Message::user("a"), Message::assistant("b"), Message::user("c")];
+        assert!(build_request(&o, &msgs, true).cache_control.is_none());
     }
 
     #[test]

@@ -66,6 +66,13 @@ pub struct MessagesRequest {
     /// Optional list of stop sequences.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
+
+    /// Top-level automatic caching: the API places this breakpoint on the
+    /// last cacheable block and moves it forward as the conversation grows.
+    /// It caches the conversation tail that the explicit tools and system
+    /// breakpoints do not reach. It takes one of the 4 breakpoint slots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// `system` field shape — string or block list.
@@ -443,6 +450,7 @@ mod tests {
             thinking: None,
             output_config: None,
             stop_sequences: vec![],
+            cache_control: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         // Optional fields skip-serialize when None / empty.
