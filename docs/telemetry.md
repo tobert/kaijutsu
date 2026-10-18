@@ -223,7 +223,10 @@ INFO llm request context="9c1f02aa" turn="b37e5d10" step=1 attempt=1 provider="a
 
 `step` counts model calls in the turn. `attempt` counts tries at one step: the
 turn's startup retry loop sends the request again after a transient failure,
-and each try logs its own line and writes its own file. `last_user_*` describe
+and a stream the provider cut for lack of capacity before any output is sent
+again as the next attempt of the same step. Each try logs its own line and
+writes its own file. The `llm.turn` span records `llm.stream_cuts`, the count
+of cut streams, which report no usage. `last_user_*` describe
 the last user message that carries text. `total_chars` counts text only
 (system prompt, message text, tool input and output; images count 0). The line
 holds counts and a hash, never text. To compare: `kj block read <id>` the user

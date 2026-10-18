@@ -124,7 +124,12 @@ pub(crate) fn is_history_eligible(block: &BlockSnapshot) -> bool {
     {
         return false;
     }
+    // Withheld or omitted thinking has no text, only the signature the next
+    // request sends back.
+    let signed_thinking = block.kind == BlockKind::Thinking
+        && block.signature.as_deref().is_some_and(|signature| !signature.is_empty());
     !block.content.is_empty()
+        || signed_thinking
         || matches!(
             block.kind,
             BlockKind::ToolCall
@@ -1579,6 +1584,56 @@ mod hydration_blindness_tests {
                  messages as the same block without spans"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod withheld_thinking_tests {
+    use super::*;
+    use crate::llm::{ContentBlock, MessageContent};
+    use kaijutsu_types::{BlockSnapshot, ContextId, PrincipalId};
+
+    fn thinking(seq: u64, signature: Option<&str>) -> BlockSnapshot {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), seq);
+        let mut block = BlockSnapshot::thinking(id, None, "");
+        block.signature = signature.map(str::to_string);
+        block.status = kaijutsu_types::Status::Done;
+        block
+    }
+
+    fn model_text(text: &str) -> BlockSnapshot {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 9);
+        BlockSnapshot::text(id, None, BlockRole::Model, text)
+    }
+
+    fn hydrate(blocks: &[BlockSnapshot]) -> Vec<Message> {
+        let mut state = HydrationState::new();
+        for block in blocks {
+            state.translate_block(block, None);
+        }
+        state.into_messages()
+    }
+
+    /// Thinking the API withheld has empty text and a signature the next
+    /// request must send back.
+    #[test]
+    fn a_signed_thinking_block_with_no_text_is_eligible_and_replays() {
+        let blocks = [thinking(1, Some("sig")), model_text("done")];
+        assert!(is_history_eligible(&blocks[0]));
+        let messages = hydrate(&blocks);
+        let MessageContent::Blocks(parts) = &messages[0].content else {
+            panic!("expected blocks: {messages:?}");
+        };
+        assert!(
+            matches!(parts.first(), Some(ContentBlock::Reasoning { text, signature })
+                if text.is_empty() && signature.as_deref() == Some("sig")),
+            "{parts:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_empty_thinking_block_is_not_eligible() {
+        assert!(!is_history_eligible(&thinking(1, None)));
     }
 }
 

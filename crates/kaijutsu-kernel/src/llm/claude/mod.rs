@@ -12,6 +12,8 @@
 //! `prompt()` does the non-streaming form, returning concatenated text.
 
 pub mod build;
+#[cfg(test)]
+mod live;
 pub mod models_api;
 pub mod sse;
 pub mod stream;
@@ -26,7 +28,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::endpoint::{Endpoint, Slot};
-use crate::llm::stream::{BuildOpts, StreamEvent};
+use crate::llm::stream::{BuildOpts, StreamError, StreamErrorKind, StreamEvent};
 use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, http_user_agent};
 
 use self::models_api::{HttpModelCapabilitySource, ModelCapabilitySource};
@@ -36,6 +38,36 @@ use self::types::{MessagesResponse, ResponseContent};
 
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const DEEPSEEK_MESSAGES_BASE_URL: &str = "https://api.deepseek.com/anthropic";
+
+/// Which server speaks the Messages wire. The wire shape is the same; the
+/// dialects differ in what the server accepts, so each difference is one
+/// method here and one branch where it applies.
+///
+/// - `Anthropic`: `api.anthropic.com` and compatible gateways.
+/// - `DeepSeek`: `api.deepseek.com/anthropic`. It has no `GET /v1/models`
+///   (404), takes `thinking` as `enabled` or `disabled` only, ignores
+///   `cache_control`, and takes sampling parameters beside thinking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Anthropic,
+    DeepSeek,
+}
+
+impl Dialect {
+    /// The provider label on request dumps.
+    fn provider_label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::DeepSeek => "deepseek-messages",
+        }
+    }
+
+    /// Whether `GET /v1/models/{id}` answers with `max_input_tokens`.
+    fn has_models_api(self) -> bool {
+        self == Self::Anthropic
+    }
+}
 
 /// Anthropic Claude client.
 ///
@@ -82,16 +114,17 @@ pub struct Client {
     /// only for a client built directly rather than by
     /// `Provider::from_backend`.
     endpoint: Option<Arc<Endpoint>>,
+    dialect: Dialect,
 }
 
 impl Client {
     /// Construct a client from an API key.
     ///
-    /// Panics only if `reqwest::Client::builder()` fails — which on a
-    /// healthy host means a TLS backend init failure (no system roots,
-    /// for instance). That's a startup-time misconfiguration; we
-    /// surface it via `LlmError::Unavailable` so the caller can fall
-    /// back to a different provider gracefully.
+    /// Panics if the key is not a valid header value (non-ASCII or control
+    /// characters), or if `reqwest::Client::builder()` fails, which on a
+    /// healthy host means a TLS backend init failure (no system roots, for
+    /// instance). Both are startup-time misconfigurations that should crash
+    /// loudly.
     pub fn new(api_key: impl Into<String>) -> Self {
         let api_key = api_key.into();
         let mut headers = reqwest::header::HeaderMap::new();
@@ -123,7 +156,22 @@ impl Client {
             capability_source,
             request_timeout: None,
             endpoint: None,
+            dialect: Dialect::Anthropic,
         }
+    }
+
+    /// A client for DeepSeek's Messages endpoint,
+    /// `https://api.deepseek.com/anthropic`. Auth is the same `x-api-key`
+    /// header; `anthropic-version` is sent and ignored.
+    pub fn deepseek(api_key: impl Into<String>) -> Self {
+        let mut client = Self::new(api_key).with_base_url(DEEPSEEK_MESSAGES_BASE_URL);
+        client.dialect = Dialect::DeepSeek;
+        client
+    }
+
+    /// The dialect this client speaks.
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
     }
 
     /// Take a slot from `endpoint` before each `/v1/messages` request.
@@ -197,6 +245,9 @@ impl Client {
     /// a legitimate, documented outcome here, so this is an informational
     /// log, not a silently swallowed failure.
     pub async fn context_window(&self, model: &str) -> Option<u64> {
+        if !self.dialect.has_models_api() {
+            return None;
+        }
         {
             let cache = self.model_window_cache.read().await;
             if let Some(cached) = cache.get(model) {
@@ -232,14 +283,20 @@ impl Client {
         }
     }
 
-    /// Available Claude model IDs surfaced by this provider.
+    /// Model IDs surfaced by this provider.
     pub fn available_models(&self) -> Vec<&'static str> {
-        vec![
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-        ]
+        match self.dialect {
+            Dialect::Anthropic => vec![
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-haiku-5-5",
+                "claude-opus-4-8",
+                "claude-opus-4-7",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5-20251001",
+            ],
+            Dialect::DeepSeek => vec!["deepseek-flash", "deepseek-v4-pro"],
+        }
     }
 
     /// One-shot prompt with optional system preamble.
@@ -259,7 +316,13 @@ impl Client {
         if let Some(sys) = system {
             opts = opts.with_system(sys);
         }
-        let body = build::build_request(&opts, &messages, false);
+        let mut body = build::build_request(&opts, &messages, false, self.dialect)?;
+        if self.dialect == Dialect::DeepSeek {
+            // The server thinks by default, and thinking tokens count against
+            // `max_tokens`; a distillation wants the answer text.
+            opts.thinking_style = Some("off".into());
+            build::apply_thinking(&mut body, &opts, self.dialect)?;
+        }
 
         let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
@@ -271,10 +334,10 @@ impl Client {
             request = request.timeout(timeout);
         }
         crate::llm::request_dump::record(
-            None, "anthropic", model, &self.base_url, system, &messages, &body,
+            None, self.dialect.provider_label(), model, &self.base_url, system, &messages, &body,
         );
         let response = request.send().await.map_err(http_error)?;
-        crate::llm::endpoint::observe(slot.as_ref(), &response);
+        observe(slot.as_ref(), &response, false);
 
         let response = error_for_status(response).await?;
 
@@ -283,14 +346,20 @@ impl Client {
             .await
             .map_err(|e| LlmError::ApiError(format!("response JSON parse: {e}")))?;
 
+        // A reply that stopped before it finished is an error, not partial text.
+        stream::check_stop_reason(parsed.stop_reason.as_deref())?;
+
         let mut text = String::new();
         for content in &parsed.content {
             match content {
                 ResponseContent::Text { text: t } => text.push_str(t),
-                ResponseContent::Thinking { .. } => {
+                ResponseContent::Thinking { .. } | ResponseContent::RedactedThinking { .. } => {
                     tracing::debug!(
                         "claude::prompt: dropping thinking block from non-streaming response"
                     );
+                }
+                ResponseContent::Other => {
+                    tracing::debug!("claude::prompt: dropping a non-text block from the response");
                 }
                 ResponseContent::ToolUse { name, .. } => {
                     tracing::warn!(
@@ -315,13 +384,13 @@ impl Client {
         opts: BuildOpts,
         messages: Vec<Message>,
     ) -> LlmResult<Stream> {
-        let mut body = build::build_request(&opts, &messages, true);
+        let mut body = build::build_request(&opts, &messages, true, self.dialect)?;
         // Provider-tailored knob (the reason this client is bespoke):
         // resolves opts's thinking_style/thinking_budget/effort cascade
         // (model-gated adaptive default when unset) and strips
         // temperature/top_p when thinking ends up on — see
         // `build::apply_thinking`.
-        build::apply_thinking(&mut body, &opts)?;
+        build::apply_thinking(&mut body, &opts, self.dialect)?;
 
         let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
@@ -334,11 +403,11 @@ impl Client {
             request = request.timeout(timeout);
         }
         crate::llm::request_dump::record(
-            opts.trace.as_deref(), "anthropic", &opts.model, &self.base_url,
+            opts.trace.as_deref(), self.dialect.provider_label(), &opts.model, &self.base_url,
             opts.system.as_deref(), &messages, &body,
         );
         let response = request.send().await.map_err(http_error)?;
-        crate::llm::endpoint::observe_open(slot.as_ref(), &response);
+        observe(slot.as_ref(), &response, true);
 
         let response = error_for_status(response).await?;
 
@@ -367,16 +436,44 @@ pub(crate) async fn error_for_status(response: reqwest::Response) -> LlmResult<r
         .unwrap_or_else(|e| format!("(failed to read body: {e})"));
     // Parse the error JSON if we can; otherwise pass through.
     let detail = serde_json::from_str::<sse::SseError>(&body)
-        .map(|e| format!("{}: {}", e.error.kind, e.error.message))
+        .map(|e| match e.request_id {
+            Some(id) => format!("{}: {} (request_id: {id})", e.error.kind, e.error.message),
+            None => format!("{}: {}", e.error.kind, e.error.message),
+        })
         .unwrap_or(body);
-    let mapped = match status.as_u16() {
+    Err(map_status(status.as_u16(), detail))
+}
+
+/// Map a failing HTTP status onto [`LlmError`]. 529 is Anthropic's
+/// `overloaded_error` and 504 its `timeout_error`; both are transient server
+/// failures. A 400 that says the prompt is too long is a full context, which
+/// no retry fixes.
+fn map_status(status: u16, detail: String) -> LlmError {
+    match status {
         401 | 403 => LlmError::AuthError(detail),
+        402 => LlmError::InsufficientBalance(detail),
         429 => LlmError::RateLimited(detail),
+        400 if detail.contains("prompt is too long") => LlmError::ContextFull(detail),
         400..=499 => LlmError::InvalidRequest(detail),
         500..=599 => LlmError::ApiError(detail),
         _ => LlmError::ApiError(format!("unexpected HTTP {status}: {detail}")),
-    };
-    Err(mapped)
+    }
+}
+
+/// Tells `slot`'s endpoint how it answered `response`. A 529 is told as a
+/// 503 so the limiter cools down on it. `opening` is a stream open: a 2xx
+/// there waits for the stream's end event before it counts as an answer.
+fn observe(slot: Option<&Slot>, response: &reqwest::Response, opening: bool) {
+    let status = response.status();
+    if status.as_u16() == 529 {
+        if let Some(slot) = slot {
+            slot.answered_with(503, crate::llm::endpoint::retry_after(response.headers()));
+        }
+    } else if opening {
+        crate::llm::endpoint::observe_open(slot, response);
+    } else {
+        crate::llm::endpoint::observe(slot, response);
+    }
 }
 
 pub(crate) fn http_error(e: reqwest::Error) -> LlmError {
@@ -452,8 +549,7 @@ impl Stream {
 
     /// Poll for the next event. Returns `None` once the stream is
     /// exhausted (after a `Done` or `Error` event, or a clean close
-    /// with no `message_stop` — which we surface via the state
-    /// machine's already-emitted events).
+    /// with no `message_stop`).
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         loop {
             if self.finished {
@@ -489,25 +585,45 @@ impl Stream {
                     match item {
                         Some(Ok(event)) => match decode_event(&event) {
                             Ok(typed) => {
-                                if matches!(&typed, ClaudeSseEvent::MessageStop) {
+                                let ends = matches!(&typed, ClaudeSseEvent::MessageStop);
+                                let busy = match &typed {
+                                    ClaudeSseEvent::Error(e) => e.error.class().busy_status(),
+                                    _ => None,
+                                };
+                                let emitted = self.state.step(typed);
+                                // Any error ends the stream, and no completed
+                                // answer follows it. An error that means "too
+                                // much load" cools the endpoint as the same
+                                // answer on the HTTP status would.
+                                if self.state.failed() {
+                                    self.finished = true;
+                                    if let (Some(slot), Some(status)) = (&self.slot, busy) {
+                                        slot.answered_with(status, None);
+                                    }
+                                } else if ends {
                                     self.finished = true;
                                     if let Some(slot) = &self.slot {
                                         slot.completed();
                                     }
                                 }
-                                let emitted = self.state.step(typed);
                                 for ev in emitted {
                                     self.pending.push_back(ev);
                                 }
                             }
                             Err(e) => {
                                 self.finished = true;
-                                return Some(StreamEvent::Error(format!("SSE decode: {e}")));
+                                return Some(StreamEvent::Error(StreamError::new(
+                                    StreamErrorKind::Protocol,
+                                    format!("SSE decode: {e}"),
+                                )));
                             }
                         },
                         Some(Err(e)) => {
                             self.finished = true;
-                            return Some(StreamEvent::Error(format!("SSE transport: {e}")));
+                            return Some(StreamEvent::Error(StreamError::new(
+                                StreamErrorKind::Transport,
+                                format!("SSE transport: {e}"),
+                            )));
                         }
                         None => {
                             // Source stream closed without an explicit
@@ -621,164 +737,6 @@ data: {\"type\":\"message_stop\"}
             s.next_event().await.is_none(),
             "stream is finished after cancel-Done"
         );
-    }
-
-    /// Live API smoke test — exercises the real wire path against
-    /// Anthropic. Gated behind `ANTHROPIC_API_KEY` so CI / casual
-    /// `cargo test` runs skip it cleanly. Cost: ~30 input tokens, ~20
-    /// output tokens against Haiku — negligible.
-    ///
-    /// Run with `--nocapture` to see what Claude said:
-    ///
-    /// ```sh
-    /// ANTHROPIC_API_KEY=$(< ~/.anthropic-key.txt) \
-    ///   cargo test -p kaijutsu-kernel --lib claude_live_smoke \
-    ///   -- --ignored --nocapture
-    /// ```
-    #[tokio::test]
-    #[ignore = "requires ANTHROPIC_API_KEY; run with `cargo test --ignored claude_live`"]
-    async fn claude_live_smoke_streams_real_response() {
-        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(k) if !k.is_empty() => k,
-            _ => return, // belt-and-suspenders alongside #[ignore]
-        };
-        let client = Client::new(api_key);
-        let opts = BuildOpts::new("claude-haiku-4-5-20251001")
-            .with_max_tokens(128)
-            .with_system("You are friendly. Respond briefly.");
-        let mut stream = client
-            .stream(opts, vec![Message::user("hi there")])
-            .await
-            .expect("stream open must succeed with valid key");
-        let mut text = String::new();
-        let mut saw_done = false;
-        let mut stop_reason = String::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        while let Some(ev) = stream.next_event().await {
-            match ev {
-                StreamEvent::TextStart | StreamEvent::TextEnd => {}
-                StreamEvent::TextDelta(t) => text.push_str(&t),
-                StreamEvent::Done {
-                    stop_reason: sr,
-                    input_tokens: it,
-                    output_tokens: ot,
-                    ..
-                } => {
-                    saw_done = true;
-                    if let Some(s) = sr {
-                        stop_reason = s;
-                    }
-                    if let Some(n) = it {
-                        input_tokens = n;
-                    }
-                    if let Some(n) = ot {
-                        output_tokens = n;
-                    }
-                }
-                StreamEvent::Error(e) => panic!("live stream error: {e}"),
-                _ => {}
-            }
-        }
-        // Visible only with --nocapture. Captures the actual response so
-        // a human running the test can confirm Claude really replied.
-        println!("\n--- claude said ---\n{text}\n--- meta ---");
-        println!("stop_reason: {stop_reason}");
-        println!("tokens: in={input_tokens} out={output_tokens}\n");
-
-        assert!(!text.is_empty(), "live response must include some text");
-        assert!(saw_done, "live response must terminate with Done");
-        assert_eq!(stop_reason, "end_turn", "expected natural turn end");
-    }
-
-    /// Live thinking smoke test — confirms adaptive thinking with
-    /// `display: "summarized"` actually yields non-empty ThinkingDelta
-    /// text on a model that supports it. Uses a prompt that reliably
-    /// triggers thinking under the adaptive policy.
-    ///
-    /// ```sh
-    /// ANTHROPIC_API_KEY=$(< ~/.anthropic-key.txt) \
-    ///   cargo test -p kaijutsu-kernel --lib claude_live_thinking \
-    ///   -- --ignored --nocapture
-    /// ```
-    #[tokio::test]
-    #[ignore = "requires ANTHROPIC_API_KEY; run with `cargo test --ignored claude_live`"]
-    async fn claude_live_thinking_streams_summarized_thinking_text() {
-        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(k) if !k.is_empty() => k,
-            _ => return,
-        };
-        let client = Client::new(api_key);
-        let opts = BuildOpts::new("claude-opus-4-6").with_max_tokens(2048);
-        let mut stream = client
-            .stream(
-                opts,
-                vec![Message::user(
-                    "A farmer has 17 sheep. All but 9 run away, then a third of the \
-                     remainder are sold, and he buys back twice what he sold. How many \
-                     sheep now? Reason it through carefully before answering.",
-                )],
-            )
-            .await
-            .expect("stream open must succeed with valid key");
-        let mut thinking_text = String::new();
-        let mut saw_thinking_end_signature = false;
-        let mut text = String::new();
-        while let Some(ev) = stream.next_event().await {
-            match ev {
-                StreamEvent::ThinkingDelta(t) => thinking_text.push_str(&t),
-                StreamEvent::ThinkingEnd { signature } => {
-                    saw_thinking_end_signature |= signature.is_some();
-                }
-                StreamEvent::TextDelta(t) => text.push_str(&t),
-                StreamEvent::Error(e) => panic!("live stream error: {e}"),
-                _ => {}
-            }
-        }
-        println!("\n--- thinking ---\n{thinking_text}\n--- answer ---\n{text}\n");
-        assert!(!text.is_empty(), "must produce answer text");
-        assert!(
-            !thinking_text.trim().is_empty(),
-            "adaptive + summarized must yield non-empty thinking text \
-             (empty means display defaulted to omitted — the bug this fixes)"
-        );
-        assert!(
-            saw_thinking_end_signature,
-            "thinking block must carry a signature for multi-turn replay"
-        );
-    }
-
-    /// Live effort test: a current model accepts the effort token on the
-    /// request's top-level `output_config` beside adaptive thinking.
-    ///
-    /// ```sh
-    /// ANTHROPIC_API_KEY=$(< ~/.anthropic-key.txt) \
-    ///   cargo test -p kaijutsu-kernel --lib claude_live_effort \
-    ///   -- --ignored --nocapture
-    /// ```
-    #[tokio::test]
-    #[ignore = "requires ANTHROPIC_API_KEY; run with `cargo test --ignored claude_live`"]
-    async fn claude_live_effort_is_accepted_beside_adaptive_thinking() {
-        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(k) if !k.is_empty() => k,
-            _ => return,
-        };
-        let client = Client::new(api_key);
-        let opts = BuildOpts::new("claude-sonnet-5-5").with_max_tokens(1024).with_effort("low");
-        let mut stream = client
-            .stream(opts, vec![Message::user("Reply with the single word: ready.")])
-            .await
-            .expect("stream open must succeed: effort beside adaptive thinking is valid");
-        let mut text = String::new();
-        while let Some(ev) = stream.next_event().await {
-            match ev {
-                StreamEvent::TextDelta(t) => text.push_str(&t),
-                StreamEvent::Error(e) => panic!("live stream error: {e}"),
-                _ => {}
-            }
-        }
-        println!("\n--- answer ---\n{text}\n");
-        assert!(!text.is_empty(), "must produce answer text");
     }
 
     /// The UA rides the real wire path: reqwest applies client defaults at
@@ -1035,5 +993,154 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(client.context_window("claude-opus-4-8").await, Some(200_000));
         assert_eq!(*probe.1.lock().unwrap(), Some(1), "the lookup held a slot");
         assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A stream that fails does not count as a completed answer: a
+    /// `message_stop` that ends in an error leaves the doubling as it was.
+    ///
+    /// Falsified by a failed stream that still calls `completed`.
+    #[tokio::test]
+    async fn a_stream_that_ends_in_an_error_keeps_the_doubling() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let paused = SIMPLE_COMPLETION.replace("end_turn", "pause_turn");
+        let (base, _) = serve(vec![sse(&paused)]).await;
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
+        assert_eq!(endpoint.busy_in_a_row(), 1);
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        assert!(matches!(events.last(), Some(StreamEvent::Error(e)) if matches!(e.kind, StreamErrorKind::Truncated(_))), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Done { .. })), "{events:?}");
+        assert_eq!(endpoint.busy_in_a_row(), 1, "a failed stream is not a completed answer");
+    }
+
+    /// `prompt()` returns text only for a reply that finished.
+    #[tokio::test]
+    async fn a_prompt_that_stopped_before_it_finished_is_an_error() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let body = |stop: &str| format!(
+            r#"{{"id":"m","model":"claude-haiku-5-5","role":"assistant","content":[{{"type":"text","text":"partial"}}],"stop_reason":{stop},"stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}}"#
+        );
+        for stop in ["\"pause_turn\"", "\"model_context_window_exceeded\"", "null"] {
+            let (base, _) = serve(vec![reply(200, &body(stop))]).await;
+            let err = Client::new("k").with_base_url(&base).prompt("m", None, "hi").await.unwrap_err();
+            assert!(matches!(err, LlmError::CompletionError(_)), "{stop}: {err:?}");
+        }
+        let (base, _) = serve(vec![reply(200, &body("\"end_turn\""))]).await;
+        assert_eq!(Client::new("k").with_base_url(&base).prompt("m", None, "hi").await.unwrap(), "partial");
+    }
+
+    /// A model that thinks on every request rejects `thinking: disabled`, so
+    /// the request fails before it is sent.
+    #[tokio::test]
+    async fn thinking_off_for_an_always_on_model_never_reaches_the_wire() {
+        use kaijutsu_mk::test_server::serve;
+        let (base, seen) = serve(vec![]).await;
+        let mut opts = BuildOpts::new("claude-sonnet-5-5");
+        opts.thinking_style = Some("off".into());
+        let err = Client::new("k").with_base_url(&base).stream(opts, vec![Message::user("hi")]).await.err().unwrap();
+        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("claude-sonnet-5-5")), "{err:?}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// A 529 is Anthropic's `overloaded_error`: transient, and the endpoint
+    /// cools as it does for a 503.
+    ///
+    /// Falsified by a 529 the limiter never hears about.
+    #[tokio::test]
+    async fn a_529_cools_the_endpoint_as_a_503() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let (base, _) = serve(vec![reply(529, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_1"}"#)]).await;
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let err = client.prompt("m", None, "hi").await.unwrap_err();
+        assert!(matches!(&err, LlmError::ApiError(m) if m.contains("overloaded_error") && m.contains("req_1")), "{err:?}");
+        let (_, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 503);
+    }
+
+    #[test]
+    fn http_statuses_map_to_distinguishable_errors() {
+        assert!(matches!(map_status(402, "x".into()), LlmError::InsufficientBalance(_)));
+        assert!(matches!(map_status(401, "x".into()), LlmError::AuthError(_)));
+        assert!(matches!(map_status(403, "x".into()), LlmError::AuthError(_)));
+        assert!(matches!(map_status(413, "x".into()), LlmError::InvalidRequest(_)));
+        assert!(matches!(map_status(429, "x".into()), LlmError::RateLimited(_)));
+        assert!(matches!(map_status(500, "x".into()), LlmError::ApiError(_)));
+        assert!(matches!(map_status(504, "x".into()), LlmError::ApiError(_)));
+        assert!(matches!(map_status(529, "x".into()), LlmError::ApiError(_)));
+        assert!(matches!(
+            map_status(400, "invalid_request_error: prompt is too long: 250000 tokens > 200000 maximum".into()),
+            LlmError::ContextFull(_)
+        ));
+        assert!(matches!(map_status(400, "other".into()), LlmError::InvalidRequest(_)));
+    }
+
+    /// A mid-stream `overloaded_error` ends the stream with an error that
+    /// names its type, and cools the endpoint.
+    ///
+    /// Falsified by an error event that never reaches the limiter, or one
+    /// that leaves the stream open.
+    #[tokio::test]
+    async fn a_mid_stream_overloaded_error_cools_the_endpoint_and_ends_the_stream() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let cut = &SIMPLE_COMPLETION[..SIMPLE_COMPLETION.find("event: content_block_stop").unwrap()];
+        let failed = format!(
+            "{cut}event: error\ndata: {}\n\n{}",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        let (base, _) = serve(vec![sse(&failed)]).await;
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        assert!(matches!(events.last(), Some(StreamEvent::Error(e)) if e.kind == StreamErrorKind::Overloaded), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::TextEnd)), "the stream stopped at the error: {events:?}");
+        let (_, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 503);
+    }
+
+    #[tokio::test]
+    async fn the_deepseek_preset_points_at_the_messages_endpoint() {
+        let client = Client::deepseek("k");
+        assert_eq!(client.base_url, "https://api.deepseek.com/anthropic");
+        assert_eq!(client.dialect(), Dialect::DeepSeek);
+        assert_eq!(client.available_models(), vec!["deepseek-flash", "deepseek-v4-pro"]);
+        assert_eq!(Client::new("k").dialect(), Dialect::Anthropic);
+    }
+
+    /// DeepSeek's endpoint answers `GET /v1/models/{id}` with 404, so the
+    /// lookup is not made.
+    ///
+    /// Falsified by a deepseek client that asks its capability source.
+    #[tokio::test]
+    async fn a_deepseek_client_makes_no_context_window_lookup() {
+        use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
+        let fake = Arc::new(FakeModelCapabilitySource::always_none().with_response("deepseek-flash", Ok(Some(5))));
+        let client = Client::deepseek("k").with_capability_source(fake.clone());
+        assert_eq!(client.context_window("deepseek-flash").await, None);
+        assert_eq!(fake.call_count(), 0);
+    }
+
+    /// `prompt()` against DeepSeek turns thinking off, so `max_tokens` is
+    /// not spent before the answer.
+    #[tokio::test]
+    async fn a_deepseek_prompt_sends_thinking_disabled() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let ok = r#"{"id":"m","model":"deepseek-flash","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (base, seen) = serve(vec![reply(200, ok)]).await;
+        let text = Client::deepseek("k").with_base_url(&base).prompt("deepseek-flash", None, "hi").await.unwrap();
+        assert_eq!(text, "ok");
+        let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(wire["thinking"], serde_json::json!({"type": "disabled"}));
     }
 }

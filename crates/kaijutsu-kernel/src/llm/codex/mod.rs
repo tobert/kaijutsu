@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::llm::{InlineToolResult, StreamEvent};
+use crate::llm::{InlineToolResult, StreamError, StreamErrorKind, StreamEvent};
 
 /// The version-neutral error surface for this experimental protocol bridge.
 #[derive(Debug, Error)]
@@ -39,6 +39,23 @@ pub enum CodexError {
 }
 
 pub type Result<T> = std::result::Result<T, CodexError>;
+
+impl CodexError {
+    /// The stream failure this error ends a turn with.
+    fn stream_kind(&self) -> StreamErrorKind {
+        match self {
+            Self::Io(_) | Self::Closed => StreamErrorKind::Transport,
+            Self::Json(_) | Self::Protocol(_) => StreamErrorKind::Protocol,
+            Self::Rejected { .. } => StreamErrorKind::InvalidRequest,
+        }
+    }
+}
+
+impl From<CodexError> for StreamError {
+    fn from(error: CodexError) -> Self {
+        StreamError::new(error.stream_kind(), error.to_string())
+    }
+}
 
 /// Bidirectional line-delimited JSON transport for one app-server session.
 ///
@@ -414,22 +431,24 @@ impl<T: JsonlTransport> Client<T> {
             return None;
         }
         if self.inline_tool.is_some() {
-            return Some(StreamEvent::Error(
-                "Codex app-server is waiting for an inline tool result".into(),
-            ));
+            return Some(StreamEvent::Error(StreamError::new(
+                StreamErrorKind::Protocol,
+                "Codex app-server is waiting for an inline tool result",
+            )));
         }
         loop {
             let packet = match self.transport.receive().await {
                 Ok(Some(packet)) => packet,
                 Ok(None) => {
                     self.terminal_emitted = true;
-                    return Some(StreamEvent::Error(
-                        "Codex app-server closed before turn/completed".into(),
-                    ));
+                    return Some(StreamEvent::Error(StreamError::new(
+                        StreamErrorKind::Transport,
+                        "Codex app-server closed before turn/completed",
+                    )));
                 }
                 Err(error) => {
                     self.terminal_emitted = true;
-                    return Some(StreamEvent::Error(error.to_string()));
+                    return Some(StreamEvent::Error(error.into()));
                 }
             };
             match self.handle_packet(packet).await {
@@ -443,7 +462,7 @@ impl<T: JsonlTransport> Client<T> {
                 }
                 Err(error) => {
                     self.terminal_emitted = true;
-                    return Some(StreamEvent::Error(error.to_string()));
+                    return Some(StreamEvent::Error(error.into()));
                 }
             }
         }
@@ -655,7 +674,10 @@ impl<T: JsonlTransport> Client<T> {
                         .get("error")
                         .map(Value::to_string)
                         .unwrap_or_else(|| format!("Codex turn ended with status {status:?}"));
-                    self.pending.push_back(StreamEvent::Error(detail));
+                    self.pending.push_back(StreamEvent::Error(StreamError::new(
+                        StreamErrorKind::Unknown("codex_turn".into()),
+                        detail,
+                    )));
                 } else {
                     self.pending.push_back(StreamEvent::Done {
                         stop_reason: Some("end_turn".into()),
@@ -672,7 +694,10 @@ impl<T: JsonlTransport> Client<T> {
                     .map(Value::to_string)
                     .unwrap_or_else(|| "Codex app-server reported an error".into());
                 self.close_open_blocks();
-                self.pending.push_back(StreamEvent::Error(detail));
+                self.pending.push_back(StreamEvent::Error(StreamError::new(
+                    StreamErrorKind::Unknown("codex_error".into()),
+                    detail,
+                )));
             }
             _ => {}
         }
@@ -781,8 +806,8 @@ mod tests {
             "method": "item/commandExecution/requestApproval", "params": {}
         });
         let mut client = Client::new(FakeTransport::new([request]));
-        assert!(matches!(client.next_event().await, Some(StreamEvent::Error(detail))
-            if detail.contains("closed before turn/completed")));
+        assert!(matches!(client.next_event().await, Some(StreamEvent::Error(error))
+            if error.message.contains("closed before turn/completed")));
         assert_eq!(client.transport.sent, vec![json!({
             "id": "approval-1", "result": { "decision": "decline" }
         })]);
@@ -878,7 +903,10 @@ mod tests {
         let mut client = Client::new(FakeTransport::new([]));
         assert_eq!(
             client.next_event().await,
-            Some(StreamEvent::Error("Codex app-server closed before turn/completed".into()))
+            Some(StreamEvent::Error(StreamError::new(
+                StreamErrorKind::Transport,
+                "Codex app-server closed before turn/completed",
+            )))
         );
         assert_eq!(client.next_event().await, None);
     }
@@ -888,7 +916,7 @@ mod tests {
         let mut client = Client::new(FakeTransport::new([json!({
             "method": "turn/completed", "params": { "turn": {} },
         })]));
-        assert!(matches!(client.next_event().await, Some(StreamEvent::Error(detail)) if detail.contains("status None")));
+        assert!(matches!(client.next_event().await, Some(StreamEvent::Error(error)) if error.message.contains("status None")));
         assert_eq!(client.next_event().await, None);
     }
 

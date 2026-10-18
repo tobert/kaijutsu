@@ -49,14 +49,17 @@ pub enum StreamEvent {
     ThinkingDelta(String),
     /// End of the current thinking block.
     ///
-    /// `signature` carries the provider-specific verification token
-    /// (Anthropic's `signature_delta`) when extended thinking is
-    /// enabled. The server-side block writer captures it and threads
-    /// it into [`crate::llm::ContentBlock::Reasoning`] on the
-    /// assistant message so subsequent tool-use turns can echo the
-    /// reasoning chain back with its verifying signature. `None` when
-    /// the provider didn't emit one (e.g. extended thinking disabled,
-    /// or non-Anthropic providers that don't have the concept).
+    /// `signature` is the provider's continuity token for the block, and
+    /// only that provider can use it: Anthropic's `signature_delta` (base64),
+    /// a UUID from DeepSeek's Messages endpoint, a sentinel the OpenAI-compatible client and `mk` write (reasoning
+    /// they round-trip as text), or, for a `redacted_thinking` block, its
+    /// opaque `data` behind the `anthropic:redacted_thinking:` prefix. The
+    /// block writer stores it on the block and threads it into
+    /// [`crate::llm::ContentBlock::Reasoning`] so a later request can send
+    /// the block back; a provider drops a signature it did not produce
+    /// (`llm/claude/build.rs`). The block can have no text when the API
+    /// withheld or omitted it; its signature still goes back. `None` when
+    /// the provider emitted none.
     ThinkingEnd {
         signature: Option<String>,
     },
@@ -135,8 +138,120 @@ pub enum StreamEvent {
         extra: Option<UsageExtra>,
     },
 
-    /// Generation failed. The detail describes the provider or transport error.
-    Error(String),
+    /// Generation failed. The kind says whether a repeat can succeed.
+    Error(StreamError),
+}
+
+/// Whether sending the same request again can succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryDisposition {
+    /// A provider-side hiccup: retry under the bounded backoff.
+    Transient,
+    /// The same request fails the same way: stop and report it.
+    Permanent,
+}
+
+/// What kind of failure ended a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamErrorKind {
+    /// The provider has no capacity for the request (Anthropic 529).
+    Overloaded,
+    /// The account's rate limit answered the request.
+    RateLimited,
+    /// An internal failure on the provider's side.
+    ServerError,
+    /// The provider, or the runtime's own deadline, timed out.
+    Timeout,
+    /// The provider cut the reply for lack of capacity (`insufficient_system_resource`).
+    CapacityCut,
+    /// The provider's content filter ended the reply.
+    ContentFilter,
+    /// The model stopped before it finished: `pause_turn`,
+    /// `model_context_window_exceeded`, or a stop reason this client does not
+    /// know or did not receive. Holds the reason.
+    Truncated(String),
+    /// The credential was refused.
+    Auth,
+    /// The provider rejected the request.
+    InvalidRequest,
+    /// The account cannot pay for the request.
+    Billing,
+    /// The connection failed while the stream was open.
+    Transport,
+    /// The provider's events broke the wire contract: undecodable data, a
+    /// repeated or unopened content block.
+    Protocol,
+    /// An error type this client does not know. Holds the provider's type name.
+    Unknown(String),
+}
+
+impl StreamErrorKind {
+    /// Whether the same request may succeed on another attempt.
+    pub fn retry_disposition(&self) -> RetryDisposition {
+        match self {
+            Self::Overloaded
+            | Self::RateLimited
+            | Self::ServerError
+            | Self::Timeout
+            | Self::CapacityCut
+            | Self::Transport => RetryDisposition::Transient,
+            Self::ContentFilter
+            | Self::Truncated(_)
+            | Self::Auth
+            | Self::InvalidRequest
+            | Self::Billing
+            | Self::Protocol
+            | Self::Unknown(_) => RetryDisposition::Permanent,
+        }
+    }
+
+    /// The name logs and error blocks lead with.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Overloaded => "overloaded_error",
+            Self::RateLimited => "rate_limit_error",
+            Self::ServerError => "api_error",
+            Self::Timeout => "timeout_error",
+            Self::CapacityCut => "insufficient_system_resource",
+            Self::ContentFilter => "content_filter",
+            Self::Truncated(reason) | Self::Unknown(reason) => reason,
+            Self::Auth => "authentication_error",
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Billing => "billing_error",
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+        }
+    }
+}
+
+/// The failure that ended a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamError {
+    pub kind: StreamErrorKind,
+    pub message: String,
+    /// The provider's id for the failed request, when it sent one.
+    pub request_id: Option<String>,
+}
+
+impl StreamError {
+    pub fn new(kind: StreamErrorKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into(), request_id: None }
+    }
+
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
+    }
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind.label(), self.message)?;
+        if let Some(id) = &self.request_id {
+            write!(f, " (request_id: {id})")?;
+        }
+        Ok(())
+    }
 }
 
 /// Result returned to a provider for [`StreamEvent::InlineToolUse`].
@@ -494,30 +609,32 @@ impl FinishReason {
     }
 }
 
-/// Common stream errors plus a typed provider escape hatch.
-///
-/// Phase 1 defines the variants; Phase 2 will surface these from the
-/// Claude wire layer (replacing the current opaque `Error(String)` event).
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum StreamError {
-    #[error("rate limited: {0}")]
-    RateLimit(String),
-    #[error("authentication failed: {0}")]
-    Auth(String),
-    #[error("server error: {0}")]
-    Server(String),
-    #[error("overloaded: {0}")]
-    Overloaded(String),
-    /// Provider-specific error payload that doesn't fit the common shape.
-    /// Kaijutsu surfaces errors as JSON to users — homogenization isn't
-    /// load-bearing, but the typed variant keeps the carrier honest.
-    #[error("provider error: {0}")]
-    Provider(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_load_and_connection_failures_are_transient() {
+        use StreamErrorKind::*;
+        for kind in [Overloaded, RateLimited, ServerError, Timeout, CapacityCut, Transport] {
+            assert_eq!(kind.retry_disposition(), RetryDisposition::Transient, "{kind:?}");
+        }
+        for kind in [
+            ContentFilter, Truncated("pause_turn".into()), Auth, InvalidRequest, Billing, Protocol,
+            Unknown("x".into()),
+        ] {
+            assert_eq!(kind.retry_disposition(), RetryDisposition::Permanent, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_stream_error_displays_its_kind_and_message() {
+        let error = StreamError::new(StreamErrorKind::Overloaded, "servers are busy");
+        assert_eq!(error.to_string(), "overloaded_error: servers are busy");
+        let error = StreamError::new(StreamErrorKind::Truncated("pause_turn".into()), "paused")
+            .with_request_id(Some("req_1".into()));
+        assert_eq!(error.to_string(), "pause_turn: paused (request_id: req_1)");
+    }
 
     #[test]
     fn stream_event_is_delta() {
@@ -538,7 +655,7 @@ mod tests {
             }
             .is_terminal()
         );
-        assert!(StreamEvent::Error("oops".into()).is_terminal());
+        assert!(StreamEvent::Error(StreamError::new(StreamErrorKind::Unknown("x".into()), "oops")).is_terminal());
         assert!(!StreamEvent::TextStart.is_terminal());
     }
 

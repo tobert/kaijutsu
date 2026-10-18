@@ -248,6 +248,9 @@ fn text(content: &MessageContent) -> String {
 }
 
 fn join(into: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
     if !into.is_empty() {
         into.push('\n');
     }

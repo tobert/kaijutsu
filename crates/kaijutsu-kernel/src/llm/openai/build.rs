@@ -331,6 +331,9 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, reasoning_r
                     // Echoed back as reasoning_content (V4 requires it on
                     // tool-call turns). Concatenate if several are present.
                     ContentBlock::Reasoning { text: r, .. } => {
+                        if r.is_empty() {
+                            continue;
+                        }
                         if !reasoning.is_empty() {
                             reasoning.push('\n');
                         }

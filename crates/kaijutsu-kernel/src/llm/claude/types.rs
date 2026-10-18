@@ -168,6 +168,10 @@ pub enum RequestContent {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    /// Echoed back unchanged from assistant history; `data` is opaque.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,7 +220,6 @@ pub enum ToolChoice {
 /// for models [`Thinking::default_for_model`] returns `None` for.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)] // Enabled/Disabled reserved for explicit overrides
 pub enum Thinking {
     Adaptive {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,6 +228,10 @@ pub enum Thinking {
     Enabled {
         budget_tokens: u64,
     },
+    /// `type: "enabled"` with no budget, the shape the DeepSeek endpoint
+    /// takes (it ignores `budget_tokens`).
+    #[serde(rename = "enabled")]
+    On,
     Disabled,
 }
 
@@ -254,6 +261,28 @@ impl Thinking {
         }
     }
 
+    /// Whether the model thinks on every request. Such a model rejects
+    /// `thinking: {"type": "disabled"}`: the Fable and Mythos tiers, and
+    /// Sonnet from 5.5. Parses the id as [`Self::default_for_model`] does.
+    pub fn is_always_on(model: &str) -> bool {
+        let mut parts = model.split('-');
+        if parts.next() != Some("claude") {
+            return false;
+        }
+        match parts.next() {
+            Some("fable" | "mythos") => true,
+            Some("sonnet") => {
+                let major: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+                let minor: u32 = parts
+                    .next()
+                    .and_then(|p| if p.len() <= 2 { p.parse().ok() } else { None })
+                    .unwrap_or(0);
+                major.is_some_and(|major| (major, minor) >= (5, 5))
+            }
+            _ => false,
+        }
+    }
+
     /// Model-gated default thinking config for a Claude model id.
     ///
     /// Adaptive thinking exists on the 4.6+ generation (Opus 4.6/4.7/
@@ -272,7 +301,7 @@ impl Thinking {
         match family {
             // Always-on thinking tier; adaptive is the only accepted shape.
             "fable" | "mythos" => Some(Self::adaptive_summarized()),
-            "opus" | "sonnet" => {
+            "opus" | "sonnet" | "haiku" => {
                 let major: u32 = parts.next()?.parse().ok()?;
                 // Minor is absent on bare ids like `claude-sonnet-5` and
                 // date-suffixed on pinned ids; a non-numeric next part
@@ -282,9 +311,12 @@ impl Thinking {
                     .next()
                     .and_then(|p| if p.len() <= 2 { p.parse().ok() } else { None })
                     .unwrap_or(0);
-                ((major, minor) >= (4, 6)).then(Self::adaptive_summarized)
+                // Haiku joined the adaptive tier with 5; haiku-4-5 has only the
+                // budget tier.
+                let first_adaptive = if family == "haiku" { (5, 0) } else { (4, 6) };
+                ((major, minor) >= first_adaptive).then(Self::adaptive_summarized)
             }
-            // haiku-4-5 and unknown families: no adaptive support.
+            // Unknown families: no adaptive support.
             _ => None,
         }
     }
@@ -354,11 +386,17 @@ pub enum ResponseContent {
         #[serde(default)]
         signature: Option<String>,
     },
+    RedactedThinking {
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
     },
+    /// Any block type `prompt()` has no use for (server tool blocks, say).
+    #[serde(other)]
+    Other,
 }
 
 /// Token usage payload — both non-streaming responses and the streaming
@@ -444,6 +482,8 @@ mod tests {
             "claude-sonnet-5",
             "claude-opus-5-5",
             "claude-sonnet-5-5",
+            "claude-haiku-5",
+            "claude-haiku-5-5",
             "claude-fable-5",
             "claude-fable-5-1",
             "claude-mythos-5",
@@ -475,6 +515,30 @@ mod tests {
                 "{model} must not default to thinking"
             );
         }
+    }
+
+    #[test]
+    fn thinking_on_serializes_as_enabled_without_a_budget() {
+        let v = serde_json::to_value(Thinking::On).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "enabled"}));
+    }
+
+    #[test]
+    fn redacted_thinking_request_block_wire_shape() {
+        let block = RequestContent::RedactedThinking { data: "EmwK".into() };
+        let v = serde_json::to_value(&block).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "redacted_thinking", "data": "EmwK"}));
+    }
+
+    #[test]
+    fn a_response_with_server_tool_blocks_still_parses() {
+        let body = r#"{"id":"m","model":"x","role":"assistant","stop_reason":"end_turn","stop_sequence":null,
+            "content":[{"type":"server_tool_use","id":"s","name":"web_search","input":{}},
+                       {"type":"redacted_thinking","data":"d"},{"type":"text","text":"hi"}],
+            "usage":{"input_tokens":1,"output_tokens":1,"service_tier":"standard"}}"#;
+        let parsed: MessagesResponse = serde_json::from_str(body).unwrap();
+        assert!(matches!(parsed.content[0], ResponseContent::Other));
+        assert!(matches!(parsed.content[1], ResponseContent::RedactedThinking { .. }));
     }
 
     #[test]

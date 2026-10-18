@@ -1723,17 +1723,21 @@ pub struct BlockSnapshot {
     /// `None` until the tool finishes.
     #[serde(default)]
     pub stderr: Option<String>,
-    /// Provider reasoning-continuity token for `Thinking` blocks — an opaque,
-    /// provider-agnostic marker that says "this reasoning is rehydratable."
-    /// Carries the verbatim Anthropic `signature` (or Gemini `thoughtSignature`)
-    /// that the API requires when echoing thinking back during a tool-use cycle;
-    /// carries a sentinel nonce for every OpenAI-compatible provider (DeepSeek,
-    /// vLLM, llama.cpp, Alibaba), which round-trips reasoning as plain text.
-    /// `None` means "not rehydratable": the hydrator drops the block with a
-    /// warning (blocks written before OpenAI-compatible streams carried the
-    /// nonce). The token is opaque to the hydrator: cross-provider safety (e.g.
-    /// not feeding an OpenAI-compatible nonce to Anthropic) is a fork/rc-policy
-    /// concern, not a kernel one. See `llm::hydrate`.
+    /// Provider reasoning-continuity token for `Thinking` blocks. It says
+    /// "this reasoning is rehydratable," and only the provider that wrote it
+    /// can use it. Carries the verbatim Anthropic `signature` (or Gemini
+    /// `thoughtSignature`) that the API requires when echoing thinking back
+    /// during a tool-use cycle; the `anthropic:redacted_thinking:` prefix and
+    /// then the opaque `data` for a `redacted_thinking` block, whose `content`
+    /// is empty; and a sentinel nonce for every OpenAI-compatible provider
+    /// (DeepSeek, vLLM, llama.cpp, Alibaba) and `mk`, which round-trip
+    /// reasoning as plain text. A block with a signature and no text still
+    /// replays, since the API withheld or omitted its text. `None` means "not
+    /// rehydratable": the hydrator drops the block with a warning (blocks
+    /// written before OpenAI-compatible streams carried the nonce). The
+    /// hydrator treats the token as opaque; the provider's request builder
+    /// refuses a signature it did not produce (`llm/claude/build.rs`). See
+    /// `llm::hydrate`.
     #[serde(default)]
     pub signature: Option<String>,
     /// Structured output data for richer formatting (tables, trees).

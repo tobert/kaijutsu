@@ -544,15 +544,17 @@ were not the root, with no error. The ledger now uses
 fault (`Err`); move these callers to it and propagate the fault. The other
 `lineage_root` callers in the same file need the same check.
 
-## The turn path's futures sit near the 2 MB stack (2026-10-11)
+## Debug-build stack frames sit near the 2 MB test-thread limit (2026-10-18)
 
-`kj::context::tests::a_root_cwd_is_accepted_with_a_warning` overflowed a 2 MB test-thread
-stack when `BuildOpts` grew by about 80 bytes (the request trace, now behind an `Arc`;
-`llm/request_dump.rs` pins it pointer-sized). `BuildOpts` rides by value through every
-provider stream and prompt future, so small growth multiplies. The server's tokio workers run
-on default stacks too. Measure the turn future (`size_of_val` on the provider stream and
-`run_llm_stream` futures) and box the largest inner future, so a field added later cannot
-crash a live turn. Running tests with `RUST_MIN_STACK` hides this; isolation runs should not.
+`kj::context::tests::a_root_cwd_is_accepted_with_a_warning` overflowed a 2 MB thread without
+`RUST_MIN_STACK`. The overflow is in `kj context create`, not the turn path: rc runs kaish,
+which re-enters `KjDispatcher::dispatch`, and an unoptimized build gives each awaited handler
+future a slot in that frame. `dispatch` now awaits its large handlers through
+`Box::pin(async { ... })` and `process_llm_stream` boxes `run_llm_stream`; the test needs about
+1.65 MB where it needed more than 2 MB. Open: the margin is still small. The clap derive
+`augment_subcommands` for `kj block` takes a 378 KB frame, the kaish interpreter frames take
+about 390 KB, and `rc::run` frames about 170 KB. Guards: `dispatch_future_stays_small`,
+`a_turn_future_stays_small`. Running tests with `RUST_MIN_STACK` hides growth.
 
 ## A card that arms mid-line takes a typed letter as an answer (2026-10-08)
 
@@ -1423,13 +1425,16 @@ more readily than other agents". Open, most costly first:
 From the first Terminal-Bench 2.0 runs in containers (jobs under
 `~/src/bench-work/harbor/jobs/kj-calib-1`):
 
-- **A mid-stream transport failure still fails the turn.** The recorded runs
-  carry "error decoding response body" and "Connection closed" after content
-  had already streamed into blocks. Retrying there means deciding what happens
-  to the partial blocks the first attempt wrote, which the stream-start retry
-  policy does not cover; `runtime/llm_stream.rs` deliberately does not retry
-  mid-stream to avoid duplicate kernel blocks. Bring partial-block handling to
-  the design before changing it.
+- **A mid-stream failure after a written block still fails the turn.**
+  The recorded runs carry "error decoding response body" and "Connection
+  closed" after content had already streamed into blocks.
+  `runtime/llm_stream.rs` sends a failed stream again only when its error
+  kind is transient and the attempt wrote no block
+  (`docs/retries-and-ratelimits.md`, "Mid-stream retry follows the error
+  kind"). A `Transport` failure before any block is sent again now; after a
+  written block a resend would duplicate the partial blocks. Open: decide what
+  happens to those partial blocks, and whether a cut after only a thinking
+  block may be sent again, before widening the rule.
 - **The bench adapter duplicates DeepSeek's output budget.**
   `contrib/bench/harbor/kaijutsu_solo_agent.py` passes 65536 on DeepSeek
   when `KAIJUTSU_ACP_MAX_TOKENS` is unset. The DeepSeek model rows
@@ -4001,25 +4006,37 @@ is what `invalid_live_tool_pairing_fails_once_without_retry` already uses. An
 error-injection builder on `MockClient` would let that test's shape cover the
 permanent and transient cases, and would prove the attempt count.
 
-## OpenAI's 402 becomes a retried `ApiError` (2026-09-20)
+## A `refusal` stop reason ends a turn as `EndTurn` (2026-10-18)
 
-`llm/openai/mod.rs:255` maps HTTP 402 to `LlmError::ApiError("insufficient
-balance: ...")`, and `retry_disposition` (`runtime/llm_stream.rs`) classifies
-every `ApiError` as transient, so an exhausted balance spends the full backoff
-reproducing itself. Claude routes the same status through `400..=499 =>
-InvalidRequest` (`llm/claude/mod.rs:331`), so the two providers disagree. The
-catch-all `_` arm in both also lands a non-4xx/5xx status on `ApiError`, and a
-JSON-parse failure of a successful response does too
-(`openai/mod.rs:192`, `claude/mod.rs:246`). Decide whether 402 is a permanent
-variant or whether `ApiError` needs splitting, and make both providers agree.
-Found by kaibo reviewing the retry-classification commit.
+The Messages stream delivers `stop_reason: refusal` as `Done`, and the runtime
+reports the turn as `EndTurn` (`runtime/llm_stream.rs`, the `Done` arm). A
+player cannot tell a refusal from a finished reply. A distinct outcome needs a
+new `TurnStopReason` variant, which touches the capnp enum in `kaijutsu.capnp`,
+the client mirror in `kaijutsu-client/src/subscriptions.rs`, the ACP
+`stopReason` mapping, and `flows.rs`'s `as_str` and serde round trip. Decide
+the wire change first.
 
-## A Claude provider comment promises an error it panics instead (2026-09-20)
+## Thinking signature provenance is a shape check (2026-10-18)
 
-`llm/claude/mod.rs:85-89` says a reqwest client-builder failure surfaces as
-`LlmError::Unavailable`; the code `.expect()`s and panics
-(`claude/mod.rs:108-109`). Either return the error or say that a builder
-failure is unrecoverable at construction. Found by kaibo.
+`llm/claude/build.rs` sends a thinking block only when its signature has the
+shape its dialect's streams produce (`is_own_signature`): base64 for Anthropic,
+a UUID for DeepSeek's Messages endpoint (live-observed). The other providers'
+markers (`openai-compat-reasoning`, `mk-reasoning`) and the redacted-thinking
+marker (`anthropic:redacted_thinking:`) fit neither. If a server changes its
+signature encoding, valid thinking is dropped with a warning. A block that says
+which provider signed it (a field on `BlockSnapshot`, set by the block writer
+from the stream) would replace the check.
+
+## The catch-all HTTP statuses still land on a retried `ApiError` (2026-09-20)
+
+HTTP 402 is fixed on the OpenAI-compatible and `mk` paths (both give
+`LlmError::InsufficientBalance`, permanent). Claude routes 402 through
+`400..=499 => InvalidRequest` (`llm/claude/mod.rs:331`), which is also
+permanent. The catch-all `_` arm in both providers still lands a
+non-4xx/5xx status on `ApiError`, and a JSON-parse failure of a successful
+response does too (`openai/mod.rs`, `claude/mod.rs:246`); `retry_disposition`
+treats every `ApiError` as transient. Decide whether those cases need a
+permanent variant. Found by kaibo reviewing the retry-classification commit.
 
 ## `cargo test -p kaijutsu-solo-acp` fails 21 tests for a missing feature (2026-09-20)
 

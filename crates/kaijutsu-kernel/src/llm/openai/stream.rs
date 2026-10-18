@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::llm::stream::{OpenAiCompatUsageExtra, StreamEvent, UsageExtra};
+use crate::llm::stream::{OpenAiCompatUsageExtra, StreamError, StreamErrorKind, StreamEvent, UsageExtra};
 
 use super::sse::OpenAiSseEvent;
 use super::types::{ChunkChoice, ToolCallChunk, Usage};
@@ -65,6 +65,24 @@ pub struct StateMachine {
     tool_calls: BTreeMap<usize, ToolAccum>,
     stop_reason: Option<String>,
     usage: Option<Usage>,
+    /// A `finish_reason` ended the stream in an error. The `[DONE]` that
+    /// follows completes nothing.
+    failed: bool,
+}
+
+/// `finish_reason` a provider sends when it cut the response for lack of
+/// capacity. The reply is incomplete and a repeat may succeed.
+const INSUFFICIENT_RESOURCE: &str = "insufficient_system_resource";
+
+/// `finish_reason` a provider sends when its content filter ended the reply.
+const CONTENT_FILTER: &str = "content_filter";
+
+/// The [`StreamEvent::Error`] for a capacity cut.
+pub(crate) fn capacity_cut() -> StreamError {
+    StreamError::new(
+        StreamErrorKind::CapacityCut,
+        "the provider cut the response for lack of capacity",
+    )
 }
 
 /// Sentinel token marking openai-compatible reasoning as rehydratable. Opaque —
@@ -75,6 +93,11 @@ const REASONING_NONCE: &str = "openai-compat-reasoning";
 impl StateMachine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether a `finish_reason` or an error chunk ended the reply in an error.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
     }
 
     /// The `ThinkingEnd` signature: the rehydration nonce, so a model's own
@@ -98,6 +121,11 @@ impl StateMachine {
                 }
                 out
             }
+            OpenAiSseEvent::Error(error) => {
+                self.failed = true;
+                vec![StreamEvent::Error(error)]
+            }
+            OpenAiSseEvent::Done if self.failed => Vec::new(),
             OpenAiSseEvent::Done => {
                 let mut out = Vec::new();
                 // Defensive: if the stream ended without a finish_reason
@@ -167,9 +195,25 @@ impl StateMachine {
         }
 
         // finish_reason → close the open block and flush accumulated tools.
+        // A capacity cut or a content filter ends the reply without its
+        // pending tool calls: they are dropped, not run.
         if let Some(fr) = finish_reason {
             self.close_open_block(out);
-            self.flush_tool_calls(out);
+            let failure = match fr.as_str() {
+                INSUFFICIENT_RESOURCE => Some(capacity_cut()),
+                CONTENT_FILTER => Some(StreamError::new(
+                    StreamErrorKind::ContentFilter,
+                    "the provider's content filter ended the response",
+                )),
+                _ => None,
+            };
+            if let Some(error) = failure {
+                self.tool_calls.clear();
+                self.failed = true;
+                out.push(StreamEvent::Error(error));
+            } else {
+                self.flush_tool_calls(out);
+            }
             self.stop_reason = Some(fr);
         }
     }
@@ -216,8 +260,9 @@ impl StateMachine {
         let drained = std::mem::take(&mut self.tool_calls);
         for (index, accum) in drained {
             let Some(name) = accum.name else {
-                out.push(StreamEvent::Error(format!(
-                    "tool call at index {index} arrived without a function name",
+                out.push(StreamEvent::Error(StreamError::new(
+                    StreamErrorKind::Protocol,
+                    format!("tool call at index {index} arrived without a function name"),
                 )));
                 continue;
             };
@@ -674,5 +719,56 @@ data: [DONE]
                 },
             ]
         );
+    }
+
+    const CUT_WITH_TOOL_CALL: &str = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"FINISH\"}]}
+
+data: [DONE]
+
+";
+
+    #[tokio::test]
+    async fn a_capacity_cut_is_a_transient_error_and_runs_no_tool_call() {
+        let events = run(&CUT_WITH_TOOL_CALL.replace("FINISH", "insufficient_system_resource")).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::ToolUse { .. } | StreamEvent::Done { .. })),
+            "a cut stream must not yield a tool call or a completion: {events:?}"
+        );
+        match events.last() {
+            Some(StreamEvent::Error(error)) => {
+                assert_eq!(error.kind, StreamErrorKind::CapacityCut, "{error}");
+            }
+            other => panic!("expected a CapacityCut Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_content_filter_stop_is_a_visible_error_and_runs_no_tool_call() {
+        let events = run(&CUT_WITH_TOOL_CALL.replace("FINISH", "content_filter")).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::ToolUse { .. } | StreamEvent::Done { .. })),
+            "a filtered stream must not yield a tool call or a completion: {events:?}"
+        );
+        match events.last() {
+            Some(StreamEvent::Error(error)) => {
+                assert_eq!(error.kind, StreamErrorKind::ContentFilter, "{error}");
+            }
+            other => panic!("expected an Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_chunk_surfaces_the_providers_message() {
+        let events = run("data: {\"error\":{\"message\":\"engine overloaded\",\"type\":\"server_error\"}}\n\n").await;
+        match events.as_slice() {
+            [StreamEvent::Error(error)] => {
+                assert_eq!(error.kind, StreamErrorKind::ServerError, "{error}");
+                assert!(error.message.contains("engine overloaded"), "{error}");
+            }
+            other => panic!("expected one Error, got {other:?}"),
+        }
     }
 }

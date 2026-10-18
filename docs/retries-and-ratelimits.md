@@ -89,6 +89,41 @@ in the first place.
   to its player. A turn's existing startup retry (`runtime/llm_stream.rs`,
   two retries for a transient error) still applies to `RateLimited`, so a
   turn that got no slot tries twice more, each waiting for a slot again.
+  Each retry waits for a ceiling that doubles from 1 s up to 30 s, less a
+  random amount of up to half of it, so the wait runs from 0.5 s up to
+  30 s: between half the ceiling and the ceiling. HTTP 402 (insufficient balance) is
+  permanent and is not sent again.
+- **Mid-stream retry follows the error kind.** A stream error is a
+  `StreamError { kind, message, request_id }` (`llm/stream.rs`), and the kind
+  says whether a repeat can succeed. Transient kinds are `Overloaded`,
+  `RateLimited`, `ServerError`, `Timeout`, `CapacityCut`, and `Transport`.
+  The rest are permanent: `ContentFilter`, `Truncated` (a model-side
+  incomplete stop: `pause_turn`, `model_context_window_exceeded`, an unknown
+  or missing stop reason), `Auth`, `InvalidRequest`, `Billing`, `Protocol`,
+  and `Unknown`. A failed stream is sent again only when its kind is
+  transient, the attempt wrote no block, the step's total timeout has not
+  passed, and fewer than two retries are spent, with the same backoff as a
+  startup retry. The resend keeps its step and raises the attempt number on
+  the request log, and shares the step's total request timeout with the first
+  attempt. Each provider maps its own errors to kinds: the OpenAI-compatible
+  client by `finish_reason` (`insufficient_system_resource` is `CapacityCut`,
+  `content_filter` is `ContentFilter`) and by an error chunk's `type`; the
+  Messages client by the API error type (`ApiErrorKind`), with the
+  `request_id` kept; the `mk` client by status or by how the call failed; and
+  the runtime's own idle and total timeouts are `Timeout`. Endpoint cooling
+  stays in the providers: a capacity cut starts a cooldown (503, from 5 s,
+  doubling while cuts repeat), so parallel seats wait with the one that was
+  cut. A capacity cut sends no usage, so each one logs a `warn` with context,
+  step, attempt, and the provider's reason, and the turn span records the
+  count as `llm.stream_cuts`. A stream that fails after it wrote a block
+  fails the turn whatever its kind: streamed text, thinking, and tool calls
+  are durable as they arrive, so a resend would duplicate them. A
+  `content_filter` stop and an in-stream error chunk end the stream with
+  their error and run none of the reply's tool calls. `Display` of a stream
+  error reads `<kind>: <message>`, with the request id when there is one.
+  A `refusal` stop reason is still reported as `EndTurn`: telling it apart
+  needs a new `TurnStopReason` on the wire (`kaijutsu.capnp`, the client
+  mirror, and the ACP mapping), recorded in `docs/issues.md`.
 
 ## Where it applies
 
@@ -190,6 +225,25 @@ Each of these waits for a reading that says the simple form is not enough:
 - Opening a stream keeps the doubling, and a stream that ends whole resets
   it; a mid-stream 503 cools the endpoint (`llm/endpoint.rs`,
   `llm/mk/mod.rs`, `llm/claude/mod.rs`, `llm/openai/mod.rs`).
+- A capacity cut cools the endpoint (503) and the `[DONE]` after it does not
+  reset the doubling (`llm/openai/mod.rs`). Each provider's errors map to the
+  kinds above (`llm/openai/sse.rs`, `llm/claude/stream.rs`, `llm/mk/mod.rs`),
+  and a Messages stream that ends in an error does not count as a completed
+  answer (`llm/claude/mod.rs`).
+- A capacity cut before any block is sent again with the same messages; the
+  third cut fails the turn; a cut after text, or after a thinking block, or
+  a permanent kind, is not sent again; every transient kind is sent again
+  and every permanent kind is not; an idle stream is sent again and a total
+  timeout is not; the retry keeps its step and raises the attempt; it shares
+  the step's total timeout; the turn span counts cuts
+  (`runtime/llm_stream.rs`, `a_transient_cut_*`, `a_cut_after_*`,
+  `a_retried_cut_*`, `the_error_kind_decides_*`, `an_idle_stream_*`,
+  `a_total_timeout_*`, `turn_span_records_usage_once_*`).
+- A 402 sends one request and fails the turn, from the OpenAI-compatible
+  client end to end (`runtime/llm_stream.rs`,
+  `an_insufficient_balance_answer_sends_one_request`) and from `mk`
+  (`llm/mk/mod.rs`); the retry backoff is 0.5 s to 30 s
+  (`runtime/llm_stream.rs`, `retry_backoff_tests`).
 - A backend that does not build sets no limit (`llm/db_config.rs`), `kj
   backend show` says so, and `kj backend set` refuses `--max-concurrent`
   on codex-app (`kj/backend.rs`).

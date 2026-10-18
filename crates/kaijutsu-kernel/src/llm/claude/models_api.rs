@@ -179,6 +179,7 @@ pub mod test_support {
             LlmError::NetworkError(s) => LlmError::NetworkError(s.clone()),
             LlmError::AuthError(s) => LlmError::AuthError(s.clone()),
             LlmError::ApiError(s) => LlmError::ApiError(s.clone()),
+            LlmError::InsufficientBalance(s) => LlmError::InsufficientBalance(s.clone()),
             LlmError::RateLimited(s) => LlmError::RateLimited(s.clone()),
             LlmError::InvalidRequest(s) => LlmError::InvalidRequest(s.clone()),
             LlmError::Unavailable(s) => LlmError::Unavailable(s.clone()),

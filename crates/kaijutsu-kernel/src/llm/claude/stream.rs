@@ -21,11 +21,35 @@
 //! content_block_start (tool_use)              (buffer id, name; collect partials)
 //! content_block_delta (input_json_delta)      (append partial_json)
 //! content_block_stop                          ToolUse { id, name, input }
+//! content_block_start (redacted_thinking)     ThinkingStart (data kept for ThinkingEnd)
+//! content_block_stop                          ThinkingEnd { signature: redacted marker }
 //! message_delta                               (capture stop_reason + usage, no emit)
-//! message_stop                                (close open blocks), Done { ... }
-//! error                                       Error(String)
-//! ping                                        (no emit)
+//! message_stop                                (close open blocks), Done or Error
+//! error                                       Error(StreamError, kind by the error type)
+//! ping, unknown event names                   (no emit)
 //! ```
+//!
+//! `message_stop` ends in `Done` for the stop reasons that complete a reply
+//! (`end_turn`, `stop_sequence`, `tool_use`, `max_tokens`, `refusal`; the
+//! reason rides on `Done`). It ends in `Error` for a reply that did not
+//! complete: `pause_turn` (a server-tool loop this client does not run),
+//! `model_context_window_exceeded` (the reply is truncated by the window),
+//! a missing reason, and any reason this client does not know; the kind is
+//! [`StreamErrorKind::Truncated`] holding the reason.
+//!
+//! After an `Error` the machine emits nothing more: no `Done` follows a
+//! failure.
+//!
+//! The Messages API returns a redacted thinking block as opaque `data` that
+//! must go back unchanged. `StreamEvent::ThinkingEnd` has one string for it,
+//! so the block's `data` rides there behind [`REDACTED_THINKING_PREFIX`];
+//! [`super::build`] turns it back into a `redacted_thinking` block for the
+//! Anthropic dialect only. A real signature is base64 and holds neither `:`
+//! nor `-`, so the marker cannot collide with one.
+//!
+//! A block's opening event can already carry content: text, thinking, or a
+//! tool call's whole input. The machine emits it as the first delta, and a
+//! tool call whose deltas never come takes the input from the opening event.
 //!
 //! Signature bytes from `signature_delta` accumulate across deltas
 //! (Anthropic emits one in practice, but the `delta` suffix on the
@@ -38,15 +62,49 @@
 
 use std::collections::HashMap;
 
-use crate::llm::stream::StreamEvent;
+use crate::llm::stream::{StreamError, StreamErrorKind, StreamEvent};
 
 use super::sse::{BlockDelta, ClaudeSseEvent, StartedBlock};
+
+/// Marks a `ThinkingEnd` signature that carries a `redacted_thinking` block's
+/// `data`, not a signature. No other provider's marker starts with it.
+pub const REDACTED_THINKING_PREFIX: &str = "anthropic:redacted_thinking:";
+
+/// `Ok` when the `stop_reason` completes a reply, `Err` with the error for a
+/// reply that did not complete.
+pub(super) fn check_stop_reason(stop_reason: Option<&str>) -> Result<(), StreamError> {
+    let truncated = |reason: &str, message: &str| {
+        Err(StreamError::new(StreamErrorKind::Truncated(reason.to_string()), message))
+    };
+    match stop_reason {
+        Some("end_turn" | "stop_sequence" | "tool_use" | "max_tokens" | "refusal") => Ok(()),
+        Some("pause_turn") => truncated(
+            "pause_turn",
+            "the reply paused inside a server-tool loop, which this client does not continue",
+        ),
+        Some("model_context_window_exceeded") => truncated(
+            "model_context_window_exceeded",
+            "the reply filled the model's context window and is truncated",
+        ),
+        Some(other) => truncated(other, "unknown stop_reason; the reply may be incomplete"),
+        None => truncated("no_stop_reason", "the message ended without a stop_reason"),
+    }
+}
+
+/// The error for an event that breaks the wire contract.
+fn protocol(message: String) -> StreamEvent {
+    StreamEvent::Error(StreamError::new(StreamErrorKind::Protocol, message))
+}
 
 /// Per-content-block state we need to remember between `start`,
 /// `delta`, and `stop` events.
 #[derive(Debug, Clone)]
 enum BlockState {
     Text,
+    /// A `redacted_thinking` block: its opaque `data`, surfaced at stop.
+    RedactedThinking {
+        data: String,
+    },
     Thinking {
         /// Accumulated `signature_delta` payload. Anthropic emits a
         /// single signature_delta per thinking block in practice, but
@@ -58,6 +116,9 @@ enum BlockState {
     ToolUse {
         id: String,
         name: String,
+        /// The input the opening event carried, when it was not empty. Used
+        /// only when no `input_json_delta` follows.
+        start_input: Option<serde_json::Value>,
         /// Concatenated `partial_json` fragments from `input_json_delta`
         /// events. Parsed at `content_block_stop` time. Empty after a
         /// bare `content_block_start` for tool_use means "no arguments"
@@ -88,11 +149,18 @@ pub struct StateMachine {
     /// instead of dropping them.
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
+    /// An `Error` was emitted. Nothing follows it.
+    failed: bool,
 }
 
 impl StateMachine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether an `Error` ended the reply.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// Process one SSE event, returning the corresponding
@@ -101,6 +169,18 @@ impl StateMachine {
     /// Returns a `Vec` because `message_stop` can emit the closing events
     /// of blocks left open before its `Done`.
     pub fn step(&mut self, event: ClaudeSseEvent) -> Vec<StreamEvent> {
+        if self.failed {
+            return Vec::new();
+        }
+        let mut out = self.dispatch(event);
+        if let Some(position) = out.iter().position(|e| matches!(e, StreamEvent::Error(_))) {
+            out.truncate(position + 1);
+            self.failed = true;
+        }
+        out
+    }
+
+    fn dispatch(&mut self, event: ClaudeSseEvent) -> Vec<StreamEvent> {
         match event {
             ClaudeSseEvent::MessageStart(p) => {
                 self.input_tokens = Some(p.message.usage.input_tokens);
@@ -112,11 +192,25 @@ impl StateMachine {
             ClaudeSseEvent::ContentBlockDelta(p) => self.on_block_delta(p.index, p.delta),
             ClaudeSseEvent::ContentBlockStop(p) => self.on_block_stop(p.index),
             ClaudeSseEvent::MessageDelta(p) => {
-                self.stop_reason = p.delta.stop_reason;
-                // message_delta carries only output_tokens (Anthropic
-                // omits input_tokens here); overwrite is intentional —
-                // it's the final value.
-                self.output_tokens = Some(p.usage.output_tokens);
+                // A later `message_delta` that restates nothing keeps the reason.
+                if let Some(reason) = p.delta.stop_reason {
+                    self.stop_reason = Some(reason);
+                }
+                // `message_delta` usage is cumulative: a field it carries is
+                // the final value. A field it leaves out keeps the count from
+                // `message_start`.
+                if let Some(n) = p.usage.output_tokens {
+                    self.output_tokens = Some(n);
+                }
+                if let Some(n) = p.usage.input_tokens {
+                    self.input_tokens = Some(n);
+                }
+                if let Some(n) = p.usage.cache_read_input_tokens {
+                    self.cache_read_input_tokens = n;
+                }
+                if let Some(n) = p.usage.cache_creation_input_tokens {
+                    self.cache_creation_input_tokens = n;
+                }
                 vec![]
             }
             ClaudeSseEvent::MessageStop => {
@@ -137,43 +231,73 @@ impl StateMachine {
                             },
                         )
                     });
-                out.push(StreamEvent::Done {
-                    stop_reason: self.stop_reason.clone(),
-                    input_tokens: self.input_tokens,
-                    output_tokens: self.output_tokens,
-                    extra,
-                });
+                match check_stop_reason(self.stop_reason.as_deref()) {
+                    Ok(()) => out.push(StreamEvent::Done {
+                        stop_reason: self.stop_reason.clone(),
+                        input_tokens: self.input_tokens,
+                        output_tokens: self.output_tokens,
+                        extra,
+                    }),
+                    Err(error) => out.push(StreamEvent::Error(error)),
+                }
                 out
             }
-            ClaudeSseEvent::Error(e) => vec![StreamEvent::Error(format!(
-                "{}: {}",
-                e.error.kind, e.error.message
-            ))],
+            ClaudeSseEvent::Error(e) => vec![StreamEvent::Error(
+                StreamError::new(e.error.class().stream_kind(), e.error.message.clone())
+                    .with_request_id(e.request_id),
+            )],
             ClaudeSseEvent::Ping => vec![],
+            ClaudeSseEvent::Unknown(name) => {
+                tracing::debug!(event = %name, "ignoring an unknown Messages stream event");
+                vec![]
+            }
         }
     }
 
     fn on_block_start(&mut self, index: usize, block: StartedBlock) -> Vec<StreamEvent> {
+        if self.blocks.contains_key(&index) {
+            return vec![protocol(format!(
+                "received content_block_start for index {index}, which is already open"
+            ))];
+        }
         match block {
-            StartedBlock::Text { .. } => {
+            StartedBlock::Text { text } => {
                 self.blocks.insert(index, BlockState::Text);
-                vec![StreamEvent::TextStart]
+                let mut out = vec![StreamEvent::TextStart];
+                if !text.is_empty() {
+                    out.push(StreamEvent::TextDelta(text));
+                }
+                out
             }
-            StartedBlock::Thinking { .. } => {
+            StartedBlock::Thinking { thinking } => {
                 self.blocks.insert(
                     index,
                     BlockState::Thinking {
                         signature: String::new(),
                     },
                 );
+                let mut out = vec![StreamEvent::ThinkingStart];
+                if !thinking.is_empty() {
+                    out.push(StreamEvent::ThinkingDelta(thinking));
+                }
+                out
+            }
+            StartedBlock::RedactedThinking { data } => {
+                self.blocks.insert(index, BlockState::RedactedThinking { data });
                 vec![StreamEvent::ThinkingStart]
             }
-            StartedBlock::ToolUse { id, name, .. } => {
+            StartedBlock::ToolUse { id, name, input } => {
+                let start_input = match input {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Object(ref map) if map.is_empty() => None,
+                    other => Some(other),
+                };
                 self.blocks.insert(
                     index,
                     BlockState::ToolUse {
                         id,
                         name,
+                        start_input,
                         partial_input: String::new(),
                     },
                 );
@@ -187,12 +311,13 @@ impl StateMachine {
             // Anthropic doesn't send deltas for blocks we never opened —
             // surface the inconsistency so a wire-shape shift fails
             // loudly rather than silently dropping content.
-            return vec![StreamEvent::Error(format!(
+            return vec![protocol(format!(
                 "received content_block_delta for unknown index {index}",
             ))];
         };
         match (state, delta) {
             (BlockState::Text, BlockDelta::TextDelta { text }) => vec![StreamEvent::TextDelta(text)],
+            (BlockState::Text, BlockDelta::CitationsDelta {}) => vec![],
             (BlockState::Thinking { .. }, BlockDelta::ThinkingDelta { thinking }) => {
                 vec![StreamEvent::ThinkingDelta(thinking)]
             }
@@ -210,7 +335,7 @@ impl StateMachine {
                 partial_input.push_str(&partial_json);
                 vec![]
             }
-            (state, delta) => vec![StreamEvent::Error(format!(
+            (state, delta) => vec![protocol(format!(
                 "content_block_delta type mismatch at index {index}: block={state:?}, delta={delta:?}",
             ))],
         }
@@ -218,12 +343,15 @@ impl StateMachine {
 
     fn on_block_stop(&mut self, index: usize) -> Vec<StreamEvent> {
         let Some(state) = self.blocks.remove(&index) else {
-            return vec![StreamEvent::Error(format!(
+            return vec![protocol(format!(
                 "received content_block_stop for unknown index {index}",
             ))];
         };
         match state {
             BlockState::Text => vec![StreamEvent::TextEnd],
+            BlockState::RedactedThinking { data } => vec![StreamEvent::ThinkingEnd {
+                signature: Some(format!("{REDACTED_THINKING_PREFIX}{data}")),
+            }],
             BlockState::Thinking { signature } => {
                 let signature = (!signature.is_empty()).then_some(signature);
                 vec![StreamEvent::ThinkingEnd { signature }]
@@ -231,27 +359,37 @@ impl StateMachine {
             BlockState::ToolUse {
                 id,
                 name,
+                start_input,
                 partial_input,
             } => {
-                let input = if partial_input.is_empty() {
-                    serde_json::Value::Object(serde_json::Map::new())
-                } else {
-                    match serde_json::from_str(&partial_input) {
-                        Ok(v) => v,
-                        // The call is real and the model waits on it, so it
-                        // keeps its identity: the runtime answers it with an
-                        // error tool result instead of failing the turn.
-                        Err(e) => {
-                            return vec![StreamEvent::ToolUseInvalid {
-                                id,
-                                name,
-                                arguments: partial_input,
-                                error: e.to_string(),
-                            }];
-                        }
+                let (raw, parsed) = if partial_input.is_empty() {
+                    match start_input {
+                        Some(value) => (value.to_string(), Ok(value)),
+                        None => (String::new(), Ok(serde_json::Value::Object(Default::default()))),
                     }
+                } else {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&partial_input);
+                    (partial_input, parsed)
                 };
-                vec![StreamEvent::ToolUse { id, name, input }]
+                // The call is real and the model waits on it, so a call whose
+                // input is not a JSON object keeps its identity: the runtime
+                // answers it with an error tool result instead of failing the
+                // turn.
+                match parsed {
+                    Ok(input) if input.is_object() => vec![StreamEvent::ToolUse { id, name, input }],
+                    Ok(other) => vec![StreamEvent::ToolUseInvalid {
+                        id,
+                        name,
+                        arguments: raw,
+                        error: format!("a tool input must be a JSON object, not {other}"),
+                    }],
+                    Err(e) => vec![StreamEvent::ToolUseInvalid {
+                        id,
+                        name,
+                        arguments: raw,
+                        error: e.to_string(),
+                    }],
+                }
             }
         }
     }
@@ -266,6 +404,7 @@ impl StateMachine {
 mod tests {
     use super::*;
     use crate::llm::claude::sse::decode_event;
+    use crate::llm::stream::RetryDisposition;
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
     use std::convert::Infallible;
@@ -420,6 +559,9 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signat
 event: content_block_stop
 data: {\"type\":\"content_block_stop\",\"index\":0}
 
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}
+
 event: message_stop
 data: {\"type\":\"message_stop\"}
 
@@ -441,9 +583,9 @@ data: {\"type\":\"message_stop\"}
                     signature: Some("sig_xyz".into()),
                 },
                 StreamEvent::Done {
-                    stop_reason: None,
+                    stop_reason: Some("end_turn".into()),
                     input_tokens: None,
-                    output_tokens: None,
+                    output_tokens: Some(3),
                     extra: None,
                 },
             ]
@@ -481,15 +623,17 @@ data: {\"type\":\"content_block_stop\",\"index\":0}
     async fn error_event_emits_typed_kaijutsu_error() {
         let payload = "\
 event: error
-data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"servers are busy\"}}
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"servers are busy\"},\"request_id\":\"req_9\"}
 
 ";
         let events = run(payload).await;
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::Error(s) => {
-                assert!(s.contains("overloaded_error"));
-                assert!(s.contains("servers are busy"));
+            StreamEvent::Error(e) => {
+                assert_eq!(e.kind, StreamErrorKind::Overloaded);
+                assert_eq!(e.message, "servers are busy");
+                assert_eq!(e.request_id.as_deref(), Some("req_9"));
+                assert_eq!(e.to_string(), "overloaded_error: servers are busy (request_id: req_9)");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -515,7 +659,10 @@ data: {\"type\":\"content_block_delta\",\"index\":99,\"delta\":{\"type\":\"text_
 ";
         let events = run(payload).await;
         match &events[0] {
-            StreamEvent::Error(s) => assert!(s.contains("unknown index 99")),
+            StreamEvent::Error(e) => {
+                assert_eq!(e.kind, StreamErrorKind::Protocol);
+                assert!(e.message.contains("unknown index 99"), "{e}");
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -634,5 +781,237 @@ data: {\"type\":\"message_stop\"}
             ] if id == "toolu_cut"),
             "open blocks close in index order before Done: {events:?}"
         );
+    }
+
+    fn stopped_with(reason: &str) -> String {
+        format!(
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":{reason}}},\"usage\":{{\"output_tokens\":5}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        )
+    }
+
+    /// Every stop reason that completes a reply is a `Done` carrying the
+    /// reason; the runtime tells them apart by it.
+    #[tokio::test]
+    async fn completing_stop_reasons_end_in_done_with_the_reason() {
+        for reason in ["end_turn", "stop_sequence", "tool_use", "max_tokens", "refusal"] {
+            let events = run(&stopped_with(&format!("\"{reason}\""))).await;
+            match events.as_slice() {
+                [StreamEvent::Done { stop_reason, .. }] => {
+                    assert_eq!(stop_reason.as_deref(), Some(reason))
+                }
+                other => panic!("{reason}: expected Done, got {other:?}"),
+            }
+        }
+    }
+
+    /// A reply that did not complete is an `Error` that names why, never a
+    /// normal end.
+    #[tokio::test]
+    async fn incomplete_stop_reasons_end_in_a_named_error() {
+        let cases = [
+            ("\"pause_turn\"", "pause_turn"),
+            ("\"model_context_window_exceeded\"", "model_context_window_exceeded"),
+            ("\"some_new_reason\"", "some_new_reason"),
+            ("null", "no_stop_reason"),
+        ];
+        for (wire, reason) in cases {
+            let events = run(&stopped_with(wire)).await;
+            match events.as_slice() {
+                [StreamEvent::Error(e)] => {
+                    assert_eq!(e.kind, StreamErrorKind::Truncated(reason.into()), "{wire}: {e}");
+                    assert_eq!(e.kind.retry_disposition(), RetryDisposition::Permanent);
+                }
+                other => panic!("{wire}: expected one Error, got {other:?}"),
+            }
+        }
+        let no_delta = run("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").await;
+        assert!(matches!(no_delta.as_slice(), [StreamEvent::Error(e)]
+            if e.kind == StreamErrorKind::Truncated("no_stop_reason".into())), "{no_delta:?}");
+    }
+
+    #[tokio::test]
+    async fn unknown_event_names_are_skipped() {
+        let payload = format!(
+            "event: future_event\ndata: {{\"type\":\"future_event\"}}\n\n{SIMPLE}"
+        );
+        let events = run(&payload).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
+    }
+
+    /// A redacted thinking block round-trips as one bracketed thinking run
+    /// whose signature carries the opaque data behind the marker.
+    #[tokio::test]
+    async fn redacted_thinking_surfaces_its_data_behind_the_marker() {
+        let payload = "\
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"EmwKAhgB\"}}
+
+event: content_block_stop
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+";
+        let events = run(payload).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingEnd {
+                    signature: Some(format!("{REDACTED_THINKING_PREFIX}EmwKAhgB")),
+                },
+            ]
+        );
+    }
+
+    /// `message_delta` usage is cumulative and may restate the input and
+    /// cache counts; a count it leaves out keeps `message_start`'s value.
+    #[tokio::test]
+    async fn message_delta_usage_overrides_what_it_carries_and_keeps_the_rest() {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"x\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":2,\"output_tokens\":1}}}\n\n";
+        let restated = format!("{start}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":100,\"cache_read_input_tokens\":40,\"output_tokens\":7}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
+        let events = run(&restated).await;
+        assert_eq!(
+            events,
+            vec![StreamEvent::Done {
+                stop_reason: Some("end_turn".into()),
+                input_tokens: Some(100),
+                output_tokens: Some(7),
+                extra: Some(crate::llm::stream::UsageExtra::Claude(
+                    crate::llm::stream::ClaudeUsageExtra {
+                        cache_read_input_tokens: 40,
+                        cache_creation_input_tokens: 2,
+                    }
+                )),
+            }]
+        );
+        let kept = format!("{start}{}", stopped_with("\"end_turn\""));
+        match run(&kept).await.as_slice() {
+            [StreamEvent::Done { input_tokens, output_tokens, .. }] => {
+                assert_eq!(*input_tokens, Some(10));
+                assert_eq!(*output_tokens, Some(5));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn block_start(index: usize, block: &str) -> String {
+        format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{block}}}\n\n"
+        )
+    }
+
+    fn block_stop(index: usize) -> String {
+        format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n")
+    }
+
+    const ERROR_EVENT: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n";
+    const MESSAGE_STOP: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    /// A failure ends the reply: a `message_stop` that follows an error event
+    /// completes nothing.
+    #[tokio::test]
+    async fn nothing_follows_an_error_event() {
+        let payload = format!("{ERROR_EVENT}{}{}", block_start(0, r#"{"type":"text","text":"late"}"#), stopped_with("\"end_turn\""));
+        let events = run(&payload).await;
+        assert!(matches!(events.as_slice(), [StreamEvent::Error(e)] if e.kind == StreamErrorKind::ServerError), "{events:?}");
+    }
+
+    /// An error the machine raises itself ends the reply too: the
+    /// `message_stop` after a protocol error is not a `Done`.
+    #[tokio::test]
+    async fn nothing_follows_a_protocol_error() {
+        let orphan = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+        let payload = format!("{orphan}{}", stopped_with("\"end_turn\""));
+        let events = run(&payload).await;
+        assert!(matches!(events.as_slice(), [StreamEvent::Error(_)]), "{events:?}");
+    }
+
+    /// A later `message_delta` that restates no reason keeps the earlier one.
+    #[tokio::test]
+    async fn a_later_message_delta_without_a_stop_reason_keeps_the_earlier_one() {
+        let payload = format!(
+            "{}{}",
+            stopped_with("\"end_turn\"").replace(&format!("{MESSAGE_STOP}"), ""),
+            format_args!("event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":null}},\"usage\":{{\"output_tokens\":9}}}}\n\n{MESSAGE_STOP}")
+        );
+        let events = run(&payload).await;
+        assert!(matches!(events.as_slice(), [StreamEvent::Done { stop_reason: Some(r), output_tokens: Some(9), .. }] if r == "end_turn"), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_block_start_for_an_open_index_is_a_protocol_error() {
+        let payload = format!(
+            "{}{}",
+            block_start(0, r#"{"type":"text","text":""}"#),
+            block_start(0, r#"{"type":"text","text":""}"#)
+        );
+        let events = run(&payload).await;
+        match events.as_slice() {
+            [StreamEvent::TextStart, StreamEvent::Error(e)] => {
+                assert_eq!(e.kind, StreamErrorKind::Protocol);
+                assert!(e.message.contains("already open"), "{e}");
+            }
+            other => panic!("expected TextStart then a protocol Error, got {other:?}"),
+        }
+    }
+
+    /// A tool input that parses but is not an object cannot be a call's
+    /// arguments; the call keeps its identity and the runtime answers it.
+    #[tokio::test]
+    async fn a_tool_input_that_is_not_an_object_is_invalid() {
+        for fragment in ["[1,2]", "\\\"text\\\"", "7"] {
+            let payload = format!(
+                "{}event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{fragment}\"}}}}\n\n{}",
+                block_start(0, r#"{"type":"tool_use","id":"toolu_N","name":"f","input":{}}"#),
+                block_stop(0),
+            );
+            let events = run(&payload).await;
+            assert!(matches!(events.as_slice(), [StreamEvent::ToolUseInvalid { id, .. }] if id == "toolu_N"), "{fragment}: {events:?}");
+        }
+    }
+
+    /// The opening event can carry content; none of it is dropped.
+    #[tokio::test]
+    async fn a_block_start_with_content_seeds_the_block() {
+        let payload = format!(
+            "{}{}{}{}{}{}{}",
+            block_start(0, r#"{"type":"text","text":"Hel"}"#),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+            block_stop(0),
+            block_start(1, r#"{"type":"thinking","thinking":"hm"}"#),
+            block_stop(1),
+            block_start(2, r#"{"type":"tool_use","id":"toolu_S","name":"f","input":{"path":"/a"}}"#),
+            block_stop(2),
+        );
+        let events = run(&payload).await;
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextStart,
+                StreamEvent::TextDelta("Hel".into()),
+                StreamEvent::TextDelta("lo".into()),
+                StreamEvent::TextEnd,
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingDelta("hm".into()),
+                StreamEvent::ThinkingEnd { signature: None },
+                StreamEvent::ToolUse {
+                    id: "toolu_S".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"path": "/a"}),
+                },
+            ]
+        );
+    }
+
+    /// The opening input yields to deltas: input_json_delta text is the
+    /// call's arguments when it arrives.
+    #[tokio::test]
+    async fn tool_input_deltas_win_over_the_opening_input() {
+        let payload = format!(
+            "{}event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"b\\\":2}}\"}}}}\n\n{}",
+            block_start(0, r#"{"type":"tool_use","id":"toolu_W","name":"f","input":{"a":1}}"#),
+            block_stop(0),
+        );
+        let events = run(&payload).await;
+        assert!(matches!(events.as_slice(), [StreamEvent::ToolUse { input, .. }] if *input == serde_json::json!({"b": 2})), "{events:?}");
     }
 }

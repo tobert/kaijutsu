@@ -52,7 +52,7 @@ pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, MkUsageExtra, OpenAiCompatUsageExtra,
-    InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_tunables,
+    InlineToolResult, RetryDisposition, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
 pub use system_prompt::{CharacterIdentity, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
@@ -112,6 +112,9 @@ pub struct MockClient {
     /// handed — the only way a test can pin the shape of a request the wire
     /// would have to accept. `None` records nothing.
     sent: Option<Arc<parking_lot::Mutex<Vec<Vec<Message>>>>>,
+    /// The `(step, attempt)` of each `Provider::stream` call's request trace,
+    /// in call order, when a test asked for it with `recording_traces`.
+    traces: Option<Arc<parking_lot::Mutex<Vec<(u32, u32)>>>>,
     /// One `Provider::stream` call, by zero-based index, that waits for the
     /// test to release it; see `holding_call`.
     hold: Option<(usize, Arc<CallHold>)>,
@@ -151,6 +154,7 @@ impl MockClient {
             script_dir: None,
             script_by_model: None,
             sent: None,
+            traces: None,
             hold: None,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -173,6 +177,15 @@ impl MockClient {
         let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.sent = Some(sent.clone());
         (self, sent)
+    }
+
+    /// Builder: record the `(step, attempt)` of the request trace each
+    /// `Provider::stream` call received. A call with no trace records
+    /// `(0, 0)`.
+    pub fn recording_traces(mut self) -> (Self, Arc<parking_lot::Mutex<Vec<(u32, u32)>>>) {
+        let traces = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        self.traces = Some(traces.clone());
+        (self, traces)
     }
 
     /// Builder: make `prompt`/`prompt_with_system` sleep `delay` before
@@ -308,9 +321,14 @@ pub enum ContentBlock {
         data_base64: Option<String>,
     },
     /// Assistant reasoning preserved across tool-use iterations within a
-    /// single agentic-loop turn (A3). Signature is provider-specific
-    /// (Anthropic extended-thinking requires it for cross-tool-use turns);
-    /// `None` is fine when extended thinking is not enabled.
+    /// single agentic-loop turn (A3). The signature is provider-specific:
+    /// Anthropic requires its own signature for thinking replayed beside a
+    /// tool call, the OpenAI-compatible client and `mk` use a sentinel, and a
+    /// redacted block carries its opaque data behind the
+    /// `anthropic:redacted_thinking:` prefix. A provider sends only a
+    /// signature it produced and drops the block otherwise. `text` can be
+    /// empty when the API withheld or omitted the thinking; a block with a
+    /// signature stays. `None` is fine when extended thinking is not enabled.
     Reasoning {
         text: String,
         signature: Option<String>,
@@ -382,7 +400,9 @@ impl Message {
     /// of the text and tool uses, *not* merged. Anthropic requires each thinking
     /// block echoed back unmodified with its own signature (the signature is a
     /// verifier over that block's exact text), so collapsing distinct blocks
-    /// would produce a signature mismatch. Empty-text entries are skipped.
+    /// would produce a signature mismatch. An entry with no text and no
+    /// signature is skipped; one with a signature stays, since withheld or
+    /// omitted thinking has no text and the provider needs the signature back.
     pub fn with_reasoning_text_and_tool_uses(
         reasoning: Vec<(String, Option<String>)>,
         text: Option<String>,
@@ -390,7 +410,7 @@ impl Message {
     ) -> Self {
         let mut blocks = Vec::new();
         for (reasoning_text, signature) in reasoning {
-            if reasoning_text.is_empty() {
+            if reasoning_text.is_empty() && signature.as_deref().is_none_or(str::is_empty) {
                 continue;
             }
             blocks.push(ContentBlock::Reasoning {
@@ -507,6 +527,11 @@ pub enum LlmError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// The account cannot pay for the request (HTTP 402). Repeating the
+    /// request fails until the balance changes.
+    #[error("insufficient balance: {0}")]
+    InsufficientBalance(String),
+
     /// API error.
     #[error("api error: {0}")]
     ApiError(String),
@@ -531,6 +556,29 @@ impl LlmError {
         match self {
             LlmError::ContextFull(_) => (kaijutsu_types::ErrorCategory::Context, Some("full")),
             _ => (kaijutsu_types::ErrorCategory::Stream, None),
+        }
+    }
+}
+
+/// A failed stream, reported where a call returns an [`LlmError`] instead of
+/// events. The kind picks the variant; the text is the stream error's own.
+impl From<StreamError> for LlmError {
+    fn from(error: StreamError) -> Self {
+        let detail = error.to_string();
+        match error.kind {
+            StreamErrorKind::RateLimited => LlmError::RateLimited(detail),
+            StreamErrorKind::Auth => LlmError::AuthError(detail),
+            StreamErrorKind::InvalidRequest => LlmError::InvalidRequest(detail),
+            StreamErrorKind::Billing => LlmError::InsufficientBalance(detail),
+            StreamErrorKind::Transport => LlmError::NetworkError(detail),
+            StreamErrorKind::Truncated(_) => LlmError::CompletionError(detail),
+            StreamErrorKind::Overloaded
+            | StreamErrorKind::ServerError
+            | StreamErrorKind::Timeout
+            | StreamErrorKind::CapacityCut
+            | StreamErrorKind::ContentFilter
+            | StreamErrorKind::Protocol
+            | StreamErrorKind::Unknown(_) => LlmError::ApiError(detail),
         }
     }
 }
@@ -767,7 +815,7 @@ impl CodexAppClient {
             match event {
                 StreamEvent::TextDelta(delta) => output.push_str(&delta),
                 StreamEvent::Done { .. } => break,
-                StreamEvent::Error(error) => return Err(LlmError::ApiError(error)),
+                StreamEvent::Error(error) => return Err(LlmError::from(error)),
                 _ => {}
             }
         }
@@ -1090,6 +1138,9 @@ impl Provider {
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
                     sent.lock().push(messages.clone());
+                }
+                if let Some(traces) = &mock.traces {
+                    traces.lock().push(opts.trace.as_ref().map_or((0, 0), |t| (t.step, t.attempt)));
                 }
                 let call = mock.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some((index, hold)) = &mock.hold
@@ -2195,6 +2246,48 @@ mod tests {
     }
 
     // ── context_window_for_live: config override / live fallback / seam ──
+
+    mod reasoning_builder_tests {
+        use super::super::*;
+
+        fn reasoning_blocks(message: &Message) -> Vec<(String, Option<String>)> {
+            match &message.content {
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Reasoning { text, signature } => Some((text.clone(), signature.clone())),
+                        _ => None,
+                    })
+                    .collect(),
+                MessageContent::Text(_) => Vec::new(),
+            }
+        }
+
+        /// Withheld or omitted thinking has no text; its signature must still
+        /// reach the next request.
+        #[test]
+        fn a_signed_block_with_no_text_is_kept() {
+            let message = Message::with_reasoning_text_and_tool_uses(
+                vec![(String::new(), Some("sig".into())), ("why".into(), Some("sig2".into()))],
+                Some("answer".into()),
+                Vec::new(),
+            );
+            assert_eq!(
+                reasoning_blocks(&message),
+                vec![(String::new(), Some("sig".to_string())), ("why".to_string(), Some("sig2".to_string()))]
+            );
+        }
+
+        #[test]
+        fn a_block_with_no_text_and_no_signature_is_dropped() {
+            let message = Message::with_reasoning_text_and_tool_uses(
+                vec![(String::new(), None), (String::new(), Some(String::new()))],
+                Some("answer".into()),
+                Vec::new(),
+            );
+            assert!(reasoning_blocks(&message).is_empty());
+        }
+    }
 
     mod context_window_for_live_tests {
         use super::*;

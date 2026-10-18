@@ -30,7 +30,7 @@ use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::endpoint::{Endpoint, Slot};
-use crate::llm::stream::{BuildOpts, StreamEvent};
+use crate::llm::stream::{BuildOpts, StreamError, StreamErrorKind, StreamEvent};
 use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, http_user_agent};
 
 use self::sse::{OpenAiSseEvent, decode_event};
@@ -283,15 +283,19 @@ impl Client {
                 None => e.error.message,
             })
             .unwrap_or(body);
-        let mapped = match status.as_u16() {
-            401 | 403 => LlmError::AuthError(detail),
-            402 => LlmError::ApiError(format!("insufficient balance: {detail}")),
-            429 => LlmError::RateLimited(detail),
-            400..=499 => LlmError::InvalidRequest(detail),
-            500..=599 => LlmError::ApiError(detail),
-            _ => LlmError::ApiError(format!("unexpected HTTP {status}: {detail}")),
-        };
-        Err(mapped)
+        Err(map_status(status, detail))
+    }
+}
+
+/// Map a failing HTTP status and its decoded detail onto [`LlmError`].
+fn map_status(status: reqwest::StatusCode, detail: String) -> LlmError {
+    match status.as_u16() {
+        401 | 403 => LlmError::AuthError(detail),
+        402 => LlmError::InsufficientBalance(detail),
+        429 => LlmError::RateLimited(detail),
+        400..=499 => LlmError::InvalidRequest(detail),
+        500..=599 => LlmError::ApiError(detail),
+        _ => LlmError::ApiError(format!("unexpected HTTP {status}: {detail}")),
     }
 }
 
@@ -401,23 +405,43 @@ impl Stream {
                             Ok(typed) => {
                                 if matches!(&typed, OpenAiSseEvent::Done) {
                                     self.finished = true;
-                                    if let Some(slot) = &self.slot {
-                                        slot.completed();
+                                    if !self.state.failed() {
+                                        if let Some(slot) = &self.slot {
+                                            slot.completed();
+                                        }
                                     }
                                 }
+                                if matches!(&typed, OpenAiSseEvent::Error(_)) {
+                                    self.finished = true;
+                                }
                                 let emitted = self.state.step(typed);
+                                // A capacity cut tells the endpoint it is overloaded, so
+                                // other callers wait with this one.
+                                if emitted.iter().any(|ev| matches!(ev,
+                                    StreamEvent::Error(e) if e.kind == StreamErrorKind::CapacityCut))
+                                {
+                                    if let Some(slot) = &self.slot {
+                                        slot.cut();
+                                    }
+                                }
                                 for ev in emitted {
                                     self.pending.push_back(ev);
                                 }
                             }
                             Err(e) => {
                                 self.finished = true;
-                                return Some(StreamEvent::Error(format!("SSE decode: {e}")));
+                                return Some(StreamEvent::Error(StreamError::new(
+                                    StreamErrorKind::Protocol,
+                                    format!("SSE decode: {e}"),
+                                )));
                             }
                         },
                         Some(Err(e)) => {
                             self.finished = true;
-                            return Some(StreamEvent::Error(format!("SSE transport: {e}")));
+                            return Some(StreamEvent::Error(StreamError::new(
+                                StreamErrorKind::Transport,
+                                format!("SSE transport: {e}"),
+                            )));
                         }
                         None => {
                             // Source closed without an explicit [DONE].
@@ -447,6 +471,16 @@ impl Stream {
 mod tests {
     use super::*;
     use crate::llm::stream::{OpenAiCompatUsageExtra, UsageExtra};
+
+    mod map_status_tests {
+        use super::*;
+
+        #[test]
+        fn payment_required_is_an_insufficient_balance_error() {
+            let err = map_status(reqwest::StatusCode::PAYMENT_REQUIRED, "Insufficient Balance".into());
+            assert!(matches!(&err, LlmError::InsufficientBalance(m) if m == "Insufficient Balance"), "{err:?}");
+        }
+    }
 
     mod is_hosted_openai_tests {
         use super::*;
@@ -786,6 +820,27 @@ data: [DONE]
         assert_eq!(status, 429);
         assert!(left > std::time::Duration::from_secs(2) && left <= std::time::Duration::from_secs(3), "{left:?}");
         assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A capacity cut cools the endpoint and the `[DONE]` after it does not
+    /// reset the doubling, so parallel callers wait with the one that was cut.
+    ///
+    /// Falsified by a cut that leaves the endpoint open for the next request.
+    #[tokio::test]
+    async fn a_capacity_cut_cools_the_endpoint() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\ndata: [DONE]\n\n";
+        let (base, _) = serve(vec![sse(cut)]).await;
+        let (client, endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        assert!(matches!(events.as_slice(), [StreamEvent::Error(e)] if e.kind == StreamErrorKind::CapacityCut), "{events:?}");
+        let (_, status) = endpoint.status().cooldown.expect("cooling down after a cut");
+        assert_eq!(status, 503);
+        assert_eq!(endpoint.busy_in_a_row(), 1, "the [DONE] after a cut completes nothing");
     }
 
     /// A stream that reaches `[DONE]` resets the doubling; opening it does

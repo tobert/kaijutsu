@@ -12,6 +12,7 @@
 //! ────────────                          ───────
 //! data: {"choices":[{"delta":…}]}       OpenAiSseEvent::Chunk(ChatChunk)
 //! data: {"choices":[],"usage":{…}}      OpenAiSseEvent::Chunk (usage-only)
+//! data: {"error":{"message":…}}         OpenAiSseEvent::Error
 //! data: [DONE]                          OpenAiSseEvent::Done
 //! ```
 //!
@@ -20,6 +21,7 @@
 //! DeepSeek shifts the chunk shape.
 
 use super::types::ChatChunk;
+use crate::llm::stream::{StreamError, StreamErrorKind};
 
 /// The SSE `data: [DONE]` terminator literal.
 const DONE_SENTINEL: &str = "[DONE]";
@@ -32,6 +34,10 @@ pub enum OpenAiSseEvent {
     Chunk(ChatChunk),
     /// The `[DONE]` sentinel — stream is complete.
     Done,
+    /// A `data:` payload carrying an `error` key: the provider failed the
+    /// request after the stream opened. Its kind follows the payload's
+    /// `type`, or its `code` when there is no type.
+    Error(StreamError),
 }
 
 /// Errors from the SSE layer.
@@ -49,7 +55,8 @@ pub enum SseDecodeError {
 /// [`OpenAiSseEvent`].
 ///
 /// The `[DONE]` sentinel decodes to [`OpenAiSseEvent::Done`]; anything
-/// else is parsed as a [`ChatChunk`]. A JSON parse failure surfaces as
+/// else is parsed as a [`ChatChunk`], unless it carries an `error` key, which
+/// decodes to [`OpenAiSseEvent::Error`]. A JSON parse failure surfaces as
 /// [`SseDecodeError::InvalidJson`] rather than silently dropping — per
 /// the crash-over-corrupt principle.
 pub fn decode_event(event: &eventsource_stream::Event) -> Result<OpenAiSseEvent, SseDecodeError> {
@@ -57,12 +64,40 @@ pub fn decode_event(event: &eventsource_stream::Event) -> Result<OpenAiSseEvent,
     if data == DONE_SENTINEL {
         return Ok(OpenAiSseEvent::Done);
     }
-    serde_json::from_str::<ChatChunk>(data)
+    let invalid = |source| SseDecodeError::InvalidJson {
+        raw: data.to_string(),
+        source,
+    };
+    let value = serde_json::from_str::<serde_json::Value>(data).map_err(invalid)?;
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Ok(OpenAiSseEvent::Error(stream_error(error)));
+    }
+    serde_json::from_value::<ChatChunk>(value)
         .map(OpenAiSseEvent::Chunk)
-        .map_err(|source| SseDecodeError::InvalidJson {
-            raw: data.to_string(),
-            source,
-        })
+        .map_err(invalid)
+}
+
+/// The [`StreamError`] for a payload's `error` value: the message of the
+/// OpenAI object shape, the string itself for a bare string, the raw JSON
+/// otherwise.
+fn stream_error(error: &serde_json::Value) -> StreamError {
+    if let Some(text) = error.as_str() {
+        return StreamError::new(StreamErrorKind::Unknown("error".into()), text);
+    }
+    let name = |field| error.get(field).and_then(|v| v.as_str());
+    let kind = match name("type").or_else(|| name("code")) {
+        Some("server_error" | "internal_error") => StreamErrorKind::ServerError,
+        Some("rate_limit_error" | "rate_limit_exceeded") => StreamErrorKind::RateLimited,
+        Some("overloaded_error" | "engine_overloaded_error") => StreamErrorKind::Overloaded,
+        Some("timeout" | "timeout_error") => StreamErrorKind::Timeout,
+        Some("invalid_request_error") => StreamErrorKind::InvalidRequest,
+        Some("authentication_error" | "invalid_api_key" | "permission_error") => StreamErrorKind::Auth,
+        Some("insufficient_quota" | "billing_error") => StreamErrorKind::Billing,
+        Some(other) => StreamErrorKind::Unknown(other.to_string()),
+        None => StreamErrorKind::Unknown("error".into()),
+    };
+    let message = name("message").map_or_else(|| error.to_string(), str::to_string);
+    StreamError::new(kind, message)
 }
 
 // ============================================================================
@@ -227,5 +262,59 @@ data: [DONE]
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_error_object_decodes_to_an_error_event_typed_by_its_type() {
+        let events = parse_all("data: {\"error\":{\"message\":\"engine overloaded\",\"type\":\"server_error\"}}\n\n").await;
+        match &events[0] {
+            Ok(OpenAiSseEvent::Error(error)) => {
+                assert_eq!(error.kind, StreamErrorKind::ServerError);
+                assert_eq!(error.message, "engine overloaded");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_type_maps_to_its_kind() {
+        let cases = [
+            ("rate_limit_exceeded", StreamErrorKind::RateLimited),
+            ("overloaded_error", StreamErrorKind::Overloaded),
+            ("invalid_request_error", StreamErrorKind::InvalidRequest),
+            ("invalid_api_key", StreamErrorKind::Auth),
+            ("insufficient_quota", StreamErrorKind::Billing),
+            ("brand_new_type", StreamErrorKind::Unknown("brand_new_type".into())),
+        ];
+        for (wire, kind) in cases {
+            let payload = format!("data: {{\"error\":{{\"message\":\"m\",\"type\":\"{wire}\"}}}}\n\n");
+            match &parse_all(&payload).await[0] {
+                Ok(OpenAiSseEvent::Error(error)) => assert_eq!(error.kind, kind, "{wire}"),
+                other => panic!("{wire}: expected Error, got {other:?}"),
+            }
+        }
+        // No type: the code names the kind.
+        match &parse_all("data: {\"error\":{\"message\":\"m\",\"code\":\"rate_limit_exceeded\"}}\n\n").await[0] {
+            Ok(OpenAiSseEvent::Error(error)) => assert_eq!(error.kind, StreamErrorKind::RateLimited),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_string_decodes_to_an_unknown_error_event() {
+        let events = parse_all("data: {\"error\":\"upstream closed\"}\n\n").await;
+        match &events[0] {
+            Ok(OpenAiSseEvent::Error(error)) => {
+                assert_eq!(error.kind, StreamErrorKind::Unknown("error".into()));
+                assert_eq!(error.message, "upstream closed");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_null_error_key_is_an_ordinary_chunk() {
+        let events = parse_all("data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n").await;
+        assert!(matches!(&events[0], Ok(OpenAiSseEvent::Chunk(_))), "{events:?}");
     }
 }

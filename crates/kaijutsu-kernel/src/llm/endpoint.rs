@@ -500,6 +500,13 @@ impl Slot {
         self.endpoint.answered();
     }
 
+    /// A stream was cut for lack of capacity after it opened. Starts a
+    /// cooldown as a 503 does, doubling from [`FIRST_COOLDOWN`] while cuts
+    /// repeat, and keeps the doubling a later `[DONE]` would reset.
+    pub fn cut(&self) {
+        self.endpoint.busy(503, None);
+    }
+
     /// A megakernel call or stream failed with `error`. An error status, or
     /// an error event in a stream, of 429 or 503 starts a cooldown.
     pub fn failed_mk(&self, error: &kaijutsu_mk::MkError) {

@@ -33,7 +33,7 @@ use kaijutsu_mk::{MkClient, MkError};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::endpoint::{Endpoint, Slot, SlotWaits};
-use crate::llm::stream::{BuildOpts, StreamEvent};
+use crate::llm::stream::{BuildOpts, StreamError, StreamErrorKind, StreamEvent};
 use crate::llm::{LlmError, LlmResult, Message};
 
 use reply::{Reply, Timing};
@@ -316,6 +316,9 @@ fn to_llm(name: &str, e: MkError) -> LlmError {
         MkError::Request(_) => LlmError::InvalidRequest(detail),
         MkError::Service { status: 400 | 404 | 413, .. } => LlmError::InvalidRequest(detail),
         MkError::Service { status: 429, .. } => LlmError::RateLimited(detail),
+        MkError::Service { status: 402, .. } | MkError::Status { status: 402, .. } => {
+            LlmError::InsufficientBalance(detail)
+        }
         MkError::Timeout | MkError::Transport(_) => LlmError::NetworkError(detail),
         MkError::ContextFull { .. } => LlmError::ContextFull(format!(
             "{detail}; exclude blocks with `kj stage exclude`, then fork"
@@ -326,6 +329,34 @@ fn to_llm(name: &str, e: MkError) -> LlmError {
         | MkError::Decode { .. }
         | MkError::Status { .. }
         | MkError::SpecIdMismatch { .. } => LlmError::ApiError(detail),
+    }
+}
+
+/// The kind of a stream failure that came from the megakernel. An error
+/// event or status maps by its HTTP status; the rest by how the call failed.
+fn mk_error_kind(e: &MkError) -> StreamErrorKind {
+    use StreamErrorKind::*;
+    match e {
+        MkError::Timeout => Timeout,
+        MkError::Transport(_) | MkError::Truncated(_) => Transport,
+        MkError::Decode { .. } | MkError::SpecIdMismatch { .. } => Protocol,
+        MkError::Request(_) | MkError::ContextFull { .. } => InvalidRequest,
+        MkError::Status { status, .. } | MkError::Service { status, .. } => status_kind(*status),
+        MkError::Stream(error) => status_kind(error.code),
+    }
+}
+
+fn status_kind(status: u16) -> StreamErrorKind {
+    use StreamErrorKind::*;
+    match status {
+        429 => RateLimited,
+        503 => Overloaded,
+        401 | 403 => Auth,
+        402 => Billing,
+        408 | 504 => Timeout,
+        400..=499 => InvalidRequest,
+        500..=599 => ServerError,
+        other => Unknown(other.to_string()),
     }
 }
 
@@ -423,7 +454,10 @@ impl Stream {
                         let reply = self.reply.take().expect("done comes once");
                         match reply.done_v2(done, &identity.model, &identity.weight_hash, timing) {
                             Ok(events) => self.pending.extend(events),
-                            Err(e) => return Some(StreamEvent::Error(format!("mk backend '{}': {e}", self.name))),
+                            Err(e) => return Some(StreamEvent::Error(StreamError::new(
+                                StreamErrorKind::Protocol,
+                                format!("mk backend '{}': {e}", self.name),
+                            ))),
                         }
                     }
                     Some(Ok(Event::Done(done))) => {
@@ -440,7 +474,10 @@ impl Stream {
                         let reply = self.reply.take().expect("done comes once");
                         match reply.done(done, &id_base, timing) {
                             Ok(events) => self.pending.extend(events),
-                            Err(e) => return Some(StreamEvent::Error(format!("mk backend '{}': {e}", self.name))),
+                            Err(e) => return Some(StreamEvent::Error(StreamError::new(
+                                StreamErrorKind::Protocol,
+                                format!("mk backend '{}': {e}", self.name),
+                            ))),
                         }
                     }
                     Some(Err(e)) => {
@@ -449,7 +486,10 @@ impl Stream {
                         if let Some(slot) = &self.slot {
                             slot.failed_mk(&e);
                         }
-                        return Some(StreamEvent::Error(format!("mk backend '{}': {e}", self.name)));
+                        return Some(StreamEvent::Error(StreamError::new(
+                            mk_error_kind(&e),
+                            format!("mk backend '{}': {e}", self.name),
+                        )));
                     }
                     None => {
                         self.finished = true;
@@ -478,6 +518,19 @@ mod tests {
     const MODEL: &str = include_str!("../../../../kaijutsu-mk/tests/fixtures/mk_model.json");
     const ANSWER: &str = include_str!("../../../../kaijutsu-mk/tests/fixtures/mk_stream_answer.sse");
     const TOOL: &str = include_str!("../../../../kaijutsu-mk/tests/fixtures/mk_stream_tool.sse");
+
+    /// A 402 is a refusal that repeating cannot fix, whichever error family
+    /// carries it.
+    #[test]
+    fn a_402_is_an_insufficient_balance_error() {
+        for e in [
+            MkError::Service { status: 402, error: None, retry_after: None, body: "pay".into() },
+            MkError::Status { status: 402, error: None, retry_after: None, body: "pay".into() },
+        ] {
+            let err = to_llm("b", e);
+            assert!(matches!(&err, LlmError::InsufficientBalance(m) if m.contains("mk backend 'b'")), "{err:?}");
+        }
+    }
 
     fn rendered(n: u32) -> kaijutsu_mk::test_server::Reply {
         http(200, json!({"text": "", "tokens": [], "n_tokens": n}).to_string())
@@ -746,13 +799,34 @@ mod tests {
         assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("holds at most 32768")), "{err:?}");
     }
 
+    #[test]
+    fn an_mk_error_maps_to_its_stream_kind() {
+        use kaijutsu_mk::{MkError, ServiceError};
+        let stream = |code: u16| MkError::Stream(ServiceError { code, message: "m".into(), r#type: "t".into() });
+        let cases = [
+            (stream(503), StreamErrorKind::Overloaded),
+            (stream(429), StreamErrorKind::RateLimited),
+            (stream(500), StreamErrorKind::ServerError),
+            (stream(504), StreamErrorKind::Timeout),
+            (stream(400), StreamErrorKind::InvalidRequest),
+            (MkError::Timeout, StreamErrorKind::Timeout),
+            (MkError::Transport("reset".into()), StreamErrorKind::Transport),
+            (MkError::Truncated("x".into()), StreamErrorKind::Transport),
+            (MkError::Decode { what: "w", message: "m".into(), body: String::new() }, StreamErrorKind::Protocol),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(mk_error_kind(&error), kind, "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn a_stream_cut_before_done_is_an_error_event() {
         let cut = &ANSWER[..ANSWER.find("event: done").unwrap()];
         let (base, _) = serve(vec![http(200, MODEL), rendered(10), sse(cut)]).await;
         let mut stream = client(&base, HashMap::new()).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let events = drain(&mut stream).await;
-        assert!(matches!(events.last(), Some(StreamEvent::Error(m)) if m.contains("before its done event")), "{events:?}");
+        assert!(matches!(events.last(), Some(StreamEvent::Error(e))
+            if e.kind == StreamErrorKind::Transport && e.message.contains("before its done event")), "{events:?}");
         assert!(!events.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
     }
 
@@ -991,7 +1065,8 @@ mod tests {
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let events = drain(&mut stream).await;
-        assert!(matches!(events.last(), Some(StreamEvent::Error(m)) if m.contains("pass_timeout_error")), "{events:?}");
+        assert!(matches!(events.last(), Some(StreamEvent::Error(e))
+            if e.kind == StreamErrorKind::Overloaded && e.message.contains("pass_timeout_error")), "{events:?}");
         let (_, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
     }

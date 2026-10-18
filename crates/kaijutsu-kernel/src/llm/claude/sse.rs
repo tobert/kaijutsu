@@ -16,6 +16,7 @@
 use serde::Deserialize;
 
 use super::types::ResponseUsage;
+use crate::llm::stream::StreamErrorKind;
 
 /// Typed Anthropic streaming event.
 ///
@@ -32,6 +33,9 @@ pub enum ClaudeSseEvent {
     MessageStop,
     Error(SseError),
     Ping,
+    /// An event name this client does not know. The API versioning policy
+    /// says new event types may appear, so the stream goes on without it.
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -70,6 +74,11 @@ pub enum StartedBlock {
         #[serde(default)]
         thinking: String,
     },
+    /// Thinking the API withheld. `data` is opaque and must go back
+    /// unchanged on the next request.
+    RedactedThinking {
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -103,6 +112,8 @@ pub enum BlockDelta {
     SignatureDelta {
         signature: String,
     },
+    /// Citation metadata for a text block. Nothing downstream reads it.
+    CitationsDelta {},
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -113,11 +124,25 @@ pub struct ContentBlockStopPayload {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MessageDeltaPayload {
     pub delta: MessageDeltaInner,
-    /// Output-side usage at message close. Anthropic omits
-    /// `input_tokens` here (already reported in `message_start`); the
-    /// `ResponseUsage` default fills 0.
+    /// Cumulative usage at message close. Each field is present only when
+    /// the API sent it: `input_tokens` and the cache counts ride here on some
+    /// replies and are absent on others.
     #[serde(default)]
-    pub usage: ResponseUsage,
+    pub usage: DeltaUsage,
+}
+
+/// The `usage` object of a `message_delta`, with absent fields kept absent
+/// so a field the API left out does not overwrite `message_start`'s count.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DeltaUsage {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -130,20 +155,106 @@ pub struct MessageDeltaInner {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SseError {
     pub error: SseErrorBody,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SseErrorBody {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
     pub message: String,
+}
+
+/// What an API error type asks of the caller. The wire strings are those of
+/// <https://platform.claude.com/docs/en/api/errors>; the same names arrive in
+/// an HTTP error body and in a mid-stream `error` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// 529: the API is overloaded. A repeat may succeed.
+    Overloaded,
+    /// 429.
+    RateLimit,
+    /// 500: an internal failure. A repeat may succeed.
+    Api,
+    /// 504.
+    Timeout,
+    /// 401.
+    Authentication,
+    /// 403.
+    Permission,
+    /// 402: the account cannot pay. A repeat fails until the balance changes.
+    Billing,
+    /// 400, and the other 4xx statuses without a type of their own.
+    InvalidRequest,
+    /// 404.
+    NotFound,
+    /// 413.
+    RequestTooLarge,
+    /// A type this client does not know.
+    Other(String),
+}
+
+impl ApiErrorKind {
+    pub fn parse(kind: &str) -> Self {
+        match kind {
+            "overloaded_error" => Self::Overloaded,
+            "rate_limit_error" => Self::RateLimit,
+            "api_error" => Self::Api,
+            "timeout_error" => Self::Timeout,
+            "authentication_error" => Self::Authentication,
+            "permission_error" => Self::Permission,
+            "billing_error" => Self::Billing,
+            "invalid_request_error" => Self::InvalidRequest,
+            "not_found_error" => Self::NotFound,
+            "request_too_large" => Self::RequestTooLarge,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// The stream error kind this API error type becomes.
+    pub fn stream_kind(&self) -> StreamErrorKind {
+        match self {
+            Self::Overloaded => StreamErrorKind::Overloaded,
+            Self::RateLimit => StreamErrorKind::RateLimited,
+            Self::Api => StreamErrorKind::ServerError,
+            Self::Timeout => StreamErrorKind::Timeout,
+            Self::Authentication | Self::Permission => StreamErrorKind::Auth,
+            Self::Billing => StreamErrorKind::Billing,
+            Self::InvalidRequest | Self::NotFound | Self::RequestTooLarge => StreamErrorKind::InvalidRequest,
+            Self::Other(kind) => StreamErrorKind::Unknown(kind.clone()),
+        }
+    }
+
+    /// The status that tells an endpoint it is busy, for the kinds that mean
+    /// "too much load": the limiter cools down on 429 and 503 only, so an
+    /// overloaded 529 is reported as 503.
+    pub fn busy_status(&self) -> Option<u16> {
+        match self {
+            Self::Overloaded => Some(503),
+            Self::RateLimit => Some(429),
+            _ => None,
+        }
+    }
+}
+
+impl SseErrorBody {
+    pub fn class(&self) -> ApiErrorKind {
+        ApiErrorKind::parse(&self.kind)
+    }
 }
 
 /// Errors from the SSE layer.
 #[derive(Debug, thiserror::Error)]
 pub enum SseDecodeError {
-    #[error("unknown event type: {0}")]
-    UnknownEvent(String),
+    /// A content block type this client cannot represent. The stream fails
+    /// rather than dropping content the model produced.
+    #[error("unsupported content block type: {0}")]
+    UnsupportedBlock(String),
+    /// A delta type this client cannot represent.
+    #[error("unsupported content block delta type: {0}")]
+    UnsupportedDelta(String),
     #[error("invalid JSON in event {event}: {source}")]
     InvalidJson {
         event: String,
@@ -155,16 +266,24 @@ pub enum SseDecodeError {
 /// Decode one [`eventsource_stream::Event`] into a typed
 /// [`ClaudeSseEvent`].
 ///
-/// Unknown event names produce [`SseDecodeError::UnknownEvent`] rather
-/// than silently dropping — surfacing the mismatch is the point per the
-/// crash-over-corrupt principle.
+/// An unknown event name decodes to [`ClaudeSseEvent::Unknown`]: the API
+/// versioning policy adds event types over time, and none of them carries
+/// content a block writer needs. An unknown content block or delta type does
+/// fail, because dropping it would drop model output.
 pub fn decode_event(event: &eventsource_stream::Event) -> Result<ClaudeSseEvent, SseDecodeError> {
     match event.event.as_str() {
         "message_start" => parse_json(&event.event, &event.data).map(ClaudeSseEvent::MessageStart),
         "content_block_start" => {
+            check_tag(&event.data, "/content_block/type", SseDecodeError::UnsupportedBlock, &[
+                "text", "thinking", "redacted_thinking", "tool_use",
+            ])?;
             parse_json(&event.event, &event.data).map(ClaudeSseEvent::ContentBlockStart)
         }
         "content_block_delta" => {
+            check_tag(&event.data, "/delta/type", SseDecodeError::UnsupportedDelta, &[
+                "text_delta", "input_json_delta", "thinking_delta", "signature_delta",
+                "citations_delta",
+            ])?;
             parse_json(&event.event, &event.data).map(ClaudeSseEvent::ContentBlockDelta)
         }
         "content_block_stop" => {
@@ -174,7 +293,25 @@ pub fn decode_event(event: &eventsource_stream::Event) -> Result<ClaudeSseEvent,
         "message_stop" => Ok(ClaudeSseEvent::MessageStop),
         "error" => parse_json(&event.event, &event.data).map(ClaudeSseEvent::Error),
         "ping" => Ok(ClaudeSseEvent::Ping),
-        other => Err(SseDecodeError::UnknownEvent(other.to_string())),
+        other => Ok(ClaudeSseEvent::Unknown(other.to_string())),
+    }
+}
+
+/// Fail with `unsupported(tag)` when the JSON at `pointer` names a type
+/// outside `known`. Data that does not parse falls through to the typed
+/// decode, which reports the JSON error.
+fn check_tag(
+    data: &str,
+    pointer: &str,
+    unsupported: fn(String) -> SseDecodeError,
+    known: &[&str],
+) -> Result<(), SseDecodeError> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Ok(());
+    };
+    match value.pointer(pointer).and_then(|t| t.as_str()) {
+        Some(tag) if !known.contains(&tag) => Err(unsupported(tag.to_string())),
+        _ => Ok(()),
     }
 }
 
@@ -195,6 +332,7 @@ fn parse_json<T: for<'de> serde::Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::stream::RetryDisposition;
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
     use std::convert::Infallible;
@@ -446,15 +584,87 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     }
 
     #[tokio::test]
-    async fn unknown_event_name_surfaces_decode_error() {
-        // Anthropic shipping a new event we haven't taught the decoder
-        // about must fail loudly, not silently drop.
+    async fn an_unknown_event_name_decodes_to_unknown() {
         let payload = "event: future_event\ndata: {\"type\":\"future_event\"}\n\n";
         let events = parse_all(payload).await;
         assert_eq!(events.len(), 1);
         match &events[0] {
-            Err(SseDecodeError::UnknownEvent(name)) => assert_eq!(name, "future_event"),
-            other => panic!("expected UnknownEvent error, got {other:?}"),
+            Ok(ClaudeSseEvent::Unknown(name)) => assert_eq!(name, "future_event"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_content_block_type_is_a_typed_decode_error() {
+        let payload = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\"}}\n\n";
+        match &parse_all(payload).await[0] {
+            Err(SseDecodeError::UnsupportedBlock(name)) => assert_eq!(name, "fallback"),
+            other => panic!("expected UnsupportedBlock, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_delta_type_is_a_typed_decode_error() {
+        let payload = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"compaction_delta\"}}\n\n";
+        match &parse_all(payload).await[0] {
+            Err(SseDecodeError::UnsupportedDelta(name)) => assert_eq!(name, "compaction_delta"),
+            other => panic!("expected UnsupportedDelta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redacted_thinking_block_and_a_citations_delta_decode() {
+        let payload = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"EmwK\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"x\":1}}}\n\n";
+        let events = parse_all(payload).await;
+        match &events[0] {
+            Ok(ClaudeSseEvent::ContentBlockStart(p)) => {
+                assert_eq!(p.content_block, StartedBlock::RedactedThinking { data: "EmwK".into() });
+            }
+            other => panic!("expected redacted block, got {other:?}"),
+        }
+        assert!(matches!(&events[1], Ok(ClaudeSseEvent::ContentBlockDelta(p)) if p.delta == BlockDelta::CitationsDelta {}));
+    }
+
+    #[test]
+    fn error_types_map_to_distinguishable_kinds() {
+        let cases = [
+            ("overloaded_error", ApiErrorKind::Overloaded, true, Some(503)),
+            ("rate_limit_error", ApiErrorKind::RateLimit, true, Some(429)),
+            ("api_error", ApiErrorKind::Api, true, None),
+            ("timeout_error", ApiErrorKind::Timeout, true, None),
+            ("billing_error", ApiErrorKind::Billing, false, None),
+            ("authentication_error", ApiErrorKind::Authentication, false, None),
+            ("permission_error", ApiErrorKind::Permission, false, None),
+            ("invalid_request_error", ApiErrorKind::InvalidRequest, false, None),
+            ("request_too_large", ApiErrorKind::RequestTooLarge, false, None),
+            ("not_found_error", ApiErrorKind::NotFound, false, None),
+        ];
+        for (wire, kind, transient, busy) in cases {
+            let parsed = ApiErrorKind::parse(wire);
+            assert_eq!(parsed, kind, "{wire}");
+            assert_eq!(
+                parsed.stream_kind().retry_disposition() == RetryDisposition::Transient,
+                transient,
+                "{wire}"
+            );
+            assert_eq!(parsed.busy_status(), busy, "{wire}");
+        }
+        let other = ApiErrorKind::parse("brand_new_error");
+        assert_eq!(other, ApiErrorKind::Other("brand_new_error".into()));
+        assert_eq!(other.stream_kind(), StreamErrorKind::Unknown("brand_new_error".into()));
+        assert_eq!(other.stream_kind().retry_disposition(), RetryDisposition::Permanent, "an unknown type is not retried");
+    }
+
+    #[tokio::test]
+    async fn message_delta_usage_keeps_absent_fields_absent() {
+        let payload = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9,\"service_tier\":\"standard\"}}\n\n";
+        match &parse_all(payload).await[0] {
+            Ok(ClaudeSseEvent::MessageDelta(p)) => {
+                assert_eq!(p.usage.output_tokens, Some(9));
+                assert_eq!(p.usage.input_tokens, None);
+                assert_eq!(p.usage.cache_read_input_tokens, None);
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
         }
     }
 

@@ -17,8 +17,8 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, summarize_thinking};
 use crate::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use crate::kernel_db::KernelDb;
 use crate::llm::stream::{
-    BuildOpts, CacheTarget, InlineToolResult, StreamEvent, apply_tunables,
-    longest_cache_ttl_secs,
+    BuildOpts, CacheTarget, InlineToolResult, RetryDisposition, StreamError, StreamErrorKind,
+    StreamEvent, apply_tunables, longest_cache_ttl_secs,
 };
 use crate::llm::SlotTunables;
 use crate::llm::{ContentBlock, LlmError, ToolDefinition};
@@ -803,18 +803,6 @@ impl StreamTimeouts {
     }
 }
 
-/// Whether a stream-start failure is worth retrying under the bounded
-/// backoff, or a permanent refusal that repeating the same request cannot
-/// change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryDisposition {
-    /// A provider-side hiccup — retry under the existing backoff.
-    Transient,
-    /// Retrying the identical request reproduces the identical refusal —
-    /// stop after one attempt and surface it.
-    Permanent,
-}
-
 /// Classify a stream-start `LlmError` as transient or permanent. Exhaustive
 /// over every `LlmError` variant on purpose: a new variant must be
 /// classified here before it compiles, rather than silently inheriting
@@ -840,7 +828,25 @@ fn retry_disposition(error: &LlmError) -> RetryDisposition {
         LlmError::CompletionError(_) => RetryDisposition::Transient,
         // The same history fills the same window on every attempt.
         LlmError::ContextFull(_) => RetryDisposition::Permanent,
+        // The balance does not refill during the backoff.
+        LlmError::InsufficientBalance(_) => RetryDisposition::Permanent,
     }
+}
+
+/// How long to wait before retry number `attempt` (1-based) of a failed
+/// inference. The ceiling doubles from 1 s and stops at 30 s; the wait is
+/// that ceiling less up to half of it, chosen by `entropy`, so callers that
+/// fail together do not return together.
+fn retry_backoff(attempt: u32, entropy: u64) -> std::time::Duration {
+    let ceiling_ms = (1000u64 << attempt.saturating_sub(1).min(5)).min(30_000);
+    let floor_ms = ceiling_ms / 2;
+    let jitter_ms = (u128::from(floor_ms) * u128::from(entropy) / u128::from(u64::MAX)) as u64;
+    std::time::Duration::from_millis(floor_ms + jitter_ms)
+}
+
+/// Entropy for [`retry_backoff`].
+fn backoff_entropy() -> u64 {
+    uuid::Uuid::new_v4().as_u128() as u64
 }
 
 /// How many times one turn answers an output-ceiling stop with a notice and
@@ -967,16 +973,18 @@ impl CeilingStop {
 }
 
 /// Reasoning entries a provider may receive back: those carrying a continuity
-/// signature. This is the hydrator's rule (`llm/hydrate.rs`), applied to the
-/// live loop so one turn serializes the same way live and rehydrated. An
-/// unsigned block is dropped — Anthropic refuses one echoed back without its
-/// signature, and the next hydration would not replay it either.
+/// signature, whatever their text. This is the hydrator's rule
+/// (`llm/hydrate.rs`), applied to the live loop so one turn serializes the
+/// same way live and rehydrated. An unsigned block is dropped — Anthropic
+/// refuses one echoed back without its signature, and the next hydration
+/// would not replay it either. A signed block with no text is thinking the
+/// API withheld or omitted; its signature still has to go back.
 fn replayable_reasoning(
     reasoning: Vec<(String, Option<String>)>,
 ) -> Vec<(String, Option<String>)> {
     reasoning
         .into_iter()
-        .filter(|(text, signature)| signature.is_some() && !text.is_empty())
+        .filter(|(_, signature)| signature.as_deref().is_some_and(|s| !s.is_empty()))
         .collect()
 }
 
@@ -1131,12 +1139,33 @@ mod continuation_replay_tests {
         assert!(replayed_assistant(Vec::new(), "").is_none());
     }
 
-    /// A signed but empty thinking block is skipped by the message builder
-    /// (`llm/mod.rs`), so guarding on the pre-build list would produce an
-    /// assistant message with no content blocks at all.
+    /// A signed thinking block with no text cannot carry a message without
+    /// text.
     #[test]
     fn signed_but_empty_reasoning_replays_nothing() {
         assert!(replayed_assistant(vec![signed("")], "").is_none());
+    }
+
+    /// Thinking the API withheld or omitted has no text and a signature the
+    /// next request must send back; the text it rides with keeps it.
+    #[test]
+    fn signed_reasoning_with_no_text_rides_with_the_reply() {
+        let message = replayed_assistant(vec![signed("")], "the answer")
+            .expect("text can stand as an assistant message");
+        let blocks = blocks(&message);
+        assert!(
+            matches!(blocks.first(), Some(ContentBlock::Reasoning { text, signature })
+                if text.is_empty() && signature.as_deref() == Some("signed")),
+            "{blocks:?}"
+        );
+    }
+
+    /// Without a signature there is nothing to verify, so empty reasoning goes.
+    #[test]
+    fn unsigned_empty_reasoning_is_dropped_from_the_replay() {
+        let message = replayed_assistant(vec![("".into(), None)], "the answer")
+            .expect("text can stand as an assistant message");
+        assert_eq!(message.as_text(), Some("the answer"));
     }
 
     /// Whitespace is not text: it cannot carry a message either.
@@ -1166,6 +1195,35 @@ mod stream_timeout_tests {
         slow.request_timeout_secs = Some(1200);
         let t = StreamTimeouts::resolve(&policy, Some(&slow));
         assert_eq!(t.request, Duration::from_secs(1200));
+    }
+}
+
+#[cfg(test)]
+mod retry_backoff_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_ceiling_doubles_from_one_second_and_stops_at_thirty() {
+        let ceilings: Vec<_> = (1..=7).map(|n| retry_backoff(n, 0).max(retry_backoff(n, u64::MAX))).collect();
+        let secs: Vec<_> = ceilings.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn jitter_takes_up_to_half_of_the_ceiling() {
+        for n in 1..=7 {
+            let longest = retry_backoff(n, u64::MAX);
+            let shortest = retry_backoff(n, 0);
+            assert_eq!(shortest, longest / 2, "attempt {n}");
+            let middle = retry_backoff(n, u64::MAX / 2);
+            assert!(shortest < middle && middle < longest, "attempt {n}: {middle:?}");
+        }
+    }
+
+    #[test]
+    fn a_huge_attempt_number_does_not_overflow() {
+        assert_eq!(retry_backoff(u32::MAX, u64::MAX), Duration::from_secs(30));
     }
 }
 
@@ -1225,6 +1283,14 @@ mod retry_disposition_tests {
         assert_eq!(
             retry_disposition(&LlmError::ApiError("500".into())),
             RetryDisposition::Transient
+        );
+    }
+
+    #[test]
+    fn insufficient_balance_is_permanent() {
+        assert_eq!(
+            retry_disposition(&LlmError::InsufficientBalance("top up".into())),
+            RetryDisposition::Permanent
         );
     }
 
@@ -2107,6 +2173,9 @@ async fn dispatch_inline_tool_result(
 struct TurnUsageOnSpan {
     span: tracing::Span,
     last: Option<TurnUsage>,
+    /// Streams the provider cut for lack of capacity this turn. A cut sends
+    /// no usage, so this is the only count of those attempts.
+    cuts: u32,
 }
 
 struct TurnUsage {
@@ -2120,6 +2189,9 @@ struct TurnUsage {
 
 impl Drop for TurnUsageOnSpan {
     fn drop(&mut self) {
+        if self.cuts > 0 {
+            self.span.record("llm.stream_cuts", u64::from(self.cuts));
+        }
         let Some(usage) = self.last.take() else {
             return;
         };
@@ -2203,6 +2275,7 @@ fn record_continuation_yield(
         llm.usage.cache_write_tokens = tracing::field::Empty,
         llm.usage.reasoning_tokens = tracing::field::Empty,
         llm.response.stop_reason = tracing::field::Empty,
+        llm.stream_cuts = tracing::field::Empty,
         turn.id = %turn_lease.id(),
         turn.stop_reason = tracing::field::Empty,
         turn.origin = tracing::field::Empty,
@@ -2262,12 +2335,15 @@ async fn process_llm_stream(
     let mut undelivered = Vec::new();
     let outcome = if let Some(mailbox) = mailbox.as_mut() {
         kernel.turns().open_ingress(context_id, turn_id, turn_lease.interrupt());
-        let outcome = std::panic::AssertUnwindSafe(run_llm_stream(
+        // Boxed so the turn's state lives on the heap: an unoptimized build
+        // sizes this frame by every local, and a 2 MB thread has little to
+        // spare. `a_turn_future_stays_small` pins the size.
+        let outcome = std::panic::AssertUnwindSafe(Box::pin(run_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, tunables,
             conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
             continuation_epoch, &mut *mailbox, &turn_lease,
-        )).catch_unwind().await;
+        ))).catch_unwind().await;
         let pending = kernel.turns().close_ingress(context_id, turn_id);
         let stopped = turn_lease.interrupt().cancel.is_cancelled()
             || turn_lease.interrupt().stop_after_turn.load(std::sync::atomic::Ordering::Relaxed);
@@ -2460,6 +2536,7 @@ async fn run_llm_stream(
     let mut usage_on_span = TurnUsageOnSpan {
         span: tracing::Span::current(),
         last: None,
+        cuts: 0,
     };
 
     // The principal stamped on blocks this stream authors. Two provenance
@@ -2585,8 +2662,17 @@ async fn run_llm_stream(
         context_id
     );
 
-    // Counts inferences this turn, for logging only.
+    // Counts model calls this turn: the step number on request logs. A
+    // mid-stream retry keeps its call's number.
     let mut iteration: u32 = 0;
+    // Requests sent for the current step, across startup and mid-stream
+    // retries: the attempt number on request logs.
+    let mut step_attempt: u32 = 0;
+    // When the current step's total wall-clock cap ends. Fixed when the step's
+    // first stream opens, so its mid-stream retries share it.
+    let mut step_deadline: Option<tokio::time::Instant> = None;
+    // The loop is re-entering the same step after a mid-stream cut.
+    let mut resending = false;
     // Request sensors: the summary line always, the body dump when
     // `KJ_LLM_REQUEST_DUMP` names a directory. One trace per turn, so a write
     // failure warns once.
@@ -2604,6 +2690,8 @@ async fn run_llm_stream(
     let mut done_nudges: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
+    // Transient mid-stream cuts sent again so far, against `MAX_LLM_RETRIES`.
+    let mut stream_retries: u32 = 0;
 
     // Track last inserted block for ordering - each new block goes after the previous
     let mut last_block_id = after_block_id;
@@ -2631,7 +2719,13 @@ async fn run_llm_stream(
             stop_reason_out = TurnStopReason::Cancelled { immediate: true };
             break;
         }
-        iteration += 1;
+        if resending {
+            resending = false;
+        } else {
+            iteration += 1;
+            step_attempt = 0;
+            step_deadline = None;
+        }
 
         // Soft interrupt: stop before the next LLM call. The in-flight model
         // call already finished, so the output block is a whole phrase — that
@@ -2692,12 +2786,14 @@ async fn run_llm_stream(
 
         // `retry_disposition` decides which startup failures keep the
         // bounded backoff and which are permanent refusals that stop after
-        // one attempt. Mid-stream errors are never retried, regardless of
-        // disposition, to avoid duplicate kernel blocks.
+        // one attempt. A mid-stream error is sent again only when the
+        // provider marked it transient and the attempt wrote no block; see
+        // the `StreamEvent::Error` arm below.
         let mut stream = {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
+                step_attempt += 1;
                 let stamp = continuation_epoch.map(|epoch| kernel_db.lock().admit_inference_request(
                     context_id, epoch, kaijutsu_types::now_millis() as i64,
                 )).transpose();
@@ -2712,7 +2808,7 @@ async fn run_llm_stream(
                             break 'agentic;
                         }
                         result = provider.stream(
-                            build_opts.clone().with_trace(request_trace.at_step(iteration).at_attempt(attempt)),
+                            build_opts.clone().with_trace(request_trace.at_step(iteration).at_attempt(step_attempt)),
                             messages.clone(),
                         ) => result,
                     },
@@ -2731,13 +2827,13 @@ async fn run_llm_stream(
                     }
                     Err(e) if attempt <= MAX_LLM_RETRIES
                         && retry_disposition(&e) == RetryDisposition::Transient => {
-                        let delay_secs = attempt as u64;
+                        let delay = retry_backoff(attempt, backoff_entropy());
                         tracing::warn!(
-                            "LLM stream failed (attempt {}/{}): {}, retrying in {}s",
+                            "LLM stream failed (attempt {}/{}): {}, retrying in {:?}",
                             attempt,
                             MAX_LLM_RETRIES + 1,
                             e,
-                            delay_secs
+                            delay
                         );
                         tokio::select! {
                             biased;
@@ -2745,7 +2841,7 @@ async fn run_llm_stream(
                                 stop_reason_out = TurnStopReason::Cancelled { immediate: true };
                                 break 'agentic;
                             }
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                            _ = tokio::time::sleep(delay) => {}
                         }
                     }
                     Err(e) => {
@@ -2786,6 +2882,7 @@ async fn run_llm_stream(
         };
 
         // Process stream events
+        let attempt_start_block = last_block_id;
         let mut open_content: Option<OpenContent> = None;
         // Each pending invocation already has a durable call block, in the
         // order the provider sent the calls. A call whose arguments did not
@@ -2816,8 +2913,9 @@ async fn run_llm_stream(
         // but stop sending tokens — both the backend's own when it set them.
         let idle_timeout = stream_timeouts.idle;
         let request_timeout = stream_timeouts.request;
-        let total_deadline =
-            tokio::time::sleep(request_timeout);
+        let total_deadline = tokio::time::sleep_until(
+            *step_deadline.get_or_insert_with(|| tokio::time::Instant::now() + request_timeout),
+        );
         tokio::pin!(total_deadline);
         let received_done = 'stream: loop {
             // Cancellation retains accepted output and may still report usage.
@@ -2847,8 +2945,9 @@ async fn run_llm_stream(
                             request_timeout, context_id
                         );
                         stream.cancel();
-                        StreamEvent::Error(format!(
-                            "LLM request timed out after {:?}", request_timeout
+                        StreamEvent::Error(StreamError::new(
+                            StreamErrorKind::Timeout,
+                            format!("LLM request timed out after {:?}", request_timeout),
                         ))
                     }
                     r = tokio::time::timeout(idle_timeout, stream.next_event()) => {
@@ -2861,8 +2960,9 @@ async fn run_llm_stream(
                                     idle_timeout, context_id
                                 );
                                 stream.cancel();
-                                StreamEvent::Error(format!(
-                                    "LLM stream idle for {:?}", idle_timeout
+                                StreamEvent::Error(StreamError::new(
+                                    StreamErrorKind::Timeout,
+                                    format!("LLM stream idle for {:?}", idle_timeout),
                                 ))
                             }
                         }
@@ -3238,12 +3338,49 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::Error(err) => {
+                    if err.kind == StreamErrorKind::CapacityCut {
+                        usage_on_span.cuts += 1;
+                        tracing::warn!(
+                            %context_id, step = iteration, attempt = step_attempt, reason = %err,
+                            "provider cut the stream; no usage is reported for the attempt"
+                        );
+                    }
+                    // A failure the kind marks transient is sent again when
+                    // this attempt wrote no block: every durable write moves
+                    // `last_block_id`, so nothing is duplicated. An inline
+                    // tool call is a durable write too (see
+                    // `dispatch_inline_tool_result`); a tool call that waits
+                    // for the stream's end has not run, and a failure drops
+                    // it. A step whose total cap has passed gets no resend:
+                    // it would hit the same cap at once.
+                    if last_block_id == attempt_start_block
+                        && stream_retries < MAX_LLM_RETRIES
+                        && err.kind.retry_disposition() == RetryDisposition::Transient
+                        && tokio::time::Instant::now() < total_deadline.deadline()
+                    {
+                        stream_retries += 1;
+                        let delay = retry_backoff(stream_retries, backoff_entropy());
+                        tracing::info!(
+                            %context_id, step = iteration, kind = ?err.kind,
+                            "sending the step again, retry {stream_retries}/{MAX_LLM_RETRIES} in {delay:?}"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = interrupt.cancel.cancelled() => {
+                                stop_reason_out = TurnStopReason::Cancelled { immediate: true };
+                                break 'agentic;
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        resending = true;
+                        continue 'agentic;
+                    }
                     tracing::error!("LLM stream error: {}", err);
                     let payload = kaijutsu_types::ErrorPayload {
                         category: kaijutsu_types::ErrorCategory::Stream,
                         severity: kaijutsu_types::ErrorSeverity::Error,
                         code: None,
-                        detail: Some(err.clone()),
+                        detail: Some(err.to_string()),
                         span: None,
                         source_kind: None,
                     };
@@ -3267,6 +3404,7 @@ async fn run_llm_stream(
         if !received_done && cancel_deadline.is_none() {
             return Err(StreamFailure::Protocol("stream ended before Done".into()));
         }
+        stream_retries = 0;
 
         // Hard cancellation ends with a retained fragment, never a score delivery.
         if cancel_deadline.is_some() {
@@ -3636,6 +3774,11 @@ mod publish_tests {
         .await
     }
 
+    /// Upper bound on the `process_llm_stream` future, checked on every driven
+    /// turn. The measured size is about 3 KB with `run_llm_stream` boxed and
+    /// 21 KB without.
+    const TURN_FUTURE_MAX_BYTES: usize = 8 * 1024;
+
     /// The general form: pick the provider, and get a chance to arm the
     /// interrupt state *before* the stream starts (how the cancel paths are
     /// driven — a cancel already pending when the loop first looks is the
@@ -3726,7 +3869,7 @@ mod publish_tests {
         );
 
         let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
-        process_llm_stream(
+        let turn = process_llm_stream(
             provider,
             documents.clone(),
             ctx,
@@ -3747,7 +3890,14 @@ mod publish_tests {
             turn_lease,
             origin,
             None,
-        )
+        );
+        let size = std::mem::size_of_val(&turn);
+        assert!(
+            size <= TURN_FUTURE_MAX_BYTES,
+            "a_turn_future_stays_small: the process_llm_stream future is {size} bytes, over {TURN_FUTURE_MAX_BYTES}. \
+             A 2 MB thread overflows when the turn path's frames grow; Box::pin the new large future where it is awaited."
+        );
+        turn
         .await;
 
         (documents, ctx, player)
@@ -3861,7 +4011,7 @@ mod publish_tests {
                     let mut terminal = kernel.turn_flows().subscribe("turn.*");
                     let mut events = vec![StreamEvent::TextStart, StreamEvent::TextDelta("accepted prefix".into())];
                     match ending {
-                        "error" => events.push(StreamEvent::Error("transport stopped".into())),
+                        "error" => events.push(StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "transport stopped"))),
                         "done" => events.push(StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None }),
                         _ => {},
                     }
@@ -4297,6 +4447,252 @@ mod publish_tests {
         ]
     }
 
+    /// The error a provider emits when it cuts a reply for lack of capacity.
+    fn cut() -> crate::llm::StreamEvent {
+        stream_error(crate::llm::StreamErrorKind::CapacityCut)
+    }
+
+    fn stream_error(kind: crate::llm::StreamErrorKind) -> crate::llm::StreamEvent {
+        crate::llm::StreamEvent::Error(crate::llm::StreamError::new(kind, "scripted failure"))
+    }
+
+    /// Drive an interactive turn over `script` and report how it ended, the
+    /// blocks it left, and the message list of each request the provider
+    /// received.
+    async fn midstream_turn(name: &str, script: Vec<Vec<crate::llm::StreamEvent>>)
+        -> (bool, Vec<kaijutsu_types::BlockSnapshot>, Vec<serde_json::Value>)
+    {
+        let kernel = Arc::new(Kernel::new_ephemeral(name).await);
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let (mock, sent) = MockClient::new("unused").with_scripted_stream(script).recording_sent_messages();
+        let (documents, ctx, _player) = drive_turn_offering(TurnOrigin::Interactive, kernel.clone(),
+            Provider::Mock(mock), |_| {}, 0, vec![], vec![]).await;
+        let ok = completed.try_recv().is_some();
+        let requests = sent.lock().iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        (ok, documents.block_snapshots(ctx).unwrap(), requests)
+    }
+
+    /// A cut before any block was written leaves nothing to duplicate, so the
+    /// same request goes again.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_cut_before_any_block_is_sent_again() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (ok, blocks, requests) = midstream_turn("cut-retry",
+                vec![vec![cut()], text_reply("recovered")]).await;
+            assert!(ok, "the second attempt completes the turn");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0], requests[1], "the retry sends the first attempt's messages");
+            assert_eq!(blocks.iter().filter(|b| b.content == "recovered").count(), 1, "{blocks:?}");
+            assert!(!blocks.iter().any(|b| b.kind == BlockKind::Error), "a retried cut leaves no error block");
+        }).await;
+    }
+
+    /// Two retries, as at startup; the third cut fails the turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_cut_that_keeps_happening_fails_after_the_retries() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (ok, blocks, requests) = midstream_turn("cut-exhausted",
+                vec![vec![cut()], vec![cut()], vec![cut()], text_reply("never")]).await;
+            assert!(!ok);
+            assert_eq!(requests.len(), 3);
+            assert!(blocks.iter().any(|b| b.kind == BlockKind::Error), "{blocks:?}");
+        }).await;
+    }
+
+    /// Text already written is durable; a second attempt would write it twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_after_a_block_was_written_is_not_sent_again() {
+        tokio::task::LocalSet::new().run_until(async {
+            let partial = vec![
+                crate::llm::StreamEvent::TextStart,
+                crate::llm::StreamEvent::TextDelta("half".into()),
+                crate::llm::StreamEvent::TextEnd,
+                cut(),
+            ];
+            let (ok, blocks, requests) = midstream_turn("cut-after-text", vec![partial, text_reply("again")]).await;
+            assert!(!ok);
+            assert_eq!(requests.len(), 1);
+            assert!(!blocks.iter().any(|b| b.content == "again"), "{blocks:?}");
+        }).await;
+    }
+
+    /// Reasoning already written is durable too; a second attempt would
+    /// write it twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_after_a_thinking_block_was_written_is_not_sent_again() {
+        tokio::task::LocalSet::new().run_until(async {
+            let partial = vec![
+                crate::llm::StreamEvent::ThinkingStart,
+                crate::llm::StreamEvent::ThinkingDelta("hmm".into()),
+                crate::llm::StreamEvent::ThinkingEnd { signature: None },
+                cut(),
+            ];
+            let (ok, blocks, requests) = midstream_turn("cut-after-thinking", vec![partial, text_reply("again")]).await;
+            assert!(!ok);
+            assert_eq!(requests.len(), 1);
+            assert!(!blocks.iter().any(|b| b.content == "again"), "{blocks:?}");
+            assert_eq!(blocks.iter().filter(|b| b.kind == BlockKind::Thinking).count(), 1, "{blocks:?}");
+        }).await;
+    }
+
+    /// A retried cut is the same step on its next attempt; the next model
+    /// call is the next step, on its first.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_cut_keeps_its_step_and_raises_the_attempt() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("cut-step").await);
+            let tool_round = vec![
+                crate::llm::StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(), input: serde_json::json!({}) },
+                crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
+            ];
+            let (mock, traces) = MockClient::new("unused")
+                .with_scripted_stream(vec![vec![cut()], tool_round, text_reply("done")])
+                .recording_traces();
+            drive_turn_offering(TurnOrigin::Interactive, kernel, Provider::Mock(mock), |_| {}, 0, vec![], vec![]).await;
+            assert_eq!(*traces.lock(), [(1, 1), (1, 2), (2, 1)]);
+        }).await;
+    }
+
+    /// The total cap covers a step's first attempt and its retries together.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_cut_shares_the_steps_total_deadline() {
+        use std::time::Duration;
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("cut-deadline").await.with_timeouts(kaijutsu_types::TimeoutPolicy {
+                llm_request_timeout: Duration::from_secs(10),
+                llm_idle_timeout: Duration::from_secs(60),
+                ..Default::default()
+            }));
+            let mock = MockClient::new("unused")
+                .with_scripted_stream(vec![vec![cut()], vec![]])
+                .hangs_when_exhausted();
+            let started = tokio::time::Instant::now();
+            drive_turn_offering(TurnOrigin::Interactive, kernel, Provider::Mock(mock), |_| {}, 0, vec![], vec![]).await;
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
+            assert!(elapsed < Duration::from_millis(10_400),
+                "the retry's own cap would end it after the backoff too: {elapsed:?}");
+        }).await;
+    }
+
+    /// A 402 is a permanent refusal: one request goes out, not the startup
+    /// retries.
+    #[tokio::test]
+    async fn an_insufficient_balance_answer_sends_one_request() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        tokio::task::LocalSet::new().run_until(async {
+            let body = r#"{"error":{"message":"Insufficient Balance","type":"unknown_error"}}"#;
+            let (base, captured) = serve(vec![reply(402, body), reply(402, body), reply(402, body)]).await;
+            let kernel = Arc::new(Kernel::new_ephemeral("balance-402").await);
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let provider = Provider::OpenAi(crate::llm::openai::Client::new("local").with_base_url(base));
+            let (documents, ctx, _player) = drive_turn_offering(TurnOrigin::Interactive, kernel.clone(),
+                provider, |_| {}, 0, vec![], vec![]).await;
+            assert!(completed.try_recv().is_none(), "the turn fails");
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            let blocks = documents.block_snapshots(ctx).unwrap();
+            assert!(blocks.iter().any(|b| b.content.contains("insufficient balance")), "{blocks:?}");
+        }).await;
+    }
+
+    /// Each transient kind is sent again when the attempt wrote no block, and
+    /// each permanent kind fails the turn after one request.
+    #[tokio::test(start_paused = true)]
+    async fn the_error_kind_decides_whether_a_step_is_sent_again() {
+        use crate::llm::StreamErrorKind::*;
+        tokio::task::LocalSet::new().run_until(async {
+            for kind in [Overloaded, RateLimited, ServerError, Timeout, CapacityCut, Transport] {
+                let (ok, _blocks, requests) = midstream_turn("kind-transient",
+                    vec![vec![stream_error(kind.clone())], text_reply("recovered")]).await;
+                assert!(ok, "{kind:?} is sent again and the second attempt completes");
+                assert_eq!(requests.len(), 2, "{kind:?}");
+            }
+            for kind in [
+                ContentFilter, Truncated("pause_turn".into()), Auth, InvalidRequest, Billing, Protocol,
+                Unknown("x".into()),
+            ] {
+                let (ok, _blocks, requests) = midstream_turn("kind-permanent",
+                    vec![vec![stream_error(kind.clone())], text_reply("again")]).await;
+                assert!(!ok, "{kind:?} fails the turn");
+                assert_eq!(requests.len(), 1, "{kind:?} is not sent again");
+            }
+        }).await;
+    }
+
+    /// A transient kind after a block was written still fails: the block is
+    /// durable and a second attempt would write it twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_kind_after_a_block_was_written_is_not_sent_again() {
+        tokio::task::LocalSet::new().run_until(async {
+            let partial = vec![
+                crate::llm::StreamEvent::TextStart,
+                crate::llm::StreamEvent::TextDelta("half".into()),
+                crate::llm::StreamEvent::TextEnd,
+                stream_error(crate::llm::StreamErrorKind::Overloaded),
+            ];
+            let (ok, _blocks, requests) = midstream_turn("overloaded-after-text", vec![partial, text_reply("again")]).await;
+            assert!(!ok);
+            assert_eq!(requests.len(), 1);
+        }).await;
+    }
+
+    /// The idle guard's own error is a timeout: a stream that opened and went
+    /// quiet is sent again.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_stream_is_sent_again() {
+        use std::time::Duration;
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("idle-retry").await.with_timeouts(kaijutsu_types::TimeoutPolicy {
+                llm_request_timeout: Duration::from_secs(600),
+                llm_idle_timeout: Duration::from_secs(5),
+                ..Default::default()
+            }));
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let (mock, sent) = MockClient::new("unused")
+                .with_scripted_stream(vec![vec![], text_reply("recovered")])
+                .hangs_when_exhausted()
+                .recording_sent_messages();
+            drive_turn_offering(TurnOrigin::Interactive, kernel, Provider::Mock(mock), |_| {}, 0, vec![], vec![]).await;
+            assert!(completed.try_recv().is_some(), "the second attempt completes the turn");
+            assert_eq!(sent.lock().len(), 2);
+        }).await;
+    }
+
+    /// The step's total cap is spent when it fires, so a resend would hit it
+    /// at once: the turn fails after one request.
+    #[tokio::test(start_paused = true)]
+    async fn a_total_timeout_is_not_sent_again() {
+        use std::time::Duration;
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("total-timeout").await.with_timeouts(kaijutsu_types::TimeoutPolicy {
+                llm_request_timeout: Duration::from_secs(10),
+                llm_idle_timeout: Duration::from_secs(60),
+                ..Default::default()
+            }));
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let (mock, sent) = MockClient::new("unused")
+                .with_scripted_stream(vec![vec![], text_reply("never")])
+                .hangs_when_exhausted()
+                .recording_sent_messages();
+            let started = tokio::time::Instant::now();
+            drive_turn_offering(TurnOrigin::Interactive, kernel, Provider::Mock(mock), |_| {}, 0, vec![], vec![]).await;
+            assert!(completed.try_recv().is_none(), "the turn fails");
+            assert_eq!(sent.lock().len(), 1);
+            assert!(started.elapsed() < Duration::from_millis(10_400), "{:?}", started.elapsed());
+        }).await;
+    }
+
+    /// Only the errors a provider marks transient are sent again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unmarked_error_before_any_block_is_not_sent_again() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (ok, _blocks, requests) = midstream_turn("unmarked-error",
+                vec![vec![crate::llm::StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "SSE decode: bad json"))], text_reply("again")]).await;
+            assert!(!ok);
+            assert_eq!(requests.len(), 1);
+        }).await;
+    }
+
     fn done_call(id: &str) -> Vec<crate::llm::StreamEvent> {
         vec![
             crate::llm::StreamEvent::ToolUse { id: id.into(), name: "done".into(),
@@ -4588,6 +4984,17 @@ mod publish_tests {
             let log = log.lock().clone();
             let at = |event: &str| log.iter().position(|e| e == event).unwrap_or_else(|| panic!("{event} missing: {log:?}"));
             assert!(at("end x1") < at("start x2"), "the qualified second edit on x.c waits for the first: {log:?}");
+        }).await;
+    }
+
+    /// The turn future is bounded by `TURN_FUTURE_MAX_BYTES`, which
+    /// `drive_turn_offering` asserts on every turn it drives. One turn here
+    /// reports the measured size, so a failure names the bound to revisit.
+    #[tokio::test]
+    async fn a_turn_future_stays_small() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("turn-size").await);
+            drive_one_turn(TurnOrigin::Interactive, kernel).await;
         }).await;
     }
 
@@ -6610,7 +7017,7 @@ mod usage_tests {
     /// a thread-local default they cache `never` and this thread's turn
     /// creates no spans at all. A global default is what those registrations
     /// consult. Spans are told apart by the thread that created them.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn turn_span_records_usage_once_with_the_final_call() {
         use std::sync::Mutex as StdMutex;
         use std::thread::ThreadId;
@@ -6687,6 +7094,8 @@ mod usage_tests {
                 tracing::callsite::rebuild_interest_cache();
                 let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
                     vec![
+                        // A cut reports no usage; the span counts it apart.
+                        vec![StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::CapacityCut, "cut"))],
                         vec![
                             StreamEvent::ToolUse {
                                 id: "call_1".into(),
@@ -6760,6 +7169,8 @@ mod usage_tests {
             "the span carries the final call's usage, not the first's"
         );
         assert_eq!(seen["llm.usage.output_tokens"].last, Some(30));
+        assert_eq!(seen["llm.stream_cuts"].count, 1, "one cut, recorded once at turn exit");
+        assert_eq!(seen["llm.stream_cuts"].last, Some(1));
     }
 }
 
@@ -8140,7 +8551,7 @@ mod lifetime_tests {
             ];
             events.extend(if thinking { [StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta(partial.into())] }
                 else { [StreamEvent::TextStart, StreamEvent::TextDelta(partial.into())] });
-            if ending == "error" { events.push(StreamEvent::Error("provider broke".into())); }
+            if ending == "error" { events.push(StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "provider broke"))); }
             let mock = MockClient::new("").with_scripted_stream(vec![events]);
             let mock = match ending {
                 "panic" => mock.panics_when_exhausted(), "cancel" => mock.hangs_when_exhausted(), _ => mock,
@@ -8811,7 +9222,7 @@ mod lifetime_tests {
                 events.extend([StreamEvent::TextStart, StreamEvent::TextDelta("half an answer".into())]);
             }
             if ending == "error" {
-                events.push(StreamEvent::Error("provider fell over".into()));
+                events.push(StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "provider fell over")));
             }
             let mock = MockClient::new("").with_scripted_stream(vec![events]);
             let mock = if ending == "cancel" { mock.hangs_when_exhausted() } else { mock };
@@ -8838,7 +9249,7 @@ mod lifetime_tests {
             let expected = if ending == "cancel" {
                 "(The previous turn was interrupted before it finished. It gave no complete reply; do not resume it unless asked.)"
             } else {
-                "(The previous turn failed before it finished: LLM stream error: provider fell over. It gave no complete reply; do not resume it unless asked.)"
+                "(The previous turn failed before it finished: LLM stream error: protocol: provider fell over. It gave no complete reply; do not resume it unless asked.)"
             };
             assert_eq!(notice.as_text(), Some(expected));
             let mut before = &history[history.len() - 2];
@@ -8860,7 +9271,7 @@ mod lifetime_tests {
     #[tokio::test]
     async fn a_note_accepted_by_a_failing_turn_gets_a_turn_of_its_own() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
-            vec![StreamEvent::Error("provider fell over".into())],
+            vec![StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "provider fell over"))],
             text_reply("ack"),
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
@@ -8922,7 +9333,7 @@ mod lifetime_tests {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
             vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
                 input: serde_json::json!({}) }, done("tool_use")],
-            vec![StreamEvent::Error("provider fell over".into())],
+            vec![StreamEvent::Error(crate::llm::StreamError::new(crate::llm::StreamErrorKind::Protocol, "provider fell over"))],
             text_reply("ack"),
         ]).recording_sent_messages();
         let (mock, hold) = mock.holding_call(0);
