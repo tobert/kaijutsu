@@ -148,6 +148,8 @@ overlay.
 - **Build cache.** `~/kj-dev/<project>/cargo-target` mounts at `~/.cache/kaijutsu/cargo-target`, the
   `CARGO_TARGET_DIR` that the default rc gives each context. The root file system is read-only, so without the
   volume cargo cannot write there. `check.sh <project>` probes each path that a seat writes.
+- **Models.** `/tank/ml/models` mounts read-only at the same path, so GPU tests read weights where the
+  engine's own docs name them. `check.sh` probes it.
 - **Seats.** banto plays a `director` context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
   supervising Claude session, which connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`). banto starts
   coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.

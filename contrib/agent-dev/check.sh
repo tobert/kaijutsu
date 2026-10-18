@@ -26,4 +26,13 @@ probe /workspace
 probe /exchange/to-supervisor
 probe "$HOME/src/$project"
 
+# Model weights are read-only. mk's GPU tests read its shards from MK_SHARDS (harness/paths.py, MODEL_DIR).
+models="${KJ_DEV_MODELS:-/tank/ml/models}"
+if podman exec "$container" sh -c "test -r \"$models\" && ls \"$models\" >/dev/null" 2>/dev/null; then
+  echo "ok    $models is readable"
+else
+  echo "FAIL  $models is not readable in $container" >&2
+  fail=1
+fi
+
 exit "$fail"
