@@ -906,9 +906,21 @@ fn extract_context(content: &str, pos: usize, match_len: usize) -> String {
         .iter()
         .enumerate()
         .map(|(i, piece)| {
-            let line = piece.strip_suffix('\n').unwrap_or(piece);
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            format!("{:>width$}→ {}", start + i + 1, line, width = width)
+            // Same line notion as `str::lines` (and so as `read`/anchors): a
+            // `\r` is a terminator only when a `\n` followed it.
+            let line = match piece.strip_suffix('\n') {
+                Some(l) => l.strip_suffix('\r').unwrap_or(l),
+                None => piece,
+            };
+            // Same `N:hash→ text` form `read` prints, so the next anchored
+            // edit can use these anchors without a re-read.
+            format!(
+                "{:>width$}:{}→ {}",
+                start + i + 1,
+                line_hash(line),
+                truncate_line(line),
+                width = width
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1511,6 +1523,81 @@ mod tests {
             cache.try_read_content(path).await.unwrap(),
             "# 改善\n\n- α bullet\n- done\n"
         );
+    }
+
+    /// Pull `N:hash` out of the window line whose text contains `needle`.
+    fn window_anchor(out: &str, needle: &str) -> String {
+        let line = out
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no window line with {needle:?} in: {out}"));
+        let (head, _) = line.split_once('→').expect("window line has an arrow");
+        assert!(head.contains(':'), "window line lacks a hash: {line:?}");
+        head.trim().to_string()
+    }
+
+    /// The success window prints hashline anchors, and an anchor copied from
+    /// it works in the next edit even though the first edit shifted lines.
+    #[tokio::test]
+    async fn edit_string_mode_window_carries_usable_anchors() {
+        let path = "/tmp/win.md";
+        let (broker, cache) = broker_with_file(path, "a\n\nb\nTARGET\nc\nd\n").await;
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({ "path": path, "old_string": "TARGET", "new_string": "x1\nx2\nx3" }),
+        )
+        .await;
+        assert!(!res.is_error, "edit failed: {}", text_of(&res));
+        let out = text_of(&res);
+        assert!(
+            out.contains(&format!("4:{}→ x1", line_hash("x1"))),
+            "window must be hashline form, got: {out}"
+        );
+
+        let anchor = window_anchor(&out, " c");
+        let res2 = call(
+            &broker,
+            "edit",
+            serde_json::json!({ "path": path, "anchor": anchor, "new_string": "C" }),
+        )
+        .await;
+        assert!(!res2.is_error, "anchor from window rejected: {}", text_of(&res2));
+        assert_eq!(
+            cache.try_read_content(path).await.unwrap(),
+            "a\n\nb\nx1\nx2\nx3\nC\nd\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_mode_window_carries_usable_anchors() {
+        let path = "/tmp/win2.md";
+        let content = "a\nb\nc\nd\ne\n";
+        let (broker, cache) = broker_with_file(path, content).await;
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "anchor": format!("2:{}", line_hash("b")),
+                "new_string": "B1\nB2",
+            }),
+        )
+        .await;
+        assert!(!res.is_error, "edit failed: {}", text_of(&res));
+        let out = text_of(&res);
+        let anchor = window_anchor(&out, "→ d");
+        assert!(anchor.starts_with("5:"), "d moved to line 5: {out}");
+        let res2 = call(
+            &broker,
+            "edit",
+            serde_json::json!({ "path": path, "anchor": anchor, "new_string": "D" }),
+        )
+        .await;
+        assert!(!res2.is_error, "anchor from window rejected: {}", text_of(&res2));
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "a\nB1\nB2\nc\nD\ne\n");
     }
 
     /// `apply_edit_plan` converts `try_get_or_load`/`try_read_content`'s typed
