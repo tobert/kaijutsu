@@ -105,6 +105,7 @@ kaish-glob = { version = "0.18" }
 kaish-types = { version = "0.18" }
 kaish-help = { version = "0.18" }
 
+
 # Cap'n Proto
 capnp = "0.25"
 capnp-rpc = "0.25"
@@ -238,4 +239,14 @@ tracing-opentelemetry = "0.32"
 # Testing
 tempfile = "3"
 
-
+# TEMPORARY (Amy, 2026-10-18: "we can switch to a hash temporarily, will probably be a few days before I do a
+# kaish release"). tobert/kaish PR #528 (bare `%` in words) at 94871e59. The patch also covers the
+# kaish crates that kaish-extras pulls from crates.io, so one copy of each is built. Remove this block when the
+# kaish release that carries #528 lands, and keep the version lines above.
+[patch.crates-io]
+kaish-glob = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
+kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
+kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
+kaish-types = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
+kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
