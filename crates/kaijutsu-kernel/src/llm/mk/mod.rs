@@ -343,6 +343,8 @@ fn mk_error_kind(e: &MkError) -> StreamErrorKind {
         MkError::Request(_) | MkError::ContextFull { .. } => InvalidRequest,
         MkError::Status { status, .. } | MkError::Service { status, .. } => status_kind(*status),
         MkError::Stream(error) => status_kind(error.code),
+        // A council error event names a type, which `status` maps to the status it stands for.
+        MkError::CouncilStream { .. } => e.status().map_or(ServerError, status_kind),
     }
 }
 
@@ -532,7 +534,7 @@ mod tests {
     fn a_402_is_an_insufficient_balance_error() {
         for e in [
             MkError::Service { status: 402, error: None, retry_after: None, body: "pay".into() },
-            MkError::Status { status: 402, error: None, retry_after: None, body: "pay".into() },
+            MkError::Status { status: 402, error: None, retry_after: None, body: "pay".into(), request_id: None },
         ] {
             let err = to_llm("b", e);
             assert!(matches!(&err, LlmError::InsufficientBalance(m) if m.contains("mk backend 'b'")), "{err:?}");
@@ -833,6 +835,7 @@ mod tests {
     fn an_mk_error_maps_to_its_stream_kind() {
         use kaijutsu_mk::{MkError, ServiceError};
         let stream = |code: u16| MkError::Stream(ServiceError { code, message: "m".into(), r#type: "t".into() });
+        let council = |r#type| MkError::CouncilStream { error: gogi_proto::ErrorBody::new(r#type, "m").error, request_id: None };
         let cases = [
             (stream(503), StreamErrorKind::Overloaded),
             (stream(429), StreamErrorKind::RateLimited),
@@ -843,6 +846,10 @@ mod tests {
             (MkError::Transport("reset".into()), StreamErrorKind::Transport),
             (MkError::Truncated("x".into()), StreamErrorKind::Transport),
             (MkError::Decode { what: "w", message: "m".into(), body: String::new() }, StreamErrorKind::Protocol),
+            (council(gogi_proto::ErrorType::ModelUnavailable), StreamErrorKind::Overloaded),
+            (council(gogi_proto::ErrorType::Busy), StreamErrorKind::RateLimited),
+            (council(gogi_proto::ErrorType::Timeout), StreamErrorKind::Timeout),
+            (council(gogi_proto::ErrorType::InvalidRequest), StreamErrorKind::ServerError),
         ];
         for (error, kind) in cases {
             assert_eq!(mk_error_kind(&error), kind, "{error}");

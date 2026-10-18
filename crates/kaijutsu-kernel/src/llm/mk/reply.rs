@@ -284,10 +284,10 @@ fn marker_prefix_len(text: &str, marker: &str) -> usize {
     (1..marker.len()).rev().find(|&k| text.ends_with(&marker[..k])).unwrap_or(0)
 }
 
-/// Whitespace as Python's `str.strip()` sees it, which is how the service
-/// trims: Unicode white space plus the four ASCII separators U+001C..U+001F.
+/// Whitespace the service trims from each part, which a part's pieces and
+/// `done`'s text may differ by at either end (gogi's `is_edge_space`).
 fn is_space(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+    gogi_proto::generation::is_edge_space(c)
 }
 
 #[derive(Clone, Copy)]

@@ -139,12 +139,6 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   deadline. Linking the script into `submit` would catch them for turns a
   person starts, at one rc run per submit; nothing catches them for
   autonomous turns.
-- **A streamed reply is checked against its pieces.** The provider joins
-  each phase's pieces into a block and refuses a `done` whose `reasoning`
-  or `content` differs, because a streamed block cannot be taken back. Amy
-  chose (2026-10-18) to make the contract promise this: a phase's pieces
-  join to `done`'s text up to whitespace at either end. gogi is adding the
-  rule and a conformance check; delete this entry when it lands.
 - **Request ids appear only on errors.** A failed call's error and miss
   cause name the `request-id`; a call that succeeds logs none.
 - **Reachability ignores the server and the served model.** The pin sweep
