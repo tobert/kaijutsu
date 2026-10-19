@@ -1271,6 +1271,9 @@ mod tests {
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("archive-home"), None, principal);
         let target = register_context(&dispatcher, Some("retained"), Some(home), principal);
+        // The shell performs as the system principal; it holds `home`, the
+        // target's senpai, so the authority rule lets it archive.
+        dispatcher.kernel_db().lock().update_played_by(home, Some(PrincipalId::system())).unwrap();
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
         let held = kaish.execute_with_options("kj context archive retained", ExecuteOptions::default()).await.unwrap();
         assert_eq!(held.code, 2, "{}", held.err);

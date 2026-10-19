@@ -383,13 +383,15 @@ enum LedgerCommand {
         /// The ask to withdraw.
         request_id: String,
     },
-    /// Assign a pending ask to another live character for review.
+    /// Pass a pending ask up the senpai chain to the next holder above its
+    /// reviewer. The assigned reviewer, the holder of the ask context's
+    /// senpai, or its lineage root may escalate.
     Escalate {
         /// The ask to reassign.
         request_id: String,
-        /// The live character who will review the ask next. Defaults to
-        /// the next responsible character above the one already assigned,
-        /// walking the ask's context forest; refuses at a root.
+        /// The live character who will review the ask next, instead of the
+        /// next holder up; naming yourself takes the ask over. Only the
+        /// lineage root of the ask's context may use it
         #[arg(long)]
         to: Option<String>,
     },
@@ -405,11 +407,6 @@ enum LedgerCommand {
         /// m/h/d, e.g. 30m, 2h, 7d. No absolute timestamps.
         #[arg(long)]
         since: Option<String>,
-    },
-    /// Manage director-wide approval reviewer delegations.
-    Delegation {
-        #[command(subcommand)]
-        command: DelegationCommand,
     },
     /// Forget a standing rule so its statement escalates to a human again.
     /// Only the character that made the rule can forget it.
@@ -462,25 +459,6 @@ enum LedgerCommand {
     Signal {
         #[command(subcommand)]
         command: SignalCommand,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum DelegationCommand {
-    /// List active director-wide reviewer delegations.
-    List,
-    /// Grant a director's asks to a live reviewer.
-    Grant {
-        /// Existing live director character.
-        director: String,
-        /// Existing live reviewer character.
-        #[arg(long)]
-        to: String,
-    },
-    /// Revoke a director-wide reviewer delegation after pending asks are settled.
-    Revoke {
-        /// Existing director character. A retired director's delegation may be revoked.
-        director: String,
     },
 }
 
@@ -585,7 +563,6 @@ impl KjDispatcher {
             }
             LedgerCommand::Cancel { request_id } => self.ledger_cancel(&request_id, caller),
             LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, to.as_deref(), caller).await,
-            LedgerCommand::Delegation { command } => self.ledger_delegation(command, caller).await,
             LedgerCommand::Rules { limit, since } => {
                 self.ledger_rules(limit, since.as_deref(), caller).await
             }
@@ -976,56 +953,6 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    async fn ledger_delegation(&self, command: DelegationCommand, caller: &KjCaller) -> KjResult {
-        let db = self.kernel_db().lock();
-        if !matches!(command, DelegationCommand::List) {
-            match db.get_character(caller.actor_id) {
-                Ok(Some(sheet)) if sheet.root && sheet.retired_at.is_none() => {}
-                Ok(_) => return KjResult::Err("kj ledger delegation: only a live root character may grant or revoke delegations".into()),
-                Err(error) => return KjResult::Err(format!("kj ledger delegation: could not resolve current authority: {error}")),
-            }
-        }
-        let resolve = |name: &str| -> Result<PrincipalId, String> {
-            let character = db.get_character_by_name(name).map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("no character named '{name}'"))?;
-            if character.retired_at.is_some() { return Err(format!("character '{name}' is retired")); }
-            Ok(character.principal_id)
-        };
-        match command {
-            DelegationCommand::List => match db.list_approval_delegations() {
-                Ok(rows) => KjResult::ok_with_data(rows.iter().map(|(director, reviewer, _, _)| format!("{director} -> {reviewer}")).collect::<Vec<_>>().join("\n"), serde_json::json!(rows.iter().map(|(director, reviewer, grantor, granted_at)| serde_json::json!({"director_id": director.to_string(), "reviewer_id": reviewer.to_string(), "granted_by": grantor.to_string(), "granted_at": granted_at})).collect::<Vec<_>>())),
-                Err(error) => KjResult::Err(format!("kj ledger delegation: {error}")),
-            },
-            DelegationCommand::Grant { director, to } => {
-                let director_id = match resolve(&director) { Ok(id) => id, Err(error) => return KjResult::Err(format!("kj ledger delegation: {error}")) };
-                let reviewer_id = match resolve(&to) { Ok(id) => id, Err(error) => return KjResult::Err(format!("kj ledger delegation: {error}")) };
-                match db.has_pending_asks_for_director(director_id) {
-                    Ok(true) => return KjResult::Err("kj ledger delegation: settle or cancel pending asks before changing a delegation".into()),
-                    Ok(false) => {}
-                    Err(error) => return KjResult::Err(format!("kj ledger delegation: could not inspect pending asks: {error}")),
-                }
-                let span = tracing::info_span!("approval.delegation", operation = "grant", principal.id = %caller.principal_id, actor.id = %caller.actor_id, director.id = %director_id, reviewer.id = %reviewer_id);
-                let _guard = span.enter();
-                match db.grant_approval_delegation(director_id, reviewer_id, caller.actor_id) { Ok(()) => KjResult::ok(format!("delegated contexts directed by {director} to reviewer {to}")), Err(error) => KjResult::Err(format!("kj ledger delegation: {error}")) }
-            }
-            DelegationCommand::Revoke { director } => {
-                let director_id = match db.get_character_by_name(&director) {
-                    Ok(Some(character)) => character.principal_id,
-                    Ok(None) => return KjResult::Err(format!("kj ledger delegation: no character named '{director}'")),
-                    Err(error) => return KjResult::Err(format!("kj ledger delegation: {error}")),
-                };
-                match db.has_pending_asks_for_director(director_id) {
-                    Ok(true) => return KjResult::Err("kj ledger delegation: settle or cancel pending asks before revoking a delegation".into()),
-                    Ok(false) => {}
-                    Err(error) => return KjResult::Err(format!("kj ledger delegation: could not inspect pending asks: {error}")),
-                }
-                let span = tracing::info_span!("approval.delegation", operation = "revoke", principal.id = %caller.principal_id, actor.id = %caller.actor_id, director.id = %director_id, reviewer.id = tracing::field::Empty);
-                let _guard = span.enter();
-                match db.revoke_approval_delegation(director_id, caller.actor_id) { Ok(true) => KjResult::ok(format!("revoked {director} approval delegation")), Ok(false) => KjResult::Err(format!("kj ledger delegation: {director} has no active delegation")), Err(error) => KjResult::Err(format!("kj ledger delegation: {error}")) }
-            }
-        }
-    }
-
     fn ledger_cancel(&self, request_id: &str, caller: &KjCaller) -> KjResult {
         let span = tracing::info_span!(
             "approval.cancel",
@@ -1055,12 +982,8 @@ impl KjDispatcher {
         }
     }
 
-    /// `to` names the next reviewer explicitly; omitted, it continues the
-    /// same walk reviewer resolution made, from the ask's own context up
-    /// `forked_from`, past the ancestor that yielded the current reviewer
-    /// (`docs/character.md`, "Roots and rotation"). Refuses at a root,
-    /// where nobody is above. The assigned reviewer or the lineage root of
-    /// the ask's context may escalate.
+    /// `kj ledger escalate`: see [`escalate_ask`] for who may climb and who
+    /// may name the next reviewer with `--to`.
     async fn ledger_escalate(&self, request_id: &str, to: Option<&str>, caller: &KjCaller) -> KjResult {
         let target = match to {
             Some(name) => match self.kernel_db.lock().get_character_by_name(name) {
@@ -1884,13 +1807,13 @@ fn session_remember_applies(
     Ok(())
 }
 
-/// Reassign a pending ask. `to` names the next reviewer; `None` continues
-/// the climb reviewer resolution made, from the ask's context up the senpai
-/// chain, past the current reviewer and the performer
-/// (`docs/senpai-kohai.md`, "Routing"), and refuses at a context with no senpai. The
-/// assigned reviewer or the lineage root of the ask's context may reassign.
-/// A caller who names itself takes the ask over; the `escalated` event
-/// records both reviewers either way.
+/// Reassign a pending ask. `None` continues the climb reviewer resolution
+/// made, from the ask's context up the senpai chain, past the current
+/// reviewer and the performer (`docs/senpai-kohai.md`, "Routing"), and
+/// refuses at a context with no senpai. The assigned reviewer, the holder of
+/// the ask context's senpai, or its lineage root may climb. `to` names the
+/// next reviewer, and a caller who names itself takes the ask over: both are
+/// the lineage root's alone. The `escalated` event records both reviewers.
 pub fn escalate_ask(
     kernel: &crate::Kernel,
     caller: PrincipalId,
@@ -1916,13 +1839,45 @@ pub fn escalate_ask(
             Ok(None) => return Err(not_found(request_id)),
             Err(e) => return Err(failure(AskAnswerFailureKind::Refused, format!("could not read ask '{request_id}': {e}"))),
         };
-        // When the lineage has no root, only the assigned reviewer may escalate.
-        let root_authority = match ContextId::try_from_slice(&row.context_id).map(|context| db.live_lineage_root(context)) {
+        // The assigned reviewer, or the one authority rule over the ask's
+        // context (`docs/senpai-kohai.md`, "Authority"), may climb. Naming the
+        // next reviewer with `--to`, or taking the ask over, is the lineage
+        // root's override alone.
+        let ask_context = ContextId::try_from_slice(&row.context_id);
+        let root_authority = match ask_context.map(|context| db.live_lineage_root(context)) {
             Some(Ok(root)) => root,
             Some(Err(error)) => return Err(failure(AskAnswerFailureKind::Refused, format!(
                 "could not find the lineage root of ask '{request_id}': {error}"
             ))),
             None => None,
+        };
+        let is_root = root_authority == Some(caller);
+        if to.is_some() && !is_root {
+            let root_name = root_authority.map_or_else(|| "none".to_string(), |root| db.name_for(root));
+            return Err(failure(AskAnswerFailureKind::NotReviewer, format!(
+                "only the lineage root ({root_name}) of ask {request_id}'s context may name its next reviewer with --to or take it over; \
+                 omit --to to climb the senpai chain"
+            )));
+        }
+        let assigned = row.reviewer_id.as_deref() == Some(caller.as_bytes().as_slice());
+        let authorized = if is_root {
+            true
+        } else if let Some(context) = ask_context.filter(|_| !assigned) {
+            match db.get_context(context) {
+                Ok(Some(_)) => match db.context_authority(context, caller, crate::kernel_db::GovernedAct::Escalate) {
+                    Ok(Ok(_)) => true,
+                    Ok(Err(rule)) => return Err(failure(AskAnswerFailureKind::NotReviewer, format!(
+                        "{rule}; the ask's assigned reviewer may also escalate it"
+                    ))),
+                    Err(e) => return Err(failure(AskAnswerFailureKind::Refused, format!(
+                        "could not check authority over ask '{request_id}': {e}"
+                    ))),
+                },
+                Ok(None) => false,
+                Err(e) => return Err(failure(AskAnswerFailureKind::Refused, format!("could not read ask '{request_id}''s context: {e}"))),
+            }
+        } else {
+            false
         };
         let target = match to {
             Some(target) => match db.get_character(target) {
@@ -1943,7 +1898,7 @@ pub fn escalate_ask(
         }
         let escalated = approval_ledger::decide::escalate_with_authority(
             db.conn_for_ledger(), request_id, caller.as_bytes(), target.as_bytes(),
-            root_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
+            authorized.then_some(caller.as_bytes().as_slice()),
         );
         committed = escalated.is_ok();
         escalated
@@ -2177,14 +2132,12 @@ impl Classify for LedgerCommand {
             | LedgerCommand::Show { .. }
             | LedgerCommand::Rules { .. }
             | LedgerCommand::Runs { .. }
-            | LedgerCommand::Bumps { .. }
-            | LedgerCommand::Delegation { command: DelegationCommand::List } => Effect::Read,
+            | LedgerCommand::Bumps { .. } => Effect::Read,
             LedgerCommand::Allow { .. }
             | LedgerCommand::Deny { .. }
             | LedgerCommand::Cancel { .. }
             | LedgerCommand::Escalate { .. }
-            | LedgerCommand::Forget { .. }
-            | LedgerCommand::Delegation { .. } => {
+            | LedgerCommand::Forget { .. } => {
                 Effect::Write
             }
             LedgerCommand::Signal { command } => command.effect(),
@@ -4998,54 +4951,63 @@ mod tests {
         assert!(!bad_verb.is_ok(), "an unwired verb must be refused at parse time, not silently accepted");
     }
 
+    /// The hard cut: `kj ledger delegation` is gone with the delegation table.
     #[tokio::test]
-    async fn retired_director_delegation_can_be_revoked_by_a_root() {
+    async fn ledger_has_no_delegation_verb() {
         let d = test_dispatcher().await;
-        let amy = crate::kj::test_helpers::test_reviewer_principal();
-        let lead = PrincipalId::new();
-        let judge = PrincipalId::new();
-        {
-            let db = d.kernel_db().lock();
-            for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
-            }
+        let c = registered_caller(&d);
+        for argv in [vec![s("ledger"), s("delegation"), s("list")], vec![s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")]] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{argv:?}");
+            assert!(result.message().contains("unrecognized subcommand 'delegation'"), "{}", result.message());
         }
-        let amy_caller = KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
-        assert!(d.dispatch(&[s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")], &amy_caller).await.is_ok());
-        d.kernel_db().lock().conn_for_ledger().execute("UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [lead.as_bytes().as_slice()]).unwrap();
-        let result = d.dispatch(&[s("ledger"), s("delegation"), s("revoke"), s("lead")], &amy_caller).await;
-        assert!(result.is_ok(), "{}", result.message());
-        assert_eq!(d.kernel_db().lock().active_approval_delegation(lead).unwrap(), None);
     }
 
-    /// Delegation authority belongs to any live root character, and to
-    /// nobody else: a director cannot grant review of its own contexts.
+    /// Escalation follows the one authority rule: the holder of the ask
+    /// context's senpai (here also its assigned reviewer) climbs; a sibling
+    /// may not. Naming the next reviewer with `--to` is the lineage root's
+    /// override alone.
     #[tokio::test]
-    async fn only_a_live_root_may_grant_or_revoke_a_delegation() {
+    async fn escalate_follows_the_authority_rule_and_to_is_root_only() {
         let d = test_dispatcher().await;
         let amy = crate::kj::test_helpers::test_reviewer_principal();
-        let lead = PrincipalId::new();
-        let judge = PrincipalId::new();
-        let bob = PrincipalId::new();
+        let [banto, coder, sibling, judge] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let seat = crate::kj::test_helpers::register_context(&d, Some("banto-seat"), Some(root), amy);
+        let lane = crate::kj::test_helpers::register_context(&d, Some("lane"), Some(seat), amy);
         {
             let db = d.kernel_db().lock();
-            for (principal_id, name, root) in [(lead, "lead", false), (judge, "judge", false), (bob, "bob", true)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+            for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
+            db.update_played_by(seat, Some(banto)).unwrap();
+            db.update_played_by(lane, Some(coder)).unwrap();
         }
-        let caller = |actor| KjCaller { principal_id: actor, actor_id: actor, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
-        let grant = [s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")];
-        let refused = d.dispatch(&grant, &caller(lead)).await;
-        assert!(!refused.is_ok() && refused.message().contains("only a live root character"), "{}", refused.message());
-        assert_eq!(d.kernel_db().lock().active_approval_delegation(lead).unwrap(), None);
+        let mut caller = crate::kj::test_helpers::test_caller();
+        caller.context_id = Some(lane);
+        let caller = caller.with_actor(coder, Some(banto));
+        let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
+        let reviewer_of = || d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().reviewer_id;
+        assert_eq!(reviewer_of().as_deref(), Some(banto.as_bytes().as_slice()));
+        let climb = [s("ledger"), s("escalate"), ask.request_id.clone()];
+        let to_judge = [s("ledger"), s("escalate"), ask.request_id.clone(), s("--to"), s("judge")];
 
-        assert!(d.dispatch(&grant, &caller(bob)).await.is_ok(), "a second root has the same delegation authority");
-        let revoke = [s("ledger"), s("delegation"), s("revoke"), s("lead")];
-        assert!(!d.dispatch(&revoke, &caller(judge)).await.is_ok());
-        assert!(d.dispatch(&revoke, &caller(amy)).await.is_ok(), "any live root may revoke");
+        let refused = d.dispatch(&climb, &caller.clone().with_actor(sibling, None)).await;
+        assert!(!refused.is_ok());
+        assert!(refused.message().contains(&format!(
+            "only lane ({})'s senpai (banto) or its lineage root (amy) may escalate its asks", lane.short()
+        )), "{}", refused.message());
+        let refused = d.dispatch(&to_judge, &caller.clone().with_actor(banto, None)).await;
+        assert!(!refused.is_ok());
+        assert!(refused.message().contains("only the lineage root (amy)") && refused.message().contains("--to"), "{}", refused.message());
+        assert_eq!(reviewer_of().as_deref(), Some(banto.as_bytes().as_slice()), "a refused escalate changes nothing");
 
-        d.kernel_db().lock().conn_for_ledger().execute("UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [bob.as_bytes().as_slice()]).unwrap();
-        assert!(!d.dispatch(&grant, &caller(bob)).await.is_ok(), "a retired root has no authority");
+        let climbed = d.dispatch(&climb, &caller.clone().with_actor(banto, None)).await;
+        assert!(climbed.is_ok(), "{}", climbed.message());
+        assert_eq!(reviewer_of().as_deref(), Some(amy.as_bytes().as_slice()));
+        let named = d.dispatch(&to_judge, &caller.clone().with_actor(amy, None)).await;
+        assert!(named.is_ok(), "{}", named.message());
+        assert_eq!(reviewer_of().as_deref(), Some(judge.as_bytes().as_slice()));
     }
 
     /// The lineage root of an ask's context may reclaim it from its
@@ -5074,8 +5036,11 @@ mod tests {
         assert_eq!(row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
     }
 
+    /// With the lineage root retired, nobody may name a reviewer with
+    /// `--to`, and the assigned reviewer's climb refuses by name at the
+    /// retired holder above it rather than skipping it.
     #[tokio::test]
-    async fn assigned_reviewer_can_escalate_when_the_lineage_root_is_unavailable() {
+    async fn with_the_lineage_root_retired_to_is_refused_and_the_climb_names_the_retired_holder() {
         let d = test_dispatcher().await;
         let amy = crate::kj::test_helpers::test_reviewer_principal();
         let lead = PrincipalId::new();
@@ -5095,12 +5060,14 @@ mod tests {
             "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [amy.as_bytes().as_slice()],
         ).unwrap();
         let reviewer = caller.with_actor(lead, Some(lead));
-        let listed = d.dispatch(&[s("ledger"), s("delegation"), s("list")], &reviewer).await;
-        assert!(listed.is_ok(), "delegation inspection remains available: {}", listed.message());
         let result = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone(), s("--to"), s("judge")], &reviewer).await;
-        assert!(result.is_ok(), "{}", result.message());
+        assert!(!result.is_ok(), "--to is the lineage root's override: {}", result.message());
+        assert!(result.message().contains("only the lineage root (none)"), "{}", result.message());
+        let climb = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &reviewer).await;
+        assert!(!climb.is_ok(), "{}", climb.message());
+        assert!(climb.message().contains("amy") && climb.message().contains("retired"), "{}", climb.message());
         let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
-        assert_eq!(row.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
+        assert_eq!(row.reviewer_id.as_deref(), Some(lead.as_bytes().as_slice()));
     }
 
     /// Omitting `--to` continues the walk reviewer resolution made: past

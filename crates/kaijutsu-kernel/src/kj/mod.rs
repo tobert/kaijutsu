@@ -1629,6 +1629,20 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// A confirmed caller acting as a new live character that performs
+    /// `context`, so it holds the senpai of every kohai of `context` and has
+    /// authority over them (`docs/senpai-kohai.md`, "Authority").
+    pub fn confirmed_holder_caller(dispatcher: &KjDispatcher, context: ContextId) -> KjCaller {
+        let caller = confirmed_caller(context);
+        let db = dispatcher.kernel_db().lock();
+        db.insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: caller.actor_id, name: format!("holder-{}", caller.actor_id.short()), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        db.update_played_by(context, Some(caller.actor_id)).unwrap();
+        caller
+    }
+
     /// A new live root character: a person's hands, whose uncovered shell
     /// statements run without an ask. For tests that are not about the ask.
     pub fn root_character(dispatcher: &KjDispatcher) -> PrincipalId {

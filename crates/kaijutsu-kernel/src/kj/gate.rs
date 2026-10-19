@@ -1790,19 +1790,20 @@ mod tests {
         assert_eq!(redeemed.verdict, GateVerdict::Allowed);
     }
 
-    /// An explicit override that names the actor resolves the same way as
-    /// an exhausted walk: a self-confirmation the actor may answer. The
-    /// actor can still hand the ask to someone else, and `--to` refuses to
-    /// name the performer.
+    /// A root's own statement in its console is a self-confirmation the
+    /// root may answer. As the lineage root it can still hand the ask to
+    /// someone else, and `--to` refuses to name the performer.
     #[tokio::test]
-    async fn an_explicit_self_assignment_is_a_self_confirmation_and_can_still_be_handed_on() {
+    async fn a_root_self_confirmation_can_still_be_handed_on() {
         let d = gate_dispatcher().await;
         let mut direct = test_caller();
         let actor = crate::kj::test_helpers::test_reviewer_principal();
         direct.actor_id = actor;
         direct.principal_id = actor;
         let judge = kaijutsu_types::PrincipalId::new();
-        let context = register_context(&d, Some("direct-gate"), None, direct.principal_id);
+        // amy's own console: her statement there is a self-confirmation, and
+        // she is its lineage root, so she may hand the ask on with --to.
+        let context = crate::kj::test_helpers::register_root_context(&d);
         direct.context_id = Some(context);
         direct.reviewer_id = None;
         {
@@ -1815,9 +1816,6 @@ mod tests {
                 handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap();
-            // judge directs the context, so the walk would resolve to
-            // judge: only the explicit override can name the actor here.
-            db.update_context_review_assignment(context, None, Some(actor), Some(judge)).unwrap();
         }
 
         let first = run_gate(
@@ -1834,7 +1832,7 @@ mod tests {
             let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id).unwrap().unwrap();
             assert_eq!(
                 row.reviewer_id.as_deref(), row.actor_id.as_deref(),
-                "an explicit override naming the actor raises a self-confirmation",
+                "a root's statement in its own console raises a self-confirmation",
             );
         }
 

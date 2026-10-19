@@ -2912,12 +2912,12 @@ esac
                 ctx
             }
             VERB_ARCHIVE => {
-                let ctx = register_context(&d, Some("wired-archive"), None, principal);
+                let ctx = crate::kj::test_helpers::register_rooted_context(&d, Some("wired-archive"), principal);
                 set_context_type(&d, ctx, "test");
                 d.block_store()
                     .create_document(ctx, crate::DocumentKind::Conversation, None)
                     .unwrap();
-                let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+                let caller = root_archiver(&d);
                 let r = d.dispatch(&argv(&["context", "archive", "wired-archive"]), &caller).await;
                 assert!(r.is_ok(), "archive failed: {}", r.message());
                 ctx
@@ -3331,8 +3331,11 @@ esac
 
     /// A live context of `context_type` with a conversation document, a
     /// structural child of `parent` when given, as `kj context create` makes.
+    /// A context to archive: under `parent`, or else under amy's console, so
+    /// [`root_archiver`] has authority over it as its lineage root.
     fn archivable(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str) -> ContextId {
-        let ctx = register_context(d, Some(label), parent, PrincipalId::new());
+        let senpai = parent.unwrap_or_else(|| crate::kj::test_helpers::register_root_context(d));
+        let ctx = register_context(d, Some(label), Some(senpai), PrincipalId::new());
         set_context_type(d, ctx, context_type);
         if let Some(parent) = parent {
             d.kernel_db()
@@ -3349,6 +3352,16 @@ esac
         }
         d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
         ctx
+    }
+
+    /// amy, the lineage root of every [`archivable`] context, confirmed.
+    fn root_archiver(d: &KjDispatcher) -> KjCaller {
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        KjCaller {
+            principal_id: amy, actor_id: amy, confirmed: true,
+            context_id: Some(crate::kj::test_helpers::register_root_context(d)),
+            ..console_caller(d)
+        }
     }
 
     async fn archive_dispatcher() -> std::sync::Arc<KjDispatcher> {
@@ -3374,7 +3387,7 @@ esac
         )
         .await;
         let ctx = archivable(&d, "summarized", None, "test");
-        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        let caller = root_archiver(&d);
         let r = d.dispatch(&argv(&["context", "archive", "summarized"]), &caller).await;
         assert!(r.is_ok(), "archive failed: {}", r.message());
         assert_eq!(count_blocks_containing(&d, ctx, "archive summary written"), 1, "{:?}", block_contents_in(&d, ctx));
@@ -3388,7 +3401,7 @@ esac
         let d = archive_dispatcher().await;
         install_rc_script_file(&d, "/config/rc/test/archive/S10-broken.kai", "false").await;
         let ctx = archivable(&d, "broken-rc", None, "test");
-        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        let caller = root_archiver(&d);
         let r = d.dispatch(&argv(&["context", "archive", "broken-rc"]), &caller).await;
         assert!(r.is_ok(), "archive failed: {}", r.message());
         assert!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().archived_at.is_some());
@@ -3404,7 +3417,7 @@ esac
         let seat = archivable(&d, "seat", None, "test");
         let judge = archivable(&d, "judge-seat", Some(seat), "judge");
         let other = archivable(&d, "other-child", Some(seat), "test");
-        let caller = KjCaller { confirmed: true, ..caller_with_context(seat) };
+        let caller = KjCaller { context_id: Some(seat), ..root_archiver(&d) };
         let r = d.dispatch(&argv(&["context", "archive", "--children", "--type", "judge"]), &caller).await;
         assert!(r.is_ok(), "archive --children failed: {}", r.message());
         let db = d.kernel_db().lock();
@@ -3424,7 +3437,7 @@ esac
         d.kernel().broker().set_kj_dispatcher(&d).await;
         let seat = archivable(&d, "coder-seat", None, "coder");
         let judge = archivable(&d, "judge-coder-seat", Some(seat), "judge");
-        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        let caller = root_archiver(&d);
         let r = d.dispatch(&argv(&["context", "archive", "coder-seat"]), &caller).await;
         assert!(r.is_ok(), "archive failed: {}", r.message());
         let db = d.kernel_db().lock();
