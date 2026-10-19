@@ -206,3 +206,17 @@ These are later steps on this branch, after steps 1-3:
    (S00-stance) moves to the character that plays the seat.
 7. **The gate's own cast**, as in kaibo's config: the reserved `gate` role leaves `cast_slots`. In parallel with
    4-6 where it does not collide; otherwise after them.
+
+## Open (step 2)
+
+Choices made where the design was silent, the smaller shape each time.
+
+- **Escalation**: the ask's assigned reviewer may climb as well as the rule's two (the senpai's holder, the lineage
+  root), so a reviewer reached by one climb can pass the ask on again. `--to` and taking an ask over are the
+  lineage root's alone; with no live lineage root nobody may use `--to`.
+- **Archive inside an rc lifecycle**: a nested `kj context archive` from an rc lifecycle (privileged, `rc_depth >
+  0`) is not checked again. The shipped coder archive bucket archives the seat's judge shadows, whose senpai the
+  seat holds, not whoever archived the seat; the verb that started the lifecycle was checked.
+- **Archiving a holderless top**: a parentless system context with no holder has no senpai and no lineage root, so
+  `kj context archive` refuses it for everyone. Nothing in the shipped rc or bootstrap archives one.
+- **The old columns** are on `contexts` (`contexts.reviewer_id`, `contexts.director_id`), not on `characters`.
