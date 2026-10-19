@@ -1788,6 +1788,47 @@ impl KjDispatcher {
         }
     }
 
+    /// The authority rule for a verb nested in an rc lifecycle, with the
+    /// seat (`caller.context_id`, the context whose lifecycle runs) as the
+    /// actor: passes when the seat is `target`'s senpai, or when the seat's
+    /// holder passes [`KernelDb::context_authority`]. A lifecycle with no
+    /// context refuses.
+    ///
+    /// [`KernelDb::context_authority`]: crate::kernel_db::KernelDb::context_authority
+    pub(crate) fn require_lifecycle_authority(
+        &self,
+        target: ContextId,
+        caller: &KjCaller,
+        act: crate::kernel_db::GovernedAct,
+    ) -> Result<(), String> {
+        let db = self.kernel_db().lock();
+        let checked = (|| -> crate::kernel_db::KernelDbResult<Result<(), String>> {
+            let Some(seat) = caller.context_id else {
+                return Ok(Err(format!("an rc lifecycle with no context may not {}", act.as_str())));
+            };
+            let row = db.get_context(target)?.ok_or_else(|| crate::kernel_db::KernelDbError::NotFound(format!(
+                "context {} has no row to check authority over", target.short()
+            )))?;
+            if row.senpai_ctx == Some(seat) {
+                return Ok(Ok(()));
+            }
+            let seat_label = db.get_context(seat)?.and_then(|r| r.label).unwrap_or_else(|| seat.short());
+            Ok(match db.context_holder(seat)? {
+                Some(holder) => db.context_authority(target, holder, act)?.map(|_| ()).map_err(|refusal| {
+                    format!("{refusal}; this runs in {seat_label}'s rc lifecycle, as {}", db.name_for(holder))
+                }),
+                None => Err(format!(
+                    "{seat_label}'s rc lifecycle may {} only its own kohai, and nobody holds {seat_label}",
+                    act.as_str()
+                )),
+            })
+        })();
+        match checked {
+            Ok(rule) => rule,
+            Err(e) => Err(format!("could not check authority to {}: {e}", act.as_str())),
+        }
+    }
+
     /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--cwd path] [--env KEY=VALUE] [--type t]`
     async fn context_set(
         &self,
@@ -2106,12 +2147,17 @@ impl KjDispatcher {
             (target_id, label)
         };
         // A nested archive from an rc lifecycle (a coder's archive bucket
-        // retiring its judge shadows) runs under the authority of the verb
-        // that started the lifecycle, which was checked when it ran.
+        // retiring its judge shadows) is checked with the seat — the
+        // context whose lifecycle runs — as the actor, not whoever started
+        // the lifecycle: the seat may archive its own kohai, or what its
+        // holder has authority over (`docs/senpai-kohai.md`, "Open (step 3)").
         let in_rc_lifecycle = caller.privileged && caller.rc_depth > 0;
-        if !in_rc_lifecycle
-            && let Err(refusal) = self.require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
-        {
+        let authority = if in_rc_lifecycle {
+            self.require_lifecycle_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
+        } else {
+            self.require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive).map(|_| ())
+        };
+        if let Err(refusal) = authority {
             return KjResult::Err(format!("kj context archive: {refusal}"));
         }
 

@@ -3450,6 +3450,39 @@ esac
         assert!(db.get_context(judge).unwrap().unwrap().archived_at.is_some(), "the shadow is archived with its seat");
     }
 
+    /// A nested `kj context archive` inside an rc lifecycle is checked with
+    /// the seat — the context whose lifecycle runs — as the actor, not
+    /// whoever archived the seat: it may archive a kohai of the seat, and
+    /// may not archive a context the seat does not hold, even when the
+    /// archiver (amy, the lineage root) could have.
+    ///
+    /// Falsified by restoring the skip for privileged rc callers: the
+    /// stranger is archived under amy's authority.
+    #[tokio::test]
+    async fn an_archive_lifecycle_archives_only_what_the_seat_holds() {
+        let d = archive_dispatcher().await;
+        install_rc_script_file(&d, "/config/rc/test/archive/S10-kid.kai", "kj context archive kid --confirm").await;
+        install_rc_script_file(&d, "/config/rc/test/archive/S20-stranger.kai", "kj context archive stranger --confirm").await;
+        let coder = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let seat = archivable(&d, "seat", None, "test");
+        d.kernel_db().lock().update_played_by(seat, Some(coder)).unwrap();
+        let kid = archivable(&d, "kid", Some(seat), "other");
+        let stranger = archivable(&d, "stranger", None, "other");
+        let r = d.dispatch(&argv(&["context", "archive", "seat"]), &root_archiver(&d)).await;
+        assert!(r.is_ok(), "the seat's own archive stands: {}", r.message());
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(seat).unwrap().unwrap().archived_at.is_some());
+        assert!(db.get_context(kid).unwrap().unwrap().archived_at.is_some(), "the seat holds kid's senpai");
+        assert!(db.get_context(stranger).unwrap().unwrap().archived_at.is_none(), "the seat does not hold stranger's senpai");
+        drop(db);
+        let contents = block_contents_in(&d, seat).join("\n");
+        assert!(contents.contains("only stranger"), "the refusal is recorded in the seat: {contents}");
+    }
+
     /// Retiring a character runs the archive lifecycle of each context it
     /// plays.
     #[tokio::test]
