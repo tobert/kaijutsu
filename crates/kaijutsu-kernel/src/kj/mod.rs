@@ -57,6 +57,7 @@ pub mod roster;
 pub mod model;
 pub mod refs;
 pub mod search;
+pub mod senpai;
 pub mod shell_gate;
 pub mod system;
 pub mod stage;
@@ -157,7 +158,7 @@ pub struct KjCaller {
     pub confirmed: bool,
     /// Recursion depth from rc lifecycle dispatch. The rc runner increments
     /// this before invoking nested kj from a script, so an rc-driven
-    /// `kj context create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
+    /// `kj kohai create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
     /// prevent runaway recursion (see `rc/mod.rs`).
     pub rc_depth: u8,
     /// True when this caller originates from the rc lifecycle's privileged
@@ -465,7 +466,7 @@ impl KjDispatcher {
             return KjResult::Err(self.help_for(caller));
         }
 
-        // Footgun guard: a trailing bare `help` (e.g. `kj context create help`)
+        // Footgun guard: a trailing bare `help` (e.g. `kj kohai create help`)
         // would otherwise bind as a positional and silently mint a context named
         // "help". Rewrite it to `--help` so clap renders the leaf's help. Flag
         // values (`--name help`) and non-trailing positionals are left intact.
@@ -520,6 +521,15 @@ impl KjDispatcher {
         // Most context/workspace/preset subcommands work without an active context
         if cmd == "context" || cmd == "ctx" {
             return Box::pin(async { self.dispatch_context(&argv[1..], caller).await }).await;
+        }
+        // `kj senpai` and `kj kohai` take an optional context and default to
+        // the current one, like `kj context`; `create` needs a context of
+        // its own to answer to and says so.
+        if cmd == "senpai" {
+            return Box::pin(async { self.dispatch_senpai(&argv[1..], caller).await }).await;
+        }
+        if cmd == "kohai" {
+            return Box::pin(async { self.dispatch_kohai(&argv[1..], caller).await }).await;
         }
         if cmd == "workspace" || cmd == "ws" {
             return self.dispatch_workspace(&argv[1..], caller);
@@ -865,7 +875,7 @@ impl KjDispatcher {
     }
 
     /// "Did this context end up with a usable loadout?" — the outcome question
-    /// `kj context create` reports on and `kj context rebind` gates on.
+    /// `kj kohai create` reports on and `kj context rebind` gates on.
     ///
     /// A missing binding row and a row that grants nothing answer the same: no.
     /// That is deliberate. Keying on *which rc script failed* instead would
@@ -1183,7 +1193,7 @@ fn unbound_denial(verb: &str, ctx: ContextId, state: &str, label: &str) -> KjRes
          did not bind it, so it grants nothing (including the '{label}' capability \
          this verb needs) and cannot widen itself. \
          Read this context's Error blocks for why it failed. \
-         Repair: `kj context rebind`. Or leave it: `kj context create <label-of-new>` \
+         Repair: `kj context rebind`. Or leave it: `kj kohai create <label-of-new>` \
          then `kj context switch <label-of-new>` (both ungated), and \
          `kj context archive {ctx_short}` from there.",
         ctx_short = ctx.short()
@@ -1629,6 +1639,18 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// Give `caller`'s actor a live character sheet if it has none, so it may
+    /// `kj kohai create` (`docs/senpai-kohai.md`, "Creating and moving").
+    pub fn give_character(dispatcher: &KjDispatcher, caller: &KjCaller) {
+        let db = dispatcher.kernel_db().lock();
+        if db.get_character(caller.actor_id).unwrap().is_none() {
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: caller.actor_id, name: format!("caller-{}", caller.actor_id.short()), created_at: 0,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+    }
+
     /// A confirmed caller acting as a new live character that performs
     /// `context`, so it holds the senpai of every kohai of `context` and has
     /// authority over them (`docs/senpai-kohai.md`, "Authority").
@@ -1851,7 +1873,7 @@ mod help_footgun_tests {
         let caller = test_caller();
 
         let result = d
-            .dispatch(&[s("context"), s("create"), s("help")], &caller)
+            .dispatch(&[s("kohai"), s("create"), s("help")], &caller)
             .await;
 
         // It rendered help (ephemeral Ok), not a creation/switch result.
@@ -1878,7 +1900,7 @@ mod help_footgun_tests {
             .expect("db query ok");
         assert!(
             created.is_none(),
-            "`kj context create help` must not mint a context labelled 'help'"
+            "`kj kohai create help` must not mint a context labelled 'help'"
         );
     }
 
@@ -1900,8 +1922,9 @@ mod help_footgun_tests {
         let d = test_dispatcher().await;
         let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
         let caller = caller_with_context(parent);
+        crate::kj::test_helpers::give_character(&d, &caller);
         let result = d
-            .dispatch(&[s("context"), s("create"), s("--name"), s("help")], &caller)
+            .dispatch(&[s("kohai"), s("create"), s("--name"), s("help")], &caller)
             .await;
         assert!(
             !matches!(&result, KjResult::Ok { message, .. } if message.to_lowercase().contains("usage")),
@@ -1914,7 +1937,7 @@ mod help_footgun_tests {
             .expect("db query ok");
         assert!(
             created.is_some(),
-            "`kj context create --name help` should mint a context labelled 'help'"
+            "`kj kohai create --name help` should mint a context labelled 'help'"
         );
     }
 }

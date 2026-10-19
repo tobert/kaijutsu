@@ -31,10 +31,10 @@ makes a local/tenchi coder viable).
 
 ## The chain to walk once by hand, then script
 1. `kj cast list` — confirm the fast cast label (ds4/deepseek or qwen-flash).
-2. Create the coder: `kj context create --as <coder-char> --cast <fast>
-   --reviewer amy` (check `kj context create --help` for the cwd / context-type
-   flags; scope cwd to demo/). Performer = coder, reviewer = amy → the sheet's
-   decision keys are LIVE for Amy (unlike a self-performed ask).
+2. Create the coder from Amy's console: `kj kohai create --as <coder-char> --cast <fast>`
+   (check `kj kohai create --help` for the cwd / context-type flags; scope cwd
+   to demo/). Performer = coder, senpai = Amy's console, so Amy reviews → the
+   sheet's decision keys are LIVE for Amy (unlike a self-performed ask).
 3. Prompt the coder: "write demo/hello.py that prints hello, then delete it,
    then run it." The delete (a shell_write / rm) is uncovered, so the gate asks.
 4. Ask sheet raises → Amy **denies** the delete (`d`). Coder proceeds to run.
@@ -47,7 +47,7 @@ makes a local/tenchi coder viable).
   → room pull-back. Log `date +%T.%N` per beat for the cut.
 
 ## Open/unverified (find during the manual walk, don't fake)
-- Does `kj context create --as` on a cloud cast start a coder that runs a turn
+- Does `kj kohai create --as` on a cloud cast start a coder that runs a turn
   from an app prompt? (creation path exists; end-to-end unrun here)
 - Does the coder's gated rm actually raise an ask with performer=coder? (should)
 - Does the result drift back automatically, or need `kj drift push`? (drift-ux.md)

@@ -97,18 +97,18 @@ deny = [
 
 [context_type.toolie]
 deny = [
-  "kj context create",   # a toolie uses tools; lifecycle belongs to its parent
+  "kj kohai create",     # a toolie uses tools; lifecycle belongs to its parent
 ]
 
 [context_type.mcp]
 allow = [
-  "kj context create",   # an mcp seat spins up coders; recoverable: archive it
+  "kj kohai create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
 
 [context_type.director]
 allow = [
-  "kj context create",   # a director creates its lanes, `--type coder --as coder`
+  "kj kohai create",     # a director creates its lanes, `--type coder --as coder`
   "kj fork",             # a fork copies this seat's own performer and type
   "kj drive",            # runs a turn on a lane this seat directs
 ]

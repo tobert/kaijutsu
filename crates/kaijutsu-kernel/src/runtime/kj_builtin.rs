@@ -333,7 +333,7 @@ impl Tool for KjBuiltin {
         //
         // With `owns_output` false, kaish's generic whole-tool help router
         // (`wants_help` in kernel.rs) would intercept `--help`/`-h`, but
-        // `kj context create --help` must render `create`'s leaf help from kj's
+        // `kj kohai create --help` must render `create`'s leaf help from kj's
         // OWN clap parser (tobert/kaish#51). `params_from_clap` cannot express
         // "this tool claims help" (it skips a "help"-id arg at every level, as
         // it does "json"), so a root-level "help" param (aliased "h") is added
@@ -936,7 +936,7 @@ mod tests {
     /// `kj` call resets depth to 0 and an rc create-cycle recurses unbounded.
     /// This red test asserts propagation via the guard's observable effect,
     /// WITHOUT any self-recreating script (so a pre-fix run cannot fork-bomb):
-    /// at `KJ_RC_DEPTH == MAX_RC_DEPTH`, a `kj context create` still creates
+    /// at `KJ_RC_DEPTH == MAX_RC_DEPTH`, a `kj kohai create` still creates
     /// the context, but its rc scripts are refused with the guard error block
     /// and the instruction script never runs.
     #[tokio::test]
@@ -946,6 +946,8 @@ mod tests {
 
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
+        // The embedded shell performs as the system principal; `kj kohai create` needs a live character.
+        crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("rcdepth-home"), None, principal);
         // Inert banner: proves the lifecycle ran (pre-fix) or was refused (post-fix).
@@ -966,7 +968,7 @@ mod tests {
         );
         let res = kaish
             .execute_with_options(
-                "kj context create rcdepth-e2e --type rdtest",
+                "kj kohai create rcdepth-e2e --type rdtest",
                 ExecuteOptions::new().with_vars(vars),
             )
             .await
@@ -1025,19 +1027,21 @@ mod tests {
 
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
+        // The embedded shell performs as the system principal; `kj kohai create` needs a live character.
+        crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("chain-home"), None, principal);
         install_rc_script_file(
             &dispatcher,
             "/config/rc/chaintest/create/S00-recreate.kai",
-            "kj context create \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
+            "kj kohai create \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
         )
         .await;
 
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
         let res = kaish
             .execute_with_options(
-                "kj context create chain-d0 --type chaintest",
+                "kj kohai create chain-d0 --type chaintest",
                 ExecuteOptions::default(),
             )
             .await
@@ -1368,7 +1372,7 @@ mod tests {
         assert!(list.ok(), "context list -t (bool tree) failed: {list:?}");
     }
 
-    /// `kj context create <label> --type <t>` must land the context_type on
+    /// `kj kohai create <label> --type <t>` must land the context_type on
     /// the row for BOTH the space form (`--type toolie`) and the equals
     /// form (`--type=toolie`). Regression: when `--type` is absent from the
     /// kj tool schema, kaish parses the space form as a bool flag + a stray
@@ -1378,7 +1382,7 @@ mod tests {
     /// the control: it binds regardless of the schema, so if both asserts
     /// pass we know the space form genuinely round-tripped.
     ///
-    /// Driving `kj context create` through kaish (rather than a direct
+    /// Driving `kj kohai create` through kaish (rather than a direct
     /// `dispatch` call) stacks the interpreter's own frames on top of the
     /// rc lifecycle's, overflowing the default 2 MiB test stack; run it on
     /// the production rc stack instead (see `self_recreating_rc_chain_
@@ -1400,6 +1404,8 @@ mod tests {
     async fn context_create_type_flag_binds_both_forms_body() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
+        // The embedded shell performs as the system principal; `kj kohai create` needs a live character.
+        crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
         let principal = PrincipalId::system();
         let root = register_context(&dispatcher, Some("root"), None, principal);
         let kaish = embedded_with_kj(dispatcher.clone(), root).await;
@@ -1407,7 +1413,7 @@ mod tests {
         // Space form.
         let res = kaish
             .execute_with_options(
-                "kj context create exp --type toolie",
+                "kj kohai create exp --type toolie",
                 ExecuteOptions::default(),
             )
             .await
@@ -1417,7 +1423,7 @@ mod tests {
         // Equals form (control).
         let res2 = kaish
             .execute_with_options(
-                "kj context create exp2 --type=toolie",
+                "kj kohai create exp2 --type=toolie",
                 ExecuteOptions::default(),
             )
             .await
@@ -2264,7 +2270,7 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
 
         let res = kaish
-            .execute_with_options("kj context create --help", ExecuteOptions::default())
+            .execute_with_options("kj kohai create --help", ExecuteOptions::default())
             .await
             .expect("kaish exec");
         let out = res.text_out();
@@ -2273,13 +2279,13 @@ mod tests {
         assert!(
             out.contains("Usage: create [OPTIONS] [LABEL]")
                 && out.contains("Label (positional form"),
-            "`kj context create --help` must render the leaf's clap help; got:\n{out}"
+            "`kj kohai create --help` must render the leaf's clap help; got:\n{out}"
         );
         // NOT intercepted by the outer router (which would emit the whole-tool
         // help headed by the kj banner instead of the create leaf).
         assert!(
             !out.contains("# kj — kernel command interface"),
-            "outer help router intercepted `kj context create --help` — it \
+            "outer help router intercepted `kj kohai create --help` — it \
              rendered top-level help instead of the leaf; got:\n{out}"
         );
     }

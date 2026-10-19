@@ -93,7 +93,7 @@ config          Read or reset files under /config/kernel and /config/client.
 council         build — build this context's council seats (reviewer chain,
                 house rules, judge) in the background ahead of its first
                 gate decision; the create and fork rc lifecycles call it
-context (ctx)   list, info, prompt, current, switch, create, scratch, rebind,
+context (ctx)   list, info, prompt, current, switch, scratch, rebind,
                 set, unset, log, move, rename, rotate, archive, conclude, promote,
                 demote, pause, resume, retag, hydrate — prompt renders
                 a context's system prompt; rebind repairs a context left with
@@ -136,7 +136,8 @@ ledger          list, show, allow, deny, rules, forget, runs — answer pending
                 generalize the decision into a standing rule (refused for
                 `allow` when a statement has a free variable; `character`
                 covers the performer anywhere, and its kj drive, interrupt,
-                context archive and create only on contexts it directs),
+                context archive and kohai create only on contexts whose
+                senpai it holds),
                 `--remember … --family`
                 to remember the command family (`kj handoff note`, `git
                 push`) whatever the arguments; `rules` lists the rules in
@@ -154,6 +155,9 @@ midi            list, show, send note|cc|pc|sysex, identify, panic — device
                 device (the kernel never touches hardware — a sink resolves
                 the port); identify asks a device what it is and records the
                 answer at /run/midi/<device>
+kohai           create, list — create a context that answers to this one
+                (--senpai, --parent, --as, --type, --cast, --cwd, --env), and
+                list a context's live kohai with type and performer
 model           Show a context's effective model and its tunables (--context <ref>)
 models          List configured providers, their models, and --model aliases
 play            Play a sample now (a host path, or --cas <hash> for an object
@@ -171,6 +175,9 @@ roster          status <text> [--availability], list — the live roster: post
                 your own self-reported status (identity is always the
                 caller's own) or list who's around right now
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
+senpai          show, set — the context a context answers to: show prints
+                the senpai, its holder, the lineage root and who reviews the
+                performer's asks; set moves a context under another senpai
 stage           commit, status, include, exclude — curate a staged (liminal) fork
 swap            list, ack, discard — resolve a file buffer recovered after a
                 kernel restart (docs/file-buffers.md rule 4); read it first at

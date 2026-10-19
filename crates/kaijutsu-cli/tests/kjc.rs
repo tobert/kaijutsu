@@ -44,7 +44,7 @@ fn kjc_runs_kj_verbs_and_shell_commands_and_returns_their_exit_codes() {
     let port = start_kernel(&key);
     let root = SshServerConfig::EPHEMERAL_ROOT;
 
-    let created = kjc(port, &key, root, &["kj", "context", "create", "verify"]);
+    let created = kjc(port, &key, root, &["kj", "kohai", "create", "verify"]);
     assert!(created.status.success(), "create: {}{}", text(&created.stdout), text(&created.stderr));
 
     let listed = kjc(port, &key, "verify", &["kj", "block", "list", "--tail", "1"]);
@@ -60,5 +60,5 @@ fn kjc_runs_kj_verbs_and_shell_commands_and_returns_their_exit_codes() {
 
     let missing = kjc(port, &key, "no-such-context", &["kj", "context", "list"]);
     assert_eq!(missing.status.code(), Some(1));
-    assert!(text(&missing.stderr).contains("kj context create no-such-context"), "{}", text(&missing.stderr));
+    assert!(text(&missing.stderr).contains("kj kohai create no-such-context"), "{}", text(&missing.stderr));
 }

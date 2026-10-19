@@ -119,7 +119,7 @@ fn character_create_then_json_list_prints_data_not_the_message() {
     assert_ne!(stdout(&json), stdout(&table), "--json must print the data, not the plain message");
 }
 
-/// `kj -- context create lane --type coder --as bob` runs from the caller's
+/// `kj -- kohai create lane --type coder --as bob` runs from the caller's
 /// root context (the sole live root, joined with no `--context` needed) and
 /// creates a context played by `bob`; `kj -- context info lane` then names
 /// bob as its performer.
@@ -131,8 +131,8 @@ fn context_create_and_info_name_the_performer() {
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
 
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
-    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
+    assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
     let info = home.run(&["kj", "--", "context", "info", "lane"]);
     assert!(info.status.success(), "kj context info failed: {}", stderr(&info));
@@ -193,8 +193,8 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
 
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
-    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
+    assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
     let drive = home.run(&["kj", "--", "drive", "lane", "--prompt", "hi"]);
     assert!(drive.status.success(), "kj drive failed: {}", stderr(&drive));
@@ -229,8 +229,8 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     ]).to_string()).unwrap();
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
-    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
+    assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
     let drive = Command::new(server_bin())
         .args(["kj", "--", "drive", "lane", "--prompt", "run it"])
@@ -346,8 +346,8 @@ fn a_destroy_verb_without_confirm_exits_2() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder"]);
-    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder"]);
+    assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
     let archive = home.run(&["kj", "--", "context", "archive", "lane"]);
     assert_eq!(

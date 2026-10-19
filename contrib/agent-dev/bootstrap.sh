@@ -103,7 +103,7 @@ allow = ["shell_write"]
 # The supervisor's MCP session registers by creating its context under Amy's root; only Amy's and senpai's keys
 # are bound in this kernel.
 [context_type.root]
-allow = ["kj context create"]
+allow = ["kj kohai create"]
 GATE
 cat >> "$kernel_cfg/mcp.toml" <<MCP
 
@@ -121,9 +121,9 @@ MCP
 sed -i 's/^\[context_type\.mcp\]$/[context_type.mcp]\nuncovered = "allow"/' "$kernel_cfg/gate.toml"
 python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel_cfg/gate.toml"
 
-kj context create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo"
-kj context create "$project-coder" --type coder --as "$project-coder" --cwd /workspace
-kj context set "$project-coder" --reviewer banto
+kj kohai create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo"
+# The coder answers to banto's seat, so banto reviews its asks and its drifts reach banto.
+kj kohai create "$project-coder" --type coder --as "$project-coder" --senpai "$project-banto" --cwd /workspace
 # The kernel passes only HOME, PATH and context exports to the programs a seat runs, so set the locale here.
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
 for seat in "$project-banto" "$project-coder"; do

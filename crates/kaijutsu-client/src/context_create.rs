@@ -1,4 +1,4 @@
-//! Create a context through `kj context create`.
+//! Create a context through `kj kohai create`.
 //!
 //! The kernel has no RPC for creating a context. A client runs `kj context
 //! create` from an existing context, which becomes the new context's parent,
@@ -21,7 +21,7 @@ pub enum ParentSource {
     OnlyRoot,
 }
 
-/// The context a client runs `kj context create` from.
+/// The context a client runs `kj kohai create` from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentChoice {
     pub context_id: ContextId,
@@ -78,8 +78,7 @@ pub fn choose_parent(explicit: Option<&str>, contexts: &[ContextInfo]) -> Result
 /// The create lifecycle runs in that cwd.
 pub fn context_create_argv(label: &str, context_type: &str, performer: Option<&str>, cwd: Option<&str>) -> Vec<String> {
     let mut argv = vec![
-        "context".to_string(),
-        "create".to_string(),
+        "kohai".to_string(), "create".to_string(),
         label.to_string(),
         "--type".to_string(),
         context_type.to_string(),
@@ -95,7 +94,7 @@ pub fn context_create_argv(label: &str, context_type: &str, performer: Option<&s
     argv
 }
 
-/// The new context's id from a `kj context create` result. A nonzero exit
+/// The new context's id from a `kj kohai create` result. A nonzero exit
 /// is an error carrying the kernel's message.
 pub fn context_id_from_create_result(result: &KjExecutionResult) -> Result<ContextId, String> {
     if result.exit_code != 0 {
@@ -107,8 +106,8 @@ pub fn context_id_from_create_result(result: &KjExecutionResult) -> Result<Conte
         .as_ref()
         .and_then(|data| data.get("context_id"))
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "kj context create succeeded without context_id data".to_string())?;
-    ContextId::parse(id).map_err(|e| format!("kj context create returned an invalid context_id '{id}': {e}"))
+        .ok_or_else(|| "kj kohai create succeeded without context_id data".to_string())?;
+    ContextId::parse(id).map_err(|e| format!("kj kohai create returned an invalid context_id '{id}': {e}"))
 }
 
 /// Why [`ActorHandle::create_context_under`] failed.
@@ -116,7 +115,7 @@ pub fn context_id_from_create_result(result: &KjExecutionResult) -> Result<Conte
 pub enum CreateContextError {
     /// The call never produced a `kj` result: connection, timeout, shutdown.
     Call(CallError),
-    /// The kernel ran `kj context create` and refused, with its message.
+    /// The kernel ran `kj kohai create` and refused, with its message.
     Refused(String),
 }
 
@@ -129,7 +128,7 @@ impl CreateContextError {
     /// The kernel refused the `--cwd` directory: it is not an absolute
     /// directory on the kernel's mount table.
     pub fn is_cwd_refusal(&self) -> bool {
-        matches!(self, Self::Refused(message) if message.contains("kj context create: --cwd '"))
+        matches!(self, Self::Refused(message) if message.contains("kj kohai create: --cwd '"))
     }
 }
 
@@ -155,7 +154,7 @@ impl std::fmt::Display for CreateContextError {
 impl std::error::Error for CreateContextError {}
 
 impl ActorHandle {
-    /// Run `kj context create` from `parent`, authoring no blocks there, and
+    /// Run `kj kohai create` from `parent`, authoring no blocks there, and
     /// return the new context's id. The caller joins it. A given `cwd` is
     /// stored before the create lifecycle runs, so rc sees it.
     pub async fn create_context_under(
@@ -291,14 +290,14 @@ mod tests {
 
     #[test]
     fn argv_names_the_performer_and_cwd_only_when_given() {
-        assert_eq!(context_create_argv("lane", "coder", None, None), ["context", "create", "lane", "--type", "coder"]);
+        assert_eq!(context_create_argv("lane", "coder", None, None), ["kohai", "create", "lane", "--type", "coder"]);
         assert_eq!(
             context_create_argv("lane", "coder", Some("coder"), None),
-            ["context", "create", "lane", "--type", "coder", "--as", "coder"]
+            ["kohai", "create", "lane", "--type", "coder", "--as", "coder"]
         );
         assert_eq!(
             context_create_argv("lane", "coder", Some("coder"), Some("/app")),
-            ["context", "create", "lane", "--type", "coder", "--as", "coder", "--cwd", "/app"]
+            ["kohai", "create", "lane", "--type", "coder", "--as", "coder", "--cwd", "/app"]
         );
     }
 
@@ -315,8 +314,8 @@ mod tests {
 
     #[test]
     fn only_a_kernel_refusal_can_be_a_label_conflict() {
-        assert!(CreateContextError::Refused("kj context create: label conflict: lane".into()).is_label_conflict());
-        assert!(!CreateContextError::Refused("kj context create: unknown context type".into()).is_label_conflict());
+        assert!(CreateContextError::Refused("kj kohai create: label conflict: lane".into()).is_label_conflict());
+        assert!(!CreateContextError::Refused("kj kohai create: unknown context type".into()).is_label_conflict());
         assert!(!CreateContextError::Call(CallError::PermanentlyFailed("label conflict".into())).is_label_conflict());
         assert!(!CreateContextError::Call(CallError::Shutdown).is_label_conflict());
     }
@@ -324,13 +323,13 @@ mod tests {
     #[test]
     fn only_a_kernel_refusal_of_the_directory_is_a_cwd_refusal() {
         for refusal in [
-            "kj context create: --cwd '/gone' is unavailable: not found",
-            "kj context create: --cwd '/etc/hosts' is not a directory",
-            "kj context create: --cwd 'rel' is not an absolute path",
+            "kj kohai create: --cwd '/gone' is unavailable: not found",
+            "kj kohai create: --cwd '/etc/hosts' is not a directory",
+            "kj kohai create: --cwd 'rel' is not an absolute path",
         ] {
             assert!(CreateContextError::Refused(refusal.into()).is_cwd_refusal(), "{refusal}");
         }
-        assert!(!CreateContextError::Refused("kj context create: label conflict: lane".into()).is_cwd_refusal());
+        assert!(!CreateContextError::Refused("kj kohai create: label conflict: lane".into()).is_cwd_refusal());
         assert!(!CreateContextError::Call(CallError::PermanentlyFailed("--cwd '/x'".into())).is_cwd_refusal());
     }
 
@@ -340,8 +339,8 @@ mod tests {
         let ok = result(0, "", Some(serde_json::json!({ "context_id": id.to_hex() })));
         assert_eq!(context_id_from_create_result(&ok), Ok(id));
 
-        let refused = result(1, "kj context create: label conflict\n", None);
-        assert_eq!(context_id_from_create_result(&refused), Err("kj context create: label conflict".to_string()));
+        let refused = result(1, "kj kohai create: label conflict\n", None);
+        assert_eq!(context_id_from_create_result(&refused), Err("kj kohai create: label conflict".to_string()));
 
         let missing = result(0, "", None);
         assert!(context_id_from_create_result(&missing).unwrap_err().contains("without context_id"));

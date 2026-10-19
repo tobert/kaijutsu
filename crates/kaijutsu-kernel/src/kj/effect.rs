@@ -87,6 +87,8 @@ pub(crate) struct KjArgs {
 #[derive(Subcommand, Debug)]
 pub(crate) enum KjCommand {
     Context(super::context::ContextArgs),
+    Senpai(super::senpai::SenpaiArgs),
+    Kohai(super::senpai::KohaiArgs),
     Workspace(super::workspace::WorkspaceArgs),
     Preset(super::preset::PresetArgs),
     Backend(super::backend::BackendArgs),
@@ -146,6 +148,8 @@ impl Classify for KjCommand {
     fn effect(&self) -> Effect {
         match self {
             KjCommand::Context(a) => a.effect(),
+            KjCommand::Senpai(a) => a.effect(),
+            KjCommand::Kohai(a) => a.effect(),
             KjCommand::Workspace(a) => a.effect(),
             KjCommand::Preset(a) => a.effect(),
             KjCommand::Backend(a) => a.effect(),

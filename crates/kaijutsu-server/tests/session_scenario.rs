@@ -359,7 +359,7 @@ fn kaijutsu_session_scenario() {
         s.kj("kj cast slot set mockcast director --backend mock --model mock-banto").await;
         s.kj("kj cast slot set mockcast coder --backend mock --model mock-coder").await;
 
-        s.kj("kj context create banto --type director --as banto --cast mockcast").await;
+        s.kj("kj kohai create banto --type director --as banto --cast mockcast").await;
         let banto_ctx = s.context_by_label("banto");
         let banto_principal = s.character_principal("banto");
         let coder_a_principal = s.character_principal("coder-a");

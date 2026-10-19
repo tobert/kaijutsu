@@ -780,7 +780,7 @@ impl RegisterFailure {
         }
     }
 
-    /// A failed `kj context create`, reported as `message`.
+    /// A failed `kj kohai create`, reported as `message`.
     fn create(message: String, error: &kaijutsu_client::CreateContextError) -> Self {
         match error {
             kaijutsu_client::CreateContextError::Refused(_) => Self::Verdict(message),
@@ -3384,7 +3384,7 @@ mod tests {
     // Two concurrent `register_session` calls racing the same
     // concluded/archived base label
     // can both resolve the same suffixed candidate as free, then race
-    // `kj context create`. The loser retries only on a kernel refusal naming
+    // `kj kohai create`. The loser retries only on a kernel refusal naming
     // a label conflict; `kaijutsu_client::CreateContextError` pins that
     // classification with its own tests.
 

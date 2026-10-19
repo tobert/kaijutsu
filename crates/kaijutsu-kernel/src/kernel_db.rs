@@ -2338,7 +2338,29 @@ impl KernelDb {
             "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
             params![senpai.as_ref().map(|id| id.as_bytes().to_vec()), blob_param(context.as_bytes())],
         )?;
+        // The migration's note stands until the senpai is set again.
+        self.conn.execute(
+            "DELETE FROM senpai_migration_report WHERE context_id = ?1",
+            params![blob_param(context.as_bytes())],
+        )?;
         Ok(())
+    }
+
+    /// The live kohai of `context`: the live contexts whose senpai it is,
+    /// oldest first.
+    pub fn list_kohai(&self, context: ContextId) -> KernelDbResult<Vec<ContextRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, label, provider, model,
+                    system_prompt, context_state, context_type,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, senpai_ctx
+             FROM contexts
+             WHERE senpai_ctx = ?1 AND archived_at IS NULL
+             ORDER BY created_at, context_id",
+        )?;
+        let rows = stmt.query_map(params![blob_param(context.as_bytes())], row_to_context_row)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
     /// Route a review: the one resolver behind every reviewer decision
@@ -2524,7 +2546,7 @@ impl KernelDb {
     }
 
     /// The context id at the top of `context_id`'s senpai chain —
-    /// the root context `kj context create --top` places a new context
+    /// the root context `kj kohai create --top` places a new context
     /// under. Unlike `lineage_root`, this names the top context itself and
     /// requires nothing of its responsible character.
     pub fn lineage_root_context(&self, context_id: ContextId) -> KernelDbResult<ContextId> {

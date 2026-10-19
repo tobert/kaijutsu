@@ -711,6 +711,7 @@ mod tests {
         let parent =
             crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
         let c = crate::kj::test_helpers::caller_with_context(parent);
+        crate::kj::test_helpers::give_character(&d, &c);
 
         d.dispatch(&[s("cast"), s("create"), s("band")], &c).await;
         let r = d
@@ -733,8 +734,7 @@ mod tests {
         let r = d
             .dispatch(
                 &[
-                    s("context"),
-                    s("create"),
+                    s("kohai"), s("create"),
                     s("probe"),
                     s("--type"),
                     s("coder"),
@@ -788,6 +788,7 @@ mod tests {
         let principal = PrincipalId::new();
         let parent = crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
         let c = crate::kj::test_helpers::caller_with_context(parent);
+        crate::kj::test_helpers::give_character(&d, &c);
         for (cast, model) in [("band", "deepseek-v4-pro"), ("house", "deepseek-flash")] {
             assert!(d.dispatch(&[s("cast"), s("create"), s(cast)], &c).await.is_ok());
             let r = d
@@ -806,7 +807,7 @@ mod tests {
 
         let coder = d.kernel_db().lock().get_character_by_name("coder").unwrap().unwrap().principal_id;
         let played = |label: &str, cast: Option<&str>| {
-            let mut argv = vec![s("context"), s("create"), s(label), s("--type"), s("coder")];
+            let mut argv = vec![s("kohai"), s("create"), s(label), s("--type"), s("coder")];
             if let Some(cast) = cast {
                 argv.extend([s("--cast"), s(cast)]);
             }
@@ -850,7 +851,8 @@ mod tests {
         let parent =
             crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
         let c = crate::kj::test_helpers::caller_with_context(parent);
-        let r = d.dispatch(&[s("context"), s("create"), s("plain"), s("-m"), s("deepseek/deepseek-flash")], &c).await;
+        crate::kj::test_helpers::give_character(&d, &c);
+        let r = d.dispatch(&[s("kohai"), s("create"), s("plain"), s("-m"), s("deepseek/deepseek-flash")], &c).await;
         assert!(r.is_ok(), "context create failed: {}", r.message());
 
         let result = d.dispatch(&[s("model"), s("--context"), s("plain")], &c).await;

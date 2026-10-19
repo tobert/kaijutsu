@@ -74,7 +74,7 @@ fn create_context_leaves_played_by_unset() {
 /// `played_by` is metadata, not authority, and a principal without a sheet
 /// is a legitimate pre-character state.
 #[test]
-fn create_context_leaves_played_by_null_for_a_characterless_principal() {
+fn create_context_refuses_a_characterless_principal() {
     run_local(async {
         let tmp = tempfile::tempdir().unwrap();
         let auth_db_path = tmp.path().join("auth.db");
@@ -94,7 +94,7 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral(addr.port());
-        common::allow_in_shipped_gate(&config, &["kj context create"]); // model credentials create their own contexts in setup
+        common::allow_in_shipped_gate(&config, &["kj kohai create"]); // model credentials create their own contexts in setup
         config.auth_db_path = Some(auth_db_path);
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {
@@ -124,30 +124,19 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
         client.retain_ssh_session(ssh_client);
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = create_context(&kj, "played-by-null-test").await.unwrap();
+        let refused = create_context(&kj, "played-by-null-test").await.unwrap_err();
 
         assert!(
             kernel.kernel_db.lock().get_character(unmapped).unwrap().is_none(),
             "the fixture is only valid if this principal really has no character row"
         );
-
-        let row = kernel
-            .kernel_db
-            .lock()
-            .get_context(context_id)
-            .unwrap()
-            .expect("just-created context must have a row");
-        assert_eq!(
-            row.created_by, unmapped,
-            "the bound key must authenticate straight to its own principal, not the root character"
+        assert!(
+            refused.contains("no character sheet"),
+            "a new context answers to its creator, so a characterless principal cannot create one: {refused}"
         );
-        assert_eq!(
-            row.played_by, None,
-            "a characterless creating principal must leave played_by NULL, not fail"
-        );
-        assert_eq!(
-            row.senpai_ctx, row.forked_from,
-            "the context it was created from is its senpai, whoever created it"
+        assert!(
+            kernel.kernel_db.lock().find_context_by_label("played-by-null-test").unwrap().is_none(),
+            "a refused create commits nothing"
         );
         drop(kj);
         drop(client);

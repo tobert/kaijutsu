@@ -674,7 +674,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
 
 // ============================================================================
 // rc create-lifecycle runs on the RPC creation path (app / MCP), not just
-// `kj context create`. Regression guard for the divergent-creation-path bug:
+// `kj kohai create`. Regression guard for the divergent-creation-path bug:
 // register_session / the GUI create dialog go through the kernel RPC
 // `create_context`, which used to skip rc entirely.
 // ============================================================================
@@ -838,12 +838,12 @@ fn test_rpc_created_context_does_not_stamp_the_registry_default() {
         assert!(
             data["provider"].is_null(),
             "RPC-created row.provider must be null (never stamped with the \
-             registry default) — matching `kj context create`: {data}"
+             registry default) — matching `kj kohai create`: {data}"
         );
         assert!(
             data["model"].is_null(),
             "RPC-created row.model must be null (never stamped with the \
-             registry default) — matching `kj context create`: {data}"
+             registry default) — matching `kj kohai create`: {data}"
         );
         assert_eq!(
             data["resolved_model"].as_str(),

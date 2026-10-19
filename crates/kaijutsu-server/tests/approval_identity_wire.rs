@@ -58,7 +58,7 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
-        common::allow_in_shipped_gate(&config, &["kj context create"]); // model credentials create their own contexts in setup
+        common::allow_in_shipped_gate(&config, &["kj kohai create"]); // model credentials create their own contexts in setup
         let amy = kaijutsu_kernel::KernelDb::open(config.data_dir.as_ref().unwrap().join("kernel.db"))
             .unwrap()
             .get_character_by_name("amy")
@@ -117,7 +117,7 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         kj_fails(&lead_kj, lead_context, &["ledger", "allow", &ask.request_id]).await;
         assert_eq!(kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status.as_str(), "pending");
         amy_kj.join_context(work, "coder-work").await.unwrap();
-        for argv in [vec!["context", "create", "--help"], vec!["ledger", "escalate", "--help"]] {
+        for argv in [vec!["kohai", "create", "--help"], vec!["ledger", "escalate", "--help"]] {
             let argv = argv.into_iter().map(String::from).collect::<Vec<_>>();
             let help = amy_kj.execute_kj(work, &argv).await.expect("help reaches kernel");
             assert_eq!(help.exit_code, 0, "{}", help.stderr);

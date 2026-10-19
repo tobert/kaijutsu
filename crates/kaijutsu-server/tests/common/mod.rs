@@ -378,7 +378,7 @@ pub async fn start_server_with_kernel_handle() -> (SocketAddr, kaijutsu_server::
 
 /// Write the shipped `gate.toml` into `config`'s kernel config with `keys`
 /// added to its global allow tier. For a test whose model or sheetless
-/// credential runs setup verbs such as `kj context create`: those are
+/// credential runs setup verbs such as `kj kohai create`: those are
 /// uncovered, so they would ask, and the ask is not what the test is about.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn allow_in_shipped_gate(config: &kaijutsu_server::SshServerConfig, keys: &[&str]) {
@@ -487,14 +487,14 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
         .expect("RPC client init failed")
 }
 
-/// Create `label` of type `default` through `kj context create`, run from
+/// Create `label` of type `default` through `kj kohai create`, run from
 /// the kernel's only root context (`kaijutsu_client::choose_parent`).
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijutsu_types::ContextId, String> {
     create_context_typed(kernel, label, "default").await
 }
 
-/// Create `label` of `context_type` through `kj context create`, run from
+/// Create `label` of `context_type` through `kj kohai create`, run from
 /// the kernel's only root context.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context_typed(

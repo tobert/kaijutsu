@@ -59,7 +59,7 @@ enum DocCommand {
         expand_tools: bool,
     },
     /// Create a new document. For Conversation kind, prefer
-    /// `kj context create` (which also registers contexts metadata).
+    /// `kj kohai create` (which also registers contexts metadata).
     /// Use this verb for File docs that aren't conversations.
     Create {
         /// Kind: conversation|file|symlink (default: conversation)
@@ -329,7 +329,7 @@ impl KjDispatcher {
     }
 
     /// Create a new document. Generates a fresh UUID unless `--id <hex>` is
-    /// supplied. For conversation kind, prefer `kj context create` (which
+    /// supplied. For conversation kind, prefer `kj kohai create` (which
     /// also registers the contexts row) — kj doc create stops at the
     /// storage layer.
     fn doc_create(
@@ -559,7 +559,7 @@ mod tests {
     }
 
     /// Register a context AND its document — matches production
-    /// `kj context create` behavior. `register_context` already writes
+    /// `kj kohai create` behavior. `register_context` already writes
     /// the documents + contexts rows to KernelDb (the storage of record
     /// `kj doc list` reads from); `block_store.create_document` adds the
     /// in-memory store entry that backs block_count + block snapshots.

@@ -101,7 +101,7 @@ impl Held {
         let mut config = SshServerConfig::ephemeral(addr.port());
         // Setup runs as non-root principals, whose uncovered statements ask;
         // only the model's own calls should reach a reviewer here.
-        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "cd"]);
+        common::allow_in_shipped_gate(&config, &["kj kohai create", "kj drive", "cd"]);
         config.auth_db_path = Some(auth_db_path);
         common::seed_mock_backend_with_model(config.data_dir.as_ref().unwrap(), "mock-model");
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();

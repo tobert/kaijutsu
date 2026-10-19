@@ -121,7 +121,7 @@ pub fn root_cwd_line(context: ContextId, cwd: &str) -> Option<String> {
 ///
 /// The check runs through a shell built for `identity`, so it sees what
 /// `cd` sees: the kernel mount table and the shell's own `/v/docs` and
-/// `/v/swap`. `kj context create|set --cwd`, `kj fork --pwd`, and the
+/// `/v/swap`. `kj kohai create|set --cwd`, `kj fork --pwd`, and the
 /// `setContextCwd` RPC all use it. The error names the path.
 pub async fn check_shell_cwd(
     dispatcher: &crate::kj::KjDispatcher,

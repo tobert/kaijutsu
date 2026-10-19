@@ -128,7 +128,7 @@
                 principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            let created = d.dispatch(&argv(&["context", "create", "prompt-test", "--type", context_type]), &caller).await;
+            let created = d.dispatch(&argv(&["kohai", "create", "prompt-test", "--type", context_type]), &caller).await;
             assert!(created.is_ok(), "{context_type}: {}", created.message());
             let ctx = lookup_context_id(&d, "prompt-test");
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
@@ -302,12 +302,17 @@
 
     /// A privileged caller joined to a fresh parentless console context,
     /// registered directly in the db the way boot's `ensure_root_contexts`
-    /// registers a root console. `kj context create` needs a parent, so a
+    /// registers a root console. `kj kohai create` needs a parent, so a
     /// create from this caller lands as the console's child. Privileged so
-    /// these rc-lifecycle tests can `kj context create` (Operator-gated) as
+    /// these rc-lifecycle tests can `kj kohai create` (Operator-gated) as
     /// the trusted control plane would.
 fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
+        // A person at a console is a live character, which `kj kohai create` needs.
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
         let console = register_context(d, None, None, principal_id);
         KjCaller {
             principal_id,
@@ -359,7 +364,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         install_rc_script_file(&d, "/config/rc/test/create/S00-prompt.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'You are a test context. Be terse.'"#).await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-md", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-md", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -400,7 +405,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-link", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-link", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -435,7 +440,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-broken-link", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-broken-link", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -475,7 +480,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-kai", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-kai", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -499,7 +504,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-echo", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-echo", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -692,7 +697,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         install_rc_script_file(&d, "/config/rc/test/create/S00-echo-type.kai", "echo \"type=$KJ_CONTEXT_TYPE\"").await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-type", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-type", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -733,7 +738,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             "echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"").await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-color", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-color", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -792,7 +797,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         .await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-tick", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-tick", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-tick");
@@ -840,7 +845,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         .await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-novars", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-novars", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-novars");
@@ -879,7 +884,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let owner = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-owned-kai", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-owned-kai", "--type", "test"]),
                 &owner,
             )
             .await;
@@ -918,14 +923,14 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
     // Runs an rc lifecycle; use the production rc stack.
     #[test]
-    fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer() {
-        crate::on_rc_thread(rc_nested_context_keeps_the_lead_as_director_and_its_reviewer_body);
+    fn rc_nested_context_answers_to_the_lead_and_the_lead_reviews_it() {
+        crate::on_rc_thread(rc_nested_context_answers_to_the_lead_and_the_lead_reviews_it_body);
     }
 
-    async fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer_body() {
+    async fn rc_nested_context_answers_to_the_lead_and_the_lead_reviews_it_body() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/create/S00-spawn-coder.kai", "kj context create child-work --type child --as coder")
+        install_rc_script_file(&d, "/config/rc/test/create/S00-spawn-coder.kai", "kj kohai create child-work --type child --as coder")
         .await;
         install_rc_script_file(&d, "/config/rc/child/create/S00-noop.kai", "true")
         .await;
@@ -933,8 +938,8 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let mut caller = console_caller(&d);
         let lead = PrincipalId::new();
         let coder = PrincipalId::new();
+        // The console caller is a live character already (`console_caller`).
         for (principal_id, name) in [
-            (caller.principal_id, "amy"),
             (lead, "lead"),
             (coder, "coder"),
         ] {
@@ -956,7 +961,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let result = d
             .dispatch(
-                &argv(&["context", "create", "lead-work", "--type", "test", "--as", "lead"]),
+                &argv(&["kohai", "create", "lead-work", "--type", "test", "--as", "lead"]),
                 &caller,
             )
             .await;
@@ -997,7 +1002,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let owner = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-owned-fail", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-owned-fail", "--type", "test"]),
                 &owner,
             )
             .await;
@@ -1132,7 +1137,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-silent", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-silent", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1158,7 +1163,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-hidden", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-hidden", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1213,7 +1218,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let started = std::time::Instant::now();
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-slow", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-slow", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1283,7 +1288,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-kj", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-kj", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1317,7 +1322,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-empty", "--type", "nonexistent"]),
+                &argv(&["kohai", "create", "ctx-empty", "--type", "nonexistent"]),
                 &caller,
             )
             .await;
@@ -1360,7 +1365,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-counted", "--type", "counted"]),
+                &argv(&["kohai", "create", "ctx-counted", "--type", "counted"]),
                 &caller,
             )
             .await;
@@ -1396,7 +1401,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-zero", "--type", "nothinghere"]),
+                &argv(&["kohai", "create", "ctx-zero", "--type", "nothinghere"]),
                 &caller,
             )
             .await;
@@ -1434,7 +1439,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-stray", "--type", "stray"]),
+                &argv(&["kohai", "create", "ctx-stray", "--type", "stray"]),
                 &caller,
             )
             .await;
@@ -1469,7 +1474,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-inert", "--type", "inert"]),
+                &argv(&["kohai", "create", "ctx-inert", "--type", "inert"]),
                 &caller,
             )
             .await;
@@ -1496,7 +1501,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-mixed", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-mixed", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -1587,7 +1592,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         // Construct a fresh context manually via the dispatch path.
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-recur", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-recur", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1816,7 +1821,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", "parent", "--type", "test"]),
+                &argv(&["kohai", "create", "parent", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1847,7 +1852,7 @@ esac
             )
             .unwrap();
 
-        // Privileged: the parent was made via `kj context create` (deny-by-
+        // Privileged: the parent was made via `kj kohai create` (deny-by-
         // default), so a plain caller would be refused by the `fork` gate. This
         // test exercises fork mechanics, not the capability check.
         let fork_caller = KjCaller {
@@ -1916,7 +1921,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", "parent", "--type", "test"]),
+                &argv(&["kohai", "create", "parent", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -1959,7 +1964,7 @@ esac
         // Fork. Parent's blocks copy into the child, then the fork
         // marker injects (taking the child's count to >3), then
         // rc-on-fork runs and reads KJ_PARENT_BLOCK_COUNT.
-        // Privileged: the parent was made via `kj context create` (deny-by-
+        // Privileged: the parent was made via `kj kohai create` (deny-by-
         // default), so a plain caller would be refused by the `fork` gate. This
         // test exercises fork mechanics, not the capability check.
         let fork_caller = KjCaller {
@@ -1996,7 +2001,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", "solo", "--type", "test"]),
+                &argv(&["kohai", "create", "solo", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -2020,7 +2025,7 @@ esac
 
         // Step 1: create parent (CREATE-MARKER appears in parent).
         let caller = console_caller(&d);
-        d.dispatch(&argv(&["context", "create", "parent", "--type", "test"]), &caller)
+        d.dispatch(&argv(&["kohai", "create", "parent", "--type", "test"]), &caller)
             .await;
         let parent_id = lookup_context_id(&d, "parent");
         let parent_contents = block_contents_in(&d, parent_id);
@@ -2031,7 +2036,7 @@ esac
 
         // Step 2: fork the parent. Use a caller bound to the parent so
         // fork resolves "."  to the parent context.
-        // Privileged: the parent was made via `kj context create` (deny-by-
+        // Privileged: the parent was made via `kj kohai create` (deny-by-
         // default), so a plain caller would be refused by the `fork` gate. This
         // test exercises fork mechanics, not the capability check.
         let fork_caller = KjCaller {
@@ -2153,7 +2158,7 @@ esac
         install_rc_script_file(
             &d,
             "/config/rc/nested-cancel-outer/create/S00-create-child.kai",
-            "kj context create nested-cancel-child --type nested-cancel-child",
+            "kj kohai create nested-cancel-child --type nested-cancel-child",
         )
         .await;
         install_rc_script_file(
@@ -2173,6 +2178,7 @@ esac
         let cancel = tokio_util::sync::CancellationToken::new();
         let invocation = RcInvocation::new("create", &admission, &cancel);
         let caller = caller_with_context(outer);
+        crate::kj::test_helpers::give_character(&d, &caller);
         let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
         let run = crate::rc::run(&d, invocation, &caller);
         tokio::pin!(run);
@@ -2235,7 +2241,7 @@ esac
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-default-kills", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-default-kills", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -2333,7 +2339,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", "c1", "--type", "coder"]),
+                &argv(&["kohai", "create", "c1", "--type", "coder"]),
                 &caller,
             )
             .await;
@@ -2419,7 +2425,7 @@ esac
             let label = format!("c-{context_type}");
             let r = d
                 .dispatch(
-                    &argv(&["context", "create", &label, "--type", context_type]),
+                    &argv(&["kohai", "create", &label, "--type", context_type]),
                     &caller,
                 )
                 .await;
@@ -2448,7 +2454,7 @@ esac
             let label = format!("c-{context_type}");
             let r = d
                 .dispatch(
-                    &argv(&["context", "create", &label, "--type", context_type]),
+                    &argv(&["kohai", "create", &label, "--type", context_type]),
                     &caller,
                 )
                 .await;
@@ -2479,7 +2485,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", "parent", "--type", "coder"]),
+                &argv(&["kohai", "create", "parent", "--type", "coder"]),
                 &caller,
             )
             .await;
@@ -2491,7 +2497,7 @@ esac
             "parent should carry its create-time datetime note"
         );
 
-        // Privileged: the parent was made via `kj context create` (deny-by-
+        // Privileged: the parent was made via `kj kohai create` (deny-by-
         // default), so a plain caller would be refused by the `fork` gate.
         // This test exercises fork mechanics, not the capability check.
         let fork_caller = KjCaller {
@@ -2546,7 +2552,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-run-fail", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-run-fail", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -2579,7 +2585,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-run-ok", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-run-ok", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -2607,7 +2613,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-run-scripts", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-run-scripts", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -2653,7 +2659,7 @@ esac
 
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-run-guarded", "--type", "test"]),
+                &argv(&["kohai", "create", "ctx-run-guarded", "--type", "test"]),
                 &caller,
             )
             .await;
@@ -2685,7 +2691,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", "ctx-run-empty", "--type", "emptytype"]),
+                &argv(&["kohai", "create", "ctx-run-empty", "--type", "emptytype"]),
                 &caller,
             )
             .await;
@@ -2724,7 +2730,7 @@ esac
         }
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-order", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-order", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-order");
@@ -2776,7 +2782,7 @@ esac
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", "ctx-link-id", "--type", "test"]), &caller)
+            .dispatch(&argv(&["kohai", "create", "ctx-link-id", "--type", "test"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-link-id");
@@ -2835,7 +2841,7 @@ esac
             VERB_CREATE => {
                 let r = d
                     .dispatch(
-                        &argv(&["context", "create", "wired-create", "--type", "test"]),
+                        &argv(&["kohai", "create", "wired-create", "--type", "test"]),
                         &console_caller(&d),
                     )
                     .await;
@@ -3018,7 +3024,7 @@ esac
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let args: Vec<String> = ["context", "create", "loadout", "--type", "coder"].map(String::from).to_vec();
+            let args: Vec<String> = ["kohai", "create", "loadout", "--type", "coder"].map(String::from).to_vec();
             let r = d.dispatch(&args, &caller).await;
             assert!(r.is_ok(), "create failed: {}", r.message());
             let ctx = lookup_context_id(&d, "loadout");
@@ -3035,7 +3041,7 @@ esac
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let args: Vec<String> = ["context", "create", "council-chat", "--type", "council"].map(String::from).to_vec();
+            let args: Vec<String> = ["kohai", "create", "council-chat", "--type", "council"].map(String::from).to_vec();
             let r = d.dispatch(&args, &caller).await;
             assert!(r.is_ok(), "create failed: {}", r.message());
             let ctx = lookup_context_id(&d, "council-chat");
@@ -3093,7 +3099,7 @@ esac
             .await;
         d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
         let caller = console_caller(&d);
-        let mut args = vec!["context".to_string(), "create".into(), "orient".into(), "--type".into(), "coder".into()];
+        let mut args = vec!["kohai".to_string(), "create".into(), "orient".into(), "--type".into(), "coder".into()];
         if let Some(cwd) = cwd {
             args.push("--cwd".into());
             args.push(cwd.display().to_string());
@@ -3329,7 +3335,7 @@ esac
     // ── archive verb ────────────────────────────────────────────────────
 
     /// A live context of `context_type` with a conversation document, a
-    /// structural child of `parent` when given, as `kj context create` makes.
+    /// structural child of `parent` when given, as `kj kohai create` makes.
     /// A context to archive: under `parent`, or else under amy's console, so
     /// [`root_archiver`] has authority over it as its lineage root.
     fn archivable(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str) -> ContextId {

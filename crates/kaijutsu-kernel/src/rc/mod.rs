@@ -464,7 +464,7 @@ async fn load_scripts(
 /// committed context, not an empty bucket. A missing directory reads as
 /// empty, the same as `load_scripts`.
 ///
-/// `kj context create` calls this before committing a context row: a type
+/// `kj kohai create` calls this before committing a context row: a type
 /// whose `create` bucket is missing or holds no candidate script would bind
 /// no loadout and be committed inert (deny-by-default). Other verbs keep
 /// `load_scripts`' "missing directory is zero scripts, not a failure" rule —

@@ -61,11 +61,11 @@ pub fn extract_all_named_args(argv: &[String], names: &[&str]) -> Vec<String> {
 /// Rewrite a trailing bare `help` token to `--help` so clap renders the leaf
 /// subcommand's help instead of binding `help` as a positional value.
 ///
-/// Guards the footgun where `kj context create help` silently mints a context
+/// Guards the footgun where `kj kohai create help` silently mints a context
 /// labelled "help" (the verb's positional `label` swallows the bare token,
 /// since the clap structs `disable_help_subcommand`). We only touch a `help`
 /// that is **last** and **not the value of a preceding flag** — so
-/// `kj context create --name help` (a deliberate "help" label via `--name`)
+/// `kj kohai create --name help` (a deliberate "help" label via `--name`)
 /// and `kj context retag help target` (help as a non-trailing positional) are
 /// left untouched. Returns the argv unchanged when no rewrite applies.
 pub fn normalize_trailing_help(argv: &[String]) -> Vec<String> {
@@ -213,12 +213,12 @@ mod tests {
 
     #[test]
     fn normalize_trailing_help_rewrites_bare_positional() {
-        // The footgun: `kj context create help` — without rewrite, `help` is the
+        // The footgun: `kj kohai create help` — without rewrite, `help` is the
         // positional label and a context named "help" is born.
-        let argv = vec![s("context"), s("create"), s("help")];
+        let argv = vec![s("kohai"), s("create"), s("help")];
         assert_eq!(
             normalize_trailing_help(&argv),
-            vec![s("context"), s("create"), s("--help")]
+            vec![s("kohai"), s("create"), s("--help")]
         );
     }
 
@@ -234,10 +234,10 @@ mod tests {
     #[test]
     fn normalize_trailing_help_leaves_flag_value_alone() {
         // `--name help` deliberately labels a context "help" — not a help request.
-        let argv = vec![s("context"), s("create"), s("--name"), s("help")];
+        let argv = vec![s("kohai"), s("create"), s("--name"), s("help")];
         assert_eq!(normalize_trailing_help(&argv), argv);
         // Short flag form too.
-        let argv2 = vec![s("context"), s("create"), s("-n"), s("help")];
+        let argv2 = vec![s("kohai"), s("create"), s("-n"), s("help")];
         assert_eq!(normalize_trailing_help(&argv2), argv2);
     }
 

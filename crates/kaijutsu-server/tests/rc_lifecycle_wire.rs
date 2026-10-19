@@ -16,7 +16,7 @@ async fn install_nested_lifecycle(server: &SharedKernel, child_label: &str) {
         vfs.mkdir(Path::new(path), 0o755).await.unwrap();
     }
     vfs.write_all(Path::new("/config/rc/nested-parent/create/S00-child.kai"),
-        format!("kj context create {child_label} --type nested-child").as_bytes()).await.unwrap();
+        format!("kj kohai create {child_label} --type nested-child").as_bytes()).await.unwrap();
     vfs.write_all(Path::new("/config/rc/nested-child/create/S00-wait.kai"),
         b"kj block create --role system --kind text --content child-entered\nwhile test ! -e /config/rc/release; do sleep 0.01; done\nkj block create --role system --kind text --content child-finished").await.unwrap();
     vfs.write_all(Path::new("/config/rc/nested-child/create/S10-later.kai"),
@@ -59,7 +59,7 @@ fn shutdown_joins_nested_rc_before_settling_the_command() {
         let (kernel, _) = client.bind_kernel().await.unwrap();
         let parent = create_context(&kernel, "nested-shutdown").await.unwrap();
         install_nested_lifecycle(&server, "shutdown-child").await;
-        let submission = kernel.shell_submit("kj context create nested-outer --type nested-parent", parent, false).await.unwrap();
+        let submission = kernel.shell_submit("kj kohai create nested-outer --type nested-parent", parent, false).await.unwrap();
         assert!(submission.refusal.is_none());
         let child = wait_child(&server, "shutdown-child").await;
 
@@ -87,7 +87,7 @@ fn accepted_nested_rc_survives_disconnect_and_archive() {
         kernel.join_context(parent, "nested-submitter").await.unwrap();
         let session = *server.session_contexts.iter().find(|row| *row.value() == parent).unwrap().key();
         install_nested_lifecycle(&server, "disconnect-child").await;
-        let submission = kernel.shell_submit("kj context create nested-outer --type nested-parent", parent, false).await.unwrap();
+        let submission = kernel.shell_submit("kj kohai create nested-outer --type nested-parent", parent, false).await.unwrap();
         assert!(submission.refusal.is_none());
         let child = wait_child(&server, "disconnect-child").await;
         drop(kernel);
@@ -139,7 +139,7 @@ fn client_reads_complete_rc_output_from_successful_and_failed_scripts() {
             let script = format!("printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2; {ending}");
             vfs.write_all(Path::new(&format!("{base}/create/S00-output.kai")), script.as_bytes()).await.unwrap();
             let result = kernel.execute_kj(parent, &[
-                "context".into(), "create".into(), label.into(), "--type".into(), label.into(),
+                "kohai".into(), "create".into(), label.into(), "--type".into(), label.into(),
             ]).await.unwrap();
             assert_eq!(result.exit_code, 0, "ordinary script failure retains the context: {}", result.stderr);
             let context = kernel.list_contexts().await.unwrap().into_iter()

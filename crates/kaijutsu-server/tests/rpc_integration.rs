@@ -597,7 +597,7 @@ fn pre_call_deny_on_shell_write_blocks_shell_execute_end_to_end() {
     run_local(async {
         let (addr, kernel) = start_server_with_kernel_handle().await;
 
-        // Create the context before the hook: `kj context create` runs through
+        // Create the context before the hook: `kj kohai create` runs through
         // the same shell_write gate the hook denies.
         let client = connect_client(addr).await;
         let (kj_kernel, _kernel_id) = client.bind_kernel().await.unwrap();

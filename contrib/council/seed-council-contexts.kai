@@ -10,8 +10,9 @@
 # docs/writing.md: plain words, the rule first, specific values.
 set -e
 
-kj context create council-system --top --type default
-kj context create council-amy --top --type default
+# Run from Amy's console: both contexts answer to it.
+kj kohai create council-system --type default
+kj kohai create council-amy --type default
 
 # council-system: the house rules. The opening, routine-work, risk, and
 # JSON paragraphs follow contrib/bench/rc-variants/council, whose wording was

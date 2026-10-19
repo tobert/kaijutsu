@@ -719,7 +719,7 @@ fn the_window_title_follows_the_context_and_is_given_back() {
     );
 
     // A second context with a label of its own, then a switch to its seat.
-    colon_line(&session, ":kj context create second");
+    colon_line(&session, ":kj kohai create second");
     clear_status_notice(&session);
     let digit = seat_of(&session, "second");
     session.send(&format!("\x01{digit}")); // Ctrl+A <digit>

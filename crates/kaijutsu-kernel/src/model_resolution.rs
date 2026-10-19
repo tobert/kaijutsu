@@ -9,7 +9,7 @@
 //!    `kj model` already reports as `source: "context"`.
 //! 2. A **cast slot** matched on the context's `context_type`, except a
 //!    reserved role ([`RESERVED_ROLES`]) — the named
-//!    ensemble assigned via `kj context create --cast <label>` /
+//!    ensemble assigned via `kj kohai create --cast <label>` /
 //!    `kj context set --cast <label>` (`ContextRow::cast_id`, resolved to a
 //!    label by the caller) or inherited from a preset's `cast_id` at fork.
 //! 3. The **registry-wide default** backend/model (`kj backend`'s

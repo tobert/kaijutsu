@@ -1,4 +1,4 @@
-//! Creating a context over the wire goes through `kj context create`, run
+//! Creating a context over the wire goes through `kj kohai create`, run
 //! from an existing context that becomes the parent (`docs/character.md`,
 //! "Bootstrap: the person creates themself"). There is no `createContext`
 //! RPC.
@@ -26,7 +26,7 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
             .execute_kj_quiet(parent.context_id, &context_create_argv("lane", "coder", None, None))
             .await
             .unwrap();
-        let lane = context_id_from_create_result(&result).expect("kj context create succeeds");
+        let lane = context_id_from_create_result(&result).expect("kj kohai create succeeds");
 
         let root = kernel.kernel_db.lock().get_character_by_name(SshServerConfig::EPHEMERAL_ROOT).unwrap().unwrap();
         let row = kernel.kernel_db.lock().get_context(lane).unwrap().unwrap();
