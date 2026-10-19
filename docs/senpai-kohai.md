@@ -264,9 +264,9 @@ Choices made where the design was silent, the smaller shape each time.
   the turn. `kj context prompt` reads the same fact and no longer resolves the reviewer, so it no longer refuses
   where review routing would; the turn still does.
 - **A nested archive in an rc lifecycle** (step 2 follow-up 1) passes when the seat, the context whose lifecycle
-  runs, is the target's senpai, or when the seat's holder passes the authority rule. The first case covers a
-  seat nobody performs (`archiving_a_coder_archives_its_judge_shadow`). Whoever started the lifecycle lends it
-  nothing.
+  runs, is the target's senpai, and only then. A lifecycle has no more power than its seat: neither the seat's
+  holder nor whoever started the lifecycle lends it anything (Amy, 2026-10-19). The shipped coder archive
+  bucket needs no more, since the seat is its judge shadows' senpai.
 - **The council bench contexts** (`contrib/bench/rc-variants/council/coder/create/S04..S06`, step 2 follow-up 2)
   are made with `kj kohai create` inside the first coder's create lifecycle, so they answer to that coder seat.
   They raise no asks, so the edge routes nothing for them today.

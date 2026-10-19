@@ -3467,7 +3467,34 @@ esac
         assert!(db.get_context(stranger).unwrap().unwrap().archived_at.is_none(), "the seat does not hold stranger's senpai");
         drop(db);
         let contents = block_contents_in(&d, seat).join("\n");
-        assert!(contents.contains("only stranger"), "the refusal is recorded in the seat: {contents}");
+        assert!(contents.contains("stranger is not one"), "the refusal is recorded in the seat: {contents}");
+    }
+
+    /// A nested archive passes only for a kohai of the seat itself. The
+    /// seat's holder holding the target's senpai through another seat lends
+    /// the lifecycle nothing.
+    #[tokio::test]
+    async fn an_archive_lifecycle_does_not_borrow_its_holders_authority() {
+        let d = archive_dispatcher().await;
+        install_rc_script_file(&d, "/config/rc/test/archive/S10-cousin.kai", "kj context archive cousin --confirm").await;
+        let coder = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let seat = archivable(&d, "seat", None, "test");
+        let other_seat = archivable(&d, "other-seat", None, "other");
+        d.kernel_db().lock().update_played_by(seat, Some(coder)).unwrap();
+        d.kernel_db().lock().update_played_by(other_seat, Some(coder)).unwrap();
+        let cousin = archivable(&d, "cousin", Some(other_seat), "other");
+        let r = d.dispatch(&argv(&["context", "archive", "seat"]), &root_archiver(&d)).await;
+        assert!(r.is_ok(), "the seat's own archive stands: {}", r.message());
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(seat).unwrap().unwrap().archived_at.is_some());
+        assert!(db.get_context(cousin).unwrap().unwrap().archived_at.is_none(), "seat is not cousin's senpai");
+        drop(db);
+        let contents = block_contents_in(&d, seat).join("\n");
+        assert!(contents.contains("only its own kohai"), "the refusal is recorded in the seat: {contents}");
     }
 
     /// Retiring a character runs the archive lifecycle of each context it

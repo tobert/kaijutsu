@@ -1772,11 +1772,9 @@ impl KjDispatcher {
 
     /// The authority rule for a verb nested in an rc lifecycle, with the
     /// seat (`caller.context_id`, the context whose lifecycle runs) as the
-    /// actor: passes when the seat is `target`'s senpai, or when the seat's
-    /// holder passes [`KernelDb::context_authority`]. A lifecycle with no
-    /// context refuses.
-    ///
-    /// [`KernelDb::context_authority`]: crate::kernel_db::KernelDb::context_authority
+    /// actor: passes only when the seat is `target`'s senpai. A lifecycle
+    /// has no more power than its seat, so the seat's holder lends it
+    /// nothing. A lifecycle with no context refuses.
     pub(crate) fn require_lifecycle_authority(
         &self,
         target: ContextId,
@@ -1795,15 +1793,11 @@ impl KjDispatcher {
                 return Ok(Ok(()));
             }
             let seat_label = db.get_context(seat)?.and_then(|r| r.label).unwrap_or_else(|| seat.short());
-            Ok(match db.context_holder(seat)? {
-                Some(holder) => db.context_authority(target, holder, act)?.map(|_| ()).map_err(|refusal| {
-                    format!("{refusal}; this runs in {seat_label}'s rc lifecycle, as {}", db.name_for(holder))
-                }),
-                None => Err(format!(
-                    "{seat_label}'s rc lifecycle may {} only its own kohai, and nobody holds {seat_label}",
-                    act.as_str()
-                )),
-            })
+            let target_label = row.label.unwrap_or_else(|| target.short());
+            Ok(Err(format!(
+                "{seat_label}'s rc lifecycle may {} only its own kohai, and {target_label} is not one",
+                act.as_str()
+            )))
         })();
         match checked {
             Ok(rule) => rule,
@@ -2131,8 +2125,7 @@ impl KjDispatcher {
         // A nested archive from an rc lifecycle (a coder's archive bucket
         // retiring its judge shadows) is checked with the seat — the
         // context whose lifecycle runs — as the actor, not whoever started
-        // the lifecycle: the seat may archive its own kohai, or what its
-        // holder has authority over (`docs/senpai-kohai.md`, "Open (step 3)").
+        // the lifecycle: the seat may archive only its own kohai.
         let in_rc_lifecycle = caller.privileged && caller.rc_depth > 0;
         let authority = if in_rc_lifecycle {
             self.require_lifecycle_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
