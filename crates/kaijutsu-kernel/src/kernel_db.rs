@@ -8639,9 +8639,8 @@ impl KernelDb {
     /// Does not touch the character's contexts — `kj character retire`
     /// concludes and archives them separately, through the same
     /// `archive_context`/`conclude_context` every other archival path uses.
-    /// A context whose responsible character has retired refuses reviewer
-    /// resolution by name rather than being skipped
-    /// (`responsible_character_above`).
+    /// A context whose senpai's holder has retired refuses reviewer
+    /// resolution by name rather than being skipped ([`Self::route_review`]).
     pub fn retire_character(&self, principal_id: PrincipalId, at: i64) -> KernelDbResult<bool> {
         let updated = self.conn.execute(
             "UPDATE characters SET retired_at = ?1

@@ -149,9 +149,11 @@ kj ledger cancel <request-id>
 
 An ask snapshots its requester, performer, and reviewer. `show` reports all
 three plus the deciding character. The assigned reviewer may allow or deny.
-The assigned reviewer or the lineage root of the ask's context may
-explicitly reassign a pending ask with `escalate`. This lets Amy reclaim an
-ask in her lineage when its reviewer is unavailable. Escalation records both reviewer identities
+The assigned reviewer, the holder of the ask context's senpai, or its lineage
+root may pass a pending ask up the senpai chain with `escalate`. Naming the
+next reviewer with `--to`, or taking the ask over, is the lineage root's
+alone; this lets Amy reclaim an ask in her lineage when its reviewer is
+unavailable. Escalation records both reviewer identities
 and the actual caller, and refuses to assign the performer. The requester or
 performer may cancel a pending ask. Cancellation runs nothing; it does not
 undo an executed action.
