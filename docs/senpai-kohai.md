@@ -167,6 +167,23 @@ Choices made conservatively where the design was silent. None is a new rule; eac
 - **Tests rewritten for the new model** (old to new): `lineage_root_repairs_a_retired_explicit_reviewer` removed (covers `--reviewer`, step 2); `explicit_reviewer_can_assign_a_performer_when_the_lineage_root_is_retired` is now `the_senpai_holder_can_assign_a_performer_when_the_lineage_root_is_retired`; `context_info_keeps_metadata_when_explicit_reviewer_is_retired` is now `..._when_the_senpai_holder_is_retired`; `final_assignment_rejects_reviewer_revoked_after_precheck` and the egress twin move the senpai instead of revoking a delegation; `final_context_insert_rejects_a_reviewer_changed_to_the_performer` is now `..._a_performer_nobody_can_review`; `a_forked_from_cycle_fails_the_listing_and_the_escalation_loudly` is now a senpai cycle; the escalate tests expect "at the top" and a held root console; `context_review_assignment_belongs_to_the_director` drops the self-review step (unreachable); the server wire test `amy_default_and_director_delegation_route_approval_over_the_wire` is now `..._and_escalation_...` (delegation steps removed).
 - **Verified**: `cargo test -p kaijutsu-kernel` 4107 passed, 0 failed, 19 ignored; `kaijutsu-server` and `approval-ledger` pass; fmt clean; clippy on kaijutsu-kernel lib 77 warnings (baseline ~78), none in new code.
 
+## Decided after the docs pass (senpai, 2026-10-18, within Amy's decisions)
+
+The docs rewrite (`4a5c8be3`..`ff20a31c`) found these gaps in the spec. Steps 2 and 3 build to these answers:
+
+1. Character standing rules on `kj drive`, `interrupt`, `archive` and `kohai create` that tested
+   `director_id == actor` now test "the actor holds the target's senpai" (the first half of the authority rule).
+2. `--top` goes. Only root consoles and the listed system contexts have no senpai; `--senpai <ctx>` covers the rest.
+3. `--parent` (provenance) and `--senpai` (routing) both default to the caller's context and may differ.
+4. Parentless system contexts keep no senpai and raise no asks; if one does, it refuses loudly.
+5. Egress authority follows the one authority rule.
+6. `kj ledger escalate --to <character>` and the lineage root's take-over stay, as lineage-root-only overrides on
+   top of the climb.
+7. Fix container.md: "senpai" is the supervising session outside the container; "banto" is the director seat.
+8. Step 5's replacement for a one-off `kj context set --model`, and step 7's home for `[council] server` and the
+   per-slot backend choice, go to Amy when those steps start.
+9. Step 2 also removes the stale doc comment naming `responsible_character_above` (kernel_db.rs ~8562).
+
 ## Follow-ups in the same stack (decided by Amy, 2026-10-18)
 
 Amy, on the cleanup after senpai/kohai: "1. gates would have a cast too, sorta like we did in kaibo's config. but
