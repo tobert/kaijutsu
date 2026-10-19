@@ -152,6 +152,8 @@ overlay.
   engine's own docs name them. `check.sh` probes it.
 - **Seats.** banto plays a `director` context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
   supervising Claude session's context, whose holder connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`).
+  That context does not exist when `bootstrap.sh` runs, so banto starts under Amy's root console, and Amy moves
+  it with `kj senpai set <project>-banto <senpai's context>` (bootstrap prints the command).
   banto's asks go to senpai, and a drift between banto and senpai (`kj senpai report`) needs no ask. banto starts
   coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.
 - **Gate.** Coders run with `uncovered = "allow"`. The `mcp` type does too, so the supervisor's `kj` verbs do not

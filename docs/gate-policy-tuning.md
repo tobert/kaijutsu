@@ -611,6 +611,13 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   senpai to its own kohai, runs with no ask, and `kj senpai report "<text>"` is the same act. This replaces
   the per-context `kj ledger allow --remember session --family` rule that the 2026-10-18 nagaya run had to
   teach by hand. Any other drift target keeps the tier it has here; a drift to a sibling still asks.
+  Shipped in step 3 as the `senpai edge` layer of `gate_policy::evaluate`: it allows a command that no
+  user rule, family rule or `gate.toml` key decided, before the uncovered tier, so an `ask` or `deny` key
+  on `kj drift push` stays firm. The target is read from the arguments as the verb resolves it, so every
+  argument must be a literal word and the command plain (no redirect, background flag or heredoc). Broker
+  PreCall has no database and sees no edge: the pre_call hooks still run, then the gate allows. The
+  decision reads `gate policy: senpai edge allows kj drift push to <ctx>, its senpai` (or `its kohai`, or
+  `kj senpai report to <ctx>`).
 - **The gate's model comes from its own cast** (step 7). Today the `gate` slot of a seat's cast names the
   council server and served model that decide its gate (`docs/council.md`, "Configuration"). The reserved
   `gate` role leaves `cast_slots`, and the gate gets a cast of its own, as kaibo's config does.

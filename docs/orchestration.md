@@ -148,6 +148,7 @@ kj drift queue                                 # see what's staged
 kj drift flush                                 # deliver
 kj drift pull <label> [prompt]                 # LLM digest from another context into this one
 kj drift merge                                 # summarize this fork back into parent
+kj senpai report "text"                        # deliver to the context this one answers to; no id, no ask
 ```
 
 A drift block lands in the target context's document. The next time anyone
