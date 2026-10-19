@@ -1193,8 +1193,8 @@ fn unbound_denial(verb: &str, ctx: ContextId, state: &str, label: &str) -> KjRes
          did not bind it, so it grants nothing (including the '{label}' capability \
          this verb needs) and cannot widen itself. \
          Read this context's Error blocks for why it failed. \
-         Repair: `kj context rebind`. Or leave it: `kj kohai create <label-of-new>` \
-         then `kj context switch <label-of-new>` (both ungated), and \
+         Repair: `kj context rebind`. Or leave it: `kj context scratch` \
+         then `kj context switch scratch` (both ungated), and \
          `kj context archive {ctx_short}` from there.",
         ctx_short = ctx.short()
     ))

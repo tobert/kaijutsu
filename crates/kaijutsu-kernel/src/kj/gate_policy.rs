@@ -1883,7 +1883,7 @@ mod tests {
         assert_eq!(target("kohai create child --type coder --as coder"), NewChild);
         assert_eq!(target("kohai create child --parent lane"), NewChild, "--parent is provenance only");
         assert_eq!(target("kohai create child --senpai lane"), NewUnder("lane".into()));
-        assert_eq!(target("context create child"), Unread, "kj kohai create is gone");
+        assert_eq!(target("context create child"), Unread, "kj context create is gone");
         assert_eq!(target("context set lane --model m"), Unread);
         assert_eq!(target("fork"), Unread);
         assert_eq!(target("drive --no-such-flag"), Unread);

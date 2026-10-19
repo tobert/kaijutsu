@@ -172,13 +172,14 @@ enum ContextCommand {
     },
     /// Replace a context with a fresh successor (default: current). The
     /// successor is created from the same parent and copies the type, cast,
-    /// performer, director, reviewer override, model, system prompt,
-    /// workspace, env, and cwd, then runs the `create` rc lifecycle.
+    /// performer, senpai, model, system prompt, workspace, env, and cwd,
+    /// then runs the `create` rc lifecycle.
     /// `ROTATED_FROM` names the predecessor by id. When the successor has a
     /// loadout, it takes the label, the ring seat, and any character's
     /// `root_ctx` pointer, and the predecessor is archived after its
-    /// `archive` rc lifecycle runs. The performer or the lineage root may
-    /// rotate.
+    /// `archive` rc lifecycle runs, and the predecessor's live kohai move to
+    /// the successor. Its performer, the holder of its senpai, or its
+    /// lineage root may rotate.
     Rotate {
         /// Context to rotate. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
@@ -313,8 +314,8 @@ struct ResolvedModel {
 }
 
 /// Insert a new context only while its model approval assignment is valid.
-/// The check follows insertion within one database transaction so retirement or
-/// delegation changes cannot leave a visible self-reviewed model context.
+/// The check follows insertion within one database transaction so a retirement
+/// or a senpai move cannot leave a visible self-reviewed model context.
 fn insert_new_context_checked(
     db: &KernelDb,
     row: &ContextRow,

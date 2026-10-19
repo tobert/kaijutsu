@@ -27,7 +27,7 @@ pub(crate) fn resolve(
 ) -> Result<TurnIdentity, String> {
     let actor = require_performer(actor)?;
     if actor == reviewer {
-        return Err("The performer cannot review its own work. Ask the default review authority to assign a different reviewer with 'kj context set . --reviewer <character>'.".to_string());
+        return Err("The performer cannot review its own work. Ask the holder of this context's senpai, or its lineage root, to move it under a senpai another character holds with 'kj senpai set . <senpai-context>'.".to_string());
     }
     let character = db.get_character(actor)
         .map_err(|e| format!("Could not resolve performer: {e}"))?

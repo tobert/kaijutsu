@@ -168,6 +168,13 @@ async fn two_connections(mock_llm: bool) -> TwoConnections {
             .unwrap();
     });
     let server = kernel_rx.await.unwrap();
+    // Each connection is a live character: `kj kohai create` needs one.
+    {
+        let db = server.kernel_db.lock();
+        for (principal, name) in [(a_principal, "conn-a"), (b_principal, "conn-b")] {
+            db.insert_character(&character(principal, name)).unwrap();
+        }
+    }
 
     let a_client = connect_with_key(addr, a_key, "conn-a").await;
     let b_client = connect_with_key(addr, b_key, "conn-b").await;
