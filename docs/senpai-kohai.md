@@ -32,8 +32,8 @@ functions (`KernelDb::effective_approval_reviewer` and `Kernel::resolve_review_a
 
 What stays as it is:
 
-- `character`: who performs a context (persona, keys, default cast).
-- `cast`: the model team.
+- `character`: who performs a context (persona, keys) and which model it uses for each role (its slots,
+  step 5; the separate `cast` goes).
 - `context_type`: what a context does (its rc bundle and gate tier). The `director` type keeps its name.
 - `forked_from` and fork kind: provenance only. They no longer route anything. `forked_from` is the only parent link (step 4).
 
@@ -194,16 +194,124 @@ These are later steps on this branch, after steps 1-3:
 
 4. **One parent link.** `forked_from` is the only parent link. The 'structural' rows in `context_edges` that
    duplicate it go; drift edges stay.
-5. **Model provenance per turn; no cast on the context.** Today a turn records nothing durable about its model:
-   `context_usage` keeps only the last request per context. First, each turn writes a durable record: turn id,
-   context, performer, cast, role (context type), provider, model, and the token counts, which also gives spend
-   totals. Then `contexts.cast_id` and the per-context provider/model override go. A context's model is its
-   performer's cast slot for the context's type. To run another model, cast a character whose cast has it.
+5. **Model provenance per turn; model choice on the character, bound at creation.** Each turn writes a durable
+   record (done, `959b6dac`). Then the cast merges into the character, and a context's model is bound once when
+   the context is made. See "Step 5: the character chooses the model" below, which replaces the first version of
+   this item (Amy, 2026-10-19).
 6. **Persona on the character.** The character sheet carries the persona text; the context type says what the
    seat does. The `director` type, which predates characters, is reworked or replaced, and its persona file
    (S00-stance) moves to the character that plays the seat.
-7. **The gate's own cast**, as in kaibo's config: the reserved `gate` role leaves `cast_slots`. In parallel with
-   4-6 where it does not collide; otherwise after them.
+7. **The gate's own cast**, as in kaibo's config: the reserved `gate` role leaves the character's slots. After
+   step 5. Until step 7, a seat with no `gate` slot decides on `[council] server`; step 7 removes that fallback.
+
+## Step 5: the character chooses the model
+
+Amy, 2026-10-19: "I *hate* fallbacks. remove it." "I'm kinda back to thinking we should merge cast into
+character... mid-context re-cast would be bad." "yes, merge and bind at creation; write the spec first."
+
+Why: a turn's model could come from six places (the context's provider/model override, the context's cast, the
+performer's default cast, `llm_defaults`, and a preset's cast at fork time), and the last of them was a fallback.
+A shared cast also gave little reuse: one character already plays many seats. And a model that a character change
+moves on the next turn recasts a conversation in the middle, which loses its prompt cache and its coherence.
+
+### The model
+
+- **Slots live on the character.** `character_slots (principal_id, role)` holds the backend, the model and the
+  sampling parameters (`max_tokens`, `temperature`, `top_p`, `effort`, `thinking_budget`, `thinking_style`) for
+  one role. A role is a context type, or `gate` until step 7. The columns are those of `cast_slots` today, without
+  `loadout` and `extra`, which have no consumer.
+- **A context's models are bound once, at birth.** `kj kohai create`, `kj fork` and `kj context rotate` read the
+  new context's performer's slots and write one binding per role the context uses: its own type, and `judge` and
+  `gate` when the performer has those slots. `context_models (context_id, role, principal_id, backend_id, model,
+  the parameters as the slot holds them, bound_at)`, keyed on `(context_id, role)`. Every new context binds by
+  this one rule; fork and rotate copy no model from the source. No verb changes a binding.
+- **A context with no binding has no model.** A context with no performer binds nothing. A performer with no slot
+  for the type binds nothing, and `kj kohai create` says so in its output: "<context> has no model: <character>
+  has no <type> slot". `kj context info` shows the same line. A model turn in such a context refuses before any
+  provider work, naming the character, the type and the fix (`kj character slot set`, then `kj context rotate`).
+- **A seat changes model by rotation.** To move a live seat to another model, set the character's slot and rotate
+  the seat. The successor binds the new slot and reads its predecessor's handoff, as rotation does today. To run
+  two models side by side, make a second character (for example `banto-sonnet`) and create a seat `--as` it.
+- **Parameters at a turn**: the binding's values, then the model's own row in `backend_models`. Nothing below
+  them: kaijutsu supplies no parameter value of its own. `max_tokens`, which every provider request carries, must
+  come from the slot or the model's row; a bind without one refuses, naming the slot and the model. The
+  `llm_defaults` floor of 64000 (`LlmRegistry::max_output_tokens`) and the openai-compatible client's 8192 for a
+  zero go. A backend's connection facts (`base_url`, keys, timeouts) are read live; they are infrastructure, not
+  a model choice.
+- **The judge and the gate** read the seat's `judge` and `gate` bindings. A judge shadow is still created on the
+  seat's first gate call; it runs on the seat's `judge` binding and stores none of its own. A seat with no
+  `judge` binding gets no shadow, as today. A recast of the character no longer moves a live seat's gate or judge.
+- **The turn record** keeps its columns minus `cast_label` and `model_source`; `provider` and `model` are the
+  binding's. Every turn now has exactly one source.
+
+### Removed (hard cut)
+
+- Tables `casts`, `cast_slots` and `llm_defaults`. Columns `characters.default_cast_id`, `contexts.cast_id`,
+  `contexts.provider`, `contexts.model`, `presets.cast_id`, `presets.system_prompt`, and `turns.cast_label`,
+  `turns.model_source`.
+- `kj cast` (all of it), `kj model` (`kj context info` shows the binding), `kj character set --cast`,
+  `kj context set|unset --model|--cast`, `kj kohai create -m|--model|--cast`, `kj fork --model`,
+  `kj backend default`, and `kj preset save --cast|--system-prompt`. `kj models` (discovery) stays.
+- RPC `configureLlm`, `setDefaultProvider` and `setDefaultModel`; the client's `set_context_model`; the wire's
+  `ContextHandleInfo.castLabel`. `ContextHandleInfo.provider` and `.model` carry the binding.
+- The MCP `session.start` hook's model write.
+- The live `GET /v1/models` lookup for a context window. A window that `backend_models` does not hold shows as
+  unknown.
+- The DriftRouter handle's provider/model copy. The binding row is the one place.
+
+New: `kj character slot set <character> <role> --backend <b> --model <m> [parameters]`, `kj character slot remove
+<character> <role>`, and the slots in `kj character show`.
+
+Presets keep only their fork filters (`kj fork --preset full|window|spawn`).
+
+### Migration
+
+It runs once, in one transaction, and logs every value it drops, as `migrate_preset_cast_narrowing` does.
+
+1. Each character with a default cast gets a copy of that cast's slots. A cast shared by several characters is
+   copied to each.
+2. Each live context with a performer gets bindings from the old resolver, run once: what its next turn, its
+   judge and its gate would have used, override, context cast and `llm_defaults` included, with `max_tokens` as
+   the old code would have sent it (the 64000 floor written out). A live seat keeps its models across the
+   upgrade. A context the old resolver could not resolve gets no binding, and the migration lists it.
+3. Casts, slots, `llm_defaults` values and per-context overrides that no binding or character slot took are
+   logged by value, then dropped with their tables and columns.
+
+The migration never invents a model: step 2 records an answer the old code would have given.
+
+### Scripts and docs
+
+- `contrib/agent-dev/bootstrap.sh` sets the slots of each character it makes, for example `kj character slot set
+  banto director --backend anthropic --model claude-haiku-5-5`, and the coder character's `coder` slot. It
+  creates no cast. The council seed sets the `council` character's `council` slot.
+- `docs/character.md`, `docs/council.md` (its casts section: "mk bumps", "Jev bumps" become a character's `gate`
+  and `judge` slots), `docs/fork-and-create.md`, `docs/fork-filters.md`, `docs/prompts.md`, `docs/container.md`,
+  `docs/benchmarks.md` and the other docs that name casts move to slots. The council's "to give a seat another
+  cast" becomes "to give a seat another model, rotate it after setting the slot, or create it as another
+  character".
+
+### Tests (each falsified once)
+
+- Create binds the performer's slot for the type; fork and rotate bind fresh from the performer, not from the
+  source; a later slot change does not move a live context's binding.
+- A performer with no slot for the type: the create says the context has no model; a turn there refuses and
+  names the character, the type and the fix. A context with no performer has no binding.
+- A turn uses the binding's parameters, then `backend_models`. A bind with no `max_tokens` in either refuses;
+  an unset optional parameter (temperature, top_p, ...) is left out of the request.
+- The migration: a cast shared by two characters copies to both; a live context with an override keeps that model
+  in its binding; one resolved through `llm_defaults` keeps that model; an unresolvable one is listed and gets
+  none; dropped values are logged.
+- A seat binds its type, `judge` and `gate` slots at creation; the judge shadow and the gate use the seat's
+  bindings; a later slot change moves neither.
+- `kj context info` and `ContextHandleInfo` show the binding; the removed verbs and RPCs are gone (`kj cast` is
+  unknown).
+
+### Open for step 5
+
+- The `mcp` producer seat: an MCP session's context has a performer (the session's character) but runs no
+  kaijutsu model turns. With no `mcp` slot it binds nothing, and the create says it has no model, which is the
+  truth. If that line is noise for MCP seats, the create could stay quiet for a type with no model turns; that
+  needs a per-type flag, so we wait to see whether it is noise.
 
 ## Open (step 2)
 
