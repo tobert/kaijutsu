@@ -38,6 +38,8 @@ enum StreamFailure {
     Protocol(String),
     #[error("Could not deliver input to the running turn: {0}")]
     LiveInput(String),
+    #[error("Could not write the turn record: {0}")]
+    TurnRecord(String),
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +201,31 @@ fn warn_if_near_context_window(
 /// OpenAI-compatible providers (DeepSeek) count the hit inside `tokens_in`, so
 /// theirs are logged as `cache_hit`/`cache_miss`, which a reader must not add.
 /// The megakernel's `kept` (held prefix) and `fed` are inside `tokens_in` too.
+/// The provider's counts for one call, as reported. Cache reads and writes
+/// come from the provider-specific extra; nothing is added or subtracted
+/// (see [`crate::RawUsage`]).
+fn raw_usage(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    extra: &Option<crate::llm::UsageExtra>,
+) -> crate::RawUsage {
+    use crate::llm::UsageExtra;
+    let (cache_read, cache_write, reasoning) = match extra {
+        Some(UsageExtra::OpenAiCompat(d)) => (d.prompt_cache_hit_tokens, 0, d.reasoning_tokens),
+        Some(UsageExtra::Claude(c)) => (c.cache_read_input_tokens, c.cache_creation_input_tokens, 0),
+        // A held prefix is the megakernel's cache hit.
+        Some(UsageExtra::Mk(m)) => (m.kept, 0, 0),
+        None => (0, 0, 0),
+    };
+    crate::RawUsage {
+        input: input_tokens.unwrap_or(0),
+        output: output_tokens.unwrap_or(0),
+        cache_read,
+        cache_write,
+        reasoning,
+    }
+}
+
 fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
     use crate::llm::UsageExtra;
     match extra {
@@ -605,7 +632,7 @@ pub(super) async fn spawn_admitted_turn(
             }
         }
     };
-    let provider_resolution: Result<(Arc<Provider>, String, u64, SlotTunables, StreamTimeouts), String> = {
+    let provider_resolution: Result<(Arc<Provider>, String, u64, SlotTunables, StreamTimeouts, String, &'static str), String> = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
@@ -633,7 +660,8 @@ pub(super) async fn spawn_admitted_turn(
                         registry.backend_config(&resolved.backend),
                     );
                     let tunables = resolved.tunables_in(&registry);
-                    Ok((p, resolved.model, max_tokens, tunables, timeouts))
+                    let tier = resolved.source.tier();
+                    Ok((p, resolved.model, max_tokens, tunables, timeouts, resolved.backend, tier))
                 }
                 // A resolved backend must be registered; falling back would
                 // send the pinned model name to a different provider.
@@ -654,7 +682,7 @@ pub(super) async fn spawn_admitted_turn(
             ),
         }
     };
-    let (provider, model_name, max_output_tokens, tunables, stream_timeouts) = match provider_resolution {
+    let (provider, model_name, max_output_tokens, tunables, stream_timeouts, backend_name, model_tier) = match provider_resolution {
         Ok(v) => v,
         Err(detail) => {
             tracing::error!("LLM resolution failed for context {context_id}: {detail}");
@@ -747,15 +775,33 @@ pub(super) async fn spawn_admitted_turn(
     assert_eq!(turn_lease.context(), context_id, "turn lease belongs to its request");
     let interrupt = turn_lease.interrupt();
 
+    // The turn's durable record. A turn that cannot be recorded does not run.
+    let turn_id = turn_lease.id();
+    if let Err(error) = kernel_db.lock().begin_turn(&crate::TurnStart {
+        turn_id,
+        context_id,
+        performer: performer.principal_id,
+        cast: cast_label.clone(),
+        role: context_type.clone(),
+        provider: backend_name,
+        model: model_name.clone(),
+        model_source: model_tier.to_string(),
+        started_at: kaijutsu_types::now_millis() as i64,
+    }) {
+        tracing::error!("turn record for {turn_id} in {context_id} failed: {error}");
+        return Err(format!("Could not write the turn record: {error}. The turn was not started."));
+    }
+
     // Queue admission and this function's return must stay in the same poll.
     // Startup owns refusal; the queued stream owns its terminal event.
+    let record_db = kernel_db.clone();
     let accepted = kernel.spawn_runtime_task(move |stop| async move {
         let cancel = interrupt.clone();
         let run = process_llm_stream(
             provider, documents, context_id, model_name, kernel_arc, kernel_db,
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts,
             tunables, conversation_cache, user_principal_id,
-            Some(TurnSpanIdentity { performer, reviewer, review_source: review.source }),
+            Some(TurnProvenance { performer, reviewer, review_source: review.source }),
             tool_ctx, interrupt, turn_lease, origin,
             continuation_epoch,
         );
@@ -767,6 +813,11 @@ pub(super) async fn spawn_admitted_turn(
         }
     });
     if let Err(error) = accepted {
+        if let Err(record) = record_db.lock().finish_turn(
+            turn_id, kaijutsu_types::now_millis() as i64, "not_started",
+        ) {
+            tracing::error!("turn record for {turn_id} could not be closed: {record}");
+        }
         return Err(error);
     }
 
@@ -2226,8 +2277,12 @@ impl Drop for TurnUsageOnSpan {
 /// facts the `TurnEvents` wire push carries, so a trace and a subscriber tell the
 /// same story. Turn/LLM spans are 100%-sampled (`docs/telemetry.md`), so these
 /// land on every turn.
+///
+/// A turn run with a `TurnProvenance` has a `turns` row (written by
+/// `spawn_admitted_turn`); the stream adds each call's spend to it and
+/// `process_llm_stream` closes it. A turn run without one has no row.
 #[derive(Debug, Clone)]
-struct TurnSpanIdentity {
+struct TurnProvenance {
     performer: crate::CharacterIdentity,
     reviewer: crate::CharacterIdentity,
     review_source: crate::approval_identity::ReviewSource,
@@ -2304,7 +2359,7 @@ async fn process_llm_stream(
     // Resolved once when the turn begins. Tool calls receive IDs in their
     // CallContext, but character names belong on the turn span only: no
     // per-tool character database reads.
-    span_identity: Option<TurnSpanIdentity>,
+    provenance: Option<TurnProvenance>,
     tool_ctx: crate::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     turn_lease: TurnLease,
@@ -2316,6 +2371,7 @@ async fn process_llm_stream(
     continuation_epoch: Option<i64>,
 ) {
     let turn_id = turn_lease.id();
+    let records_turn = provenance.is_some();
     let panic_anchor = after_block_id.clone();
     // The mailbox lock keeps conversation exclusion through terminal publication.
     // The lease releases liveness first so observers see that this turn ended.
@@ -2339,7 +2395,7 @@ async fn process_llm_stream(
         let outcome = std::panic::AssertUnwindSafe(Box::pin(run_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, tunables,
-            conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
+            conversation_cache, user_principal_id, provenance, tool_ctx, interrupt, origin,
             continuation_epoch, &mut *mailbox, &turn_lease,
         ))).catch_unwind().await;
         let pending = kernel.turns().close_ingress(context_id, turn_id);
@@ -2378,13 +2434,23 @@ async fn process_llm_stream(
                     Some(format!("Model turn ended with {count} unfinished block(s); they were marked Error.")),
                 _ => None,
             };
-            let needs_diagnostic = stream_failure || cleanup_error.is_some();
+            let mut needs_diagnostic = stream_failure || cleanup_error.is_some();
             if let Some(mut error) = cleanup_error {
                 if let TurnFlow::Failed { error: original, .. } = &event {
                     error = format!("{original}; {error}");
                 }
                 tracing::error!(%context_id, %error);
                 event = TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id, error, origin };
+            }
+            // Close the turn's record with how it ended. A write that fails
+            // turns the ending into a failure that says so.
+            if records_turn && let Some(mut error) = finish_turn_record(&kernel_db, &event) {
+                if let TurnFlow::Failed { error: original, .. } = &event {
+                    error = format!("{original}; {error}");
+                }
+                tracing::error!(%context_id, %error);
+                event = TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id, error, origin };
+                needs_diagnostic = true;
             }
             // Do not re-enter a document whose cleanup failed. Terminal
             // publication remains possible when its journal is unavailable.
@@ -2420,6 +2486,9 @@ async fn process_llm_stream(
             let event = TurnFlow::Failed {
                 turn_id, context_id, principal_id: user_principal_id, error: error.into(), origin,
             };
+            if records_turn && let Some(record) = finish_turn_record(&kernel_db, &event) {
+                tracing::error!(%context_id, "{record}");
+            }
             if can_record_diagnostic && let Some(mailbox) = mailbox.as_deref()
                 && std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
                     record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event))).is_err() {
@@ -2430,6 +2499,20 @@ async fn process_llm_stream(
             std::panic::resume_unwind(panic);
         }
     }
+}
+
+/// Close the turn's `turns` row with how `event` ended it. Returns the
+/// message of a failed write, for the caller to turn into the turn's failure.
+fn finish_turn_record(kernel_db: &parking_lot::Mutex<KernelDb>, event: &TurnFlow) -> Option<String> {
+    let (turn_id, stop_reason) = match event {
+        TurnFlow::Completed { turn_id, reason, .. } => (*turn_id, reason.as_str()),
+        TurnFlow::Failed { turn_id, .. } => (*turn_id, "failed"),
+        _ => unreachable!("only terminal events close a turn"),
+    };
+    kernel_db.lock()
+        .finish_turn(turn_id, kaijutsu_types::now_millis() as i64, stop_reason)
+        .err()
+        .map(|error| format!("Could not write the turn record: {error}"))
 }
 
 /// The notice a turn that ended without a complete reply leaves for the
@@ -2504,7 +2587,7 @@ async fn run_llm_stream(
     // Resolved once when the turn begins. Tool calls receive IDs in their
     // CallContext, but character names belong on the turn span only: no
     // per-tool character database reads.
-    span_identity: Option<TurnSpanIdentity>,
+    provenance: Option<TurnProvenance>,
     tool_ctx: crate::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     // Who asked for the turn (see `spawn_llm_for_prompt`). Rides onto every
@@ -2517,7 +2600,10 @@ async fn run_llm_stream(
     turn_lease: &TurnLease,
 ) -> Result<TurnFlow, StreamFailure> {
     let turn_id = turn_lease.id();
-    if let Some(identity) = span_identity {
+    // A turn started by `spawn_admitted_turn` has a `turns` row; the
+    // calls it makes are added to it.
+    let records_turn = provenance.is_some();
+    if let Some(identity) = provenance {
         let span = tracing::Span::current();
         span.record("actor.id", tracing::field::display(identity.performer.principal_id));
         span.record("reviewer.id", tracing::field::display(identity.reviewer.principal_id));
@@ -3147,24 +3233,20 @@ async fn run_llm_stream(
                     output_tokens,
                     extra,
                 } => {
-                    // Map the provider-specific usage extra into the shared
-                    // TokenCounts shape. DeepSeek reports an automatic-cache
-                    // hit/miss split + reasoning tokens; Anthropic reports
-                    // cache read/creation. Unknown / absent → zeros.
+                    // DeepSeek reports an automatic-cache hit/miss split and
+                    // reasoning tokens; Anthropic reports cache read/creation.
+                    // Absent extra means zeros.
                     use crate::llm::UsageExtra;
-                    let (cache_read, cache_write, reasoning) = match &extra {
-                        Some(UsageExtra::OpenAiCompat(d)) => {
-                            (d.prompt_cache_hit_tokens, 0, d.reasoning_tokens)
-                        }
-                        Some(UsageExtra::Claude(c)) => (
-                            c.cache_read_input_tokens,
-                            c.cache_creation_input_tokens,
-                            0,
-                        ),
-                        // A held prefix is the megakernel's cache hit.
-                        Some(UsageExtra::Mk(m)) => (m.kept, 0, 0),
-                        None => (0, 0, 0),
-                    };
+                    let raw = raw_usage(input_tokens, output_tokens, &extra);
+                    let (cache_read, cache_write, reasoning) = (raw.cache_read, raw.cache_write, raw.reasoning);
+
+                    // The turn's row sums every call's raw counts: each call
+                    // is spend. A call that reported no counts spent nothing
+                    // we know of. A write that fails fails the turn.
+                    if records_turn && !(input_tokens.is_none() && output_tokens.is_none()) {
+                        kernel_db.lock().add_turn_usage(turn_id, raw)
+                            .map_err(|error| StreamFailure::TurnRecord(error.to_string()))?;
+                    }
 
                     // The turn span gets this call's usage at turn exit, once
                     // (`TurnUsageOnSpan`); a later call replaces it.
@@ -6617,6 +6699,12 @@ mod usage_tests {
         .with_actor(actor, Some(reviewer));
 
         let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
+        // `Some` provenance means a started turn has a row to add counts to.
+        kernel_db.lock().begin_turn(&crate::TurnStart {
+            turn_id: turn_lease.id(), context_id: ctx, performer: actor, cast: None,
+            role: "default".into(), provider: "mock".into(), model: "mock-model".into(),
+            model_source: "default".into(), started_at: kaijutsu_types::now_millis() as i64,
+        }).unwrap();
         process_llm_stream(
             provider,
             documents.clone(),
@@ -6632,7 +6720,7 @@ mod usage_tests {
             SlotTunables::default(),
             conversation_cache,
             player,
-            Some(TurnSpanIdentity {
+            Some(TurnProvenance {
                 performer: crate::CharacterIdentity {
                     principal_id: actor,
                     name: "Coder".to_string(),
@@ -7860,6 +7948,149 @@ mod lifetime_tests {
             BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(reviewer)).unwrap();
         let call = crate::ExecContext::new(reviewer, context, "/", SessionId::new(), kernel.id());
         (kernel, context, after, call)
+    }
+
+    fn call_with(
+        stop: &str, input: u64, output: u64, extra: Option<crate::llm::UsageExtra>,
+    ) -> Vec<crate::llm::StreamEvent> {
+        vec![
+            crate::llm::StreamEvent::TextStart,
+            crate::llm::StreamEvent::TextDelta("words".into()),
+            crate::llm::StreamEvent::TextEnd,
+            crate::llm::StreamEvent::Done {
+                stop_reason: Some(stop.into()), input_tokens: Some(input), output_tokens: Some(output), extra,
+            },
+        ]
+    }
+
+    fn claude_extra(read: u64, write: u64) -> Option<crate::llm::UsageExtra> {
+        Some(crate::llm::UsageExtra::Claude(crate::llm::ClaudeUsageExtra {
+            cache_read_input_tokens: read, cache_creation_input_tokens: write,
+        }))
+    }
+
+    /// Run one turn through the production startup and wait for it to end.
+    async fn run_recorded_turn(
+        script: Vec<Vec<crate::llm::StreamEvent>>,
+    ) -> (Arc<Kernel>, ContextId, kaijutsu_types::TurnId) {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("unused").with_scripted_stream(script))).await;
+        let mut ended = kernel.turn_flows().subscribe("turn.*");
+        let lease = kernel.turns().begin(context);
+        let turn_id = lease.id();
+        spawn_admitted_turn(&kernel, context, None, &after, call.clone(), call.principal_id,
+            TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ended.recv().await.unwrap().payload {
+                    TurnFlow::Completed { .. } | TurnFlow::Failed { .. } => return,
+                    _ => {}
+                }
+            }
+        }).await.expect("the turn ends");
+        (kernel, context, turn_id)
+    }
+
+    /// Every turn leaves a row naming who performed it and what answered, and
+    /// the row sums the provider's RAW counts over all its calls. A Claude
+    /// call's `input` excludes its cache tokens, so the row's input stays the
+    /// provider's number while the `context_usage` gauge adds the cache back.
+    #[tokio::test]
+    async fn a_turn_records_provenance_and_the_summed_raw_claude_spend() {
+        let (kernel, context, turn_id) = run_recorded_turn(vec![
+            call_with("length", 10, 1024, claude_extra(1000, 200)),
+            call_with("end_turn", 20, 5, claude_extra(1200, 0)),
+        ]).await;
+        let db = kernel.kernel_db().lock();
+        let turn = db.get_turn(turn_id).unwrap().expect("the turn left a row");
+        let performer = db.get_context(context).unwrap().unwrap().played_by.unwrap();
+        assert_eq!(turn.start.context_id, context);
+        assert_eq!(turn.start.performer, performer);
+        assert_eq!(turn.start.role, "default");
+        assert_eq!((turn.start.provider.as_str(), turn.start.model.as_str()), ("mock", "mock-model"));
+        assert_eq!(turn.start.model_source, "default");
+        assert_eq!(turn.start.cast, None);
+        assert!(turn.ended_at.is_some_and(|ended| ended >= turn.start.started_at));
+        assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            (turn.llm_calls, turn.input_tokens, turn.output_tokens, turn.cache_read_tokens, turn.cache_write_tokens),
+            (2, 30, 1029, 2200, 200),
+        );
+        let gauge = db.get_context_usage(context).unwrap().unwrap();
+        assert_eq!(gauge.input_tokens, 20 + 1200, "the gauge is the last call, normalized");
+        assert_eq!(db.context_turn_totals(context).unwrap().input_tokens, 30);
+    }
+
+    /// DeepSeek reports `input` with its cache hits already inside it, so the
+    /// row keeps that number and records the hits beside it, uncounted twice.
+    #[tokio::test]
+    async fn a_turn_records_deepseek_input_as_reported() {
+        let extra = Some(crate::llm::UsageExtra::OpenAiCompat(crate::llm::OpenAiCompatUsageExtra {
+            prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 100, reasoning_tokens: 50,
+        }));
+        let (kernel, context, turn_id) = run_recorded_turn(vec![call_with("end_turn", 1100, 80, extra)]).await;
+        let db = kernel.kernel_db().lock();
+        let turn = db.get_turn(turn_id).unwrap().unwrap();
+        assert_eq!(
+            (turn.input_tokens, turn.output_tokens, turn.cache_read_tokens, turn.cache_write_tokens, turn.reasoning_tokens),
+            (1100, 80, 1000, 0, 50),
+        );
+        assert_eq!(db.get_context_usage(context).unwrap().unwrap().input_tokens, 1100);
+    }
+
+    #[test]
+    fn raw_usage_keeps_each_providers_own_input() {
+        use crate::llm::{ClaudeUsageExtra, OpenAiCompatUsageExtra, UsageExtra};
+        let claude = raw_usage(Some(10), Some(5), &Some(UsageExtra::Claude(ClaudeUsageExtra {
+            cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 })));
+        assert_eq!(claude, crate::RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, reasoning: 0 });
+        let deepseek = raw_usage(Some(1100), Some(5), &Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+            prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 100, reasoning_tokens: 7 })));
+        assert_eq!(deepseek, crate::RawUsage { input: 1100, output: 5, cache_read: 1000, cache_write: 0, reasoning: 7 });
+        assert_eq!(raw_usage(None, None, &None), crate::RawUsage::default());
+    }
+
+    /// A turn whose start cannot be recorded does not run: the refusal names
+    /// the record, and no provider call is made.
+    #[tokio::test]
+    async fn a_turn_whose_record_cannot_start_is_refused() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("unused").with_scripted_stream(vec![]))).await;
+        let lease = kernel.turns().begin(context);
+        let performer = kernel.kernel_db().lock().get_context(context).unwrap().unwrap().played_by.unwrap();
+        kernel.kernel_db().lock().begin_turn(&crate::TurnStart {
+            turn_id: lease.id(), context_id: context, performer, cast: None, role: "default".into(),
+            provider: "mock".into(), model: "mock-model".into(), model_source: "default".into(), started_at: 1,
+        }).unwrap();
+        let error = spawn_admitted_turn(&kernel, context, None, &after, call.clone(), call.principal_id,
+            TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap_err();
+        assert!(error.contains("turn record"), "{error}");
+        assert!(!kernel.turn_in_flight(context));
+    }
+
+    /// A count that cannot be written fails the turn and says why, where the
+    /// transcript and the failure event both carry it.
+    #[tokio::test]
+    async fn a_turn_whose_spend_cannot_be_recorded_fails_loudly() {
+        let (kernel, context, after, call) = fixture(Some(
+            MockClient::new("unused").with_scripted_stream(vec![call_with("end_turn", 10, 5, None)]))).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let mut failed = kernel.turn_flows().subscribe("turn.*");
+        let lease = kernel.turns().begin(context);
+        let turn_id = lease.id();
+        spawn_admitted_turn(&kernel, context, None, &after, call.clone(), call.principal_id,
+            TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap();
+        // The row is closed under the running turn, so its first count has nowhere to land.
+        kernel.kernel_db().lock().finish_turn(turn_id, 1, "end_turn").unwrap();
+        drop(held);
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let TurnFlow::Failed { error, .. } = failed.recv().await.unwrap().payload { return error; }
+            }
+        }).await.expect("the turn fails");
+        // The failed count and the failed close each say so.
+        assert_eq!(error.matches("turn record").count(), 2, "{error}");
+        assert!(kernel.blocks().block_snapshots(context).unwrap().iter()
+            .any(|b| b.status == Status::Error && b.content.contains("turn record")), "the transcript carries it");
     }
 
     #[tokio::test]

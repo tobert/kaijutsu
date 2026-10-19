@@ -51,6 +51,17 @@ pub enum ModelSource {
     RegistryDefault,
 }
 
+impl ModelSource {
+    /// The tier's stable name, as the `turns` table records it.
+    pub fn tier(&self) -> &'static str {
+        match self {
+            Self::ContextOverride => "context_override",
+            Self::CastSlot { .. } => "cast_slot",
+            Self::RegistryDefault => "default",
+        }
+    }
+}
+
 /// The resolved answer to "what model does this context play?"
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedContextModel {

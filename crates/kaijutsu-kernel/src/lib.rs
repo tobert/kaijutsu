@@ -188,8 +188,8 @@ pub use flows::{
 };
 pub use kernel_db::{
     ContextEdgeRow, ContextEnvRow, ContextRow, ContextShellRow, ContextUsageRow, DocSnapshotRow,
-    DocumentRow, KernelDb, KernelDbError, KernelDbResult, PresetRow, WorkspacePathRow,
-    WorkspaceRow, context_used_pct,
+    DocumentRow, KernelDb, KernelDbError, KernelDbResult, PresetRow, RawUsage, TurnRow, TurnStart,
+    TurnTotals, WorkspacePathRow, WorkspaceRow, context_used_pct,
 };
 pub use kj::{KjCaller, KjDispatcher, KjResult};
 

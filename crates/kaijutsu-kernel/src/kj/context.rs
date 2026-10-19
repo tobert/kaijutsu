@@ -82,6 +82,17 @@ enum ContextCommand {
         /// labels come from `kj context list`.
         context: Option<String>,
     },
+    /// List a context's model turns, newest first: who performed each, which
+    /// cast and model answered, how it ended, and the provider's token counts
+    /// (default: current).
+    Turns {
+        /// Context whose turns to list. Defaults to the current context.
+        /// Ids and labels come from `kj context list`.
+        context: Option<String>,
+        /// Show at most this many turns
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Show the system instructions and runtime facts used for this context's
     /// next model turn (default: current).
     // Mirrors `crate::llm::build_system_prompt` (llm_stream.rs's
@@ -604,6 +615,9 @@ impl KjDispatcher {
             ContextCommand::Info { context } => {
                 self.context_info(context.as_deref(), caller).await
             }
+            ContextCommand::Turns { context, limit } => {
+                self.context_turns(context.as_deref(), limit, caller)
+            }
             ContextCommand::Prompt { context } => {
                 self.context_prompt(context.as_deref(), caller).await
             }
@@ -696,6 +710,7 @@ impl KjDispatcher {
             env_vars,
             egress_hosts,
             usage,
+            turn_totals,
             workspace_paths,
             workspace_label,
             cast_label,
@@ -756,6 +771,13 @@ impl KjDispatcher {
             // completed a call — shown as absence, never a fabricated zero.
             let usage = db.get_context_usage(target_id).ok().flatten();
 
+            // Spend: the provider's raw counts summed over every turn. A
+            // failed read is an error, never zero.
+            let turn_totals = match db.context_turn_totals(target_id) {
+                Ok(totals) => totals,
+                Err(e) => return KjResult::Err(format!("kj context info: turn totals: {e}")),
+            };
+
             // Workspace paths
             let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
             let workspace_label = row
@@ -787,6 +809,7 @@ impl KjDispatcher {
                 env_vars,
                 egress_hosts,
                 usage,
+                turn_totals,
                 workspace_paths,
                 workspace_label,
                 cast_label,
@@ -919,6 +942,17 @@ impl KjDispatcher {
             }
         }
 
+        info.push_str(&format!(
+            "\nTurns:   {} ({} calls): {} in, {} out, cache read {}, write {}, reasoning {}",
+            turn_totals.turns,
+            turn_totals.llm_calls,
+            turn_totals.input_tokens,
+            turn_totals.output_tokens,
+            turn_totals.cache_read_tokens,
+            turn_totals.cache_write_tokens,
+            turn_totals.reasoning_tokens,
+        ));
+
         if let Some(paths) = workspace_paths.as_ref().filter(|p| !p.is_empty()) {
             let ws_label = workspace_label.clone().unwrap_or_else(|| "?".into());
             info.push_str(&format!("\nWorkspace: {ws_label}"));
@@ -1028,6 +1062,15 @@ impl KjDispatcher {
                 "context_used_pct": context_used_pct,
             })),
         });
+        record["turns"] = serde_json::json!({
+            "turns": turn_totals.turns,
+            "llm_calls": turn_totals.llm_calls,
+            "input_tokens": turn_totals.input_tokens,
+            "output_tokens": turn_totals.output_tokens,
+            "cache_read_tokens": turn_totals.cache_read_tokens,
+            "cache_write_tokens": turn_totals.cache_write_tokens,
+            "reasoning_tokens": turn_totals.reasoning_tokens,
+        });
         record["reviewer_id"] = serde_json::json!(effective_review.as_ref().map(|review| review.reviewer.principal_id.to_hex()));
         record["reviewer_name"] = serde_json::json!(reviewer_name);
         record["review_source"] = serde_json::json!(effective_review.as_ref().map(|review| review.source.as_str()));
@@ -1035,6 +1078,69 @@ impl KjDispatcher {
         record["senpai_ctx"] = serde_json::json!(row.senpai_ctx.map(|id| id.to_hex()));
 
         KjResult::ok_with_data(info, record)
+    }
+
+    /// `kj context turns`: a context's recorded model turns, newest first.
+    fn context_turns(&self, context: Option<&str>, limit: usize, caller: &KjCaller) -> KjResult {
+        let db = self.kernel_db().lock();
+        let target_id = match super::refs::resolve_context_arg(context, caller, &db) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj context turns: {e}")),
+        };
+        let turns = match db.list_turns(target_id, limit) {
+            Ok(turns) => turns,
+            Err(e) => return KjResult::Err(format!("kj context turns: {e}")),
+        };
+        let names = |principal: kaijutsu_types::PrincipalId| {
+            db.get_character(principal).ok().flatten().map(|c| c.name).unwrap_or_else(|| principal.short())
+        };
+        let mut text = String::new();
+        let mut records = Vec::new();
+        for turn in &turns {
+            let start = &turn.start;
+            let performer = names(start.performer);
+            let ended = turn.stop_reason.as_deref().unwrap_or("running");
+            text.push_str(&format!(
+                "{} {} {performer} {}/{} ({}, cast {}, role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}\n",
+                start.turn_id.short(),
+                start.started_at,
+                start.provider,
+                start.model,
+                start.model_source,
+                start.cast.as_deref().unwrap_or("-"),
+                start.role,
+                turn.llm_calls,
+                turn.input_tokens,
+                turn.output_tokens,
+                turn.cache_read_tokens,
+                turn.cache_write_tokens,
+                turn.reasoning_tokens,
+            ));
+            records.push(serde_json::json!({
+                "turn_id": start.turn_id.to_hex(),
+                "context_id": start.context_id.to_hex(),
+                "performer": start.performer.to_hex(),
+                "performer_name": performer,
+                "cast": start.cast,
+                "role": start.role,
+                "provider": start.provider,
+                "model": start.model,
+                "model_source": start.model_source,
+                "started_at": start.started_at,
+                "ended_at": turn.ended_at,
+                "stop_reason": turn.stop_reason,
+                "llm_calls": turn.llm_calls,
+                "input_tokens": turn.input_tokens,
+                "output_tokens": turn.output_tokens,
+                "cache_read_tokens": turn.cache_read_tokens,
+                "cache_write_tokens": turn.cache_write_tokens,
+                "reasoning_tokens": turn.reasoning_tokens,
+            }));
+        }
+        if turns.is_empty() {
+            text.push_str("no turns recorded\n");
+        }
+        KjResult::ok_with_data(text.trim_end().to_string(), serde_json::Value::Array(records))
     }
 
     /// Render the system prompt this context actually gets: the exact
@@ -2667,6 +2773,7 @@ impl Classify for ContextCommand {
         match self {
             Self::List { .. }
             | Self::Info { .. }
+            | Self::Turns { .. }
             | Self::Prompt { .. }
             | Self::Current
             | Self::Log { .. } => Effect::Read,
@@ -5691,6 +5798,54 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    fn record_turn(d: &crate::kj::KjDispatcher, ctx: kaijutsu_types::ContextId, input: u64, at: i64) -> kaijutsu_types::TurnId {
+        let db = d.kernel_db().lock();
+        let turn_id = kaijutsu_types::TurnId::new();
+        db.begin_turn(&crate::TurnStart {
+            turn_id, context_id: ctx, performer: PrincipalId::new(), cast: Some("house".into()),
+            role: "coder".into(), provider: "deepseek".into(), model: "deepseek-flash".into(),
+            model_source: "cast_slot".into(), started_at: at,
+        }).unwrap();
+        db.add_turn_usage(turn_id, crate::RawUsage { input, output: 3, cache_read: 7, cache_write: 0, reasoning: 1 }).unwrap();
+        db.finish_turn(turn_id, at + 5, "end_turn").unwrap();
+        turn_id
+    }
+
+    /// `kj context info` totals the context's turns, and `kj context turns`
+    /// lists them newest first with the cast, model and tier that answered.
+    #[tokio::test]
+    async fn context_info_totals_turns_and_turns_lists_them() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("spender"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let none = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(none.message().contains("\nTurns:   0"), "{}", none.message());
+
+        let first = record_turn(&d, ctx, 100, 1_000);
+        let second = record_turn(&d, ctx, 250, 2_000);
+        let info = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(info.message().contains("\nTurns:   2 (2 calls): 350 in, 6 out, cache read 14, write 0, reasoning 2"),
+            "{}", info.message());
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info carries a record") };
+        assert_eq!(data["turns"]["turns"], 2);
+        assert_eq!(data["turns"]["input_tokens"], 350);
+
+        let listed = d.dispatch(&[s("context"), s("turns")], &c).await;
+        assert!(listed.is_ok(), "{}", listed.message());
+        let msg = listed.message();
+        assert!(msg.find(&second.short()).unwrap() < msg.find(&first.short()).unwrap(), "newest first: {msg}");
+        assert!(msg.contains("house") && msg.contains("deepseek/deepseek-flash") && msg.contains("cast_slot")
+            && msg.contains("end_turn"), "{msg}");
+        let KjResult::Ok { data: Some(data), .. } = &listed else { panic!("turns carries a record") };
+        assert_eq!(data.as_array().unwrap().len(), 2);
+        assert_eq!(data[0]["turn_id"], second.to_hex());
+
+        let one = d.dispatch(&[s("context"), s("turns"), s("--limit"), s("1")], &c).await;
+        let KjResult::Ok { data: Some(data), .. } = &one else { panic!("turns carries a record") };
+        assert_eq!(data.as_array().unwrap().len(), 1);
     }
 
     /// `kj context info --json`'s `usage` field is the token-usage gauge's

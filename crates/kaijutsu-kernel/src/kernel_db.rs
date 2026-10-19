@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use kaijutsu_types::{
     BackendId, BlockId, CastId, ContextId, ContextState, DocKind, ForkKind,
-    KernelId, PresetId, PrincipalId, WorkspaceId,
+    KernelId, PresetId, PrincipalId, TurnId, WorkspaceId,
 };
 
 use crate::llm::stream::{CacheTarget, CacheTtl};
@@ -568,6 +568,71 @@ impl ContextUsageRow {
     }
 }
 
+/// What one model turn is, recorded when it starts. The turn id is the
+/// `TurnId` the runtime minted; every other field is what the resolver and the
+/// identity check decided for this turn. See the `turns` table in `SCHEMA`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStart {
+    pub turn_id: TurnId,
+    pub context_id: ContextId,
+    /// The character that performed the turn.
+    pub performer: PrincipalId,
+    /// Label of the cast whose slot answered; `None` when no cast did.
+    pub cast: Option<String>,
+    /// The context type the cast slot was matched on.
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    /// Which resolver tier answered (`ModelSource::tier`).
+    pub model_source: String,
+    /// Unix milliseconds.
+    pub started_at: i64,
+}
+
+/// Token counts exactly as the provider reported them for one call. Nothing is
+/// normalized: Claude's `input` excludes `cache_read` and `cache_write`;
+/// DeepSeek's and the other OpenAI-compatible providers' `input` already
+/// includes `cache_read`. Sums stay honest per provider; compare across
+/// providers only through the cache columns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RawUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
+}
+
+/// One row of `turns`: a turn's start facts, its end, and the provider's raw
+/// token counts summed over every call the turn made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRow {
+    pub start: TurnStart,
+    /// `None` while the turn runs, and for a turn the kernel stopped before
+    /// it could write its end.
+    pub ended_at: Option<i64>,
+    pub stop_reason: Option<String>,
+    /// Provider calls the turn made (one per `Done` it received).
+    pub llm_calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+}
+
+/// A context's turns, summed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnTotals {
+    pub turns: i64,
+    pub llm_calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+}
+
 /// How full a context is, as a percentage of `window` (0-100+, never
 /// clamped), computed from the LAST completed call's fill
 /// (`usage.total_tokens()`) — not a running total across turns. `None`
@@ -968,6 +1033,39 @@ CREATE TABLE IF NOT EXISTS context_usage (
     cache_ttl_secs     INTEGER NOT NULL DEFAULT 0,
     updated_at         INTEGER NOT NULL
 );
+
+-- ── Turns (per-turn provenance and spend) ────────────────────────
+-- One row per model turn, keyed on the `TurnId` the runtime minted. The row
+-- is written when the turn starts and finished when it ends; `ended_at` NULL
+-- means the turn is running or the kernel stopped before it could say. It
+-- names who performed the turn, under which cast and role, and which
+-- provider and model answered through which resolver tier. The token columns
+-- are the provider's RAW counts summed over every call in the turn, so they
+-- are spend: Claude's `input_tokens` excludes the cache columns, DeepSeek's
+-- already includes `cache_read_tokens`. `context_usage` stays the last-call
+-- fill gauge and normalizes `input_tokens`; the two never mix. History is
+-- retained: no ON DELETE action on `context_id`, and `performer` and
+-- `cast_label` are names as the turn saw them, with no foreign key.
+CREATE TABLE IF NOT EXISTS turns (
+    turn_id            BLOB    NOT NULL PRIMARY KEY,
+    context_id         BLOB    NOT NULL REFERENCES contexts(context_id),
+    performer          BLOB    NOT NULL,
+    cast_label         TEXT,
+    role               TEXT    NOT NULL,
+    provider           TEXT    NOT NULL,
+    model              TEXT    NOT NULL,
+    model_source       TEXT    NOT NULL,
+    started_at         INTEGER NOT NULL,
+    ended_at           INTEGER,
+    stop_reason        TEXT,
+    llm_calls          INTEGER NOT NULL DEFAULT 0,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_turns_context ON turns(context_id, started_at);
 
 -- ── Context Tool Bindings (Phase 5, D-54) ───────────────────────
 -- Per-context capability allow-set + sticky name resolution, persisted so the
@@ -5958,6 +6056,152 @@ impl KernelDb {
             })
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    // ========================================================================
+    // Turns (per-turn provenance and spend)
+    // ========================================================================
+
+    /// Write the row for a turn that is starting. The turn id is unique: a
+    /// second start for the same id fails.
+    pub fn begin_turn(&self, turn: &TurnStart) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO turns (
+                turn_id, context_id, performer, cast_label, role,
+                provider, model, model_source, started_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                blob_param(turn.turn_id.as_bytes()),
+                blob_param(turn.context_id.as_bytes()),
+                blob_param(turn.performer.as_bytes()),
+                turn.cast,
+                turn.role,
+                turn.provider,
+                turn.model,
+                turn.model_source,
+                turn.started_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Add one provider call's raw counts to its turn. Fails when the turn has
+    /// no row or has already ended: a count that cannot be recorded is an error.
+    pub fn add_turn_usage(&self, turn_id: TurnId, usage: RawUsage) -> KernelDbResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE turns SET
+                llm_calls = llm_calls + 1,
+                input_tokens = input_tokens + ?2,
+                output_tokens = output_tokens + ?3,
+                cache_read_tokens = cache_read_tokens + ?4,
+                cache_write_tokens = cache_write_tokens + ?5,
+                reasoning_tokens = reasoning_tokens + ?6
+             WHERE turn_id = ?1 AND ended_at IS NULL",
+            params![
+                blob_param(turn_id.as_bytes()),
+                usage.input as i64,
+                usage.output as i64,
+                usage.cache_read as i64,
+                usage.cache_write as i64,
+                usage.reasoning as i64,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(KernelDbError::NotFound(format!("running turn {turn_id}")));
+        }
+        Ok(())
+    }
+
+    /// Close a turn with how it ended. Fails when the turn has no row or has
+    /// already ended.
+    pub fn finish_turn(&self, turn_id: TurnId, ended_at: i64, stop_reason: &str) -> KernelDbResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE turns SET ended_at = ?2, stop_reason = ?3
+             WHERE turn_id = ?1 AND ended_at IS NULL",
+            params![blob_param(turn_id.as_bytes()), ended_at, stop_reason],
+        )?;
+        if changed == 0 {
+            return Err(KernelDbError::NotFound(format!("running turn {turn_id}")));
+        }
+        Ok(())
+    }
+
+    const TURN_COLUMNS: &'static str = "turn_id, context_id, performer, cast_label, role, provider, model,
+        model_source, started_at, ended_at, stop_reason, llm_calls, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens, reasoning_tokens";
+
+    fn read_turn_row(row: &rusqlite::Row<'_>) -> SqliteResult<TurnRow> {
+        let turn_bytes: Vec<u8> = row.get(0)?;
+        let turn_id = TurnId::try_from_slice(&turn_bytes).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0, rusqlite::types::Type::Blob, "invalid TurnId bytes".into())
+        })?;
+        Ok(TurnRow {
+            start: TurnStart {
+                turn_id,
+                context_id: read_context_id(row, 1)?,
+                performer: read_principal_id(row, 2)?,
+                cast: row.get(3)?,
+                role: row.get(4)?,
+                provider: row.get(5)?,
+                model: row.get(6)?,
+                model_source: row.get(7)?,
+                started_at: row.get(8)?,
+            },
+            ended_at: row.get(9)?,
+            stop_reason: row.get(10)?,
+            llm_calls: row.get(11)?,
+            input_tokens: row.get(12)?,
+            output_tokens: row.get(13)?,
+            cache_read_tokens: row.get(14)?,
+            cache_write_tokens: row.get(15)?,
+            reasoning_tokens: row.get(16)?,
+        })
+    }
+
+    /// One turn, or `None` when no such turn was recorded.
+    pub fn get_turn(&self, turn_id: TurnId) -> KernelDbResult<Option<TurnRow>> {
+        let sql = format!("SELECT {} FROM turns WHERE turn_id = ?1", Self::TURN_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(params![blob_param(turn_id.as_bytes())], Self::read_turn_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A context's most recent turns, newest first.
+    pub fn list_turns(&self, context_id: ContextId, limit: usize) -> KernelDbResult<Vec<TurnRow>> {
+        let sql = format!(
+            "SELECT {} FROM turns WHERE context_id = ?1 ORDER BY started_at DESC, turn_id DESC LIMIT ?2",
+            Self::TURN_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![blob_param(context_id.as_bytes()), limit as i64],
+            Self::read_turn_row,
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Every turn of a context, summed. All zero for a context that never ran one.
+    pub fn context_turn_totals(&self, context_id: ContextId) -> KernelDbResult<TurnTotals> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(llm_calls), 0), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(reasoning_tokens), 0)
+             FROM turns WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+            |row| Ok(TurnTotals {
+                turns: row.get(0)?,
+                llm_calls: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_write_tokens: row.get(5)?,
+                reasoning_tokens: row.get(6)?,
+            }),
+        )?)
     }
 
     // ========================================================================
@@ -12769,6 +13013,90 @@ mod tests {
         let ctx = make_context_row(Some("usage-absent"));
         insert_context_with_doc(&db, &ctx, ws_id);
         assert!(db.get_context_usage(ctx.context_id).unwrap().is_none());
+    }
+
+    fn turn_start(ctx: ContextId) -> TurnStart {
+        TurnStart {
+            turn_id: TurnId::new(),
+            context_id: ctx,
+            performer: PrincipalId::new(),
+            cast: Some("house".into()),
+            role: "coder".into(),
+            provider: "anthropic".into(),
+            model: "claude-haiku-5-5".into(),
+            model_source: "cast_slot".into(),
+            started_at: 1_000,
+        }
+    }
+
+    /// A turn's row keeps what it started with, and each provider call adds
+    /// its raw counts: the second call does not replace the first, unlike the
+    /// `context_usage` gauge.
+    #[test]
+    fn turn_usage_sums_every_call_and_finish_closes_the_row() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("turn-sum"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        let start = turn_start(ctx.context_id);
+        db.begin_turn(&start).unwrap();
+        db.add_turn_usage(start.turn_id, RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, reasoning: 0 }).unwrap();
+        db.add_turn_usage(start.turn_id, RawUsage { input: 20, output: 7, cache_read: 1200, cache_write: 0, reasoning: 3 }).unwrap();
+        let running = db.get_turn(start.turn_id).unwrap().unwrap();
+        assert_eq!(running.start, start);
+        assert_eq!((running.ended_at, running.stop_reason.clone()), (None, None));
+        db.finish_turn(start.turn_id, 2_000, "end_turn").unwrap();
+
+        let done = db.get_turn(start.turn_id).unwrap().unwrap();
+        assert_eq!((done.ended_at, done.stop_reason.as_deref()), (Some(2_000), Some("end_turn")));
+        assert_eq!(
+            (done.llm_calls, done.input_tokens, done.output_tokens, done.cache_read_tokens,
+             done.cache_write_tokens, done.reasoning_tokens),
+            (2, 30, 12, 2200, 200, 3),
+        );
+    }
+
+    /// A count or an end with nowhere to land is an error, not a no-op: the
+    /// turn has no row, or the turn already ended.
+    #[test]
+    fn turn_writes_fail_loudly_without_a_running_row() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("turn-loud"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        let missing = TurnId::new();
+        assert!(matches!(db.add_turn_usage(missing, RawUsage::default()), Err(KernelDbError::NotFound(_))));
+        assert!(matches!(db.finish_turn(missing, 1, "end_turn"), Err(KernelDbError::NotFound(_))));
+
+        let start = turn_start(ctx.context_id);
+        db.begin_turn(&start).unwrap();
+        assert!(db.begin_turn(&start).is_err(), "a turn id starts once");
+        db.finish_turn(start.turn_id, 2_000, "end_turn").unwrap();
+        assert!(matches!(db.finish_turn(start.turn_id, 3_000, "failed"), Err(KernelDbError::NotFound(_))));
+        assert!(matches!(db.add_turn_usage(start.turn_id, RawUsage::default()), Err(KernelDbError::NotFound(_))));
+        assert_eq!(db.get_turn(start.turn_id).unwrap().unwrap().ended_at, Some(2_000));
+    }
+
+    #[test]
+    fn context_turn_totals_sum_the_context_s_turns_only() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ours = make_context_row(Some("turn-ours"));
+        let theirs = make_context_row(Some("turn-theirs"));
+        insert_context_with_doc(&db, &ours, ws_id);
+        insert_context_with_doc(&db, &theirs, ws_id);
+        assert_eq!(db.context_turn_totals(ours.context_id).unwrap(), TurnTotals::default());
+        for (ctx, input) in [(ours.context_id, 10), (ours.context_id, 32), (theirs.context_id, 999)] {
+            let mut start = turn_start(ctx);
+            start.started_at += input as i64;
+            db.begin_turn(&start).unwrap();
+            db.add_turn_usage(start.turn_id, RawUsage { input, output: 1, ..Default::default() }).unwrap();
+        }
+        let totals = db.context_turn_totals(ours.context_id).unwrap();
+        assert_eq!((totals.turns, totals.llm_calls, totals.input_tokens, totals.output_tokens), (2, 2, 42, 2));
+        let listed = db.list_turns(ours.context_id, 10).unwrap();
+        assert_eq!(listed.iter().map(|t| t.input_tokens).collect::<Vec<_>>(), vec![32, 10], "newest first");
+        assert_eq!(db.list_turns(ours.context_id, 1).unwrap().len(), 1);
     }
 
     #[test]
