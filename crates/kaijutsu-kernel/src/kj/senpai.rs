@@ -42,6 +42,15 @@ enum SenpaiCommand {
         /// The context it answers to from now on.
         senpai: String,
     },
+    /// Send a report to this context's senpai: the text lands in the
+    /// senpai's log as a drift block from this context, as `kj drift push`
+    /// would put it there, with no context id to type. A drift along the
+    /// senpai edge needs no ask. Refuses a context with no senpai.
+    Report {
+        /// The report (joined with spaces).
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -95,7 +104,7 @@ impl Classify for SenpaiArgs {
     fn effect(&self) -> Effect {
         match self.command {
             SenpaiCommand::Show { .. } => Effect::Read,
-            SenpaiCommand::Set { .. } => Effect::Write,
+            SenpaiCommand::Set { .. } | SenpaiCommand::Report { .. } => Effect::Write,
         }
     }
 }
@@ -151,6 +160,12 @@ impl KjDispatcher {
                     return denied;
                 }
                 self.senpai_set(&context, &senpai, caller)
+            }
+            SenpaiCommand::Report { text } => {
+                if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drift, "senpai report") {
+                    return denied;
+                }
+                self.senpai_report(&text, caller).await
             }
         }
     }
@@ -266,6 +281,40 @@ impl KjDispatcher {
                 serde_json::json!({ "context": context_json(&row), "senpai": context_json(&senpai) }),
             ),
             Err(e) => KjResult::Err(format!("kj senpai set: {e}")),
+        }
+    }
+
+    /// `kj senpai report <text>...`: `kj drift push` to the caller's senpai,
+    /// by id, so the report can only reach the context this one answers to.
+    async fn senpai_report(&self, text: &[String], caller: &KjCaller) -> KjResult {
+        let here = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let senpai = {
+            let db = self.kernel_db().lock();
+            let found = (|| -> Result<ContextRow, String> {
+                let row = db.get_context(here).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("context {} not found", here.short()))?;
+                let senpai = row.senpai_ctx.ok_or_else(|| {
+                    format!("{} has no senpai, so there is nobody to report to", display(&row))
+                })?;
+                db.get_context(senpai).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai context {} has no row", senpai.short()))
+            })();
+            match found {
+                Ok(senpai) => senpai,
+                Err(e) => return KjResult::Err(format!("kj senpai report: {e}")),
+            }
+        };
+        let pushed = self.drift_push(&senpai.context_id.to_hex(), false, false, text, caller).await;
+        match pushed {
+            KjResult::Ok { .. } => KjResult::ok_with_data(
+                format!("reported → {}", display(&senpai)),
+                serde_json::json!({ "senpai": context_json(&senpai) }),
+            ),
+            KjResult::Err(e) => KjResult::Err(e.replacen("kj drift push", "kj senpai report", 1)),
+            other => other,
         }
     }
 
@@ -524,6 +573,44 @@ mod tests {
         assert!(own.is_ok(), "banto holds banto-seat: {}", own.message());
         let row = d.kernel_db().lock().find_context_by_label("by-holder").unwrap().unwrap();
         assert_eq!((row.senpai_ctx, row.forked_from), (Some(h.seat), Some(h.lane)));
+    }
+
+    /// `kj senpai report` lands the text in the senpai's log as a drift
+    /// block from the reporting context, with no context id to type. A
+    /// context with no senpai, an archived senpai and an empty report are
+    /// refused, and nothing lands.
+    #[tokio::test]
+    async fn senpai_report_drifts_the_text_to_the_senpai_and_needs_no_id() {
+        let d = test_dispatcher().await;
+        let h = house(&d);
+        for ctx in [h.root, h.seat, h.lane] {
+            d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        }
+        let drifts = |ctx: ContextId| -> Vec<kaijutsu_types::BlockSnapshot> {
+            d.block_store().block_snapshots(ctx).unwrap().into_iter()
+                .filter(|b| b.kind == kaijutsu_types::BlockKind::Drift).collect()
+        };
+        let reported = d.dispatch(&[s("senpai"), s("report"), s("the tests pass;"), s("ready for review")], &caller(h.coder, h.lane)).await;
+        assert!(reported.is_ok(), "{}", reported.message());
+        assert!(reported.message().contains("banto-seat"), "{}", reported.message());
+        let landed = drifts(h.seat);
+        assert_eq!(landed.len(), 1, "{landed:?}");
+        assert!(landed[0].content.contains("the tests pass; ready for review"), "{}", landed[0].content);
+        assert_eq!(landed[0].source_context, Some(h.lane), "the report is from the kohai");
+        assert!(drifts(h.root).is_empty() && drifts(h.lane).is_empty(), "only the senpai's log gets it");
+
+        let top = d.dispatch(&[s("senpai"), s("report"), s("hello?")], &caller(h.amy, h.root)).await;
+        assert!(!top.is_ok());
+        assert!(top.message().contains("has no senpai"), "{}", top.message());
+
+        let empty = d.dispatch(&[s("senpai"), s("report")], &caller(h.coder, h.lane)).await;
+        assert!(!empty.is_ok(), "{}", empty.message());
+
+        d.kernel_db().lock().archive_context(h.seat).unwrap();
+        let archived = d.dispatch(&[s("senpai"), s("report"), s("still there?")], &caller(h.coder, h.lane)).await;
+        assert!(!archived.is_ok());
+        assert!(archived.message().contains("archived"), "{}", archived.message());
+        assert_eq!(drifts(h.seat).len(), 1, "a refused report lands nothing");
     }
 
     /// A new context answers to its creator, so a caller with no character

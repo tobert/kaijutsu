@@ -3515,6 +3515,7 @@ mod tests {
         let d = test_dispatcher().await;
         let house = character_house(&d);
         let lane = crate::kj::KjCaller { context_id: Some(house.lane_a), ..house.banto.clone() };
+        let root = crate::kj::KjCaller { context_id: Some(house.root), actor_id: house.banto.principal_id, ..house.banto.clone() };
         let cases: &[(&crate::kj::KjCaller, &str, crate::kj::gate::GateVerdict)] = &[
             (&lane, "kj drift push banto-seat 'done with the first part'", Allowed),
             (&house.banto, "kj drift push lane-a 'next, the tests'", Allowed),
@@ -3526,6 +3527,8 @@ mod tests {
             (&house.kei, "kj drift push lane-a 'not my kohai'", Pending),
             (&house.banto, "kj drift push $LANE 'which one?'", Pending),
             (&house.banto, "kj drift push lane-a 'x' > /tmp/out", Pending),
+            (&lane, "kj senpai report 'the first part is done'", Allowed),
+            (&root, "kj senpai report 'nobody above me'", Pending),
         ];
         for (caller, source, expected) in cases {
             let outcome = gate_once(&d, caller, planned_shell_spec(source)).await;

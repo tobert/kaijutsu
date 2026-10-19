@@ -300,7 +300,7 @@ impl KjDispatcher {
         Some(format!("context '{name}' is {why}"))
     }
 
-    async fn drift_push(
+    pub(super) async fn drift_push(
         &self,
         dst_query: &str,
         summarize: bool,
