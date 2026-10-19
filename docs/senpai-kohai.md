@@ -43,8 +43,8 @@ Two layers. Static settings are edited in place. The dynamic layer is appended t
 ```
 static     characters           principal_id, name, root, created_at, retired_at, persona (step 6), cast_id
            casts, cast_slots    a reusable model team: one slot per role
-dynamic    character_instances  instance_id, principal_id, label, senpai_instance, handoff_ctx,
-                                started_at, ended_at, created_by
+dynamic    character_instances  instance_id, principal_id, senpai_instance, handoff_ctx, started_at,
+                                created_by
            instance_bindings    instance_id, seq, conversation_ctx, bound_at, cast_label, persona
            instance_slots       instance_id, seq, role, backend_id, model, max_tokens, temperature, top_p,
                                 effort, thinking_budget, thinking_style
@@ -58,7 +58,7 @@ turns                           turn_id, context_id, instance_id, binding_seq, p
 - **A cast** is a reusable model team: one slot per role, where a role is a context type, or `judge` or `gate`.
   Many characters may name one cast.
 - **A character instance** is one run of one character. `kj kohai create` starts it. Its senpai is another
-  character instance. Its character never changes. It ends when it is archived or its character retires.
+  character instance. Its character never changes. It is live while its conversation is live.
 - **A binding** is the settings an instance runs on: the character's persona and a copy of its cast's slots, as
   they were when the binding was written. Binding `seq` 1 is written when the instance starts. A rotation appends
   the next `seq`, read fresh from the static settings, together with the instance's new conversation. Nothing
@@ -149,22 +149,27 @@ the instance has pending asks.
 - `kj fork`: the child joins the forking context's instance and runs on the same binding `seq`.
 - `kj context rotate <instance-or-ctx>`: a new conversation in the same instance, with the next binding `seq`
   read fresh from the static settings. The kohai and the senpai do not move: they point at the instance.
-- `kj context archive` of an instance's conversation ends the instance and archives its live contexts. Archiving
-  any other context archives only that context.
+- `kj context archive` archives only the context it names. Archiving an instance's conversation makes the
+  instance inactive: reports to it and `kj senpai set` onto it refuse, and its forks stay live. Contexts that
+  should go with it go by their type's archive rc, as the coder's judge shadows do today
+  (`coder/archive/S10-shadows.kai`). `kj context promote` of the conversation makes the instance live again.
 - `kj senpai set <instance> <senpai-instance>`: moves a kohai. It needs the authority rule, refuses with pending
-  asks, refuses a cycle, and refuses an ended senpai instance.
+  asks, refuses a cycle, and refuses an inactive senpai instance.
 - `kj senpai show [<instance-or-ctx>]`, `kj kohai list [<instance-or-ctx>]`, `kj senpai report "<text>"` work on
   instances; given a context, they use its instance.
 - `kj context info` shows the context's instance, its binding `seq`, and the model for its type (or why it has
   none). `kj character show` lists the character's live instances.
-- **Addresses.** An instance's label is unique among live instances and does not collide with a live context's
-  label. Where a verb takes a context, an instance label names that instance's conversation.
+- **Addresses.** An instance has no label of its own. It is named by its conversation's label, which a rotation
+  carries to the new conversation as it does today. A verb that takes an instance accepts any of the instance's
+  contexts and uses that context's instance.
 
 ## Reports and drift
 
 - `kj senpai report "<text>"` puts the text in the senpai instance's conversation as a drift block.
 - `kj drift push` along the edge, from a context of a kohai instance to its senpai's conversation or back, runs
-  with no ask. Any other drift target keeps today's gate. A `gate.toml` key on `kj drift push` still wins over the
+  with no ask. Within one instance, a push from the conversation down to one of its forks runs with no ask; a
+  push from a fork up to the conversation keeps today's gate (see Open). Any other drift target keeps today's
+  gate. A `gate.toml` key on `kj drift push` still wins over the
   edge (Amy, 2026-10-19).
 
 ## What a context sees
@@ -219,9 +224,9 @@ answer the old code would have given.
    next `seq`, in creation order. A context the old resolver could not resolve gets a binding with no slot for its
    type, and the migration lists it.
 5. **Conversation.** An instance's conversation is its newest live context that is not a fork child of another of
-   its contexts, a judge shadow, or a context an rc lifecycle made. An instance with none ends.
-6. **Labels.** An instance takes its conversation's label. Two live instances that would share a label refuse the
-   migration, naming both.
+   its contexts, a judge shadow, or a context an rc lifecycle made. With none, its newest context of those kinds
+   is its conversation, and the instance is inactive when that context is archived.
+6. **Labels.** Labels stay on contexts; the migration moves none.
 7. **Handoff.** A character's `handoff_ctx` moves to its newest live instance and is logged.
 8. Archived contexts map like live ones; an archived context that cannot be mapped is left with no instance and
    listed, as step 1 did. Only live contexts refuse.
@@ -239,7 +244,9 @@ answer the old code would have given.
 - Escalation climbs one step and refuses at the top.
 - The authority rule allows the senpai's character and the lineage root, and refuses a sibling and the kohai
   itself, for each act it governs.
-- `kj senpai set` refuses a cycle, pending asks, and an ended senpai.
+- `kj senpai set` refuses a cycle, pending asks, and an inactive senpai.
+- Archiving a conversation archives no other context; the instance is inactive until `kj context promote`
+  restores the conversation; a report to an inactive instance refuses.
 - Create writes binding `seq` 1 from the character's cast and persona; a fork joins the instance on the same
   `seq`; a rotation appends the next `seq` read fresh; a later cast or persona change moves no running context;
   the kohai of a rotated instance stay where they are.
@@ -247,24 +254,28 @@ answer the old code would have given.
   the type and the fix. A slot with no `max_tokens` in it or in `backend_models` refuses when bound.
 - A turn uses the slot's parameters, then `backend_models`, and sends no unset optional parameter.
 - The judge shadow and the gate use the instance binding's `judge` and `gate` slots.
-- A drift along the edge runs with no ask, both ways; a drift to a sibling still asks; a `gate.toml` ask key wins.
+- A drift along the edge runs with no ask, both ways; a drift from a conversation to its own fork runs with no
+  ask; a drift to a sibling still asks; a `gate.toml` ask key wins.
 - The prompt's `<situation>` names the instance and the senpai.
 - The migration: a rotation chain becomes one instance; a fork child joins its source's instance; a judge shadow
   joins the instance of the context it judges; a shared cast copies into each binding; a context with an
   override keeps its model; one resolved through `llm_defaults` keeps that model; an unresolvable one is listed;
-  a label collision and a cycle refuse; dropped values are logged.
+  a cycle refuses; dropped values are logged.
 - Each turn row names its instance and binding `seq`; the removed verbs and RPCs are gone (`kj model` and
   `kj context set --as` are unknown).
 
 ## Open (step 5)
 
-- **A character's log across instances.** `handoff_ctx` moves to the instance. If a character needs memory that
-  outlives its instances, that is a new static field, decided when a use appears.
-- **The `mcp` context type.** An MCP session starts an instance of its key's character, under the parent named by
-  `--parent` or the root console. With no `mcp` slot in its cast it has no model, and the create says so. If that
-  line is noise for a type that runs no model turns, a per-type flag could quiet it; we wait to see.
-- **Drift within one instance** (between a conversation and its forks) still asks. It could ride the edge rule;
-  decided when a use appears.
+- **Drift up within one instance**, from a fork to its own conversation: Amy, 2026-10-19: "downwards, yes,
+  upwards, it depends." It keeps today's gate until we name what it depends on.
+
+Decided (Amy, 2026-10-19):
+
+- **The handoff log is per instance.** "per instance will be a nice division and we can always join them when
+  needed." No log across a character's instances.
+- **The `mcp` type prints "no model"** at create when its cast has no `mcp` slot, and we keep the line. It is
+  noise, since the MCP client brings its own model and the context is more of a log, and it hurts nothing. A
+  later direction: MCP offers a way to chat with kaijutsu's characters instead.
 
 The sections below record what each step built. Steps 1-3 built the context-edge version that step 5 replaces;
 where they conflict with the sections above, the sections above win.
