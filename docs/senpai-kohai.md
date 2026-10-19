@@ -47,8 +47,8 @@ static     characters           principal_id, name, root, created_at, retired_at
 dynamic    character_instances  instance_id, principal_id, senpai_instance, started_at,
                                 created_by
            instance_bindings    instance_id, seq, conversation_ctx, bound_at, cast_label, persona
-           instance_slots       instance_id, seq, role, backend_id, model, max_tokens, temperature, top_p,
-                                effort, thinking_budget, thinking_style
+           instance_slots       instance_id, seq, role, backend_id, model, max_tokens, context_window,
+                                temperature, top_p, effort, thinking_budget, thinking_style
 contexts                        instance_id, binding_seq, context_type, forked_from, ...
 turns                           turn_id, context_id, instance_id, binding_seq, provider, model, raw tokens, ...
 ```
@@ -56,7 +56,7 @@ turns                           turn_id, context_id, instance_id, binding_seq, p
 - **A character** is the persistent someone a name resolves to. Keys in `auth.db` bind to it. Its row holds
   static settings only: its name, the root flag, its persona (step 6) and the cast it uses. Editing them changes
   no running instance.
-- **A cast** is a reusable model team: one slot per role, where a role is a context type, or `judge` or `gate`.
+- **A cast** is a reusable model team: one slot per role, where a role is a context type, or `judge`, `gate` or `distill`.
   Many characters may name one cast.
 - **A character instance** is one run of one character. `kj kohai create` starts it. Its senpai is another
   character instance. Its character never changes. It is live while its conversation is live.
@@ -86,14 +86,17 @@ What stays as it is:
 
 ## Where a model comes from
 
-A model turn in context K runs on the slot for K's context type in the binding K was made with. That is the one
-place.
+Every model call reads the character instance and nothing else. A model turn in context K runs on the slot for
+K's context type in the binding K was made with. A call with no instance runs no model.
 
-- The slot gives the backend, the model and the sampling parameters. A parameter the slot leaves unset comes from
-  the model's own row in `backend_models`. Nothing below them: kaijutsu supplies no parameter value of its own.
-- `max_tokens`, which every provider request carries, must come from the slot or the model's row. A binding
+- Writing a binding copies everything a call needs into `instance_slots`: the cast slot's backend, model and
+  parameters, and for each parameter the slot leaves unset, the value in the model's `backend_models` row,
+  context window included. After that no call reads the cast or `backend_models`; they are catalogs read when a
+  binding is written. Kaijutsu supplies no parameter value of its own.
+- `max_tokens`, which every provider request carries, must come from the cast slot or the model's row. A binding
   whose slot has neither refuses when it is written, naming the cast, the role and the model. An unset optional
-  parameter (temperature, top_p, effort, thinking) is left out of the request.
+  parameter (temperature, top_p, effort, thinking) is left out of the request. A context window neither holds
+  shows as unknown.
 - A binding with no slot for K's type gives K no model. `kj kohai create` and `kj context rotate` say so in their
   output ("<instance> has no model for <type>: cast <cast> has no <type> slot", or "<character> has no cast"),
   and `kj context info` shows the same line. A model turn in K refuses before any provider work, naming the
@@ -101,13 +104,13 @@ place.
   `kj context rotate`).
 - The judge shadow runs on the `judge` slot of its instance's binding, and the gate on the `gate` slot, so a cast
   change moves neither in a running instance. Both read the binding, not the live cast: `seat_slot_backend`'s
-  `effective_cast` lookup goes. Until step 7, an instance with no `gate` slot decides on `[council] server`;
-  step 7 removes that fallback.
+  `effective_cast` lookup goes. An instance with no `gate` slot has no council: its gate decides without one.
+  `[council] server` and `[council] model` in `gate.toml` are gone (Amy, 2026-10-19: "Remove it now").
 - A judge shadow belongs to one conversation, as today: the coder's archive rc archives it when a rotation
   archives the predecessor, and the successor's first gate call makes a new one on the successor's binding.
-- Other model callers resolve the same way. A fork's distillation runs on the forking context's slot, or on
-  `--distill-model <backend>/<model>`; a bare model name refuses. A one-shot prompt (summaries) takes
-  `max_tokens` from the slot it runs on.
+- A fork's distillation runs on the forking instance's `distill` slot (Amy, 2026-10-19), so a cheap model can
+  summarize for an expensive conversation. With no `distill` slot, a fork that asks for distillation refuses,
+  naming the cast and the fix. A one-shot prompt takes `max_tokens` from the slot it runs on.
 - A backend's connection facts (`base_url`, keys, timeouts, `max_concurrent`) are read live. They are
   infrastructure, not a model choice.
 - To move a running instance to another model or persona, change the static settings and rotate it. To run two
@@ -213,7 +216,10 @@ Step 5 (instances and bindings):
   the binding's cast label.
 - The MCP `session.start` hook's model write; the live `GET /v1/models` lookup for a context window (a window that
   `backend_models` does not hold shows as unknown); the DriftRouter handle's provider/model copy and the turn's
-  explicit `model` argument that outranks it.
+  explicit `model` argument that outranks it, with the wire `prompt` method's `model` parameter
+  (`kaijutsu-client` `prompt(content, model, ctx)`).
+- `kj fork --distill-model`; `[council] server` and `[council] model` in `gate.toml`; every read of
+  `backend_models` or `cast_slots` outside writing a binding.
 - Every value kaijutsu supplies on its own: the 64000 `max_tokens` floor (`LlmRegistry::max_output_tokens`),
   `BuildOpts::new`'s 64000 (`BuildOpts` takes `max_tokens` from its caller), the openai-compatible client's 8192
   for a zero, and the one-shot prompts' 4096.
@@ -247,8 +253,9 @@ answer the old code would have given.
 4. **Bindings.** Each context gets the binding its next turn, its judge and its gate would have used under the old
    resolver (override, context cast, default cast and `llm_defaults` included), resolved from the rows as they
    stand at migration. `max_tokens` is what the old code sent: the slot's, the model row's, `llm_defaults`', or
-   64000 when all are unset, written into the slot. A binding gets a `gate` slot only from a cast `gate` slot;
-   without one, `[council] server` in `gate.toml` decides until step 7, since the migration cannot read the VFS.
+   64000 when all are unset, written into the slot. A binding gets a `gate` or `distill` slot only from the
+   cast's own slot. The migration cannot read `gate.toml`, so it lists each live instance whose cast has no
+   `gate` slot, and each whose cast has no `distill` slot; we add them with `kj cast slot set` before deploy.
    Contexts of one instance with equal resolutions share a `seq`; a different resolution starts the
    next `seq`, in creation order. A context the old resolver could not resolve gets a binding with no slot for its
    type, and the migration lists it.
@@ -282,7 +289,10 @@ answer the old code would have given.
   the kohai of a rotated instance stay where they are.
 - A binding with no slot for the type: create and rotate say so; a turn refuses and names the character, the cast,
   the type and the fix. A slot with no `max_tokens` in it or in `backend_models` refuses when bound.
-- A turn uses the slot's parameters, then `backend_models`, and sends no unset optional parameter.
+- A binding copies the slot's parameters and fills unset ones from `backend_models`; a later edit to either
+  moves no running context; a turn sends no unset optional parameter.
+- A fork with distillation runs on the `distill` slot, and refuses with no `distill` slot; an instance with no
+  `gate` slot runs its gate with no council; a `[council] server` key in `gate.toml` is refused as unknown.
 - The judge shadow and the gate use the instance binding's `judge` and `gate` slots.
 - A drift along the edge runs with no ask, both ways; a drift from a conversation to its own fork runs with no
   ask; a drift up from a fork the character made runs with no ask, and up from a fork a person made asks; a
