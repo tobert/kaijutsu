@@ -4,8 +4,8 @@ kj is how we work with this kernel. It runs in the shell. `kj help` gives the
 overview, and `kj <verb> --help` gives a verb's options.
 
 A context is one conversation: a log of blocks, a type that selects its
-instructions, a performer who takes its turns, and a reviewer who answers its
-asks. A context with no performer cannot take a turn. We name a context as `.`
+instructions, a performer who takes its turns, and a senpai, the context it
+answers to. The character holding the senpai answers its asks. A context with no performer cannot take a turn. We name a context as `.`
 (this one), `.parent`, its label, or a prefix of its id.
 
 `kj drive` starts a turn in a context. `kj wait` returns when that turn ends,
@@ -21,9 +21,10 @@ Drift moves information between contexts. `kj drift push` puts text in another
 context's log without running a model; a running turn there reads it after its
 next tool call. `kj drift pull` has a model distill another context into ours.
 `kj drift merge`, run inside a fork, summarizes the fork into its parent.
+A drift between a context and its senpai, either way, needs no ask.
 
 When a context needs a decision outside its loadout, it raises an ask and
-waits. The ledger holds the asks, and the reviewer allows or denies each one.
+waits. The ledger holds the asks, and the senpai allows or denies each one.
 
 Examples. Replace each `<...>` with a real value read from kj.
 
@@ -62,6 +63,9 @@ Correct or inform a context without running a model.
 
 kj drift pull fix-login "List the files you changed and each check you ran, with its exit status."
 Bring a distilled result from a context into ours.
+
+kj senpai report "Done: <...> Checked: <...> Open: <...>"
+Report to our senpai. It needs no context id.
 
 kj interrupt fix-login
 Stop a turn that is looping or off course. Add --immediate to stop it at once.

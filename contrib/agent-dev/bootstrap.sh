@@ -5,8 +5,8 @@
 # The project repository is ~/src/<project>. The kernel gets:
 #   - Amy as root (her ~/.ssh/id_ed25519.pub), and senpai, the supervising Claude session (~/.ssh/kaijutsu-senpai);
 #   - DeepSeek (deepseek-flash, the default) and Anthropic backends, keys read from their files;
-#   - characters <project>-coder and banto; a banto context on claude-haiku-5-5 in the project, and a coder
-#     context in /workspace, with banto as its reviewer;
+#   - characters <project>-coder and banto; a banto context on claude-haiku-5-5 in the project, answering to
+#     Amy's root console until senpai's context exists, and a coder context in /workspace that answers to banto's;
 #   - the agent-dev rc overlay, a gate.toml that lets coders run with no asks, and kaibo (crusoe cast) in mcp.toml.
 # It refuses to run over an existing kernel. Build the image first (build.sh), and start the unit after.
 set -euo pipefail
@@ -122,7 +122,8 @@ sed -i 's/^\[context_type\.mcp\]$/[context_type.mcp]\nuncovered = "allow"/' "$ke
 python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel_cfg/gate.toml"
 
 kj kohai create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo"
-# The coder answers to banto's seat, so banto reviews its asks and its drifts reach banto.
+# The coder answers to banto's seat (its senpai), so banto reviews its asks, and a drift either way between them,
+# or a `kj senpai report`, needs no ask.
 kj kohai create "$project-coder" --type coder --as "$project-coder" --senpai "$project-banto" --cwd /workspace
 # The kernel passes only HOME, PATH and context exports to the programs a seat runs, so set the locale here.
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
@@ -135,3 +136,6 @@ echo
 echo "Ready. Install and start the unit:"
 echo "  cp $here/kaijutsu-dev@.container ~/.config/containers/systemd/"
 echo "  systemctl --user daemon-reload && systemctl --user start kaijutsu-dev@$project"
+echo
+echo "banto answers to Amy's root console. Once senpai's MCP session has made its context, Amy moves banto under it:"
+echo "  kj senpai set $project-banto <senpai's context>"

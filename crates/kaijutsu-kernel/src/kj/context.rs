@@ -6795,6 +6795,46 @@ mod tests {
 
     // ── kj context prompt ─────────────────────────────────────────────
 
+    /// The director stance names its senpai from the kernel fact (`kj senpai
+    /// show`), says "our senpai", and points reports at `kj senpai report`
+    /// (`docs/senpai-kohai.md`, "What a seat sees").
+    #[test]
+    fn director_stance_names_its_senpai_from_the_kernel_fact() {
+        crate::on_rc_thread(director_stance_names_its_senpai_from_the_kernel_fact_body);
+    }
+
+    async fn director_stance_names_its_senpai_from_the_kernel_fact_body() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("senpai-seat"), None, principal);
+        let create_caller = caller_with_context(parent);
+        let banto = PrincipalId::new();
+        for (principal_id, name) in [(create_caller.actor_id, "sensei"), (banto, "banto")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: s(name), created_at: 0,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+        d.kernel_db().lock().update_played_by(parent, Some(create_caller.actor_id)).unwrap();
+        let create = d
+            .dispatch(&[s("kohai"), s("create"), s("banto-seat"), s("--type"), s("director"), s("--as"), s("banto")], &create_caller)
+            .await;
+        assert!(create.is_ok(), "create failed: {}", create.message());
+        let ctx = d.kernel_db().lock().resolve_context("banto-seat").expect("banto-seat exists");
+        let result = d.dispatch(&[s("context"), s("prompt"), ctx.to_hex()], &caller_with_context(ctx)).await;
+        assert!(result.is_ok(), "prompt failed: {}", result.message());
+        let flat = result.message().split_whitespace().collect::<Vec<_>>().join(" ");
+        for said in [
+            "In this seat we are banto, the operator of this Kaijutsu kernel. Our senpai is sensei, in senpai-seat.",
+            "Our own asks go to our senpai",
+            "kj senpai report",
+        ] {
+            assert!(flat.contains(said), "director stance is missing {said:?}: {flat}");
+        }
+        assert!(!flat.contains("We are the reviewer for the contexts we create"), "{flat}");
+    }
+
     #[tokio::test]
     async fn system_prompt_read_failure_reaches_preview() {
         let d = test_dispatcher().await;
