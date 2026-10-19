@@ -949,12 +949,14 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                 })
                 .expect("insert live character");
         }
+        // Amy performs the console the lead's work is created from.
+        d.kernel_db().lock().update_played_by(caller.context_id.unwrap(), Some(caller.principal_id)).unwrap();
         caller.actor_id = lead;
         caller.reviewer_id = Some(caller.principal_id);
 
         let result = d
             .dispatch(
-                &argv(&["context", "create", "lead-work", "--type", "test"]),
+                &argv(&["context", "create", "lead-work", "--type", "test", "--as", "lead"]),
                 &caller,
             )
             .await;
@@ -2895,7 +2897,7 @@ esac
                             handoff_ctx: None, root_ctx: None, root: false,
                         }).unwrap();
                     }
-                    db.update_context_review_assignment(ctx, Some(performer), Some(reviewer), None).unwrap();
+                    db.assign_test_review(ctx, Some(performer), Some(reviewer)).unwrap();
                 }
                 // No provider is configured, so startup fails after the
                 // lifecycle; only the run row is under test.
@@ -3440,7 +3442,7 @@ esac
         assert!(d.dispatch(&argv(&["character", "create", "retiree"]), &caller).await.is_ok());
         let retiree = d.kernel_db().lock().get_character_by_name("retiree").unwrap().unwrap().principal_id;
         let ctx = archivable(&d, "retiree-seat", None, "test");
-        d.kernel_db().lock().update_context_review(ctx, Some(retiree), None).unwrap();
+        d.kernel_db().lock().assign_test_review(ctx, Some(retiree), None).unwrap();
         let r = d.dispatch(&argv(&["character", "retire", "retiree"]), &caller).await;
         assert!(r.is_ok(), "retire failed: {}", r.message());
         assert!(find_run_for_context(&d, ctx, VERB_ARCHIVE).is_some(), "the played context's archive lifecycle ran");

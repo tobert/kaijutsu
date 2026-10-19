@@ -250,7 +250,7 @@ mod tests {
         let principal = PrincipalId::new();
         let context_a = register_context(&d, Some("shell-ops-a"), None, principal);
         let context_b = register_context(&d, Some("shell-ops-b"), None, principal);
-        kernel.kernel_db().lock().update_context_review(context_a, Some(principal), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context_a, Some(principal), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context_a, crate::DocumentKind::Conversation, None).unwrap();
 
         let call_a = CallContext::new(principal, context_a, SessionId::new(), d.kernel_id());

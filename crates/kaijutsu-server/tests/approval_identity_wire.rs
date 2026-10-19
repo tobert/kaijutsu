@@ -51,7 +51,7 @@ async fn kj_fails(kernel: &KernelHandle, context_id: kaijutsu_types::ContextId, 
 }
 
 #[test]
-fn amy_default_and_director_delegation_route_approval_over_the_wire() {
+fn amy_default_and_escalation_route_approval_over_the_wire() {
     run_local(async {
         let temp = tempfile::tempdir().unwrap();
         let auth_path = temp.path().join("auth.db");
@@ -95,7 +95,7 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         assert_eq!(row.director_id, Some(lead));
         let coder_client = connect(addr, coder_key, "coder").await;
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
-        kernel.kernel_db.lock().update_context_review_assignment(work, Some(coder), None, Some(lead)).unwrap();
+        kernel.kernel_db.lock().assign_test_review(work, Some(coder), None).unwrap();
         kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("identity-wire-gate".into()), match_instance: None,
             match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(work),
@@ -122,22 +122,7 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         kj_fails(&lead_kj, lead_context, &["ledger", "allow", &ask.request_id]).await;
         assert_eq!(kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status.as_str(), "pending");
         amy_kj.join_context(work, "coder-work").await.unwrap();
-        let delegation_help = amy_kj.execute_kj(work, &[
-            "ledger".into(), "delegation".into(), "grant".into(), "--help".into(),
-        ]).await.expect("delegation help reaches kernel");
-        assert_eq!(delegation_help.exit_code, 0, "delegation help failed: {}", delegation_help.stderr);
-        let delegation_help_text = format!("{}{}", delegation_help.stdout, delegation_help.stderr);
-        assert!(delegation_help_text.contains("--to"), "delegation help: {delegation_help_text}");
-        eprintln!("{delegation_help_text}");
-        let context_help = amy_kj.execute_kj(work, &[
-            "context".into(), "set".into(), "--help".into(),
-        ]).await.expect("context help reaches kernel");
-        assert_eq!(context_help.exit_code, 0, "context help failed: {}", context_help.stderr);
-        let context_help_text = format!("{}{}", context_help.stdout, context_help.stderr);
-        assert!(context_help_text.contains("--reviewer") && context_help_text.contains("--director"), "context help: {context_help_text}");
-        assert!(context_help_text.contains("--clear-reviewer"));
-        eprintln!("{context_help_text}");
-        for argv in [vec!["context", "create", "--help"], vec!["ledger", "delegation", "revoke", "--help"]] {
+        for argv in [vec!["context", "create", "--help"], vec!["ledger", "escalate", "--help"]] {
             let argv = argv.into_iter().map(String::from).collect::<Vec<_>>();
             let help = amy_kj.execute_kj(work, &argv).await.expect("help reaches kernel");
             assert_eq!(help.exit_code, 0, "{}", help.stderr);
@@ -146,63 +131,36 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         kj(&amy_kj, work, &["ledger", "allow", &ask.request_id]).await;
         assert!(kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status.is_allowed());
 
-        kj_fails(&lead_kj, lead_context, &["ledger", "delegation", "grant", "lead", "--to", "judge"]).await;
-        kj(&amy_kj, work, &["ledger", "delegation", "grant", "lead", "--to", "judge"]).await;
+        // A later ask routes to the senpai's holder again; only Amy (its
+        // reviewer or the lineage root) reassigns it, and then only the new
+        // reviewer answers.
         coder_kj.join_context(work, "coder-work").await.unwrap();
         let submission = coder_kj.shell_submit("true", work, true).await.unwrap();
         assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
-        let delegated = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
-        assert_eq!(delegated.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
-        kj_fails(&amy_kj, work, &["ledger", "allow", &delegated.request_id]).await;
+        let escalated = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
+        assert_eq!(escalated.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
+        kj_fails(&lead_kj, lead_context, &["ledger", "escalate", &escalated.request_id, "--to", "judge"]).await;
+        kj(&amy_kj, work, &["ledger", "escalate", &escalated.request_id, "--to", "judge"]).await;
+        let escalated_row = kernel.kernel_db.lock().get_approval(&escalated.request_id).unwrap().unwrap();
+        assert_eq!(escalated_row.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
+        kj_fails(&amy_kj, work, &["ledger", "allow", &escalated.request_id]).await;
         judge_kj.join_context(work, "coder-work").await.unwrap();
-        kj(&judge_kj, work, &["ledger", "allow", &delegated.request_id]).await;
-        assert!(kernel.kernel_db.lock().get_approval(&delegated.request_id).unwrap().unwrap().status.is_allowed());
+        kj(&judge_kj, work, &["ledger", "allow", &escalated.request_id]).await;
+        assert!(kernel.kernel_db.lock().get_approval(&escalated.request_id).unwrap().unwrap().status.is_allowed());
 
-        coder_kj.join_context(work, "coder-work").await.unwrap();
-        let submission = coder_kj.shell_submit("true", work, true).await.unwrap();
-        assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
-        let reclaimed = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
-        assert_eq!(reclaimed.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
-        amy_kj.join_context(work, "coder-work").await.unwrap();
-        kj_fails(&amy_kj, work, &["ledger", "delegation", "revoke", "lead"]).await;
-        kj(&amy_kj, work, &["ledger", "escalate", &reclaimed.request_id, "--to", "amy"]).await;
-        let reclaimed = kernel.kernel_db.lock().get_approval(&reclaimed.request_id).unwrap().unwrap();
-        assert_eq!(reclaimed.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
-        kj(&amy_kj, work, &["ledger", "allow", &reclaimed.request_id]).await;
-        assert!(kernel.kernel_db.lock().get_approval(&reclaimed.request_id).unwrap().unwrap().status.is_allowed());
-        kj(&amy_kj, work, &["ledger", "delegation", "revoke", "lead"]).await;
         let other = create_context(&coder_kj, "coder-other").await.unwrap();
         coder_kj.join_context(work, "coder-work").await.unwrap();
         let submission = coder_kj.shell_submit("false", work, true).await.unwrap();
         assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
         let second = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
-        assert_eq!(second.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()), "a revoked delegation sends the next ask back to Amy");
+        assert_eq!(second.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()), "the next ask goes back to the senpai's holder");
         kj_fails(&coder_kj, other, &["ledger", "allow", &second.request_id]).await;
         assert_eq!(
             kernel.kernel_db.lock().get_approval(&second.request_id).unwrap().unwrap().status.as_str(),
             "pending",
         );
         kj(&amy_kj, work, &["ledger", "allow", &second.request_id]).await;
-
         kernel.kernel.broker().hooks().write().await.pre_call.entries.clear();
-        kernel.kernel_db.lock().update_context_review_assignment(work, Some(coder), Some(judge), Some(lead)).unwrap();
-        assert!(kernel.kernel_db.lock().retire_character(judge, 1).unwrap());
-        let broken_info = amy_kj.execute_kj(work, &["context".into(), "info".into()])
-            .await.expect("context info reaches a context with a retired reviewer");
-        assert_eq!(broken_info.exit_code, 0, "broken context info failed: {}", broken_info.stderr);
-        let broken_data = broken_info.data.expect("context info data");
-        assert!(broken_data["reviewer_error"].as_str().is_some_and(|error| error.contains("retired")));
-        assert!(broken_data["reviewer_id"].is_null());
-        assert!(broken_data["reviewer_name"].is_null());
-        assert_eq!(broken_data["reviewer_override_id"], judge.to_hex());
-        kj(&amy_kj, work, &["context", "set", ".", "--reviewer", "amy"]).await;
-        let repaired_info = amy_kj.execute_kj(work, &["context".into(), "info".into()])
-            .await.expect("context info reaches repaired context");
-        assert_eq!(repaired_info.exit_code, 0, "repaired context info failed: {}", repaired_info.stderr);
-        let repaired_data = repaired_info.data.expect("repaired context info data");
-        assert!(repaired_data["reviewer_error"].is_null());
-        assert_eq!(repaired_data["reviewer_id"], amy.to_hex());
-        assert_eq!(repaired_data["reviewer_name"], "amy");
         drop(coder_kj);
         drop(amy_kj);
         drop(lead_kj);

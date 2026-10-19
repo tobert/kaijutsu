@@ -1080,7 +1080,7 @@ async fn run_gate_once(
         // A self-confirmation names the actor as its own reviewer: the row
         // is raised, and only that actor may answer it
         // (`docs/approval-identity.md`).
-        let reviewer = match db.effective_approval_reviewer(context, caller.actor_id) {
+        let reviewer = match db.route_review(crate::kernel_db::ReviewQuery::ask(context, caller.actor_id)) {
             Ok(resolved) => resolved.reviewer(),
             Err(error) => return GateOutcome::unavailable_without_row(format!("approval gate could not resolve reviewer: {error}")),
         };
@@ -1412,7 +1412,7 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
         }
         let caller = KjCaller {
             principal_id: requester,
@@ -1660,7 +1660,7 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.update_context_review(context, Some(coder), Some(lead)).unwrap();
+            db.assign_test_review(context, Some(coder), Some(lead)).unwrap();
         }
         let mut coder_call = test_caller();
         coder_call.principal_id = requester;

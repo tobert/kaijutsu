@@ -631,6 +631,8 @@ impl KjDispatcher {
                 // The forking actor directs the child; the reviewer override is
                 // the one review field a fork preserves.
                 director_id: Some(caller.actor_id),
+                // The forking context is the fork's senpai.
+                senpai_ctx: Some(source_id),
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1002,6 +1004,8 @@ impl KjDispatcher {
                 played_by: source_played_by,
                 reviewer_id: source_reviewer_id,
                 director_id: Some(caller.actor_id),
+                // The forking context is the fork's senpai.
+                senpai_ctx: Some(source_id),
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -2436,6 +2440,43 @@ mod tests {
             "the forking actor directs the child, not the source's director"
         );
         assert_eq!(row.created_by, c.principal_id, "created_by still names the requester");
+    }
+
+    /// A fork answers to the context it was forked from, whoever forked it.
+    #[tokio::test]
+    async fn fork_makes_the_forking_context_the_senpai() {
+        let d = test_dispatcher().await;
+        let requester = PrincipalId::new();
+        let top = register_context(&d, Some("senpai-fork-top"), None, requester);
+        let source = register_context(&d, Some("senpai-fork-src"), Some(top), requester);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        let c = caller_with_context(source);
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("senpai-fork-child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+        let child_ctx = child_id(&d, "senpai-fork-child");
+        let child = d.kernel_db().lock().get_context(child_ctx).unwrap().unwrap();
+        assert_eq!(child.forked_from, Some(source));
+        assert_eq!(child.senpai_ctx, Some(source), "the forking context is the fork's senpai");
+        assert_ne!(
+            d.kernel_db().lock().get_context(source).unwrap().unwrap().senpai_ctx,
+            child.senpai_ctx,
+            "the fork does not inherit the source's own senpai"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_fork_makes_the_forking_context_the_senpai() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("senpai-compact-src"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        setup_compact_source(&d, source, principal).await;
+        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("senpai-compact-child")], &caller_with_context(source)).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let child_ctx = child_id(&d, "senpai-compact-child");
+        let child = d.kernel_db().lock().get_context(child_ctx).unwrap().unwrap();
+        assert_eq!(child.senpai_ctx, Some(source));
     }
 
     #[tokio::test]

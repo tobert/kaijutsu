@@ -818,7 +818,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("completion-once"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
         let receipt = crate::runtime::tool_command::create_operation(kernel, &call, "echo captured", None).unwrap();

@@ -133,7 +133,7 @@ impl Held {
         let (reviewer_kj, _) = reviewer_client.bind_kernel().await.unwrap();
         let context = create_context(&performer_kj, label).await.unwrap();
         let reviewer_context = create_context(&reviewer_kj, &format!("{label}-review")).await.unwrap();
-        server.kernel_db.lock().update_context_review(context, Some(performer), Some(reviewer)).unwrap();
+        server.kernel_db.lock().assign_test_review(context, Some(performer), Some(reviewer)).unwrap();
         performer_kj.join_context(context, label).await.unwrap();
         Self {
             _performer_client: performer_client, _reviewer_client: reviewer_client,

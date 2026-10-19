@@ -249,7 +249,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("completion-live"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
         let receipt = super::super::tool_command::create_operation(kernel, &call, "never run", None).unwrap();
@@ -276,7 +276,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("completion-backlog"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
         let mut keys = Vec::new();
@@ -302,13 +302,13 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("changed-notice-recipient"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
         let receipt = super::super::tool_command::create_operation(kernel, &call, "never run", None).unwrap();
         let source = Source::Shell(receipt.operation_id.clone());
         prepare(&kernel.kernel_db().lock(), &source, "completion for the original performer").unwrap();
-        kernel.kernel_db().lock().update_context_review(context, Some(PrincipalId::new()), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(PrincipalId::new())).unwrap();
         deliver(kernel, &source, &tokio_util::sync::CancellationToken::new()).await.unwrap();
         let status = summary(&kernel.kernel_db().lock(), &source).unwrap().unwrap();
         assert_eq!(status["status"], "suppressed");
@@ -325,7 +325,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("undelivered-completion"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let now = kaijutsu_types::now_millis() as i64;
         let epoch = kernel.kernel_db().lock().begin_continuation(context, now).unwrap().epoch;
@@ -359,7 +359,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("interrupted-continuation"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let now = kaijutsu_types::now_millis() as i64;
         let epoch = kernel.kernel_db().lock().begin_continuation(context, now).unwrap().epoch;
@@ -390,7 +390,7 @@ mod tests {
             let kernel = dispatcher.kernel();
             let actor = PrincipalId::new();
             let context = register_context(&dispatcher, Some("notice-recovery"), None, actor);
-            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let now = kaijutsu_types::now_millis() as i64;
             let epoch = kernel.kernel_db().lock().begin_continuation(context, now).unwrap().epoch;
@@ -439,7 +439,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("interrupted-notice"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
         let receipt = super::super::tool_command::create_operation(kernel, &call, "never execute after restart", None).unwrap();

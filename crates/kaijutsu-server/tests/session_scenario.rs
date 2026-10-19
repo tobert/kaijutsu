@@ -286,6 +286,8 @@ async fn boot() -> Scenario {
         .await
         .expect("create amy-home");
     amy.join_context(amy_home, "amy").await.expect("join amy-home");
+    // amy performs her own home: a context other contexts answer to must have a holder.
+    kernel.kernel_db.lock().assign_test_review(amy_home, Some(amy_principal), None).expect("amy plays amy-home");
 
     Scenario {
         _amy_client: amy_client,
@@ -582,7 +584,7 @@ fn kaijutsu_session_scenario() {
             [("lane-a", lane_a_ctx, coder_a_principal), ("lane-b", lane_b_ctx, coder_b_principal)]
         {
             assert_eq!(
-                s.kernel.kernel_db.lock().effective_approval_reviewer(ctx, performer).unwrap(),
+                s.kernel.kernel_db.lock().route_review(kaijutsu_kernel::kernel_db::ReviewQuery::ask(ctx, performer)).unwrap(),
                 kaijutsu_kernel::kernel_db::EffectiveReviewer::Assigned(banto_principal),
                 "{label}'s performer answers to banto, which forked it",
             );

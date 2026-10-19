@@ -545,6 +545,8 @@ fn shadow_row(seat: &ContextRow, cast_id: kaijutsu_types::CastId) -> ContextRow 
         played_by: None,
         reviewer_id: None,
         director_id: None,
+        // A fork child of the seat: the seat is its senpai.
+        senpai_ctx: Some(seat.context_id),
     }
 }
 

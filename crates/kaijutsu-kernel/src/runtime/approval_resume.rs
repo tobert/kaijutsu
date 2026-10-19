@@ -1268,7 +1268,7 @@ mod lifetime_tests {
         let actor = PrincipalId::new();
         let reviewer = PrincipalId::new();
         let context = register_context(&dispatcher, Some("read-only-ask"), None, actor);
-        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let db = kernel.kernel_db().clone();
         let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
@@ -1315,7 +1315,7 @@ mod lifetime_tests {
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("claimed-notice"), None, actor);
-            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let db = kernel.kernel_db().clone();
             let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
@@ -1496,7 +1496,7 @@ mod lifetime_tests {
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("pair-handoff"), None, actor);
-            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let source = "echo approved-once";
             let request = kernel.kernel_db().lock().create_approval_ask(&NewAsk {
@@ -1606,7 +1606,7 @@ mod lifetime_tests {
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("late-pair-link"), None, actor);
-            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let source = "echo approved-once";
             let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
@@ -1628,7 +1628,7 @@ mod lifetime_tests {
             let owner = if changed_performer { crate::PairOwner::Turn } else { crate::PairOwner::Session };
             kernel.kernel_db().lock().link_ask_blocks(&request, &command, &output, owner).unwrap();
             if changed_performer {
-                kernel.kernel_db().lock().update_context_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
+                kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
             }
             let action = act_on_executable_answer(kernel, context, actor, &answer, &scanned, "reviewer", &tokio_util::sync::CancellationToken::new()).await;
             assert!(if changed_performer { matches!(action, ExecAction::Tell(_)) } else { matches!(action, ExecAction::Settled) },
@@ -1663,7 +1663,7 @@ mod lifetime_tests {
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("unlinked-approval"), None, requester);
-            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
                 context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
@@ -1873,7 +1873,7 @@ mod lifetime_tests {
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("approval-fault"), None, actor);
-            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let pair = owner.map(|owner| {
                 let (command, output) = test_pair(&kernel, context, actor, "echo approved-once");
@@ -1938,7 +1938,7 @@ mod lifetime_tests {
             let completed = kernel.blocks().block_snapshots(context).unwrap();
             assert_eq!(completed.iter().filter(|b| b.content == "approved-once\n").count(), 1,
                 "{owner:?}: approved source must run after storage recovers: {completed:?}");
-            kernel.kernel_db().lock().update_context_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
             assert!(matches!(act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await,
                 ExecAction::Settled));
             let repeated = kernel.blocks().block_snapshots(context).unwrap();

@@ -57,7 +57,7 @@ fn assign_turn_identity(
         handoff_ctx: None, root_ctx: None, root: false,
     })
     .unwrap();
-    db.update_context_review(context, Some(actor), Some(reviewer))
+    db.assign_test_review(context, Some(actor), Some(reviewer))
         .unwrap();
 }
 
@@ -731,7 +731,7 @@ fn performer_reassignment_rejects_a_queued_inference_over_the_wire() {
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
-            db.update_context_review(context, Some(performer), Some(requester)).unwrap();
+            db.assign_test_review(context, Some(performer), Some(requester)).unwrap();
         }
         {
             let mut registry = server.kernel.llm().write().await;

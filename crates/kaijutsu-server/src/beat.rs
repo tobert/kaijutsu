@@ -422,6 +422,7 @@ impl BeatScheduler {
                 played_by: None,
                 reviewer_id: None,
                 director_id: Some(system),
+                senpai_ctx: None,
             };
             db.insert_context_with_document(&row, ws).map_err(|e| {
                 format!("beat: creating score context for {}: {e}", track_id.as_str())
@@ -4004,6 +4005,7 @@ mod tests {
                     played_by: None,
                     reviewer_id: None,
                     director_id: None,
+                    senpai_ctx: None,
                 },
                 ws,
             )
@@ -4058,6 +4060,7 @@ mod tests {
                     played_by: None,
                     reviewer_id: None,
                     director_id: None,
+                    senpai_ctx: None,
                 },
                 workspace,
             )
@@ -4939,7 +4942,7 @@ mod tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(performer), reviewer_id: None, director_id: None,
+                played_by: Some(performer), reviewer_id: None, director_id: None, senpai_ctx: None,
             }, workspace).unwrap();
         }
         sched.play(&track, base);
@@ -5483,6 +5486,7 @@ mod tests {
                     played_by: None,
                     reviewer_id: None,
                     director_id: None,
+                    senpai_ctx: None,
                 },
                 ws,
             )

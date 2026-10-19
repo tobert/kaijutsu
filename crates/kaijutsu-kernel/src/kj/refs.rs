@@ -199,6 +199,7 @@ mod tests {
             played_by: None,
             reviewer_id: None,
             director_id: None,
+            senpai_ctx: None,
         };
         let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(&row, ws_id).unwrap();
@@ -257,6 +258,7 @@ mod tests {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             },
             ws_id,
         )
@@ -289,6 +291,7 @@ mod tests {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             },
             ws_id,
         )
@@ -321,6 +324,7 @@ mod tests {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             },
             ws_id,
         )

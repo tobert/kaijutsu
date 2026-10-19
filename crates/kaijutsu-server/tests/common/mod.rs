@@ -214,8 +214,20 @@ pub fn seed_turn_identity(
     let db = kernel.kernel_db.lock();
     db.insert_character(&performer)
         .expect("seed the performer's character sheet");
-    db.update_context_review(context, Some(performer.principal_id), None)
+    db.assign_test_review(context, Some(performer.principal_id), None)
         .expect("assign the performer");
+    // A context answers to its senpai's holder. One made from a context
+    // nobody performs has no reviewer, so home it under a root console.
+    let routable = db.get_context(context).ok().flatten()
+        .and_then(|row| row.senpai_ctx)
+        .is_some_and(|senpai| db.context_holder(senpai).ok().flatten().is_some());
+    if !routable {
+        let console = db.list_characters(false).expect("list characters").into_iter()
+            .find(|c| c.root).and_then(|c| c.root_ctx);
+        if let Some(console) = console.filter(|console| *console != context) {
+            db.set_context_senpai(context, Some(console)).expect("home the seeded context under a root console");
+        }
+    }
     performer.principal_id
 }
 

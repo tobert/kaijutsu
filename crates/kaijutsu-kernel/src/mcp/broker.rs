@@ -11069,6 +11069,7 @@ mod tests {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             })
             .unwrap();
             // A real row in context_bindings (so the parent-row lookup
@@ -11151,6 +11152,7 @@ mod tests {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             })
             .unwrap();
             db.upsert_context_binding(ctx, &ContextToolBinding::with_instances(vec![]))
@@ -11320,7 +11322,7 @@ mod tests {
         db.insert_character(&crate::kernel_db::CharacterRow {
             principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        db.update_context_review(context_id, Some(actor), Some(reviewer)).unwrap();
+        db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();
         CallContext::new(actor, context_id, kaijutsu_types::SessionId::new(), kj.kernel_id()).with_actor(actor, Some(reviewer))
     }
 

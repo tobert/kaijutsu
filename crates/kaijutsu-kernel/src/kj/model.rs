@@ -817,7 +817,7 @@ mod tests {
             assert!(r.is_ok(), "context create failed: {}", r.message());
             let db = d.kernel_db().lock();
             let id = db.find_context_by_label(label).unwrap().unwrap().context_id;
-            db.update_context_review(id, Some(coder), None).unwrap();
+            db.assign_test_review(id, Some(coder), None).unwrap();
         }
         let source = |result: crate::kj::KjResult| match result {
             crate::kj::KjResult::Ok { data: Some(v), .. } => (v["model"].as_str().unwrap().to_string(), v["source"].as_str().unwrap().to_string()),

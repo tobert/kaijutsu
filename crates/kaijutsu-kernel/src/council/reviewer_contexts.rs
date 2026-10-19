@@ -2,9 +2,9 @@
 //! (`docs/council.md`, "Council contexts are kaijutsu contexts").
 //!
 //! [`reviewer_context_chain`] starts at the submitting seat's reviewer, resolved the way
-//! the gate resolves an ask's reviewer (`KernelDb::effective_approval_reviewer`),
+//! the gate resolves an ask's reviewer (`KernelDb::route_review`),
 //! and climbs the way `kj ledger escalate` does
-//! (`KernelDb::responsible_character_above`, excluding the actor and every
+//! (`KernelDb::route_review` past the actor and every
 //! character already on the chain) until it reaches the first live root
 //! character. Each character on the chain contributes its council context,
 //! labeled `council-<character>`:
@@ -19,7 +19,7 @@
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use super::projection::{SYSTEM_RULES, COUNCIL_CONTEXT_PREFIX};
-use crate::kernel_db::KernelDb;
+use crate::kernel_db::{KernelDb, KernelDbError};
 use crate::kj::gate_policy::{CouncilConfig, CouncilSpec};
 
 /// A character on the chain with no `council-<character>` context.
@@ -85,13 +85,11 @@ pub(crate) fn reviewer_context_chain(
         return Ok(chain);
     }
     let first = db
-        .effective_approval_reviewer(context, actor)
+        .route_review(crate::kernel_db::ReviewQuery::ask(context, actor))
         .map_err(|e| format!("the reviewer contexts need the seat's reviewer: {e}"))?
         .reviewer();
-    let mut seen: Vec<PrincipalId> = Vec::new();
     let mut next = Some(first);
     while let Some(principal) = next {
-        seen.push(principal);
         let sheet = db
             .get_character(principal)
             .map_err(|e| format!("the reviewer contexts could not read a reviewer's character sheet: {e}"))?
@@ -117,11 +115,12 @@ pub(crate) fn reviewer_context_chain(
         if root {
             break;
         }
-        let mut excluded = seen.clone();
-        excluded.push(actor);
-        next = db
-            .responsible_character_above(context, &excluded)
-            .map_err(|e| format!("the reviewer contexts could not walk the accountability forest: {e}"))?;
+        // The chain ends where the senpai climb runs out of contexts.
+        next = match db.route_review(crate::kernel_db::ReviewQuery::ask(context, actor).above(principal)) {
+            Ok(routed) => Some(routed.reviewer()),
+            Err(KernelDbError::NoReviewerAbove(_)) => None,
+            Err(e) => return Err(format!("the reviewer contexts could not climb the senpai chain: {e}")),
+        };
     }
     Ok(chain)
 }
@@ -272,9 +271,10 @@ case = "shell"
     async fn a_character_named_system_fails_loudly() {
         let f = forest().await;
         let system = character(&f.kernel, "system", false);
+        let system_seat = live_context_with(&f.kernel, "system-seat", |r| r.played_by = Some(system));
         let ctx = live_context_with(&f.kernel, "odd", |r| {
             r.played_by = Some(f.coder);
-            r.reviewer_id = Some(system);
+            r.senpai_ctx = Some(system_seat);
         });
         let error = f.chain(REVIEWER_CONTEXTS_ON, ctx, f.coder).unwrap_err();
         assert!(error.contains("council-system"), "{error}");

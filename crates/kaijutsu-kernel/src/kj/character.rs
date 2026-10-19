@@ -388,6 +388,7 @@ impl KjDispatcher {
                 played_by: Some(character),
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             };
             db.in_transaction(|db| {
                 let default_ws = db.get_or_create_default_workspace(requester)?;
@@ -1049,6 +1050,7 @@ mod tests {
         assert_eq!(row.forked_from, None);
         assert_eq!(row.created_by, caller.principal_id, "the requester stays the creator");
         assert!(row.archived_at.is_none());
+        assert_eq!(row.senpai_ctx, None, "a root console answers to nobody: it confirms itself");
 
         let KjResult::Ok { data: Some(data), .. } =
             d.dispatch(&[s("character"), s("show"), s("sovereign")], &caller).await

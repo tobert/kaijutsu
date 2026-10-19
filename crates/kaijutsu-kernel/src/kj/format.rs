@@ -693,6 +693,7 @@ mod tests {
             played_by: None,
             reviewer_id: None,
             director_id: None,
+            senpai_ctx: None,
         }
     }
 

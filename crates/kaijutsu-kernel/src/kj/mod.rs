@@ -1574,7 +1574,7 @@ pub(crate) mod test_helpers {
             return root.context_id;
         }
         let root = register_context(dispatcher, Some("amy"), None, amy);
-        dispatcher.kernel_db().lock().update_context_review(root, Some(amy), None).unwrap();
+        dispatcher.kernel_db().lock().assign_test_review(root, Some(amy), None).unwrap();
         root
     }
 
@@ -1694,6 +1694,8 @@ pub(crate) mod test_helpers {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                // A context registered under a parent answers to it, as a create or a fork would.
+                senpai_ctx: forked_from,
             };
             db.insert_context(&row).unwrap();
 

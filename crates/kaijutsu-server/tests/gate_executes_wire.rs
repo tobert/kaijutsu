@@ -182,7 +182,7 @@ async fn seats() -> Seats {
     kernel
         .kernel_db
         .lock()
-        .update_context_review(worker, Some(worker_principal), Some(approver_principal))
+        .assign_test_review(worker, Some(worker_principal), Some(approver_principal))
         .unwrap();
     Seats {
         _worker_client: worker_client,
@@ -798,7 +798,12 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         let (original_performer, reviewer) = {
             let db = s.kernel.kernel_db.lock();
             let row = db.get_context(s.worker).unwrap().expect("worker context");
-            (row.played_by.expect("worker performer"), row.reviewer_id.expect("worker reviewer"))
+            let performer = row.played_by.expect("worker performer");
+            let reviewer = db
+                .route_review(kaijutsu_kernel::kernel_db::ReviewQuery::ask(s.worker, performer))
+                .expect("worker reviewer")
+                .reviewer();
+            (performer, reviewer)
         };
         let replacement = PrincipalId::new();
         s.kernel
@@ -815,7 +820,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         s.kernel
             .kernel_db
             .lock()
-            .update_context_review(s.worker, Some(replacement), Some(reviewer))
+            .assign_test_review(s.worker, Some(replacement), Some(reviewer))
             .unwrap();
 
         s.answer(&ask, true).await;
@@ -842,7 +847,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         s.kernel
             .kernel_db
             .lock()
-            .update_context_review(s.worker, Some(original_performer), Some(reviewer))
+            .assign_test_review(s.worker, Some(original_performer), Some(reviewer))
             .unwrap();
         let retry = s.raise(&code).await;
         assert_ne!(retry, ask, "restoring the performer must require a new approval");
@@ -1285,14 +1290,6 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
         // reviewer does — same as every other answer here.
         let kj = &s.worker_kj;
         let blocker_ctx = create_context(&kj, "gate-exec-blocker").await.unwrap();
-        let reviewer = s
-            .kernel
-            .kernel_db
-            .lock()
-            .get_context(s.worker)
-            .unwrap()
-            .and_then(|row| row.reviewer_id)
-            .expect("worker has its explicit reviewer");
         let actor = s
             .kernel
             .kernel_db
@@ -1301,7 +1298,14 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
             .unwrap()
             .and_then(|row| row.played_by)
             .expect("worker has its explicit performer");
-        s.kernel.kernel_db.lock().update_context_review(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
+        let reviewer = s
+            .kernel
+            .kernel_db
+            .lock()
+            .route_review(kaijutsu_kernel::kernel_db::ReviewQuery::ask(s.worker, actor))
+            .expect("worker routes to its senpai's holder")
+            .reviewer();
+        s.kernel.kernel_db.lock().assign_test_review(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
         let mut binding = s.kernel.kernel.broker().binding(&blocker_ctx).await.unwrap();
         binding.grant(kaijutsu_kernel::mcp::Capability::Exec);
         s.kernel.kernel.broker().set_binding(blocker_ctx, binding).await.unwrap();

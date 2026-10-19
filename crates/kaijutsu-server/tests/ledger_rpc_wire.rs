@@ -206,7 +206,7 @@ fn a_reviewer_reads_and_answers_the_ledger_without_a_context() {
 fn a_takeover_is_a_recorded_reassignment_then_an_answer() {
     run_local(async {
         let rig = Rig::new().await;
-        rig.kernel.kernel_db.lock().update_context_review_assignment(rig.work, Some(rig.coder), Some(rig.lead), None).unwrap();
+        rig.kernel.kernel_db.lock().assign_test_review(rig.work, Some(rig.coder), Some(rig.lead)).unwrap();
         let request_id = rig.raise("echo take-over").await;
         let card = rig.amy_kj.get_ask(&request_id).await.unwrap().unwrap().summary;
         assert_eq!(card.reviewer.as_ref().map(|p| p.id), Some(rig.lead));

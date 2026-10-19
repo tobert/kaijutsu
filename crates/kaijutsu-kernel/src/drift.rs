@@ -1366,6 +1366,7 @@ pub fn ensure_drift_queue_context(
                     played_by: None,
                     reviewer_id: None,
                     director_id: None,
+                    senpai_ctx: None,
                 };
                 db.insert_well_known_context(&row, ws, WellKnownRole::DriftQueue)
                     .map_err(|e| format!("failed to publish drift-queue context: {e}"))

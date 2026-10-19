@@ -6605,6 +6605,7 @@ mod usage_tests {
                 played_by: None,
                 reviewer_id: None,
                 director_id: None,
+                senpai_ctx: None,
             })
             .unwrap();
             for bp in breakpoints {
@@ -6648,7 +6649,7 @@ mod usage_tests {
                     name: "Lead".to_string(),
                 },
                 director: Some(player),
-                review_source: crate::approval_identity::ReviewSource::Walk,
+                review_source: crate::approval_identity::ReviewSource::Senpai,
             }),
             tool_ctx,
             interrupt,
@@ -7144,7 +7145,7 @@ mod usage_tests {
         assert_ne!(seen["actor.id"].text, seen["reviewer.id"].text);
         assert_eq!(seen["actor.name"].text.as_deref(), Some("Coder"));
         assert_eq!(seen["reviewer.name"].text.as_deref(), Some("Lead"));
-        assert_eq!(seen["review.source"].text.as_deref(), Some("walk"));
+        assert_eq!(seen["review.source"].text.as_deref(), Some("senpai"));
         for field in [
             "llm.usage.input_tokens",
             "llm.usage.output_tokens",
@@ -7835,6 +7836,18 @@ mod lifetime_tests {
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
+            // The reviewer holds the performer's senpai.
+            let senpai = ContextId::new();
+            let ws = db.get_or_create_default_workspace(reviewer).unwrap();
+            db.insert_context_with_document(&crate::ContextRow {
+                context_id: senpai, label: Some("reviewer-seat".into()), provider: None, model: None, system_prompt: None,
+                context_state: ContextState::Live,
+                context_type: "default".into(), created_at: 0, created_by: reviewer,
+                forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
+                played_by: Some(reviewer), reviewer_id: None, director_id: None, senpai_ctx: None,
+            }, ws).unwrap();
             db.insert_context(&crate::ContextRow {
                 context_id: context, label: None, provider: None, model: None, system_prompt: None,
                 context_state: ContextState::Live,
@@ -7842,7 +7855,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(actor), reviewer_id: Some(reviewer), director_id: None,
+                played_by: Some(actor), reviewer_id: None, director_id: None, senpai_ctx: Some(senpai),
             }).unwrap();
         }
         if let Some(mock) = mock {
@@ -8371,7 +8384,7 @@ mod lifetime_tests {
             kernel.admit_context(context).unwrap());
         tokio::pin!(startup);
         assert!(futures::poll!(&mut startup).is_pending(), "provider selection waits after resolving identity");
-        kernel.kernel_db().lock().update_context_review(context, None, Some(call.principal_id)).unwrap();
+        kernel.kernel_db().lock().assign_test_review(context, None, Some(call.principal_id)).unwrap();
         drop(held);
         let error = startup.await.unwrap_err();
         assert!(error.contains("performer changed during turn preparation"), "{error}");
@@ -8447,7 +8460,7 @@ mod lifetime_tests {
                 }).unwrap();
                 Some(releases)
             };
-            kernel.kernel_db().lock().update_context_review(context, Some(replacement), Some(call.principal_id)).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(replacement), Some(call.principal_id)).unwrap();
             drop(held_conversation);
             drop(releases);
             let event = tokio::time::timeout(Duration::from_secs(3), failures.recv()).await

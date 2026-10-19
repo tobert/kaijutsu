@@ -265,8 +265,13 @@ pub(super) mod fixtures {
             played_by: None,
             reviewer_id: None,
             director_id: None,
+            senpai_ctx: None,
         };
         edit(&mut row);
+        // A context made under a parent answers to it, as a create or a fork would.
+        if row.senpai_ctx.is_none() {
+            row.senpai_ctx = row.forked_from;
+        }
         {
             let db = kernel.kernel_db().lock();
             let ws = db

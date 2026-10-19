@@ -531,7 +531,7 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     };
     let context_id = crate::kj::test_helpers::register_context(&d, Some("council-seat"), parent, actor);
     d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
-    d.kernel_db().lock().update_context_review(context_id, Some(actor), Some(reviewer)).unwrap();
+    d.kernel_db().lock().assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();
     let mut binding = ContextToolBinding::new();
     binding.grant(Capability::Facade("shell_write".into()));
     broker.set_binding(context_id, binding).await.unwrap();
@@ -590,7 +590,7 @@ impl Rig {
         let reviewer = self.ctx.reviewer_id;
         let context_id = crate::kj::test_helpers::register_context(&self.d, Some(label), None, actor);
         self.d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
-        self.d.kernel_db().lock().update_context_review(context_id, Some(actor), reviewer).unwrap();
+        self.d.kernel_db().lock().assign_test_review(context_id, Some(actor), reviewer).unwrap();
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         self.broker.set_binding(context_id, binding).await.unwrap();

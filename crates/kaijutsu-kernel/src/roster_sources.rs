@@ -254,6 +254,7 @@ mod tests {
             played_by: None,
             reviewer_id: None,
             director_id: None,
+            senpai_ctx: None,
         };
         db.insert_context_with_document(&row, ws).expect("create context");
         (Arc::new(parking_lot::Mutex::new(db)), ctx_id)

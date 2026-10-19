@@ -1300,6 +1300,7 @@ fn bootstrap_discovered_context(
         played_by: None,
         reviewer_id: None,
         director_id: Some(PrincipalId::system()),
+        senpai_ctx: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -1367,6 +1368,7 @@ mod context_bootstrap_tests {
             played_by: None,
             reviewer_id: None,
             director_id: None,
+            senpai_ctx: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)

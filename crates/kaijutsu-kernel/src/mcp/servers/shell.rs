@@ -939,7 +939,7 @@ mod tests {
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        d.kernel_db().lock().update_context_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
+        d.kernel_db().lock().assign_test_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
@@ -2412,7 +2412,7 @@ mod tests {
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        d.kernel_db().lock().update_context_review(context, Some(principal), Some(reviewer)).unwrap();
+        d.kernel_db().lock().assign_test_review(context, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(context, binding).await.unwrap();

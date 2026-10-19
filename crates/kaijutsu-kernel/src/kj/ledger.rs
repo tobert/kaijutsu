@@ -1885,9 +1885,9 @@ fn session_remember_applies(
 }
 
 /// Reassign a pending ask. `to` names the next reviewer; `None` continues
-/// the walk reviewer resolution made, from the ask's context up
-/// `forked_from`, past the current reviewer and the performer
-/// (`docs/character.md`, "Roots and rotation"), and refuses at a root. The
+/// the climb reviewer resolution made, from the ask's context up the senpai
+/// chain, past the current reviewer and the performer
+/// (`docs/senpai-kohai.md`, "Routing"), and refuses at a context with no senpai. The
 /// assigned reviewer or the lineage root of the ask's context may reassign.
 /// A caller who names itself takes the ask over; the `escalated` event
 /// records both reviewers either way.
@@ -1969,7 +1969,7 @@ pub fn escalate_ask(
     result
 }
 
-/// The next responsible character above an ask's current reviewer,
+/// The next holder above an ask's current reviewer on the senpai chain,
 /// excluding the performer.
 fn next_reviewer_above(
     db: &crate::kernel_db::KernelDb,
@@ -1984,19 +1984,17 @@ fn next_reviewer_above(
         .unwrap_or_else(|| current_reviewer.to_string());
     let context = ContextId::try_from_slice(&row.context_id)
         .ok_or_else(|| refuse(format!("ask '{request_id}' has no readable context to walk")))?;
-    // Escalation climbs past whoever already holds the ask, and never lands
-    // on the character that performed it.
-    let mut excluded = vec![current_reviewer];
-    if let Some(actor) = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice) {
-        excluded.push(actor);
-    }
-    match db.responsible_character_above(context, &excluded) {
-        Ok(Some(next)) => match db.get_character(next) {
-            Ok(Some(_)) => Ok(next),
-            Ok(None) | Err(_) => Err(refuse(format!("the character responsible above {current_name} has no character sheet"))),
-        },
-        Ok(None) => Err(refuse(format!("{current_name} is at the root; nobody above {current_name}"))),
-        Err(e) => Err(refuse(format!("could not walk the accountability forest: {e}"))),
+    // Escalation climbs the senpai chain past the context the current
+    // reviewer holds, and never lands on the character that performed it. An
+    // ask with no recorded performer climbs past the current reviewer alone.
+    let performer = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice);
+    let query = crate::kernel_db::ReviewQuery::ask(context, performer.unwrap_or(current_reviewer));
+    match db.route_review(query.above(current_reviewer)) {
+        Ok(next) => Ok(next.reviewer()),
+        Err(crate::kernel_db::KernelDbError::NoReviewerAbove(reason)) => Err(refuse(format!(
+            "{current_name} is at the top: {reason}"
+        ))),
+        Err(e) => Err(refuse(format!("could not climb the senpai chain: {e}"))),
     }
 }
 
@@ -2425,7 +2423,7 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
         }
         let caller = crate::kj::KjCaller {
             principal_id: requester,
@@ -2690,22 +2688,22 @@ mod tests {
         assert!(listing.asks.iter().all(|a| a.lineage_root.is_none()), "{listing:?}");
     }
 
-    /// A broken context forest is a fault, not a lineage without a root: the
+    /// A broken senpai chain is a fault, not a lineage without a root: the
     /// listing and an escalation refuse and name it, instead of reading as
     /// "no root" (which would turn into a misleading authorization error).
     #[tokio::test]
-    async fn a_forked_from_cycle_fails_the_listing_and_the_escalation_loudly() {
+    async fn a_senpai_cycle_fails_the_listing_and_the_escalation_loudly() {
         let d = test_dispatcher().await;
         let amy = crate::kj::test_helpers::test_reviewer_principal();
         let c = registered_caller(&d);
         let ctx = c.context_id.unwrap();
         let ask = gate_once(&d, &c, spec()).await.ask.unwrap();
         {
-            // The root context now forks from its own descendant.
+            // The root context now answers to its own descendant.
             let db = d.kernel_db().lock();
-            let root = db.get_context(ctx).unwrap().unwrap().forked_from.expect("the caller's context has a parent");
+            let root = db.get_context(ctx).unwrap().unwrap().senpai_ctx.expect("the caller's context has a senpai");
             db.conn_for_ledger().execute(
-                "UPDATE contexts SET forked_from = ?1 WHERE context_id = ?2",
+                "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
                 rusqlite::params![ctx.as_bytes().as_slice(), root.as_bytes().as_slice()],
             ).unwrap();
             let error = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap_err();
@@ -4121,14 +4119,14 @@ mod tests {
         coder_a.context_id = Some(context);
         d.kernel_db
             .lock()
-            .update_context_review(context, Some(actor_a), Some(reviewer))
+            .assign_test_review(context, Some(actor_a), Some(reviewer))
             .unwrap();
 
         let first = gate_once(&d, &coder_a, shell_spec("performer-swap", "echo reviewed")).await;
         let request_id = first.ask.expect("the first ask").request_id;
         d.kernel_db
             .lock()
-            .update_context_review(context, Some(actor_b), Some(reviewer))
+            .assign_test_review(context, Some(actor_b), Some(reviewer))
             .unwrap();
 
         let reviewer_call = answering_seat();
@@ -5064,7 +5062,7 @@ mod tests {
             for (principal_id, name, root) in [(lead, "lead", false), (bob, "bob", true)] {
                 db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
             }
-            db.update_context_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
+            db.assign_test_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
         }
         let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
         let reclaim = [s("ledger"), s("escalate"), ask.request_id.clone(), s("--to"), s("amy")];
@@ -5090,7 +5088,7 @@ mod tests {
                     principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
-            db.update_context_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
+            db.assign_test_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
         }
         let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
         d.kernel_db().lock().conn_for_ledger().execute(
@@ -5122,8 +5120,8 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.update_context_review_assignment(root, None, None, Some(amy)).unwrap();
-            db.update_context_review(lane, None, Some(banto)).unwrap();
+            db.update_played_by(root, Some(amy)).unwrap();
+            db.assign_test_review(lane, None, Some(banto)).unwrap();
         }
         let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
         let reviewer = caller.clone().with_actor(banto, Some(banto));
@@ -5137,7 +5135,7 @@ mod tests {
         let amy_reviewer = caller.with_actor(amy, Some(amy));
         let at_root = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &amy_reviewer).await;
         assert!(!at_root.is_ok(), "{}", at_root.message());
-        assert!(at_root.message().contains("at the root"), "{}", at_root.message());
+        assert!(at_root.message().contains("at the top") && at_root.message().contains("escalate-root"), "{}", at_root.message());
     }
 
     /// Omitting `--to` when the ask's current reviewer is already the one
@@ -5151,13 +5149,13 @@ mod tests {
         let caller = crate::kj::test_helpers::registered_caller(&d);
         {
             let db = d.kernel_db().lock();
-            db.update_context_review(caller.context_id.unwrap(), None, Some(amy)).unwrap();
+            db.assign_test_review(caller.context_id.unwrap(), None, Some(amy)).unwrap();
         }
         let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
         let reviewer = caller.with_actor(amy, Some(amy));
         let result = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &reviewer).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("at the root"), "{}", result.message());
+        assert!(result.message().contains("at the top"), "{}", result.message());
         let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
         assert_eq!(
             row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()),

@@ -276,7 +276,7 @@ fn seed_turn_identity(server: &SharedKernel, ctx: ContextId) {
     let db = server.kernel_db.lock();
     db.insert_character(&character(performer, "submit-performer")).unwrap();
     db.insert_character(&character(reviewer, "submit-reviewer")).unwrap();
-    db.update_context_review(ctx, Some(performer), Some(reviewer)).unwrap();
+    db.assign_test_review(ctx, Some(performer), Some(reviewer)).unwrap();
 }
 
 /// **2. `submitInput` authors the user block as the connection principal,
@@ -569,7 +569,7 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         server
             .kernel_db
             .lock()
-            .update_context_review(worker_ctx, Some(worker_principal), Some(amy_principal))
+            .assign_test_review(worker_ctx, Some(worker_principal), Some(amy_principal))
             .unwrap();
         worker_kj.join_context(worker_ctx, "worker").await.unwrap();
         coder_kj.join_context(coder_ctx, "coder").await.unwrap();

@@ -187,7 +187,7 @@ mod tests {
             let kernel = dispatcher.kernel();
             let context = identity.context;
             kernel.kernel_db().lock().update_character_root(identity.performer, false).unwrap();
-            kernel.kernel_db().lock().update_context_review(context, Some(identity.performer), identity.reviewer).unwrap();
+            kernel.kernel_db().lock().assign_test_review(context, Some(identity.performer), identity.reviewer).unwrap();
             kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
                 id: HookId("ask-every-shell".into()), match_instance: None, match_tool: None,
                 match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
