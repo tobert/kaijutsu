@@ -257,7 +257,10 @@ answer the old code would have given.
    cast's own slot. The migration cannot read `gate.toml`, so it lists each live instance whose cast has no
    `gate` slot, and each whose cast has no `distill` slot; we add them with `kj cast slot set` before deploy.
    Contexts of one instance with equal resolutions share a `seq`; a different resolution starts the
-   next `seq`, in creation order. A context the old resolver could not resolve gets a binding with no slot for its
+   next `seq`, in creation order of each resolution's first context, except that the conversation's resolution
+   (rule 5) takes the last `seq`, so the newest binding names the conversation. A binding's slots are a copy of
+   the whole effective cast, with the context's own type slot replaced by an override or filled from
+   `llm_defaults`, so a judge shadow shares its conversation's `seq`. A context the old resolver could not resolve gets a binding with no slot for its
    type, and the migration lists it.
 5. **Conversation.** An instance's conversation is its newest live context that is not a fork child of another of
    its contexts or a judge shadow. No stored marker says an rc lifecycle made a context; one made as a fork
