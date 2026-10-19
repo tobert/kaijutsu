@@ -242,3 +242,41 @@ Choices made where the design was silent, the smaller shape each time.
 - **Pre-existing failures**: `kaijutsu-tui` `terminal_fit` tests `ctrl_a_r_rotates_the_seat_and_follows_its_successor`
   and `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` fail on `3260b9a6` as well: the coder probe
   seat lacks operator for `kj context rotate`.
+
+## Open (step 3)
+
+Choices made where the design was silent, the smaller shape each time.
+
+- **Where the edge allow sits.** A drift along the senpai edge is allowed by a `senpai edge` layer of the gate's
+  own evaluation (`gate_policy::evaluate`). It decides only a command that no user rule, family rule or
+  `gate.toml` key decided, ahead of the uncovered tier, so an `ask` or `deny` key on `kj drift push` stays firm
+  and a learned deny still wins. Broker PreCall reads no database and sees no edge, so the pre_call hooks still
+  run before the gate allows. A `KjVerb`-origin ask never meets the layers and is unchanged.
+- **What the edge reads.** `kj drift push <dst>` whose target, resolved as the verb resolves it (`.parent`,
+  labels, ids), is the caller's senpai or a context whose senpai is the caller's; and `kj senpai report` from a
+  context with a senpai. Every argument must be a literal word and the command plain (no redirect, background
+  flag or heredoc), since the target is read from the arguments; `--` refuses, as the character condition does.
+  An archived or concluded kohai passes the edge and is refused by the verb itself.
+- **`kj senpai report`** needs the drift capability, as `kj drift push` does, and delivers at once (no
+  `--stage`). It reuses push's delivery by the senpai's full id, so staging on a failed delivery and the target's
+  drift lifecycle are the same. It refuses a context with no senpai, an archived senpai, and an empty report.
+- **The `<senpai>` element** uses the short id, like `<context>`. `character` is the holder's name, named even
+  when retired (the ask refuses by name later); it is left out when nobody holds the senpai, and `context` is
+  left out when the senpai has no label. A context with no senpai has no element. A senpai with no row stops
+  the turn. `kj context prompt` reads the same fact and no longer resolves the reviewer, so it no longer refuses
+  where review routing would; the turn still does.
+- **A nested archive in an rc lifecycle** (step 2 follow-up 1) passes when the seat, the context whose lifecycle
+  runs, is the target's senpai, or when the seat's holder passes the authority rule. The first case covers a
+  seat nobody performs (`archiving_a_coder_archives_its_judge_shadow`). Whoever started the lifecycle lends it
+  nothing.
+- **The council bench contexts** (`contrib/bench/rc-variants/council/coder/create/S04..S06`, step 2 follow-up 2)
+  are made with `kj kohai create` inside the first coder's create lifecycle, so they answer to that coder seat.
+  They raise no asks, so the edge routes nothing for them today.
+- **bootstrap.sh** cannot put banto under senpai's context: that context is made later, when senpai's MCP session
+  registers. banto starts under Amy's root console, and the script prints the `kj senpai set` Amy runs once
+  senpai's context exists. Automating that move is left for the deploy.
+- **The director stance** reads the senpai from `kj senpai show --json` (the holder's name and the senpai's label)
+  and writes "Our senpai is <holder>, in <context>." The contrib S12-environment files call the session outside
+  the container "the supervisor" where they mean the `/exchange` directories, and "our senpai" for the edge.
+- **Tests rewritten**: `performer_and_reviewer_are_distinct_runtime_facts` is now
+  `performer_and_senpai_are_distinct_runtime_facts`; it pinned the `<reviewer>` element the spec replaces.
