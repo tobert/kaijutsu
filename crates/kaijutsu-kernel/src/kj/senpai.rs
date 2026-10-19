@@ -80,7 +80,7 @@ enum KohaiCommand {
         #[arg(long = "as", value_name = "CHARACTER")]
         character: Option<String>,
         #[command(flatten)]
-        config: ContextConfigArgs,
+        config: Box<ContextConfigArgs>,
     },
     /// List a context's live kohai with type and performer (default:
     /// current).
@@ -170,7 +170,7 @@ impl KjDispatcher {
                     parent.as_deref(),
                     senpai.as_deref(),
                     character.as_deref(),
-                    config,
+                    *config,
                     caller,
                 ))
                 .await

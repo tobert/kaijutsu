@@ -183,6 +183,20 @@ pub fn cast_a_performer(server: &EphemeralServer) {
     })
 }
 
+/// Grant the `operator` capability to the context labelled `label`, from the
+/// root seat. `kj kohai create` needs it, and a coder seat holds none.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
+pub fn grant_operator(server: &EphemeralServer, label: &str) {
+    with_kernel(server, async |kernel| {
+        let contexts = kernel.list_contexts().await.expect("list contexts");
+        let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
+        let target = contexts.iter().find(|info| info.label == label).unwrap_or_else(|| panic!("no context {label}")).id;
+        let argv: Vec<String> = ["binding", "allow", "operator", &target.to_hex()].iter().map(|a| a.to_string()).collect();
+        let result = kernel.execute_kj_quiet(root, &argv).await.expect("run kj");
+        assert_eq!(result.exit_code, 0, "kj {argv:?}: {}", result.stderr);
+    })
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // The pty session
 // ────────────────────────────────────────────────────────────────────────────
