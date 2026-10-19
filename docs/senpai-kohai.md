@@ -145,3 +145,47 @@ columns and tables:
 - A drift along the edge runs with no ask, both ways; a drift to a sibling still asks.
 - The prompt's `<situation>` names the senpai.
 - The migration maps nearest-ancestor cases exactly, reports the others, and refuses an unmappable context.
+
+## Open (step 1)
+
+Choices made conservatively where the design was silent. None is a new rule; each refuses or maps exactly.
+
+- **Create with no calling context** refuses. The design names the caller's context as the senpai; a caller with none (a bare `--parent` from a client that has not run from a context) has nothing to answer to, and the kernel does not pick one.
+- **Cold-start discovery** (`bootstrap_discovered_context` in the server) mints contexts with no senpai, like the other parentless system contexts. The design's list of null-senpai system contexts does not name it. A non-root actor in one refuses at the top.
+- **Judge shadows** (a fork child of a seat) take the seat as senpai, per the fork rule.
+- **Migration, performer-less contexts**: with no performer there is no actor, so the old resolver has no single answer. The migration maps them to the nearest strict ancestor that has a holder, which is what a create or fork from that ancestor would have set.
+- **Migration, retired holder on the old walk**: mapped to the ancestor whose holder is retired. The old resolver refused by name there; the new one refuses by name at the same context, so behaviour is preserved and startup is not blocked. An override naming a retired character has no such context and refuses the migration.
+- **Migration, archived contexts** map like live ones (a live context's chain passes through them). An archived context that cannot be mapped is left a top and reported instead of refusing; only live ones refuse.
+- **Migration, exhausted old walk** (nobody above, no override): the context stays a top, which refuses or self-confirms at ask time as the old resolver did.
+- **`kj context set --reviewer/--director` and `kj ledger delegation`** still exist in this step but no longer route anything; step 2 removes them.
+- **Escalation** climbs past the current reviewer by holder (not "the context that yielded it"); the two agree unless one character holds several consecutive senpai contexts.
+- **A context with no performer** has no reviewer to report (`resolve_context_review` errors "no performer"), as before.
+
+- **Escalation** climbs past the context the current reviewer holds, as designed. An ask whose reviewer was set by hand (`escalate --to`) to a character holding no senpai on the chain has no context to climb from; it refuses and asks for an explicit `--to`.
+- **Dead guard**: `insert_new_context_rows` still checks that a performer is not its own reviewer. Under the senpai climb that cannot happen (the climb passes the actor), so the check is unreachable; step 2 may remove it.
+- **Test fixtures**: contexts registered under a parent (`register_context`, council `live_context_with`) now take the parent as senpai, mirroring create and fork. `KernelDb::assign_test_review` replaces the reviewer override in fixtures: the reviewer holds a seat, and the context is placed under it. A held senpai is required, so fixtures that created a context from a context nobody performs now give that context a performer.
+- **Tests rewritten for the new model** (old to new): `lineage_root_repairs_a_retired_explicit_reviewer` removed (covers `--reviewer`, step 2); `explicit_reviewer_can_assign_a_performer_when_the_lineage_root_is_retired` is now `the_senpai_holder_can_assign_a_performer_when_the_lineage_root_is_retired`; `context_info_keeps_metadata_when_explicit_reviewer_is_retired` is now `..._when_the_senpai_holder_is_retired`; `final_assignment_rejects_reviewer_revoked_after_precheck` and the egress twin move the senpai instead of revoking a delegation; `final_context_insert_rejects_a_reviewer_changed_to_the_performer` is now `..._a_performer_nobody_can_review`; `a_forked_from_cycle_fails_the_listing_and_the_escalation_loudly` is now a senpai cycle; the escalate tests expect "at the top" and a held root console; `context_review_assignment_belongs_to_the_director` drops the self-review step (unreachable); the server wire test `amy_default_and_director_delegation_route_approval_over_the_wire` is now `..._and_escalation_...` (delegation steps removed).
+- **Verified**: `cargo test -p kaijutsu-kernel` 4107 passed, 0 failed, 19 ignored; `kaijutsu-server` and `approval-ledger` pass; fmt clean; clippy on kaijutsu-kernel lib 77 warnings (baseline ~78), none in new code.
+
+## Follow-ups in the same stack (decided by Amy, 2026-10-18)
+
+Amy, on the cleanup after senpai/kohai: "1. gates would have a cast too, sorta like we did in kaibo's config. but
+yes let's plan on that later or in parallel. 2. yes simplify. maybe a context doesn't need the cast attached? each
+turn will have an id we can trace back to cast and model right? 3. I'm cool with moving persona to the character
+and clarifying. 'director' predates the character even existing, and was an early experiment we can rework/remove/
+replace and just didn't finish doing it. 4. good. do it."
+
+These are later steps on this branch, after steps 1-3:
+
+4. **One parent link.** `forked_from` is the only parent link. The 'structural' rows in `context_edges` that
+   duplicate it go; drift edges stay.
+5. **Model provenance per turn; no cast on the context.** Today a turn records nothing durable about its model:
+   `context_usage` keeps only the last request per context. First, each turn writes a durable record: turn id,
+   context, performer, cast, role (context type), provider, model, and the token counts, which also gives spend
+   totals. Then `contexts.cast_id` and the per-context provider/model override go. A context's model is its
+   performer's cast slot for the context's type. To run another model, cast a character whose cast has it.
+6. **Persona on the character.** The character sheet carries the persona text; the context type says what the
+   seat does. The `director` type, which predates characters, is reworked or replaced, and its persona file
+   (S00-stance) moves to the character that plays the seat.
+7. **The gate's own cast**, as in kaibo's config: the reserved `gate` role leaves `cast_slots`. In parallel with
+   4-6 where it does not collide; otherwise after them.
