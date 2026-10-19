@@ -194,10 +194,10 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
         let (kj, _) = client.bind_kernel().await.unwrap();
         let context = create_context(&kj, "requester-performer").await.unwrap();
         let requester = kernel.kernel_db.lock().get_context(context).unwrap().unwrap().created_by;
-        let (performer, reviewer) = (kaijutsu_types::PrincipalId::new(), kaijutsu_types::PrincipalId::new());
+        let performer = kaijutsu_types::PrincipalId::new();
         {
             let db = kernel.kernel_db.lock();
-            for (principal_id, name) in [(performer, "distinct-performer"), (reviewer, "distinct-reviewer")] {
+            for (principal_id, name) in [(performer, "distinct-performer")] {
                 db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
                     principal_id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
@@ -206,7 +206,6 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
         }
         let set = kj.execute_kj_quiet(context, &[
             "context".into(), "set".into(), context.to_hex(), "--as".into(), "distinct-performer".into(),
-            "--reviewer".into(), "distinct-reviewer".into(),
         ]).await.unwrap();
         assert_eq!(set.exit_code, 0, "{}", set.stderr);
         assert_eq!(kernel.kernel_db.lock().get_context(context).unwrap().unwrap().played_by, Some(performer));

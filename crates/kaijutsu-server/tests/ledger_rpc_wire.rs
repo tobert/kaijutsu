@@ -86,7 +86,7 @@ impl Rig {
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
         let (lead_kj, _) = lead_client.bind_kernel().await.unwrap();
         let work = create_context(&amy_kj, "ledger-rpc-work").await.unwrap();
-        kernel.kernel_db.lock().update_context_review_assignment(work, Some(coder), None, None).unwrap();
+        kernel.kernel_db.lock().update_context_performer(work, Some(coder)).unwrap();
         kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("ledger-rpc-gate".into()), match_instance: None,
             match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(work),

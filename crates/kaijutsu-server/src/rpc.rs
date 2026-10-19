@@ -1298,8 +1298,6 @@ fn bootstrap_discovered_context(
         cast_id: None,
         origin_host: None,
         played_by: None,
-        reviewer_id: None,
-        director_id: Some(PrincipalId::system()),
         senpai_ctx: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
@@ -1366,8 +1364,6 @@ mod context_bootstrap_tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
-            reviewer_id: None,
-            director_id: None,
             senpai_ctx: None,
         };
         let ws = db

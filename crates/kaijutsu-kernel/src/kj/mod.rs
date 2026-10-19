@@ -1706,8 +1706,6 @@ pub(crate) mod test_helpers {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
-                reviewer_id: None,
-                director_id: None,
                 // A context registered under a parent answers to it, as a create or a fork would.
                 senpai_ctx: forked_from,
             };

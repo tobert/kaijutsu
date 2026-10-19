@@ -92,7 +92,7 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         let work = create_context(&lead_kj, "coder-work").await.unwrap();
         let row = kernel.kernel_db.lock().get_context(work).unwrap().unwrap();
         assert_eq!(row.created_by, lead);
-        assert_eq!(row.director_id, Some(lead));
+        assert!(row.senpai_ctx.is_some(), "the creating context is the new context's senpai");
         let coder_client = connect(addr, coder_key, "coder").await;
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
         kernel.kernel_db.lock().assign_test_review(work, Some(coder), None).unwrap();
@@ -108,11 +108,6 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         let ask = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
         assert_eq!(ask.actor_id.as_deref(), Some(coder.as_bytes().as_slice()));
         assert_eq!(ask.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
-        assert_eq!(
-            kernel.kernel_db.lock().get_context(work).unwrap().unwrap().reviewer_id,
-            None,
-            "Amy-default review is resolved at the gate, not persisted as an override"
-        );
         let amy_client = connect(addr, amy_key, "amy").await;
         let (amy_kj, _) = amy_client.bind_kernel().await.unwrap();
         let judge_client = connect(addr, judge_key, "judge").await;

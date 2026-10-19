@@ -162,7 +162,7 @@ pub fn kernel_drafts(server: &EphemeralServer) -> Vec<String> {
     })
 }
 
-/// Give every context a performer and a reviewer, so a submit is accepted rather than
+/// Give every context a performer, so a submit is accepted rather than
 /// refused before it commits. The ephemeral kernel has no model, so the
 /// turn itself then fails to start, after the user message lands.
 pub fn cast_a_performer(server: &EphemeralServer) {
@@ -176,10 +176,9 @@ pub fn cast_a_performer(server: &EphemeralServer) {
             assert_eq!(result.exit_code, 0, "kj {argv:?}: {}", result.stderr);
         };
         run(root, &["character", "create", "probe-performer"]).await;
-        run(root, &["character", "create", "probe-reviewer"]).await;
         for info in contexts.iter().filter(|info| info.id != root) {
             let id = info.id.to_hex();
-            run(root, &["context", "set", &id, "--as", "probe-performer", "--reviewer", "probe-reviewer"]).await;
+            run(root, &["context", "set", &id, "--as", "probe-performer"]).await;
         }
     })
 }

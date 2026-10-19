@@ -52,7 +52,6 @@ fn insert_context_row(
     db.insert_context(&ContextRow {
         context_id: ctx_id,
         label: None,
-        director_id: None,
         senpai_ctx: None,
         provider: None,
         model: None,
@@ -74,7 +73,6 @@ fn insert_context_row(
         cast_id: None,
         origin_host: None,
         played_by: None,
-        reviewer_id: None,
     })
     .unwrap();
 }
@@ -1479,7 +1477,6 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
         g.insert_context(&ContextRow {
             context_id: ctx_id,
                         label: None,
-                        director_id: None,
                         senpai_ctx: None,
             provider: None,
             model: None,
@@ -1501,7 +1498,6 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             cast_id: None,
             origin_host: None,
             played_by: None,
-            reviewer_id: None,
         })
         .unwrap();
     }

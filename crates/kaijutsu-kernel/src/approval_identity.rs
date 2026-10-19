@@ -132,7 +132,7 @@ mod tests {
             created_at: kaijutsu_types::now_millis() as i64, created_by: PrincipalId::system(),
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
             concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-            cast_id: None, origin_host: None, played_by, reviewer_id: None, director_id: None, senpai_ctx: senpai,
+            cast_id: None, origin_host: None, played_by, senpai_ctx: senpai,
         }, ws).unwrap();
         context_id
     }

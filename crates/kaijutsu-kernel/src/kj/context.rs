@@ -495,7 +495,8 @@ impl KjDispatcher {
                     if !db.get_character(review.actor)?.is_some_and(|sheet| sheet.retired_at.is_none()) {
                         return Err(crate::kernel_db::KernelDbError::Validation("performer must name a live character".into()));
                     }
-                    db.update_context_review_assignment(target_id, Some(review.actor), current.reviewer_id, current.director_id)?;
+                    let _ = current;
+                    db.update_context_performer(target_id, Some(review.actor))?;
                     let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(target_id, review.actor))?.reviewer();
                     if review.actor == reviewer {
                         return Err(crate::kernel_db::KernelDbError::Validation("the performer cannot review its own work".into()));
@@ -1014,15 +1015,12 @@ impl KjDispatcher {
         if let Some(review) = effective_review.as_ref() {
             info.push_str(&format!("\nReviewer: {} ({})", review.reviewer.name, review.source.as_str()));
         }
-        if let Some(override_id) = row.reviewer_id {
-            info.push_str(&format!("\nReviewer override: {override_id}"));
-        }
-        if let Some(director) = row.director_id {
-            let director_name = match self.kernel_db().lock().get_character(director) {
-                Ok(character) => character.map(|character| character.name).unwrap_or_else(|| director.to_string()),
-                Err(error) => return KjResult::Err(format!("kj context info: director lookup: {error}")),
+        if let Some(senpai) = row.senpai_ctx {
+            let label = match self.kernel_db().lock().get_context(senpai) {
+                Ok(senpai_row) => senpai_row.and_then(|r| r.label).unwrap_or_else(|| senpai.short()),
+                Err(error) => return KjResult::Err(format!("kj context info: senpai lookup: {error}")),
             };
-            info.push_str(&format!("\nDirector: {director_name}"));
+            info.push_str(&format!("\nSenpai: {label} ({})", senpai.short()));
         }
 
         // Structured record: full ids and the same fields the text view
@@ -1102,8 +1100,7 @@ impl KjDispatcher {
         record["reviewer_name"] = serde_json::json!(reviewer_name);
         record["review_source"] = serde_json::json!(effective_review.as_ref().map(|review| review.source.as_str()));
         record["reviewer_error"] = serde_json::json!(reviewer_error);
-        record["reviewer_override_id"] = serde_json::json!(row.reviewer_id.map(|id| id.to_hex()));
-        record["director_id"] = serde_json::json!(row.director_id.map(|id| id.to_hex()));
+        record["senpai_ctx"] = serde_json::json!(row.senpai_ctx.map(|id| id.to_hex()));
 
         KjResult::ok_with_data(info, record)
     }
@@ -1544,7 +1541,6 @@ impl KjDispatcher {
                     Some(_) => {}
                 }
             }
-            let director_id = caller_sheet.map(|_| caller.actor_id);
             if let Some(performer) = played_by {
                 // The context does not exist yet, so routing starts at the
                 // senpai the new row will name.
@@ -1575,8 +1571,6 @@ impl KjDispatcher {
                 cast_id: None,
                 origin_host: None,
                 played_by,
-                reviewer_id: None,
-                director_id,
                 senpai_ctx: Some(senpai_ctx),
             };
             let db = self.kernel_db().lock();
@@ -1838,8 +1832,6 @@ impl KjDispatcher {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
-                reviewer_id: None,
-                director_id: Some(caller.actor_id),
                 senpai_ctx: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
@@ -3819,7 +3811,7 @@ mod tests {
         let db = d.kernel_db().lock();
         db.update_played_by(root, Some(amy)).unwrap();
         db.set_character_root_ctx(amy, Some(root)).unwrap();
-        db.update_context_review_assignment(seat, Some(banto), Some(judge), Some(amy)).unwrap();
+        db.update_played_by(seat, Some(banto)).unwrap();
         db.set_character_root_ctx(banto, Some(seat)).unwrap();
         db.update_model(seat, Some("mock"), Some("mock-banto")).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
@@ -3863,7 +3855,7 @@ mod tests {
         assert_eq!(new.forked_from, Some(f.root), "created from the predecessor's own parent");
         assert_eq!(new.context_type, before.context_type);
         assert_eq!(new.cast_id, before.cast_id);
-        assert_eq!((new.played_by, new.reviewer_id, new.director_id), (before.played_by, before.reviewer_id, before.director_id));
+        assert_eq!((new.played_by, new.senpai_ctx), (before.played_by, before.senpai_ctx));
         assert_eq!((new.provider.as_deref(), new.model.as_deref()), (Some("mock"), Some("mock-banto")));
         assert_eq!(new.system_prompt.as_deref(), Some("seat prompt"));
         assert_eq!(new.workspace_id, before.workspace_id);
@@ -4251,8 +4243,7 @@ mod tests {
                 context_state: ContextState::Live, context_type: s("default"), created_at: 1, created_by: amy,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
                 concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                cast_id: None, origin_host: None, played_by: Some(amy), reviewer_id: None, director_id: None,
-                senpai_ctx: None,
+                cast_id: None, origin_host: None, played_by: Some(amy), senpai_ctx: None,
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
@@ -4356,8 +4347,6 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: Some(performer),
-            reviewer_id: None,
-            director_id: Some(amy),
             senpai_ctx: None,
         };
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, None).unwrap_err();
@@ -4406,8 +4395,6 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: Some(performer),
-            reviewer_id: None,
-            director_id: Some(performer),
             senpai_ctx: None,
         };
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, None).unwrap_err();
@@ -4433,35 +4420,6 @@ mod tests {
         let row = db.get_context(db.resolve_context("unassigned").unwrap()).unwrap().unwrap();
         assert_eq!(row.created_by, caller.principal_id);
         assert_eq!(row.played_by, None);
-    }
-
-    /// The caller becomes the director only when it has a character sheet;
-    /// a characterless principal cannot hold a delegation
-    /// (`docs/character.md`, "Current implementation", Client creation).
-    #[tokio::test]
-    async fn context_create_records_only_a_character_as_director() {
-        let d = test_dispatcher().await;
-        let mut characterless = test_caller();
-        let characterless_parent = register_context(&d, Some("no-sheet-parent"), None, characterless.principal_id);
-        characterless.context_id = Some(characterless_parent);
-        let result = d.dispatch(&[s("context"), s("create"), s("no-sheet")], &characterless).await;
-        assert!(result.is_ok(), "{}", result.message());
-
-        let mut character = test_caller();
-        let character_parent = register_context(&d, Some("with-sheet-parent"), None, character.principal_id);
-        character.context_id = Some(character_parent);
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: character.actor_id, name: s("lead"), created_at: 1,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-        }).unwrap();
-        let result = d.dispatch(&[s("context"), s("create"), s("with-sheet")], &character).await;
-        assert!(result.is_ok(), "{}", result.message());
-
-        let db = d.kernel_db().lock();
-        let no_sheet = db.get_context(db.resolve_context("no-sheet").unwrap()).unwrap().unwrap();
-        assert_eq!(no_sheet.director_id, None, "a characterless creator is not a director");
-        let with_sheet = db.get_context(db.resolve_context("with-sheet").unwrap()).unwrap().unwrap();
-        assert_eq!(with_sheet.director_id, Some(character.actor_id));
     }
 
     /// `--type` with no matching rc bucket is refused before any row lands

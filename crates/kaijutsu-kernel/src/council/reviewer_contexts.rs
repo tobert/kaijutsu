@@ -168,12 +168,10 @@ case = "shell"
         let seat = live_context_with(&kernel, "banto", |r| {
             r.forked_from = Some(root);
             r.played_by = Some(banto);
-            r.director_id = Some(amy);
         });
         let lane = live_context_with(&kernel, "lane-a", |r| {
             r.forked_from = Some(seat);
             r.played_by = Some(coder);
-            r.director_id = Some(banto);
         });
         Forest { kernel, amy, banto, coder, root, lane }
     }
@@ -232,7 +230,6 @@ case = "shell"
         let sub = live_context_with(&f.kernel, "lead-seat", |r| {
             r.forked_from = Some(f.lane);
             r.played_by = Some(lead);
-            r.director_id = Some(f.coder);
         });
         let worker = character(&f.kernel, "worker", false);
         let leaf = live_context_with(&f.kernel, "leaf", |r| {

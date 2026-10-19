@@ -598,7 +598,6 @@ impl KjDispatcher {
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
             let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
-            let source_reviewer_id = source_row.as_ref().and_then(|r| r.reviewer_id);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -627,10 +626,6 @@ impl KjDispatcher {
                 cast_id: source_cast,
                 origin_host: None,
                 played_by: source_played_by,
-                reviewer_id: source_reviewer_id,
-                // The forking actor directs the child; the reviewer override is
-                // the one review field a fork preserves.
-                director_id: Some(caller.actor_id),
                 // The forking context is the fork's senpai.
                 senpai_ctx: Some(source_id),
             };
@@ -977,7 +972,6 @@ impl KjDispatcher {
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
             let source_played_by = source_row.played_by;
-            let source_reviewer_id = source_row.reviewer_id;
 
             let row = ContextRow {
                 context_id: new_id,
@@ -1002,8 +996,6 @@ impl KjDispatcher {
                 cast_id: source_cast,
                 origin_host: None,
                 played_by: source_played_by,
-                reviewer_id: source_reviewer_id,
-                director_id: Some(caller.actor_id),
                 // The forking context is the fork's senpai.
                 senpai_ctx: Some(source_id),
             };
@@ -2411,13 +2403,11 @@ mod tests {
     /// carry the performer as their sender, never the requester. The new
     /// context row's `created_by` is the opposite — it names the requester
     /// who created the context.
-    /// The forking actor directs the child. A fork is the actor's own
-    /// work, so `director_id` names the performer that forked it, not
-    /// whoever directed the source; the reviewer override is preserved.
-    /// This is what lets a director cast its own children into the lanes
-    /// it forks (`docs/approval-identity.md`).
+    /// The forking context, not the forking actor, is what the child
+    /// answers to (`fork_makes_the_forking_context_the_senpai`); the row
+    /// still names the requester as its creator.
     #[tokio::test]
-    async fn fork_child_is_directed_by_the_forking_actor() {
+    async fn fork_child_names_the_requester_as_its_creator() {
         let d = test_dispatcher().await;
         let requester = PrincipalId::new();
         let source = register_context(&d, Some("dir-fork-src"), None, requester);
@@ -2434,12 +2424,8 @@ mod tests {
 
         let child = child_id(&d, "dir-fork-child");
         let row = d.kernel_db().lock().get_context(child).unwrap().unwrap();
-        assert_eq!(
-            row.director_id,
-            Some(performer),
-            "the forking actor directs the child, not the source's director"
-        );
-        assert_eq!(row.created_by, c.principal_id, "created_by still names the requester");
+        assert_ne!(c.principal_id, performer);
+        assert_eq!(row.created_by, c.principal_id, "created_by names the requester, not the performer");
     }
 
     /// A fork answers to the context it was forked from, whoever forked it.

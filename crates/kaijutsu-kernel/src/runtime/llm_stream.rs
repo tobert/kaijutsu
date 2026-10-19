@@ -473,13 +473,6 @@ pub(super) async fn spawn_admitted_turn(
 
     // A startup error is returned, not recorded here: `queue_startup`
     // records every startup failure once (`turn_request::report_failure`).
-    let director = {
-        let db = kernel_db.lock();
-        db.get_context(context_id)
-            .map_err(|e| format!("Could not read performer assignment: {e}"))?
-            .ok_or_else(|| format!("No such context: {context_id}"))?
-            .director_id
-    };
     let (identity, review) = super::turn_identity::resolve_for_context(&kernel_arc, context_id).await?;
     let performer = {
         let db = kernel_db.lock();
@@ -755,7 +748,7 @@ pub(super) async fn spawn_admitted_turn(
             provider, documents, context_id, model_name, kernel_arc, kernel_db,
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts,
             tunables, conversation_cache, user_principal_id,
-            Some(TurnSpanIdentity { performer, reviewer, director, review_source: review.source }),
+            Some(TurnSpanIdentity { performer, reviewer, review_source: review.source }),
             tool_ctx, interrupt, turn_lease, origin,
             continuation_epoch,
         );
@@ -2230,7 +2223,6 @@ impl Drop for TurnUsageOnSpan {
 struct TurnSpanIdentity {
     performer: crate::CharacterIdentity,
     reviewer: crate::CharacterIdentity,
-    director: Option<PrincipalId>,
     review_source: crate::approval_identity::ReviewSource,
 }
 
@@ -2265,7 +2257,6 @@ fn record_continuation_yield(
         principal.id = %user_principal_id,
         actor.id = tracing::field::Empty,
         reviewer.id = tracing::field::Empty,
-        director.id = tracing::field::Empty,
         review.source = tracing::field::Empty,
         actor.name = tracing::field::Empty,
         reviewer.name = tracing::field::Empty,
@@ -2523,9 +2514,6 @@ async fn run_llm_stream(
         let span = tracing::Span::current();
         span.record("actor.id", tracing::field::display(identity.performer.principal_id));
         span.record("reviewer.id", tracing::field::display(identity.reviewer.principal_id));
-        if let Some(director) = identity.director {
-            span.record("director.id", tracing::field::display(director));
-        }
         span.record("review.source", identity.review_source.as_str());
         span.record("actor.name", identity.performer.name.as_str());
         span.record("reviewer.name", identity.reviewer.name.as_str());
@@ -6603,8 +6591,6 @@ mod usage_tests {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
-                reviewer_id: None,
-                director_id: None,
                 senpai_ctx: None,
             })
             .unwrap();
@@ -6648,7 +6634,6 @@ mod usage_tests {
                     principal_id: reviewer,
                     name: "Lead".to_string(),
                 },
-                director: Some(player),
                 review_source: crate::approval_identity::ReviewSource::Senpai,
             }),
             tool_ctx,
@@ -7135,7 +7120,7 @@ mod usage_tests {
             "this thread drove one turn, so one llm.turn span was created here"
         );
         let seen = &mine[0].fields;
-        for field in ["context.id", "principal.id", "actor.id", "reviewer.id", "director.id", "review.source"] {
+        for field in ["context.id", "principal.id", "actor.id", "reviewer.id", "review.source"] {
             assert!(
                 seen.get(field).and_then(|value| value.text.as_ref()).is_some(),
                 "{field} was not recorded on llm.turn",
@@ -7846,7 +7831,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(reviewer), reviewer_id: None, director_id: None, senpai_ctx: None,
+                played_by: Some(reviewer), senpai_ctx: None,
             }, ws).unwrap();
             db.insert_context(&crate::ContextRow {
                 context_id: context, label: None, provider: None, model: None, system_prompt: None,
@@ -7855,7 +7840,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(actor), reviewer_id: None, director_id: None, senpai_ctx: Some(senpai),
+                played_by: Some(actor), senpai_ctx: Some(senpai),
             }).unwrap();
         }
         if let Some(mock) = mock {
@@ -8280,7 +8265,7 @@ mod lifetime_tests {
     async fn a_submit_without_a_performer_is_refused_before_the_input_commits() {
         let (kernel, context, _after, call) = fixture(Some(MockClient::new(""))).await;
         let player = call.principal_id;
-        kernel.kernel_db().lock().update_context_review_assignment(context, None, None, None).unwrap();
+        kernel.kernel_db().lock().update_context_performer(context, None).unwrap();
         kernel.blocks().edit_draft(context, player, 0, "keep me", 0).unwrap();
         let landed = kernel.blocks().non_draft_snapshots(context).unwrap().len();
 
@@ -8329,7 +8314,7 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
-    /// A context with a director but no performer names the missing
+    /// A context with a senpai but no performer names the missing
     /// performer, not the reviewer walk that cannot start without one, and
     /// a headless turn's transcript carries the same text, once.
     #[tokio::test]
@@ -8342,7 +8327,7 @@ mod lifetime_tests {
                 principal_id: director, name: "banto".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.update_context_review_assignment(context, None, None, Some(director)).unwrap();
+            db.assign_test_review(context, None, Some(director)).unwrap();
         }
         let error = spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None, kernel.turns().begin(context),

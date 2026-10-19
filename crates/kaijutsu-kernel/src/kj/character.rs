@@ -386,8 +386,6 @@ impl KjDispatcher {
                 cast_id: None,
                 origin_host: None,
                 played_by: Some(character),
-                reviewer_id: None,
-                director_id: None,
                 senpai_ctx: None,
             };
             db.in_transaction(|db| {

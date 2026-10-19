@@ -971,8 +971,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             .expect("rc created child context");
         assert_eq!(child.created_by, caller.principal_id, "Amy requested the work");
         assert_eq!(child.played_by, Some(coder));
-        assert_eq!(child.director_id, Some(lead), "the lead directs its coder");
-        assert_eq!(child.reviewer_id, None, "there is no implicit reviewer override");
+        assert_eq!(child.senpai_ctx, Some(lookup_context_id(&d, "lead-work")), "the lead's context is its coder's senpai");
         assert_eq!(
             d.kernel().resolve_context_review(child_id).await.unwrap().reviewer.principal_id,
             lead,

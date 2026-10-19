@@ -167,10 +167,6 @@ pub struct ContextRow {
     /// continuation by default. See `docs/character.md`, "A context is
     /// played by a character".
     pub played_by: Option<PrincipalId>,
-    /// Explicit approval reviewer override for this context.
-    pub reviewer_id: Option<PrincipalId>,
-    /// Director responsible for this context's performer.
-    pub director_id: Option<PrincipalId>,
     /// The context this one answers to: its senpai (`docs/senpai-kohai.md`). Routes
     /// its asks, reports and escalations. `None` only for a root character's
     /// console and the system contexts that have no parent.
@@ -813,8 +809,6 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- reads `auth.db`, so no FK reaches it. See `ContextRow::played_by`'s
     -- doc comment.
     played_by    BLOB,
-    reviewer_id  BLOB,
-    director_id  BLOB,
     -- The senpai context: who this context answers to. NULL only for a root
     -- console and the parentless system contexts. No ON DELETE action: history
     -- is retained, and a delete that would orphan a kohai must fail loudly.
@@ -851,22 +845,6 @@ CREATE TABLE IF NOT EXISTS context_continuations (
     -- Refuses automatic resume until the next epoch clears both.
     interrupted_at INTEGER,
     interrupted_by BLOB
-);
-
-CREATE TABLE IF NOT EXISTS approval_reviewer_delegations (
-    director_id BLOB NOT NULL PRIMARY KEY,
-    reviewer_id BLOB NOT NULL,
-    granted_by BLOB NOT NULL,
-    granted_at INTEGER NOT NULL,
-    revoked_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS approval_reviewer_delegation_events (
-    event_id BLOB NOT NULL PRIMARY KEY,
-    director_id BLOB NOT NULL,
-    reviewer_id BLOB,
-    actor_id BLOB NOT NULL,
-    operation TEXT NOT NULL CHECK (operation IN ('grant', 'revoke')),
-    occurred_at INTEGER NOT NULL
 );
 
 -- ── Context Edges ───────────────────────────────────────────────
@@ -2615,70 +2593,6 @@ impl KernelDb {
         )))
     }
 
-    /// Return the active reviewer delegation for one director.
-    pub fn active_approval_delegation(&self, director: PrincipalId) -> KernelDbResult<Option<PrincipalId>> {
-        self.conn.query_row(
-            "SELECT reviewer_id FROM approval_reviewer_delegations WHERE director_id = ?1 AND revoked_at IS NULL",
-            params![blob_param(director.as_bytes())],
-            |row| read_principal_id(row, 0),
-        ).optional().map_err(Into::into)
-    }
-
-    /// Grant or replace one director-wide reviewer delegation and record its actor.
-    pub fn grant_approval_delegation(&self, director: PrincipalId, reviewer: PrincipalId, granted_by: PrincipalId) -> KernelDbResult<()> {
-        if self.conn.is_autocommit() {
-            return self.in_transaction(|db| db.grant_approval_delegation(director, reviewer, granted_by));
-        }
-        let now = now_millis() as i64;
-        self.conn.execute(
-            "INSERT INTO approval_reviewer_delegations (director_id, reviewer_id, granted_by, granted_at, revoked_at)
-             VALUES (?1, ?2, ?3, ?4, NULL)
-             ON CONFLICT(director_id) DO UPDATE SET reviewer_id = excluded.reviewer_id, granted_by = excluded.granted_by, granted_at = excluded.granted_at, revoked_at = NULL",
-            params![blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(granted_by.as_bytes()), now],
-        )?;
-        self.conn.execute(
-            "INSERT INTO approval_reviewer_delegation_events (event_id, director_id, reviewer_id, actor_id, operation, occurred_at) VALUES (?1, ?2, ?3, ?4, 'grant', ?5)",
-            params![uuid::Uuid::now_v7().as_bytes(), blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(granted_by.as_bytes()), now],
-        )?;
-        Ok(())
-    }
-
-    /// List active director-wide reviewer delegations.
-    pub fn list_approval_delegations(&self) -> KernelDbResult<Vec<(PrincipalId, PrincipalId, PrincipalId, i64)>> {
-        let mut statement = self.conn.prepare("SELECT director_id, reviewer_id, granted_by, granted_at FROM approval_reviewer_delegations WHERE revoked_at IS NULL ORDER BY granted_at")?;
-        let rows = statement.query_map([], |row| Ok((read_principal_id(row, 0)?, read_principal_id(row, 1)?, read_principal_id(row, 2)?, row.get(3)?)))?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// Revoke an active director-wide reviewer delegation and record its actor.
-    pub fn revoke_approval_delegation(&self, director: PrincipalId, revoked_by: PrincipalId) -> KernelDbResult<bool> {
-        if self.conn.is_autocommit() {
-            return self.in_transaction(|db| db.revoke_approval_delegation(director, revoked_by));
-        }
-        let current = self.active_approval_delegation(director)?;
-        let Some(reviewer) = current else { return Ok(false) };
-        let now = now_millis() as i64;
-        self.conn.execute(
-            "UPDATE approval_reviewer_delegations SET revoked_at = ?1 WHERE director_id = ?2 AND revoked_at IS NULL",
-            params![now, blob_param(director.as_bytes())],
-        )?;
-        self.conn.execute(
-            "INSERT INTO approval_reviewer_delegation_events (event_id, director_id, reviewer_id, actor_id, operation, occurred_at) VALUES (?1, ?2, ?3, ?4, 'revoke', ?5)",
-            params![uuid::Uuid::now_v7().as_bytes(), blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(revoked_by.as_bytes()), now],
-        )?;
-        Ok(true)
-    }
-
-    /// Whether a pending ask belongs to a context whose director is this character.
-    pub fn has_pending_asks_for_director(&self, director: PrincipalId) -> KernelDbResult<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM approvals a JOIN contexts c ON c.context_id = a.context_id
-             WHERE a.status = 'pending' AND c.director_id = ?1",
-            params![blob_param(director.as_bytes())], |row| row.get(0),
-        )?;
-        Ok(count != 0)
-    }
-
     /// The public face of `approval_ledger::ask::list_pending` — the asks
     /// waiting on a human right now.
     ///
@@ -2992,7 +2906,6 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE contexts ADD COLUMN played_by BLOB",
             SENPAI_COLUMN_ALTER,
-            "ALTER TABLE contexts ADD COLUMN reviewer_id BLOB",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -3030,13 +2943,6 @@ impl KernelDb {
         if has_accountable_to {
             conn.execute("ALTER TABLE characters DROP COLUMN accountable_to", [])?;
             tracing::info!("dropped characters.accountable_to; accountability is a relation between contexts");
-        }
-        let has_director: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'director_id')", [], |row| row.get(0))?;
-        if !has_director {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute("ALTER TABLE contexts ADD COLUMN director_id BLOB", [])?;
-            tx.execute("UPDATE contexts SET reviewer_id = NULL WHERE director_id IS NULL", [])?;
-            tx.commit()?;
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS context_continuations (
@@ -3076,6 +2982,7 @@ impl KernelDb {
         Self::remove_retired_classifier(conn)?;
         Self::migrate_house_capability(conn)?;
         Self::migrate_senpai_edges(conn)?;
+        Self::drop_old_routing(conn)?;
         Ok(())
     }
 
@@ -3537,9 +3444,10 @@ impl KernelDb {
 
     const SENPAI_MIGRATION: &'static str = "senpai-edges-v1";
 
-    /// Set `senpai_ctx` for every context from what routes it today
-    /// (`docs/senpai-kohai.md`, "Migration"), once. The old columns and
-    /// tables are read, not dropped: a later step removes them.
+    /// Set `senpai_ctx` for every context from what routed it before the
+    /// senpai edge (`docs/senpai-kohai.md`, "Migration"), once. The old
+    /// columns and tables are read where they still exist;
+    /// [`Self::drop_old_routing`] removes them after this has run.
     ///
     /// For a context C with a parent on `forked_from`, run once as the old
     /// resolver would have, acting as C's performer:
@@ -3576,7 +3484,7 @@ impl KernelDb {
                         created_at, created_by, forked_from, fork_kind,
                         archived_at, workspace_id, preset_id, concluded_at,
                         last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host,
-                        played_by, reviewer_id, director_id, senpai_ctx
+                        played_by, senpai_ctx
                  FROM contexts ORDER BY created_at, context_id",
             )?;
             stmt.query_map([], row_to_context_row)?.collect::<SqliteResult<_>>()?
@@ -3589,12 +3497,27 @@ impl KernelDb {
                 .map(|r| r.map(|c| (c.principal_id, c)))
                 .collect::<SqliteResult<_>>()?
         };
-        let delegations: HashMap<PrincipalId, PrincipalId> = {
+        // The old routing, where this database still has it. A table with
+        // `reviewer_id` but no `director_id` predates the director column, and
+        // the open that added it cleared every override, so none survive.
+        let has_reviewer = Self::has_column(&tx, "contexts", "reviewer_id")?;
+        let has_director = Self::has_column(&tx, "contexts", "director_id")?;
+        let old_routing: HashMap<ContextId, (Option<PrincipalId>, Option<PrincipalId>)> = if has_director {
+            let reviewer = if has_reviewer { "reviewer_id" } else { "NULL" };
+            let mut stmt = tx.prepare(&format!("SELECT context_id, {reviewer}, director_id FROM contexts"))?;
+            stmt.query_map([], |r| Ok((read_context_id(r, 0)?, (read_opt_principal_id(r, 1)?, read_opt_principal_id(r, 2)?))))?
+                .collect::<SqliteResult<_>>()?
+        } else {
+            HashMap::new()
+        };
+        let delegations: HashMap<PrincipalId, PrincipalId> = if Self::has_table(&tx, "approval_reviewer_delegations")? {
             let mut stmt = tx.prepare(
                 "SELECT director_id, reviewer_id FROM approval_reviewer_delegations WHERE revoked_at IS NULL",
             )?;
             stmt.query_map([], |r| Ok((read_principal_id(r, 0)?, read_principal_id(r, 1)?)))?
                 .collect::<SqliteResult<_>>()?
+        } else {
+            HashMap::new()
         };
         let by_id: HashMap<ContextId, &ContextRow> = contexts.iter().map(|c| (c.context_id, c)).collect();
         let root_owner: HashMap<ContextId, PrincipalId> = characters.values()
@@ -3630,8 +3553,9 @@ impl KernelDb {
         };
 
         let plan = |c: &ContextRow| -> Plan {
-            let override_reviewer = c.reviewer_id.map(|r| (r, "explicit reviewer override".to_string())).or_else(|| {
-                let director = c.director_id?;
+            let (reviewer_id, director_id) = old_routing.get(&c.context_id).copied().unwrap_or((None, None));
+            let override_reviewer = reviewer_id.map(|r| (r, "explicit reviewer override".to_string())).or_else(|| {
+                let director = director_id?;
                 delegations.get(&director).map(|r| (*r, format!("delegation from director {}", name_of(director))))
             });
             if c.forked_from.is_none() && override_reviewer.is_none() {
@@ -3766,6 +3690,59 @@ impl KernelDb {
             reported = report.len(),
             "mapped every context to its senpai"
         );
+        Ok(())
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> KernelDbResult<bool> {
+        Ok(conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
+            [column], |row| row.get(0),
+        )?)
+    }
+
+    fn has_table(conn: &Connection, table: &str) -> KernelDbResult<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table], |row| row.get(0),
+        )?)
+    }
+
+    /// Drop the routing the senpai edge replaced: `contexts.reviewer_id`,
+    /// `contexts.director_id`, and the delegation table and its events
+    /// (`docs/senpai-kohai.md`, "Removed"). Runs only once
+    /// [`Self::migrate_senpai_edges`] has recorded its mapping, which read
+    /// them; a mapping that refused leaves them for the next open. What they
+    /// said survives as each context's `senpai_ctx`, and, where that was not
+    /// the nearest ancestor, as the old reviewer in `senpai_migration_report`.
+    /// A fresh database never had them and does nothing.
+    fn drop_old_routing(conn: &Connection) -> KernelDbResult<()> {
+        let mapped: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
+            [Self::SENPAI_MIGRATION], |row| row.get(0),
+        )?;
+        if !mapped {
+            return Err(KernelDbError::Validation(
+                "the old routing columns cannot be dropped before the senpai migration has mapped them".into(),
+            ));
+        }
+        let tx = conn.unchecked_transaction()?;
+        let mut dropped = Vec::new();
+        for column in ["reviewer_id", "director_id"] {
+            if Self::has_column(&tx, "contexts", column)? {
+                tx.execute(&format!("ALTER TABLE contexts DROP COLUMN {column}"), [])?;
+                dropped.push(format!("contexts.{column}"));
+            }
+        }
+        for table in ["approval_reviewer_delegation_events", "approval_reviewer_delegations"] {
+            if Self::has_table(&tx, table)? {
+                tx.execute(&format!("DROP TABLE {table}"), [])?;
+                dropped.push(table.to_string());
+            }
+        }
+        tx.commit()?;
+        if !dropped.is_empty() {
+            info!(dropped = %dropped.join(", "), "dropped the routing the senpai edge replaced");
+        }
         Ok(())
     }
 
@@ -4610,14 +4587,14 @@ impl KernelDb {
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-                origin_host, played_by, reviewer_id, director_id, senpai_ctx
+                origin_host, played_by, senpai_ctx
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25
+                ?21, ?22, ?23
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -4642,8 +4619,6 @@ impl KernelDb {
                     row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.origin_host,
                     row.played_by.as_ref().map(|id| id.as_bytes().to_vec()),
-                    row.reviewer_id.as_ref().map(|id| id.as_bytes().to_vec()),
-                    row.director_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.senpai_ctx.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
@@ -4664,7 +4639,7 @@ impl KernelDb {
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, senpai_ctx
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -4741,29 +4716,14 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Set a test fixture's performer while preserving its reviewer.
-    #[cfg(test)]
+    /// Set a test fixture's performer.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn update_played_by(
         &self,
         id: ContextId,
         played_by: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
-        self.in_transaction(|db| {
-            let row = db.get_context(id)?
-                .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
-            db.update_context_review(id, played_by, row.reviewer_id)
-        })
-    }
-
-    /// Atomically set the context performer and its assigned reviewer.
-    pub fn update_context_review(
-        &self,
-        id: ContextId,
-        played_by: Option<PrincipalId>,
-        reviewer_id: Option<PrincipalId>,
-    ) -> KernelDbResult<()> {
-        let director_id = self.get_context(id)?.and_then(|row| row.director_id);
-        self.update_context_review_assignment(id, played_by, reviewer_id, director_id)
+        self.update_context_performer(id, played_by)
     }
 
     /// Test fixture: make `context` performed by `played_by` and reviewed by
@@ -4779,7 +4739,7 @@ impl KernelDb {
         played_by: Option<PrincipalId>,
         reviewer: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
-        self.update_context_review(context, played_by, None)?;
+        self.update_context_performer(context, played_by)?;
         let Some(reviewer) = reviewer else { return Ok(()) };
         let label = format!("review-seat-{}", reviewer.to_hex());
         let seat = match self.find_context_by_label(&label)? {
@@ -4793,8 +4753,7 @@ impl KernelDb {
                     created_at: now_millis(), created_by: reviewer, forked_from: None, fork_kind: None,
                     archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
                     last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                    cast_id: None, origin_host: None, played_by: Some(reviewer), reviewer_id: None,
-                    director_id: None, senpai_ctx: None,
+                    cast_id: None, origin_host: None, played_by: Some(reviewer), senpai_ctx: None,
                 };
                 // The reviewer's own senpai is where the context answered
                 // before, so the climb continues where the old walk did.
@@ -4806,16 +4765,15 @@ impl KernelDb {
         self.set_context_senpai(context, Some(seat))
     }
 
-    /// Atomically set performer, explicit reviewer override, and director.
-    pub fn update_context_review_assignment(
+    /// Set the context's performer. A change of performer ends the open
+    /// continuation and revokes the context's session-scoped standing rules.
+    pub fn update_context_performer(
         &self,
         id: ContextId,
         played_by: Option<PrincipalId>,
-        reviewer_id: Option<PrincipalId>,
-        director_id: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
         if self.conn.is_autocommit() {
-            return self.in_transaction(|db| db.update_context_review_assignment(id, played_by, reviewer_id, director_id));
+            return self.in_transaction(|db| db.update_context_performer(id, played_by));
         }
         let current = self.get_context(id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
@@ -4835,11 +4793,9 @@ impl KernelDb {
             )?;
         }
         let updated = self.conn.execute(
-            "UPDATE contexts SET played_by = ?1, reviewer_id = ?2, director_id = ?3 WHERE context_id = ?4",
+            "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
             params![
                 played_by.as_ref().map(|p| p.as_bytes().to_vec()),
-                reviewer_id.as_ref().map(|p| p.as_bytes().to_vec()),
-                director_id.as_ref().map(|p| p.as_bytes().to_vec()),
                 blob_param(id.as_bytes()),
             ],
         )?;
@@ -5210,7 +5166,7 @@ impl KernelDb {
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, senpai_ctx
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -5227,7 +5183,7 @@ impl KernelDb {
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, senpai_ctx
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -5278,7 +5234,7 @@ impl KernelDb {
                     c.system_prompt, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, c.senpai_ctx
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.senpai_ctx
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -5297,7 +5253,7 @@ impl KernelDb {
                     c.system_prompt, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, c.senpai_ctx
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.senpai_ctx
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -5336,7 +5292,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, c.senpai_ctx, dag.depth
+                   c.cast_id, c.origin_host, c.played_by, c.senpai_ctx, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -5344,7 +5300,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(25)?;
+            let depth: i64 = row.get(23)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -5367,7 +5323,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, c.senpai_ctx, lineage.depth
+                   c.cast_id, c.origin_host, c.played_by, c.senpai_ctx, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -5375,7 +5331,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(25)?;
+            let depth: i64 = row.get(23)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -7582,7 +7538,7 @@ impl KernelDb {
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, senpai_ctx
              FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
@@ -8701,7 +8657,7 @@ impl KernelDb {
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-             origin_host, played_by, reviewer_id, director_id, senpai_ctx
+             origin_host, played_by, senpai_ctx
              FROM contexts WHERE played_by = ?1 AND archived_at IS NULL",
         )?;
         let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_context_row)?;
@@ -8869,9 +8825,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         cast_id: read_opt_cast_id(row, 19)?,
         origin_host: row.get(20)?,
         played_by: read_opt_principal_id(row, 21)?,
-        reviewer_id: read_opt_principal_id(row, 22)?,
-        director_id: read_opt_principal_id(row, 23)?,
-        senpai_ctx: read_opt_context_id(row, 24)?,
+        senpai_ctx: read_opt_context_id(row, 22)?,
     })
 }
 
@@ -9262,8 +9216,6 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         cast_id: None,
         origin_host: None,
         played_by: None,
-        reviewer_id: None,
-        director_id: None,
         senpai_ctx: None,
     }
 }
@@ -9878,43 +9830,41 @@ mod tests {
         assert_eq!(loaded.last_activity_at, None, "fresh row: never touched");
     }
 
+    /// A database from before the director column has `reviewer_id` but no
+    /// `director_id`. The open that added the director column cleared every
+    /// such reviewer, so the senpai migration maps none of them as an
+    /// override: the context takes its nearest ancestor and is not reported.
+    /// The drop then removes `reviewer_id`.
     #[test]
-    fn director_migration_clears_implicit_reviewers_atomically_and_only_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kernel.db");
-        let db = KernelDb::open(&path).unwrap();
-        let ws = setup_test_db(&db);
-        let mut row = make_context_row(Some("legacy-review"));
-        row.played_by = Some(PrincipalId::new());
-        row.reviewer_id = Some(row.created_by);
-        insert_context_with_doc(&db, &row, ws);
-        db.conn.execute("ALTER TABLE contexts DROP COLUMN director_id", []).unwrap();
-        db.conn.execute_batch(
-            "CREATE TRIGGER refuse_reviewer_reset BEFORE UPDATE OF reviewer_id ON contexts
-             BEGIN SELECT RAISE(ABORT, 'injected reset failure'); END;",
+    fn a_reviewer_from_before_the_director_column_is_not_an_override() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [coder, banto, judge] = seed_characters(&db, &["coder", "banto", "judge"])[..] else { unreachable!() };
+        db.conn.execute("ALTER TABLE contexts ADD COLUMN reviewer_id BLOB", []).unwrap();
+        let mut seat = make_context_row(Some("seat"));
+        seat.played_by = Some(banto);
+        insert_context_with_doc(&db, &seat, ws_id);
+        let mut judge_seat = make_context_row(Some("judge-seat"));
+        judge_seat.played_by = Some(judge);
+        insert_context_with_doc(&db, &judge_seat, ws_id);
+        let mut lane = make_context_row(Some("lane"));
+        lane.forked_from = Some(seat.context_id);
+        lane.played_by = Some(coder);
+        insert_context_with_doc(&db, &lane, ws_id);
+        db.conn.execute(
+            "UPDATE contexts SET reviewer_id = ?1 WHERE context_id = ?2",
+            params![blob_param(judge.as_bytes()), blob_param(lane.context_id.as_bytes())],
         ).unwrap();
-        let error = KernelDb::apply_additive_migrations(&db.conn).unwrap_err();
-        assert!(error.to_string().contains("injected reset failure"), "{error}");
-        let has_director: bool = db.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'director_id')",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert!(!has_director, "a failed reset must roll back the migration marker column too");
-        db.conn.execute("DROP TRIGGER refuse_reviewer_reset", []).unwrap();
-        drop(db);
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::SENPAI_MIGRATION]).unwrap();
 
-        let db = KernelDb::open(&path).unwrap();
-        let migrated = db.get_context(row.context_id).unwrap().unwrap();
-        assert_eq!(migrated.played_by, row.played_by);
-        assert_eq!(migrated.created_by, row.created_by);
-        assert_eq!(migrated.reviewer_id, None);
-        assert_eq!(migrated.director_id, None, "migration must not infer a director from requester");
-        assert!(db.list_approval_delegations().unwrap().is_empty());
-        let explicit = PrincipalId::new();
-        db.update_context_review_assignment(row.context_id, row.played_by, Some(explicit), None).unwrap();
-        drop(db);
-        let db = KernelDb::open(&path).unwrap();
-        assert_eq!(db.get_context(row.context_id).unwrap().unwrap().reviewer_id, Some(explicit));
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        assert_eq!(db.get_context(lane.context_id).unwrap().unwrap().senpai_ctx, Some(seat.context_id));
+        assert!(db.senpai_migration_report().unwrap().is_empty());
+        let has_reviewer: bool = db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'reviewer_id')", [], |r| r.get(0),
+        ).unwrap();
+        assert!(!has_reviewer);
     }
 
     /// Same idempotency contract as `last_activity_at_migration_...` above,
@@ -11285,8 +11235,6 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
-            reviewer_id: None,
-            director_id: None,
             senpai_ctx: None,
         };
 
@@ -11342,15 +11290,12 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
-            reviewer_id: None,
-            director_id: None,
             senpai_ctx: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
         // Insert child forked from parent, playing under `cast_id`.
         let child_id = ContextId::new();
-        let reviewer = PrincipalId::new();
         let child = ContextRow {
             context_id: child_id,
                         label: Some("child-fork".into()),
@@ -11374,9 +11319,7 @@ mod tests {
             cast_id: Some(cast_id),
             origin_host: None,
             played_by: None,
-            reviewer_id: Some(reviewer),
-            director_id: None,
-            senpai_ctx: None,
+            senpai_ctx: Some(parent_id),
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -11396,12 +11339,12 @@ mod tests {
         assert!(recovered.preset_id.is_none());
         assert_eq!(recovered.cast_id, Some(cast_id));
         assert_eq!(recovered.played_by, None, "NULL played_by preserves today's behavior");
-        assert_eq!(recovered.reviewer_id, Some(reviewer));
+        assert_eq!(recovered.senpai_ctx, Some(parent_id));
 
         // Verify list_active_contexts returns both
         let active = db.list_active_contexts().unwrap();
         assert_eq!(active.len(), 2);
-        assert_eq!(active.iter().find(|row| row.context_id == child_id).unwrap().reviewer_id, Some(reviewer));
+        assert_eq!(active.iter().find(|row| row.context_id == child_id).unwrap().senpai_ctx, Some(parent_id));
 
         // Verify to_context() preserves forked_from
         let ctx = recovered.to_context();
@@ -11433,28 +11376,26 @@ mod tests {
         let cleared_played = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(cleared_played.played_by, None);
 
-        db.update_context_review(child_id, Some(character), Some(reviewer)).unwrap();
+        db.update_context_performer(child_id, Some(character)).unwrap();
         let reviewed = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(reviewed.played_by, Some(character));
-        assert_eq!(reviewed.reviewer_id, Some(reviewer));
         db.conn.execute("INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars) VALUES ('review-test', 'echo ok', 'command', 0)", []).unwrap();
         for scope in ["session", "global"] {
             db.conn.execute("INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, context_id, scope, allow) VALUES (?1, 'review-test', 'shell', ?2, ?1, 1)", params![scope, child_id.as_bytes().as_slice()]).unwrap();
             db.conn.execute("INSERT INTO approval_rule_families (rule_id, family_key, context_id, scope, allow) VALUES (?1, 'echo', ?2, ?1, 1)", params![scope, child_id.as_bytes().as_slice()]).unwrap();
         }
-        db.update_context_review(child_id, Some(character), Some(PrincipalId::new())).unwrap();
+        db.update_context_performer(child_id, Some(character)).unwrap();
         for table in ["approval_rules", "approval_rule_families"] {
             let active: i64 = db.conn.query_row(&format!("SELECT count(*) FROM {table} WHERE revoked_at IS NULL"), [], |row| row.get(0)).unwrap();
-            assert_eq!(active, 2, "a reviewer change does not transfer the performer's rules");
+            assert_eq!(active, 2, "setting the same performer again keeps its rules");
         }
-        db.update_context_review(child_id, None, None).unwrap();
+        db.update_context_performer(child_id, None).unwrap();
         for table in ["approval_rules", "approval_rule_families"] {
             let scopes: Vec<String> = db.conn.prepare(&format!("SELECT scope FROM {table} WHERE revoked_at IS NULL")).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
             assert_eq!(scopes, ["global"], "a new performer must not inherit session rules");
         }
         let cleared_review = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(cleared_review.played_by, None);
-        assert_eq!(cleared_review.reviewer_id, None);
     }
 
     // ── 22. FK violation produces Validation, not LabelConflict ──────────
@@ -11501,8 +11442,6 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
-            reviewer_id: None,
-            director_id: None,
             senpai_ctx: None,
         };
         let err = db.insert_context(&row).unwrap_err();
@@ -11887,15 +11826,12 @@ mod tests {
         lane.forked_from = Some(seat.context_id);
         lane.senpai_ctx = Some(judge_seat.context_id);
         lane.played_by = Some(coder);
-        lane.director_id = Some(banto);
-        lane.reviewer_id = Some(amy);
         insert_context_with_doc(&db, &lane, ws_id);
-        db.grant_approval_delegation(banto, amy, amy).unwrap();
 
         assert_eq!(
             db.route_review(ReviewQuery::ask(lane.context_id, coder)).unwrap(),
             EffectiveReviewer::Assigned(judge),
-            "the senpai's holder, not the fork parent's, the director's, the override's or a delegation's",
+            "the senpai's holder, not the fork parent's",
         );
     }
 
@@ -12191,6 +12127,63 @@ mod tests {
 
     // ── 22e. the senpai migration ───────────────────────────────────────
 
+    /// Give the database the routing schema the pre-senpai kernel had:
+    /// `contexts.reviewer_id`, `contexts.director_id` and the delegation
+    /// tables. Idempotent.
+    fn ensure_old_routing_schema(db: &KernelDb) {
+        for sql in ["ALTER TABLE contexts ADD COLUMN reviewer_id BLOB", "ALTER TABLE contexts ADD COLUMN director_id BLOB"] {
+            match db.conn.execute(sql, []) {
+                Ok(_) => {}
+                Err(e) if is_duplicate_column_error(&e) => {}
+                Err(e) => panic!("{sql}: {e}"),
+            }
+        }
+        db.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS approval_reviewer_delegations (
+                director_id BLOB NOT NULL PRIMARY KEY,
+                reviewer_id BLOB NOT NULL,
+                granted_by BLOB NOT NULL,
+                granted_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS approval_reviewer_delegation_events (
+                event_id BLOB NOT NULL PRIMARY KEY,
+                director_id BLOB NOT NULL,
+                reviewer_id BLOB,
+                actor_id BLOB NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('grant', 'revoke')),
+                occurred_at INTEGER NOT NULL
+            );",
+        ).unwrap();
+    }
+
+    /// An active delegation row as the pre-senpai kernel wrote it.
+    fn old_delegation(db: &KernelDb, director: PrincipalId, reviewer: PrincipalId, granted_by: PrincipalId) {
+        ensure_old_routing_schema(db);
+        db.conn.execute(
+            "INSERT INTO approval_reviewer_delegations (director_id, reviewer_id, granted_by, granted_at, revoked_at)
+             VALUES (?1, ?2, ?3, 1, NULL)",
+            params![blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(granted_by.as_bytes())],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO approval_reviewer_delegation_events (event_id, director_id, reviewer_id, actor_id, operation, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, 'grant', 1)",
+            params![uuid::Uuid::now_v7().as_bytes(), blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(granted_by.as_bytes())],
+        ).unwrap();
+    }
+
+    fn has_column(db: &KernelDb, table: &str, column: &str) -> bool {
+        db.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"), [column], |r| r.get(0),
+        ).unwrap()
+    }
+
+    fn has_table(db: &KernelDb, table: &str) -> bool {
+        db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)", [table], |r| r.get(0),
+        ).unwrap()
+    }
+
     /// A context as the pre-senpai kernel wrote it: routed by `forked_from`,
     /// `played_by`, `director_id` and `reviewer_id`, with no senpai.
     fn old_context(
@@ -12201,6 +12194,7 @@ mod tests {
         played_by: Option<PrincipalId>,
         created_at: i64,
     ) -> ContextRow {
+        ensure_old_routing_schema(db);
         let mut row = make_context_row(Some(label));
         row.forked_from = forked_from.map(|p| p.context_id);
         row.played_by = played_by;
@@ -12328,7 +12322,7 @@ mod tests {
         set_old_routing(&db, &to_judge, Some(banto), Some(judge));
         let delegated = old_context(&db, ws_id, "delegated", Some(&seat), Some(coder), 8);
         set_old_routing(&db, &delegated, Some(banto), None);
-        db.grant_approval_delegation(banto, judge, amy).unwrap();
+        old_delegation(&db, banto, judge, amy);
 
         run_senpai_migration(&db).unwrap();
 
@@ -12348,6 +12342,83 @@ mod tests {
         for why in reported.values().map(|(_, why)| why) {
             assert!(why.contains("senpai"), "the note says what to do: {why}");
         }
+    }
+
+    /// On a database with the old routing (an override, a delegation, the
+    /// two tables), opening maps every context to its senpai first, then
+    /// drops `contexts.reviewer_id`, `contexts.director_id` and both
+    /// delegation tables. Each context whose old route was not its nearest
+    /// ancestor stays in the report, which keeps the old reviewer. A second
+    /// open does nothing.
+    #[test]
+    fn opening_an_old_database_maps_the_senpai_then_drops_the_old_routing() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [coder, banto, judge, amy] = seed_characters(&db, &["coder", "banto", "judge", "amy"])[..] else { unreachable!() };
+        db.update_character_root(amy, true).unwrap();
+        let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
+        let lane = old_context(&db, ws_id, "lane", Some(&seat), Some(coder), 3);
+        let judge_seat = old_context(&db, ws_id, "judge-seat", Some(&root), Some(judge), 4);
+        let overridden = old_context(&db, ws_id, "overridden", Some(&seat), Some(coder), 5);
+        set_old_routing(&db, &overridden, Some(banto), Some(judge));
+        let delegated = old_context(&db, ws_id, "delegated", Some(&seat), Some(coder), 6);
+        set_old_routing(&db, &delegated, Some(banto), None);
+        old_delegation(&db, banto, judge, amy);
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::SENPAI_MIGRATION]).unwrap();
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        assert_eq!(senpai_of(&db, &lane), Some(seat.context_id));
+        assert_eq!(senpai_of(&db, &overridden), Some(judge_seat.context_id), "the override named judge: its live context");
+        assert_eq!(senpai_of(&db, &delegated), Some(judge_seat.context_id), "the delegation named judge too");
+        for column in ["reviewer_id", "director_id"] {
+            assert!(!has_column(&db, "contexts", column), "contexts.{column} is dropped");
+        }
+        for table in ["approval_reviewer_delegations", "approval_reviewer_delegation_events"] {
+            assert!(!has_table(&db, table), "{table} is dropped");
+        }
+        let reported: Vec<ContextId> = report_of(&db).into_iter().map(|(c, _, _)| c).collect();
+        assert_eq!(reported, vec![overridden.context_id, delegated.context_id]);
+        let old_reviewers: Vec<Option<Vec<u8>>> = db.conn.prepare("SELECT old_reviewer FROM senpai_migration_report ORDER BY recorded_at, context_id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<SqliteResult<_>>().unwrap();
+        assert!(old_reviewers.iter().all(|r| r.as_deref() == Some(judge.as_bytes().as_slice())), "the report keeps who the old route named");
+        for (ctx, reviewer) in [(&lane, banto), (&overridden, judge), (&delegated, judge)] {
+            assert_eq!(db.route_review(ReviewQuery::ask(ctx.context_id, coder)).unwrap().reviewer(), reviewer, "{:?}", ctx.label);
+        }
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        assert_eq!(report_of(&db).len(), 2, "a second open changes nothing");
+    }
+
+    /// A database the step-1 kernel already mapped (the marker is set) still
+    /// carries the columns and tables; opening drops them and leaves every
+    /// senpai as it was. A migration that refuses drops nothing, so the old
+    /// routing is still there to map on the next try.
+    #[test]
+    fn the_drop_follows_a_recorded_mapping_and_never_a_refused_one() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [coder, banto, nobody, amy] = seed_characters(&db, &["coder", "banto", "nobody", "amy"])[..] else { unreachable!() };
+        db.update_character_root(amy, true).unwrap();
+        let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
+        let bad = old_context(&db, ws_id, "bad", Some(&seat), Some(coder), 3);
+        set_old_routing(&db, &bad, Some(banto), Some(nobody));
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::SENPAI_MIGRATION]).unwrap();
+
+        let error = KernelDb::apply_additive_migrations(&db.conn).unwrap_err().to_string();
+        assert!(error.contains("bad") && error.contains("nobody"), "{error}");
+        assert!(has_column(&db, "contexts", "reviewer_id") && has_column(&db, "contexts", "director_id"), "a refused mapping drops nothing");
+        assert!(has_table(&db, "approval_reviewer_delegations"));
+
+        set_old_routing(&db, &bad, Some(banto), None);
+        db.set_context_senpai(bad.context_id, Some(seat.context_id)).unwrap();
+        db.conn.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [KernelDb::SENPAI_MIGRATION]).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        assert!(!has_column(&db, "contexts", "reviewer_id") && !has_column(&db, "contexts", "director_id"));
+        assert!(!has_table(&db, "approval_reviewer_delegations") && !has_table(&db, "approval_reviewer_delegation_events"));
+        assert_eq!(senpai_of(&db, &bad), Some(seat.context_id), "the recorded mapping is kept");
     }
 
     /// A context the migration cannot map refuses the whole migration, naming
@@ -17135,25 +17206,25 @@ mod label_index_tests {
         insert_context_with_doc(&db, &row, ws_id);
         let actor = PrincipalId::new();
         let other = PrincipalId::new();
-        db.update_context_review(row.context_id, Some(actor), None).unwrap();
+        db.update_context_performer(row.context_id, Some(actor)).unwrap();
         let origin = db.begin_continuation(row.context_id, 1_000).unwrap();
         db.record_continuation_request(row.context_id, origin.epoch, 1_100).unwrap();
         db.record_continuation_yield(row.context_id, origin.epoch, 1_200).unwrap();
-        // Changing only review policy preserves this performer's continuation.
-        db.update_context_review(row.context_id, Some(actor), Some(other)).unwrap();
+        // Setting the same performer again preserves its continuation.
+        db.update_context_performer(row.context_id, Some(actor)).unwrap();
         assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
         db.conn.execute_batch("CREATE TRIGGER reject_assignment BEFORE UPDATE OF played_by ON contexts
             BEGIN SELECT RAISE(ABORT, 'injected reassignment fault'); END;").unwrap();
-        assert!(db.update_context_review(row.context_id, Some(other), None).is_err());
+        assert!(db.update_context_performer(row.context_id, Some(other)).is_err());
         assert_eq!(db.get_context(row.context_id).unwrap().unwrap().played_by, Some(actor));
         assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
         db.conn.execute_batch("DROP TRIGGER reject_assignment").unwrap();
-        db.update_context_review(row.context_id, Some(other), None).unwrap();
+        db.update_context_performer(row.context_id, Some(other)).unwrap();
         assert_eq!(db.continuation_epoch(row.context_id).unwrap(), None);
         assert!(!db.admit_inference_request(row.context_id, origin.epoch, 1_300).unwrap());
         assert!(!db.claim_automatic_resume(row.context_id, origin.epoch, 1_300, 600).unwrap());
         assert!(!db.record_continuation_request(row.context_id, origin.epoch, 1_300).unwrap());
-        db.update_context_review(row.context_id, Some(actor), None).unwrap();
+        db.update_context_performer(row.context_id, Some(actor)).unwrap();
         assert!(!db.claim_automatic_resume(row.context_id, origin.epoch, 1_300, 600).unwrap(),
             "assigning the original performer again must not revive old work");
         let next = db.begin_continuation(row.context_id, 1_400).unwrap();

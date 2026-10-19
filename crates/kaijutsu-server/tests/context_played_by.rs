@@ -57,15 +57,10 @@ fn create_context_leaves_played_by_unset() {
             None,
             "ordinary context creation records its requester, not an inferred performer"
         );
+        assert!(row.senpai_ctx.is_some(), "ordinary context creation records a senpai");
         assert_eq!(
-            row.director_id,
-            Some(root.principal_id),
-            "ordinary context creation records the authenticated creator as director"
-        );
-        assert_eq!(
-            row.reviewer_id,
-            None,
-            "ordinary context creation does not persist a reviewer override"
+            row.senpai_ctx, row.forked_from,
+            "the context it was created from is its senpai"
         );
         drop(kj);
         drop(client);
@@ -151,11 +146,9 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
             "a characterless creating principal must leave played_by NULL, not fail"
         );
         assert_eq!(
-            row.director_id, None,
-            "a creator with no character sheet cannot hold a delegation, so it is not \
-             recorded as director; the reviewer resolves to the default instead"
+            row.senpai_ctx, row.forked_from,
+            "the context it was created from is its senpai, whoever created it"
         );
-        assert_eq!(row.reviewer_id, None);
         drop(kj);
         drop(client);
         tokio::task::yield_now().await;

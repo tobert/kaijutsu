@@ -3355,12 +3355,13 @@ mod tests {
     }
 
     /// A banto-shaped house: amy's root context; banto's seat under it,
-    /// performed by banto and directed by amy; two lanes banto directs;
-    /// a context amy directs; and kei's seat with a lane kei directs.
+    /// performed by banto; two lanes under banto's seat; a context under
+    /// amy's console; and kei's seat with a lane under it.
     struct CharacterHouse {
         banto: crate::kj::KjCaller,
         kei: crate::kj::KjCaller,
         lane_a: kaijutsu_types::ContextId,
+        root: kaijutsu_types::ContextId,
     }
 
     fn character_house(d: &crate::kj::KjDispatcher) -> CharacterHouse {
@@ -3377,17 +3378,18 @@ mod tests {
         };
         let banto = character("banto");
         let kei = character("kei");
-        let context = |label: &str, parent, played_by, director| {
+        // Each context's senpai is its parent here (`register_context`).
+        let context = |label: &str, parent, played_by| {
             let id = register_context(d, Some(label), Some(parent), amy);
-            d.kernel_db().lock().update_context_review_assignment(id, played_by, None, Some(director)).unwrap();
+            d.kernel_db().lock().update_played_by(id, played_by).unwrap();
             id
         };
-        let banto_seat = context("banto-seat", root, Some(banto), amy);
-        let lane_a = context("lane-a", banto_seat, None, banto);
-        context("lane-b", banto_seat, None, banto);
-        context("amy-lane", root, None, amy);
-        let kei_seat = context("kei-seat", root, Some(kei), amy);
-        context("kei-lane", kei_seat, None, kei);
+        let banto_seat = context("banto-seat", root, Some(banto));
+        let lane_a = context("lane-a", banto_seat, None);
+        context("lane-b", banto_seat, None);
+        context("amy-lane", root, None);
+        let kei_seat = context("kei-seat", root, Some(kei));
+        context("kei-lane", kei_seat, None);
         let seat = |actor, context| crate::kj::KjCaller {
             principal_id: amy,
             actor_id: actor,
@@ -3396,7 +3398,7 @@ mod tests {
             privileged: false,
             ..test_caller()
         };
-        CharacterHouse { banto: seat(banto, banto_seat), kei: seat(kei, kei_seat), lane_a }
+        CharacterHouse { banto: seat(banto, banto_seat), kei: seat(kei, kei_seat), lane_a, root }
     }
 
     /// A character rule lets banto's seat drive a lane banto directs with
@@ -3525,8 +3527,7 @@ mod tests {
         assert_eq!(covered.verdict, Allowed, "{}", covered.reason);
         assert!(covered.reason.contains("user rule"), "{}", covered.reason);
 
-        let amy = crate::kj::test_helpers::test_reviewer_principal();
-        d.kernel_db().lock().update_context_review_assignment(house.lane_a, None, None, Some(amy)).unwrap();
+        d.kernel_db().lock().set_context_senpai(house.lane_a, Some(house.root)).unwrap();
         let moved = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
         assert_eq!(moved.verdict, Pending, "lane-a is amy's now: {}", moved.reason);
 

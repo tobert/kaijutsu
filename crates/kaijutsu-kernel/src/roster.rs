@@ -434,8 +434,6 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
-            reviewer_id: None,
-            director_id: None,
             senpai_ctx: None,
         };
         db.insert_context_with_document(&row, ws).expect("create context");

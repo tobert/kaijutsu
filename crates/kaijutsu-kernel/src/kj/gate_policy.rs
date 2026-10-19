@@ -1532,7 +1532,9 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
             super::refs::resolve_context_arg_from(target.as_deref(), caller.context_id, db)
                 .ok()
                 .and_then(|id| db.get_context(id).ok().flatten())
-                .is_some_and(|row| row.director_id == Some(caller.actor_id))
+                .and_then(|row| row.senpai_ctx)
+                .and_then(|senpai| db.context_holder(senpai).ok().flatten())
+                .is_some_and(|holder| holder == caller.actor_id)
         }
     }
 }

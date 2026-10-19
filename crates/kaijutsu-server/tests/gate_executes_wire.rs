@@ -213,7 +213,7 @@ impl Seats {
             session,
             self.kernel.kernel.id(),
         )
-        .with_actor(actor, row.reviewer_id);
+        .with_actor(actor, None);
         self.kernel
             .kernel
             .dispatch_tool_via_broker_with_cancel(
