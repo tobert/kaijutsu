@@ -220,3 +220,25 @@ Choices made where the design was silent, the smaller shape each time.
 - **Archiving a holderless top**: a parentless system context with no holder has no senpai and no lineage root, so
   `kj context archive` refuses it for everyone. Nothing in the shipped rc or bootstrap archives one.
 - **The old columns** are on `contexts` (`contexts.reviewer_id`, `contexts.director_id`), not on `characters`.
+- **`kj kohai create` flags**: it keeps `kj context create`'s whole flag set (`--name`, `-m/--model`,
+  `--system-prompt`, an optional `--type` defaulting to `default`) minus `--top`, plus `--senpai`. The spec's
+  synopsis lists fewer; step 5 removes the per-context model.
+- **`kj senpai set`** also needs the caller to hold the new senpai or be its lineage root, the same rule as
+  `--senpai` at create, and the operator capability, as other changes to an existing context do. It refuses an
+  archived senpai. A successful set clears the migration report row, so `kj senpai show` stops printing the note.
+- **Character standing rules on `kj kohai create`**: a bare create is covered; `--senpai <ctx>` is covered only when
+  the actor holds `<ctx>` itself; `--parent` is provenance and does not narrow the rule.
+- **A characterless creator refuses**: a key in `auth.db` whose principal has no character sheet can no longer
+  create a context (the server wire test now expects the refusal).
+- **`kj context info`** shows `Senpai:` and its record has `senpai_ctx` in place of `reviewer_override_id` and
+  `director_id`. `llm.turn` no longer records `director.id`.
+- **Kept**: the dead self-review guard in `insert_new_context_rows` (step 1 note) stays.
+- **contrib/agent-dev/bootstrap.sh** moved to `kj kohai create` in this step: the coder is created with
+  `--senpai "$project-banto"` instead of `kj context set --reviewer banto`, and the root's gate allow names
+  `kj kohai create`. The council seed scripts, `headless-app.sh` and the demo storyboard moved too.
+- **Left for step 3**: `contrib/bench/rc-variants/council/coder/create/S04..S06` still run `kj context create --top`.
+  They run inside a coder's create lifecycle, where `--top` has no equivalent until we choose which context the
+  council contexts answer to.
+- **Pre-existing failures**: `kaijutsu-tui` `terminal_fit` tests `ctrl_a_r_rotates_the_seat_and_follows_its_successor`
+  and `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` fail on `3260b9a6` as well: the coder probe
+  seat lacks operator for `kj context rotate`.
