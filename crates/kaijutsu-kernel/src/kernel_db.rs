@@ -33,6 +33,11 @@ use crate::mcp::binding::ContextToolBinding;
 use crate::mcp::types::InstanceId;
 use crate::roster::{Availability, LivenessKind, PresenceSnapshotRow, RosterEntity, RosterRow};
 
+mod instances;
+pub use instances::{
+    CharacterInstanceRow, InstanceBindingRow, InstanceMigrationNote, InstanceSlotRow,
+};
+
 // ============================================================================
 // Error type
 // ============================================================================
@@ -872,7 +877,12 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- The senpai context: who this context answers to. NULL only for a root
     -- console and the parentless system contexts. No ON DELETE action: history
     -- is retained, and a delete that would orphan a kohai must fail loudly.
-    senpai_ctx   BLOB REFERENCES contexts(context_id)
+    senpai_ctx   BLOB REFERENCES contexts(context_id),
+    -- The character instance this context belongs to and the binding `seq` it
+    -- runs on (NULL = none: scratch, the handoff log, system contexts). Both
+    -- are set once and never changed; a trigger refuses the change.
+    instance_id  BLOB REFERENCES character_instances(instance_id),
+    binding_seq  INTEGER
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -890,6 +900,64 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
     note         TEXT NOT NULL,
     old_reviewer BLOB,
     recorded_at  INTEGER NOT NULL
+);
+
+-- ── Character instances (docs/senpai-kohai.md, "The model") ────────
+-- The dynamic layer: one row per run of one character, and the settings it
+-- runs on. Bindings and slots are appended and never changed; a trigger
+-- refuses an UPDATE or DELETE. `principal_id` is a bare id like
+-- `contexts.played_by`: the kernel never reads `auth.db`.
+CREATE TABLE IF NOT EXISTS character_instances (
+    instance_id     BLOB    NOT NULL PRIMARY KEY,
+    principal_id    BLOB    NOT NULL,
+    senpai_instance BLOB    REFERENCES character_instances(instance_id),
+    started_at      INTEGER NOT NULL,
+    created_by      BLOB    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_character_instances_principal
+    ON character_instances(principal_id);
+
+-- One binding per `seq`: the persona and the cast a conversation runs on.
+CREATE TABLE IF NOT EXISTS instance_bindings (
+    instance_id      BLOB    NOT NULL REFERENCES character_instances(instance_id),
+    seq              INTEGER NOT NULL CHECK (seq >= 1),
+    conversation_ctx BLOB    NOT NULL REFERENCES contexts(context_id),
+    bound_at         INTEGER NOT NULL,
+    cast_label       TEXT,
+    persona          TEXT,
+    PRIMARY KEY (instance_id, seq)
+);
+
+-- A copy of one cast slot, with every unset parameter filled from the model's
+-- `backend_models` row. `max_tokens` is required: every provider request
+-- carries it, except a `gate` or `judge` slot, which names a council server.
+-- NULL optional parameters are left out of the request.
+CREATE TABLE IF NOT EXISTS instance_slots (
+    instance_id     BLOB    NOT NULL,
+    seq             INTEGER NOT NULL,
+    role            TEXT    NOT NULL,
+    backend_id      BLOB    NOT NULL REFERENCES backends(backend_id),
+    model           TEXT    NOT NULL CHECK (model != ''),
+    max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+    context_window  INTEGER CHECK (context_window IS NULL OR context_window > 0),
+    temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+    top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+    effort          TEXT,
+    thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+    thinking_style  TEXT,
+    PRIMARY KEY (instance_id, seq, role),
+    FOREIGN KEY (instance_id, seq) REFERENCES instance_bindings(instance_id, seq)
+);
+
+-- What `instances-v1` did not carry over or could not resolve, by kind:
+-- dropped, unresolved, unmapped, no_gate_slot, no_distill_slot.
+CREATE TABLE IF NOT EXISTS instance_migration_report (
+    report_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL,
+    context_id  BLOB    REFERENCES contexts(context_id) ON DELETE CASCADE,
+    instance_id BLOB    REFERENCES character_instances(instance_id),
+    note        TEXT    NOT NULL,
+    recorded_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS context_continuations (
@@ -3011,6 +3079,8 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE contexts ADD COLUMN played_by BLOB",
             SENPAI_COLUMN_ALTER,
+            "ALTER TABLE contexts ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
+            "ALTER TABLE contexts ADD COLUMN binding_seq INTEGER",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -3089,6 +3159,8 @@ impl KernelDb {
         Self::migrate_senpai_edges(conn)?;
         Self::drop_old_routing(conn)?;
         Self::drop_structural_edges(conn)?;
+        Self::ensure_instance_guards(conn)?;
+        Self::migrate_instances(conn)?;
         Ok(())
     }
 

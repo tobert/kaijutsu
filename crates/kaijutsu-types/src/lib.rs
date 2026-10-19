@@ -168,7 +168,8 @@ pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use dag::ConversationDAG;
 pub use enums::{ContextState, DocKind, ForkKind};
 pub use ids::{
-    BackendId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, TurnId, WorkspaceId,
+    BackendId, CastId, CharacterInstanceId, ContextId, KernelId, PresetId, PrincipalId, SessionId, TurnId,
+    WorkspaceId,
 };
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
 pub use kernel::Kernel;

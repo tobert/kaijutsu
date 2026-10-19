@@ -63,6 +63,13 @@ pub struct BackendId(uuid::Uuid);
 #[serde(transparent)]
 pub struct CastId(uuid::Uuid);
 
+/// A character instance identifier (UUIDv7). A *character instance* is one run
+/// of one character: its bindings and the contexts it owns hang off this id.
+/// Distinct from the MCP server instance id in `kaijutsu-kernel`.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CharacterInstanceId(uuid::Uuid);
+
 // ── Shared behavior ─────────────────────────────────────────────────────────
 
 macro_rules! impl_typed_id {
@@ -208,6 +215,7 @@ impl_typed_id!(WorkspaceId, "WorkspaceId");
 impl_typed_id!(PresetId, "PresetId");
 impl_typed_id!(BackendId, "BackendId");
 impl_typed_id!(CastId, "CastId");
+impl_typed_id!(CharacterInstanceId, "CharacterInstanceId");
 
 // ── PrefixResolvable ────────────────────────────────────────────────────────
 
