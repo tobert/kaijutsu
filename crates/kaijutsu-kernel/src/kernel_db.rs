@@ -234,6 +234,48 @@ pub enum ReviewFrom {
     Senpai(ContextId),
 }
 
+/// An act the one authority rule governs (`docs/senpai-kohai.md`, "Authority").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernedAct {
+    /// `kj context set <ctx> --as <character>`.
+    Cast,
+    /// `kj context set <ctx> --egress-allow|--egress-deny`.
+    Egress,
+    /// `kj senpai set`.
+    Move,
+    /// `kj ledger escalate` on an ask raised in the context.
+    Escalate,
+    /// `kj context rotate` (its own performer may also rotate it).
+    Rotate,
+    /// `kj context archive`.
+    Archive,
+}
+
+impl GovernedAct {
+    pub const ALL: [GovernedAct; 6] = [Self::Cast, Self::Egress, Self::Move, Self::Escalate, Self::Rotate, Self::Archive];
+
+    /// The act, as the refusal names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cast => "cast its performer",
+            Self::Egress => "change its egress list",
+            Self::Move => "move it to another senpai",
+            Self::Escalate => "escalate its asks",
+            Self::Rotate => "rotate it",
+            Self::Archive => "archive it",
+        }
+    }
+}
+
+/// Which half of the authority rule matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Authority {
+    /// The actor holds the context's senpai.
+    SenpaiHolder,
+    /// The actor is the context's lineage root.
+    LineageRoot,
+}
+
 /// One request to [`KernelDb::route_review`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewQuery {
@@ -2509,6 +2551,68 @@ impl KernelDb {
     /// requires nothing of its responsible character.
     pub fn lineage_root_context(&self, context_id: ContextId) -> KernelDbResult<ContextId> {
         Ok(self.lineage_top_row(context_id)?.context_id)
+    }
+
+    /// The one authority rule (`docs/senpai-kohai.md`, "Authority"): the
+    /// holder of `target`'s senpai, or `target`'s lineage root, may perform
+    /// `act` on it. The inner `Err` is the refusal, naming the rule, the
+    /// holder and the root; the outer `Err` is a fault (a missing row, a
+    /// senpai cycle).
+    pub fn context_authority(
+        &self,
+        target: ContextId,
+        actor: PrincipalId,
+        act: GovernedAct,
+    ) -> KernelDbResult<Result<Authority, String>> {
+        let row = self.get_context(target)?.ok_or_else(|| KernelDbError::NotFound(format!(
+            "context {} has no row to check authority over", target.short()
+        )))?;
+        let holder = match row.senpai_ctx {
+            Some(senpai) => self.context_holder(senpai)?,
+            None => None,
+        };
+        if holder == Some(actor) {
+            return Ok(Ok(Authority::SenpaiHolder));
+        }
+        let root = self.lineage_root_or_reason(target)?;
+        if root.as_ref() == Ok(&actor) {
+            return Ok(Ok(Authority::LineageRoot));
+        }
+        let holder_name = holder.map_or_else(|| "none".to_string(), |h| self.name_for(h));
+        let root_name = match root {
+            Ok(root) => self.name_for(root),
+            Err(reason) => format!("none: {reason}"),
+        };
+        Ok(Err(format!(
+            "only {}'s senpai ({holder_name}) or its lineage root ({root_name}) may {}",
+            Self::context_display(&row), act.as_str()
+        )))
+    }
+
+    /// Whether `actor` may place a context under `senpai`: it holds `senpai`
+    /// itself, or is `senpai`'s lineage root (`docs/senpai-kohai.md`,
+    /// "Creating and moving"). The inner `Err` is the refusal.
+    pub fn may_place_under(&self, senpai: ContextId, actor: PrincipalId) -> KernelDbResult<Result<Authority, String>> {
+        let row = self.get_context(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
+            "senpai context {} has no row", senpai.short()
+        )))?;
+        let holder = self.holder_of_row(&row)?;
+        if holder == Some(actor) {
+            return Ok(Ok(Authority::SenpaiHolder));
+        }
+        let root = self.lineage_root_or_reason(senpai)?;
+        if root.as_ref() == Ok(&actor) {
+            return Ok(Ok(Authority::LineageRoot));
+        }
+        let holder_name = holder.map_or_else(|| "none".to_string(), |h| self.name_for(h));
+        let root_name = match root {
+            Ok(root) => self.name_for(root),
+            Err(reason) => format!("none: {reason}"),
+        };
+        Ok(Err(format!(
+            "only the holder of {} ({holder_name}) or its lineage root ({root_name}) may place a context under it",
+            Self::context_display(&row)
+        )))
     }
 
     /// Return the active reviewer delegation for one director.
@@ -12032,6 +12136,57 @@ mod tests {
         assert_eq!(senpai(elsewhere.context_id), Some(top.context_id));
         assert_eq!(senpai(new.context_id), Some(top.context_id));
         assert_eq!(senpai(old.context_id), Some(top.context_id));
+    }
+
+    // ── 22d2. the one authority rule ────────────────────────────────────
+
+    /// amy's console → banto's seat → two lanes. Over a lane, banto (who
+    /// holds its senpai) and amy (its lineage root) have authority for every
+    /// act the rule governs; the sibling lane's performer and the lane's own
+    /// performer do not, and the refusal names the rule, the holder and the
+    /// root.
+    #[test]
+    fn authority_rule_allows_the_senpai_holder_and_the_lineage_root_only() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [coder, sibling, banto, amy] = seed_characters(&db, &["coder", "sibling", "banto", "amy"])[..] else { unreachable!() };
+        db.update_character_root(amy, true).unwrap();
+        let root = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
+        let seat = senpai_ctx_row(&db, ws_id, "banto", Some(&root), Some(banto));
+        let lane = senpai_ctx_row(&db, ws_id, "lane", Some(&seat), Some(coder));
+        let _other = senpai_ctx_row(&db, ws_id, "other-lane", Some(&seat), Some(sibling));
+
+        for act in GovernedAct::ALL {
+            assert_eq!(db.context_authority(lane.context_id, banto, act).unwrap(), Ok(Authority::SenpaiHolder), "{act:?}");
+            assert_eq!(db.context_authority(lane.context_id, amy, act).unwrap(), Ok(Authority::LineageRoot), "{act:?}");
+            for refused in [sibling, coder] {
+                let why = db.context_authority(lane.context_id, refused, act).unwrap().unwrap_err();
+                assert_eq!(why, format!(
+                    "only lane ({})'s senpai (banto) or its lineage root (amy) may {}",
+                    lane.context_id.short(), act.as_str()
+                ));
+            }
+        }
+        // Over the seat, amy holds the senpai and is also the root.
+        assert_eq!(db.context_authority(seat.context_id, amy, GovernedAct::Cast).unwrap(), Ok(Authority::SenpaiHolder));
+        assert!(db.context_authority(seat.context_id, banto, GovernedAct::Cast).unwrap().is_err(), "a seat has no authority over itself");
+    }
+
+    /// A context with no senpai and a lineage with no live root still answer
+    /// with the rule's text, naming what is missing; neither is a fault.
+    #[test]
+    fn authority_rule_names_a_missing_senpai_and_a_missing_root() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [coder, banto] = seed_characters(&db, &["coder", "banto"])[..] else { unreachable!() };
+        let top = senpai_ctx_row(&db, ws_id, "top", None, Some(banto));
+        let lane = senpai_ctx_row(&db, ws_id, "lane", Some(&top), Some(coder));
+
+        let why = db.context_authority(top.context_id, coder, GovernedAct::Archive).unwrap().unwrap_err();
+        assert!(why.starts_with(&format!("only top ({})'s senpai (none) or its lineage root (none:", top.context_id.short())), "{why}");
+        assert!(why.ends_with("may archive it"), "{why}");
+        assert_eq!(db.context_authority(lane.context_id, banto, GovernedAct::Archive).unwrap(), Ok(Authority::SenpaiHolder),
+            "holding the senpai is enough when the lineage has no root");
     }
 
     // ── 22e. the senpai migration ───────────────────────────────────────
