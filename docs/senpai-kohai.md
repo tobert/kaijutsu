@@ -304,6 +304,8 @@ answer the old code would have given.
 - **Drift within one instance**: "downwards, yes, upwards, it depends." It depends on who made the fork: "Forks
   come from 2 places, me and the character/context. A context can fork for the same reasons you might in claude
   code using its fork ability."
+- **A judge shadow belongs to one conversation**, not to the instance: "correct on the judge shadows". A rotation
+  archives it with the predecessor, and the successor gets its own.
 - **The `mcp` type prints "no model"** at create when its cast has no `mcp` slot, and we keep the line. It is
   noise, since the MCP client brings its own model and the context is more of a log, and it hurts nothing. A
   later direction: MCP offers a way to chat with kaijutsu's characters instead.
