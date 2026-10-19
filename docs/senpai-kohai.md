@@ -41,9 +41,10 @@ conversation, and a missing model fell back to a default.
 Two layers. Static settings are edited in place. The dynamic layer is appended to and never modified.
 
 ```
-static     characters           principal_id, name, root, created_at, retired_at, persona (step 6), cast_id
+static     characters           principal_id, name, root, created_at, retired_at, persona (step 6), cast_id,
+                                handoff_ctx
            casts, cast_slots    a reusable model team: one slot per role
-dynamic    character_instances  instance_id, principal_id, senpai_instance, handoff_ctx, started_at,
+dynamic    character_instances  instance_id, principal_id, senpai_instance, started_at,
                                 created_by
            instance_bindings    instance_id, seq, conversation_ctx, bound_at, cast_label, persona
            instance_slots       instance_id, seq, role, backend_id, model, max_tokens, temperature, top_p,
@@ -72,8 +73,10 @@ turns                           turn_id, context_id, instance_id, binding_seq, p
   most one live root instance. `characters.root_ctx` goes; the root console is that instance's conversation.
 - **The kohai** of an instance are the live instances whose `senpai_instance` is that instance. The senpai chain
   never has a cycle. Setting an edge that would close one is refused.
-- **The handoff log** of an instance is its `handoff_ctx`. A rotation reads the predecessor conversation's
-  handoff as it does today. Whether a character also keeps a log across its instances is open (below).
+- **The handoff log** belongs to the character: `characters.handoff_ctx`, as today. Every instance of the
+  character writes and reads the same log, so a new instance sees the old one's notes. A rotation reads the
+  predecessor conversation's handoff as it does today. For a fresh log, `kj context rotate` of the handoff context
+  points `characters.handoff_ctx` at its successor.
 
 What stays as it is:
 
@@ -167,9 +170,10 @@ the instance has pending asks.
 
 - `kj senpai report "<text>"` puts the text in the senpai instance's conversation as a drift block.
 - `kj drift push` along the edge, from a context of a kohai instance to its senpai's conversation or back, runs
-  with no ask. Within one instance, a push from the conversation down to one of its forks runs with no ask; a
-  push from a fork up to the conversation keeps today's gate (see Open). Any other drift target keeps today's
-  gate. A `gate.toml` key on `kj drift push` still wins over the
+  with no ask. Within one instance, a push from the conversation down to one of its forks runs with no ask. A
+  push from a fork up to the conversation runs with no ask when the instance's own character made the fork (the
+  fork's `created_by`), as a context forks itself the way Claude Code forks a subagent; a fork a person made
+  keeps today's gate on the way up. Any other drift target keeps today's gate. A `gate.toml` key on `kj drift push` still wins over the
   edge (Amy, 2026-10-19).
 
 ## What a context sees
@@ -190,7 +194,7 @@ Steps 1-3 (context edge):
 Step 5 (instances and bindings):
 
 - Columns `contexts.senpai_ctx`, `contexts.played_by`, `contexts.cast_id`, `contexts.provider`, `contexts.model`,
-  `characters.handoff_ctx`, `characters.root_ctx`, `presets.cast_id`, `presets.system_prompt`, `turns.cast_label`
+  `characters.root_ctx`, `presets.cast_id`, `presets.system_prompt`, `turns.cast_label`
   and `turns.model_source`; table `llm_defaults`; the `senpai_migration_report` table once its rows map.
 - `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj kohai create -m|--model|--cast`;
   `kj fork --model`; `kj model` (`kj context info` shows the model); `kj backend default`;
@@ -227,7 +231,7 @@ answer the old code would have given.
    its contexts, a judge shadow, or a context an rc lifecycle made. With none, its newest context of those kinds
    is its conversation, and the instance is inactive when that context is archived.
 6. **Labels.** Labels stay on contexts; the migration moves none.
-7. **Handoff.** A character's `handoff_ctx` moves to its newest live instance and is logged.
+7. **Handoff.** `characters.handoff_ctx` stays where it is.
 8. Archived contexts map like live ones; an archived context that cannot be mapped is left with no instance and
    listed, as step 1 did. Only live contexts refuse.
 
@@ -255,7 +259,10 @@ answer the old code would have given.
 - A turn uses the slot's parameters, then `backend_models`, and sends no unset optional parameter.
 - The judge shadow and the gate use the instance binding's `judge` and `gate` slots.
 - A drift along the edge runs with no ask, both ways; a drift from a conversation to its own fork runs with no
-  ask; a drift to a sibling still asks; a `gate.toml` ask key wins.
+  ask; a drift up from a fork the character made runs with no ask, and up from a fork a person made asks; a
+  drift to a sibling still asks; a `gate.toml` ask key wins.
+- Two instances of one character read and write the same handoff log; rotating the handoff context repoints
+  `characters.handoff_ctx`.
 - The prompt's `<situation>` names the instance and the senpai.
 - The migration: a rotation chain becomes one instance; a fork child joins its source's instance; a judge shadow
   joins the instance of the context it judges; a shared cast copies into each binding; a context with an
@@ -264,15 +271,13 @@ answer the old code would have given.
 - Each turn row names its instance and binding `seq`; the removed verbs and RPCs are gone (`kj model` and
   `kj context set --as` are unknown).
 
-## Open (step 5)
+## Decided (step 5, Amy, 2026-10-19)
 
-- **Drift up within one instance**, from a fork to its own conversation: Amy, 2026-10-19: "downwards, yes,
-  upwards, it depends." It keeps today's gate until we name what it depends on.
-
-Decided (Amy, 2026-10-19):
-
-- **The handoff log is per instance.** "per instance will be a nice division and we can always join them when
-  needed." No log across a character's instances.
+- **The handoff log belongs to the character.** "it should be by character for handoffs. If I want a fresh
+  handoff I could rotate the handoff context perhaps."
+- **Drift within one instance**: "downwards, yes, upwards, it depends." It depends on who made the fork: "Forks
+  come from 2 places, me and the character/context. A context can fork for the same reasons you might in claude
+  code using its fork ability."
 - **The `mcp` type prints "no model"** at create when its cast has no `mcp` slot, and we keep the line. It is
   noise, since the MCP client brings its own model and the context is more of a log, and it hurts nothing. A
   later direction: MCP offers a way to chat with kaijutsu's characters instead.
