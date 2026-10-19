@@ -2,12 +2,15 @@
 # decision, once per kernel. The text is the companion Markdown. The council
 # context type has no seeded rc bucket, and an rc overlay may only replace
 # files in existing types, so the bucket is installed here with `kj rc add`.
+# Made with `kj kohai create` from inside the coder's create lifecycle, each
+# council context answers to that first coder seat (docs/senpai-kohai.md,
+# "Open (step 3)"); the council contexts raise no asks of their own.
 set -e
 if kj context info council-system > /dev/null 2>&1; then
   echo "council-system: present"
   exit 0
 fi
 kj rc add /config/rc/council/create/S00-none.kai --content "true" || true
-kj context create council-system --type council --top
+kj kohai create council-system --type council
 kj block create -c council-system --role user --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
 echo "council-system: created"

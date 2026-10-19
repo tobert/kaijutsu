@@ -16,7 +16,7 @@ if kj context info council-code > /dev/null 2>&1; then
 fi
 D="$(dirname "$0")"
 B="$(basename "$0" .kai)"
-kj context create council-code --type council --top
+kj kohai create council-code --type council
 kj block create -c council-code --role user --kind text --content-type text/markdown < "$D/$B.md"
 for n in 01 02 03 04 05 06 07 08 09 10; do
   kj block create -c council-code --role user --kind text < "$D/$B.ex$n.proposal.json"

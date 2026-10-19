@@ -2,7 +2,8 @@
 
 Creates `council-system`, the house rules the council reads for every gate
 decision, and the `council` context type it lives in (no instruction blocks,
-no turns). Pair it with `contrib/bench/gate-council.toml` and Harbor's
+no turns). Each council context is made with `kj kohai create` inside the first
+coder seat's create lifecycle, so it answers to that seat. Pair it with `contrib/bench/gate-council.toml` and Harbor's
 `--ak permission_mode=deny`, so a council ask is a refusal the model sees.
 
 The rules say what our seats may do (explore, read and edit code, build,
