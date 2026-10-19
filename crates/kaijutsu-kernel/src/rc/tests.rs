@@ -3335,26 +3335,13 @@ esac
     // ── archive verb ────────────────────────────────────────────────────
 
     /// A live context of `context_type` with a conversation document, a
-    /// structural child of `parent` when given, as `kj kohai create` makes.
+    /// child of `parent` when given, as `kj kohai create` makes.
     /// A context to archive: under `parent`, or else under amy's console, so
     /// [`root_archiver`] has authority over it as its lineage root.
     fn archivable(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str) -> ContextId {
         let senpai = parent.unwrap_or_else(|| crate::kj::test_helpers::register_root_context(d));
         let ctx = register_context(d, Some(label), Some(senpai), PrincipalId::new());
         set_context_type(d, ctx, context_type);
-        if let Some(parent) = parent {
-            d.kernel_db()
-                .lock()
-                .insert_edge(&crate::kernel_db::ContextEdgeRow {
-                    edge_id: uuid::Uuid::now_v7(),
-                    source_id: parent,
-                    target_id: ctx,
-                    kind: kaijutsu_types::EdgeKind::Structural,
-                    metadata: None,
-                    created_at: kaijutsu_types::now_millis() as i64,
-                })
-                .unwrap();
-        }
         d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
         ctx
     }

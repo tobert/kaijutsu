@@ -463,12 +463,12 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
             seat_type: seat_row.context_type.clone(),
             server,
         };
-        if let Some(existing) = db.structural_children(seat)?.into_iter().find(|c| c.context_type == JUDGE) {
+        if let Some(existing) = db.fork_children(seat)?.into_iter().find(|c| c.context_type == JUDGE) {
             judge.shadow = existing.context_id;
             return Ok(Some((judge, false)));
         }
         let row = shadow_row(&seat_row, cast_id);
-        db.in_transaction(|db| crate::kj::context::insert_new_context_rows(db, &row, Some(seat)))?;
+        db.in_transaction(|db| crate::kj::context::insert_new_context_rows(db, &row))?;
         judge.shadow = row.context_id;
         (row, judge)
     };

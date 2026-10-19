@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::DriftKind;
-use kaijutsu_types::{ContentType, ContextId, EdgeKind};
+use kaijutsu_types::{ContentType, ContextId};
 
 use super::effect::{Classify, Effect};
 use super::format::format_drift_queue;
@@ -227,7 +227,6 @@ impl KjDispatcher {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id: source_ctx,
                 target_id: target_ctx,
-                kind: EdgeKind::Drift,
                 metadata: Some(edge_metadata),
                 created_at: kaijutsu_types::now_millis() as i64,
             };
@@ -560,7 +559,6 @@ impl KjDispatcher {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id,
                 target_id: context_id,
-                kind: EdgeKind::Drift,
                 metadata: Some("pull".to_string()),
                 created_at: kaijutsu_types::now_millis() as i64,
             };
@@ -697,7 +695,6 @@ impl KjDispatcher {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id: context_id,
                 target_id,
-                kind: EdgeKind::Drift,
                 metadata: Some("merge".to_string()),
                 created_at: kaijutsu_types::now_millis() as i64,
             };
@@ -872,7 +869,6 @@ impl KjDispatcher {
                             edge_id: uuid::Uuid::now_v7(),
                             source_id: source_ctx,
                             target_id: drift.target_ctx,
-                            kind: EdgeKind::Drift,
                             metadata: Some(format!("{}#{}", drift.drift_kind, drift.id)),
                             created_at: kaijutsu_types::now_millis() as i64,
                         };
@@ -1258,7 +1254,7 @@ impl KjDispatcher {
 
         let outgoing = db.drift_provenance(target_id).unwrap_or_default();
         let incoming = db
-            .edges_to(target_id, Some(kaijutsu_types::EdgeKind::Drift))
+            .edges_to(target_id)
             .unwrap_or_default();
 
         let text = super::format::format_drift_history(&outgoing, &incoming, &db);
@@ -2407,7 +2403,7 @@ mod tests {
     /// `kj drift edge rm <uuid>` deletes a single drift edge and pairs
     /// with the UUIDs that `kj drift history` emits in `.data`. Full
     /// round-trip: push a drift → flush writes both the Drift block and
-    /// the `EdgeKind::Drift` row → history surfaces the UUID → edge rm
+    /// the drift edge row → history surfaces the UUID → edge rm
     /// removes it → history is empty again. This is the user-facing path,
     /// not a hand-seeded edge.
     #[tokio::test]
@@ -2473,12 +2469,10 @@ mod tests {
     /// injected Drift block — otherwise `kj drift history`
     /// (`drift_provenance` + `edges_to`) sees nothing. This test pins the
     /// flush write site: push one drift, flush, and verify exactly one
-    /// Drift edge exists with the expected source/target/kind and
+    /// Drift edge exists with the expected source/target and
     /// metadata stamped with the staged id.
     #[tokio::test]
     async fn drift_flush_writes_edge() {
-        use kaijutsu_types::EdgeKind;
-
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -2510,7 +2504,6 @@ mod tests {
         let edge = &edges[0];
         assert_eq!(edge.source_id, src);
         assert_eq!(edge.target_id, dst);
-        assert_eq!(edge.kind, EdgeKind::Drift);
         assert_eq!(
             edge.metadata.as_deref(),
             Some("push#1"),
@@ -2557,52 +2550,6 @@ mod tests {
             "msg: {}",
             result.message()
         );
-    }
-
-    /// Structural edges are NOT eligible — `edge rm` only touches drift
-    /// edges so it can't break the context DAG. This test inserts a
-    /// structural edge directly and confirms `edge rm <its-uuid>`
-    /// returns a friendly "not found" rather than silently deleting it.
-    #[tokio::test]
-    async fn drift_edge_rm_refuses_structural() {
-        use crate::kernel_db::ContextEdgeRow;
-        use kaijutsu_types::EdgeKind;
-
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let child = register_context(&d, Some("child"), Some(parent), principal);
-
-        let structural_id = uuid::Uuid::now_v7();
-        {
-            let db = d.kernel_db().lock();
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: structural_id,
-                source_id: parent,
-                target_id: child,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-            .expect("insert structural edge");
-        }
-
-        let c = caller_with_context(parent);
-        let result = d
-            .dispatch(
-                &[s("drift"), s("edge"), s("rm"), structural_id.to_string()],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "must refuse structural: {}", result.message());
-
-        // And the structural edge is still there.
-        let edges = d
-            .kernel_db()
-            .lock()
-            .edges_from(parent, Some(EdgeKind::Structural))
-            .unwrap();
-        assert_eq!(edges.len(), 1, "structural edge must survive");
     }
 
     #[tokio::test]

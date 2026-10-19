@@ -15,10 +15,10 @@
 
 use clap::Parser;
 use kaijutsu_types::{
-    ContentType, ContextId, ContextState, EdgeKind, ForkKind, PrincipalId,
+    ContentType, ContextId, ContextState, ForkKind, PrincipalId,
 };
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow};
+use crate::kernel_db::ContextRow;
 use crate::llm::splice::{SpliceItem, plan_splice};
 
 use super::effect::{Classify, Effect};
@@ -640,19 +640,6 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj fork: {e}"));
             }
 
-            // Structural edge: source → new
-            let edge = ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id,
-                target_id: new_id,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            };
-            if let Err(e) = db.insert_edge(&edge) {
-                return KjResult::Err(format!("kj fork: failed to insert structural edge: {e}"));
-            }
-
             // Carry the hydration policy when its marker survived (3d). The
             // child row exists now, so the `context_hydration` FK is satisfied.
             if policy_travels
@@ -1010,19 +997,6 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj fork --compact: {e}"));
             }
 
-            let edge = ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id,
-                target_id: new_id,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            };
-            if let Err(e) = db.insert_edge(&edge) {
-                return KjResult::Err(format!(
-                    "kj fork --compact: failed to insert structural edge: {e}"
-                ));
-            }
             crate::runtime::admission::ContextAdmission::for_inserted(&row)
         };
 

@@ -47,37 +47,6 @@ impl fmt::Display for ForkKind {
 }
 
 // ============================================================================
-// EdgeKind — edge type in the context graph
-// ============================================================================
-
-/// Edge type in the context graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
-#[serde(rename_all = "lowercase")]
-#[strum(ascii_case_insensitive)]
-pub enum EdgeKind {
-    /// Structural parent-child edge (fork lineage).
-    #[default]
-    Structural,
-    /// Drift communication edge (content transfer).
-    Drift,
-}
-
-impl EdgeKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Structural => "structural",
-            Self::Drift => "drift",
-        }
-    }
-}
-
-impl fmt::Display for EdgeKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-// ============================================================================
 // ContextState — lifecycle phase of a context
 // ============================================================================
 
@@ -248,55 +217,6 @@ mod tests {
         for kind in [ForkKind::Full, ForkKind::Filtered, ForkKind::Compact] {
             let bytes = crate::codec::encode(&kind).unwrap();
             let parsed: ForkKind = crate::codec::decode(&bytes).unwrap();
-            assert_eq!(kind, parsed);
-        }
-    }
-
-    // ── EdgeKind ────────────────────────────────────────────────────────
-
-    #[test]
-    fn edge_kind_default() {
-        assert_eq!(EdgeKind::default(), EdgeKind::Structural);
-    }
-
-    #[test]
-    fn edge_kind_as_str_roundtrip() {
-        for kind in [EdgeKind::Structural, EdgeKind::Drift] {
-            let s = kind.as_str();
-            let parsed = EdgeKind::from_str(s).unwrap();
-            assert_eq!(kind, parsed);
-        }
-    }
-
-    #[test]
-    fn edge_kind_case_insensitive() {
-        assert_eq!(
-            EdgeKind::from_str("STRUCTURAL").unwrap(),
-            EdgeKind::Structural
-        );
-        assert_eq!(EdgeKind::from_str("Drift").unwrap(), EdgeKind::Drift);
-    }
-
-    #[test]
-    fn edge_kind_display() {
-        assert_eq!(format!("{}", EdgeKind::Structural), "structural");
-        assert_eq!(format!("{}", EdgeKind::Drift), "drift");
-    }
-
-    #[test]
-    fn edge_kind_serde_roundtrip() {
-        let kind = EdgeKind::Drift;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, "\"drift\"");
-        let parsed: EdgeKind = serde_json::from_str(&json).unwrap();
-        assert_eq!(kind, parsed);
-    }
-
-    #[test]
-    fn edge_kind_cbor_roundtrip() {
-        for kind in [EdgeKind::Structural, EdgeKind::Drift] {
-            let bytes = crate::codec::encode(&kind).unwrap();
-            let parsed: EdgeKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);
         }
     }

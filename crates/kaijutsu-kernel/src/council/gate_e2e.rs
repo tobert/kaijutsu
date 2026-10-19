@@ -3056,9 +3056,9 @@ fn give_cast_slot(
     db.update_cast(seat, Some(cast_id)).unwrap();
 }
 
-/// The seat's judge shadows: its live structural children of type `judge`.
+/// The seat's judge shadows: its live children of type `judge`.
 fn judge_shadows(rig: &Rig) -> Vec<crate::kernel_db::ContextRow> {
-    let children = rig.d.kernel_db().lock().structural_children(rig.ctx.context_id).unwrap();
+    let children = rig.d.kernel_db().lock().fork_children(rig.ctx.context_id).unwrap();
     children.into_iter().filter(|c| c.context_type == super::shadow::JUDGE).collect()
 }
 

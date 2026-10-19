@@ -1,9 +1,9 @@
 //! Context subcommands: list, info, switch, create, set, log, move, archive, retag.
 
 use clap::{Args, Parser, Subcommand};
-use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, EdgeKind, PrincipalId};
+use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, PrincipalId};
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
+use crate::kernel_db::{ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
 use super::format::{
     format_context_info, format_context_table, format_context_tree, format_fork_lineage,
@@ -316,21 +316,13 @@ struct ResolvedModel {
 /// Insert a new context only while its model approval assignment is valid.
 /// The check follows insertion within one database transaction so a retirement
 /// or a senpai move cannot leave a visible self-reviewed model context.
-fn insert_new_context_checked(
-    db: &KernelDb,
-    row: &ContextRow,
-    parent_id: Option<ContextId>,
-) -> KernelDbResult<()> {
-    db.in_transaction(|db| insert_new_context_rows(db, row, parent_id))
+fn insert_new_context_checked(db: &KernelDb, row: &ContextRow) -> KernelDbResult<()> {
+    db.in_transaction(|db| insert_new_context_rows(db, row))
 }
 
 /// The body of [`insert_new_context_checked`], for a caller that already
 /// holds a transaction and writes more rows in it.
-pub(crate) fn insert_new_context_rows(
-    db: &KernelDb,
-    row: &ContextRow,
-    parent_id: Option<ContextId>,
-) -> KernelDbResult<()> {
+pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow) -> KernelDbResult<()> {
     {
         if let Some(performer) = row.played_by {
             let Some(sheet) = db.get_character(performer)?.filter(|sheet| sheet.retired_at.is_none()) else {
@@ -347,16 +339,6 @@ pub(crate) fn insert_new_context_rows(
         } else {
             let default_ws = db.get_or_create_default_workspace(row.created_by)?;
             db.insert_context_with_document(row, default_ws)?;
-        }
-        if let Some(source_id) = parent_id {
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id,
-                target_id: row.context_id,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })?;
         }
         Ok(())
     }
@@ -734,19 +716,19 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context info: {e}")),
             };
 
-            // Count structural children
+            // Count live children: the contexts forked from this one
             let children_count = db
-                .edges_from(target_id, Some(EdgeKind::Structural))
-                .map(|edges| edges.len())
+                .fork_children(target_id)
+                .map(|children| children.len())
                 .unwrap_or(0);
 
             // Count drift edges (both directions)
             let drift_from = db
-                .edges_from(target_id, Some(EdgeKind::Drift))
+                .edges_from(target_id)
                 .map(|edges| edges.len())
                 .unwrap_or(0);
             let drift_to = db
-                .edges_to(target_id, Some(EdgeKind::Drift))
+                .edges_to(target_id)
                 .map(|edges| edges.len())
                 .unwrap_or(0);
 
@@ -1497,7 +1479,7 @@ impl KjDispatcher {
                 senpai_ctx: Some(senpai_ctx),
             };
             let db = self.kernel_db().lock();
-            if let Err(e) = insert_new_context_checked(&db, &row, parent_id) {
+            if let Err(e) = insert_new_context_checked(&db, &row) {
                 return KjResult::Err(format!("kj kohai create: {e}"));
             }
             crate::runtime::admission::ContextAdmission::for_inserted(&row)
@@ -2118,7 +2100,7 @@ impl KjDispatcher {
     /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
     ///
-    /// Never recurses. Children keep their structural edge and their own
+    /// Never recurses. Children keep their `forked_from` and their own
     /// state, so a lineage stays walkable after most of it is archived
     /// (`docs/issues.md`, "Managing roots").
     async fn context_archive(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
@@ -2209,7 +2191,7 @@ impl KjDispatcher {
     }
 
     /// `kj context archive --children [<parent>] [--type <type>]`: archive
-    /// each live structural child of the parent, optionally of one type,
+    /// each live child of the parent (a context forked from it), optionally of one type,
     /// each through [`Self::context_archive`].
     async fn context_archive_children(&self, parent_ref: Option<&str>, context_type: Option<&str>, caller: &KjCaller) -> KjResult {
         let children = {
@@ -2218,7 +2200,7 @@ impl KjDispatcher {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context archive --children: {e}")),
             };
-            match db.structural_children(parent) {
+            match db.fork_children(parent) {
                 Ok(children) => children,
                 Err(e) => return KjResult::Err(format!("kj context archive --children: {e}")),
             }
@@ -2293,7 +2275,7 @@ impl KjDispatcher {
         let admission = {
             let db = self.kernel_db().lock();
             let inserted = db.in_transaction(|db| {
-                insert_new_context_rows(db, &successor, parent)?;
+                insert_new_context_rows(db, &successor)?;
                 db.copy_context_env(predecessor.context_id, successor_id)?;
                 db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
                 if let Some(shell) = db.get_context_shell(predecessor.context_id)? {
@@ -2716,11 +2698,10 @@ impl Classify for ContextCommand {
 #[cfg(test)]
 mod tests {
     use super::{insert_new_context_checked, ContextConfig, EgressAssignment, PerformerAssignment};
-    use crate::kernel_db::ContextEdgeRow;
     #[allow(unused_imports)]
     use crate::kj::KjResult;
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::{ContextId, ContextState, EdgeKind, PrincipalId};
+    use kaijutsu_types::{ContextId, ContextState, PrincipalId};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -2758,20 +2739,7 @@ mod tests {
         let principal = PrincipalId::new();
         let root = register_context(&d, Some("root"), None, principal);
 
-        // Add structural edge for child
-        let child = register_context(&d, Some("child"), Some(root), principal);
-        {
-            let db = d.kernel_db().lock();
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id: root,
-                target_id: child,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-            .unwrap();
-        }
+        let _child = register_context(&d, Some("child"), Some(root), principal);
 
         let c = caller_with_context(root);
         let result = d
@@ -2781,6 +2749,45 @@ mod tests {
         let msg = result.message();
         assert!(msg.contains("root"), "output: {msg}");
         assert!(msg.contains("child"), "output: {msg}");
+    }
+
+    /// A context created after a sibling that already has children lists
+    /// after that sibling's whole subtree, so every child sits under its
+    /// real parent.
+    #[tokio::test]
+    async fn context_list_tree_keeps_children_under_their_parent() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let pause = || tokio::time::sleep(std::time::Duration::from_millis(3));
+        let root = register_context(&d, Some("amy"), None, principal);
+        pause().await;
+        let parent = register_context(&d, Some("parent"), Some(root), principal);
+        pause().await;
+        let _kid_a = register_context(&d, Some("kid-a"), Some(parent), principal);
+        pause().await;
+        let _kid_b = register_context(&d, Some("kid-b"), Some(parent), principal);
+        pause().await;
+        let newcomer = register_context(&d, Some("newcomer"), Some(root), principal);
+
+        let result = d
+            .dispatch(&[s("context"), s("list"), s("--tree")], &caller_with_context(newcomer))
+            .await;
+        assert!(result.is_ok(), "{}", result.message());
+        let lines: Vec<(usize, &str)> = result
+            .message()
+            .lines()
+            .map(|l| (l.find("└─").map_or(0, |at| at), l))
+            .collect();
+        let labels: Vec<&str> = lines
+            .iter()
+            .map(|(_, l)| ["newcomer", "kid-a", "kid-b", "parent", "amy"].into_iter().find(|n| l.contains(n)).unwrap())
+            .collect();
+        assert_eq!(labels, ["amy", "parent", "kid-a", "kid-b", "newcomer"], "{}", result.message());
+        let indent = |label: &str| lines[labels.iter().position(|l| *l == label).unwrap()].0;
+        assert!(indent("kid-a") > indent("parent"), "{}", result.message());
+        assert_eq!(indent("kid-a"), indent("kid-b"), "{}", result.message());
+        assert_eq!(indent("newcomer"), indent("parent"), "{}", result.message());
+        assert!(lines[4].1.starts_with('*'), "the caller's row is marked: {}", result.message());
     }
 
     #[tokio::test]
@@ -4226,7 +4233,7 @@ mod tests {
             played_by: Some(performer),
             senpai_ctx: None,
         };
-        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, None).unwrap_err();
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row).unwrap_err();
         assert!(error.to_string().contains("performer must name a live character"), "{error}");
         let db = d.kernel_db().lock();
         assert!(db.get_context(context_id).unwrap().is_none());
@@ -4274,7 +4281,7 @@ mod tests {
             played_by: Some(performer),
             senpai_ctx: None,
         };
-        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, None).unwrap_err();
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row).unwrap_err();
         assert!(error.to_string().contains("nobody reviews") && error.to_string().contains("reviewer-changed-after-validation"), "{error}");
         let db = d.kernel_db().lock();
         assert!(db.get_context(context_id).unwrap().is_none());
@@ -4895,20 +4902,6 @@ mod tests {
         let root = register_context(&d, Some("root"), None, principal);
         let old = register_context(&d, Some("old-root"), Some(root), principal);
         let child = register_context(&d, Some("child"), Some(old), principal);
-        {
-            let db = d.kernel_db().lock();
-            for (source, target) in [(root, old), (old, child)] {
-                db.insert_edge(&ContextEdgeRow {
-                    edge_id: uuid::Uuid::now_v7(),
-                    source_id: source,
-                    target_id: target,
-                    kind: EdgeKind::Structural,
-                    metadata: None,
-                    created_at: kaijutsu_types::now_millis() as i64,
-                })
-                .unwrap();
-            }
-        }
 
         let c = crate::kj::test_helpers::confirmed_holder_caller(&d, root);
         let result = d
@@ -4922,9 +4915,7 @@ mod tests {
         let child_row = db.get_context(child).unwrap().unwrap();
         assert!(child_row.archived_at.is_none(), "the child was archived with its parent");
         assert_eq!(child_row.context_state, kaijutsu_types::ContextState::Live);
-        let parents = db.structural_parents(child).unwrap();
-        assert_eq!(parents.len(), 1, "the child lost its parent edge");
-        assert_eq!(parents[0].context_id, old);
+        assert_eq!(child_row.forked_from, Some(old), "the child lost its parent");
         let router = d.drift_router().read();
         assert_eq!(router.get(child).unwrap().state, kaijutsu_types::ContextState::Live);
     }

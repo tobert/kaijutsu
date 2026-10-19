@@ -16,7 +16,7 @@
 //! `docs/architecture/kernel.md` for the connection-pool angle. Don't
 //! pre-emptively refactor.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult,
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    BackendId, BlockId, CastId, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
+    BackendId, BlockId, CastId, ContextId, ContextState, DocKind, ForkKind,
     KernelId, PresetId, PrincipalId, WorkspaceId,
 };
 
@@ -79,10 +79,6 @@ pub enum KernelDbError {
     /// or `*` — refused at the durable write, `docs/egress.md`, "The rule".
     #[error("invalid egress host: {0}")]
     InvalidEgressHost(String),
-
-    /// Structural edge would create a cycle.
-    #[error("cycle detected: adding this edge would create a cycle")]
-    CycleDetected,
 
     /// General validation failure.
     #[error("validation error: {0}")]
@@ -606,13 +602,12 @@ pub struct ContextEnvRow {
     pub value: String,
 }
 
-/// A context edge row (structural or drift).
+/// A drift edge row: content moved from `source_id` to `target_id`.
 #[derive(Debug, Clone)]
 pub struct ContextEdgeRow {
     pub edge_id: uuid::Uuid,
     pub source_id: ContextId,
     pub target_id: ContextId,
-    pub kind: EdgeKind,
     pub metadata: Option<String>,
     pub created_at: i64,
 }
@@ -848,16 +843,14 @@ CREATE TABLE IF NOT EXISTS context_continuations (
 );
 
 -- ── Context Edges ───────────────────────────────────────────────
+-- Drift edges only. A context's parent is `contexts.forked_from`.
 CREATE TABLE IF NOT EXISTS context_edges (
     edge_id    BLOB NOT NULL PRIMARY KEY,
     source_id  BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
     target_id  BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
-    kind       TEXT NOT NULL DEFAULT 'structural',
     metadata   TEXT,
     created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_structural_unique
-    ON context_edges(source_id, target_id) WHERE kind = 'structural';
 CREATE INDEX IF NOT EXISTS idx_edges_source ON context_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON context_edges(target_id);
 
@@ -1934,14 +1927,6 @@ fn doc_kind_from_sql(s: &str) -> DocKind {
     })
 }
 
-/// Parse EdgeKind from TEXT column.
-fn edge_kind_from_sql(s: &str) -> EdgeKind {
-    EdgeKind::from_str(s).unwrap_or_else(|_| {
-        warn!(kind = %s, "unknown EdgeKind in DB, defaulting to Structural");
-        EdgeKind::Structural
-    })
-}
-
 /// Current time as Unix milliseconds.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -3005,6 +2990,7 @@ impl KernelDb {
         Self::migrate_house_capability(conn)?;
         Self::migrate_senpai_edges(conn)?;
         Self::drop_old_routing(conn)?;
+        Self::drop_structural_edges(conn)?;
         Ok(())
     }
 
@@ -3765,6 +3751,89 @@ impl KernelDb {
         if !dropped.is_empty() {
             info!(dropped = %dropped.join(", "), "dropped the routing the senpai edge replaced");
         }
+        Ok(())
+    }
+
+    /// Remove the `kind = 'structural'` rows of `context_edges`, which
+    /// duplicated `contexts.forked_from`, and the `kind` column with them.
+    ///
+    /// The column's presence is the state: a database without it is done.
+    /// Before deleting, every structural row is compared with `forked_from`.
+    /// A row whose target was not forked from its source, a target with two
+    /// structural parents, and a kind that is neither `structural` nor
+    /// `drift` each refuse the whole migration, naming the contexts; nothing
+    /// is written. The refusal repeats on every open until the rows are
+    /// corrected by hand.
+    fn drop_structural_edges(conn: &Connection) -> KernelDbResult<()> {
+        if !Self::has_column(conn, "context_edges", "kind")? {
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        let mut refusals = Vec::new();
+
+        let unknown: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT kind FROM context_edges WHERE kind NOT IN ('structural', 'drift')",
+            )?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<SqliteResult<_>>()?
+        };
+        for kind in unknown {
+            refusals.push(format!("an edge has the unknown kind '{kind}'"));
+        }
+
+        let rows: Vec<(ContextId, ContextId, Option<ContextId>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT e.source_id, e.target_id, c.forked_from
+                 FROM context_edges e
+                 JOIN contexts c ON c.context_id = e.target_id
+                 WHERE e.kind = 'structural'
+                 ORDER BY e.target_id, e.source_id",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((read_context_id(r, 0)?, read_context_id(r, 1)?, read_opt_context_id(r, 2)?))
+            })?
+            .collect::<SqliteResult<_>>()?
+        };
+        let mut parents: HashMap<ContextId, Vec<ContextId>> = HashMap::new();
+        for (source, target, forked_from) in &rows {
+            parents.entry(*target).or_default().push(*source);
+            if *forked_from != Some(*source) {
+                refusals.push(format!(
+                    "context {} has structural parent {} but forked_from {}",
+                    target.short(),
+                    source.short(),
+                    forked_from.map_or_else(|| "none".to_string(), |p| p.short()),
+                ));
+            }
+        }
+        for (target, sources) in &parents {
+            if sources.len() > 1 {
+                let names: Vec<String> = sources.iter().map(|s| s.short()).collect();
+                refusals.push(format!(
+                    "context {} has {} structural parents ({})",
+                    target.short(),
+                    sources.len(),
+                    names.join(", "),
+                ));
+            }
+        }
+        if !refusals.is_empty() {
+            refusals.sort();
+            refusals.dedup();
+            return Err(KernelDbError::Validation(format!(
+                "cannot drop the structural context_edges rows: {}. Correct forked_from or the edge rows; \
+                 forked_from is the only parent link.",
+                refusals.join("; "),
+            )));
+        }
+
+        let deleted = tx.execute("DELETE FROM context_edges WHERE kind = 'structural'", [])?;
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_edges_structural_unique;
+             ALTER TABLE context_edges DROP COLUMN kind;",
+        )?;
+        tx.commit()?;
+        info!(deleted, "dropped the structural context_edges rows; forked_from is the only parent link");
         Ok(())
     }
 
@@ -5249,8 +5318,8 @@ impl KernelDb {
         })
     }
 
-    /// Get structural parents of a context.
-    pub fn structural_parents(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
+    /// Get the live children of a context: the contexts forked from it.
+    pub fn fork_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.context_state, c.context_type,
@@ -5258,8 +5327,8 @@ impl KernelDb {
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                     c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.senpai_ctx
              FROM contexts c
-             JOIN context_edges e ON e.source_id = c.context_id
-             WHERE e.target_id = ?1 AND e.kind = 'structural'",
+             WHERE c.forked_from = ?1 AND c.archived_at IS NULL
+             ORDER BY c.created_at, c.context_id",
         )?;
 
         let rows = stmt.query_map(params![blob_param(id.as_bytes())], |row| {
@@ -5268,64 +5337,45 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// Get active structural children of a context.
-    pub fn structural_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.context_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.context_state, c.context_type,
-                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.senpai_ctx
-             FROM contexts c
-             JOIN context_edges e ON e.target_id = c.context_id
-             WHERE e.source_id = ?1 AND e.kind = 'structural'
-               AND c.archived_at IS NULL",
-        )?;
-
-        let rows = stmt.query_map(params![blob_param(id.as_bytes())], |row| {
-            row_to_context_row(row)
-        })?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// Walk the full context DAG via recursive CTE on structural edges.
-    /// Returns `(ContextRow, depth)` pairs.
+    /// Every live context in depth-first order over `forked_from`, each
+    /// parent followed by its subtree, siblings by creation time. Returns
+    /// `(ContextRow, depth)` pairs. A live context whose parent is archived
+    /// (or absent) is a root of its own, so it still appears.
     pub fn context_dag(&self) -> KernelDbResult<Vec<(ContextRow, i64)>> {
-        // Find roots: contexts with no incoming structural edges.
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE dag(ctx_id, depth) AS (
-                -- Roots: contexts with no incoming structural edges
-                SELECT c.context_id, 0
-                FROM contexts c
-                WHERE c.archived_at IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM context_edges e
-                      WHERE e.target_id = c.context_id AND e.kind = 'structural'
-                  )
-                UNION ALL
-                -- Children via structural edges
-                SELECT e.target_id, dag.depth + 1
-                FROM dag
-                JOIN context_edges e ON e.source_id = dag.ctx_id AND e.kind = 'structural'
-                JOIN contexts c2 ON c2.context_id = e.target_id AND c2.archived_at IS NULL
-            )
-            SELECT c.context_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.context_state, c.context_type,
-                   c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                   c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.senpai_ctx, dag.depth
-            FROM dag
-            JOIN contexts c ON c.context_id = dag.ctx_id
-            ORDER BY dag.depth, c.created_at",
-        )?;
+        let live = self.list_active_contexts()?;
+        let live_ids: HashSet<ContextId> = live.iter().map(|c| c.context_id).collect();
+        let mut children: HashMap<ContextId, Vec<&ContextRow>> = HashMap::new();
+        let mut roots: Vec<&ContextRow> = Vec::new();
+        for ctx in &live {
+            match ctx.forked_from.filter(|p| live_ids.contains(p)) {
+                Some(parent) => children.entry(parent).or_default().push(ctx),
+                None => roots.push(ctx),
+            }
+        }
+        let order = |a: &&ContextRow, b: &&ContextRow| {
+            (a.created_at, a.context_id).cmp(&(b.created_at, b.context_id))
+        };
+        roots.sort_by(order);
+        for siblings in children.values_mut() {
+            siblings.sort_by(order);
+        }
 
-        let rows = stmt.query_map([], |row| {
-            let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(23)?;
-            Ok((ctx, depth))
-        })?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+        let mut out = Vec::with_capacity(live.len());
+        let mut stack: Vec<(&ContextRow, i64)> = roots.into_iter().rev().map(|c| (c, 0)).collect();
+        while let Some((ctx, depth)) = stack.pop() {
+            out.push((ctx.clone(), depth));
+            if let Some(kids) = children.get(&ctx.context_id) {
+                stack.extend(kids.iter().rev().map(|c| (*c, depth + 1)));
+            }
+        }
+        if out.len() != live.len() {
+            return Err(KernelDbError::Validation(format!(
+                "forked_from forms a cycle among live contexts: {} of {} reachable from a root",
+                out.len(),
+                live.len()
+            )));
+        }
+        Ok(out)
     }
 
     /// Walk fork lineage from a context upward via `forked_from`.
@@ -5363,143 +5413,56 @@ impl KernelDb {
     // Context Edges
     // ========================================================================
 
-    /// Insert an edge. Structural edges get cycle detection.
+    /// Insert a drift edge.
     pub fn insert_edge(&self, row: &ContextEdgeRow) -> KernelDbResult<()> {
-        if row.kind == EdgeKind::Structural {
-            // Check for cycle: walk descendants of target — if source appears, reject.
-            if self.would_create_cycle(row.source_id, row.target_id)? {
-                return Err(KernelDbError::CycleDetected);
-            }
-        }
-
         self.conn.execute(
-            "INSERT INTO context_edges (edge_id, source_id, target_id, kind, metadata, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO context_edges (edge_id, source_id, target_id, metadata, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 row.edge_id.as_bytes().as_slice(),
                 blob_param(row.source_id.as_bytes()),
                 blob_param(row.target_id.as_bytes()),
-                row.kind.as_str(),
                 row.metadata,
                 row.created_at,
             ],
-        ).map_err(|e| {
-            map_unique_violation(e, format!(
-                "structural edge {:?} → {:?} already exists",
-                row.source_id.short(), row.target_id.short()
-            ))
-        })?;
+        )?;
         Ok(())
     }
 
-    /// Check if adding source→target structural edge would create a cycle.
-    fn would_create_cycle(&self, source: ContextId, target: ContextId) -> KernelDbResult<bool> {
-        if source == target {
-            return Ok(true);
-        }
-
-        // Walk descendants of target via structural edges.
-        let mut visited = HashSet::new();
-        let mut stack = vec![target];
-
-        while let Some(node) = stack.pop() {
-            if node == source {
-                return Ok(true);
-            }
-            if !visited.insert(node) {
-                continue;
-            }
-
-            let mut stmt = self.conn.prepare(
-                "SELECT target_id FROM context_edges
-                 WHERE source_id = ?1 AND kind = 'structural'",
-            )?;
-            let children: Vec<ContextId> = stmt
-                .query_map(params![blob_param(node.as_bytes())], |row| {
-                    read_context_id(row, 0)
-                })?
-                .collect::<SqliteResult<Vec<_>>>()?;
-
-            stack.extend(children);
-        }
-
-        Ok(false)
-    }
-
-    /// List edges from a source, optionally filtered by kind.
-    pub fn edges_from(
-        &self,
-        source: ContextId,
-        kind: Option<EdgeKind>,
-    ) -> KernelDbResult<Vec<ContextEdgeRow>> {
-        let rows = match kind {
-            Some(k) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT edge_id, source_id, target_id, kind, metadata, created_at
-                     FROM context_edges
-                     WHERE source_id = ?1 AND kind = ?2
-                     ORDER BY created_at",
-                )?;
-                stmt.query_map(
-                    params![blob_param(source.as_bytes()), k.as_str()],
-                    row_to_edge_row,
-                )?
-                .collect::<SqliteResult<Vec<_>>>()?
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT edge_id, source_id, target_id, kind, metadata, created_at
-                     FROM context_edges
-                     WHERE source_id = ?1
-                     ORDER BY created_at",
-                )?;
-                stmt.query_map(params![blob_param(source.as_bytes())], row_to_edge_row)?
-                    .collect::<SqliteResult<Vec<_>>>()?
-            }
-        };
+    /// List edges from a source, oldest first.
+    pub fn edges_from(&self, source: ContextId) -> KernelDbResult<Vec<ContextEdgeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT edge_id, source_id, target_id, metadata, created_at
+             FROM context_edges
+             WHERE source_id = ?1
+             ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map(params![blob_param(source.as_bytes())], row_to_edge_row)?
+            .collect::<SqliteResult<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// List edges to a target, optionally filtered by kind.
-    pub fn edges_to(
-        &self,
-        target: ContextId,
-        kind: Option<EdgeKind>,
-    ) -> KernelDbResult<Vec<ContextEdgeRow>> {
-        let rows = match kind {
-            Some(k) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT edge_id, source_id, target_id, kind, metadata, created_at
-                     FROM context_edges
-                     WHERE target_id = ?1 AND kind = ?2
-                     ORDER BY created_at",
-                )?;
-                stmt.query_map(
-                    params![blob_param(target.as_bytes()), k.as_str()],
-                    row_to_edge_row,
-                )?
-                .collect::<SqliteResult<Vec<_>>>()?
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT edge_id, source_id, target_id, kind, metadata, created_at
-                     FROM context_edges
-                     WHERE target_id = ?1
-                     ORDER BY created_at",
-                )?;
-                stmt.query_map(params![blob_param(target.as_bytes())], row_to_edge_row)?
-                    .collect::<SqliteResult<Vec<_>>>()?
-            }
-        };
+    /// List edges to a target, oldest first.
+    pub fn edges_to(&self, target: ContextId) -> KernelDbResult<Vec<ContextEdgeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT edge_id, source_id, target_id, metadata, created_at
+             FROM context_edges
+             WHERE target_id = ?1
+             ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map(params![blob_param(target.as_bytes())], row_to_edge_row)?
+            .collect::<SqliteResult<Vec<_>>>()?;
         Ok(rows)
     }
 
     /// List drift edges originating from a context, newest first.
     pub fn drift_provenance(&self, context_id: ContextId) -> KernelDbResult<Vec<ContextEdgeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT edge_id, source_id, target_id, kind, metadata, created_at
+            "SELECT edge_id, source_id, target_id, metadata, created_at
              FROM context_edges
-             WHERE source_id = ?1 AND kind = 'drift'
+             WHERE source_id = ?1
              ORDER BY created_at DESC",
         )?;
 
@@ -7517,13 +7480,12 @@ impl KernelDb {
     /// Delete a single drift edge by its UUID.
     ///
     /// Companion to `kj drift edge rm` — `kj drift history` emits these
-    /// UUIDs as iteration handles. Kind filter pins this to drift edges
-    /// only so a stray `delete_drift_edge` can't accidentally remove a
-    /// structural edge (which would orphan a context's parent link).
+    /// UUIDs as iteration handles. A context's parent link is
+    /// `contexts.forked_from`, so no edge row holds one.
     pub fn delete_drift_edge(&self, edge_id: uuid::Uuid) -> KernelDbResult<bool> {
         let deleted = self.conn.execute(
             "DELETE FROM context_edges
-             WHERE edge_id = ?1 AND kind = 'drift'",
+             WHERE edge_id = ?1",
             params![edge_id.as_bytes().as_slice()],
         )?;
         Ok(deleted > 0)
@@ -8851,14 +8813,12 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
 }
 
 fn row_to_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextEdgeRow> {
-    let kind_str: String = row.get(3)?;
     Ok(ContextEdgeRow {
         edge_id: read_edge_id(row, 0)?,
         source_id: read_context_id(row, 1)?,
         target_id: read_context_id(row, 2)?,
-        kind: edge_kind_from_sql(&kind_str),
-        metadata: row.get(4)?,
-        created_at: row.get(5)?,
+        metadata: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
@@ -9266,12 +9226,11 @@ fn setup_test_db(db: &KernelDb) -> WorkspaceId {
 }
 
 #[cfg(test)]
-fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdgeRow {
+fn make_edge(source: ContextId, target: ContextId) -> ContextEdgeRow {
     ContextEdgeRow {
         edge_id: uuid::Uuid::now_v7(),
         source_id: source,
         target_id: target,
-        kind,
         metadata: None,
         created_at: now_millis(),
     }
@@ -9954,14 +9913,10 @@ mod tests {
         assert!(matches!(err, KernelDbError::NotFound(_)), "got: {err:?}");
     }
 
-    /// `list_active_contexts`/`list_all_contexts`/`structural_parents`/
-    /// `structural_children`/`context_dag`/`fork_lineage`/
-    /// `find_context_by_label` all share the same `contexts` column list —
-    /// this exercises the two CTE-based reads (`context_dag`, whose SELECT
-    /// appends `origin_host` BEFORE the extra `depth` column) to catch a
-    /// column-index-off-by-one if `origin_host` and `depth` ever get
-    /// reordered without updating both `row_to_context_row` and the `depth`
-    /// read together.
+    /// `list_active_contexts`/`list_all_contexts`/`fork_children`/
+    /// `context_dag`/`fork_lineage`/`find_context_by_label` all share the
+    /// same `contexts` column list — `context_dag` must carry `origin_host`
+    /// through to its rows.
     #[test]
     fn origin_host_survives_the_context_dag_cte_read() {
         let db = KernelDb::temporary().unwrap();
@@ -9974,9 +9929,9 @@ mod tests {
         let (found, depth) = dag
             .into_iter()
             .find(|(r, _)| r.context_id == row.context_id)
-            .expect("row must appear in the DAG (it's a root — no structural edges)");
+            .expect("row must appear in the DAG (it's a root — no forked_from)");
         assert_eq!(found.origin_host, Some("moltar".to_string()));
-        assert_eq!(depth, 0, "a root with no structural parent is depth 0");
+        assert_eq!(depth, 0, "a root with no parent is depth 0");
     }
 
     /// A real `ALTER TABLE` failure — not the expected/ignorable "duplicate
@@ -10776,33 +10731,6 @@ mod tests {
         assert_eq!(lineage[2].1, 2);
     }
 
-    // ── 7. Structural edge unique ──────────────────────────────────────
-
-    #[test]
-    fn structural_edge_unique() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let a = make_context_row(Some("a"));
-        let b = make_context_row(Some("b"));
-        insert_context_with_doc(&db, &a, ws_id);
-        insert_context_with_doc(&db, &b, ws_id);
-
-        // First structural edge OK
-        db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
-            .unwrap();
-
-        // Duplicate structural → error
-        let err = db
-            .insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
-            .unwrap_err();
-        assert!(matches!(err, KernelDbError::LabelConflict(_)));
-
-        // Same pair as drift → OK
-        db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Drift))
-            .unwrap();
-    }
-
     // ── 8. Drift edge allows dupes ─────────────────────────────────────
 
     #[test]
@@ -10817,43 +10745,12 @@ mod tests {
 
         // Multiple drift edges same pair → all stored
         for _ in 0..3 {
-            db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Drift))
+            db.insert_edge(&make_edge(a.context_id, b.context_id))
                 .unwrap();
         }
 
-        let edges = db.edges_from(a.context_id, Some(EdgeKind::Drift)).unwrap();
+        let edges = db.edges_from(a.context_id).unwrap();
         assert_eq!(edges.len(), 3);
-    }
-
-    // ── 9. Cycle detection ─────────────────────────────────────────────
-
-    #[test]
-    fn cycle_detection() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let a = make_context_row(Some("cyc-a"));
-        let b = make_context_row(Some("cyc-b"));
-        insert_context_with_doc(&db, &a, ws_id);
-        insert_context_with_doc(&db, &b, ws_id);
-
-        // A → B structural OK
-        db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
-            .unwrap();
-
-        // B → A structural → CycleDetected
-        let err = db
-            .insert_edge(&make_edge(b.context_id, a.context_id, EdgeKind::Structural))
-            .unwrap_err();
-        assert!(matches!(err, KernelDbError::CycleDetected));
-
-        // Self-loop also detected
-        let c = make_context_row(Some("cyc-c"));
-        insert_context_with_doc(&db, &c, ws_id);
-        let err = db
-            .insert_edge(&make_edge(c.context_id, c.context_id, EdgeKind::Structural))
-            .unwrap_err();
-        assert!(matches!(err, KernelDbError::CycleDetected));
     }
 
     // ── 10. Preset lifecycle ───────────────────────────────────────────
@@ -11022,16 +10919,16 @@ mod tests {
         insert_context_with_doc(&db, &b, ws_id);
 
         // Simulate drift push → create drift edge
-        let edge1 = make_edge(a.context_id, b.context_id, EdgeKind::Drift);
+        let edge1 = make_edge(a.context_id, b.context_id);
         db.insert_edge(&edge1).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1));
 
-        let edge2 = make_edge(a.context_id, b.context_id, EdgeKind::Drift);
+        let edge2 = make_edge(a.context_id, b.context_id);
         db.insert_edge(&edge2).unwrap();
 
         // edges_from returns both
-        let edges = db.edges_from(a.context_id, Some(EdgeKind::Drift)).unwrap();
+        let edges = db.edges_from(a.context_id).unwrap();
         assert_eq!(edges.len(), 2);
 
         // drift_provenance returns newest first
@@ -11049,31 +10946,18 @@ mod tests {
 
         // Create a 5-node tree: root → [a, b], a → [c, d]
         let root = make_context_row(Some("root"));
-        let a = make_context_row(Some("a"));
-        let b = make_context_row(Some("b"));
-        let c = make_context_row(Some("c"));
-        let d = make_context_row(Some("d"));
+        let mut a = make_context_row(Some("a"));
+        let mut b = make_context_row(Some("b"));
+        let mut c = make_context_row(Some("c"));
+        let mut d = make_context_row(Some("d"));
+        a.forked_from = Some(root.context_id);
+        b.forked_from = Some(root.context_id);
+        c.forked_from = Some(a.context_id);
+        d.forked_from = Some(a.context_id);
 
         for ctx in [&root, &a, &b, &c, &d] {
             insert_context_with_doc(&db, ctx, ws_id);
         }
-
-        db.insert_edge(&make_edge(
-            root.context_id,
-            a.context_id,
-            EdgeKind::Structural,
-        ))
-        .unwrap();
-        db.insert_edge(&make_edge(
-            root.context_id,
-            b.context_id,
-            EdgeKind::Structural,
-        ))
-        .unwrap();
-        db.insert_edge(&make_edge(a.context_id, c.context_id, EdgeKind::Structural))
-            .unwrap();
-        db.insert_edge(&make_edge(a.context_id, d.context_id, EdgeKind::Structural))
-            .unwrap();
 
         let dag = db.context_dag().unwrap();
         assert_eq!(dag.len(), 5);
@@ -11089,6 +10973,175 @@ mod tests {
         // c, d at depth 2
         let depth2: Vec<_> = dag.iter().filter(|(_, d)| *d == 2).collect();
         assert_eq!(depth2.len(), 2);
+    }
+
+    #[test]
+    fn context_dag_lists_every_child_under_its_own_parent() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        // root has two children; the earlier one has a child of its own that
+        // is newer than the later sibling.
+        let base = now_millis();
+        let mut root = make_context_row(Some("root"));
+        let mut first = make_context_row(Some("first"));
+        let mut later = make_context_row(Some("later"));
+        let mut grandchild = make_context_row(Some("grandchild"));
+        root.created_at = base;
+        first.created_at = base + 1;
+        later.created_at = base + 2;
+        grandchild.created_at = base + 3;
+        first.forked_from = Some(root.context_id);
+        later.forked_from = Some(root.context_id);
+        grandchild.forked_from = Some(first.context_id);
+        for ctx in [&root, &first, &later, &grandchild] {
+            insert_context_with_doc(&db, ctx, ws_id);
+        }
+
+        let dag = db.context_dag().unwrap();
+        let shape: Vec<(String, i64)> = dag
+            .iter()
+            .map(|(c, depth)| (c.label.clone().unwrap(), *depth))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("root".to_string(), 0),
+                ("first".to_string(), 1),
+                ("grandchild".to_string(), 2),
+                ("later".to_string(), 1),
+            ],
+            "each child follows its own parent, depth-first"
+        );
+    }
+
+    // ── Dropping the structural edge rows ──────────────────────────────
+
+    /// Give `context_edges` the shape it had while it carried structural
+    /// rows: the `kind` column and its partial unique index.
+    fn restore_edge_kind_column(db: &KernelDb) {
+        db.conn
+            .execute_batch(
+                "ALTER TABLE context_edges ADD COLUMN kind TEXT NOT NULL DEFAULT 'structural';
+                 CREATE UNIQUE INDEX idx_edges_structural_unique
+                     ON context_edges(source_id, target_id) WHERE kind = 'structural';",
+            )
+            .unwrap();
+    }
+
+    fn insert_legacy_edge(db: &KernelDb, source: ContextId, target: ContextId, kind: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO context_edges (edge_id, source_id, target_id, kind, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![
+                    uuid::Uuid::now_v7().as_bytes().as_slice(),
+                    blob_param(source.as_bytes()),
+                    blob_param(target.as_bytes()),
+                    kind
+                ],
+            )
+            .unwrap();
+    }
+
+    fn edge_count(db: &KernelDb) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM context_edges", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn dropping_structural_edges_keeps_drift_and_forked_from() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let parent = make_context_row(Some("parent"));
+        let mut child = make_context_row(Some("child"));
+        child.forked_from = Some(parent.context_id);
+        insert_context_with_doc(&db, &parent, ws_id);
+        insert_context_with_doc(&db, &child, ws_id);
+        restore_edge_kind_column(&db);
+        insert_legacy_edge(&db, parent.context_id, child.context_id, "structural");
+        insert_legacy_edge(&db, child.context_id, parent.context_id, "drift");
+
+        KernelDb::drop_structural_edges(&db.conn).unwrap();
+
+        assert!(!KernelDb::has_column(&db.conn, "context_edges", "kind").unwrap());
+        assert_eq!(edge_count(&db), 1, "only the drift row remains");
+        let edges = db.edges_from(child.context_id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target_id, parent.context_id);
+        assert_eq!(
+            db.get_context(child.context_id).unwrap().unwrap().forked_from,
+            Some(parent.context_id)
+        );
+        // A second run finds the column gone and changes nothing.
+        KernelDb::drop_structural_edges(&db.conn).unwrap();
+        assert_eq!(edge_count(&db), 1);
+    }
+
+    #[test]
+    fn dropping_structural_edges_refuses_a_parent_that_is_not_forked_from() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let edge_parent = make_context_row(Some("edge-parent"));
+        let fork_parent = make_context_row(Some("fork-parent"));
+        let mut child = make_context_row(Some("child"));
+        child.forked_from = Some(fork_parent.context_id);
+        let mut orphan = make_context_row(Some("orphan"));
+        orphan.forked_from = None;
+        for ctx in [&edge_parent, &fork_parent, &child, &orphan] {
+            insert_context_with_doc(&db, ctx, ws_id);
+        }
+        restore_edge_kind_column(&db);
+        insert_legacy_edge(&db, edge_parent.context_id, child.context_id, "structural");
+        insert_legacy_edge(&db, edge_parent.context_id, orphan.context_id, "structural");
+
+        let err = KernelDb::drop_structural_edges(&db.conn).unwrap_err().to_string();
+
+        assert!(err.contains(&child.context_id.short()), "names the child: {err}");
+        assert!(err.contains(&orphan.context_id.short()), "names the orphan: {err}");
+        assert!(err.contains("forked_from"), "{err}");
+        assert!(KernelDb::has_column(&db.conn, "context_edges", "kind").unwrap(), "nothing was dropped");
+        assert_eq!(edge_count(&db), 2, "nothing was deleted");
+    }
+
+    #[test]
+    fn dropping_structural_edges_refuses_two_structural_parents() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let one = make_context_row(Some("one"));
+        let two = make_context_row(Some("two"));
+        let mut child = make_context_row(Some("child"));
+        child.forked_from = Some(one.context_id);
+        for ctx in [&one, &two, &child] {
+            insert_context_with_doc(&db, ctx, ws_id);
+        }
+        restore_edge_kind_column(&db);
+        insert_legacy_edge(&db, one.context_id, child.context_id, "structural");
+        insert_legacy_edge(&db, two.context_id, child.context_id, "structural");
+
+        let err = KernelDb::drop_structural_edges(&db.conn).unwrap_err().to_string();
+
+        assert!(err.contains("2 structural parents"), "{err}");
+        assert!(err.contains(&child.context_id.short()), "{err}");
+        assert_eq!(edge_count(&db), 2, "nothing was deleted");
+    }
+
+    #[test]
+    fn dropping_structural_edges_refuses_an_unknown_kind() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let a = make_context_row(Some("a"));
+        let b = make_context_row(Some("b"));
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
+        restore_edge_kind_column(&db);
+        insert_legacy_edge(&db, a.context_id, b.context_id, "mystery");
+
+        let err = KernelDb::drop_structural_edges(&db.conn).unwrap_err().to_string();
+
+        assert!(err.contains("unknown kind 'mystery'"), "{err}");
+        assert_eq!(edge_count(&db), 1);
     }
 
     // ── 15. Tag resolution (label + prefix) ────────────────────────────
@@ -11156,7 +11209,7 @@ mod tests {
         assert_eq!(all.len(), 5);
     }
 
-    // ── 18. Archive excludes from active + structural_children ─────────
+    // ── 18. Archive excludes from active + fork_children ─────────
 
     #[test]
     fn archive_excludes_from_active() {
@@ -11164,18 +11217,13 @@ mod tests {
         let ws_id = setup_test_db(&db);
 
         let parent = make_context_row(Some("parent"));
-        let child = make_context_row(Some("child"));
+        let mut child = make_context_row(Some("child"));
+        child.forked_from = Some(parent.context_id);
         insert_context_with_doc(&db, &parent, ws_id);
         insert_context_with_doc(&db, &child, ws_id);
-        db.insert_edge(&make_edge(
-            parent.context_id,
-            child.context_id,
-            EdgeKind::Structural,
-        ))
-        .unwrap();
 
         // Before archive
-        let children = db.structural_children(parent.context_id).unwrap();
+        let children = db.fork_children(parent.context_id).unwrap();
         assert_eq!(children.len(), 1);
 
         // Archive child
@@ -11186,8 +11234,8 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].context_id, parent.context_id);
 
-        // structural_children excludes archived
-        let children = db.structural_children(parent.context_id).unwrap();
+        // fork_children excludes archived
+        let children = db.fork_children(parent.context_id).unwrap();
         assert!(children.is_empty());
     }
 
@@ -11203,14 +11251,12 @@ mod tests {
         insert_context_with_doc(&db, &a, ws_id);
         insert_context_with_doc(&db, &b, ws_id);
 
-        db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
-            .unwrap();
-        db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Drift))
+        db.insert_edge(&make_edge(a.context_id, b.context_id))
             .unwrap();
 
-        // Both edges exist
-        let all = db.edges_from(a.context_id, None).unwrap();
-        assert_eq!(all.len(), 2);
+        // The edge exists
+        let all = db.edges_from(a.context_id).unwrap();
+        assert_eq!(all.len(), 1);
 
         // Delete context a → edges cascade
         db.conn
@@ -11221,7 +11267,7 @@ mod tests {
             .unwrap();
 
         // Edges gone
-        let all = db.edges_from(a.context_id, None).unwrap();
+        let all = db.edges_from(a.context_id).unwrap();
         assert!(all.is_empty());
     }
 

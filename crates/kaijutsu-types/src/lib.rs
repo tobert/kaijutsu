@@ -166,7 +166,7 @@ pub use error_block::IntoErrorPayload;
 pub use summary::summarize_thinking;
 pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use dag::ConversationDAG;
-pub use enums::{ContextState, DocKind, EdgeKind, ForkKind};
+pub use enums::{ContextState, DocKind, ForkKind};
 pub use ids::{
     BackendId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, TurnId, WorkspaceId,
 };
