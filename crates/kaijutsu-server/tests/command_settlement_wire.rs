@@ -197,12 +197,10 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
         let performer = kaijutsu_types::PrincipalId::new();
         {
             let db = kernel.kernel_db.lock();
-            for (principal_id, name) in [(performer, "distinct-performer")] {
-                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
-                    principal_id, name: name.into(), created_at: 0, retired_at: None,
-                    handoff_ctx: None, root_ctx: None, root: false,
-                }).unwrap();
-            }
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                principal_id: performer, name: "distinct-performer".into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
         }
         let set = kj.execute_kj_quiet(context, &[
             "context".into(), "set".into(), context.to_hex(), "--as".into(), "distinct-performer".into(),
