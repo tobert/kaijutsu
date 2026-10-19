@@ -66,7 +66,7 @@
 //! reason column motions were dropped in slice 5: a cursor somewhere the
 //! reader cannot see is state that lies.
 
-use editor_types::application::{ApplicationAction, ApplicationInfo};
+use editor_types::application::{ApplicationAction, ApplicationInfo, EmptyInfo};
 use editor_types::context::{EditContext, Resolve};
 use editor_types::prelude::{CommandType, Count, TargetShape, ViewportContext};
 use editor_types::{
@@ -256,10 +256,7 @@ impl ApplicationInfo for DiffInfo {
     type ContentId = String;
 
     fn content_of_command(cmdtype: CommandType) -> String {
-        match cmdtype {
-            CommandType::Search => "*search*".into(),
-            CommandType::Command => "*command*".into(),
-        }
+        EmptyInfo::content_of_command(cmdtype)
     }
 }
 
@@ -1069,7 +1066,7 @@ fn is_read_only(ea: &EditorAction, ctx: &EditContext) -> bool {
     match ea {
         EditorAction::Edit(spec, _) => {
             let op: EditAction = ctx.resolve(spec);
-            matches!(op, EditAction::Motion | EditAction::Yank)
+            matches!(op, EditAction::Motion | EditAction::Yank(..))
         }
         EditorAction::Cursor(_) | EditorAction::Selection(_) | EditorAction::Mark(_) => true,
         EditorAction::InsertText(_) | EditorAction::History(_) | EditorAction::Complete(..) => {
@@ -1174,7 +1171,7 @@ fn is_yank(ea: &EditorAction, ctx: &EditContext) -> bool {
     match ea {
         EditorAction::Edit(spec, _) => {
             let op: EditAction = ctx.resolve(spec);
-            op == EditAction::Yank
+            matches!(op, EditAction::Yank(..))
         }
         _ => false,
     }

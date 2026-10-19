@@ -16,13 +16,13 @@
 //! `docs/vi.md`.
 
 use editor_types::application::EmptyInfo;
-use editor_types::context::EditContext;
+use editor_types::context::{EditContext, Resolve};
 use editor_types::prelude::{
-    CloseFlags, EditTarget, MoveDir2D, RepeatType, ScrollSize, ScrollStyle, SearchType, TargetShape,
-    ViewportContext,
+    CloseFlags, EditTarget, MoveDir2D, NumberChange, RepeatType, ScrollSize, ScrollStyle, SearchType,
+    TargetShape, ViewportContext,
 };
 use editor_types::{
-    Action, CommandBarAction, CursorAction, EditorAction, PromptAction, WindowAction,
+    Action, CommandBarAction, CursorAction, EditAction, EditorAction, PromptAction, WindowAction,
 };
 
 use modalkit::actions::Editable;
@@ -581,6 +581,13 @@ impl EditorCore {
             self.pending_commands = Some(Err(msg));
             return;
         }
+        if let EditorAction::Edit(spec, _) = ea
+            && let EditAction::ChangeNumber(change, _) = ctx.resolve(spec)
+            && let Err(msg) = self.check_number_change(&change, ctx)
+        {
+            self.pending_commands = Some(Err(msg));
+            return;
+        }
         let ictx = (self.group, &self.viewport, ctx);
         // Editing errors (e.g. motion off the end) are non-fatal vim behavior,
         // not corruption — drop them, keep the buffer.
@@ -602,6 +609,41 @@ impl EditorCore {
         }
     }
 
+    /// Check that `<C-a>`/`<C-x>` can change every number on the lines it
+    /// touches. modalkit 0.0.32 loops forever on a number that does not
+    /// parse as an `isize` and adds the count without an overflow check, so
+    /// such a number refuses the whole change.
+    ///
+    /// The lines are the leader's line, or its selection's lines. A `g<C-a>`
+    /// grows the step on each line, so the bound uses the count times the
+    /// line count.
+    fn check_number_change(&mut self, change: &NumberChange, ctx: &EditContext) -> Result<(), String> {
+        let lines = match self.buffer.get_leader_selection(self.group) {
+            Some((start, end, _)) => start.y..=end.y,
+            None => {
+                let y = self.buffer.get_leader(self.group).y;
+                y..=y
+            }
+        };
+        let count = match change {
+            NumberChange::Increase(count) | NumberChange::Decrease(count) => ctx.resolve(count),
+        };
+        let step = isize::try_from(count.saturating_mul(lines.end() - lines.start() + 1))
+            .unwrap_or(isize::MAX);
+        let text = self.text();
+        for line in text.lines().skip(*lines.start()).take(lines.end() - lines.start() + 1) {
+            for number in decimal_numbers(line) {
+                let fits = number
+                    .parse::<isize>()
+                    .is_ok_and(|n| n.checked_add(step).is_some() && n.checked_sub(step).is_some());
+                if !fits {
+                    return Err(format!("number too large to change: {number}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Run a parsed `:s` substitution against the document buffer and move the
     /// leader cursor onto the result (clamped). A no-match substitution leaves
     /// the buffer untouched (no EditOp). `set_text` resets undo — acceptable for
@@ -620,6 +662,26 @@ impl EditorCore {
         let (line, col) = line_col(&new, new_cursor);
         self.buffer.set_leader(self.group, Cursor::new(line, col));
     }
+}
+
+/// The decimal numbers in `line` as modalkit's `WordStyle::Number` finds
+/// them: a run of ASCII digits, with a `-` directly before it.
+fn decimal_numbers(line: &str) -> impl Iterator<Item = &str> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() && !bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return None;
+        }
+        let start = if i > 0 && bytes[i - 1] == b'-' { i - 1 } else { i };
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        Some(&line[start..i])
+    })
 }
 
 /// Remove at most one trailing `\n` (modalkit's guaranteed line terminator).
@@ -2014,6 +2076,53 @@ baz");
             ed.apply_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         assert_eq!(ed.text(), "a < b");
+    }
+
+    /// Run `keys` against `text` on a thread, and fail instead of hanging the
+    /// suite when the editor never returns.
+    fn keys_within(text: &'static str, keys: &'static str) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ed = EditorCore::new(text);
+            ed.apply_keys(keys);
+            let _ = tx.send(ed.text());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{keys:?} on {text:?} did not return within 5s"))
+    }
+
+    /// vi's `<C-a>` increments the number at or after the cursor, and does
+    /// nothing on a line without one. The tui sends it with `Ctrl+A a`.
+    #[test]
+    fn ctrl_a_increments_or_does_nothing() {
+        assert_eq!(keys_within("x 41", "<C-a>"), "x 42");
+        assert_eq!(keys_within("hello", "<C-a>"), "hello");
+        assert_eq!(keys_within("", "<C-a>"), "");
+        assert_eq!(keys_within("", "<C-x>"), "");
+    }
+
+    /// A number too large to parse, or one the step would overflow, is left
+    /// alone and the refusal is reported.
+    #[test]
+    fn ctrl_a_leaves_an_overflowing_number_alone() {
+        assert_eq!(keys_within("99999999999999999999", "<C-a>"), "99999999999999999999");
+        assert_eq!(keys_within("9223372036854775807", "<C-a>"), "9223372036854775807");
+        assert_eq!(keys_within("x -9223372036854775808", "<C-x>"), "x -9223372036854775808");
+        let mut ed = EditorCore::new("99999999999999999999");
+        ed.apply_keys("<C-a>");
+        assert_eq!(
+            ed.take_commands(),
+            Some(Err("number too large to change: 99999999999999999999".to_string()))
+        );
+    }
+
+    /// The guard reads numbers the way modalkit does: digits, with a `-`
+    /// directly before them.
+    #[test]
+    fn decimal_numbers_match_modalkit_words() {
+        let found: Vec<&str> = decimal_numbers("a-5 b12-3 - 7x").collect();
+        assert_eq!(found, ["-5", "12", "-3", "7"]);
+        assert_eq!(keys_within("a-5", "<C-a>"), "a-4");
     }
 
     /// A bare `<` opens a token, so the notation spells a literal one `<lt>`.

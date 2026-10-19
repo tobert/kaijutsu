@@ -204,8 +204,8 @@ rmcp = { version = "3.1", features = ["client", "elicitation", "transport-child-
 http = "1"
 
 # Vi-modal editing (keystroke → semantic action state machine)
-modalkit = "0.0.25"
-editor-types = "0.0.2"
+modalkit = "0.0.32"
+editor-types = "0.0.7"
 
 # Terminal UI (kaijutsu-tui). `crossterm_0_29` pins ratatui's backend to the
 # same crossterm the workspace already carries through modalkit, so one
