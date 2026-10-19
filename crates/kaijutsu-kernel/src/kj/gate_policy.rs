@@ -108,6 +108,10 @@ pub(crate) enum Layer {
     /// The council's allow for a statement no other layer covered, naming
     /// the spec it read the submission under (`docs/council.md`).
     Council(String),
+    /// A drift along the caller's senpai edge — to its senpai, or to one of
+    /// its own kohai — that no key decided (`docs/senpai-kohai.md`,
+    /// "Reports and drift").
+    SenpaiEdge,
 }
 
 impl std::fmt::Display for Layer {
@@ -121,6 +125,7 @@ impl std::fmt::Display for Layer {
             Self::UncoveredAllow(None) => f.write_str("global config uncovered tier"),
             Self::UncoveredAllow(Some(t)) => write!(f, "context_type config ({t}) uncovered tier"),
             Self::Council(spec) => write!(f, "council ({spec})"),
+            Self::SenpaiEdge => f.write_str("senpai edge"),
         }
     }
 }
@@ -1205,7 +1210,7 @@ pub(crate) fn evaluate_planned(
     layers: Layers<'_>,
 ) -> PolicyEvaluation {
     PolicyEvaluation {
-        per_statement: statements.iter().map(|s| statement_verdict(s, layers)).collect(),
+        per_statement: statements.iter().map(|s| statement_verdict(s, layers, &|_| None)).collect(),
     }
 }
 
@@ -1265,7 +1270,8 @@ pub(crate) fn evaluate(
     }
 
     let family = family_layer_per_gated_statement(db, spec, &caller, &context)?;
-    let lower = lower_layers_per_gated_statement(spec, layers);
+    let edge = |cmd: &PlannedCommand| senpai_edge_drift(db, cmd, &caller);
+    let lower = lower_layers_per_gated_statement(spec, layers, &edge);
     let per_statement = exact
         .iter()
         .zip(family)
@@ -1548,6 +1554,58 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
     }
 }
 
+/// Whether `cmd` drifts along `caller`'s senpai edge: `kj drift push`
+/// whose target, resolved as the verb resolves it, is the caller's senpai
+/// or a context whose senpai is the caller's, or `kj senpai report` from a
+/// context that has a senpai. Every argument must be a literal word, and
+/// the command plain (no redirect, background flag or heredoc), since the
+/// decision reads the target out of the arguments. `None` for anything
+/// else; the verb itself still refuses a target that is not live.
+fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
+    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+        return None;
+    }
+    let here = caller.context_id?;
+    let mut args = literal_args(cmd)?;
+    // After `--` a token such as `--json` is a word, which `strip_flag`
+    // would drop: the target read here could then differ from the verb's.
+    if args.iter().any(|a| a == "--") {
+        return None;
+    }
+    super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
+    let matches = super::effect::cached_kj_args_command().try_get_matches_from(&args).ok()?;
+    let senpai_of = |id: ContextId| db.get_context(id).ok().flatten().and_then(|row| row.senpai_ctx);
+    let label = |id: ContextId| {
+        db.get_context(id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.label)
+            .unwrap_or_else(|| id.short())
+    };
+    match matches.subcommand()? {
+        ("drift", m) => match m.subcommand()? {
+            ("push", m) => {
+                let dst = m.try_get_one::<String>("dst").ok()??;
+                let target = super::refs::resolve_context_arg_from(Some(dst.as_str()), Some(here), db).ok()?;
+                if senpai_of(here) == Some(target) {
+                    Some(Decision { layer: Layer::SenpaiEdge, key: format!("kj drift push to {}, its senpai", label(target)) })
+                } else if target != here && senpai_of(target) == Some(here) {
+                    Some(Decision { layer: Layer::SenpaiEdge, key: format!("kj drift push to {}, its kohai", label(target)) })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        ("senpai", m) => match m.subcommand()? {
+            ("report", _) => senpai_of(here)
+                .map(|senpai| Decision { layer: Layer::SenpaiEdge, key: format!("kj senpai report to {}", label(senpai)) }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Every argument's word, when each is known before the command runs.
 fn literal_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
     use kaish_types::plan::PlannedValue;
@@ -1590,15 +1648,15 @@ pub(crate) fn character_rule_refusal(statements: &[PlannedStatement]) -> Option<
 /// `Origin::Hook` gates one statement standing for the whole call: denied
 /// or asked if any planned statement is, allowed only when every one is.
 /// `Origin::KjVerb` carries no plan.
-fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>) -> Vec<PolicyVerdict> {
+fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>, edge: &EdgeCheck<'_>) -> Vec<PolicyVerdict> {
     let n = spec.statements.len();
     match spec.origin {
         Origin::ShellGate if spec.planned.len() == n && n > 0 => {
-            spec.planned.iter().map(|s| statement_verdict(s, layers)).collect()
+            spec.planned.iter().map(|s| statement_verdict(s, layers, edge)).collect()
         }
         Origin::Hook if n == 1 && !spec.planned.is_empty() => {
-            let program = evaluate_planned(&spec.planned, layers);
-            vec![fold_verdicts(program.per_statement)]
+            let program = spec.planned.iter().map(|s| statement_verdict(s, layers, edge)).collect();
+            vec![fold_verdicts(program)]
         }
         Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => {
             vec![PolicyVerdict::Uncovered; n]
@@ -1606,14 +1664,28 @@ fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>) -> Vec<
     }
 }
 
+/// The senpai-edge check [`statement_verdict`] consults for a command no
+/// key decided: `Some` names the edge it travels. Only the gate's own
+/// evaluation ([`evaluate`]) reads the database; broker PreCall passes a
+/// check that finds no edge.
+type EdgeCheck<'a> = dyn Fn(&PlannedCommand) -> Option<Decision> + 'a;
+
 /// One statement's verdict: the fold of its commands' verdicts. A
-/// statement with no commands is not an allow.
-fn statement_verdict(statement: &PlannedStatement, layers: Layers<'_>) -> PolicyVerdict {
+/// statement with no commands is not an allow. A command no key decides
+/// is allowed when it drifts along the caller's senpai edge, before the
+/// uncovered tier.
+fn statement_verdict(statement: &PlannedStatement, layers: Layers<'_>, edge: &EdgeCheck<'_>) -> PolicyVerdict {
     let verdicts: Vec<PolicyVerdict> = statement
         .plan
         .commands
         .iter()
-        .map(|cmd| command_verdict(cmd, layers))
+        .map(|cmd| match keyed_command_verdict(cmd, layers) {
+            PolicyVerdict::Uncovered => match edge(cmd) {
+                Some(decision) => PolicyVerdict::Allow(vec![decision]),
+                None => layers.uncovered_verdict(|| command_key(cmd)),
+            },
+            decided => decided,
+        })
         .collect();
     match fold_verdicts(verdicts) {
         // A statement with no command has nothing to key on, so the tier

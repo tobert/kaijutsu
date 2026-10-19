@@ -3504,6 +3504,50 @@ mod tests {
         }
     }
 
+    /// A drift along the senpai edge needs no ask, both ways: a kohai to
+    /// its senpai, and a senpai to its own kohai (`docs/senpai-kohai.md`,
+    /// "Reports and drift"). A drift to a sibling, to a context whose
+    /// senpai the caller is not, or with a target the gate cannot read
+    /// still asks, as does a redirect.
+    #[tokio::test]
+    async fn a_drift_along_the_senpai_edge_needs_no_ask_both_ways() {
+        use crate::kj::gate::GateVerdict::{Allowed, Pending};
+        let d = test_dispatcher().await;
+        let house = character_house(&d);
+        let lane = crate::kj::KjCaller { context_id: Some(house.lane_a), ..house.banto.clone() };
+        let cases: &[(&crate::kj::KjCaller, &str, crate::kj::gate::GateVerdict)] = &[
+            (&lane, "kj drift push banto-seat 'done with the first part'", Allowed),
+            (&house.banto, "kj drift push lane-a 'next, the tests'", Allowed),
+            (&house.banto, "kj drift push --stage lane-b 'batched'", Allowed),
+            (&house.banto, "kj drift push .parent 'up to amy'", Allowed),
+            (&lane, "kj drift push lane-b 'hello sibling'", Pending),
+            (&house.banto, "kj drift push amy-lane 'not my kohai'", Pending),
+            (&house.banto, "kj drift push kei-lane 'not my kohai'", Pending),
+            (&house.kei, "kj drift push lane-a 'not my kohai'", Pending),
+            (&house.banto, "kj drift push $LANE 'which one?'", Pending),
+            (&house.banto, "kj drift push lane-a 'x' > /tmp/out", Pending),
+        ];
+        for (caller, source, expected) in cases {
+            let outcome = gate_once(&d, caller, planned_shell_spec(source)).await;
+            assert_eq!(outcome.verdict, *expected, "{source}: {}", outcome.reason);
+            if *expected == Allowed {
+                assert!(outcome.reason.contains("senpai edge"), "{source}: {}", outcome.reason);
+            }
+        }
+
+        // The edge allows only what no key decides: an ask key stays firm.
+        let config = Ok(crate::kj::gate_policy::GateConfig::parse("[global]\nask = [\"kj drift push\"]\n").unwrap());
+        let asked = run_gate(
+            d.kernel(),
+            &lane,
+            planned_shell_spec("kj drift push banto-seat 'still asks'"),
+            d.kernel.ledger_flows(),
+            &config,
+        )
+        .await;
+        assert_eq!(asked.verdict, Pending, "{}", asked.reason);
+    }
+
     /// An exact character rule checks the target too: the same statement
     /// asks again once its target is no longer banto's to direct. A program
     /// with a kj verb the condition does not read teaches no character
