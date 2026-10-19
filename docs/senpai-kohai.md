@@ -100,8 +100,14 @@ place.
   character, the cast, the type and the fix (`kj cast slot set` or `kj character set <name> --cast`, then
   `kj context rotate`).
 - The judge shadow runs on the `judge` slot of its instance's binding, and the gate on the `gate` slot, so a cast
-  change moves neither in a running instance. Until step 7, an instance with no `gate` slot decides on
-  `[council] server`; step 7 removes that fallback.
+  change moves neither in a running instance. Both read the binding, not the live cast: `seat_slot_backend`'s
+  `effective_cast` lookup goes. Until step 7, an instance with no `gate` slot decides on `[council] server`;
+  step 7 removes that fallback.
+- A judge shadow belongs to one conversation, as today: the coder's archive rc archives it when a rotation
+  archives the predecessor, and the successor's first gate call makes a new one on the successor's binding.
+- Other model callers resolve the same way. A fork's distillation runs on the forking context's slot, or on
+  `--distill-model <backend>/<model>`; a bare model name refuses. A one-shot prompt (summaries) takes
+  `max_tokens` from the slot it runs on.
 - A backend's connection facts (`base_url`, keys, timeouts, `max_concurrent`) are read live. They are
   infrastructure, not a model choice.
 - To move a running instance to another model or persona, change the static settings and rotate it. To run two
@@ -152,6 +158,9 @@ the instance has pending asks.
 - `kj fork`: the child joins the forking context's instance and runs on the same binding `seq`.
 - `kj context rotate <instance-or-ctx>`: a new conversation in the same instance, with the next binding `seq`
   read fresh from the static settings. The kohai and the senpai do not move: they point at the instance.
+- `kj context rotate` of a character's handoff log points `characters.handoff_ctx` at the successor. A context
+  with no instance has no loadout to check, so rotate skips that check for it; a context with no instance that
+  is not a handoff log refuses rotation. `kj handoff note` refuses an archived log.
 - `kj context archive` archives only the context it names. Archiving an instance's conversation makes the
   instance inactive: reports to it and `kj senpai set` onto it refuse, and its forks stay live. Contexts that
   should go with it go by their type's archive rc, as the coder's judge shadows do today
@@ -203,8 +212,17 @@ Step 5 (instances and bindings):
   `ContextHandleInfo.provider` and `.model` carry the binding's model for the context's type; `.castLabel` carries
   the binding's cast label.
 - The MCP `session.start` hook's model write; the live `GET /v1/models` lookup for a context window (a window that
-  `backend_models` does not hold shows as unknown); the DriftRouter handle's provider/model copy; the 64000
-  `max_tokens` floor (`LlmRegistry::max_output_tokens`) and the openai-compatible client's 8192 for a zero.
+  `backend_models` does not hold shows as unknown); the DriftRouter handle's provider/model copy and the turn's
+  explicit `model` argument that outranks it.
+- Every value kaijutsu supplies on its own: the 64000 `max_tokens` floor (`LlmRegistry::max_output_tokens`),
+  `BuildOpts::new`'s 64000 (`BuildOpts` takes `max_tokens` from its caller), the openai-compatible client's 8192
+  for a zero, and the one-shot prompts' 4096.
+- Every resolver below the binding: `model_resolution.rs`'s override, registry-default rungs and
+  `ModelSource`; `effective_cast` and its fall back to the performer's cast; the override's borrow of the
+  current default backend; `LlmRegistry::prompt` and its first-advertised model; the tunable floor
+  (`default_tunables`, `SlotTunables::over` onto it); `resolve_model_choice`'s bare name onto the default
+  backend, and distillation's registry-default fall back.
+- `characters.default_cast_id` becomes `characters.cast_id`, read only when a binding is written.
 
 Presets keep only their fork filters (`kj fork --preset full|window|spawn`).
 
@@ -217,18 +235,26 @@ answer the old code would have given.
 1. **Root consoles.** Each root character's `root_ctx` becomes its root instance, with no senpai.
 2. **Instances.** Contexts are grouped into instances in creation order. A context with a performer joins the
    instance of its `forked_from` source when the source has the same performer and the context was forked or
-   rotated from it; otherwise it starts an instance of its performer. A context with no performer joins the
-   instance of its `senpai_ctx` (judge shadows, contexts an rc lifecycle made). A context with neither a performer
-   nor a `senpai_ctx` has no instance.
+   rotated from it; otherwise it starts an instance of its performer. "Same performer" means the current
+   `played_by`: `kj context set --as` rewrote it in place, and no history of it exists. A rotation's link is
+   its `ROTATED_FROM` env value, because a successor's `forked_from` is its predecessor's parent; a value that
+   does not parse as a context id is logged and ignored. A context with no performer joins the instance of its
+   `senpai_ctx`. A judge shadow (type `judge` with no performer, found by `forked_from` with archived rows
+   included) joins the instance of the context it judges. A context with neither a performer nor a
+   `senpai_ctx` has no instance, and neither has any character's `handoff_ctx`, which has a performer.
 3. **Edges.** An instance's senpai is the instance of its first context's `senpai_ctx`. An instance whose mapped
    senpai would be itself or would close a cycle refuses the migration, naming the contexts.
 4. **Bindings.** Each context gets the binding its next turn, its judge and its gate would have used under the old
-   resolver (override, context cast, default cast and `llm_defaults` included, `max_tokens` as the old code would
-   have sent it). Contexts of one instance with equal resolutions share a `seq`; a different resolution starts the
+   resolver (override, context cast, default cast and `llm_defaults` included), resolved from the rows as they
+   stand at migration. `max_tokens` is what the old code sent: the slot's, the model row's, `llm_defaults`', or
+   64000 when all are unset, written into the slot. A binding gets a `gate` slot only from a cast `gate` slot;
+   without one, `[council] server` in `gate.toml` decides until step 7, since the migration cannot read the VFS.
+   Contexts of one instance with equal resolutions share a `seq`; a different resolution starts the
    next `seq`, in creation order. A context the old resolver could not resolve gets a binding with no slot for its
    type, and the migration lists it.
 5. **Conversation.** An instance's conversation is its newest live context that is not a fork child of another of
-   its contexts, a judge shadow, or a context an rc lifecycle made. With none, its newest context of those kinds
+   its contexts or a judge shadow. No stored marker says an rc lifecycle made a context; one made as a fork
+   child is caught by the fork clause. With none, its newest context of those kinds
    is its conversation, and the instance is inactive when that context is archived.
 6. **Labels.** Labels stay on contexts; the migration moves none.
 7. **Handoff.** `characters.handoff_ctx` stays where it is.
