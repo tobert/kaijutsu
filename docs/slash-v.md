@@ -223,8 +223,8 @@ list to filter. The canonical context roster is `KernelDb::list_all_contexts()`
 (`kernel_db.rs:3880`), which also surfaces non-resident/archived contexts the
 resident-only `DriftRouter.contexts` would miss; fall back to the resident
 `documents` keys when no DB is configured (test mode). The fork tree (`children/`,
-the `parent` column) resolves from the `context_edges` table via
-`KernelDb::get_active_structural_children` — also DB-gated.
+the `parent` column) resolves from `contexts.forked_from` via
+`KernelDb::fork_children` — also DB-gated.
 
 **`blocks/index` recompute** is `block_ids_ordered()` once per read (it re-sorts the
 whole context and caches nothing). Slice 1 ships it naive-correct; a backend cache of

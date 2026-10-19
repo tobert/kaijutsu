@@ -35,8 +35,7 @@ What stays as it is:
 - `character`: who performs a context (persona, keys, default cast).
 - `cast`: the model team.
 - `context_type`: what a context does (its rc bundle and gate tier). The `director` type keeps its name.
-- `forked_from` and fork kind: provenance only. They no longer route anything. (`context_edges` 'structural'
-  rows duplicate `forked_from`; removing that duplication is out of scope here.)
+- `forked_from` and fork kind: provenance only. They no longer route anything. `forked_from` is the only parent link (step 4).
 
 ## Routing
 
@@ -130,7 +129,6 @@ columns and tables:
 ## Out of scope
 
 - A verify tier for reviewers (read-only builds and tests) is a gate tier change, done separately.
-- Removing the 'structural' `context_edges` duplicate of `forked_from`.
 - `@<name>` drift addressing (documented in docs/character.md, not verified as implemented).
 
 ## Tests (each falsified once)
@@ -280,3 +278,33 @@ Choices made where the design was silent, the smaller shape each time.
   the container "the supervisor" where they mean the `/exchange` directories, and "our senpai" for the edge.
 - **Tests rewritten**: `performer_and_reviewer_are_distinct_runtime_facts` is now
   `performer_and_senpai_are_distinct_runtime_facts`; it pinned the `<reviewer>` element the spec replaces.
+
+## Open (step 4)
+
+Choices made where the design was silent, the smaller shape each time.
+
+- **No `EdgeKind`, no `kind` column.** With the structural rows gone every row of `context_edges` is a drift edge,
+  so the enum had one variant and the column one value. Both are deleted, along with the `idx_edges_structural_unique`
+  index, `KernelDb::structural_parents`, `structural_children`, `would_create_cycle`, `KernelDbError::CycleDetected`
+  and the unknown-kind fallback that defaulted to Structural. `insert_edge`, `edges_from` and `edges_to` lose their
+  kind arguments. The table keeps the name `context_edges`; renaming it would touch every drift query for no gain.
+- **The migration** (`KernelDb::drop_structural_edges`) runs on open. A database without the `kind` column is done,
+  so it needs no `kernel_migrations` marker. It compares each structural row with `contexts.forked_from` and
+  refuses, writing nothing, for: a target whose `forked_from` is not the row's source (including `forked_from`
+  null), a target with two or more structural parents, and any kind other than `structural` or `drift`. The error
+  names every such context by short id and repeats on each open until the rows are corrected by hand. A context with
+  `forked_from` set and no structural row is fine: `forked_from` alone is the link.
+- **Children come from `forked_from`.** `KernelDb::fork_children` (live children, oldest first) replaces
+  `structural_children` for `kj context archive --children`, the judge shadow lookup and `kj context info`. The
+  info `Children:` count now counts live children only; it used to count every edge, archived children included.
+- **`kj context list --tree`** is depth-first: each context is followed by its whole subtree, siblings by creation
+  time. The old walk ordered by depth then creation time, so a context created after a sibling that already had
+  children was listed between that sibling and its children, and the children looked like its own. A live context
+  whose parent is archived is listed as a root of its own, where the old walk dropped it from the tree. A cycle in
+  `forked_from` among live contexts fails the listing instead of omitting its members.
+- **`insert_new_context_checked` and `insert_new_context_rows`** lose their `parent_id` argument. The row's
+  `forked_from` is the parent.
+- **`drift_edge_rm_refuses_structural`** is deleted with the kind it guarded. `delete_drift_edge` keeps its name;
+  no other kind of row exists to protect.
+- **The `forked_from` immutability** is not enforced by a trigger. No code path updates it after insert; a trigger is
+  a second mechanism for a rule nothing breaks.

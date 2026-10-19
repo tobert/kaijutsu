@@ -3331,8 +3331,8 @@ actor's resource.
 
 Settled design: a forest of one-parent trees; drift is a separate,
 deliberately cyclic overlay, never part of structure
-(`KernelDb::insert_edge`'s cycle check already applies only to
-`EdgeKind::Structural` — confirmed). Archive is one row, never a cascade,
+(a context's one parent is `contexts.forked_from`; `context_edges`
+holds drift edges only). Archive is one row, never a cascade,
 and archived contexts keep their label out of the live index — both
 **shipped 2026-09-05**. Anchors are seats, not workspaces (fork copies
 history by default, so an unused anchor is cheap and a used one taxes

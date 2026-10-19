@@ -44,7 +44,7 @@ propagate a genuine failure instead of swallowing it — only SQLite's
 | `workspaces`, `workspace_paths` | named path collections |
 | `presets`, `preset_args` | model/filter patches (full/window/spawn) |
 | `documents` | document registry |
-| `contexts`, `context_edges` | per-conversation metadata + DAG edges (fork/drift provenance) |
+| `contexts`, `context_edges` | per-conversation metadata (its parent is `forked_from`) + drift edges |
 | `oplog`, `doc_snapshots` | append-only op journal + compaction checkpoints |
 | `context_shell`, `context_env` | per-context cwd + env overrides |
 | `context_bindings` (+5 children) | per-context capability allow-sets (deny by default) |
