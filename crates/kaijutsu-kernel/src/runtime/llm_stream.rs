@@ -683,6 +683,13 @@ pub(super) async fn spawn_admitted_turn(
     // rc sections come from `(Role::System, BlockKind::Text)` blocks in the
     // conversation — typically dropped in by rc-on-create/-on-fork. They
     // land before the `<situation>` addendum.
+    let senpai = match crate::llm::system_prompt::senpai_fact(&kernel_db.lock(), context_id) {
+        Ok(senpai) => senpai,
+        Err(e) => {
+            tracing::error!("senpai fact read failed for context {context_id}: {e}");
+            return Err(format!("Could not read this context's senpai: {e}. The turn was stopped."));
+        }
+    };
     let situational = crate::SituationalContext {
         context_id: Some(context_id),
         context_label: ctx_label,
@@ -690,7 +697,7 @@ pub(super) async fn spawn_admitted_turn(
         provider: ctx_provider_name.clone(),
         model: Some(model_name.clone()),
         performer: Some(performer.clone()),
-        reviewer: Some(reviewer.clone()),
+        senpai,
     };
     let rc_sections = match crate::read_system_prompt_sections(&documents, context_id) {
         Ok(sections) => sections,

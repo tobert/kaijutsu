@@ -144,6 +144,7 @@ pub use llm::{
     resolve_image_blocks_from_cas,
     // System prompt assembly
     SituationalContext,
+    SenpaiFact,
     CharacterIdentity,
     build_system_prompt,
     extract_system_prompt_sections,

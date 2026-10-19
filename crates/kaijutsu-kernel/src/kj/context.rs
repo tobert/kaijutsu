@@ -1116,14 +1116,11 @@ impl KjDispatcher {
             };
             (target_id, row, cast_label, performer, ())
         };
-        // The reviewer reviews the performer's asks; a context with no
-        // performer has none to review, so the fact is absent.
-        let reviewer = match performer {
-            None => None,
-            Some(_) => match self.kernel().resolve_context_review(target_id).await {
-                Ok(review) => Some(review.reviewer),
-                Err(error) => return KjResult::Err(format!("kj context prompt: {error}")),
-            },
+        // The senpai this context answers to, the same fact the turn path
+        // reads (llm_stream.rs).
+        let senpai = match crate::llm::system_prompt::senpai_fact(&self.kernel_db().lock(), target_id) {
+            Ok(senpai) => senpai,
+            Err(error) => return KjResult::Err(format!("kj context prompt: senpai: {error}")),
         };
 
         // Situational label/state/provider/model come from the live
@@ -1189,7 +1186,7 @@ impl KjDispatcher {
             provider: ctx_provider_name,
             model: resolved_model.clone(),
             performer,
-            reviewer,
+            senpai,
         };
         let prompt = crate::llm::build_system_prompt(&situational, &rc_sections);
 
@@ -6948,6 +6945,58 @@ mod tests {
                 .any(|section| section.contains("CHANGED-STANCE-FOR-LATER-CREATE")),
             "a later lifecycle run must read the edited source: {after_sections:?}"
         );
+    }
+
+    /// The `<situation>` names the seat's senpai beside its performer: the
+    /// senpai context's label and id and the character that holds it
+    /// (`docs/senpai-kohai.md`, "What a seat sees"). It replaces
+    /// `<reviewer>`. A root console has no senpai, so no element.
+    #[tokio::test]
+    async fn context_prompt_situation_names_the_senpai() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let root = register_root_context(&d);
+        let banto = PrincipalId::new();
+        let coder = PrincipalId::new();
+        for (principal_id, name) in [(banto, "banto"), (coder, "coder")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+        let seat = register_context(&d, Some("banto-seat"), Some(root), amy);
+        let lane = register_context(&d, Some("lane"), Some(seat), amy);
+        for (ctx, who) in [(seat, banto), (lane, coder)] {
+            d.kernel_db().lock().update_played_by(ctx, Some(who)).unwrap();
+        }
+        for ctx in [root, seat, lane] {
+            let _ = d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None);
+        }
+        let situation = |ctx: ContextId| {
+            let d = &d;
+            async move {
+                let result = d.dispatch(&[s("context"), s("prompt"), ctx.to_hex()], &caller_with_context(ctx)).await;
+                assert!(result.is_ok(), "prompt failed: {}", result.message());
+                match result {
+                    KjResult::Ok { data: Some(v), .. } => v["situation"].as_str().unwrap().to_string(),
+                    other => panic!("expected data: {other:?}"),
+                }
+            }
+        };
+        let lane_situation = situation(lane).await;
+        assert!(
+            lane_situation.contains(&format!("<senpai context=\"banto-seat\" id=\"{}\" character=\"banto\"/>", seat.short())),
+            "{lane_situation}"
+        );
+        assert!(lane_situation.contains("name=\"coder\""), "the performer stays beside it: {lane_situation}");
+        assert!(!lane_situation.contains("<reviewer"), "{lane_situation}");
+        let seat_situation = situation(seat).await;
+        assert!(
+            seat_situation.contains(&format!("<senpai context=\"amy\" id=\"{}\" character=\"amy\"/>", root.short())),
+            "{seat_situation}"
+        );
+        let root_situation = situation(root).await;
+        assert!(!root_situation.contains("<senpai"), "a root console has no senpai: {root_situation}");
     }
 
     /// `--json`'s `data.prompt` must be exactly the string rendered in the
