@@ -401,17 +401,13 @@ the old row did not have; the new model requires it, and it is the character of 
 
 ## Open (step 5)
 
-Proposed by the lead after the kaibo review of this redesign (deepseek, 2026-10-20); each needs Amy's word:
+Nothing open. Amy took the four lead proposals from the kaibo review on 2026-10-20:
 
-- **A `rotate` rc lifecycle verb** (`/config/rc/<type>/rotate/`), run on the successor after the commit. The
-  create rc runs before the commit, so it cannot be where a successor adopts its kohai. A new lifecycle verb
-  touches rc orchestration (`docs/kaish-integration.md`).
-- **`characters.root_ctx` comes back** as a pointer like `handoff_ctx`, moved by the rotation's commit.
-  Deriving the root console from "the live context with no senpai" gives two answers while a root console
-  rotates.
-- **Root consoles cannot be forked, moved or archived.** Each would leave a root character performing another
-  context, or with none.
-- **Drift with no ask is one hop.** The first build allowed the whole `forked_from` chain within an instance.
+- The `rotate` rc lifecycle verb, run on the successor after the commit: "perfect. yes."
+- `characters.root_ctx` as a pointer moved by the commit: "fine."
+- Root consoles cannot be forked, moved or archived: "agreed. so far it seems like they mostly end up being a
+  scratch space for me to do admin stuff, and will rotate infrequently, so this is fine."
+- No-ask drift is one hop: "good."
 
 The sections below record what each step built. Steps 1-3 built the context-edge version, and the first build
 of step 5 built character instances that spanned contexts. Where they conflict with the sections above, the
