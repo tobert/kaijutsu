@@ -529,7 +529,7 @@ impl KernelDb {
 
     /// The instance a context belongs to; a context with none is refused,
     /// naming it.
-    pub(super) fn require_context_instance(&self, context_id: ContextId) -> KernelDbResult<CharacterInstanceRow> {
+    pub(crate) fn require_context_instance(&self, context_id: ContextId) -> KernelDbResult<CharacterInstanceRow> {
         self.context_instance_row(context_id)?.ok_or_else(|| {
             KernelDbError::Validation(format!(
                 "context {} belongs to no character instance, so it has no senpai and routes nothing; \
@@ -537,6 +537,16 @@ impl KernelDb {
                 self.context_name(context_id)
             ))
         })
+    }
+
+    /// Every context that runs on `instance_id`, oldest first: its
+    /// conversations, forks, judge shadows and rc-made contexts.
+    pub fn instance_contexts(&self, instance_id: CharacterInstanceId) -> KernelDbResult<Vec<ContextId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id FROM contexts WHERE instance_id = ?1 ORDER BY created_at, context_id",
+        )?;
+        let rows = stmt.query_map(params![blob_param(instance_id.as_bytes())], |r| read_context_id(r, 0))?;
+        Ok(rows.collect::<SqliteResult<_>>()?)
     }
 
     /// `label (short-id)` of a context, or its short id when it has no row or label.
@@ -567,6 +577,30 @@ impl KernelDb {
             KernelDbError::NotFound(format!("conversation {} of character instance {}", conversation.short(), instance_id.short()))
         })?;
         Ok(!row.is_archived())
+    }
+
+    /// The live (active) instances of a character, oldest first.
+    pub fn character_live_instances(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<CharacterInstanceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT instance_id, principal_id, senpai_instance, started_at, created_by
+             FROM character_instances WHERE principal_id = ?1 ORDER BY started_at, instance_id",
+        )?;
+        let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], |r| {
+            Ok(CharacterInstanceRow {
+                instance_id: read_instance_id(r, 0)?,
+                principal_id: read_principal_id(r, 1)?,
+                senpai_instance: read_opt_instance_id(r, 2)?,
+                started_at: r.get(3)?,
+                created_by: read_principal_id(r, 4)?,
+            })
+        })?;
+        let mut live = Vec::new();
+        for row in rows.collect::<SqliteResult<Vec<_>>>()? {
+            if self.instance_is_active(row.instance_id)? {
+                live.push(row);
+            }
+        }
+        Ok(live)
     }
 
     /// The instances whose senpai is `instance_id`, oldest first, active or not.

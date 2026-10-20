@@ -89,7 +89,7 @@ run add-key /keys/senpai.pub --as senpai
 kj character create banto
 kj character create "$project-coder"
 
-# The overlay goes in before any seat exists, so the seats' create lifecycle reads it.
+# The overlay goes in before any context exists, so each create lifecycle reads it.
 rc="$base/kernel-data/config/kaijutsu/config/rc"
 cp -r "$here/rc/." "$rc/"
 
@@ -121,15 +121,13 @@ MCP
 sed -i 's/^\[context_type\.mcp\]$/[context_type.mcp]\nuncovered = "allow"/' "$kernel_cfg/gate.toml"
 python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel_cfg/gate.toml"
 
-kj kohai create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo"
-# The coder answers to banto's seat (its senpai), so banto reviews its asks, and a drift either way between them,
-# or a `kj senpai report`, needs no ask.
-kj kohai create "$project-coder" --type coder --as "$project-coder" --senpai "$project-banto" --cwd /workspace
-# The kernel passes only HOME, PATH and context exports to the programs a seat runs, so set the locale here.
+# The kernel passes only HOME, PATH and context exports to the programs a context runs, so set the locale at create.
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
-for seat in "$project-banto" "$project-coder"; do
-  kj context set "$seat" --env LANG=C.UTF-8
-done
+kj kohai create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo" --env LANG=C.UTF-8
+# The coder is a character instance that answers to banto's instance (its senpai), so banto's character reviews its
+# asks, and a drift either way between their conversations, or a `kj senpai report`, needs no ask. Banto starts the
+# coder's turns with `kj drive`.
+kj kohai create "$project-coder" --type coder --as "$project-coder" --senpai "$project-banto" --cwd /workspace --env LANG=C.UTF-8
 kj context list
 
 echo
@@ -137,5 +135,5 @@ echo "Ready. Install and start the unit:"
 echo "  cp $here/kaijutsu-dev@.container ~/.config/containers/systemd/"
 echo "  systemctl --user daemon-reload && systemctl --user start kaijutsu-dev@$project"
 echo
-echo "banto answers to Amy's root console. Once senpai's MCP session has made its context, Amy moves banto under it:"
+echo "banto answers to Amy's root console. Once senpai's MCP session has made its context, Amy moves banto's instance under it:"
 echo "  kj senpai set $project-banto <senpai's context>"

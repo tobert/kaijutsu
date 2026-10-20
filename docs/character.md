@@ -18,7 +18,7 @@ an instruction to use nonexistent features.
 | Bootstrap | `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
 | Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no senpai. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Performer | `kj kohai create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, the performer is unset. Fork copies it. `kj context set <ctx> --as <character>` recasts, for the holder of the context's senpai or its lineage root |
+| Performer | `kj kohai create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, the performer is unset. Fork copies it. An instance's character never changes; to put another character on the work, start an instance of it with `kj kohai create --as` |
 | Client creation | There is no create RPC. A client runs `kj kohai create` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. MCP session registration records the credential character as performer, except a root character, which cannot be cast |
 | Senpai edge | Every working context has one senpai context (`contexts.senpai_ctx`); the holder of the senpai reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
@@ -183,10 +183,10 @@ Two things follow, and they are the ones to check a change against:
   senpai, or, when that holder is the actor, the holder of the senpai's
   senpai, and so on. A root console self-confirms. There is no configured
   default and no override. See `docs/approval-identity.md`, "Routing".
-- **The holder of the senpai casts its kohai.** `kj context set <ctx> --as
-  <character>` is allowed for the holder of the context's senpai and for its
-  lineage root. Casting is what makes the cast character accountable to the
-  caller there. Roots cannot be cast, since they have no model.
+- **A character instance's character never changes.** The holder of the
+  senpai, or the lineage root, starts another instance of the character that
+  should do the work (`kj kohai create --as`). Roots cannot be cast, since
+  they have no model.
 - **A model rotates itself with `kj context rotate`.** Amy, 2026-09-17:
   the performer may rotate its own seat, so no ask is needed.
   `kj kohai create --as` follows the same shape: Operator and a live

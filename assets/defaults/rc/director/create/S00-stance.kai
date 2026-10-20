@@ -1,15 +1,16 @@
 # The director stance. The first block names the system, the character
-# playing the seat (`played_by_name` in context metadata), and our senpai: the
-# character holding the context this seat answers to and that context's label,
-# read from `kj senpai show`. With no performer the seat is named generically;
-# a seat with no senpai (a root console) names none. The second block is the companion
+# playing the context (`played_by_name` in context metadata), and our senpai:
+# the character of the instance this context's instance answers to and that
+# instance's label, read from `kj senpai show`. With no performer the context
+# is named generically; an instance with no senpai (a root console) names
+# none. The second block is the companion
 # Markdown, read the same way every stance companion is. S06-kj-help.kai
 # supplies the kj narrative, and <situation> appends the live model and
 # identities.
 set -e
 who="$(kj context info --json | jq -r '.played_by_name // empty')"
-senpai="$(kj senpai show --json | jq -r '.holder.name // empty')"
-senpai_ctx="$(kj senpai show --json | jq -r '.senpai.label // .senpai.id // empty')"
+senpai="$(kj senpai show --json | jq -r '.senpai.character // empty')"
+senpai_label="$(kj senpai show --json | jq -r '.senpai.label // .senpai.id // empty')"
 
 system="We are a cybernetic system focused on coordinating people and models across contexts."
 
@@ -25,7 +26,7 @@ esac
 case "$senpai" in
   "") ;;
   *)
-    intro="$intro Our senpai is $senpai, in $senpai_ctx."
+    intro="$intro Our senpai is $senpai, in $senpai_label."
     ;;
 esac
 

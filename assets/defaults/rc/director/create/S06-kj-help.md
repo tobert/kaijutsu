@@ -3,10 +3,13 @@
 kj is how we work with this kernel. It runs in the shell. `kj help` gives the
 overview, and `kj <verb> --help` gives a verb's options.
 
-A context is one conversation: a log of blocks, a type that selects its
-instructions, a performer who takes its turns, and a senpai, the context it
-answers to. The character holding the senpai answers its asks. A context with no performer cannot take a turn. We name a context as `.`
-(this one), `.parent`, its label, or a prefix of its id.
+A context is one conversation: a log of blocks and a type that selects its
+instructions. A context runs on a character instance: one run of one character,
+which takes its turns. A character instance answers to a senpai, another
+character instance. The senpai's character answers its asks. A context with no
+character instance cannot take a turn. We name a context as `.` (this one),
+`.parent`, its label, or a prefix of its id. A character instance is named by
+its conversation's label.
 
 `kj drive` starts a turn in a context. `kj wait` returns when that turn ends,
 when the context raises an ask, or when the timeout passes, and it says which.
@@ -21,10 +24,11 @@ Drift moves information between contexts. `kj drift push` puts text in another
 context's log without running a model; a running turn there reads it after its
 next tool call. `kj drift pull` has a model distill another context into ours.
 `kj drift merge`, run inside a fork, summarizes the fork into its parent.
-A drift between a context and its senpai, either way, needs no ask.
+A drift between a character instance's conversation and its senpai's, either
+way, needs no ask. So does a drift from a conversation down to its own forks.
 
 When a context needs a decision outside its loadout, it raises an ask and
-waits. The ledger holds the asks, and the senpai allows or denies each one.
+waits. The ledger holds the asks, and the senpai's character allows or denies each one.
 
 Examples. Replace each `<...>` with a real value read from kj.
 
@@ -35,13 +39,13 @@ kj rc list
 See the context types this kernel has and their lifecycle scripts.
 
 kj character list
-Find the character who will perform a new context. The `coder` character plays coder contexts; if it is missing, we ask the human.
+Find the character who will perform a new piece of work. The `coder` character plays coder contexts; if it is missing, we ask the human.
 
 kj kohai create fix-login --type coder --as coder
-Start one piece of work in its own context. It answers to this seat, so its asks come to us. Pick the type that fits the work; coder is one type.
+Start one piece of work as a new character instance with its own conversation. It answers to us, so its asks come to us. Pick the type that fits the work; coder is one type.
 
 kj kohai list
-See the contexts that answer to this seat, with type and performer.
+See the character instances that answer to us, each with its conversation, character and type.
 
 kj drive fix-login --prompt "<the work, what it may touch, what done looks like, and how to check it>"
 Send the brief and start the turn.

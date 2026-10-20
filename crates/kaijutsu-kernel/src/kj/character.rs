@@ -2,7 +2,7 @@
 //! "the sheet": `docs/character.md`). `create` mints a fresh principal id
 //! and its sheet row, idempotent on the name; `list`/`show` read it;
 //! `retire` stamps `retired_at` and, in the same act, concludes and
-//! archives every live context the character plays.
+//! archives every live context of the character's instances.
 //!
 //! No attribution change in this slice: a context's `played_by` is metadata
 //! only, and every block is still stamped exactly as it is today
@@ -55,7 +55,7 @@ enum CharacterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show one character's sheet.
+    /// Show one character's sheet and its live instances.
     Show {
         /// The character's name.
         name: String,
@@ -486,7 +486,12 @@ impl KjDispatcher {
                     Ok(cast) => cast.map(|c| c.label),
                     Err(e) => return KjResult::Err(format!("kj character show: {e}")),
                 };
-                let text = format!(
+                let instances = match db.character_live_instances(row.principal_id) {
+                    Ok(live) => live,
+                    Err(e) => return KjResult::Err(format!("kj character show: {e}")),
+                };
+                let instance_names: Vec<String> = instances.iter().map(|i| db.instance_name(i.instance_id)).collect();
+                let mut text = format!(
                     "Character:       {}\nID:              {}\nRoot:            {}\n\
                      Default cast:    {}\nCreated:         {}\nRetired:         {}",
                     row.name,
@@ -498,8 +503,16 @@ impl KjDispatcher {
                         .map(super::format::format_timestamp)
                         .unwrap_or_else(|| "-".to_string()),
                 );
+                text.push_str(&format!("\nInstances:       {}", if instance_names.is_empty() { "-".to_string() } else { instance_names.join(", ") }));
                 let mut data = character_to_json(&row);
                 data["default_cast"] = serde_json::json!(default_cast);
+                data["instances"] = serde_json::Value::Array(
+                    instances.iter().map(|i| serde_json::json!({
+                        "id": i.instance_id.to_hex(),
+                        "name": db.instance_name(i.instance_id),
+                        "senpai": i.senpai_instance.map(|s| db.instance_name(s)),
+                    })).collect(),
+                );
                 KjResult::ok_with_data(text, data)
             }
             // A missing mapping is corruption, never a fallback to a
@@ -614,7 +627,8 @@ impl KjDispatcher {
     }
 
     /// Retire: stamp `retired_at`, and conclude + archive every live
-    /// context the character plays, in the same act
+    /// context of the character's instances (conversations, forks and the
+    /// contexts their rc lifecycles made), in the same act
     /// (`docs/character.md`, "Retire takes its contexts with it").
     /// `Destroy`-classed (`kj/effect.rs`); the dispatcher latches
     /// an unconfirmed call before this handler runs, whether or not the
@@ -955,6 +969,66 @@ mod tests {
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].author(), principal_id, "block authorship must not change");
+    }
+
+    /// Retire archives every live context of the character's instances, forks
+    /// included, and nothing of another character's instance, even one that
+    /// answers to it.
+    #[tokio::test]
+    async fn retire_archives_the_contexts_of_the_characters_instances_only() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        let [lead, coder] = [PrincipalId::new(), PrincipalId::new()];
+        for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+        let seat = register_context(&d, Some("lead-seat"), None, lead);
+        d.kernel_db().lock().update_played_by(seat, Some(lead)).unwrap();
+        let fork = register_context(&d, Some("lead-fork"), Some(seat), lead);
+        let lane = register_context(&d, Some("coder-lane"), Some(seat), lead);
+        {
+            let db = d.kernel_db().lock();
+            let (instance, seq) = db.context_instance(seat).unwrap().unwrap();
+            db.join_instance(fork, instance, seq).unwrap();
+            db.update_played_by(lane, Some(coder)).unwrap();
+        }
+        let mut confirmed = caller.clone();
+        confirmed.confirmed = true;
+        let result = d.dispatch(&[s("character"), s("retire"), s("lead")], &confirmed).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(result.message().contains("2 context(s) archived"), "{}", result.message());
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(seat).unwrap().unwrap().is_archived());
+        assert!(db.get_context(fork).unwrap().unwrap().is_archived(), "a fork of the conversation goes with it");
+        assert!(!db.get_context(lane).unwrap().unwrap().is_archived(), "another character's instance stays");
+    }
+
+    /// `show` lists the character's live instances by conversation; an
+    /// instance whose conversation is archived is not live.
+    #[tokio::test]
+    async fn show_lists_the_characters_live_instances() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let coder = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let live = register_context(&d, Some("lane-live"), None, coder);
+        let gone = register_context(&d, Some("lane-gone"), None, coder);
+        {
+            let db = d.kernel_db().lock();
+            db.update_played_by(live, Some(coder)).unwrap();
+            db.update_played_by(gone, Some(coder)).unwrap();
+            db.archive_context(gone).unwrap();
+        }
+        let shown = d.dispatch(&[s("character"), s("show"), s("coder")], &test_caller()).await;
+        assert!(shown.is_ok(), "{}", shown.message());
+        assert!(shown.message().contains(&format!("Instances:       lane-live ({})", live.short())), "{}", shown.message());
+        assert!(!shown.message().contains("lane-gone"), "{}", shown.message());
+        let KjResult::Ok { data: Some(data), .. } = shown else { panic!("expected data") };
+        assert_eq!(data["instances"].as_array().unwrap().len(), 1);
+        assert_eq!(data["instances"][0]["name"], format!("lane-live ({})", live.short()));
     }
 
     /// A NULL `played_by` is not a marker some code path special-cases —

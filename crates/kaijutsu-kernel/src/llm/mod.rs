@@ -55,7 +55,7 @@ pub use stream::{
     InlineToolResult, RetryDisposition, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
-pub use system_prompt::{CharacterIdentity, SenpaiFact, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
+pub use system_prompt::{CharacterIdentity, InstanceFact, SenpaiFact, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
 pub(crate) use system_prompt::is_system_prompt_section;
 
 use serde::{Deserialize, Serialize};

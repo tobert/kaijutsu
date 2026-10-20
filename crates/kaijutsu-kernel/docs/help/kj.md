@@ -85,8 +85,9 @@ cc              list — roster of live Claude Code sessions on this machine,
                 behind the approval ledger (`--dry-run` exempt)
 character       create, list, show, retire — the sheet a name resolves to
                 (principal id + given name); create mints a fresh principal
-                and is idempotent on the name; retire concludes and archives
-                every live context the character plays
+                and is idempotent on the name; show lists its live instances;
+                retire concludes and archives every live context of its
+                instances
 config          Read or reset files under /config/kernel and /config/client.
                 Edit them with the file tools or `kj vi`. For model
                 configuration, see `kj backend`, `kj cast`, and `kj alias`.
@@ -111,7 +112,8 @@ doc             list, tree, create, delete — storage layer (all kinds, not jus
 drift           push, pull, merge, flush, queue, cancel, history, edge rm
 drive           Clock one autonomous turn on a context (--prompt)
 fork            Fork current context (--name, --prompt, --preset, --model,
-                --include/--exclude ranges, --compact, --as, --stage, --switch)
+                --include/--exclude ranges, --compact, --stage, --switch); the
+                child joins the forking context's character instance
 handoff         note [--for <character>], tail [--window] — a character's
                 handoff log (an ordinary context); note is authored by the
                 caller even when writing into someone else's log
@@ -155,9 +157,11 @@ midi            list, show, send note|cc|pc|sysex, identify, panic — device
                 device (the kernel never touches hardware — a sink resolves
                 the port); identify asks a device what it is and records the
                 answer at /run/midi/<device>
-kohai           create, list — create a context that answers to this one
-                (--senpai, --parent, --as, --type, --cast, --cwd, --env), and
-                list a context's live kohai with type and performer
+kohai           create, list — start a character instance, with a new
+                conversation, that answers to this one (--as is required;
+                --senpai, --parent, --type, --cast, --cwd, --env), and list an
+                instance's live kohai with character and type; a verb that
+                takes an instance accepts any of its contexts
 model           Show a context's effective model and its tunables (--context <ref>)
 models          List configured providers, their models, and --model aliases
 play            Play a sample now (a host path, or --cas <hash> for an object
@@ -175,9 +179,10 @@ roster          status <text> [--availability], list — the live roster: post
                 your own self-reported status (identity is always the
                 caller's own) or list who's around right now
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
-senpai          show, set — the context a context answers to: show prints
-                the senpai, its holder, the lineage root and who reviews the
-                performer's asks; set moves a context under another senpai
+senpai          show, set, report — the character instance an instance answers
+                to: show prints the senpai, the lineage root and who reviews
+                the character's asks; set moves an instance under another
+                senpai; report puts text in the senpai's conversation
 stage           commit, status, include, exclude — curate a staged (liminal) fork
 swap            list, ack, discard — resolve a file buffer recovered after a
                 kernel restart (docs/file-buffers.md rule 4); read it first at

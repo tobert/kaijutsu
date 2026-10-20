@@ -14,30 +14,55 @@ pub struct CharacterIdentity {
     pub name: String,
 }
 
-/// The context a seat answers to, as its `<situation>` names it
-/// (`docs/senpai-kohai.md`, "What a seat sees").
+/// The character instance a context runs on, as its `<situation>` names it
+/// (`docs/senpai-kohai.md`, "What a context sees").
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SenpaiFact {
-    pub context_id: ContextId,
-    pub label: Option<String>,
-    /// The character that holds the senpai context: its performer, or the
-    /// root character whose console it is. `None` when nobody holds it.
-    pub holder: Option<String>,
+pub struct InstanceFact {
+    /// The instance's name: its conversation's label, or the conversation's
+    /// short id when it has none.
+    pub label: String,
+    /// The character the instance runs.
+    pub character: String,
 }
 
-/// The senpai fact for `context_id`, read off the senpai edge; `None` for
-/// a context with no senpai (a root console, a system context). A senpai
-/// with no row is an error, never an absent fact.
-pub(crate) fn senpai_fact(db: &crate::kernel_db::KernelDb, context_id: ContextId) -> Result<Option<SenpaiFact>, String> {
-    let row = db.get_context(context_id).map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("context {} has no row", context_id.short()))?;
-    let Some(senpai) = row.senpai_ctx else {
-        return Ok(None);
+/// The senpai instance of the instance a context runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenpaiFact {
+    /// The senpai instance's name, as [`InstanceFact::label`].
+    pub instance: String,
+    /// The character the senpai instance runs.
+    pub character: String,
+}
+
+/// The instance fact and the senpai fact for `context_id`, read from the
+/// character instance tables. A context with no instance has neither; an
+/// instance with no senpai (a root console) has no senpai fact. A missing
+/// row is an error, never an absent fact.
+pub(crate) fn instance_facts(
+    db: &crate::kernel_db::KernelDb,
+    context_id: ContextId,
+) -> Result<(Option<InstanceFact>, Option<SenpaiFact>), String> {
+    let Some(instance) = db.context_instance_row(context_id).map_err(|e| e.to_string())? else {
+        return Ok((None, None));
     };
-    let senpai_row = db.get_context(senpai).map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("senpai context {} has no row", senpai.short()))?;
-    let holder = db.context_holder(senpai).map_err(|e| e.to_string())?.map(|h| db.name_for(h));
-    Ok(Some(SenpaiFact { context_id: senpai, label: senpai_row.label, holder }))
+    let fact = |row: &crate::kernel_db::CharacterInstanceRow| -> Result<(String, String), String> {
+        let conversation = db.instance_conversation(row.instance_id).map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("character instance {} has no binding", row.instance_id.short()))?;
+        let conversation_row = db.get_context(conversation).map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("conversation {} has no row", conversation.short()))?;
+        Ok((conversation_row.label.unwrap_or_else(|| conversation.short()), db.name_for(row.principal_id)))
+    };
+    let (label, character) = fact(&instance)?;
+    let senpai = match instance.senpai_instance {
+        Some(senpai) => {
+            let row = db.get_instance(senpai).map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("senpai instance {} has no row", senpai.short()))?;
+            let (instance, character) = fact(&row)?;
+            Some(SenpaiFact { instance, character })
+        }
+        None => None,
+    };
+    Ok((Some(InstanceFact { label, character }), senpai))
 }
 
 /// Read the instruction sections currently stored in a context.
@@ -63,7 +88,9 @@ pub struct SituationalContext {
     pub model: Option<String>,
     /// The character performing this turn.
     pub performer: Option<CharacterIdentity>,
-    /// The context this one answers to. Who reviews the performer's asks
+    /// The character instance this context runs on.
+    pub instance: Option<InstanceFact>,
+    /// The instance this one answers to. Who reviews the performer's asks
     /// follows from it (`kj senpai show` prints the climb).
     pub senpai: Option<SenpaiFact>,
 }
@@ -77,6 +104,7 @@ impl SituationalContext {
             && self.provider.is_none()
             && self.model.is_none()
             && self.performer.is_none()
+            && self.instance.is_none()
             && self.senpai.is_none()
     }
 }
@@ -93,7 +121,8 @@ impl SituationalContext {
 ///   <context id="…" label="…" state="live"/>
 ///   <model provider="anthropic" name="claude-haiku-4-5"/>
 ///   <performer id="…" name="coder"/>
-///   <senpai context="lead-seat" id="…" character="lead"/>
+///   <instance label="coder-1" character="coder"/>
+///   <senpai instance="lead" character="lead"/>
 /// </situation>
 /// ```
 ///
@@ -170,16 +199,20 @@ pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[Stri
         ));
     }
 
+    if let Some(instance) = &situational.instance {
+        out.push_str(&format!(
+            "  <instance label=\"{}\" character=\"{}\"/>\n",
+            xml_escape(&instance.label),
+            xml_escape(&instance.character)
+        ));
+    }
+
     if let Some(senpai) = &situational.senpai {
-        out.push_str("  <senpai");
-        if let Some(label) = &senpai.label {
-            out.push_str(&format!(" context=\"{}\"", xml_escape(label)));
-        }
-        out.push_str(&format!(" id=\"{}\"", senpai.context_id.short()));
-        if let Some(holder) = &senpai.holder {
-            out.push_str(&format!(" character=\"{}\"", xml_escape(holder)));
-        }
-        out.push_str("/>\n");
+        out.push_str(&format!(
+            "  <senpai instance=\"{}\" character=\"{}\"/>\n",
+            xml_escape(&senpai.instance),
+            xml_escape(&senpai.character)
+        ));
     }
 
     out.push_str("</situation>\n");
@@ -282,6 +315,7 @@ mod tests {
             provider: Some("anthropic".to_string()),
             model: Some("claude-haiku-4-5".to_string()),
             performer: None,
+            instance: None,
             senpai: None,
         };
         let out = build_system_prompt(&situational, &[]);
@@ -294,27 +328,31 @@ mod tests {
     }
 
     #[test]
-    fn performer_and_senpai_are_distinct_runtime_facts() {
+    fn performer_instance_and_senpai_are_distinct_runtime_facts() {
         let performer = CharacterIdentity { principal_id: PrincipalId::new(), name: "coder <one>".into() };
-        let senpai = SenpaiFact { context_id: ContextId::new(), label: Some("lead \"seat\"".into()), holder: Some("lead & two".into()) };
+        let instance = InstanceFact { label: "lane \"a\"".into(), character: "coder <one>".into() };
+        let senpai = SenpaiFact { instance: "lead \"seat\"".into(), character: "lead & two".into() };
         let prompt = build_system_prompt(
             &SituationalContext {
                 model: Some("test-model".into()),
                 performer: Some(performer.clone()),
-                senpai: Some(senpai.clone()),
+                instance: Some(instance),
+                senpai: Some(senpai),
                 ..Default::default()
             },
             &[],
         );
         assert!(prompt.contains(&format!("<performer id=\"{}\" name=\"coder &lt;one&gt;\"/>", performer.principal_id)));
-        assert!(prompt.contains(&format!(
-            "<senpai context=\"lead &quot;seat&quot;\" id=\"{}\" character=\"lead &amp; two\"/>", senpai.context_id.short()
-        )), "{prompt}");
-        let holderless = build_system_prompt(
-            &SituationalContext { senpai: Some(SenpaiFact { holder: None, label: None, ..senpai.clone() }), ..Default::default() },
+        assert!(prompt.contains("<instance label=\"lane &quot;a&quot;\" character=\"coder &lt;one&gt;\"/>"), "{prompt}");
+        assert!(prompt.contains("<senpai instance=\"lead &quot;seat&quot;\" character=\"lead &amp; two\"/>"), "{prompt}");
+        let top = build_system_prompt(
+            &SituationalContext {
+                instance: Some(InstanceFact { label: "console".into(), character: "amy".into() }),
+                ..Default::default()
+            },
             &[],
         );
-        assert!(holderless.contains(&format!("<senpai id=\"{}\"/>", senpai.context_id.short())), "{holderless}");
+        assert!(top.contains("<instance label=\"console\" character=\"amy\"/>") && !top.contains("<senpai"), "{top}");
     }
 
     #[test]

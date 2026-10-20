@@ -54,11 +54,9 @@
 //!   path, just not the cast-by-role path the brief sketched for the coder
 //!   slot. The cast is still created and the `director` slot IS reached
 //!   normally (banto's own `context_type` really is `director`).
-//! - **banto casts its own lanes.** `kj context set <lane> --as <coder>`
-//!   is allowed when the target's director is the caller
-//!   (`crates/kaijutsu-kernel/src/kj/context.rs`, `caller_may_assign_performer`),
-//!   and a fork is directed by the actor that forked it
-//!   (`crates/kaijutsu-kernel/src/kj/fork.rs`), so the assignment happens
+//! - **banto starts its own lanes.** `kj kohai create <lane> --as <coder>`
+//!   starts a character instance whose senpai is banto's instance, and a fork
+//!   stays in the forking context's instance, so the assignment happens
 //!   inside banto's own scripted turn; amy assigns nothing.
 //! - The kernel worker reserves `KAISH_RC_THREAD_STACK` for nested kaish
 //!   (`crates/kaijutsu-kernel/src/runtime/worker.rs`), and

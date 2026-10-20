@@ -66,7 +66,6 @@ refuses with the reason.
 
 One rule: **the holder of a context's senpai, or its lineage root**, may
 
-- cast or recast its performer (`kj context set <ctx> --as <character>`);
 - move it to another senpai (`kj senpai set <ctx> <senpai-ctx>`);
 - escalate its asks;
 - rotate it (its own performer may also rotate it, with no ask);

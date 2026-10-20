@@ -16,7 +16,7 @@ pub(crate) struct TurnIdentity {
 /// about the reviewer, which is not the repair the caller needs.
 pub(crate) fn require_performer(actor: Option<PrincipalId>) -> Result<PrincipalId, String> {
     actor.ok_or_else(||
-        "No performer assigned. Use 'kj context set . --as <character>' before starting a model turn.".to_string()
+        "No performer assigned: this context belongs to no character instance. A context gets its character when it is made, with 'kj kohai create --as <character>'.".to_string()
     )
 }
 
@@ -36,7 +36,7 @@ pub(crate) fn resolve(
         return Err(format!("The assigned performer '{}' is retired. Assign a live character before starting a model turn.", character.name));
     }
     if character.root {
-        return Err(format!("A root character has no model, so '{}' cannot perform a turn. Cast a character a model plays with 'kj context set . --as <character>'.", character.name));
+        return Err(format!("A root character has no model, so '{}' cannot perform a turn. Start an instance of a character a model plays with 'kj kohai create --as <character>'.", character.name));
     }
     Ok(TurnIdentity { actor, reviewer })
 }

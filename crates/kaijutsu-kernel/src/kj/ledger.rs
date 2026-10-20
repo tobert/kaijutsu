@@ -3555,6 +3555,72 @@ mod tests {
         assert_eq!(asked.verdict, Pending, "{}", asked.reason);
     }
 
+    /// Inside one instance a drift runs with no ask from the conversation
+    /// down to its forks, and from a fork up to the conversation when the
+    /// instance's own character made the fork; a fork a person made keeps
+    /// the gate on the way up, and so does a fork-to-fork drift. A `gate.toml`
+    /// ask key on `kj drift push` still wins (`docs/senpai-kohai.md`,
+    /// "Reports and drift").
+    #[tokio::test]
+    async fn a_drift_inside_one_instance_asks_only_up_from_a_fork_a_person_made() {
+        use crate::kj::gate::GateVerdict::{Allowed, Pending};
+        let d = test_dispatcher().await;
+        let house = character_house(&d);
+        let seat = house.banto.context_id.unwrap();
+        let banto = house.banto.actor_id;
+        let amy = house.banto.principal_id;
+        let (instance, seq) = d.kernel_db().lock().context_instance(seat).unwrap().unwrap();
+        let fork = |label: &str, parent: kaijutsu_types::ContextId, made_by: PrincipalId| {
+            let id = crate::kj::test_helpers::register_context(&d, Some(label), Some(parent), made_by);
+            d.kernel_db().lock().join_instance(id, instance, seq).unwrap();
+            id
+        };
+        let own = fork("own-fork", seat, banto);
+        let person = fork("person-fork", seat, amy);
+        let grandchild = fork("own-grandchild", own, banto);
+        // In the instance but not forked from its conversation.
+        let stray = fork("stray", house.root, banto);
+        // A fork inside a kohai's instance: the edge reaches a conversation only.
+        {
+            let id = crate::kj::test_helpers::register_context(&d, Some("lane-fork"), Some(house.lane_a), banto);
+            let (lane_instance, lane_seq) = d.kernel_db().lock().context_instance(house.lane_a).unwrap().unwrap();
+            d.kernel_db().lock().join_instance(id, lane_instance, lane_seq).unwrap();
+        }
+        let from = |context| crate::kj::KjCaller { context_id: Some(context), ..house.banto.clone() };
+        let cases: &[(kaijutsu_types::ContextId, &str, crate::kj::gate::GateVerdict)] = &[
+            (seat, "kj drift push own-fork 'take this branch'", Allowed),
+            (seat, "kj drift push person-fork 'take this branch'", Allowed),
+            (seat, "kj drift push own-grandchild 'deeper'", Allowed),
+            (own, "kj drift push banto-seat 'branch done'", Allowed),
+            (grandchild, "kj drift push banto-seat 'deep branch done'", Allowed),
+            (person, "kj drift push banto-seat 'a person made me'", Pending),
+            (own, "kj drift push person-fork 'sideways'", Pending),
+            (own, "kj drift push own-grandchild 'down from a fork'", Pending),
+            (seat, "kj drift push stray 'not one of my forks'", Pending),
+            (stray, "kj drift push banto-seat 'not forked from it'", Pending),
+            (seat, "kj drift push lane-fork 'a fork of a kohai'", Pending),
+            (seat, "kj drift push lane-a 'the kohai conversation'", Allowed),
+        ];
+        for (context, source, expected) in cases {
+            let outcome = gate_once(&d, &from(*context), planned_shell_spec(source)).await;
+            assert_eq!(outcome.verdict, *expected, "{source}: {}", outcome.reason);
+            if *expected == Allowed {
+                assert!(outcome.reason.contains("senpai edge"), "{source}: {}", outcome.reason);
+            }
+        }
+
+        let config = Ok(crate::kj::gate_policy::GateConfig::parse("[global]\nask = [\"kj drift push\"]\n").unwrap());
+        let asked = run_gate(
+            d.kernel(),
+            &from(seat),
+            planned_shell_spec("kj drift push own-fork 'still asks'"),
+            d.kernel.ledger_flows(),
+            &config,
+        )
+        .await;
+        assert_eq!(asked.verdict, Pending, "{}", asked.reason);
+    }
+
     /// An exact character rule checks the target too: the same statement
     /// asks again once its target is no longer banto's to direct. A program
     /// with a kj verb the condition does not read teaches no character

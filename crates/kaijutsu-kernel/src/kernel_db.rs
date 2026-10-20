@@ -253,8 +253,6 @@ pub enum ReviewFrom {
 /// An act the one authority rule governs (`docs/senpai-kohai.md`, "Authority").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GovernedAct {
-    /// `kj context set <ctx> --as <character>`.
-    Cast,
     /// `kj context set <ctx> --egress-allow|--egress-deny`.
     Egress,
     /// `kj senpai set`.
@@ -268,12 +266,11 @@ pub enum GovernedAct {
 }
 
 impl GovernedAct {
-    pub const ALL: [GovernedAct; 6] = [Self::Cast, Self::Egress, Self::Move, Self::Escalate, Self::Rotate, Self::Archive];
+    pub const ALL: [GovernedAct; 5] = [Self::Egress, Self::Move, Self::Escalate, Self::Rotate, Self::Archive];
 
     /// The act, as the refusal names it.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Cast => "cast its performer",
             Self::Egress => "change its egress list",
             Self::Move => "move it to another senpai",
             Self::Escalate => "escalate its asks",
@@ -2708,7 +2705,7 @@ impl KernelDb {
         };
         Ok(Err(format!(
             "only {}'s senpai ({holder_name}) or its lineage root ({root_name}) may {}",
-            Self::context_display(&row), act.as_str()
+            self.instance_name(instance.instance_id), act.as_str()
         )))
     }
 
@@ -12583,8 +12580,8 @@ mod tests {
             }
         }
         // Over the seat, amy holds the senpai and is also the root.
-        assert_eq!(db.context_authority(seat.context_id, amy, GovernedAct::Cast).unwrap(), Ok(Authority::SenpaiHolder));
-        assert!(db.context_authority(seat.context_id, banto, GovernedAct::Cast).unwrap().is_err(), "a seat has no authority over itself");
+        assert_eq!(db.context_authority(seat.context_id, amy, GovernedAct::Move).unwrap(), Ok(Authority::SenpaiHolder));
+        assert!(db.context_authority(seat.context_id, banto, GovernedAct::Move).unwrap().is_err(), "a seat has no authority over itself");
     }
 
     /// A context with no senpai and a lineage with no live root still answer
