@@ -28,10 +28,7 @@ use std::sync::Arc;
 use crate::kernel_db::KernelDb;
 use crate::llm::endpoint::Endpoints;
 
-use super::config::{
-    BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo, ResolvedSlot,
-    SlotTunables,
-};
+use super::config::{BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo, SlotTunables};
 use super::{LlmError, LlmRegistry, LlmResult, Provider};
 
 /// Read every `backends` row (plus its `backend_models`) into
@@ -95,10 +92,9 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
 /// Build a fresh [`LlmRegistry`] from the DB.
 ///
 /// Registers one client per backend row, keyed by backend NAME. A backend that
-/// fails to construct (no resolvable key, say) is warned about and skipped —
-/// except the default one, which is fatal: silently falling back to some other
-/// backend would hide the misconfiguration and quietly change which model runs
-/// every turn.
+/// fails to construct (no resolvable key, say) is warned about and skipped; a
+/// turn bound to it refuses, naming the backend. Nothing here chooses a
+/// model: a character instance's binding does.
 ///
 /// Each client takes its slots from `endpoints`, the kernel's one set, whose
 /// limits this rebuild sets from the backends that built. A skipped backend
@@ -137,34 +133,6 @@ pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<Llm
     endpoints.configure(&built);
     registry.set_backends(backends);
 
-    // ── defaults ────────────────────────────────────────────────────────
-    let defaults = db
-        .get_llm_defaults()
-        .map_err(|e| LlmError::InvalidRequest(format!("reading llm_defaults: {e}")))?;
-    if let Some(d) = &defaults {
-        if !registry.set_default(&d.default_backend) {
-            let available: Vec<String> = registry.list().iter().map(|s| s.to_string()).collect();
-            return Err(LlmError::InvalidRequest(format!(
-                "default backend '{}' is not registered; available backends: {available:?}",
-                d.default_backend
-            )));
-        }
-        registry.set_default_model(&d.default_model);
-        registry.set_default_tunables(SlotTunables {
-            max_tokens: d.max_tokens.and_then(|v| u64::try_from(v).ok()),
-            temperature: d.temperature,
-            top_p: d.top_p,
-            effort: d.effort.clone(),
-            thinking_budget: d.thinking_budget.and_then(|v| u64::try_from(v).ok()),
-            thinking_style: d.thinking_style.clone(),
-        });
-    } else {
-        // A kernel ships no defaults, so this is the state of every kernel
-        // until an operator runs `kj backend default set`. Not an error here:
-        // a model turn reports it with how to configure a backend.
-        tracing::warn!("no llm_defaults row — registry has no default backend/model");
-    }
-
     // ── aliases ─────────────────────────────────────────────────────────
     let backend_names: HashMap<_, _> = db
         .list_backends()
@@ -197,47 +165,6 @@ pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<Llm
     }
     registry.set_model_aliases(aliases);
 
-    // ── casts ───────────────────────────────────────────────────────────
-    // A slot's unset fields take its model's row, then the floor.
-    let mut slots: Vec<(String, ResolvedSlot)> = Vec::new();
-    for cast in db
-        .list_casts()
-        .map_err(|e| LlmError::InvalidRequest(format!("reading casts: {e}")))?
-    {
-        for slot in db
-            .list_cast_slots(cast.cast_id)
-            .map_err(|e| LlmError::InvalidRequest(format!("reading cast_slots: {e}")))?
-        {
-            let Some(backend) = backend_names.get(&slot.backend_id) else {
-                return Err(LlmError::InvalidRequest(format!(
-                    "cast '{}' slot '{}' references a backend_id with no row — DB is corrupt",
-                    cast.label, slot.role
-                )));
-            };
-            let own = SlotTunables {
-                max_tokens: slot.max_tokens.and_then(|v| u64::try_from(v).ok()),
-                temperature: slot.temperature,
-                top_p: slot.top_p,
-                effort: slot.effort.clone(),
-                thinking_budget: slot.thinking_budget.and_then(|v| u64::try_from(v).ok()),
-                thinking_style: slot.thinking_style.clone(),
-            };
-            let tunables = own.over(&registry.model_tunables(backend, &slot.model));
-            slots.push((
-                cast.label.clone(),
-                ResolvedSlot {
-                    role: slot.role,
-                    backend: backend.clone(),
-                    model: slot.model,
-                    tunables,
-                    loadout: slot.loadout,
-                    extra: slot.extra,
-                },
-            ));
-        }
-    }
-    registry.set_cast_slots(slots);
-
     Ok(registry)
 }
 
@@ -266,8 +193,8 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_db::{BackendModelRow, EmbeddingConfigRow, LlmDefaultsRow, ModelAliasRow, ModelTunablesRow};
-    use kaijutsu_types::{BackendId, CastId, PrincipalId};
+    use crate::kernel_db::{BackendModelRow, EmbeddingConfigRow, ModelAliasRow};
+    use kaijutsu_types::{BackendId, PrincipalId};
 
     fn seeded_db() -> KernelDb {
         let db = KernelDb::temporary().unwrap();
@@ -318,19 +245,16 @@ mod tests {
         assert_eq!(status.backends, vec![("mk-zorak".to_string(), None)]);
     }
 
-    /// A kernel ships no backends: a new DB has no backend, model, alias,
-    /// cast, or defaults row, and its registry has no default.
+    /// A kernel ships no backends: a new DB has no backend, model, alias or
+    /// cast row, and its registry has no provider.
     #[test]
     fn a_new_kernel_db_has_no_llm_configuration() {
         let db = KernelDb::temporary().unwrap();
         assert!(db.list_backends().unwrap().is_empty());
-        assert_eq!(db.get_llm_defaults().unwrap(), None);
         assert!(db.list_model_aliases().unwrap().is_empty());
         assert!(db.list_casts().unwrap().is_empty());
         let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
         assert!(registry.list().is_empty());
-        assert_eq!(registry.default_provider_name(), None);
-        assert_eq!(registry.default_model(), None);
     }
 
     #[test]
@@ -399,41 +323,6 @@ mod tests {
         assert!(registry.resolve_alias("Opus").is_some());
     }
 
-    /// The defaults row and a model row reach the live registry: the
-    /// defaults' budget and the model row's effort and budget.
-    #[test]
-    fn defaults_and_model_rows_reach_the_registry() {
-        let db = seeded_db();
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
-        assert_eq!(registry.default_provider_name(), Some("deepseek"));
-        assert_eq!(registry.default_model(), Some("deepseek-flash"));
-        assert_eq!(registry.max_output_tokens(), 16384);
-        let t = registry.default_tunables();
-        assert_eq!(t.effort, None);
-        let model = registry.model_tunables("deepseek", "deepseek-flash");
-        assert_eq!(model.effort.as_deref(), Some("high"));
-        assert_eq!(model.max_tokens, Some(65536));
-        // An unset knob stays NULL: "provider default" is a real answer.
-        assert_eq!(t.temperature, None);
-        assert_eq!(t.top_p, None);
-        assert_eq!(t.thinking_budget, None);
-        assert_eq!(t.thinking_style, None);
-    }
-
-    #[test]
-    fn missing_default_backend_is_fatal_not_a_silent_fallback() {
-        let db = seeded_db();
-        // Point the defaults at a backend name nothing registers under.
-        // `set_llm_defaults` refuses a dangling name and `delete_backend`
-        // refuses the default backend, so delete the row behind both, as an
-        // edit outside the kernel would.
-        db.conn_for_ledger().execute("DELETE FROM backends WHERE name = 'deepseek'", []).unwrap();
-        let err = build_llm_registry(&db, &Endpoints::default()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("default backend 'deepseek'"), "{msg}");
-        assert!(msg.contains("not registered"), "{msg}");
-    }
-
     #[test]
     fn unknown_kind_in_the_table_is_fatal() {
         // The write path refuses unknown kinds, so one in the table means the
@@ -481,107 +370,6 @@ mod tests {
             err.to_string().contains("gemini"),
             "the write path must reject an unknown kind, naming it: {err}"
         );
-    }
-
-    #[test]
-    fn cast_slots_resolve_with_the_defaults_cascade() {
-        let db = seeded_db();
-        let cast_id = CastId::new();
-        db.insert_cast(&crate::kernel_db::CastRow {
-            cast_id,
-            label: "house".into(),
-            description: None,
-            created_at: 0,
-            created_by: PrincipalId::system(),
-        })
-        .unwrap();
-        let anthropic = db.get_backend_by_name("anthropic").unwrap().unwrap();
-        db.set_cast_slot(&crate::kernel_db::CastSlotRow {
-            cast_id,
-            role: "coder".into(),
-            backend_id: anthropic.backend_id,
-            model: "claude-opus-5".into(),
-            max_tokens: None, // falls back to the llm_defaults floor
-            temperature: Some(0.3),
-            top_p: None,
-            effort: Some("high".into()),
-            thinking_budget: None,
-            thinking_style: None,
-            loadout: Some("coder".into()),
-            extra: None,
-        })
-        .unwrap();
-
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
-        let slot = registry.resolved_slot("house", "coder").expect("slot resolves");
-        assert_eq!(slot.backend, "anthropic");
-        assert_eq!(slot.model, "claude-opus-5");
-        assert_eq!(slot.tunables.max_tokens, Some(16384), "NULL cascades to the floor");
-        assert_eq!(slot.tunables.temperature, Some(0.3), "slot value wins");
-        assert_eq!(slot.tunables.effort.as_deref(), Some("high"));
-        assert_eq!(slot.loadout.as_deref(), Some("coder"));
-        // Cast labels are case-insensitive, like the UNIQUE collation.
-        assert!(registry.resolved_slot("HOUSE", "coder").is_some());
-        assert!(registry.resolved_slot("house", "musician").is_none());
-    }
-
-    /// Tunables belong to a model on its provider: a model row's values sit
-    /// between a cast slot and the `llm_defaults` floor, field by field, and a
-    /// model with no row of its own gets the floor.
-    #[test]
-    fn a_model_row_supplies_tunables_between_a_cast_slot_and_the_floor() {
-        let db = seeded_db();
-        db.set_llm_defaults(&LlmDefaultsRow {
-            default_backend: "deepseek".into(),
-            default_model: "deepseek-flash".into(),
-            max_tokens: Some(16384),
-            temperature: Some(0.5),
-            top_p: None,
-            effort: None,
-            thinking_budget: None,
-            thinking_style: None,
-        })
-        .unwrap();
-        let deepseek = db.get_backend_by_name("deepseek").unwrap().unwrap();
-        db.set_backend_model(&BackendModelRow {
-            backend_id: deepseek.backend_id,
-            model_id: "deepseek-flash".into(),
-            context_window: Some(1_000_000),
-            extra: None,
-            tunables: ModelTunablesRow {
-                max_tokens: Some(65536),
-                effort: Some("high".into()),
-                ..Default::default()
-            },
-        })
-        .unwrap();
-        let cast_id = CastId::new();
-        db.insert_cast(&crate::kernel_db::CastRow {
-            cast_id, label: "deep".into(), description: None, created_at: 0,
-            created_by: PrincipalId::system(),
-        })
-        .unwrap();
-        db.set_cast_slot(&crate::kernel_db::CastSlotRow {
-            cast_id, role: "coder".into(), backend_id: deepseek.backend_id,
-            model: "deepseek-flash".into(), max_tokens: None, temperature: None,
-            top_p: None, effort: Some("max".into()), thinking_budget: None,
-            thinking_style: None, loadout: None, extra: None,
-        })
-        .unwrap();
-
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
-        let model = registry.model_tunables("deepseek", "deepseek-flash");
-        assert_eq!(model.max_tokens, Some(65536), "the model row wins over the floor");
-        assert_eq!(model.effort.as_deref(), Some("high"));
-        assert_eq!(model.temperature, Some(0.5), "an unset model field takes the floor");
-        assert_eq!(registry.model_tunables("deepseek", "deepseek-unlisted"), *registry.default_tunables(),
-            "a model without a row gets the floor");
-        assert_eq!(registry.model_tunables("nonesuch", "m"), *registry.default_tunables());
-
-        let slot = registry.resolved_slot("deep", "coder").unwrap();
-        assert_eq!(slot.tunables.effort.as_deref(), Some("max"), "the slot wins");
-        assert_eq!(slot.tunables.max_tokens, Some(65536), "an unset slot field takes the model row");
-        assert_eq!(slot.tunables.temperature, Some(0.5), "then the floor");
     }
 
     #[test]

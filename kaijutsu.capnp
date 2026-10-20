@@ -1240,8 +1240,8 @@ struct ContextHandleInfo {
   id @0 :Data;                    # 16-byte ContextId (UUIDv7) — the real identity
   label @1 :Text;                 # Optional human-friendly name (mutable)
   parentId @2 :Data;              # 16-byte ContextId of parent (empty = no parent)
-  provider @3 :Text;
-  model @4 :Text;
+  provider @3 :Text;             # Backend name of the binding's model for this context's type; empty = the binding has none
+  model @4 :Text;                # Model id of the binding's model for this context's type; empty = the binding has none
   createdAt @5 :UInt64;
   traceId @6 :Data;               # 16-byte OTel trace ID for context-scoped tracing
   forkKind @7 :Text;              # "full"/"filtered"/"compact" or empty
@@ -1259,12 +1259,12 @@ struct ContextHandleInfo {
   pausedAt @19 :UInt64;           # 0 = not paused, else Unix millis of the explicit pause; gating deferred (see setContextPaused)
 
   # Context-window usage — the bottom-dock gauge's wire spine. Resolved
-  # kernel-side from the SAME KernelDb::get_context_usage +
-  # LlmRegistry::context_window_for + shared percentage helper that
+  # kernel-side from the SAME KernelDb::get_context_usage + the binding
+  # slot's context window + shared percentage helper that
   # `kj context info --json` uses, so the two surfaces can never disagree.
   # `contextUsedTokens` is the LAST completed call's fill (input+output),
   # NOT a running total across turns — see `ContextUsageRow`.
-  contextWindow @20 :UInt64;         # 0 = unknown (no configured window for this model, or no usage yet)
+  contextWindow @20 :UInt64;         # 0 = unknown (the binding slot holds no window, or no usage yet)
   contextUsedTokens @21 :UInt64;         # 0 = no usage yet (this context has never completed an LLM call)
   contextUsedPct @22 :Float32 = -1.0; # -1.0 = unknown (window unconfigured or no usage yet). This struct's
                                          # usual "0 = unknown" convention doesn't work here because 0.0 is a
@@ -1293,11 +1293,9 @@ struct ContextHandleInfo {
                                                  # (real exit codes, incl. 128+signal, are never negative — see
                                                  # background_exec.rs's exit_code_from_status)
 
-  # Track D (cast-on-context, 2026-08-03): the named model ensemble this
-  # context plays under (`ContextRow::cast_id`, resolved to its label
-  # kernel-side — the wire never ships a bare CastId for the app to look up
-  # itself). Empty = no cast assigned (falls through to the registry default
-  # at resolution time; see `kaijutsu-kernel`'s `model_resolution` module).
+  # The label of the cast the context's binding was written from, resolved
+  # kernel-side. Empty = the binding has no cast, or the context belongs to no
+  # character instance (see `kaijutsu-kernel`'s `model_resolution` module).
   castLabel @28 :Text;
 
   # Advisory hostname the registering client self-reported (`gethostname` on
@@ -1340,18 +1338,12 @@ struct PresetInfo {
   label @1 :Text;
   description @2 :Text;
 
-  # Track D (2026-08-03): the `presets` table's `provider`/`model` columns
-  # are demolished — a preset now narrows to a cast reference instead of
-  # pinning a provider/model pair itself ("cast = who plays; preset = patch
-  # recall over verb args"). capnp ordinals are dense and never renumbered,
-  # so @3/@4 stay DECLARED but UNUSED (the server never sets them; always
-  # empty on the wire) rather than removed — `castLabel` (resolved
-  # kernel-side, same convention as `ContextHandleInfo.castLabel`) is the
-  # additive replacement at @5. Empty = the preset moves no model knobs (the
-  # three factory presets' shape).
-  provider @3 :Text; # UNUSED since Track D — always empty; do not repurpose
-  model @4 :Text;    # UNUSED since Track D — always empty; do not repurpose
-  castLabel @5 :Text;
+  # A preset holds fork filters and names no model. capnp ordinals are dense
+  # and never renumbered, so the fields that once named one stay DECLARED but
+  # UNUSED (the server never sets them; always empty on the wire).
+  provider @3 :Text;  # UNUSED — always empty; do not repurpose
+  model @4 :Text;     # UNUSED — always empty; do not repurpose
+  castLabel @5 :Text; # UNUSED — always empty; do not repurpose
 }
 
 struct SimilarContext {
@@ -1678,7 +1670,7 @@ interface Vfs {
 
 struct LlmRequest {
   content @0 :Text;       # The prompt text
-  model @1 :Text;         # Optional model name, uses server default if empty
+  retiredModel @1 :Text;  # UNUSED — always empty; do not repurpose. A turn runs on the model its context's binding gives it
   contextId @2 :Data;     # 16-byte ContextId — target context for response blocks
 }
 
@@ -1693,21 +1685,6 @@ enum CompletionKind {
   path @1;
   variable @2;
   keyword @3;
-}
-
-# Information about a single LLM provider
-struct LlmProviderInfo {
-  name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
-  defaultModel @1 :Text;      # Default model for this provider
-  available @2 :Bool;         # Whether the provider is available (has API key)
-  models @3 :List(Text);      # All available model IDs (from aliases + default)
-}
-
-# Current LLM configuration for a kernel
-struct LlmConfigInfo {
-  defaultProvider @0 :Text;   # Name of the default provider
-  defaultModel @1 :Text;      # Name of the default model
-  providers @2 :List(LlmProviderInfo);
 }
 
 # ============================================================================
@@ -2161,15 +2138,16 @@ interface Kernel {
 
   prompt @20 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
 
-  getLlmConfig @21 (trace :TraceContext) -> (config :LlmConfigInfo);
+  # A turn's model comes from its context's character instance binding alone
+  # (`kj cast`, `kj character set --cast`, `kj context rotate`); there is no
+  # default provider or model, and no per-context model assignment.
+  retired21 @21 ();
 
-  setDefaultProvider @22 (provider :Text) -> (success :Bool, error :Text);
+  retired22 @22 ();
 
-  setDefaultModel @23 (provider :Text, model :Text) -> (success :Bool, error :Text);
+  retired23 @23 ();
 
-  # Configure LLM provider/model for a specific context (per-context model assignment).
-  # If contextId is empty/missing, uses the connection's current context.
-  configureLlm @24 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
+  retired24 @24 ();
 
   # ==========================================================================
   # Context management & lifecycle (ContextId = 16-byte UUIDv7 as Data)

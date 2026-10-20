@@ -81,13 +81,24 @@ run init --as amy --key /keys/amy.pub
 
 kj backend set deepseek --kind deepseek --api-key-file "$HOME/.deepseek-key"
 kj backend model set deepseek deepseek-flash --context-window 1000000 --max-tokens 65536 --effort high
-kj backend default set --backend deepseek --model deepseek-flash
 kj backend set anthropic --kind anthropic --api-key-file "$HOME/.anthropic-key.txt"
+kj backend model set anthropic claude-haiku-5-5 --max-tokens 64000
 
 kj character create senpai
 run add-key /keys/senpai.pub --as senpai
 kj character create banto
 kj character create "$project-coder"
+
+# A character's cast gives its instances their models, bound when the instance starts. banto runs Haiku; the coder
+# runs DeepSeek. Each has a `distill` slot, which `kj fork --compact` and `kj drift pull` summarize on.
+kj cast create agent-dev-banto
+kj cast slot set agent-dev-banto director --backend anthropic --model claude-haiku-5-5
+kj cast slot set agent-dev-banto distill --backend deepseek --model deepseek-flash
+kj cast create agent-dev-coder
+kj cast slot set agent-dev-coder coder --backend deepseek --model deepseek-flash
+kj cast slot set agent-dev-coder distill --backend deepseek --model deepseek-flash
+kj character set banto --cast agent-dev-banto
+kj character set "$project-coder" --cast agent-dev-coder
 
 # The overlay goes in before any context exists, so each create lifecycle reads it.
 rc="$base/kernel-data/config/kaijutsu/config/rc"
@@ -123,7 +134,7 @@ python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel
 
 # The kernel passes only HOME, PATH and context exports to the programs a context runs, so set the locale at create.
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
-kj kohai create "$project-banto" --type director --as banto --model anthropic/claude-haiku-5-5 --cwd "$repo" --env LANG=C.UTF-8
+kj kohai create "$project-banto" --type director --as banto --cwd "$repo" --env LANG=C.UTF-8
 # The coder is a character instance that answers to banto's instance (its senpai), so banto's character reviews its
 # asks, and a drift either way between their conversations, or a `kj senpai report`, needs no ask. Banto starts the
 # coder's turns with `kj drive`.

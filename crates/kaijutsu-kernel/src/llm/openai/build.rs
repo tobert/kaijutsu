@@ -108,11 +108,10 @@ pub fn build_request(
         })
         .collect();
 
-    let clamped_max_tokens = ChatRequest::clamp_max_tokens(opts.max_tokens);
     let (max_tokens, max_completion_tokens) = if hosted_openai {
-        (None, Some(clamped_max_tokens))
+        (None, Some(opts.max_tokens))
     } else {
-        (Some(clamped_max_tokens), None)
+        (Some(opts.max_tokens), None)
     };
 
     let (reasoning_effort, thinking) = resolve_effort(
@@ -405,7 +404,7 @@ mod tests {
     use crate::llm::ToolDefinition;
 
     fn opts() -> BuildOpts {
-        BuildOpts::new("deepseek-v4-flash")
+        BuildOpts::new("deepseek-v4-flash", 4096)
     }
 
     /// Shadows `super::build_request` for the bulk of this module's
@@ -651,15 +650,20 @@ mod tests {
         assert!(content.contains("unavailable"));
     }
 
+    /// The request carries the `max_tokens` its caller built it with and
+    /// substitutes none of its own, a zero included: the provider refuses
+    /// that loudly.
+    ///
+    /// Falsified by clamping a zero to a default.
     #[test]
-    fn max_tokens_clamps_zero_to_default() {
+    fn max_tokens_is_sent_as_given() {
         let mut o = opts();
         o.max_tokens = 0;
         let req = build_request(&o, &[Message::user("hi")], false, true);
-        assert!(
-            req.max_tokens.unwrap() > 0,
-            "zero must become a sane default"
-        );
+        assert_eq!(req.max_tokens, Some(0));
+        o.max_tokens = 777;
+        let req = build_request(&o, &[Message::user("hi")], false, true);
+        assert_eq!(req.max_tokens, Some(777));
     }
 
     // ── Generic OpenAI-compatible mode (reasoning_required = false) ──────
@@ -742,7 +746,7 @@ mod tests {
 
         #[test]
         fn hosted_openai_uses_max_completion_tokens_not_max_tokens() {
-            let mut o = BuildOpts::new("gpt-5.6-terra");
+            let mut o = BuildOpts::new("gpt-5.6-terra", 4096);
             o.max_tokens = 4096;
             let req = super::super::build_request(
                 &o,
@@ -798,7 +802,7 @@ mod tests {
 
         #[test]
         fn hosted_openai_effort_passes_through_as_reasoning_effort() {
-            let mut o = BuildOpts::new("gpt-5.6-terra");
+            let mut o = BuildOpts::new("gpt-5.6-terra", 4096);
             o.effort = Some("medium".into());
             let req = super::super::build_request(
                 &o,

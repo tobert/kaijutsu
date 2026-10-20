@@ -2176,22 +2176,17 @@ mod tests {
         dispatcher.set_self_arc();
 
         // A provider that takes 800ms to answer — past the 300ms watchdog, well
-        // under the 10s LLM budget. summarize() falls to the registry default
-        // when the context has no model of its own.
-        {
-            let mut reg = dispatcher.kernel().llm().write().await;
-            reg.register(
-                "mock",
-                Arc::new(Provider::Mock(
-                    MockClient::new("distilled summary").with_delay(Duration::from_millis(800)),
-                )),
-            );
-            assert!(reg.set_default("mock"), "set default provider");
-            reg.set_default_model("mock-model");
-        }
+        // under the 10s LLM budget. The summary runs on the context's
+        // `distill` slot.
+        dispatcher.kernel().llm().write().await.register(
+            "mock",
+            Arc::new(Provider::Mock(
+                MockClient::new("distilled summary").with_delay(Duration::from_millis(800)),
+            )),
+        );
 
         let principal = PrincipalId::system();
-        let here = register_context(&dispatcher, Some("here"), None, principal);
+        let here = crate::kj::test_helpers::register_context_with_model(&dispatcher, Some("here"), None, principal, &["distill"]);
         let sink = register_context(&dispatcher, Some("sink"), None, principal);
         // `push` delivers immediately, so the target needs a document to
         // receive the distilled block.

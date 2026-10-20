@@ -40,20 +40,10 @@
 //!   lane's ask resolves to `banto` as the character responsible for the
 //!   seat that forked it — see the assertions below and
 //!   `docs/character.md`, "Roots and rotation".
-//! - **The coder lanes' own `context_type`.** `kj fork` always copies the
-//!   parent's `context_type` onto the child
-//!   (`crates/kaijutsu-kernel/src/kj/fork.rs:1649-1686`,
-//!   `inherit_parent_context_type`) — there is no `--type` on `fork`. Each
-//!   lane therefore stays `context_type = "director"`, the same as banto's
-//!   seat, so the cast's `coder` slot (keyed on `context_type`, per
-//!   `crates/kaijutsu-kernel/src/model_resolution.rs:11-14`) is never
-//!   reached by a lane's own type. Each lane instead gets an **explicit
-//!   per-context model override** (`kj context set <lane> --model
-//!   mock/mock-coder-a`, `-b` for the other), which the same module's resolution ladder
-//!   (`model_resolution.rs:83-94`) always tries first — a real, exercised
-//!   path, just not the cast-by-role path the brief sketched for the coder
-//!   slot. The cast is still created and the `director` slot IS reached
-//!   normally (banto's own `context_type` really is `director`).
+//! - **Each lane runs its coder's cast.** A lane is `kj kohai create <lane>
+//!   --type coder --as <coder>`, so its binding is written from the cast its
+//!   coder character names (`kj character set <coder> --cast`), and its
+//!   `coder` slot gives it `mock-coder-a` or `mock-coder-b`.
 //! - **banto starts its own lanes.** `kj kohai create <lane> --as <coder>`
 //!   starts a character instance whose senpai is banto's instance, and a fork
 //!   stays in the forking context's instance, so the assignment happens
@@ -197,9 +187,8 @@ impl Drop for MockScriptDirGuard {
 }
 
 /// Boot a server with `KJ_MOCK_SCRIPT_DIR` pointed at this crate's
-/// `tests/mock_scripts/` fixtures, a mock backend seeded (`mock-model` stays
-/// the registry default; the scenario's contexts pick their own models via
-/// cast slot / explicit override), and one real SSH credential bound to a
+/// `tests/mock_scripts/` fixtures, a mock backend seeded (the scenario's
+/// contexts run the models their characters' casts give them), and one real SSH credential bound to a
 /// character named `amy`, whose context banto's seat is created from
 /// (`docs/approval-identity.md`).
 async fn boot() -> Scenario {
@@ -353,11 +342,19 @@ fn kaijutsu_session_scenario() {
         s.kj("kj character create coder-a").await;
         s.kj("kj character create coder-b").await;
 
-        s.kj("kj cast create mockcast").await;
-        s.kj("kj cast slot set mockcast director --backend mock --model mock-banto").await;
-        s.kj("kj cast slot set mockcast coder --backend mock --model mock-coder").await;
+        // A character's cast is bound when its instance starts: banto runs
+        // `mock-banto`, and each coder lane runs its own coder's model.
+        s.kj("kj cast create banto-cast").await;
+        s.kj("kj cast slot set banto-cast director --backend mock --model mock-banto --max-tokens 4096").await;
+        s.kj("kj cast create cast-a").await;
+        s.kj("kj cast slot set cast-a coder --backend mock --model mock-coder-a --max-tokens 4096").await;
+        s.kj("kj cast create cast-b").await;
+        s.kj("kj cast slot set cast-b coder --backend mock --model mock-coder-b --max-tokens 4096").await;
+        s.kj("kj character set banto --cast banto-cast").await;
+        s.kj("kj character set coder-a --cast cast-a").await;
+        s.kj("kj character set coder-b --cast cast-b").await;
 
-        s.kj("kj kohai create banto --type director --as banto --cast mockcast").await;
+        s.kj("kj kohai create banto --type director --as banto").await;
         let banto_ctx = s.context_by_label("banto");
         let banto_principal = s.character_principal("banto");
         let coder_a_principal = s.character_principal("coder-a");

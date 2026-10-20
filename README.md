@@ -103,14 +103,18 @@ cargo run -p kaijutsu-server -- list-characters
 cargo run -p kaijutsu-app
 ```
 
-A new kernel has no model backends and no default model, so a model turn
-fails until you configure one. In a client's shell:
+A new kernel has no model backends and no casts, so a model turn fails until
+you configure a backend, give a cast a slot on it, and point a character at
+the cast. In a client's shell:
 
 ```bash
 # DeepSeek, with the key in an environment variable or a file
 kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY --api-key-file ~/.deepseek-key
 kj backend model set deepseek deepseek-flash --context-window 1000000 --max-tokens 65536 --effort high
-kj backend default set --backend deepseek --model deepseek-flash
+kj cast create house
+kj cast slot set house coder --backend deepseek --model deepseek-flash
+kj character set <character> --cast house
+kj kohai create <label> --as <character> --type coder
 
 # Anthropic
 kj backend set anthropic --kind anthropic --api-key-env ANTHROPIC_API_KEY --api-key-file ~/.anthropic-key.txt

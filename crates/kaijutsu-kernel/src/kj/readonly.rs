@@ -354,13 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_default_show_is_read_only() {
+    fn a_backend_model_show_style_read_is_read_only() {
         // The nested-subcommand case a two-level table couldn't tell apart
-        // from `backend default set` — the class doesn't have that problem.
-        let cmd = plan_one("kj backend default show");
+        // from `backend model set` — the class doesn't have that problem.
+        let cmd = plan_one("kj backend show deepseek");
         assert!(is_read_only_kj(&cmd));
+        let cmd = plan_one("kj backend model set deepseek m --max-tokens 1");
+        assert!(!is_read_only_kj(&cmd));
     }
-
     #[test]
     fn a_block_cat_is_read_only_only_without_out() {
         let read = plan_one("kj block cat 019a2f3c");

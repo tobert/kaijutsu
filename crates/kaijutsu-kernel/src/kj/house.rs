@@ -22,7 +22,7 @@ pub(crate) const HOUSE_VERBS: &[&str] = &[
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const WORKER_VERBS: &[&str] = &[
     "block", "cache", "cas", "context", "diff", "drift", "fork", "stage", "handoff",
-    "kaish", "kohai", "model", "models", "search", "senpai", "synth", "vfs", "vi", "wait", "workspace",
+    "kaish", "kohai", "models", "search", "senpai", "synth", "vfs", "vi", "wait", "workspace",
 ];
 
 /// Short forms of top-level verbs, and the verb each one names.

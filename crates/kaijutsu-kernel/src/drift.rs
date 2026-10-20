@@ -70,10 +70,6 @@ pub struct ContextHandle {
     pub label: Option<String>,
     /// Working directory in VFS (e.g., "/mnt/kaijutsu").
     pub pwd: Option<String>,
-    /// Provider name if configured (e.g., "anthropic", "gemini").
-    pub provider: Option<String>,
-    /// Model name if configured (e.g., "claude-opus-4-6", "gemini-2.0-flash").
-    pub model: Option<String>,
     /// Fork source context ID (for fork lineage).
     pub forked_from: Option<ContextId>,
     /// Who created this context.
@@ -343,7 +339,6 @@ impl DriftRouter {
     /// Register a live context with a pre-assigned ContextId.
     ///
     /// The caller (server RPC) creates the ContextId and passes it in.
-    /// Provider and model default to None; use `configure_llm()` to set them.
     /// Returns an error if the label is already in use by a different context.
     #[tracing::instrument(skip(self), name = "drift.register")]
     pub fn register(
@@ -383,8 +378,6 @@ impl DriftRouter {
             id,
             label: label.map(|s| s.to_string()),
             pwd: None,
-            provider: None,
-            model: None,
             forked_from,
             created_by,
             created_at: kaijutsu_types::now_millis(),
@@ -396,9 +389,8 @@ impl DriftRouter {
         Ok(())
     }
 
-    /// Register a forked context, inheriting provider/model from the parent.
+    /// Register a forked context.
     ///
-    /// Model is immutable on a context after creation — fork to change it.
     /// Returns an error if the parent context is not registered.
     #[tracing::instrument(skip(self), name = "drift.register_fork")]
     pub fn register_fork(
@@ -408,14 +400,9 @@ impl DriftRouter {
         forked_from: ContextId,
         created_by: PrincipalId,
     ) -> Result<(), DriftError> {
-        let parent = self
-            .contexts
-            .get(&forked_from)
-            .ok_or_else(|| DriftError::UnknownContext(forked_from.short()))?;
-
-        // Inherit parent's provider/model (COW semantics — snapshot at fork time)
-        let parent_provider = parent.provider.clone();
-        let parent_model = parent.model.clone();
+        if !self.contexts.contains_key(&forked_from) {
+            return Err(DriftError::UnknownContext(forked_from.short()));
+        }
 
         if let Some(l) = label {
             self.check_label_available(l, id)?;
@@ -426,8 +413,6 @@ impl DriftRouter {
             id,
             label: label.map(|s| s.to_string()),
             pwd: None,
-            provider: parent_provider,
-            model: parent_model,
             forked_from: Some(forked_from),
             created_by,
             created_at: kaijutsu_types::now_millis(),
@@ -562,34 +547,6 @@ impl DriftRouter {
                 DriftError::AmbiguousContext { prefix, candidates }
             }
         })
-    }
-
-    /// Update provider/model for a context.
-    pub fn configure_llm(
-        &mut self,
-        id: ContextId,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), DriftError> {
-        let handle = self
-            .contexts
-            .get_mut(&id)
-            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
-        handle.provider = Some(provider.to_string());
-        handle.model = Some(model.to_string());
-        Ok(())
-    }
-
-    /// Clear a context's provider/model, so it resolves through its cast or
-    /// the registry default.
-    pub fn clear_llm(&mut self, id: ContextId) -> Result<(), DriftError> {
-        let handle = self
-            .contexts
-            .get_mut(&id)
-            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
-        handle.provider = None;
-        handle.model = None;
-        Ok(())
     }
 
     /// Set the working directory for a context.
@@ -1805,59 +1762,6 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_llm() {
-        let mut router = DriftRouter::new();
-        let id = ContextId::new();
-        router.register(id, Some("test"), None, PrincipalId::system()).unwrap();
-
-        router
-            .configure_llm(id, "gemini", "gemini-2.0-flash")
-            .unwrap();
-
-        let handle = router.get(id).unwrap();
-        assert_eq!(handle.provider.as_deref(), Some("gemini"));
-        assert_eq!(handle.model.as_deref(), Some("gemini-2.0-flash"));
-    }
-
-    #[test]
-    fn test_register_fork_inherits_model() {
-        let mut router = DriftRouter::new();
-        let parent_id = ContextId::new();
-        router.register(parent_id, Some("parent"), None, PrincipalId::system()).unwrap();
-        router
-            .configure_llm(parent_id, "anthropic", "claude-sonnet-4-20250514")
-            .unwrap();
-
-        let child_id = ContextId::new();
-        router
-            .register_fork(child_id, Some("child"), parent_id, PrincipalId::system())
-            .unwrap();
-
-        let child = router.get(child_id).unwrap();
-        assert_eq!(child.provider.as_deref(), Some("anthropic"));
-        assert_eq!(child.model.as_deref(), Some("claude-sonnet-4-20250514"));
-        assert_eq!(child.forked_from, Some(parent_id));
-    }
-
-    #[test]
-    fn test_register_fork_no_parent_model() {
-        let mut router = DriftRouter::new();
-        let parent_id = ContextId::new();
-        router.register(parent_id, Some("bare"), None, PrincipalId::system()).unwrap();
-        // Parent has no model set
-
-        let child_id = ContextId::new();
-        router
-            .register_fork(child_id, None, parent_id, PrincipalId::system())
-            .unwrap();
-
-        let child = router.get(child_id).unwrap();
-        assert_eq!(child.provider, None);
-        assert_eq!(child.model, None);
-        assert_eq!(child.forked_from, Some(parent_id));
-    }
-
-    #[test]
     fn test_register_fork_missing_parent_errors() {
         let mut router = DriftRouter::new();
         let missing_parent = ContextId::new();
@@ -1872,13 +1776,6 @@ mod tests {
             result.is_err(),
             "should error when parent is not registered"
         );
-    }
-
-    #[test]
-    fn test_configure_llm_unknown_context() {
-        let mut router = DriftRouter::new();
-        let result = router.configure_llm(ContextId::new(), "anthropic", "claude-opus-4-6");
-        assert!(result.is_err());
     }
 
     #[test]

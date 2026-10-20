@@ -102,11 +102,13 @@ pub async fn start_server_with_host_exec() -> SocketAddr {
     addr
 }
 
-/// Seed a `mock`-kind backend into the kernel DB at `data_dir` and make it the
-/// default, so `initialize_kernel_models()` brings up a registry a test can
-/// drive without a live provider.
+/// Seed a `mock`-kind backend into the kernel DB at `data_dir`, and a `mock`
+/// cast that runs it for every context type a test creates, which the
+/// ephemeral performer plays, so `initialize_kernel_models()` brings up a
+/// registry a test can drive without a live provider and a context made as
+/// [`PERFORMER`] binds a model.
 ///
-/// Model configuration is SQL-native now (`models.toml` is demolished), so the
+/// Model configuration is SQL-native (`models.toml` is demolished), so the
 /// injection point is the DB itself rather than a host file the kernel reads
 /// once at seed time. The server opens the same `kernel.db` a moment later,
 /// and `mock` is its only backend: a kernel ships none.
@@ -115,52 +117,73 @@ pub fn seed_mock_backend(data_dir: &std::path::Path) {
     seed_mock_backend_with_model(data_dir, "mock-model");
 }
 
-/// Like `seed_mock_backend`, but with a caller-chosen `default_model`.
+/// Like `seed_mock_backend`, but the cast's slots run a caller-chosen model.
 ///
 /// Needed to exercise rc scripts (like the coder stance) that branch on the
-/// bound model: setting the REGISTRY DEFAULT here (not a per-context
-/// override) is what lets a test prove a context inherited its model rather
-/// than had one stamped on its row — the distinction the S00-stance.kai
-/// `.resolved_model` fix depends on.
+/// bound model: the model comes from the cast the performer's instance binds,
+/// so it is set before any context is created, and a test can show a context
+/// ran on its binding rather than on anything stamped on its row.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
-pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, default_model: &str) {
-    use kaijutsu_kernel::kernel_db::{BackendRow, KernelDb, LlmDefaultsRow};
-    use kaijutsu_types::{BackendId, PrincipalId};
+pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
+    use kaijutsu_kernel::kernel_db::{BackendRow, CastRow, CastSlotRow, KernelDb};
+    use kaijutsu_types::{BackendId, CastId, PrincipalId};
 
     std::fs::create_dir_all(data_dir).expect("create data dir");
     let db = KernelDb::open(data_dir.join("kernel.db")).expect("open kernel db for mock seed");
-    db.upsert_backend(&BackendRow {
-        backend_id: BackendId::new(),
-        name: "mock".to_string(),
-        kind: "mock".to_string(),
-        base_url: None,
-        api_key_env: None,
-        api_key_file: None,
-        key_optional: true,
-        request_timeout_secs: None,
-        idle_timeout_secs: None,
-        max_concurrent: None,
+    let backend = db
+        .upsert_backend(&BackendRow {
+            backend_id: BackendId::new(),
+            name: "mock".to_string(),
+            kind: "mock".to_string(),
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout_secs: None,
+            idle_timeout_secs: None,
+            max_concurrent: None,
+            created_at: 0,
+            created_by: PrincipalId::system(),
+        })
+        .expect("seed mock backend");
+    let cast = CastRow {
+        cast_id: CastId::new(),
+        label: "mock".to_string(),
+        description: None,
         created_at: 0,
         created_by: PrincipalId::system(),
-    })
-    .expect("seed mock backend");
-    db.set_llm_defaults(&LlmDefaultsRow {
-        default_backend: "mock".to_string(),
-        default_model: default_model.to_string(),
-        max_tokens: Some(16384),
-        temperature: None,
-        top_p: None,
-        effort: None,
-        thinking_budget: None,
-        thinking_style: None,
-    })
-    .expect("point defaults at the mock backend");
+    };
+    db.insert_cast(&cast).expect("seed the mock cast");
+    for role in ["default", "coder", "musician", "director", "assistant", "mcp", "toolie"] {
+        db.set_cast_slot(&CastSlotRow {
+            cast_id: cast.cast_id,
+            role: role.to_string(),
+            backend_id: backend.backend_id,
+            model: model.to_string(),
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+            loadout: None,
+            extra: None,
+        })
+        .expect("seed a mock cast slot");
+    }
+    // An ephemeral kernel has its performer; an offline home does not, and a
+    // test there points its own character at the `mock` cast.
+    if let Some(performer) = db.get_character_by_name(PERFORMER).expect("read the ephemeral performer") {
+        db.set_character_default_cast(performer.principal_id, Some(cast.cast_id))
+            .expect("point the performer at the mock cast");
+    }
 }
 
-/// Start a server whose ephemeral kernel DB carries a mock LLM backend.
+/// Start a server whose ephemeral kernel DB carries a mock LLM backend and a
+/// cast the ephemeral performer plays.
 ///
 /// This makes `initialize_kernel_models()` register a "mock" backend so that
-/// `KjDispatcher.summarize()` and other LLM-dependent paths work in tests.
+/// model turns and other LLM-dependent paths work in tests.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn start_server_with_mock_llm() -> SocketAddr {
     start_server_with_mock_llm_model("mock-model").await
@@ -237,21 +260,21 @@ pub fn seed_turn_identity(
     performer.principal_id
 }
 
-/// Like `start_server_with_mock_llm`, but the mock backend's registry-default
-/// model is caller-chosen instead of hardcoded to `"mock-model"`.
+/// Like `start_server_with_mock_llm`, but the cast's model is caller-chosen
+/// instead of hardcoded to `"mock-model"`.
 ///
-/// The model must be in place before any context is created — rc create
-/// lifecycle scripts (e.g. the coder stance) read the resolved model during
-/// context creation, so setting it afterward is too late to affect them.
+/// The model must be in place before any context is created — a context binds
+/// it when it is made, and rc create lifecycle scripts (e.g. the coder
+/// stance) read the resolved model during context creation.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
-pub async fn start_server_with_mock_llm_model(default_model: &str) -> SocketAddr {
+pub async fn start_server_with_mock_llm_model(model: &str) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let config = SshServerConfig::ephemeral(addr.port());
     register_root_key(addr, config.root_key());
     if let Some(ref data_dir) = config.data_dir {
-        seed_mock_backend_with_model(data_dir, default_model);
+        seed_mock_backend_with_model(data_dir, model);
     }
 
     tokio::task::spawn_local(async move {

@@ -8,7 +8,7 @@
 //! inexpressible and a local server had to be called `ollama`/`lemonade`/
 //! `local` because those strings were hardcoded provider types.
 //!
-//! Rows live in `kernel_db` (`backends`, `backend_models`, `llm_defaults`).
+//! Rows live in `kernel_db` (`backends`, `backend_models`).
 //! There is no TOML in this path and no host file to edit. **No key material
 //! is ever stored** — only an env-var NAME (`--api-key-env`) or a file path
 //! (`--api-key-file`).
@@ -19,7 +19,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{BackendId, ContentType};
 
-use crate::kernel_db::{BackendModelRow, BackendRow, LlmDefaultsRow, ModelTunablesRow};
+use crate::kernel_db::{BackendModelRow, BackendRow, ModelTunablesRow};
 use crate::llm::BackendKind;
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
@@ -27,7 +27,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "backend",
-    about = "LLM backends: one row per endpoint (name + kind). SQL-native — no models.toml.",
+    about = "LLM backends: one row per endpoint (name + kind).",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -92,8 +92,8 @@ enum BackendCommand {
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
     },
-    /// Remove a backend. Refused while the defaults, a cast slot, or an alias
-    /// still names it.
+    /// Remove a backend. Refused while a cast slot, a character instance's
+    /// binding, or an alias still names it.
     #[command(alias = "rm")]
     Remove {
         /// Backend name
@@ -102,16 +102,14 @@ enum BackendCommand {
     /// Per-model metadata (context windows and sparse JSON extras).
     #[command(subcommand)]
     Model(BackendModelCommand),
-    /// Show or set the kernel-wide LLM defaults (`llm_defaults`).
-    #[command(subcommand)]
-    Default(BackendDefaultCommand),
 }
 
 #[derive(Subcommand, Debug)]
 enum BackendModelCommand {
     /// Pin one model's metadata and tunables on a backend. Only the flags you
-    /// pass change. The tunables apply between a cast slot and the kernel
-    /// defaults (`kj backend default show`), field by field.
+    /// pass change. A cast slot's own value wins; a tunable the slot leaves
+    /// unset is read from here when a character instance's binding is
+    /// written, so a change reaches instances after `kj context rotate`.
     Set {
         /// Backend name
         backend: String,
@@ -137,26 +135,8 @@ enum BackendModelCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum BackendDefaultCommand {
-    /// Print the current defaults.
-    Show,
-    /// Update the defaults. Only the flags you pass change. With no defaults
-    /// yet, pass both --backend and --model.
-    Set {
-        /// Default backend name
-        #[arg(long)]
-        backend: Option<String>,
-        /// Default model id
-        #[arg(long)]
-        model: Option<String>,
-        #[command(flatten)]
-        tunables: TunableFlags,
-    },
-}
-
-/// The tunables a model row or the defaults carry, as flags. Only the flags
-/// you pass change; `--clear` returns a field to the next level down.
+/// The tunables a model row carries, as flags. Only the flags you pass
+/// change; `--clear` unsets a field.
 #[derive(clap::Args, Debug)]
 struct TunableFlags {
     /// Maximum RESPONSE tokens, reasoning included (not the context window)
@@ -177,8 +157,8 @@ struct TunableFlags {
     /// Extended-thinking style token
     #[arg(long = "thinking-style")]
     thinking_style: Option<String>,
-    /// Unset a tunable so the next level answers: max-tokens, temperature,
-    /// top-p, effort, thinking-budget, or thinking-style. Repeat for more
+    /// Unset a tunable: max-tokens, temperature, top-p, effort,
+    /// thinking-budget, or thinking-style. Repeat for more
     #[arg(long = "clear", value_name = "FIELD")]
     clear: Vec<String>,
 }
@@ -233,7 +213,7 @@ impl TunableFlags {
 }
 
 /// One model row for a person: its window, then each tunable it sets. An
-/// unset tunable takes the kernel defaults and is not listed.
+/// unset tunable is not listed.
 fn model_summary(m: &BackendModelRow) -> String {
     let mut parts = vec![m.context_window
         .map(|w| format!("{w} ctx"))
@@ -251,9 +231,9 @@ fn model_summary(m: &BackendModelRow) -> String {
 /// How to configure a backend, for a kernel that has none. A kernel ships no
 /// backends; README.md, "Quick Start" has more examples.
 pub(crate) const NO_BACKEND_HINT: &str = "No LLM backend is configured: add one with \
-     `kj backend set` and make it the default with `kj backend default set`. For example, \
+     `kj backend set`, then give a cast a slot on it with `kj cast slot set`. For example, \
      `kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY`, then \
-     `kj backend default set --backend deepseek --model deepseek-flash`.";
+     `kj cast slot set house coder --backend deepseek --model deepseek-flash --max-tokens 65536`.";
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_backend(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -277,12 +257,7 @@ impl KjDispatcher {
         // Which model runs every turn is exactly what `config-write` exists to
         // protect (it used to gate `kj config set models.toml`); list/show stay
         // ungated, discovery is not escalation.
-        let mutating = !matches!(
-            parsed.command,
-            BackendCommand::List
-                | BackendCommand::Show { .. }
-                | BackendCommand::Default(BackendDefaultCommand::Show)
-        );
+        let mutating = !matches!(parsed.command, BackendCommand::List | BackendCommand::Show { .. });
         if mutating
             && let Err(denied) =
                 self.require_cap(caller, crate::mcp::Capability::ConfigWrite, "backend")
@@ -324,12 +299,6 @@ impl KjDispatcher {
             }
             BackendCommand::Remove { name } => self.backend_remove(&name),
             BackendCommand::Model(cmd) => self.backend_model(cmd),
-            BackendCommand::Default(BackendDefaultCommand::Show) => self.backend_default_show(),
-            BackendCommand::Default(BackendDefaultCommand::Set {
-                backend,
-                model,
-                tunables,
-            }) => self.backend_default_set(backend, model, tunables),
         };
 
         if mutating && matches!(result, KjResult::Ok { .. }) {
@@ -388,21 +357,11 @@ impl KjDispatcher {
                 names,
             );
         }
-        let default_backend = db
-            .get_llm_defaults()
-            .ok()
-            .flatten()
-            .map(|d| d.default_backend);
         let lines: Vec<String> = backends
             .iter()
             .map(|b| {
-                let marker = if default_backend.as_deref() == Some(b.name.as_str()) {
-                    " *"
-                } else {
-                    "  "
-                };
                 let url = b.base_url.as_deref().unwrap_or("");
-                format!("{marker}{:<14} {:<10} {url}", b.name, b.kind)
+                format!("  {:<14} {:<10} {url}", b.name, b.kind)
             })
             .collect();
         KjResult::ok_with_data(lines.join("\n"), names)
@@ -664,108 +623,6 @@ impl KjDispatcher {
         }
     }
 
-    fn backend_default_show(&self) -> KjResult {
-        let db = self.kernel_db().lock();
-        let Some(d) = (match db.get_llm_defaults() {
-            Ok(d) => d,
-            Err(e) => return KjResult::Err(format!("kj backend default: {e}")),
-        }) else {
-            return KjResult::Err(format!("kj backend default: no defaults are set. {NO_BACKEND_HINT}"));
-        };
-        // A NULL knob prints as "(provider default)", not as a number we made
-        // up: "unset" is a real answer here.
-        let opt = |v: Option<String>| v.unwrap_or_else(|| "(provider default)".to_string());
-        let lines = [
-            format!("Default backend: {}", d.default_backend),
-            format!("Default model: {}", d.default_model),
-            format!("max_tokens: {}", opt(d.max_tokens.map(|v| v.to_string()))),
-            format!("temperature: {}", opt(d.temperature.map(|v| v.to_string()))),
-            format!("top_p: {}", opt(d.top_p.map(|v| v.to_string()))),
-            format!("effort: {}", opt(d.effort.clone())),
-            format!(
-                "thinking_budget: {}",
-                opt(d.thinking_budget.map(|v| v.to_string()))
-            ),
-            format!("thinking_style: {}", opt(d.thinking_style.clone())),
-        ];
-        let data = serde_json::json!({
-            "default_backend": d.default_backend,
-            "default_model": d.default_model,
-            "max_tokens": d.max_tokens,
-            "temperature": d.temperature,
-            "top_p": d.top_p,
-            "effort": d.effort,
-            "thinking_budget": d.thinking_budget,
-            "thinking_style": d.thinking_style,
-        });
-        KjResult::ok_with_data(lines.join("\n"), data)
-    }
-
-    // Same shape as `backend_set` above: one argument per `kj backend
-    // default set` flag / `llm_defaults` table column.
-    #[allow(clippy::too_many_arguments)]
-    fn backend_default_set(
-        &self,
-        backend: Option<String>,
-        model: Option<String>,
-        flags: TunableFlags,
-    ) -> KjResult {
-        let db = self.kernel_db().lock();
-        let current = match db.get_llm_defaults() {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                // Nothing to merge onto — require both halves of the identity.
-                let (Some(b), Some(m)) = (backend.clone(), model.clone()) else {
-                    return KjResult::Err(
-                        "kj backend default set: no defaults are set yet, so pass both \
-                         --backend and --model: `kj backend default set --backend deepseek \
-                         --model deepseek-flash`"
-                            .to_string(),
-                    );
-                };
-                LlmDefaultsRow {
-                    default_backend: b,
-                    default_model: m,
-                    max_tokens: None,
-                    temperature: None,
-                    top_p: None,
-                    effort: None,
-                    thinking_budget: None,
-                    thinking_style: None,
-                }
-            }
-            Err(e) => return KjResult::Err(format!("kj backend default set: {e}")),
-        };
-        let mut t = ModelTunablesRow {
-            max_tokens: current.max_tokens,
-            temperature: current.temperature,
-            top_p: current.top_p,
-            effort: current.effort,
-            thinking_budget: current.thinking_budget,
-            thinking_style: current.thinking_style,
-        };
-        if let Err(e) = flags.apply(&mut t) {
-            return KjResult::Err(format!("kj backend default set: {e}"));
-        }
-        let next = LlmDefaultsRow {
-            default_backend: backend.unwrap_or(current.default_backend),
-            default_model: model.unwrap_or(current.default_model),
-            max_tokens: t.max_tokens,
-            temperature: t.temperature,
-            top_p: t.top_p,
-            effort: t.effort,
-            thinking_budget: t.thinking_budget,
-            thinking_style: t.thinking_style,
-        };
-        match db.set_llm_defaults(&next) {
-            Ok(()) => KjResult::ok(format!(
-                "defaults now {}/{}",
-                next.default_backend, next.default_model
-            )),
-            Err(e) => KjResult::Err(format!("kj backend default set: {e}")),
-        }
-    }
-
     /// Rebuild the kernel's `LlmRegistry` from the database and swap it in.
     ///
     /// This is the live-reload mechanism: the registry is a snapshot behind
@@ -829,7 +686,6 @@ impl Classify for BackendCommand {
             Self::List | Self::Show { .. } => Effect::Read,
             Self::Set { .. } | Self::Remove { .. } => Effect::Write,
             Self::Model(cmd) => cmd.effect(),
-            Self::Default(cmd) => cmd.effect(),
         }
     }
 }
@@ -838,15 +694,6 @@ impl Classify for BackendModelCommand {
     fn effect(&self) -> Effect {
         match self {
             Self::Set { .. } | Self::Remove { .. } => Effect::Write,
-        }
-    }
-}
-
-impl Classify for BackendDefaultCommand {
-    fn effect(&self) -> Effect {
-        match self {
-            Self::Show => Effect::Read,
-            Self::Set { .. } => Effect::Write,
         }
     }
 }
@@ -888,20 +735,20 @@ mod tests {
         }
     }
 
-    /// A kernel ships no backends, so the empty list and the missing
-    /// defaults say how to configure one.
+    /// A kernel ships no backends, so the empty list says how to configure
+    /// one and how to give a cast a slot on it.
     #[tokio::test]
     async fn a_kernel_with_no_backends_says_how_to_configure_one() {
         let d = test_dispatcher().await;
         let c = test_caller();
         let list = d.dispatch(&argv(&["backend", "list"]), &c).await;
         assert!(list.is_ok(), "{}", list.message());
-        for verb in ["kj backend set", "kj backend default set"] {
+        for verb in ["kj backend set", "kj cast slot set"] {
             assert!(list.message().contains(verb), "{}", list.message());
         }
-        let show = d.dispatch(&argv(&["backend", "default", "show"]), &c).await;
-        assert!(!show.is_ok());
-        assert!(show.message().contains("kj backend default set"), "{}", show.message());
+        assert!(!list.message().contains("default"), "no default backend is advertised: {}", list.message());
+        let default = d.dispatch(&argv(&["backend", "default", "show"]), &c).await;
+        assert!(!default.is_ok(), "`kj backend default` is gone");
     }
 
     /// There are no factory backends to restore, so `reseed` is not a verb.
@@ -1051,23 +898,31 @@ mod tests {
         }
     }
 
-    /// The defaults name a backend, so removing it is refused with how to
-    /// change the default first; once the default moves, it removes.
+    /// A character instance's binding names a backend for as long as the
+    /// binding exists, and bindings are never changed, so the backend cannot
+    /// be removed: the refusal says which bindings hold it.
+    ///
+    /// Falsified by a removal that ignores `instance_slots`.
     #[tokio::test]
-    async fn remove_is_refused_while_the_defaults_name_the_backend() {
+    async fn remove_is_refused_while_an_instance_binding_names_the_backend() {
         let d = seeded().await;
         let c = test_caller();
+        let principal = kaijutsu_types::PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: principal, name: "bound".into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            db.seed_test_cast(principal, "deepseek", "deepseek-flash", &["default"]).unwrap();
+        }
+        let ctx = crate::kj::test_helpers::register_context(&d, Some("bound-ctx"), None, principal);
+        d.kernel_db().lock().assign_stand_in_instance(ctx, principal).unwrap();
         let r = d.dispatch(&argv(&["backend", "rm", "deepseek"]), &c).await;
-        assert!(!r.is_ok(), "the default backend must not be removed: {}", r.message());
-        assert!(r.message().contains("kj backend default set --backend"), "{}", r.message());
+        assert!(!r.is_ok(), "a bound backend must not be removed: {}", r.message());
+        assert!(r.message().contains("character instance bindings"), "{}", r.message());
         assert!(d.kernel_db().lock().get_backend_by_name("deepseek").unwrap().is_some());
-
-        let moved = d.dispatch(&argv(&["backend", "default", "set", "--backend", "ollama", "--model", "gemma4:31b"]), &c).await;
-        assert!(moved.is_ok(), "{}", moved.message());
-        let r = d.dispatch(&argv(&["backend", "rm", "deepseek"]), &c).await;
-        assert!(r.is_ok(), "{}", r.message());
     }
-
     #[tokio::test]
     async fn an_unreferenced_backend_removes_cleanly() {
         let d = seeded().await;
@@ -1118,7 +973,7 @@ mod tests {
 
         let registry = d.kernel().llm().read().await;
         assert_eq!(registry.context_window_for("gpt", "gpt-5.6-terra"), Some(400_000), "the window stays");
-        let t = registry.model_tunables("gpt", "gpt-5.6-terra");
+        let t = registry.backend_config("gpt").and_then(|b| b.model_tunables("gpt-5.6-terra")).cloned().expect("the model's row");
         assert_eq!(t.max_tokens, Some(65536));
         assert_eq!(t.effort.as_deref(), Some("high"));
         assert_eq!(t.temperature, Some(1.0));
@@ -1137,25 +992,21 @@ mod tests {
         }
     }
 
-    /// A set tunable can be cleared back to "take the next level" with
-    /// `--clear`, on a model row and on the defaults; an empty string is
-    /// refused rather than stored and sent to the provider.
+    /// A set tunable can be unset with `--clear` on a model row; an empty
+    /// string is refused rather than stored and sent to the provider.
     #[tokio::test]
     async fn clear_returns_a_tunable_to_the_next_level() {
         let d = seeded().await;
         let c = test_caller();
         let run = |args: &[&str]| argv(args);
         let ok = |r: &KjResult| assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
-        ok(&d.dispatch(&run(&["backend", "default", "set", "--effort", "max", "--max-tokens", "16384"]), &c).await);
         ok(&d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--context-window", "400000",
             "--max-tokens", "65536", "--effort", "high"]), &c).await);
 
         ok(&d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--clear", "max-tokens"]), &c).await);
-        ok(&d.dispatch(&run(&["backend", "default", "set", "--clear", "effort"]), &c).await);
         let registry = d.kernel().llm().read().await;
-        assert_eq!(registry.default_tunables().effort, None, "the defaults' effort is cleared");
-        let t = registry.model_tunables("gpt", "gpt-5.6-terra");
-        assert_eq!(t.max_tokens, Some(16384), "a cleared model value takes the defaults'");
+        let t = registry.backend_config("gpt").and_then(|b| b.model_tunables("gpt-5.6-terra")).cloned().expect("the model's row");
+        assert_eq!(t.max_tokens, None, "a cleared value is unset, not defaulted");
         assert_eq!(t.effort.as_deref(), Some("high"), "other fields stay");
         assert_eq!(registry.context_window_for("gpt", "gpt-5.6-terra"), Some(400_000));
         drop(registry);
@@ -1189,48 +1040,6 @@ mod tests {
         {
             KjResult::Err(msg) => assert!(msg.contains("positive"), "{msg}"),
             other => panic!("a zero window is a typo, not a small window: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn default_set_range_checks_loudly_and_never_clamps() {
-        let d = seeded().await;
-        let c = test_caller();
-        match d
-            .dispatch(&argv(&["backend", "default", "set", "--temperature", "3.5"]), &c)
-            .await
-        {
-            KjResult::Err(msg) => assert!(msg.contains("0.0..=2.0"), "{msg}"),
-            other => panic!("out-of-range temperature must fail, not clamp: {other:?}"),
-        }
-        // The stored value is untouched by the rejected write.
-        let db = d.kernel_db().lock();
-        assert_eq!(db.get_llm_defaults().unwrap().unwrap().temperature, None);
-    }
-
-    #[tokio::test]
-    async fn default_set_merges_rather_than_clearing() {
-        let d = seeded().await;
-        let c = test_caller();
-        d.dispatch(&argv(&["backend", "default", "set", "--temperature", "0.7"]), &c)
-            .await;
-        let db = d.kernel_db().lock();
-        let row = db.get_llm_defaults().unwrap().unwrap();
-        assert_eq!(row.temperature, Some(0.7));
-        assert_eq!(row.default_backend, "deepseek", "identity survives a knob-only set");
-        assert_eq!(row.max_tokens, Some(16384));
-    }
-
-    #[tokio::test]
-    async fn default_set_refuses_a_backend_that_does_not_exist() {
-        let d = seeded().await;
-        let c = test_caller();
-        match d
-            .dispatch(&argv(&["backend", "default", "set", "--backend", "nope"]), &c)
-            .await
-        {
-            KjResult::Err(msg) => assert!(msg.contains("does not exist"), "{msg}"),
-            other => panic!("a dangling default must be refused at write time: {other:?}"),
         }
     }
 

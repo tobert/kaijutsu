@@ -192,6 +192,8 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
 
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
+    let cast = home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]);
+    assert!(cast.status.success(), "{}", stderr(&cast));
 
     let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
     assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
@@ -229,6 +231,7 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     ]).to_string()).unwrap();
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
+    assert!(home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]).status.success());
     let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
     assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 

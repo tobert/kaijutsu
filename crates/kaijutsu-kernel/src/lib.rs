@@ -123,7 +123,6 @@ pub use llm::{
     Message as LlmMessage,
     ModelAlias,
     ModelInfo,
-    ResolvedSlot,
     ResponseBlock,
     SlotTunables,
     // Provider dispatch (replaces rig-shaped RigProvider/RigStreamAdapter)
@@ -153,7 +152,7 @@ pub use llm::{
     build_llm_registry,
     load_embedding_config,
 };
-pub use model_resolution::{ModelSource, ResolvedContextModel, resolve_context_model};
+pub use model_resolution::{ContextModel, ContextModelLookup, NoModel, RoleSlot, context_model, role_slot};
 pub use execution::{ExecContext, ExecResult};
 pub use vfs::{
     ActivityCursor, ActivityDigest, DirEntry, FileAttr, FileType, MountTable, SHARE_OP_TIMEOUT,

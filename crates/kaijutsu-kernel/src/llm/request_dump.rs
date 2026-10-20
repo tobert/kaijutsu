@@ -517,7 +517,7 @@ mod tests {
         use crate::llm::stream::BuildOpts;
         let field = std::mem::size_of::<Option<Arc<RequestTrace>>>();
         assert_eq!(field, std::mem::size_of::<usize>());
-        let opts: BuildOpts = BuildOpts::new("m");
+        let opts: BuildOpts = BuildOpts::new("m", 4096);
         assert_eq!(std::mem::size_of_val(&opts.trace), field);
     }
 

@@ -1,7 +1,7 @@
 //! LLM backend configuration — the in-memory shapes the DB rows resolve into.
 //!
 //! Model configuration is **SQL-native**: `backends` / `backend_models` /
-//! `llm_defaults` / `casts` / `cast_slots` / `model_aliases` /
+//! `casts` / `cast_slots` / `model_aliases` /
 //! `embedding_config` in `kernel_db.rs` are the source of truth. There is no
 //! TOML anywhere in this path (`models.toml` was demolished, along with the
 //! config document that carried it). These types are what a row *becomes* once read,
@@ -160,8 +160,8 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<String>,
 
-    /// This model's own tunables on this backend. They apply between a cast
-    /// slot and the `llm_defaults` floor; an unset field takes the floor.
+    /// This model's own tunables on this backend. A binding copies one into
+    /// each slot that leaves the parameter unset, when the binding is written.
     #[serde(default)]
     pub tunables: SlotTunables,
 }
@@ -268,7 +268,7 @@ impl BackendConfig {
     ///
     /// Never guesses: a model absent from `models`, and a model present but
     /// with `context_window: None`, both resolve to `None`. Callers (e.g.
-    /// `kj model`) must render that as an explicit "unknown" — never
+    /// `kj models`) must render that as an explicit "unknown" — never
     /// substitute a default, because a fabricated denominator produces a
     /// confidently wrong percentage.
     pub fn context_window(&self, model: &str) -> Option<u64> {
@@ -380,12 +380,11 @@ pub struct ModelAlias {
     pub model: String,
 }
 
-/// The request knobs a turn resolves field by field: a cast slot, then the
-/// model's `backend_models` row, then the `llm_defaults` floor
-/// (`LlmRegistry::model_tunables`; cast slots resolve in `db_config`).
+/// The request parameters of a model: a `backend_models` row's, a cast
+/// slot's, or a binding slot's.
 ///
-/// `None` at every level means "provider default", which is a real answer, not
-/// a missing one — we do not invent numbers we have not decided on.
+/// `None` means the request omits the parameter, which is a real answer, not
+/// a missing one: kaijutsu supplies no value of its own.
 ///
 /// `stream::apply_tunables` copies the resolved values onto a `BuildOpts`,
 /// and each provider's `build()` maps them to its wire (Claude:
@@ -402,42 +401,6 @@ pub struct SlotTunables {
     pub effort: Option<String>,
     pub thinking_budget: Option<u64>,
     pub thinking_style: Option<String>,
-}
-
-impl SlotTunables {
-    /// Overlay `self` (the slot) onto `floor` (the `llm_defaults` row): any
-    /// field the slot left `None` takes the floor's value. A slot that sets a
-    /// field wins even when the floor also sets it.
-    pub fn over(&self, floor: &SlotTunables) -> SlotTunables {
-        SlotTunables {
-            max_tokens: self.max_tokens.or(floor.max_tokens),
-            temperature: self.temperature.or(floor.temperature),
-            top_p: self.top_p.or(floor.top_p),
-            effort: self.effort.clone().or_else(|| floor.effort.clone()),
-            thinking_budget: self.thinking_budget.or(floor.thinking_budget),
-            thinking_style: self
-                .thinking_style
-                .clone()
-                .or_else(|| floor.thinking_style.clone()),
-        }
-    }
-}
-
-/// One cast slot with the defaults cascade already applied — what a consumer
-/// asks the registry for and hands to a turn.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedSlot {
-    /// The `context_type` this seat is for (coder, musician, mcp, …).
-    pub role: String,
-    /// Backend NAME.
-    pub backend: String,
-    pub model: String,
-    /// Slot tunables with `llm_defaults` filled in underneath.
-    pub tunables: SlotTunables,
-    /// Future capability/loadout reference. Stored, no consumer yet.
-    pub loadout: Option<String>,
-    /// Sparse slot-specific JSON.
-    pub extra: Option<String>,
 }
 
 /// Configuration for the HTTP embedding service (`embedding_config` singleton).
@@ -625,35 +588,5 @@ mod tests {
             .with_api_key_file(path.to_str().unwrap())
             .with_api_key_env("DEFINITELY_UNSET_KEY_VAR_XYZ");
         assert_eq!(config.resolve_api_key(), None);
-    }
-
-    #[test]
-    fn tunables_cascade_slot_over_defaults() {
-        let floor = SlotTunables {
-            max_tokens: Some(16384),
-            temperature: Some(0.5),
-            top_p: None,
-            effort: Some("low".into()),
-            thinking_budget: None,
-            thinking_style: None,
-        };
-        let slot = SlotTunables {
-            max_tokens: None,
-            temperature: Some(1.0),
-            top_p: Some(0.9),
-            effort: None,
-            thinking_budget: Some(4096),
-            thinking_style: None,
-        };
-        let resolved = slot.over(&floor);
-        assert_eq!(resolved.max_tokens, Some(16384), "unset slot knob takes the floor");
-        assert_eq!(resolved.temperature, Some(1.0), "set slot knob wins");
-        assert_eq!(resolved.top_p, Some(0.9), "slot-only knob survives");
-        assert_eq!(resolved.effort.as_deref(), Some("low"), "floor-only knob survives");
-        assert_eq!(resolved.thinking_budget, Some(4096));
-        assert_eq!(
-            resolved.thinking_style, None,
-            "unset on both sides stays None — 'provider default' is a real answer"
-        );
     }
 }

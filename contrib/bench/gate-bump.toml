@@ -17,7 +17,6 @@ uncovered = "ask"
 
 [council]
 mode = "bump-only"
-server = "http://zorak:8090"
 contexts = ["council-system"]
 pool = { method = "loglinear", weights = "mass" }
 # Exploration values from the Sonnet benchmark runs: a 3000 ms deadline

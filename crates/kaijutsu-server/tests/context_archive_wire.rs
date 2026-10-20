@@ -43,7 +43,7 @@ fn archived_submission(path: &'static str) {
             "structured" => kj.execute_kj(target, &["context".into(), "current".into()]).await.map(|_| ()),
             "quiet" => kj.execute_kj_quiet(target, &["context".into(), "current".into()]).await.map(|_| ()),
             "streaming" => kj.execute("echo must-not-run").await.map(|_| ()),
-            "prompt" => kj.prompt("must not become a user block", None, target).await.map(|_| ()),
+            "prompt" => kj.prompt("must not become a user block", target).await.map(|_| ()),
             "chat-draft" => kj.submit_input(target, false).await.map(|_| ()),
             "shell-draft" => kj.submit_input(target, true).await.map(|_| ()),
             _ => unreachable!(),

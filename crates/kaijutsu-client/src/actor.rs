@@ -85,7 +85,7 @@ const CONTEXT_FEED_QUEUE: usize = 256;
 
 use crate::rpc::{
     Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
-    KernelInfo, LlmConfigInfo, McpResource, PeerInfo, ShellValue, SimilarContext,
+    KernelInfo, McpResource, PeerInfo, ShellValue, SimilarContext,
     StagedDriftInfo, SubmitResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
@@ -670,31 +670,12 @@ enum RpcCommand {
     // ── LLM ──────────────────────────────────────────────────────────────
     Prompt {
         content: String,
-        model: Option<String>,
         context_id: ContextId,
         reply: oneshot::Sender<Result<String, CallError>>,
-    },
-    ConfigureLlm {
-        context_id: ContextId,
-        provider: String,
-        model: String,
-        reply: oneshot::Sender<Result<bool, CallError>>,
-    },
-    GetLlmConfig {
-        reply: oneshot::Sender<Result<LlmConfigInfo, CallError>>,
     },
     GetConfig {
         path: String,
         reply: oneshot::Sender<Result<String, CallError>>,
-    },
-    SetDefaultProvider {
-        provider: String,
-        reply: oneshot::Sender<Result<bool, CallError>>,
-    },
-    SetDefaultModel {
-        provider: String,
-        model: String,
-        reply: oneshot::Sender<Result<bool, CallError>>,
     },
 
     // ── Timeline ─────────────────────────────────────────────────────────
@@ -863,11 +844,7 @@ impl RpcCommand {
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ConfigureLlm { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::GetLlmConfig { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetConfig { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::SetDefaultProvider { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::SetDefaultModel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CherryPickBlock { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInfo { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1889,62 +1866,20 @@ impl ActorHandle {
     pub async fn prompt(
         &self,
         content: &str,
-        model: Option<&str>,
         context_id: ContextId,
     ) -> Result<String, CallError> {
         self.send(|reply| RpcCommand::Prompt {
             content: content.into(),
-            model: model.map(String::from),
             context_id,
             reply,
         })
         .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn set_context_model(
-        &self,
-        context_id: ContextId,
-        provider: &str,
-        model: &str,
-    ) -> Result<bool, CallError> {
-        self.send(|reply| RpcCommand::ConfigureLlm {
-            context_id,
-            provider: provider.into(),
-            model: model.into(),
-            reply,
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, CallError> {
-        self.send(|reply| RpcCommand::GetLlmConfig { reply }).await
     }
 
     /// Read a kernel-owned config file's content (e.g. `theme.toml`) over RPC.
     #[tracing::instrument(skip(self))]
     pub async fn get_config(&self, path: String) -> Result<String, CallError> {
         self.send(|reply| RpcCommand::GetConfig { path, reply }).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn set_default_provider(&self, provider: &str) -> Result<bool, CallError> {
-        self.send(|reply| RpcCommand::SetDefaultProvider {
-            provider: provider.into(),
-            reply,
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn set_default_model(&self, provider: &str, model: &str) -> Result<bool, CallError> {
-        self.send(|reply| RpcCommand::SetDefaultModel {
-            provider: provider.into(),
-            model: model.into(),
-            reply,
-        })
-        .await
     }
 
     // ── Timeline ─────────────────────────────────────────────────────────
@@ -3966,35 +3901,15 @@ async fn dispatch_kernel_command(
 
         // ── LLM ──
         RpcCommand::Prompt {
-            content, model, context_id, reply,
+            content, context_id, reply,
         } => {
             dispatch!(
                 kernel, reply, close_tx, k,
-                k.prompt(&content, model.as_deref(), context_id)
+                k.prompt(&content, context_id)
             );
-        }
-        RpcCommand::ConfigureLlm {
-            context_id, provider, model, reply,
-        } => {
-            dispatch!(
-                kernel, reply, close_tx, k,
-                k.set_context_model(context_id, &provider, &model)
-            );
-        }
-        RpcCommand::GetLlmConfig { reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.get_llm_config());
         }
         RpcCommand::GetConfig { path, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_config(&path));
-        }
-        RpcCommand::SetDefaultProvider { provider, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.set_default_provider(&provider));
-        }
-        RpcCommand::SetDefaultModel { provider, model, reply } => {
-            dispatch!(
-                kernel, reply, close_tx, k,
-                k.set_default_model(&provider, &model)
-            );
         }
 
         // ── Timeline ──

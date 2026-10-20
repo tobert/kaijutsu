@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{bail, Context, Result};
 use russh::keys::{PrivateKey, ssh_key};
 
-use kaijutsu_kernel::kernel_db::{BackendModelRow, BackendRow, CharacterRow, KernelDb, LlmDefaultsRow, ModelTunablesRow};
+use kaijutsu_kernel::kernel_db::{BackendModelRow, BackendRow, CastRow, CastSlotRow, CharacterRow, KernelDb, ModelTunablesRow};
 use kaijutsu_server::AuthDb;
-use kaijutsu_types::{BackendId, PrincipalId};
+use kaijutsu_types::{BackendId, CastId, PrincipalId};
 
 use crate::provider::ModelChoice;
 
@@ -210,9 +210,16 @@ pub fn ensure_client_key(path: &Path) -> Result<PrivateKey> {
     Ok(key)
 }
 
-/// The defaults' output budget a solo kernel writes, for a model whose row
-/// sets none.
-const SOLO_MAX_TOKENS: i64 = 16384;
+/// The label of the cast a solo kernel writes for its performer.
+const SOLO_CAST: &str = "solo";
+
+/// The council server the gate decides on: an `mk` backend's address and the
+/// model it serves, written as the cast's `gate` slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilGate {
+    pub server: String,
+    pub model: String,
+}
 
 /// Write the identity and model rows a first turn needs, before the kernel
 /// opens the same database.
@@ -224,22 +231,27 @@ const SOLO_MAX_TOKENS: i64 = 16384;
 ///   (`docs/approval-identity.md`), so these are two characters, never one.
 /// - A kernel ships no backends, so this writes the chosen backend row, the
 ///   chosen model's row when [`crate::provider::known_model`] knows it, and
-///   the defaults. A row a reused state directory already holds stands,
-///   except that `choice.replace_backend_row` replaces the backend row.
+///   a `solo` cast whose `context_type` slot runs the chosen model, which
+///   becomes the performer's cast. A character instance binds the cast's
+///   slots, so a session's context runs the chosen model. A row a reused
+///   state directory already holds stands, except that
+///   `choice.replace_backend_row` replaces the backend row.
 /// - `choice.idle_timeout_secs` and `request_timeout_secs`, when given, land
 ///   on the backend row, written or existing.
 /// - `max_tokens`, when given, is the output budget of every turn: it lands
-///   on the chosen model's own `backend_models` row, which outranks the
-///   defaults, keeping the row's window and other tunables. Left `None`, the
-///   model's own budget stands (DeepSeek's rows carry 65536), or the
-///   defaults' 16384 for a model with no budget of its own.
+///   on the chosen model's own `backend_models` row, keeping the row's window
+///   and other tunables. Left `None`, the model's own budget stands
+///   (DeepSeek's rows carry 65536). A model whose row has no budget refuses
+///   until `--max-tokens` names one: every request carries `max_tokens`.
 pub fn prepare_rows(
     state: &SoloState,
     root_character: &str,
     performer: &str,
+    context_type: &str,
     key: &PrivateKey,
     choice: &ModelChoice,
     max_tokens: Option<i64>,
+    council: Option<&CouncilGate>,
 ) -> Result<()> {
     let db = KernelDb::open(state.kernel_db_path())
         .with_context(|| format!("open {}", state.kernel_db_path().display()))?;
@@ -315,26 +327,6 @@ pub fn prepare_rows(
         }
     }
 
-    let defaults = match db.get_llm_defaults().context("read the model defaults")? {
-        Some(existing) => LlmDefaultsRow {
-            default_backend: choice.backend.clone(),
-            default_model: choice.model.clone(),
-            ..existing
-        },
-        None => LlmDefaultsRow {
-            default_backend: choice.backend.clone(),
-            default_model: choice.model.clone(),
-            max_tokens: Some(SOLO_MAX_TOKENS),
-            temperature: None,
-            top_p: None,
-            effort: None,
-            thinking_budget: None,
-            thinking_style: None,
-        },
-    };
-    db.set_llm_defaults(&defaults)
-        .context("point the model defaults at the chosen provider")?;
-
     if let Some(max_tokens) = max_tokens {
         let mut row = db
             .list_backend_models(backend.backend_id)
@@ -353,22 +345,104 @@ pub fn prepare_rows(
             .with_context(|| format!("set the output budget of {}/{}", choice.backend, choice.model))?;
     }
 
-    if db
+    let budget = db
+        .list_backend_models(backend.backend_id)
+        .with_context(|| format!("read the {} model rows", choice.backend))?
+        .into_iter()
+        .find(|r| r.model_id == choice.model)
+        .and_then(|r| r.tunables.max_tokens);
+    if budget.is_none() {
+        bail!(
+            "{}/{} has no output budget: every request carries max_tokens, so pass --max-tokens N",
+            choice.backend, choice.model
+        );
+    }
+
+    let performer_id = match db
         .get_character_by_name(performer)
         .with_context(|| format!("read the character {performer}"))?
-        .is_none()
     {
-        db.insert_character(&CharacterRow {
-            principal_id: PrincipalId::new(),
-            name: performer.to_string(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            retired_at: None,
-            handoff_ctx: None,
-            root_ctx: None,
-            root: false,
+        Some(existing) => existing.principal_id,
+        None => {
+            let principal_id = PrincipalId::new();
+            db.insert_character(&CharacterRow {
+                principal_id,
+                name: performer.to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .with_context(|| format!("create the character {performer}"))?;
+            principal_id
+        }
+    };
+
+    let cast = match db.get_cast_by_label(SOLO_CAST).with_context(|| format!("read the {SOLO_CAST} cast"))? {
+        Some(cast) => cast,
+        None => {
+            let cast = CastRow {
+                cast_id: CastId::new(),
+                label: SOLO_CAST.to_string(),
+                description: Some("the model a solo kernel's sessions run".to_string()),
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: PrincipalId::system(),
+            };
+            db.insert_cast(&cast).with_context(|| format!("create the {SOLO_CAST} cast"))?;
+            cast
+        }
+    };
+    db.set_cast_slot(&CastSlotRow {
+        cast_id: cast.cast_id,
+        role: context_type.to_string(),
+        backend_id: backend.backend_id,
+        model: choice.model.clone(),
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+        loadout: None,
+        extra: None,
+    })
+    .with_context(|| format!("give the {SOLO_CAST} cast a {context_type} slot on {}/{}", choice.backend, choice.model))?;
+    if let Some(council) = council {
+        let council_backend = db
+            .upsert_backend(&BackendRow {
+                backend_id: db.get_backend_by_name("council")?.map_or_else(BackendId::new, |row| row.backend_id),
+                name: "council".to_string(),
+                kind: "mk".to_string(),
+                base_url: Some(council.server.clone()),
+                api_key_env: None,
+                api_key_file: None,
+                key_optional: true,
+                request_timeout_secs: None,
+                idle_timeout_secs: None,
+                max_concurrent: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: PrincipalId::system(),
+            })
+            .context("write the council backend row")?;
+        db.set_cast_slot(&CastSlotRow {
+            cast_id: cast.cast_id,
+            role: "gate".to_string(),
+            backend_id: council_backend.backend_id,
+            model: council.model.clone(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+            loadout: None,
+            extra: None,
         })
-        .with_context(|| format!("create the character {performer}"))?;
+        .context("give the cast a gate slot on the council server")?;
     }
+    db.set_character_default_cast(performer_id, Some(cast.cast_id))
+        .with_context(|| format!("point {performer} at the {SOLO_CAST} cast"))?;
 
     Ok(())
 }
@@ -602,7 +676,7 @@ mod tests {
     fn a_max_tokens_override_lands_on_the_chosen_models_row() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
-        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), Some(4096))
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &deepseek_choice(), Some(4096), None)
             .expect("prepare rows with an override");
 
         let row = chosen_row(&state);
@@ -615,7 +689,7 @@ mod tests {
     fn without_an_override_the_models_own_budget_stands() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
-        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None)
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &deepseek_choice(), None, None)
             .expect("prepare rows with no override");
         // DeepSeek's model rows carry 65536 at effort high
         // (`provider::DEEPSEEK_V4`), documented in docs/solo-acp.md.
@@ -623,12 +697,13 @@ mod tests {
     }
 
     /// A kernel ships no backends, so a new state directory holds exactly the
-    /// chosen backend, with its key sources, and defaults that name it.
+    /// chosen backend, with its key sources, and a cast that runs the chosen
+    /// model for the context type, which the performer plays.
     #[test]
     fn a_new_state_directory_gets_only_the_chosen_backend() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
-        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None).expect("prepare rows");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &deepseek_choice(), None, None).expect("prepare rows");
 
         let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
         let backends = db.list_backends().expect("list backends");
@@ -637,9 +712,16 @@ mod tests {
         assert_eq!(backends[0].kind, "deepseek");
         assert_eq!(backends[0].api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
         assert_eq!(backends[0].api_key_file.as_deref(), Some("~/.deepseek-key"));
-        let defaults = db.get_llm_defaults().expect("read defaults").expect("defaults written");
-        assert_eq!((defaults.default_backend.as_str(), defaults.default_model.as_str()), ("deepseek", "deepseek-flash"));
-        assert_eq!(defaults.max_tokens, Some(16384));
+        let cast = db.get_cast_by_label("solo").expect("read the cast").expect("the solo cast");
+        let slot = db.get_cast_slot(cast.cast_id, "coder").expect("read the slot").expect("a coder slot");
+        assert_eq!(slot.model, "deepseek-flash");
+        assert_eq!(slot.backend_id, db.get_backend_by_name("deepseek").unwrap().unwrap().backend_id);
+        let performer = db.get_character_by_name("solo-coder").unwrap().expect("the performer");
+        assert_eq!(
+            db.character_default_cast(performer.principal_id).unwrap().map(|c| c.label).as_deref(),
+            Some("solo"),
+            "the performer plays the solo cast"
+        );
     }
 
     /// A reused state directory keeps an edit made to its backend row unless
@@ -648,21 +730,21 @@ mod tests {
     fn a_reused_state_directory_keeps_its_backend_row_unless_a_flag_replaces_it() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
-        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None).expect("first start");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &deepseek_choice(), None, None).expect("first start");
         {
             let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
             let mut row = db.get_backend_by_name("deepseek").unwrap().unwrap();
             row.base_url = Some("https://gateway.example/v1".to_string());
             db.upsert_backend(&row).unwrap();
         }
-        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None).expect("second start");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &deepseek_choice(), None, None).expect("second start");
         let base_url = |state: &SoloState| {
             KernelDb::open(state.kernel_db_path()).unwrap().get_backend_by_name("deepseek").unwrap().unwrap().base_url
         };
         assert_eq!(base_url(&state).as_deref(), Some("https://gateway.example/v1"), "the edit stands");
 
         let choice = ModelChoice { replace_backend_row: true, ..deepseek_choice() };
-        prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("third start");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &choice, None, None).expect("third start");
         assert_eq!(base_url(&state), None, "a flag of its own replaces the row");
     }
 
@@ -675,7 +757,7 @@ mod tests {
             request_timeout_secs: Some(3600),
             ..deepseek_choice()
         };
-        prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("prepare rows");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &choice, None, None).expect("prepare rows");
 
         let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
         let row = db
@@ -703,7 +785,7 @@ mod tests {
             idle_timeout_secs: Some(1800),
             request_timeout_secs: Some(2400),
         };
-        prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("prepare rows");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &choice, Some(4096), None).expect("prepare rows");
 
         let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
         let row = db.get_backend_by_name("gpt").expect("read").expect("row written");
@@ -711,6 +793,47 @@ mod tests {
         assert_eq!(row.request_timeout_secs, Some(2400));
         assert!(row.key_optional);
         assert_eq!(row.api_key_env, None);
+    }
+
+    /// `--council-server` writes the cast's `gate` slot on an `mk` backend at
+    /// that address, so the performer's instance decides on it.
+    ///
+    /// Falsified by writing the slot on any other backend kind.
+    #[test]
+    fn a_council_server_becomes_the_casts_gate_slot() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        let council = CouncilGate { server: "http://127.0.0.1:9".into(), model: "fleet-council".into() };
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &deepseek_choice(), None, Some(&council)).expect("prepare rows");
+
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let cast = db.get_cast_by_label("solo").unwrap().unwrap();
+        let slot = db.get_cast_slot(cast.cast_id, "gate").unwrap().expect("a gate slot");
+        assert_eq!(slot.model, "fleet-council");
+        let backend = db.get_backend_by_name("council").unwrap().unwrap();
+        assert_eq!((backend.kind.as_str(), backend.base_url.as_deref()), ("mk", Some("http://127.0.0.1:9")));
+        assert_eq!(slot.backend_id, backend.backend_id);
+
+        let (_parent, bare) = named_state();
+        let key = ensure_client_key(&bare.client_key_path()).unwrap();
+        prepare_rows(&bare, "solo", "solo-coder", "coder", &key, &deepseek_choice(), None, None).unwrap();
+        let db = KernelDb::open(bare.kernel_db_path()).unwrap();
+        let cast = db.get_cast_by_label("solo").unwrap().unwrap();
+        assert!(db.get_cast_slot(cast.cast_id, "gate").unwrap().is_none(), "no flag, no council");
+    }
+
+    /// Every request carries max_tokens and kaijutsu supplies none, so a model
+    /// whose row sets no output budget refuses until `--max-tokens` names one.
+    ///
+    /// Falsified by writing a default budget when the row has none.
+    #[test]
+    fn a_model_with_no_output_budget_refuses_naming_the_flag() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        let choice = ModelChoice { model: "claude-sonnet-5-5".to_string(), backend: "anthropic".to_string(), kind: "anthropic".to_string(), ..deepseek_choice() };
+        let err = prepare_rows(&state, "solo", "solo-coder", "coder", &key, &choice, None, None).unwrap_err();
+        assert!(err.to_string().contains("--max-tokens"), "{err}");
+        prepare_rows(&state, "solo", "solo-coder", "coder", &key, &choice, Some(8000), None).expect("named budget");
     }
 
     #[test]

@@ -44,7 +44,7 @@ kj drift merge
 ## Commands
 
 ```
-alias           list, set, remove — short --model handles → backend/model
+alias           list, set, remove — short model handles → backend/model
                 (the kernel ships none; they're yours to define)
 attach          Attach to an existing context and run its rc attach lifecycle
                 (distinct from `transport attach`, which attaches to a beat track)
@@ -53,13 +53,13 @@ audio           devices, keep, keep-status, keep-retry, keep-cancel, beats —
                 recent MIDI in daemon RAM and upload it to CAS (keep), then
                 poll/retry/cancel that job; beats is offline audio analysis
                 (beat/downbeat tracking via beat-this)
-backend         list, show, set, remove, model set|remove, default show|set —
-                SQL-native LLM endpoints (`kernel_db`'s `backends`/`backend_models`/
-                `llm_defaults` tables, no TOML, no host file to edit): a
-                free-form `name` plus a closed `kind` (anthropic | deepseek |
-                openai | codex-app | mk), their context windows, and the
-                kernel-wide defaults. A new kernel has none: `kj backend set`
-                adds one and `kj backend default set` makes it the default.
+backend         list, show, set, remove, model set|remove —
+                SQL-native LLM endpoints (`kernel_db`'s `backends`/`backend_models`
+                tables, no TOML, no host file to edit): a free-form `name` plus
+                a closed `kind` (anthropic | deepseek | openai | codex-app | mk),
+                and each model's context window and parameters. A new kernel has
+                none: `kj backend set` adds one and `kj cast slot set` gives a
+                cast a model on it. There is no default backend or model.
                 No key material is ever stored — only an env-var name or a
                 file path.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
@@ -76,9 +76,11 @@ block           list, inspect, count, read, render, cat, original, reproject,
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
 cast            list, show, create, remove, set, slot set|remove — named model
-                ensembles (role → backend/model + tunables); role is a
-                context_type; `set --desc` edits the description after create
-                ("" clears it to NULL)
+                ensembles (role → backend/model + parameters); a role is a
+                context_type, or `gate`, `judge` or `distill`; a character's
+                cast is copied into each instance's binding when the instance
+                starts or rotates; `set --desc` edits the description after
+                create ("" clears it to NULL)
 cc              list — roster of live Claude Code sessions on this machine,
                 read from ~/.claude/sessions/*.json (never reads *.key files);
                 send — deliver a message into a live session's inbox, gated
@@ -111,9 +113,10 @@ diff            <a> [<b>] — unified diff as a typed block: one path diffs disk
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
 drift           push, pull, merge, flush, queue, cancel, history, edge rm
 drive           Clock one autonomous turn on a context (--prompt)
-fork            Fork current context (--name, --prompt, --preset, --model,
+fork            Fork current context (--name, --prompt, --preset,
                 --include/--exclude ranges, --compact, --stage, --switch); the
-                child joins the forking context's character instance
+                child joins the forking context's character instance, and
+                `--compact` summarizes on that instance's `distill` slot
 handoff         note [--for <character>], tail [--window] — a character's
                 handoff log (an ordinary context); note is authored by the
                 caller even when writing into someone else's log
@@ -159,11 +162,10 @@ midi            list, show, send note|cc|pc|sysex, identify, panic — device
                 answer at /run/midi/<device>
 kohai           create, list — start a character instance, with a new
                 conversation, that answers to this one (--as is required;
-                --senpai, --parent, --type, --cast, --cwd, --env), and list an
+                --senpai, --parent, --type, --cwd, --env), and list an
                 instance's live kohai with character and type; a verb that
                 takes an instance accepts any of its contexts
-model           Show a context's effective model and its tunables (--context <ref>)
-models          List configured providers, their models, and --model aliases
+models          List configured providers, their models, and aliases
 play            Play a sample now (a host path, or --cas <hash> for an object
                 already in the CAS), or commit it as a clip cell onto a track
                 with --track/--at/--label (docs/pcm.md)

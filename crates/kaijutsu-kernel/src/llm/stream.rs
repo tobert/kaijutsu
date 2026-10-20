@@ -345,11 +345,14 @@ pub struct BuildOpts {
 }
 
 impl BuildOpts {
-    pub fn new(model: impl Into<String>) -> Self {
+    /// A request for `model` that may produce `max_tokens` tokens. The caller
+    /// supplies the limit: the binding's slot for a turn, or the slot a
+    /// one-shot prompt runs on.
+    pub fn new(model: impl Into<String>, max_tokens: u64) -> Self {
         Self {
             model: model.into(),
             system: None,
-            max_tokens: 64_000,
+            max_tokens,
             temperature: None,
             top_p: None,
             effort: None,
@@ -412,23 +415,10 @@ impl BuildOpts {
     }
 }
 
-/// Put a turn's resolved tunables on its request. They are already
-/// cascaded: a cast slot over the model's `backend_models` row over the
-/// `llm_defaults` floor (`LlmRegistry::model_tunables`, and the cast-slot
-/// resolution in `db_config`).
-///
-/// `max_tokens` carries different precedence than the other knobs: a set
-/// value overrides whatever `opts.max_tokens` already held, but an unset one
-/// leaves `opts.max_tokens` exactly as the caller built it — never reset to a
-/// hardcoded number — so a provider's own clamp-on-zero fallback
-/// (`ChatRequest::clamp_max_tokens` for DeepSeek/generic OpenAI) still applies
-/// when nothing upstream configured anything. Every other field is set
-/// unconditionally (including back to `None` — an unset tunable is the honest
-/// "provider default" answer, not "leave whatever was there").
+/// Put a binding slot's optional parameters on a request. An unset
+/// parameter stays unset, so the request omits it. `max_tokens` is not a
+/// tunable here: [`BuildOpts::new`] takes it from the caller.
 pub fn apply_tunables(mut opts: BuildOpts, tunables: &SlotTunables) -> BuildOpts {
-    if let Some(max_tokens) = tunables.max_tokens {
-        opts.max_tokens = max_tokens;
-    }
     opts.temperature = tunables.temperature;
     opts.top_p = tunables.top_p;
     opts.effort = tunables.effort.clone();
@@ -688,7 +678,7 @@ mod tests {
 
     #[test]
     fn build_opts_builder() {
-        let opts = BuildOpts::new("claude-haiku-4-5")
+        let opts = BuildOpts::new("claude-haiku-4-5", 4096)
             .with_system("be helpful")
             .with_max_tokens(1024)
             .with_temperature(0.7);
@@ -718,7 +708,7 @@ mod tests {
 
     #[test]
     fn build_opts_new_defaults_new_tunables_to_none() {
-        let opts = BuildOpts::new("m");
+        let opts = BuildOpts::new("m", 4096);
         assert_eq!(opts.top_p, None);
         assert_eq!(opts.effort, None);
         assert_eq!(opts.thinking_budget, None);
@@ -727,7 +717,7 @@ mod tests {
 
     #[test]
     fn build_opts_tunable_builders_set_fields() {
-        let opts = BuildOpts::new("m")
+        let opts = BuildOpts::new("m", 4096)
             .with_top_p(0.9)
             .with_effort("high")
             .with_thinking_budget(4096)
@@ -754,9 +744,9 @@ mod tests {
         }
 
         #[test]
-        fn every_tunable_reaches_the_request() {
-            let opts = apply_tunables(BuildOpts::new("m"), &tunables(Some(8000)));
-            assert_eq!(opts.max_tokens, 8000);
+        fn every_optional_parameter_reaches_the_request() {
+            let opts = apply_tunables(BuildOpts::new("m", 777), &tunables(Some(8000)));
+            assert_eq!(opts.max_tokens, 777, "max_tokens comes from the caller, not the tunables");
             assert_eq!(opts.temperature, Some(0.5));
             assert_eq!(opts.top_p, Some(0.8));
             assert_eq!(opts.effort.as_deref(), Some("low"));
@@ -765,27 +755,16 @@ mod tests {
         }
 
         #[test]
-        fn an_unset_tunable_is_the_provider_default() {
+        fn an_unset_parameter_is_omitted() {
             let opts = apply_tunables(
-                BuildOpts::new("m").with_effort("high"),
+                BuildOpts::new("m", 100).with_effort("high"),
                 &SlotTunables::default(),
             );
             assert_eq!(opts.effort, None, "an unset effort clears what was there");
-        }
-
-        #[test]
-        fn unset_max_tokens_leaves_opts_value_untouched() {
-            let opts = apply_tunables(BuildOpts::new("m").with_max_tokens(12345), &tunables(None));
-            assert_eq!(
-                opts.max_tokens, 12345,
-                "no configured max_tokens anywhere must not reset an already-set value"
-            );
-        }
-
-        #[test]
-        fn set_max_tokens_overrides_existing_opts_value() {
-            let opts = apply_tunables(BuildOpts::new("m").with_max_tokens(12345), &tunables(Some(999)));
-            assert_eq!(opts.max_tokens, 999, "an explicitly configured max_tokens wins");
+            assert_eq!(opts.temperature, None);
+            assert_eq!(opts.top_p, None);
+            assert_eq!(opts.thinking_budget, None);
+            assert_eq!(opts.thinking_style, None);
         }
     }
 }

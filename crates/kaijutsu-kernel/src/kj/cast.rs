@@ -1,12 +1,16 @@
 //! `kj cast` — named model ensembles.
 //!
 //! A **cast** is a team: one slot per *role*, where a role is a
-//! `context_type` (coder, musician, mcp, …). A slot names a backend + model
-//! and may override any of the `llm_defaults` tunables; a NULL knob falls back
-//! to that floor at resolution time (see `llm::SlotTunables::over`).
+//! `context_type` (coder, musician, mcp, …), or `gate`, `judge` or `distill`.
+//! A slot names a backend + model and may set any request parameter. A
+//! parameter the slot leaves unset is read from the model's `backend_models`
+//! row when a character instance's binding is written; after that nothing
+//! reads the cast, so a cast change reaches an instance when it is rotated.
 //!
-//! The `gate` role is not a context type: it names the council server a
-//! seat's gate decisions run on (`docs/council.md`, "Configuration").
+//! The `gate` and `judge` roles are not context types: they name the council
+//! server for gate decisions and for the judge shadow
+//! (`docs/council.md`, "Configuration"). `distill` names the model that
+//! summarizes for `kj fork --compact` and `kj drift pull|merge`.
 //!
 //! Roles are free-form TEXT with **no FK**: context types are an open set
 //! defined by the rc tree, and a cast that names a role nobody has created yet
@@ -14,8 +18,8 @@
 //!
 //! The kernel ships **no factory casts** — an ensemble is an operator/agent
 //! decision, and shipping one would be the kernel guessing at who plays which
-//! seat. The turn path selects a context's cast seat through
-//! `model_resolution::resolve_context_model`.
+//! seat. A turn reads its model from the binding
+//! (`model_resolution::context_model`), never from a cast.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{CastId, ContentType};
@@ -41,7 +45,7 @@ enum CastCommand {
     /// List casts.
     #[command(alias = "ls")]
     List,
-    /// Show one cast and its slots, with the defaults cascade applied.
+    /// Show one cast and its slots.
     Show {
         /// Cast label
         label: String,
@@ -78,12 +82,14 @@ enum CastCommand {
 
 #[derive(Subcommand, Debug)]
 enum CastSlotCommand {
-    /// Create or replace one role's seat.
+    /// Create or replace one role's slot.
     Set {
         /// Cast label
         cast: String,
-        /// Role — a context_type (coder, musician, mcp, …), or `gate` for the
-        /// council server (an mk backend) the gate decides a seat's calls on
+        /// Role: a context_type (coder, musician, mcp, …); `gate` or `judge`
+        /// for the council server (an mk backend) of the gate or the judge
+        /// shadow; or `distill` for the model that summarizes for `kj fork
+        /// --compact` and `kj drift pull|merge`
         role: String,
         /// Backend name
         #[arg(long)]
@@ -91,7 +97,9 @@ enum CastSlotCommand {
         /// Model id
         #[arg(long)]
         model: String,
-        /// Maximum RESPONSE tokens (omit to inherit the defaults floor)
+        /// Maximum RESPONSE tokens. Omit to read it from the model's
+        /// `kj backend model set` row when an instance is bound; a binding
+        /// refuses a model request role with neither
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -116,7 +124,7 @@ enum CastSlotCommand {
         #[arg(long)]
         extra: Option<String>,
     },
-    /// Remove one role's seat.
+    /// Remove one role's slot.
     #[command(alias = "rm")]
     Remove {
         /// Cast label
@@ -161,14 +169,6 @@ impl KjDispatcher {
             CastCommand::Slot(cmd) => self.cast_slot(cmd),
         };
 
-        if mutating
-            && matches!(result, KjResult::Ok { .. })
-            && let Err(e) = self.reload_llm_registry().await
-        {
-            return KjResult::Err(format!(
-                "kj cast: write landed but the LLM registry failed to reload: {e}"
-            ));
-        }
         result
     }
 
@@ -255,11 +255,11 @@ impl KjDispatcher {
             if let Some(v) = &s.thinking_style {
                 knobs.push(format!("thinking_style={v}"));
             }
-            // Only overrides are shown; everything else inherits the floor,
-            // and printing the inherited value here would read as a per-slot
-            // decision nobody made.
+            // Only the slot's own values are shown; the rest are read from
+            // the model's row when an instance is bound, and printing them
+            // here would read as a per-slot decision nobody made.
             let knob_str = if knobs.is_empty() {
-                " (all tunables inherit llm_defaults)".to_string()
+                " (no parameters set)".to_string()
             } else {
                 format!(" [{}]", knobs.join(", "))
             };
@@ -408,42 +408,38 @@ impl KjDispatcher {
                 }) {
                     Ok(()) => {
                         let mut msg = format!("set {cast}/{role} → {backend}/{model}");
-                        // Write-time inverted-budget check: request-build
-                        // time already refuses an inverted
-                        // thinking_budget/max_tokens pair loudly. This says so
-                        // at write time against the same cascade the turn
-                        // resolves (slot, then the model's row, then
-                        // llm_defaults), so the operator need not wait for a
-                        // live request to fail. Warn, not error — the write
-                        // lands either way, since raising max_tokens on the
-                        // model row or the defaults right after can make it
-                        // valid.
-                        if let Some(tb) = thinking_budget {
-                            let row_max_tokens = db
-                                .list_backend_models(b.backend_id)
-                                .ok()
-                                .and_then(|rows| rows.into_iter().find(|r| r.model_id == model))
-                                .and_then(|r| r.tunables.max_tokens)
-                                .and_then(|v| u64::try_from(v).ok());
-                            let floor_max_tokens = db
-                                .get_llm_defaults()
-                                .ok()
-                                .flatten()
-                                .and_then(|d| d.max_tokens)
-                                .and_then(|v| u64::try_from(v).ok());
-                            let effective_max_tokens = max_tokens
-                                .or(row_max_tokens)
-                                .or(floor_max_tokens)
-                                .unwrap_or(64_000);
-                            if tb >= effective_max_tokens {
-                                msg.push_str(&format!(
-                                    " — WARN: thinking_budget ({tb}) >= effective max_tokens \
-                                     ({effective_max_tokens}) after the slot, model, and \
-                                     defaults cascade; \
-                                     requests on this slot will fail at build time until one is \
-                                     raised or the other lowered"
-                                ));
+                        // Write-time checks against the values a binding
+                        // would copy: the slot's, else the model's row.
+                        // Warn, not error: the write lands either way,
+                        // since pinning `max_tokens` on the model row right
+                        // after can make the slot valid.
+                        let row_max_tokens = db
+                            .list_backend_models(b.backend_id)
+                            .ok()
+                            .and_then(|rows| rows.into_iter().find(|r| r.model_id == model))
+                            .and_then(|r| r.tunables.max_tokens)
+                            .and_then(|v| u64::try_from(v).ok());
+                        let effective_max_tokens = max_tokens.or(row_max_tokens);
+                        match effective_max_tokens {
+                            None if !matches!(role.as_str(), "gate" | "judge") => msg.push_str(&format!(
+                                " — WARN: no max_tokens in the slot or in the model's row, and every \
+                                 request carries max_tokens; binding an instance to this cast will \
+                                 refuse until one is set (`--max-tokens` here, or `kj backend model \
+                                 set {backend} {model} --max-tokens N`)"
+                            )),
+                            Some(effective) => {
+                                if let Some(tb) = thinking_budget
+                                    && tb >= effective
+                                {
+                                    msg.push_str(&format!(
+                                        " — WARN: thinking_budget ({tb}) >= effective max_tokens \
+                                         ({effective}) after the slot and model cascade; requests \
+                                         on this slot will fail at build time until one is \
+                                         raised or the other lowered"
+                                    ));
+                                }
                             }
+                            None => {}
                         }
                         KjResult::ok(msg)
                     }
@@ -528,8 +524,12 @@ mod tests {
         }
     }
 
+    /// A slot write lands in the cast and invents no value: a parameter the
+    /// slot leaves unset stays unset until an instance is bound.
+    ///
+    /// Falsified by a slot write that fills `max_tokens` itself.
     #[tokio::test]
-    async fn create_slot_set_then_the_registry_resolves_it_live() {
+    async fn slot_set_writes_the_slot_and_fills_nothing_in() {
         let d = seeded().await;
         let c = test_caller();
         d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
@@ -544,18 +544,35 @@ mod tests {
             .await;
         assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
 
-        let registry = d.kernel().llm().read().await;
-        let slot = registry.resolved_slot("house", "coder").expect("live after write");
-        assert_eq!(slot.backend, "anthropic");
+        let db = d.kernel_db().lock();
+        let cast = db.get_cast_by_label("house").unwrap().unwrap();
+        let slot = db.get_cast_slot(cast.cast_id, "coder").unwrap().expect("written");
         assert_eq!(slot.model, "claude-opus-5");
-        assert_eq!(slot.tunables.temperature, Some(0.3));
-        assert_eq!(
-            slot.tunables.max_tokens,
-            Some(16384),
-            "an unset slot knob inherits the llm_defaults floor"
-        );
+        assert_eq!(slot.temperature, Some(0.3));
+        assert_eq!(slot.max_tokens, None, "an unset slot parameter stays unset");
     }
 
+    /// A model request slot with no `max_tokens` in the slot or the model's
+    /// row says at write time that binding it will refuse.
+    #[tokio::test]
+    async fn slot_set_warns_when_no_max_tokens_will_reach_a_binding() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        let set = |role: &'static str, extra: &[&'static str]| {
+            let mut v = vec!["cast", "slot", "set", "house", role, "--backend", "anthropic", "--model", "claude-opus-5"];
+            v.extend_from_slice(extra);
+            argv(&v)
+        };
+        let bare = d.dispatch(&set("coder", &[]), &c).await;
+        assert!(bare.message().contains("WARN") && bare.message().contains("no max_tokens"), "{}", bare.message());
+        assert!(bare.message().contains("kj backend model set anthropic claude-opus-5"), "{}", bare.message());
+        let sized = d.dispatch(&set("coder", &["--max-tokens", "4096"]), &c).await;
+        assert!(!sized.message().contains("WARN"), "{}", sized.message());
+        // A council role needs no max_tokens.
+        let gate = d.dispatch(&set("gate", &[]), &c).await;
+        assert!(!gate.message().contains("WARN"), "{}", gate.message());
+    }
     #[tokio::test]
     async fn slot_set_refuses_an_unknown_backend_and_an_unknown_cast() {
         let d = seeded().await;
@@ -627,18 +644,13 @@ mod tests {
         }
     }
 
-    /// The write-time inverted-budget WARN (gemini review, the one genuine
-    /// find): a `thinking_budget` that meets or exceeds the EFFECTIVE
-    /// `max_tokens` — here the `llm_defaults` floor, since the slot doesn't
-    /// override it — is only ever caught loudly (an Err) at request-build
-    /// time today (`llm/claude/build.rs::resolve_thinking`). That stays
-    /// exactly as-is; this just says so earlier, in the write's own success
-    /// message, so the operator isn't stuck waiting for a live request to
-    /// fail before learning the slot is already broken. Warn, not error —
-    /// the write must still land (`slot_set_still_lands_despite_the_warning`
-    /// below is the other half of that contract).
+    /// The write-time inverted-budget WARN: a `thinking_budget` that meets or
+    /// exceeds the effective `max_tokens` is only ever caught loudly (an Err)
+    /// at request-build time (`llm/claude/build.rs::resolve_thinking`). That
+    /// stays as it is; this says so earlier, in the write's own success
+    /// message. Warn, not error: the write must still land.
     #[tokio::test]
-    async fn slot_set_warns_when_thinking_budget_meets_or_exceeds_the_effective_floor() {
+    async fn slot_set_warns_when_thinking_budget_meets_or_exceeds_the_slots_max_tokens() {
         let d = seeded().await;
         let c = test_caller();
         d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
@@ -646,7 +658,7 @@ mod tests {
             .dispatch(
                 &argv(&[
                     "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--thinking-budget", "20000",
+                    "claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
                 ]),
                 &c,
             )
@@ -658,18 +670,14 @@ mod tests {
                     "success message must flag the inverted pair: {message}"
                 );
                 assert!(message.contains("20000"), "{message}");
-                assert!(
-                    message.contains("16384"),
-                    "must name the resolved floor, not just the raw knob: {message}"
-                );
+                assert!(message.contains("16384"), "must name the resolved max_tokens, not just the raw knob: {message}");
             }
             other => panic!("the write must still land: {other:?}"),
         }
     }
-
-    /// The check walks the same cascade the turn does: a model row's
-    /// `max_tokens` sits between the slot and the floor, so a budget that
-    /// fits the row is not flagged, and one that overflows a small row is.
+    /// The check walks the same values a binding copies: the model row's
+    /// `max_tokens` stands in for the slot's, so a budget that fits the row is
+    /// not flagged, and one that overflows a small row is.
     #[tokio::test]
     async fn slot_set_checks_the_budget_against_the_model_row() {
         let d = seeded().await;
@@ -691,12 +699,9 @@ mod tests {
             "the row's 8192 cannot hold 12000: {}", overflows.message());
     }
 
-    /// Same check, but against an explicit per-slot `--max-tokens` override
-    /// rather than the `llm_defaults` floor — the resolved pair after the
-    /// cascade is what matters (`SlotTunables::over`: slot wins, else
-    /// floor), not the floor alone.
+    /// Same check against a small per-slot `--max-tokens`.
     #[tokio::test]
-    async fn slot_set_warns_against_its_own_max_tokens_override_not_just_the_floor() {
+    async fn slot_set_warns_against_its_own_small_max_tokens() {
         let d = seeded().await;
         let c = test_caller();
         d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
@@ -721,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn slot_set_still_lands_despite_the_warning() {
-        // Warn, not error: the resolved_slot must show the write took, even
+        // Warn, not error: the slot must show the write took, even
         // though the pair is inverted.
         let d = seeded().await;
         let c = test_caller();
@@ -729,14 +734,15 @@ mod tests {
         d.dispatch(
             &argv(&[
                 "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                "claude-opus-5", "--thinking-budget", "20000",
+                "claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
             ]),
             &c,
         )
         .await;
-        let registry = d.kernel().llm().read().await;
-        let slot = registry.resolved_slot("house", "coder").expect("write must still land");
-        assert_eq!(slot.tunables.thinking_budget, Some(20000));
+        let db = d.kernel_db().lock();
+        let cast = db.get_cast_by_label("house").unwrap().unwrap();
+        let slot = db.get_cast_slot(cast.cast_id, "coder").unwrap().expect("write must still land");
+        assert_eq!(slot.thinking_budget, Some(20000));
     }
 
     #[tokio::test]
@@ -748,7 +754,7 @@ mod tests {
             .dispatch(
                 &argv(&[
                     "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--thinking-budget", "1000",
+                    "claude-opus-5", "--max-tokens", "4096", "--thinking-budget", "1000",
                 ]),
                 &c,
             )
@@ -762,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_a_cast_cascades_its_slots_and_clears_the_registry() {
+    async fn removing_a_cast_cascades_its_slots() {
         let d = seeded().await;
         let c = test_caller();
         d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
@@ -774,9 +780,10 @@ mod tests {
             &c,
         )
         .await;
-        assert!(d.kernel().llm().read().await.resolved_slot("house", "coder").is_some());
+        let cast = d.kernel_db().lock().get_cast_by_label("house").unwrap().unwrap();
+        assert!(d.kernel_db().lock().get_cast_slot(cast.cast_id, "coder").unwrap().is_some());
         d.dispatch(&argv(&["cast", "remove", "house"]), &c).await;
-        assert!(d.kernel().llm().read().await.resolved_slot("house", "coder").is_none());
+        assert!(d.kernel_db().lock().get_cast_slot(cast.cast_id, "coder").unwrap().is_none());
     }
 
     #[tokio::test]

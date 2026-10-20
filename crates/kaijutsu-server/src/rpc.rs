@@ -998,10 +998,10 @@ fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<St
 /// Initialize a kernel's LLM registry from the kernel database.
 ///
 /// Model configuration is SQL-native (`backends` / `backend_models` /
-/// `llm_defaults` / `casts` / `cast_slots` / `model_aliases` /
+/// `casts` / `cast_slots` / `model_aliases` /
 /// `embedding_config`). There is no `models.toml`, no kernel config document, and no
 /// host file in this path. A kernel ships no backends: until an operator runs
-/// `kj backend set` and `kj backend default set`, the registry is empty and a
+/// `kj backend set` and gives a cast a slot on it, the registry is empty and a
 /// model turn fails with how to configure one.
 ///
 /// Returns the embedding config if one is set and enabled.
@@ -1021,8 +1021,7 @@ async fn initialize_kernel_models(
             Err(e) => {
                 log::error!(
                     "Failed to build the LLM registry from the kernel DB: {e}. Model turns \
-                     fail until it builds; fix the rows with `kj backend set` and \
-                     `kj backend default set`"
+                     fail until it builds; fix the rows with `kj backend set`"
                 );
                 return None;
             }
@@ -1036,10 +1035,10 @@ async fn initialize_kernel_models(
         };
         (registry, embedding)
     };
-    if registry.default_provider_name().is_none() {
+    if registry.list().is_empty() {
         log::warn!(
-            "No default LLM backend is set, so model turns fail until an operator runs \
-             `kj backend set` and `kj backend default set`"
+            "No LLM backend is registered, so model turns fail until an operator runs \
+             `kj backend set` and gives a cast a slot on it"
         );
     }
     *kernel.llm().write().await = registry;
@@ -1984,14 +1983,10 @@ pub async fn create_shared_kernel_in(
                 );
                 continue;
             }
-            if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
-                let _ = drift.configure_llm(row.context_id, provider, model);
-            }
             log::debug!(
-                "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
+                "Recovered context {} (label={:?}) from KernelDb",
                 row.context_id.short(),
                 row.label,
-                row.provider,
             );
             recovered += 1;
         }
@@ -2360,6 +2355,7 @@ fn write_context_row_to_handle_info(
     mut info: context_handle_info::Builder<'_>,
     row: &ContextRow,
     cwd: Option<&str>,
+    bound: &kaijutsu_kernel::ContextModelLookup,
 ) {
     info.set_id(row.context_id.as_bytes());
     info.set_label(row.label.as_deref().unwrap_or(""));
@@ -2369,8 +2365,11 @@ fn write_context_row_to_handle_info(
             .unwrap_or([0u8; 16])
             .as_slice(),
     );
-    info.set_provider(row.provider.as_deref().unwrap_or(""));
-    info.set_model(row.model.as_deref().unwrap_or(""));
+    if let kaijutsu_kernel::ContextModelLookup::Model(m) = bound {
+        info.set_provider(&m.backend);
+        info.set_model(&m.model);
+    }
+    info.set_cast_label(bound.cast().unwrap_or(""));
     info.set_created_at(row.created_at as u64);
     info.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
     info.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
@@ -2473,9 +2472,6 @@ async fn ensure_context_joinable(
                     "join_context: failed to heal registry for {context_id}: {e}"
                 ))
             })?;
-        if let (Some(p), Some(m)) = (&row.provider, &row.model) {
-            let _ = drift.configure_llm(context_id, p, m);
-        }
     }
 
     let trace_id = {
@@ -3504,14 +3500,6 @@ impl kernel::Server for KernelImpl {
             context_id,
             content.len()
         );
-        // Note: Cap'n Proto defaults unset Text fields to "", so we filter empty strings
-        let model = request
-            .get_model()
-            .ok()
-            .and_then(|m| m.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
-
         let kernel = self.kernel.clone();
         let (user_principal_id, session_id) = {
             let conn = self.connection.borrow();
@@ -3523,7 +3511,7 @@ impl kernel::Server for KernelImpl {
             async move {
                 kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel, context_id,
                     user_principal_id, session_id,
-                    kaijutsu_kernel::runtime::prompt::PromptSource::Text { content, model })
+                    kaijutsu_kernel::runtime::prompt::PromptSource::Text { content })
                     .await.map_err(capnp::Error::failed)?;
                 results.get().set_prompt_id(&uuid::Uuid::new_v4().to_string());
                 Ok(())
@@ -3574,16 +3562,21 @@ impl kernel::Server for KernelImpl {
                     }
                 };
 
-                // Cast id → label (Track D, 2026-08-03). Resolved ONCE for the
-                // whole listing — never per-row — same convention as
-                // `track_of`/`db_map` above. The wire ships the label, never a
-                // bare CastId, so the app never needs its own cast lookup.
-                let cast_labels: HashMap<kaijutsu_types::CastId, String> = {
+                // Context → the model its binding gives its type, and the cast
+                // the binding was written from. Resolved ONCE for the whole
+                // listing, never per row, from the binding and nothing else.
+                let bound_by_ctx: HashMap<ContextId, kaijutsu_kernel::ContextModelLookup> = {
                     let db = kernel_db_arc.lock();
-                    match db.list_casts() {
-                        Ok(casts) => casts.into_iter().map(|c| (c.cast_id, c.label)).collect(),
-                        Err(_) => HashMap::new(),
+                    let mut bound = HashMap::with_capacity(db_map.len());
+                    for id in db_map.keys() {
+                        match kaijutsu_kernel::context_model(&db, *id) {
+                            Ok(found) => {
+                                bound.insert(*id, found);
+                            }
+                            Err(e) => log::error!("list_contexts: model binding of {} unreadable: {e}", id.short()),
+                        }
                     }
+                    bound
                 };
 
                 // Context → last-call usage snapshot (one query for the whole
@@ -3597,37 +3590,6 @@ impl kernel::Server for KernelImpl {
                         Err(_) => HashMap::new(),
                     }
                 };
-                // Context-window denominator, via the same
-                // `LlmRegistry::context_window_for_live` `kj context info
-                // --json` uses (config wins as an override; a live, cached
-                // Anthropic lookup fills the honest gaps config never had) —
-                // no second, possibly-diverging lookup. Resolved ONCE per
-                // distinct (provider, model) pair, up front — not per row
-                // inside the loop below — because that loop holds a
-                // synchronous `RwLockReadGuard` (`drift.read()`, not the
-                // async kind) across its body; awaiting a live network
-                // lookup while holding that guard would block any writer
-                // for the duration of the call (clippy `await_holding_lock`
-                // caught this). A cache miss here awaits the network once
-                // per unique model; every other row (and every later poll,
-                // once the client's own cache is warm) is a synchronous hit.
-                let window_by_model: HashMap<(String, String), Option<u64>> = {
-                    let llm_registry = kernel_arc.llm().read().await;
-                    let mut resolved = HashMap::new();
-                    for u in usage_map.values() {
-                        let key = (u.provider.clone(), u.model.clone());
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            resolved.entry(key)
-                        {
-                            let window = llm_registry
-                                .context_window_for_live(&u.provider, &u.model)
-                                .await;
-                            e.insert(window);
-                        }
-                    }
-                    resolved
-                };
-
                 // Background-process ambient state — one query for the whole
                 // kernel (same batching convention as usage_map/track_of
                 // above). A context absent from the map has no background
@@ -3635,7 +3597,7 @@ impl kernel::Server for KernelImpl {
                 // that identically to `BackgroundSummary::default()`.
                 let bg_by_ctx = kernel_arc.shell_operations().summary_by_context().map_err(capnp::Error::failed)?;
 
-                // Read from the kernel's drift router — runtime authority for provider/model
+                // Read from the kernel's drift router — runtime authority for live state
                 let drift = kernel_arc.drift().read();
                 let contexts = drift.list_contexts();
                 let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
@@ -3651,8 +3613,11 @@ impl kernel::Server for KernelImpl {
                             .unwrap_or([0u8; 16])
                             .as_slice(),
                     );
-                    c.set_provider(ctx.provider.as_deref().unwrap_or(""));
-                    c.set_model(ctx.model.as_deref().unwrap_or(""));
+                    if let Some(kaijutsu_kernel::ContextModelLookup::Model(m)) = bound_by_ctx.get(&ctx.id) {
+                        c.set_provider(&m.backend);
+                        c.set_model(&m.model);
+                    }
+                    c.set_cast_label(bound_by_ctx.get(&ctx.id).and_then(|b| b.cast()).unwrap_or(""));
                     c.set_created_at(ctx.created_at);
                     c.set_trace_id(&ctx.trace_id);
 
@@ -3677,14 +3642,6 @@ impl kernel::Server for KernelImpl {
                         c.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
-                        // Empty when uncast, or the cast_id is dangling (removed
-                        // between the two reads above) — never an error.
-                        c.set_cast_label(
-                            row.cast_id
-                                .and_then(|id| cast_labels.get(&id))
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                        );
                         // Advisory registering-client hostname (empty = unknown).
                         // See `ContextHandleInfo.originHost`'s capnp doc comment.
                         c.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
@@ -3703,11 +3660,12 @@ impl kernel::Server for KernelImpl {
                     // tested directly (`context_usage_wire_tests` below) —
                     // sentinel selection lives there, not re-derived here.
                     let usage = usage_map.get(&ctx.id);
-                    let window = usage.and_then(|u| {
-                        window_by_model
-                            .get(&(u.provider.clone(), u.model.clone()))
-                            .copied()
-                            .flatten()
+                    // The window belongs to the bound model: usage recorded on
+                    // another model has no window here.
+                    let window = usage.and_then(|u| match bound_by_ctx.get(&ctx.id) {
+                        Some(kaijutsu_kernel::ContextModelLookup::Model(m))
+                            if m.backend == u.provider && m.model == u.model => m.context_window,
+                        _ => None,
                     });
                     let (wire_window, wire_used_tokens, wire_used_pct) =
                         resolve_usage_wire_fields(usage, window);
@@ -3798,7 +3756,7 @@ impl kernel::Server for KernelImpl {
         let kernel_db_arc = self.kernel.kernel_db.clone();
         Promise::from_future(
             async move {
-                let (row, cwd) = {
+                let (row, cwd, bound) = {
                     let db = kernel_db_arc.lock();
                     let row = db.find_context_by_label(&label).map_err(|e| {
                         capnp::Error::failed(format!(
@@ -3814,14 +3772,28 @@ impl kernel::Server for KernelImpl {
                             .flatten()
                             .and_then(|shell| shell.cwd)
                     });
-                    (row, cwd)
+                    let bound = match &row {
+                        Some(r) => kaijutsu_kernel::context_model(&db, r.context_id).map_err(|e| {
+                            capnp::Error::failed(format!(
+                                "resolve_context_label: model binding of '{label}' unreadable: {e}"
+                            ))
+                        })?,
+                        None => kaijutsu_kernel::ContextModelLookup::None(kaijutsu_kernel::NoModel {
+                            context: label.clone(),
+                            instance: None,
+                            character: None,
+                            role: String::new(),
+                            reason: kaijutsu_kernel::model_resolution::NoModelReason::NoInstance,
+                        }),
+                    };
+                    (row, cwd, bound)
                 };
                 let mut res = results.get();
                 match row {
                     Some(row) => {
                         res.set_found(true);
                         let info = res.init_info();
-                        write_context_row_to_handle_info(info, &row, cwd.as_deref());
+                        write_context_row_to_handle_info(info, &row, cwd.as_deref(), &bound);
                     }
                     None => res.set_found(false),
                 }
@@ -4955,95 +4927,6 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    fn configure_llm(
-        self: Rc<Self>,
-        params: kernel::ConfigureLlmParams,
-        mut results: kernel::ConfigureLlmResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
-        let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
-        let kernel_arc = self.kernel.kernel.clone();
-
-        // Use explicit contextId if provided (16 bytes), otherwise connection's current
-        let ctx_id_bytes = pry!(params_reader.get_context_id());
-        let ctx_id = if ctx_id_bytes.len() == 16 {
-            pry!(
-                ContextId::try_from_slice(ctx_id_bytes)
-                    .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-            )
-        } else {
-            pry!(self.connection.borrow().require_context())
-        };
-
-        let shared_kernel = self.kernel.clone();
-        let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
-        Promise::from_future(
-            async move {
-                // Validate the backend before persisting — never write bad
-                // data. A backend must already EXIST (`kj backend set`): the
-                // name alone no longer implies a kind, so there is nothing
-                // sensible to construct from a bare string, and inventing one
-                // here would let a typo persist onto a context row.
-                // A registry built only to look the name up; its clients
-                // never send, so they need not share the kernel's endpoints.
-                let known = kaijutsu_kernel::build_llm_registry(
-                    &shared_kernel.kernel_db.lock(),
-                    &kaijutsu_kernel::llm::endpoint::Endpoints::default(),
-                )
-                    .map(|r| r.backend_config(&provider_name).is_some())
-                    .unwrap_or(false);
-                match known {
-                    true => {
-                        // Provider is valid — now persist
-                        {
-                            let db = shared_kernel.kernel_db.lock();
-                            if let Err(e) =
-                                db.update_model(ctx_id, Some(&provider_name), Some(&model))
-                            {
-                                log::warn!(
-                                    "KernelDb update_model failed for {}: {}",
-                                    ctx_id.short(),
-                                    e
-                                );
-                            }
-                        }
-                        {
-                            let mut drift = kernel_arc.drift().write();
-                            let _ = drift.configure_llm(ctx_id, &provider_name, &model);
-                        }
-                        // The backend is already registered (that is what
-                        // `known` established); kernel-wide defaults are NOT
-                        // touched — the model is per-context.
-                        results.get().set_success(true);
-                        results.get().set_error("");
-                        log::info!(
-                            "Context {} model set: provider={}, model={}",
-                            ctx_id.short(),
-                            provider_name,
-                            model
-                        );
-                    }
-                    false => {
-                        let msg = format!(
-                            "unknown backend '{provider_name}' \
-                             (configure it with `kj backend set {provider_name} --kind …`)"
-                        );
-                        results.get().set_success(false);
-                        results.get().set_error(&msg);
-                        log::warn!(
-                            "Failed to configure LLM for context {}: {msg}",
-                            ctx_id.short(),
-                        );
-                    }
-                }
-
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
     fn drift_queue(
         self: Rc<Self>,
         _params: kernel::DriftQueueParams,
@@ -5096,193 +4979,6 @@ impl kernel::Server for KernelImpl {
     }
 
     // listAllContexts was removed — listContexts now reads from kernel's drift router
-
-    // ========================================================================
-    // LLM Configuration (Phase 5)
-    // ========================================================================
-
-    fn get_llm_config(
-        self: Rc<Self>,
-        params: kernel::GetLlmConfigParams,
-        mut results: kernel::GetLlmConfigResults,
-    ) -> Promise<(), capnp::Error> {
-        let kernel_arc = self.kernel.kernel.clone();
-
-        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_llm_config");
-        Promise::from_future(
-            async move {
-                let registry = kernel_arc.llm().read().await;
-
-                let mut config = results.get().init_config();
-                config.set_default_provider(registry.default_provider_name().unwrap_or(""));
-                config.set_default_model(registry.default_model().unwrap_or(""));
-
-                // Only include available providers (skip disabled/unconfigured)
-                let provider_names: Vec<&str> = registry
-                    .list()
-                    .into_iter()
-                    .filter(|name| registry.get(name).is_some())
-                    .collect();
-                let mut providers = config.init_providers(provider_names.len() as u32);
-                for (i, name) in provider_names.iter().enumerate() {
-                    let mut entry = providers.reborrow().get(i as u32);
-                    entry.set_name(name);
-                    entry.set_available(true);
-                    if let Some(p) = registry.get(name) {
-                        let avail = p.available_models();
-                        entry.set_default_model(avail.first().copied().unwrap_or(""));
-                    }
-                    // Populate full models list from aliases + default
-                    let model_ids = registry.models_for_provider(name);
-                    let mut models_list = entry.init_models(model_ids.len() as u32);
-                    for (j, model_id) in model_ids.iter().enumerate() {
-                        models_list.set(j as u32, model_id);
-                    }
-                }
-
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    fn set_default_provider(
-        self: Rc<Self>,
-        params: kernel::SetDefaultProviderParams,
-        mut results: kernel::SetDefaultProviderResults,
-    ) -> Promise<(), capnp::Error> {
-        let provider_name = pry!(pry!(pry!(params.get()).get_provider()).to_str()).to_owned();
-        let kernel_arc = self.kernel.kernel.clone();
-        let kernel_db = self.kernel.kernel_db.clone();
-
-        let span = tracing::info_span!("rpc", method = "set_default_provider");
-        Promise::from_future(
-            async move {
-                // DB-first, then rebuild — the same write-then-reload shape
-                // every `kj backend/cast/alias` mutation uses. The old body
-                // mutated the in-memory registry only, so the change silently
-                // reverted on the next config write's reload (or restart):
-                // registry drifting from DB truth, the dual-ownership disease
-                // this config system exists to prevent. `set_llm_defaults`
-                // refuses a dangling backend name, so validation rides the
-                // write.
-                let rebuilt = {
-                    let db = kernel_db.lock();
-                    let row = match db.get_llm_defaults() {
-                        Ok(Some(mut d)) => {
-                            d.default_backend = provider_name.clone();
-                            d
-                        }
-                        Ok(None) => {
-                            results.get().set_success(false);
-                            results.get().set_error(
-                                "no llm_defaults row — run `kj backend reseed` \
-                                 or `kj backend default set`",
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            results.get().set_success(false);
-                            results.get().set_error(format!("reading llm_defaults: {e}"));
-                            return Ok(());
-                        }
-                    };
-                    if let Err(e) = db.set_llm_defaults(&row) {
-                        results.get().set_success(false);
-                        results.get().set_error(format!("{e}"));
-                        return Ok(());
-                    }
-                    kaijutsu_kernel::build_llm_registry(&db, kernel_arc.endpoints())
-                };
-                match rebuilt {
-                    Ok(reg) => {
-                        *kernel_arc.llm().write().await = reg;
-                        results.get().set_success(true);
-                        results.get().set_error("");
-                        log::info!("Default LLM backend set to: {}", provider_name);
-                    }
-                    Err(e) => {
-                        results.get().set_success(false);
-                        results.get().set_error(format!(
-                            "write landed but the LLM registry failed to reload: {e}"
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    fn set_default_model(
-        self: Rc<Self>,
-        params: kernel::SetDefaultModelParams,
-        mut results: kernel::SetDefaultModelResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
-        let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
-        let kernel_arc = self.kernel.kernel.clone();
-        let kernel_db = self.kernel.kernel_db.clone();
-
-        let span = tracing::info_span!("rpc", method = "set_default_model");
-        Promise::from_future(
-            async move {
-                // DB-first + rebuild, same shape as set_default_provider
-                // above (and the kj mutations). Takes both halves of the
-                // identity, so it sets backend AND model together.
-                let rebuilt = {
-                    let db = kernel_db.lock();
-                    let row = match db.get_llm_defaults() {
-                        Ok(Some(mut d)) => {
-                            d.default_backend = provider_name.clone();
-                            d.default_model = model.clone();
-                            d
-                        }
-                        Ok(None) => {
-                            results.get().set_success(false);
-                            results.get().set_error(
-                                "no llm_defaults row — run `kj backend reseed` \
-                                 or `kj backend default set`",
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            results.get().set_success(false);
-                            results.get().set_error(format!("reading llm_defaults: {e}"));
-                            return Ok(());
-                        }
-                    };
-                    if let Err(e) = db.set_llm_defaults(&row) {
-                        results.get().set_success(false);
-                        results.get().set_error(format!("{e}"));
-                        return Ok(());
-                    }
-                    kaijutsu_kernel::build_llm_registry(&db, kernel_arc.endpoints())
-                };
-                match rebuilt {
-                    Ok(reg) => {
-                        *kernel_arc.llm().write().await = reg;
-                        results.get().set_success(true);
-                        results.get().set_error("");
-                        log::info!(
-                            "Default model set to: {} (backend: {})",
-                            model,
-                            provider_name
-                        );
-                    }
-                    Err(e) => {
-                        results.get().set_success(false);
-                        results.get().set_error(format!(
-                            "write landed but the LLM registry failed to reload: {e}"
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
 
     // Phase 5 D-54: get/setToolFilter and get/setContextToolFilter retired.
     // Capnp ordinals 69/70/85/86 renamed to `...Removed` stubs; the
@@ -6308,17 +6004,7 @@ impl kernel::Server for KernelImpl {
         let _span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_presets");
         let _kernel_id = self.kernel.id;
 
-        let (presets, cast_labels) = {
-            let db = self.kernel.kernel_db.lock();
-            let presets = db.list_presets().unwrap_or_default();
-            // Resolved once for the whole listing (Track D) — `provider`/
-            // `model` (@3/@4) are demolished; `castLabel` (@5) replaces them.
-            let cast_labels: HashMap<kaijutsu_types::CastId, String> = db
-                .list_casts()
-                .map(|casts| casts.into_iter().map(|c| (c.cast_id, c.label)).collect())
-                .unwrap_or_default();
-            (presets, cast_labels)
-        };
+        let presets = self.kernel.kernel_db.lock().list_presets().unwrap_or_default();
 
         let mut list = results.get().init_presets(presets.len() as u32);
         for (i, preset) in presets.iter().enumerate() {
@@ -6326,15 +6012,7 @@ impl kernel::Server for KernelImpl {
             p.set_id(preset.preset_id.as_bytes());
             p.set_label(&preset.label);
             p.set_description(preset.description.as_deref().unwrap_or(""));
-            // @3/@4 (provider/model) are UNUSED since Track D — left at their
-            // wire default (empty), never populated.
-            p.set_cast_label(
-                preset
-                    .cast_id
-                    .and_then(|id| cast_labels.get(&id))
-                    .map(String::as_str)
-                    .unwrap_or(""),
-            );
+            // provider, model and castLabel are UNUSED: a preset names no model.
         }
 
         Promise::ok(())
@@ -9378,10 +9056,8 @@ pub(crate) fn status_to_capnp(status: kaijutsu_types::Status) -> crate::kaijutsu
 
 /// Resolve one context's `(contextWindow, contextUsedTokens, contextUsedPct)`
 /// wire triple (`ContextHandleInfo` in `kaijutsu.capnp`) from its optional
-/// usage snapshot and the window already resolved for it (via
-/// `LlmRegistry::context_window_for_live`, awaited by the caller since it
-/// needs the registry lock the loop in `list_contexts` holds once for the
-/// whole listing).
+/// usage snapshot and the window its binding slot holds for the usage's
+/// model.
 ///
 /// Pulled out of `list_contexts` so the sentinel selection — 0 = unknown
 /// window/no usage, -1.0 = unknown percentage — is unit-testable

@@ -44,10 +44,6 @@ struct Turn {
     waits: SlotWaits,
 }
 
-/// The output limit asked for by [`Client::prompt`], which has no tunables:
-/// the service's own default.
-const PROMPT_MAX_TOKENS: u64 = 4096;
-
 /// A client for one `mk` backend.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -146,7 +142,7 @@ impl Client {
 
     /// One user message, not streamed, with thinking off; returns the answer
     /// text. A reply that stopped at its output limit is an error.
-    pub async fn prompt(&self, model: &str, system: Option<&str>, prompt: &str) -> LlmResult<String> {
+    pub async fn prompt(&self, model: &str, max_tokens: u64, system: Option<&str>, prompt: &str) -> LlmResult<String> {
         let mut messages = Vec::new();
         if let Some(system) = system.filter(|s| !s.is_empty()) {
             messages.push(MkMessage::system(system));
@@ -154,7 +150,7 @@ impl Client {
         messages.push(MkMessage::user(prompt));
         let thinking = Some(false);
         let turn = self.turn();
-        let max_tokens = self.admit_messages(&turn, model, &messages, &[], thinking, None, PROMPT_MAX_TOKENS).await?;
+        let max_tokens = self.admit_messages(&turn, model, &messages, &[], thinking, None, max_tokens).await?;
         let request = GenerateRequest {
             thinking,
             max_tokens: Some(max_tokens),
@@ -912,8 +908,8 @@ mod tests {
         cut["finish"] = json!("length");
         let (base, seen) = serve(vec![http(200, MODEL), rendered(40), http(200, done), rendered(40), http(200, cut.to_string())]).await;
         let c = client(&base, HashMap::new());
-        assert_eq!(c.prompt("qwen", Some("s"), "sky?").await.unwrap(), "The sky is blue on a clear day.");
-        let err = c.prompt("qwen", Some("s"), "sky?").await.unwrap_err();
+        assert_eq!(c.prompt("qwen", 4096, Some("s"), "sky?").await.unwrap(), "The sky is blue on a clear day.");
+        let err = c.prompt("qwen", 4096, Some("s"), "sky?").await.unwrap_err();
         assert!(matches!(&err, LlmError::ApiError(m) if m.contains("output limit")), "{err:?}");
         let seen = seen.lock().unwrap();
         let paths: Vec<&str> = seen.iter().map(|c| c.path.as_str()).collect();

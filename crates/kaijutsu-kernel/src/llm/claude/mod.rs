@@ -14,24 +14,21 @@
 pub mod build;
 #[cfg(test)]
 mod live;
-pub mod models_api;
 pub mod sse;
 pub mod stream;
 pub mod types;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::endpoint::{Endpoint, Slot};
 use crate::llm::stream::{BuildOpts, StreamError, StreamErrorKind, StreamEvent};
 use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, http_user_agent};
 
-use self::models_api::{HttpModelCapabilitySource, ModelCapabilitySource};
 use self::sse::{ClaudeSseEvent, decode_event};
 use self::stream::StateMachine;
 use self::types::{MessagesResponse, ResponseContent};
@@ -62,11 +59,6 @@ impl Dialect {
             Self::DeepSeek => "deepseek-messages",
         }
     }
-
-    /// Whether `GET /v1/models/{id}` answers with `max_input_tokens`.
-    fn has_models_api(self) -> bool {
-        self == Self::Anthropic
-    }
 }
 
 /// Anthropic Claude client.
@@ -76,30 +68,10 @@ impl Dialect {
 /// client makes is properly authenticated by construction. The shared
 /// `Client` lets reqwest pool TCP connections across multiple stream
 /// calls within a session.
-///
-/// `model_window_cache` + `capability_source` back the live
-/// `GET /v1/models/{id}` context-window lookup (see [`Self::context_window`])
-/// — the configured `context_window` (backend_models) is checked first by the
-/// caller (`LlmRegistry::context_window_for_live`); this is the fallback
-/// when that's absent. `capability_source` is the test seam: production
-/// code gets `HttpModelCapabilitySource` (a real network call), tests inject
-/// a fake via [`Self::with_capability_source`] so `cargo test` never
-/// touches the network.
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
-    /// Per-model-id cache of resolved live context windows, scoped to this
-    /// `Client` instance (one per registered Anthropic provider, i.e. one
-    /// per kernel process — restart to pick up a model launched after boot,
-    /// same convention as credential reload). Populated lazily on first
-    /// live lookup. `Some`/`Ok(None)` results are cached for the process
-    /// lifetime — a model's context window does not change under you, so
-    /// there is no TTL to get wrong. A lookup that *errors* (network/auth
-    /// failure) is deliberately NOT cached, so a transient outage heals
-    /// itself on the next call instead of pinning "unknown" until restart.
-    model_window_cache: Arc<AsyncRwLock<HashMap<String, Option<u64>>>>,
-    capability_source: Arc<dyn ModelCapabilitySource>,
     /// Per-request HTTP timeout (`BackendConfig.request_timeout_secs`,
     /// resolved by `Provider::from_backend`). Applied via
     /// `RequestBuilder::timeout` at each `.send()` call — covers the whole
@@ -146,14 +118,9 @@ impl Client {
             .build()
             .expect("reqwest::Client::builder must succeed on healthy host");
         let base_url = ANTHROPIC_DEFAULT_BASE_URL.to_string();
-        let capability_source: Arc<dyn ModelCapabilitySource> = Arc::new(
-            HttpModelCapabilitySource::new(http.clone(), base_url.clone()),
-        );
         Self {
             http,
             base_url,
-            model_window_cache: Arc::new(AsyncRwLock::new(HashMap::new())),
-            capability_source,
             request_timeout: None,
             endpoint: None,
             dialect: Dialect::Anthropic,
@@ -200,87 +167,9 @@ impl Client {
     }
 
     /// Override the API base URL (for proxies or local mocks).
-    ///
-    /// Rebuilds `capability_source` to point at the new base URL too, so a
-    /// proxy/mock override applies uniformly to `/v1/messages` and
-    /// `/v1/models/{id}` alike. Call [`Self::with_capability_source`]
-    /// *after* this in a test builder chain if you need to override the
-    /// rebuilt source instead.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        self.capability_source = Arc::new(HttpModelCapabilitySource::new(
-            self.http.clone(),
-            self.base_url.clone(),
-        ));
         self
-    }
-
-    /// Test seam: inject a fake [`ModelCapabilitySource`] so
-    /// [`Self::context_window`] never touches the network. Production
-    /// callers never need this — `new()`/`with_base_url()` always wire the
-    /// real HTTP-backed source.
-    #[cfg(any(test, feature = "test-mock"))]
-    pub fn with_capability_source(mut self, source: Arc<dyn ModelCapabilitySource>) -> Self {
-        self.capability_source = source;
-        self
-    }
-
-    /// Live context-window lookup for `model`, cached for the life of this
-    /// `Client`. Checked by [`crate::llm::LlmRegistry::context_window_for_live`]
-    /// only after the config path (the backend's configured `context_window`) came up
-    /// empty — config is always the override, this is the fallback.
-    ///
-    /// A cache hit never touches the network. On a miss, takes a slot at
-    /// the client's endpoint, as every outbound request does, and awaits
-    /// `capability_source.max_input_tokens(model)` (the real implementation
-    /// hits `GET /v1/models/{id}`, reading the wire's `max_input_tokens`
-    /// field — there is no `context_window` field on the API; that name is
-    /// ours, and `max_tokens` is a different number, the output cap).
-    ///
-    /// Never fabricates: an `Ok(None)` (model unknown to the API, e.g. a
-    /// 404) resolves to `None` and IS cached, same as a genuine window —
-    /// repeat lookups for a bad id shouldn't hammer the network either. An
-    /// `Err` (network/auth/parse failure) also resolves to `None` but is
-    /// NOT cached (see the field doc), and is bubbled at `warn` — `None` is
-    /// a legitimate, documented outcome here, so this is an informational
-    /// log, not a silently swallowed failure.
-    pub async fn context_window(&self, model: &str) -> Option<u64> {
-        if !self.dialect.has_models_api() {
-            return None;
-        }
-        {
-            let cache = self.model_window_cache.read().await;
-            if let Some(cached) = cache.get(model) {
-                return *cached;
-            }
-        }
-        let slot = match crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await {
-            Ok(slot) => slot,
-            Err(e) => {
-                tracing::warn!(model, error = %e, "live context-window lookup got no slot; resolving as unknown (not cached)");
-                return None;
-            }
-        };
-        let looked_up = self.capability_source.max_input_tokens(model).await;
-        drop(slot);
-        match looked_up {
-            Ok(window) => {
-                self.model_window_cache
-                    .write()
-                    .await
-                    .insert(model.to_string(), window);
-                window
-            }
-            Err(e) => {
-                tracing::warn!(
-                    model,
-                    error = %e,
-                    "live context-window lookup failed; resolving as unknown \
-                     (not cached — will retry on the next call)"
-                );
-                None
-            }
-        }
     }
 
     /// Model IDs surfaced by this provider.
@@ -308,11 +197,12 @@ impl Client {
     pub async fn prompt(
         &self,
         model: &str,
+        max_tokens: u64,
         system: Option<&str>,
         prompt: &str,
     ) -> LlmResult<String> {
         let messages = vec![Message::user(prompt)];
-        let mut opts = BuildOpts::new(model).with_max_tokens(4096);
+        let mut opts = BuildOpts::new(model, max_tokens);
         if let Some(sys) = system {
             opts = opts.with_system(sys);
         }
@@ -422,9 +312,7 @@ impl Client {
 /// the inner error to map onto kaijutsu-typed variants. Unparseable
 /// bodies fall back to raw status text — never silently swallow.
 ///
-/// Free function (not a `Client` method) so [`models_api::HttpModelCapabilitySource`]
-/// can reuse the same mapping for `GET /v1/models/{id}` without needing a
-/// `Client` reference — it's pure over the response.
+/// A free function: it is pure over the response.
 pub(crate) async fn error_for_status(response: reqwest::Response) -> LlmResult<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
@@ -779,7 +667,7 @@ data: {\"type\":\"message_stop\"}
 
         let text = Client::new("fake-key")
             .with_base_url(format!("http://127.0.0.1:{port}"))
-            .prompt("claude-haiku-4-5", None, "hi")
+            .prompt("claude-haiku-4-5", 4096, None, "hi")
             .await
             .expect("prompt round-trip against loopback");
         assert_eq!(text, "ok", "response must parse through the real path");
@@ -798,110 +686,6 @@ data: {\"type\":\"message_stop\"}
         );
     }
 
-    // ── Client::context_window: cache + failure-degradation behavior ─────
-    //
-    // `LlmRegistry::context_window_for_live`'s own tests (`llm/mod.rs`)
-    // cover config-override precedence and the None/unknown-model paths at
-    // the registry level. These tests exercise `Client::context_window`
-    // directly so a cache hit skipping the seam entirely can be asserted
-    // via `FakeModelCapabilitySource::call_count` — the registry's
-    // `Arc<dyn ModelCapabilitySource>` type-erasure makes that awkward to
-    // reach from the registry-level tests.
-
-    mod context_window_cache_tests {
-        use super::*;
-        use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
-        use std::sync::Arc;
-
-        #[tokio::test]
-        async fn second_call_for_same_model_hits_cache_not_the_seam() {
-            let fake = FakeModelCapabilitySource::always_none()
-                .with_response("claude-opus-4-8", Ok(Some(1_000_000)));
-            let fake = Arc::new(fake);
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
-
-            let first = client.context_window("claude-opus-4-8").await;
-            assert_eq!(first, Some(1_000_000));
-            assert_eq!(fake.call_count(), 1);
-
-            let second = client.context_window("claude-opus-4-8").await;
-            assert_eq!(second, Some(1_000_000), "cached value must be stable");
-            assert_eq!(
-                fake.call_count(),
-                1,
-                "a cache hit must not call the capability source a second time"
-            );
-        }
-
-        #[tokio::test]
-        async fn unknown_model_result_is_cached_too() {
-            // Ok(None) — "the live API doesn't know this model either" — is
-            // a real, cacheable answer, not a failure. Repeat lookups for a
-            // bad id shouldn't hammer the network.
-            let fake = Arc::new(FakeModelCapabilitySource::always_none());
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
-
-            assert_eq!(client.context_window("bogus-model").await, None);
-            assert_eq!(fake.call_count(), 1);
-            assert_eq!(client.context_window("bogus-model").await, None);
-            assert_eq!(fake.call_count(), 1, "Ok(None) must be cached, same as Ok(Some(_))");
-        }
-
-        #[tokio::test]
-        async fn failed_lookup_degrades_to_none_and_is_not_cached() {
-            let fake = Arc::new(FakeModelCapabilitySource::always_none().with_response(
-                "claude-opus-4-8",
-                Err(LlmError::NetworkError("connect refused".into())),
-            ));
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
-
-            assert_eq!(
-                client.context_window("claude-opus-4-8").await,
-                None,
-                "a failed live lookup must degrade to None, never panic, never fabricate"
-            );
-            assert_eq!(fake.call_count(), 1);
-
-            // Retried on the next call (not poisoned by the earlier failure) —
-            // simulates the transient outage healing without a restart.
-            assert_eq!(
-                client.context_window("claude-opus-4-8").await,
-                None,
-                "still None because the fake is still scripted to fail"
-            );
-            assert_eq!(
-                fake.call_count(),
-                2,
-                "an Err result must NOT be cached — each call retries the seam"
-            );
-        }
-
-        #[tokio::test]
-        async fn distinct_models_cache_independently() {
-            let fake = Arc::new(
-                FakeModelCapabilitySource::always_none()
-                    .with_response("claude-opus-4-8", Ok(Some(1_000_000)))
-                    .with_response("claude-haiku-4-5-20251001", Ok(Some(200_000))),
-            );
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
-
-            assert_eq!(client.context_window("claude-opus-4-8").await, Some(1_000_000));
-            assert_eq!(
-                client.context_window("claude-haiku-4-5-20251001").await,
-                Some(200_000)
-            );
-            assert_eq!(fake.call_count(), 2);
-
-            // Both now cached independently.
-            assert_eq!(client.context_window("claude-opus-4-8").await, Some(1_000_000));
-            assert_eq!(
-                client.context_window("claude-haiku-4-5-20251001").await,
-                Some(200_000)
-            );
-            assert_eq!(fake.call_count(), 2, "both hits should come from cache");
-        }
-    }
-
     /// A 503 cools the endpoint for the first backoff step, and a later
     /// request waits it out.
     #[tokio::test]
@@ -910,7 +694,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![reply(503, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
-        let err = client.prompt("m", None, "hi").await.unwrap_err();
+        let err = client.prompt("m", 4096, None, "hi").await.unwrap_err();
         assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
@@ -927,7 +711,7 @@ data: {\"type\":\"message_stop\"}
         let (base, seen) = serve(vec![reply(500, r#"{"type": "error", "error": {"type": "api_error", "message": "x"}}"#)]).await;
         let tmp = tempfile::tempdir().unwrap();
         let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 1, Some(tmp.path().to_path_buf()));
-        let opts = BuildOpts::new("claude-sonnet-4-6").with_system("sys").with_trace(trace);
+        let opts = BuildOpts::new("claude-sonnet-4-6", 4096).with_system("sys").with_trace(trace);
         let _ = Client::new("k").with_base_url(&base).stream(opts, vec![Message::user("let's do a thing")]).await;
         let files = wait_for_files(tmp.path(), 1).await;
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
@@ -946,7 +730,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![busy]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
-        let err = client.prompt("m", None, "hi").await.unwrap_err();
+        let err = client.prompt("m", 4096, None, "hi").await.unwrap_err();
         assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 429);
@@ -964,35 +748,12 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![sse(SIMPLE_COMPLETION)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
-        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
         assert_eq!(endpoint.busy_in_a_row(), 1);
         while stream.next_event().await.is_some() {}
         assert_eq!(endpoint.busy_in_a_row(), 0);
-    }
-
-    /// The live context-window lookup, `GET /v1/models/{id}`, takes a slot
-    /// at the client's endpoint.
-    ///
-    /// Falsified by a lookup that goes out beside a full endpoint.
-    #[tokio::test]
-    async fn the_context_window_lookup_takes_a_slot() {
-        #[derive(Debug)]
-        struct InFlight(Arc<Endpoint>, std::sync::Mutex<Option<u32>>);
-        #[async_trait::async_trait]
-        impl ModelCapabilitySource for InFlight {
-            async fn max_input_tokens(&self, _model: &str) -> LlmResult<Option<u64>> {
-                *self.1.lock().unwrap() = Some(self.0.status().in_flight);
-                Ok(Some(200_000))
-            }
-        }
-        let endpoint = crate::llm::endpoint::Endpoints::default().get("hosted backend claude");
-        let probe = Arc::new(InFlight(endpoint.clone(), Default::default()));
-        let client = Client::new("k").with_endpoint(endpoint.clone()).with_capability_source(probe.clone());
-        assert_eq!(client.context_window("claude-opus-4-8").await, Some(200_000));
-        assert_eq!(*probe.1.lock().unwrap(), Some(1), "the lookup held a slot");
-        assert_eq!(endpoint.status().in_flight, 0);
     }
 
     /// A stream that fails does not count as a completed answer: a
@@ -1006,7 +767,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![sse(&paused)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
-        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
         assert_eq!(endpoint.busy_in_a_row(), 1);
@@ -1028,11 +789,11 @@ data: {\"type\":\"message_stop\"}
         );
         for stop in ["\"pause_turn\"", "\"model_context_window_exceeded\"", "null"] {
             let (base, _) = serve(vec![reply(200, &body(stop))]).await;
-            let err = Client::new("k").with_base_url(&base).prompt("m", None, "hi").await.unwrap_err();
+            let err = Client::new("k").with_base_url(&base).prompt("m", 4096, None, "hi").await.unwrap_err();
             assert!(matches!(err, LlmError::CompletionError(_)), "{stop}: {err:?}");
         }
         let (base, _) = serve(vec![reply(200, &body("\"end_turn\""))]).await;
-        assert_eq!(Client::new("k").with_base_url(&base).prompt("m", None, "hi").await.unwrap(), "partial");
+        assert_eq!(Client::new("k").with_base_url(&base).prompt("m", 4096, None, "hi").await.unwrap(), "partial");
     }
 
     /// A model that thinks on every request rejects `thinking: disabled`, so
@@ -1041,7 +802,7 @@ data: {\"type\":\"message_stop\"}
     async fn thinking_off_for_an_always_on_model_never_reaches_the_wire() {
         use kaijutsu_mk::test_server::serve;
         let (base, seen) = serve(vec![]).await;
-        let mut opts = BuildOpts::new("claude-sonnet-5-5");
+        let mut opts = BuildOpts::new("claude-sonnet-5-5", 4096);
         opts.thinking_style = Some("off".into());
         let err = Client::new("k").with_base_url(&base).stream(opts, vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("claude-sonnet-5-5")), "{err:?}");
@@ -1058,7 +819,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![reply(529, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_1"}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
-        let err = client.prompt("m", None, "hi").await.unwrap_err();
+        let err = client.prompt("m", 4096, None, "hi").await.unwrap_err();
         assert!(matches!(&err, LlmError::ApiError(m) if m.contains("overloaded_error") && m.contains("req_1")), "{err:?}");
         let (_, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
@@ -1098,7 +859,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![sse(&failed)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
-        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         let mut events = Vec::new();
         while let Some(ev) = stream.next_event().await {
             events.push(ev);
@@ -1118,17 +879,18 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(Client::new("k").dialect(), Dialect::Anthropic);
     }
 
-    /// DeepSeek's endpoint answers `GET /v1/models/{id}` with 404, so the
-    /// lookup is not made.
+    /// A one-shot prompt sends the `max_tokens` its caller names, the slot it
+    /// runs on, and no limit of its own.
     ///
-    /// Falsified by a deepseek client that asks its capability source.
+    /// Falsified by a prompt that sends a fixed limit.
     #[tokio::test]
-    async fn a_deepseek_client_makes_no_context_window_lookup() {
-        use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
-        let fake = Arc::new(FakeModelCapabilitySource::always_none().with_response("deepseek-flash", Ok(Some(5))));
-        let client = Client::deepseek("k").with_capability_source(fake.clone());
-        assert_eq!(client.context_window("deepseek-flash").await, None);
-        assert_eq!(fake.call_count(), 0);
+    async fn a_prompt_sends_the_max_tokens_its_caller_names() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let ok = r#"{"id":"m","model":"m","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (base, seen) = serve(vec![reply(200, ok)]).await;
+        Client::new("k").with_base_url(&base).prompt("m", 777, None, "hi").await.unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(wire["max_tokens"], 777);
     }
 
     /// `prompt()` against DeepSeek turns thinking off, so `max_tokens` is
@@ -1138,7 +900,7 @@ data: {\"type\":\"message_stop\"}
         use kaijutsu_mk::test_server::{reply, serve};
         let ok = r#"{"id":"m","model":"deepseek-flash","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (base, seen) = serve(vec![reply(200, ok)]).await;
-        let text = Client::deepseek("k").with_base_url(&base).prompt("deepseek-flash", None, "hi").await.unwrap();
+        let text = Client::deepseek("k").with_base_url(&base).prompt("deepseek-flash", 4096, None, "hi").await.unwrap();
         assert_eq!(text, "ok");
         let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
         assert_eq!(wire["thinking"], serde_json::json!({"type": "disabled"}));

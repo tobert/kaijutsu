@@ -122,8 +122,7 @@ const CONTEXT_WARNING_THRESHOLD: f64 = 0.9;
 /// deliberately removed from kaijutsu and the kernel never silently refuses
 /// or trims a turn on this model's behalf; the provider's own overflow
 /// rejection remains the hard backstop. `window` is `None` when the model's
-/// context window is unconfigured/unresolvable (`LlmRegistry::context_window_
-/// for_live`) — in that case there is nothing honest to compare against, so
+/// context window is unknown (the binding's slot holds none) — in that case there is nothing honest to compare against, so
 /// no check runs at all. Never fabricate a denominator (same house rule as
 /// `context_used_pct`, kernel_db.rs:360).
 ///
@@ -165,7 +164,8 @@ fn warn_if_near_context_window(
          window (~{pct:.0}%). The turn was sent anyway; the provider is the hard limit. \
          Remedies: exclude large blocks then fork; `kj fork --compact`; if this model's window \
          is wrong, re-pin it with \
-         `kj backend model set {provider_name} {model_name} --context-window <N>`."
+         `kj backend model set {provider_name} {model_name} --context-window <N>` and rotate \
+         the instance to bind it."
     );
     tracing::warn!("{detail}");
 
@@ -483,7 +483,6 @@ async fn build_tool_definitions(
 pub(super) async fn spawn_admitted_turn(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
-    model: Option<&str>,
     after_block_id: &kaijutsu_types::BlockId,
     tool_ctx: crate::ExecContext,
     user_principal_id: PrincipalId,
@@ -562,9 +561,8 @@ pub(super) async fn spawn_admitted_turn(
             "the kernel is quiesced — no turn starts; `kj system resume` clears it".into());
     }
 
-    // Read per-context model from DriftRouter (quick read, release lock).
-    // Capture label/state alongside for the situational system-prompt addendum.
-    let (ctx_model, ctx_provider_name, ctx_label, ctx_state) = {
+    // Label and state for the situational system-prompt addendum.
+    let (ctx_label, ctx_state) = {
         let drift = kernel_arc.drift().read();
         // Guard: block LLM invocation while context is in Staging state
         if let Some(h) = drift.get(context_id)
@@ -588,105 +586,42 @@ pub(super) async fn spawn_admitted_turn(
                 "context is in staging mode — commit to enable LLM prompts".into());
         }
         match drift.get(context_id) {
-            Some(h) => (
-                h.model.clone(),
-                h.provider.clone(),
-                h.label.clone(),
-                Some(h.state),
-            ),
-            None => (None, None, None, None),
+            Some(h) => (h.label.clone(), Some(h.state)),
+            None => (None, None),
         }
     };
 
-    // Resolve provider + model through `resolve_context_model` (the one
-    // function that answers "what model does this context play?").
-    // Priority: explicit param > per-context (DriftRouter) > cast slot on
-    // this context's context_type (its own cast, else its performer's
-    // default cast) > registry default. The context_type and
-    // cast label are read once per turn here; the pure resolution itself
-    // lives in `crate::model_resolution` where it's unit-tested.
-    let (context_type, cast_label) = {
+    // The model comes from the binding of the context's character instance
+    // and nowhere else. A context whose binding has no slot for its type
+    // refuses here, before any provider work.
+    let bound = {
         let db = kernel_db.lock();
-        match db.get_context(context_id) {
-            Ok(Some(row)) => {
-                // The context's own cast, else its performer's default. A
-                // dangling id (FK is SET NULL, so a race at worst) falls
-                // through to the default; a read failure is logged so the
-                // fallthrough is observable.
-                let label = match db.effective_cast(&row) {
-                    Ok(cast) => cast.map(|c| c.label),
-                    Err(e) => {
-                        tracing::warn!("cast lookup for context {context_id} failed: {e}");
-                        None
-                    }
-                };
-                (row.context_type, label)
-            }
-            // No row / read failure: resolution still works (no cast, no
-            // type-matched slot). "coder" is not assumed — an empty type
-            // matches no slot role, which is the honest answer.
-            Ok(None) => (String::new(), None),
-            Err(e) => {
-                tracing::warn!("context row lookup for {context_id} failed: {e}");
-                (String::new(), None)
-            }
-        }
+        crate::model_resolution::context_model(&db, context_id)
+            .map_err(|e| format!("Could not read this context's model binding: {e}"))?
+            .into_model()?
     };
-    let provider_resolution: Result<(Arc<Provider>, String, u64, SlotTunables, StreamTimeouts, String, &'static str), String> = {
+    let context_type = bound.context_type.clone();
+    let max_output_tokens = bound.max_tokens;
+    let context_window = bound.context_window;
+    let tunables = bound.tunables.clone();
+    let model_name = bound.model.clone();
+    let backend_name = bound.backend.clone();
+    let (provider, stream_timeouts) = {
         let registry = kernel_arc.llm().read().await;
-        let max_tokens = registry.max_output_tokens();
-
-        // Explicit RPC param outranks the per-context override; both are
-        // "the context row's own model" as far as resolution is concerned.
-        let effective_model = model.or(ctx_model.as_deref());
-
-        match crate::resolve_context_model(
-            &context_type,
-            ctx_provider_name.as_deref(),
-            effective_model,
-            cast_label.as_deref(),
-            &registry,
-        ) {
-            Some(resolved) => match registry.get(&resolved.backend) {
-                Some(p) => {
-                    tracing::debug!(
-                        "model resolution for {context_id}: {}/{} via {:?}",
-                        resolved.backend,
-                        resolved.model,
-                        resolved.source
-                    );
-                    let timeouts = StreamTimeouts::resolve(
-                        kernel_arc.timeouts(),
-                        registry.backend_config(&resolved.backend),
-                    );
-                    let tunables = resolved.tunables_in(&registry);
-                    let tier = resolved.source.tier();
-                    Ok((p, resolved.model, max_tokens, tunables, timeouts, resolved.backend, tier))
-                }
-                // A resolved backend must be registered; falling back would
-                // send the pinned model name to a different provider.
-                None => Err(format!(
-                    "backend '{}' for this context is not registered (missing key? \
-                     see `kj backend list` / `kj backend show {}`)",
-                    resolved.backend, resolved.backend
-                )),
-            },
-            // The rule leads each message: an error block's summary keeps
-            // only the first 200 characters.
-            None if registry.list().is_empty() => Err(crate::kj::backend::NO_BACKEND_HINT.to_string()),
-            None => Err(
-                "No default LLM backend is set and this context names no model: set one \
-                 with `kj backend default set --backend <name> --model <model>`. \
-                 `kj backend list` shows the configured backends."
-                    .to_string(),
-            ),
-        }
-    };
-    let (provider, model_name, max_output_tokens, tunables, stream_timeouts, backend_name, model_tier) = match provider_resolution {
-        Ok(v) => v,
-        Err(detail) => {
-            tracing::error!("LLM resolution failed for context {context_id}: {detail}");
-            return Err(detail);
+        match registry.get(&backend_name) {
+            Some(p) => {
+                let timeouts = StreamTimeouts::resolve(kernel_arc.timeouts(), registry.backend_config(&backend_name));
+                (p, timeouts)
+            }
+            // A bound backend must be registered; no other backend stands in.
+            None => {
+                let detail = format!(
+                    "backend '{backend_name}' for this context is not registered (missing key? \
+                     see `kj backend list` / `kj backend show {backend_name}`)"
+                );
+                tracing::error!("LLM resolution failed for context {context_id}: {detail}");
+                return Err(detail);
+            }
         }
     };
 
@@ -722,7 +657,7 @@ pub(super) async fn spawn_admitted_turn(
         context_id: Some(context_id),
         context_label: ctx_label,
         context_state: ctx_state,
-        provider: ctx_provider_name.clone(),
+        provider: Some(backend_name.clone()),
         model: Some(model_name.clone()),
         performer: Some(performer.clone()),
         instance,
@@ -782,11 +717,12 @@ pub(super) async fn spawn_admitted_turn(
         turn_id,
         context_id,
         performer: performer.principal_id,
-        cast: cast_label.clone(),
+        instance: Some(bound.instance),
+        binding_seq: Some(bound.seq),
+        cast: bound.cast.clone(),
         role: context_type.clone(),
         provider: backend_name,
         model: model_name.clone(),
-        model_source: model_tier.to_string(),
         started_at: kaijutsu_types::now_millis() as i64,
     }) {
         tracing::error!("turn record for {turn_id} in {context_id} failed: {error}");
@@ -800,7 +736,7 @@ pub(super) async fn spawn_admitted_turn(
         let cancel = interrupt.clone();
         let run = process_llm_stream(
             provider, documents, context_id, model_name, kernel_arc, kernel_db,
-            tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts,
+            tools, after_block_id, system_prompt, max_output_tokens, context_window, stream_timeouts,
             tunables, conversation_cache, user_principal_id,
             Some(TurnProvenance { performer, reviewer, review_source: review.source }),
             tool_ctx, interrupt, turn_lease, origin,
@@ -865,10 +801,8 @@ fn retry_disposition(error: &LlmError) -> RetryDisposition {
         LlmError::InvalidRequest(_) => RetryDisposition::Permanent,
         // A bad or missing credential does not fix itself mid-turn.
         LlmError::AuthError(_) => RetryDisposition::Permanent,
-        // Constructed today only for "no default provider/model
-        // configured" (`LlmRegistry::prompt`, llm/mod.rs) — a static
-        // configuration gap, not a provider outage, so retrying the same
-        // missing configuration cannot help.
+        // A static configuration gap, not a provider outage, so retrying
+        // the same missing configuration cannot help.
         LlmError::Unavailable(_) => RetryDisposition::Permanent,
         // The provider is asking us to slow down; the existing backoff is
         // exactly the right response.
@@ -1302,13 +1236,12 @@ mod retry_disposition_tests {
         );
     }
 
-    /// As constructed today (`LlmRegistry::prompt`), `Unavailable` means no
-    /// default provider/model is configured — a static config gap, not an
-    /// outage that heals on retry.
+    /// `Unavailable` is a static configuration gap, not an outage that heals
+    /// on retry.
     #[test]
     fn unavailable_is_permanent() {
         assert_eq!(
-            retry_disposition(&LlmError::Unavailable("no default provider set".into())),
+            retry_disposition(&LlmError::Unavailable("no provider configured".into())),
             RetryDisposition::Permanent
         );
     }
@@ -2347,11 +2280,12 @@ async fn process_llm_stream(
     after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
+    // The binding's context window; `None` shows as unknown.
+    context_window: Option<u64>,
     // This backend's total and idle guards (`StreamTimeouts::resolve`).
     stream_timeouts: StreamTimeouts,
-    // The context's resolved cast-seat tunables (`resolve_context_model`),
-    // already cascaded onto `llm_defaults`; `None` when no cast seat answered
-    // (the floor then applies at the `apply_tunables` seam below).
+    // The binding slot's optional parameters. An unset one is omitted from
+    // the request.
     tunables: SlotTunables,
     conversation_cache: Arc<ConversationCache>,
     // The requester authors the TurnFlow outcome event; provider blocks
@@ -2395,7 +2329,7 @@ async fn process_llm_stream(
         // spare. `a_turn_future_stays_small` pins the size.
         let outcome = std::panic::AssertUnwindSafe(Box::pin(run_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
-            tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, tunables,
+            tools, after_block_id, system_prompt, max_output_tokens, context_window, stream_timeouts, tunables,
             conversation_cache, user_principal_id, provenance, tool_ctx, interrupt, origin,
             continuation_epoch, &mut *mailbox, &turn_lease,
         ))).catch_unwind().await;
@@ -2575,11 +2509,12 @@ async fn run_llm_stream(
     mut after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
+    // The binding's context window; `None` shows as unknown.
+    context_window: Option<u64>,
     // This backend's total and idle guards (`StreamTimeouts::resolve`).
     stream_timeouts: StreamTimeouts,
-    // The context's resolved cast-seat tunables (`resolve_context_model`),
-    // already cascaded onto `llm_defaults`; `None` when no cast seat answered
-    // (the floor then applies at the `apply_tunables` seam below).
+    // The binding slot's optional parameters. An unset one is omitted from
+    // the request.
     tunables: SlotTunables,
     conversation_cache: Arc<ConversationCache>,
     // The requester authors the TurnFlow outcome event; provider blocks
@@ -2721,12 +2656,6 @@ async fn run_llm_stream(
     // image resolution — the same `messages` the provider receives below.
     // See `warn_if_near_context_window` for the design rationale.
     {
-        let context_window = {
-            let registry = kernel.llm().read().await;
-            registry
-                .context_window_for_live(provider.name(), &model_name)
-                .await
-        };
         warn_if_near_context_window(
             &documents,
             context_id,
@@ -2855,12 +2784,9 @@ async fn run_llm_stream(
             }
         };
 
-        // The tunables were resolved with the model: cast slot, then the
-        // model's row, then the `llm_defaults` floor.
         let build_opts = apply_tunables(
-            BuildOpts::new(&model_name)
+            BuildOpts::new(&model_name, max_output_tokens)
                 .with_system(&system_prompt)
-                .with_max_tokens(max_output_tokens)
                 .with_tools(tools.clone())
                 .with_cache_breakpoints(cache_breakpoints),
             &tunables,
@@ -3958,6 +3884,7 @@ mod publish_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
             conversation_cache,
@@ -5754,6 +5681,7 @@ mod publish_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
             conversation_cache,
@@ -6704,7 +6632,7 @@ mod usage_tests {
         kernel_db.lock().begin_turn(&crate::TurnStart {
             turn_id: turn_lease.id(), context_id: ctx, performer: actor, cast: None,
             role: "default".into(), provider: "mock".into(), model: "mock-model".into(),
-            model_source: "default".into(), started_at: kaijutsu_types::now_millis() as i64,
+            instance: None, binding_seq: None, started_at: kaijutsu_types::now_millis() as i64,
         }).unwrap();
         process_llm_stream(
             provider,
@@ -6717,6 +6645,7 @@ mod usage_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
             conversation_cache,
@@ -7323,6 +7252,7 @@ mod error_child_anchor_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
             conversation_cache,
@@ -7526,6 +7456,7 @@ mod authorship_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
             conversation_cache,
@@ -7670,6 +7601,7 @@ mod gate_resume_cache_eviction_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             StreamTimeouts::from_policy(kernel.timeouts()),
             SlotTunables::default(),
             conversation_cache,
@@ -7867,7 +7799,6 @@ mod lifetime_tests {
     async fn start_fixture_turn(
         kernel: &Arc<Kernel>,
         context_admission: crate::runtime::admission::ContextAdmission,
-        model: Option<&str>,
         after_block_id: &kaijutsu_types::BlockId,
         tool_ctx: crate::ExecContext,
         user_principal_id: PrincipalId,
@@ -7885,7 +7816,7 @@ mod lifetime_tests {
             admission: context_admission, lease,
             request: crate::runtime::turn_request::TurnRequest {
                 context_id, after_block_id: *after_block_id, content: String::new(),
-                principal_id: user_principal_id, model: model.map(str::to_owned),
+                principal_id: user_principal_id,
                 continuation_epoch, score: None,
             },
             origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None, joins_live_turn: false,
@@ -7939,13 +7870,16 @@ mod lifetime_tests {
                 played_by: Some(actor), senpai_ctx: Some(senpai),
             }).unwrap();
             db.update_played_by(senpai, Some(reviewer)).unwrap();
+            // The performer's cast gives its binding a `default` slot only
+            // when a mock provider is wanted; without one the binding has
+            // no model.
+            if mock.is_some() {
+                db.seed_test_cast(actor, "mock", "mock-model", &["default"]).unwrap();
+            }
             db.update_played_by(context, Some(actor)).unwrap();
         }
         if let Some(mock) = mock {
-            let mut registry = kernel.llm().write().await;
-            registry.register("mock", Arc::new(Provider::Mock(mock)));
-            assert!(registry.set_default("mock"));
-            registry.set_default_model("mock-model");
+            kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));
         }
         let after = kernel.blocks().insert_block_as(context, None, None, Role::User,
             BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(reviewer)).unwrap();
@@ -7999,7 +7933,7 @@ mod lifetime_tests {
         let mut ended = kernel.turn_flows().subscribe("turn.*");
         let lease = kernel.turns().begin(context);
         let turn_id = lease.id();
-        spawn_admitted_turn(&kernel, context, None, &after, call.clone(), call.principal_id,
+        spawn_admitted_turn(&kernel, context, &after, call.clone(), call.principal_id,
             TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -8029,8 +7963,9 @@ mod lifetime_tests {
         assert_eq!(turn.start.performer, performer);
         assert_eq!(turn.start.role, "default");
         assert_eq!((turn.start.provider.as_str(), turn.start.model.as_str()), ("mock", "mock-model"));
-        assert_eq!(turn.start.model_source, "default");
-        assert_eq!(turn.start.cast, None);
+        let (instance, seq) = db.context_instance(context).unwrap().expect("the context has an instance");
+        assert_eq!((turn.start.instance, turn.start.binding_seq), (Some(instance), Some(seq)), "the row names the binding it ran on");
+        assert_eq!(turn.start.cast.as_deref(), Some("test-default-mock-mock-model"), "the row names the cast the binding was written from");
         assert!(turn.ended_at.is_some_and(|ended| ended >= turn.start.started_at));
         assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(
@@ -8080,9 +8015,9 @@ mod lifetime_tests {
         let performer = kernel.kernel_db().lock().get_context(context).unwrap().unwrap().played_by.unwrap();
         kernel.kernel_db().lock().begin_turn(&crate::TurnStart {
             turn_id: lease.id(), context_id: context, performer, cast: None, role: "default".into(),
-            provider: "mock".into(), model: "mock-model".into(), model_source: "default".into(), started_at: 1,
+            provider: "mock".into(), model: "mock-model".into(), instance: None, binding_seq: None, started_at: 1,
         }).unwrap();
-        let error = spawn_admitted_turn(&kernel, context, None, &after, call.clone(), call.principal_id,
+        let error = spawn_admitted_turn(&kernel, context, &after, call.clone(), call.principal_id,
             TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap_err();
         assert!(error.contains("turn record"), "{error}");
         assert!(!kernel.turn_in_flight(context));
@@ -8099,7 +8034,7 @@ mod lifetime_tests {
         let mut failed = kernel.turn_flows().subscribe("turn.*");
         let lease = kernel.turns().begin(context);
         let turn_id = lease.id();
-        spawn_admitted_turn(&kernel, context, None, &after, call.clone(), call.principal_id,
+        spawn_admitted_turn(&kernel, context, &after, call.clone(), call.principal_id,
             TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap();
         // The row is closed under the running turn, so its first count has nowhere to land.
         kernel.kernel_db().lock().finish_turn(turn_id, 1, "end_turn").unwrap();
@@ -8121,7 +8056,7 @@ mod lifetime_tests {
         let admission = kernel.admit_context(context).unwrap();
         let held = kernel.llm().write().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        let mut startup = Box::pin(start_fixture_turn(&kernel, admission, None,
+        let mut startup = Box::pin(start_fixture_turn(&kernel, admission,
             &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
         assert!(futures::poll!(&mut startup).is_pending());
         assert!(kernel.turn_in_flight(context), "accepted preparation owns its turn before provider selection");
@@ -8141,7 +8076,7 @@ mod lifetime_tests {
         let admission = kernel.admit_context(context).unwrap();
         let held = kernel.llm().write().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        let mut startup = Box::pin(start_fixture_turn(&kernel, admission, None,
+        let mut startup = Box::pin(start_fixture_turn(&kernel, admission,
             &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
         assert!(futures::poll!(&mut startup).is_pending());
         tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await.unwrap().unwrap();
@@ -8161,7 +8096,7 @@ mod lifetime_tests {
         let held = kernel.llm().write().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let mut startup = Box::pin(start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(),
-            None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
+            &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
         assert!(futures::poll!(&mut startup).is_pending());
         assert!(kernel.turns().interrupt(context, true));
         assert!(tokio::time::timeout(Duration::from_secs(1), startup).await.unwrap().is_err());
@@ -8178,7 +8113,7 @@ mod lifetime_tests {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("accepted answer"))).await;
         let held = kernel.llm().write().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        let startup = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None,
+        let startup = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(),
             &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None);
         tokio::pin!(startup);
         assert!(futures::poll!(&mut startup).is_pending(), "provider preparation is paused after admission");
@@ -8201,7 +8136,7 @@ mod lifetime_tests {
         let held = session.lock().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         for _ in 0..2 {
-            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         }
         assert_eq!(kernel.turns().active_count(context), 2);
@@ -8231,7 +8166,7 @@ mod lifetime_tests {
             let mut completed = kernel.turn_flows().subscribe("turn.completed");
             let TurnAdmission::Accepted { turn_id, work_id: Some(work) } = kernel.request_turn(TurnRequest {
                 context_id: context, after_block_id: after.clone(), content: String::new(),
-                principal_id: call.principal_id, model: None, continuation_epoch: None,
+                principal_id: call.principal_id, continuation_epoch: None,
                 score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
             }).unwrap() else { panic!("score admission must return its work ID") };
             assert_eq!(timeline.lock().status(work).unwrap().started_at, Some(Tick::ZERO));
@@ -8297,7 +8232,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let TurnAdmission::Accepted { .. } = kernel.request_turn(TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
             score: Some(crate::hyoushigi::model::ScoreIntent {
                 track, start: Tick::new(10), fallback: Fallback::Skip,
             }),
@@ -8329,7 +8264,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let request = TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
             score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
         };
         let TurnAdmission::Accepted { turn_id, work_id: Some(work) } = kernel.request_turn(request.clone()).unwrap()
@@ -8362,7 +8297,7 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
         assert!(kernel.request_turn(TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
             score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
         }).is_err());
         assert_eq!(timeline.lock().future_len(), 0);
@@ -8381,7 +8316,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let TurnAdmission::Accepted { work_id: Some(work), .. } = kernel.request_turn(TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
             score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
         }).unwrap() else { panic!("expected score admission") };
         let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
@@ -8413,7 +8348,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let TurnAdmission::Accepted { work_id: Some(work), .. } = kernel.request_turn(TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
             score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
         }).unwrap() else { panic!("expected score admission") };
         timeline.lock().advance_to(Tick::new(10));
@@ -8445,7 +8380,7 @@ mod lifetime_tests {
             kernel.request_turn(TurnRequest {
                 score: None,
                 context_id: context, after_block_id: after.clone(), content: String::new(),
-                principal_id: call.principal_id, model: None, continuation_epoch: None,
+                principal_id: call.principal_id, continuation_epoch: None,
             }).unwrap();
             let requested = serde_json::to_value(events.try_recv().unwrap().payload).unwrap();
             let id = requested["Requested"]["turn_id"].as_str()
@@ -8479,7 +8414,7 @@ mod lifetime_tests {
         let TurnAdmission::Accepted { turn_id: id, .. } = kernel.request_turn(TurnRequest {
             score: None,
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
         }).unwrap() else { panic!("explicit request must be admitted") };
         assert_eq!(events.try_recv().unwrap().payload.turn_id(), id);
         kernel.stop_runtime_worker();
@@ -8501,7 +8436,7 @@ mod lifetime_tests {
         let admission = kernel.request_turn(TurnRequest {
             score: None,
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
         }).unwrap();
         let TurnAdmission::Accepted { turn_id: admitted_id, .. } = admission else { panic!("turn was not admitted") };
         let first = events.recv().await.unwrap();
@@ -8537,7 +8472,7 @@ mod lifetime_tests {
         assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
 
         let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Text { content: "typed".into(), model: None }).await.unwrap_err();
+            crate::runtime::prompt::PromptSource::Text { content: "typed".into() }).await.unwrap_err();
         assert!(error.contains("No performer assigned"), "{error}");
         assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
         assert!(!kernel.turn_in_flight(context));
@@ -8552,16 +8487,16 @@ mod lifetime_tests {
         let (kernel, context, _after, call) = fixture(None).await;
         let mut flows = kernel.turn_flows().subscribe("turn.*");
         let block = crate::runtime::prompt::submit(&kernel, context, call.principal_id, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Text { content: "landed".into(), model: None }).await
+            crate::runtime::prompt::PromptSource::Text { content: "landed".into() }).await
             .expect("the input landed, so the submit succeeded");
 
         let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
         assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
         let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
         assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
-        assert!(errors[0].contains("No LLM backend is configured"), "{errors:?}");
-        assert!(errors[0].contains("`kj backend set`") && errors[0].contains("`kj backend default set`"),
-            "the error's summary says how to configure a backend: {errors:?}");
+        assert!(errors[0].contains("runs no model"), "{errors:?}");
+        assert!(errors[0].contains("kj character set") && errors[0].contains("kj context rotate"),
+            "the error's summary says how to give the character a model: {errors:?}");
         let failed = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let TurnFlow::Failed { .. } = flows.recv().await.unwrap().payload {
@@ -8583,7 +8518,7 @@ mod lifetime_tests {
         let context = bare_context(&kernel, call.principal_id);
         let after = kernel.blocks().insert_block_as(context, None, None, Role::User,
             BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(call.principal_id)).unwrap();
-        let error = spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
+        let error = spawn_admitted_turn(&kernel, context, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None, kernel.turns().begin(context),
             kernel.admit_context(context).unwrap()).await.unwrap_err();
         assert!(error.contains("No performer assigned"), "{error}");
@@ -8596,7 +8531,7 @@ mod lifetime_tests {
         let admission = kernel.request_turn(TurnRequest {
             score: None,
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
         }).unwrap();
         assert!(matches!(admission, TurnAdmission::Accepted { .. }));
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -8621,7 +8556,7 @@ mod lifetime_tests {
             let session = kernel.turns().conversations().get_or_create(context);
             let held = session.lock().await;
             let mut events = kernel.turn_flows().subscribe("turn.*");
-            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
             {
                 let db = kernel.kernel_db().lock();
@@ -8655,7 +8590,7 @@ mod lifetime_tests {
         assert_eq!(kernel.request_turn(TurnRequest {
             score: None,
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: Some(1),
+            principal_id: call.principal_id, continuation_epoch: Some(1),
         }).unwrap(), TurnAdmission::AlreadyActive);
         assert_eq!(kernel.turns().active_count(context), 1);
         assert!(events.try_recv().is_none());
@@ -8664,24 +8599,54 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
-    /// A kernel with a backend but no default names the verb that sets one,
-    /// rather than the advice for a kernel with no backend at all.
+    /// A binding with no slot for the context's type gives it no model. The
+    /// turn refuses before any provider work, naming the character, the cast,
+    /// the type and the fix, even with a provider registered.
+    ///
+    /// Falsified by a turn that falls back to any registered provider.
     #[tokio::test]
-    async fn a_turn_with_backends_but_no_default_says_to_set_the_default() {
-        let (kernel, context, after, call) = fixture(None).await;
+    async fn a_turn_whose_binding_has_no_slot_for_its_type_refuses_naming_the_fix() {
+        let (kernel, context, _after, call) = fixture(None).await;
         kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(MockClient::new("unused"))));
-        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        let successor = ContextId::new();
+        kernel.blocks().create_document(successor, DocumentKind::Conversation, None).unwrap();
+        let cast = {
+            let db = kernel.kernel_db().lock();
+            let performer = db.get_context(context).unwrap().unwrap().played_by.unwrap();
+            // A cast that holds a slot for another type, bound after the fact.
+            db.seed_test_cast(performer, "mock", "mock-model", &["musician"]).unwrap();
+            let instance = db.context_instance_row(context).unwrap().unwrap();
+            let ws = db.get_or_create_default_workspace(performer).unwrap();
+            db.insert_context_with_document(&crate::ContextRow {
+                context_id: successor, label: None, provider: None, model: None, system_prompt: None,
+                context_state: ContextState::Live, context_type: "default".into(), created_at: 0, created_by: performer,
+                forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
+                played_by: Some(performer), senpai_ctx: None,
+            }, ws).unwrap();
+            let cast = db.character_default_cast(performer).unwrap().unwrap();
+            db.append_binding(instance.instance_id, Some(cast.cast_id), None, successor).unwrap();
+            (successor, cast.label)
+        };
+        let (successor, cast_label) = cast;
+        let after = kernel.blocks().insert_block_as(successor, None, None, Role::User,
+            BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(call.principal_id)).unwrap();
+        let error = start_fixture_turn(&kernel, kernel.admit_context(successor).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
-        assert!(error.contains("No default LLM backend is set"), "{error}");
-        assert!(error.contains("kj backend default set --backend"), "{error}");
+        assert!(error.contains("performer"), "names the character: {error}");
+        assert!(error.contains(&cast_label), "names the cast: {error}");
+        assert!(error.contains("has no default slot"), "names the type: {error}");
+        assert!(error.contains("kj cast slot set") && error.contains("kj character set") && error.contains("kj context rotate"), "names the fix: {error}");
+        assert!(kernel.kernel_db().lock().list_turns(successor, 5).unwrap().is_empty(), "no turn was recorded");
     }
 
     #[tokio::test]
     async fn rejected_startup_leaves_no_interrupt() {
         let (kernel, context, after, call) = fixture(None).await;
-        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
-        assert!(error.contains("No LLM backend"), "{error}");
+        assert!(error.contains("runs no model"), "{error}");
         assert!(kernel.turns().active_count(context) == 0, "no task owns this interrupt");
         assert!(!kernel.turn_in_flight(context));
     }
@@ -8693,7 +8658,7 @@ mod lifetime_tests {
         let held = session.lock().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let local = tokio::task::LocalSet::new();
-        local.run_until(start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        local.run_until(start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None)).await.unwrap();
         assert!(kernel.turn_in_flight(context));
         drop(local);
@@ -8714,7 +8679,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
-            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
                 .expect("shutdown must drain accepted turns").unwrap();
@@ -8753,7 +8718,7 @@ mod lifetime_tests {
             let mut completed = kernel.turn_flows().subscribe("turn.completed");
             kernel.request_turn(TurnRequest {
                 context_id: context, after_block_id: after, content: String::new(), principal_id: call.principal_id,
-                model: None, continuation_epoch: None, score: None,
+                continuation_epoch: None, score: None,
             }).unwrap();
             if ending == "cancel" {
                 tokio::time::timeout(Duration::from_secs(3), async {
@@ -8830,7 +8795,7 @@ mod lifetime_tests {
                 let session = kernel.turns().conversations().get_or_create(context);
                 let held = session.lock().await;
                 let mut terminal = kernel.turn_flows().subscribe("turn.*");
-                start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+                start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
                 kernel.blocks().arm_accept_fault(match refused { "call" => 1, "result" => 2, _ => 0 });
                 drop(held);
                 let event = tokio::time::timeout(Duration::from_secs(3), terminal.recv()).await.unwrap().unwrap().payload;
@@ -9044,7 +9009,7 @@ mod lifetime_tests {
             documents: kernel.blocks().clone() }), InstancePolicy::default()).await.unwrap();
         kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
         let mut failures = kernel.turn_flows().subscribe("turn.failed");
-        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.expect("fault must interrupt the pending sibling").unwrap();
         let blocks = kernel.blocks().block_snapshots(context).unwrap();
         let sibling = blocks.iter().find(|block| block.kind == BlockKind::ToolResult
@@ -9090,7 +9055,7 @@ mod lifetime_tests {
             kernel.broker().register(Arc::new(PanickingTool { id: instance.clone(), cancel: cancel.clone() }), InstancePolicy::default()).await.unwrap();
             kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
             let mut failures = kernel.turn_flows().subscribe("turn.failed");
-            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.unwrap().unwrap();
             let blocks = kernel.blocks().block_snapshots(context).unwrap();
@@ -9115,14 +9080,14 @@ mod lifetime_tests {
                 let TurnAdmission::Accepted { turn_id: id, .. } = kernel.request_turn(TurnRequest {
                     score: None,
                     context_id: context, after_block_id: after, content: String::new(),
-                    principal_id: call.principal_id, model: None, continuation_epoch: None,
+                    principal_id: call.principal_id, continuation_epoch: None,
                 }).unwrap() else { panic!("explicit request must be admitted") };
                 assert_eq!(requested.try_recv().unwrap().payload.turn_id(), id);
                 id
             } else {
                 let lease = kernel.turns().begin(context);
                 let id = lease.id();
-                spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
+                spawn_admitted_turn(&kernel, context, &after, call.clone(),
                     call.principal_id, TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap();
                 id
             };
@@ -9141,7 +9106,7 @@ mod lifetime_tests {
     async fn stopped_worker_refuses_turn_without_leaving_state() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("unused"))).await;
         kernel.shutdown_runtime_worker().await.unwrap();
-        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("shut down"), "{error}");
         assert!(!kernel.turn_in_flight(context));
@@ -9156,7 +9121,7 @@ mod lifetime_tests {
         let session = kernel.turns().conversations().get_or_create(context);
         let held = session.lock().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
             .expect("queued turn must cancel without acquiring the held lock").unwrap();
@@ -9175,7 +9140,7 @@ mod lifetime_tests {
         ]]).hangs_when_exhausted();
         let (kernel, context, after, call) = fixture(Some(mock)).await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -9200,7 +9165,7 @@ mod lifetime_tests {
         mock.stream_start_delay = Duration::from_secs(5);
         let (kernel, context, after, call) = fixture(Some(mock)).await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -9263,7 +9228,7 @@ mod lifetime_tests {
         kernel.broker().register(Arc::new(PokeTool { id: instance.clone() }), InstancePolicy::default()).await.unwrap();
         kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         let event = tokio::time::timeout(Duration::from_secs(20), completed.recv()).await
             .expect(&format!("a turn with no iteration cap must still finish after {ROUNDS} tool rounds"))
@@ -9288,7 +9253,7 @@ mod lifetime_tests {
 
     async fn submit_text(kernel: &Arc<Kernel>, context: ContextId, principal: PrincipalId, text: &str) -> BlockId {
         crate::runtime::prompt::submit(kernel, context, principal, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Text { content: text.into(), model: None }).await.unwrap()
+            crate::runtime::prompt::PromptSource::Text { content: text.into() }).await.unwrap()
     }
 
     fn done(stop: &str) -> StreamEvent {
@@ -9560,7 +9525,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let TurnAdmission::Accepted { .. } = kernel.request_turn(TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
-            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            principal_id: call.principal_id, continuation_epoch: None,
             score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
         }).unwrap() else { panic!("score admission must be accepted") };
         tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
@@ -9800,7 +9765,7 @@ mod lifetime_tests {
         let (kernel, context, after, call) = fixture(Some(mock)).await;
         offer_system_messages(&kernel, context).await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Autonomous, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
         complete_in(&kernel, context, "Shell operation op-1 completed", false);
@@ -9897,7 +9862,6 @@ mod lifetime_tests {
         start_fixture_turn(
             &kernel,
             kernel.admit_context(context).unwrap(),
-            None,
             &after,
             call.clone(),
             call.principal_id,

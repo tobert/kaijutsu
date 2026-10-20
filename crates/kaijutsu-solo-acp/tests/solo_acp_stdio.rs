@@ -52,8 +52,15 @@ fn mock_scripts(case: &str) -> PathBuf {
         .join(case)
 }
 
-/// The binary with the mock backend and the scripted model `case`.
+/// The binary with the mock backend and the scripted model `case`, and an
+/// output budget: every request carries `max_tokens`, and the mock model's row
+/// sets none.
 fn mock_command(case: &str) -> AgentCommand {
+    mock_command_without_budget(case).arg("--max-tokens").arg("4096")
+}
+
+/// [`mock_command`] without `--max-tokens`.
+fn mock_command_without_budget(case: &str) -> AgentCommand {
     AgentCommand::new(BIN)
         .arg("--backend-kind")
         .arg("mock")
@@ -377,6 +384,8 @@ fn an_unusable_mount_refuses_the_boot() {
             .arg("mock")
             .arg("--model")
             .arg("solo-mock")
+            .arg("--max-tokens")
+            .arg("4096")
             .args(args)
             .env("TMPDIR", scratch_dir("tmp"))
             .output()
@@ -408,7 +417,7 @@ fn an_unusable_mount_refuses_the_boot() {
 #[test]
 fn an_unusable_unlist_refuses_the_boot() {
     let output = Command::new(BIN)
-        .args(["--backend-kind", "mock", "--model", "solo-mock", "--unlist", "logs"])
+        .args(["--backend-kind", "mock", "--model", "solo-mock", "--max-tokens", "4096", "--unlist", "logs"])
         .env("TMPDIR", scratch_dir("tmp"))
         .output()
         .unwrap_or_else(|e| panic!("run --unlist logs: {e}"));
@@ -788,6 +797,8 @@ fn an_unusable_rc_overlay_refuses_the_boot() {
             .arg("mock")
             .arg("--model")
             .arg("solo-mock")
+            .arg("--max-tokens")
+            .arg("4096")
             .arg("--rc-overlay")
             .arg(overlay)
             .env("TMPDIR", scratch_dir("tmp"))
@@ -990,17 +1001,19 @@ fn proc_environ_is_unreadable_to_same_uid_readers() {
     }
 }
 
-/// `--max-tokens` writes into `llm_defaults.max_tokens`
-/// (`kaijutsu_kernel::kernel_db::LlmDefaultsRow`), a plain DB row rather than
-/// something the ACP wire reports — so this reads it back through the
-/// library the kernel itself uses, from a state directory the binary was
-/// told to keep.
+/// `--max-tokens` lands on the chosen model's `backend_models` row, a plain
+/// DB row rather than something the ACP wire reports — so this reads it back
+/// through the library the kernel itself uses, from a state directory the
+/// binary was told to keep.
 #[test]
-fn max_tokens_overrides_the_written_defaults_row() {
+fn max_tokens_lands_on_the_chosen_models_row() {
     let state = scratch_dir("max-tokens-state").join("state");
-    let mut agent = spawn_mock_with(
-        "chat",
-        &["--state-dir", state.to_str().expect("utf-8 state path"), "--max-tokens", "4096"],
+    let mut agent = spawn(
+        mock_command_without_budget("chat")
+            .arg("--state-dir")
+            .arg(state.to_str().expect("utf-8 state path"))
+            .arg("--max-tokens")
+            .arg("2048"),
     );
     agent.initialize().expect("initialize");
 
@@ -1009,38 +1022,34 @@ fn max_tokens_overrides_the_written_defaults_row() {
 
     let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
         .expect("reopen the kernel db the binary just closed");
-    let defaults = db
-        .get_llm_defaults()
-        .expect("read the model defaults")
-        .expect("the binary wrote a defaults row");
-    assert_eq!(
-        defaults.max_tokens,
-        Some(4096),
-        "--max-tokens 4096 must land in the written defaults row"
-    );
+    let backend = db.get_backend_by_name("mock").unwrap().expect("the mock backend row");
+    let row = db
+        .list_backend_models(backend.backend_id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.model_id == "solo-mock")
+        .expect("the chosen model's row");
+    assert_eq!(row.tunables.max_tokens, Some(2048), "--max-tokens 2048 must land on the model's row");
 }
 
-/// Without the flag, the defaults row carries the 16384 `docs/solo-acp.md`
-/// documents.
+/// A model whose row sets no output budget refuses the start until
+/// `--max-tokens` names one: every request carries `max_tokens`, and
+/// kaijutsu supplies none.
+///
+/// Falsified by a default budget for a model with none.
 #[test]
-fn without_max_tokens_the_written_defaults_row_carries_16384() {
-    let state = scratch_dir("max-tokens-default-state").join("state");
-    let mut agent = spawn_mock_with(
-        "chat",
-        &["--state-dir", state.to_str().expect("utf-8 state path")],
-    );
-    agent.initialize().expect("initialize");
-
-    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
-    assert_eq!(status.code(), Some(0));
-
-    let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
-        .expect("reopen the kernel db the binary just closed");
-    let defaults = db
-        .get_llm_defaults()
-        .expect("read the model defaults")
-        .expect("the binary wrote a defaults row");
-    assert_eq!(defaults.max_tokens, Some(16384), "16384 stands unless asked");
+fn without_a_budget_the_start_is_refused_naming_the_flag() {
+    let output = Command::new(BIN)
+        .arg("--backend-kind")
+        .arg("mock")
+        .arg("--model")
+        .arg("solo-mock")
+        .env("TMPDIR", scratch_dir("tmp"))
+        .output()
+        .expect("run the binary");
+    assert!(!output.status.success(), "a model with no output budget must refuse the start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--max-tokens"), "the refusal names the flag: {stderr}");
 }
 
 #[test]

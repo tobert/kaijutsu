@@ -74,8 +74,10 @@ pub(crate) struct KohaiArgs {
 enum KohaiCommand {
     /// Start an instance of a character, with a new context as its
     /// conversation, that answers to this context's instance. Label is
-    /// positional or `--name`. Needs the operator capability and a live
-    /// character caller.
+    /// positional or `--name`. The new context runs the model in the
+    /// character's cast slot for its type, bound now; the output says when
+    /// the cast has none. Needs the operator capability and a live character
+    /// caller.
     #[command(alias = "new")]
     Create {
         /// Label (positional form; or use --name)

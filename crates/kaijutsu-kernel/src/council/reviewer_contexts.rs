@@ -133,7 +133,6 @@ mod tests {
 
     const REVIEWER_CONTEXTS_ON: &str = r#"
 [council]
-server = "http://127.0.0.1:1"
 contexts = ["council-system"]
 reviewer_contexts = true
 pool = { method = "loglinear", weights = "mass" }

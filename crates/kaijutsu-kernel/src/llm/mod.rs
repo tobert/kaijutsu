@@ -45,7 +45,7 @@ pub mod system_prompt;
 
 // Re-export key types
 pub use config::{
-    BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo, ResolvedSlot,
+    BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo,
     SUPPORTED_BACKEND_KINDS, SlotTunables, unknown_backend_kind_message,
 };
 pub use db_config::{build_llm_registry, load_embedding_config};
@@ -799,13 +799,13 @@ impl CodexAppClient {
         Ok(ProviderStream::Codex(CodexStream { client }))
     }
 
-    async fn prompt(&self, model: &str, system: Option<&str>, prompt: &str) -> LlmResult<String> {
+    async fn prompt(&self, model: &str, max_tokens: u64, system: Option<&str>, prompt: &str) -> LlmResult<String> {
         let mut stream = self
             .stream(
                 BuildOpts {
                     model: model.to_string(),
                     system: system.map(str::to_owned),
-                    ..BuildOpts::new(model)
+                    ..BuildOpts::new(model, max_tokens)
                 },
                 vec![Message::user(prompt)],
             )
@@ -1061,12 +1061,6 @@ impl Provider {
         }
     }
 
-    /// One-shot prompt — sends a single user message.
-    #[tracing::instrument(skip(self, prompt), fields(llm.model = %model, llm.provider = self.name()))]
-    pub async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String> {
-        self.prompt_with_system(model, None, prompt).await
-    }
-
     /// One-shot prompt with optional system preamble.
     ///
     /// Claude / DeepSeek / OpenAi hit their provider; Mock returns its
@@ -1078,15 +1072,16 @@ impl Provider {
     pub async fn prompt_with_system(
         &self,
         model: &str,
+        max_tokens: u64,
         system: Option<&str>,
         prompt: &str,
     ) -> LlmResult<String> {
         match self {
-            Self::Claude(client) => client.prompt(model, system, prompt).await,
-            Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
-            Self::OpenAi(client) => client.prompt(model, system, prompt).await,
-            Self::CodexApp(client) => client.prompt(model, system, prompt).await,
-            Self::Mk(client) => client.prompt(model, system, prompt).await,
+            Self::Claude(client) => client.prompt(model, max_tokens, system, prompt).await,
+            Self::DeepSeek(client) => client.prompt(model, max_tokens, system, prompt).await,
+            Self::OpenAi(client) => client.prompt(model, max_tokens, system, prompt).await,
+            Self::CodexApp(client) => client.prompt(model, max_tokens, system, prompt).await,
+            Self::Mk(client) => client.prompt(model, max_tokens, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 if !mock.delay.is_zero() {
@@ -1326,29 +1321,18 @@ impl ProviderStream {
 #[derive(Default)]
 pub struct LlmRegistry {
     providers: HashMap<String, Arc<Provider>>,
-    default_provider: Option<String>,
-    default_model: Option<String>,
     model_aliases: HashMap<String, config::ModelAlias>,
     backends: HashMap<String, BackendConfig>,
-    /// The `llm_defaults` tunable floor a cast slot cascades onto.
-    default_tunables: SlotTunables,
-    /// Resolved cast slots keyed by `(cast_label_lowercase, role)`. Stored so
-    /// Track B can ask "what does cast X say for role Y" without a DB hop on
-    /// the turn path.
-    cast_slots: HashMap<(String, String), ResolvedSlot>,
 }
 
 impl std::fmt::Debug for LlmRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmRegistry")
             .field("providers", &self.providers.keys().collect::<Vec<_>>())
-            .field("default_provider", &self.default_provider)
-            .field("default_model", &self.default_model)
             .field(
                 "model_aliases",
                 &self.model_aliases.keys().collect::<Vec<_>>(),
             )
-            .field("casts", &self.cast_labels())
             .finish()
     }
 }
@@ -1369,63 +1353,6 @@ impl LlmRegistry {
         self.providers.get(name).cloned()
     }
 
-    /// Set the default provider.
-    pub fn set_default(&mut self, name: &str) -> bool {
-        if self.providers.contains_key(name) {
-            self.default_provider = Some(name.to_string());
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get the default provider name.
-    pub fn default_provider_name(&self) -> Option<&str> {
-        self.default_provider.as_deref()
-    }
-
-    /// Set the default model.
-    pub fn set_default_model(&mut self, model: impl Into<String>) {
-        self.default_model = Some(model.into());
-    }
-
-    /// Get the default provider.
-    pub fn default_provider(&self) -> Option<Arc<Provider>> {
-        self.default_provider
-            .as_ref()
-            .and_then(|name| self.get(name))
-    }
-
-    /// Get the default model.
-    pub fn default_model(&self) -> Option<&str> {
-        self.default_model.as_deref()
-    }
-
-    /// Maximum RESPONSE tokens, from `llm_defaults.max_tokens`, falling back
-    /// to 64000 when unset.
-    ///
-    /// Set generously — the API enforces per-model ceilings. This is the
-    /// floor; a model row's or a cast slot's own `max_tokens` overrides it
-    /// (see [`Self::model_tunables`]).
-    pub fn max_output_tokens(&self) -> u64 {
-        self.default_tunables.max_tokens.unwrap_or(64000)
-    }
-
-    /// The `llm_defaults` tunable floor.
-    pub fn default_tunables(&self) -> &SlotTunables {
-        &self.default_tunables
-    }
-
-    /// A model's tunables on a backend: its `backend_models` row over the
-    /// `llm_defaults` floor, field by field. A model or backend with no row
-    /// gets the floor. A cast slot overlays this in turn.
-    pub fn model_tunables(&self, backend: &str, model: &str) -> SlotTunables {
-        match self.backends.get(backend).and_then(|b| b.model_tunables(model)) {
-            Some(own) => own.over(&self.default_tunables),
-            None => self.default_tunables.clone(),
-        }
-    }
-
     /// Get a backend's config by name.
     pub fn backend_config(&self, name: &str) -> Option<&BackendConfig> {
         self.backends.get(name)
@@ -1443,78 +1370,16 @@ impl LlmRegistry {
         self.backends = backends.into_iter().map(|b| (b.name.clone(), b)).collect();
     }
 
-    /// Install the `llm_defaults` tunable floor.
-    pub fn set_default_tunables(&mut self, tunables: SlotTunables) {
-        self.default_tunables = tunables;
-    }
-
-    /// Install the resolved cast slots (registry construction).
-    pub fn set_cast_slots(&mut self, slots: Vec<(String, ResolvedSlot)>) {
-        self.cast_slots = slots
-            .into_iter()
-            .map(|(cast, slot)| ((cast.to_lowercase(), slot.role.clone()), slot))
-            .collect();
-    }
-
-    /// One cast's seat for a role, with its model row and the `llm_defaults`
-    /// floor already applied. Cast labels are case-insensitive (matching the
-    /// UNIQUE collation); roles are exact.
-    pub fn resolved_slot(&self, cast: &str, role: &str) -> Option<&ResolvedSlot> {
-        self.cast_slots.get(&(cast.to_lowercase(), role.to_string()))
-    }
-
-    /// Every configured cast label, sorted.
-    pub fn cast_labels(&self) -> Vec<String> {
-        let mut labels: Vec<String> = self
-            .cast_slots
-            .keys()
-            .map(|(cast, _)| cast.clone())
-            .collect();
-        labels.sort();
-        labels.dedup();
-        labels
-    }
-
     /// Configured context window for a resolved `(provider, model)` pair,
     /// or `None` when unconfigured.
     ///
-    /// This is the one resolution path for "how big is this model's
-    /// context window" — it reads the same `provider_configs` that
-    /// [`Self::provider_config`] and `kj model`/`kj models` already resolve
-    /// through, so there is no second alias-aware lookup that could
-    /// disagree with it. Callers pass an
-    /// already-resolved provider + model (e.g. the context row's columns,
-    /// or the registry default), not an alias name. `None` must be
-    /// rendered as an explicit "unknown" by every caller — never a
-    /// fabricated default.
+    /// A catalog read, for discovery (`kj models`, `kj backend show`): a
+    /// turn's window comes from its binding slot, copied from this row when
+    /// the binding was written. Callers pass an already-resolved provider +
+    /// model, not an alias name. `None` must be rendered as an explicit
+    /// "unknown" by every caller — never a fabricated default.
     pub fn context_window_for(&self, provider_name: &str, model: &str) -> Option<u64> {
         self.backend_config(provider_name)?.context_window(model)
-    }
-
-    /// Live-lookup variant of [`Self::context_window_for`].
-    ///
-    /// Precedence: the config-declared `context_window` (backend_models) is
-    /// checked FIRST and, when present, returned immediately — config is
-    /// always the override, and no network is attempted if it hits. Only
-    /// when config has no entry does this ask the provider: Anthropic's live
-    /// `GET /v1/models/{id}` (see `claude::Client::context_window`, which
-    /// caches the result for the process lifetime), or an mk service's
-    /// `max_context` (see `mk::Client::context_window`). Every other
-    /// provider — including an unregistered one — falls through to `None`,
-    /// exactly as [`Self::context_window_for`] already did.
-    ///
-    /// Never fabricates: a live-lookup failure degrades to `None` (logged
-    /// by the client at `warn`), never a guessed number. Callers must keep
-    /// treating `None` as an honest "unknown" — never substitute a default.
-    pub async fn context_window_for_live(&self, provider_name: &str, model: &str) -> Option<u64> {
-        if let Some(window) = self.context_window_for(provider_name, model) {
-            return Some(window);
-        }
-        match self.get(provider_name).as_deref() {
-            Some(Provider::Claude(client)) => client.context_window(model).await,
-            Some(Provider::Mk(client)) => client.context_window(model).await,
-            _ => None,
-        }
     }
 
     /// Set model aliases. Keys are normalized to lowercase so lookups match
@@ -1550,17 +1415,6 @@ impl LlmRegistry {
             .map(|a| (a.backend.as_str(), a.model.as_str()))
     }
 
-    // `resolve_model` lived here and is deliberately GONE (2026-08-12). It
-    // resolved an alias, and on a miss silently pinned the bare name onto the
-    // registry's *default provider* — the sharp edge behind the 2026-07-04
-    // cross-provider distill bug, which was fixed by routing around it rather
-    // than by changing it. Every caller has since migrated to
-    // `kj::parse::resolve_model_choice`, which parses the `provider/model`
-    // slash form and refuses to guess a provider. The old function was left
-    // with zero callers, which made it a loaded name waiting to be reached
-    // for. Use `resolve_model_choice`; if you need alias-only resolution,
-    // `resolve_alias` is right here and does not invent a provider.
-
     /// List all registered providers.
     pub fn list(&self) -> Vec<&str> {
         self.providers.keys().map(|s| s.as_str()).collect()
@@ -1587,21 +1441,6 @@ impl LlmRegistry {
         models
     }
 
-    /// Quick prompt using default provider and model.
-    #[tracing::instrument(skip(self, prompt))]
-    pub async fn prompt(&self, prompt: &str) -> LlmResult<String> {
-        let provider = self
-            .default_provider()
-            .ok_or_else(|| LlmError::Unavailable("no default provider set".into()))?;
-
-        let model = self
-            .default_model
-            .as_deref()
-            .or_else(|| provider.available_models().first().copied())
-            .ok_or_else(|| LlmError::Unavailable("no default model set".into()))?;
-
-        provider.prompt(model, prompt).await
-    }
 }
 
 // ============================================================================
@@ -1883,7 +1722,7 @@ mod tests {
         let provider = Provider::Mock(mock);
 
         let mut coder_stream = provider
-            .stream(BuildOpts::new("mock-coder"), vec![Message::user("go")])
+            .stream(BuildOpts::new("mock-coder", 4096), vec![Message::user("go")])
             .await
             .expect("coder stream starts");
         let mut coder_events = Vec::new();
@@ -1916,7 +1755,7 @@ mod tests {
         );
 
         let mut banto_stream = provider
-            .stream(BuildOpts::new("mock-banto"), vec![Message::user("go")])
+            .stream(BuildOpts::new("mock-banto", 4096), vec![Message::user("go")])
             .await
             .expect("banto stream starts");
         let mut banto_saw_tool_use = false;
@@ -1952,7 +1791,7 @@ mod tests {
         let mock = MockClient::new("unused").with_script_dir(dir.path());
         let provider = Provider::Mock(mock);
         let _ = provider
-            .stream(BuildOpts::new("mock-missing"), vec![Message::user("go")])
+            .stream(BuildOpts::new("mock-missing", 4096), vec![Message::user("go")])
             .await
             .expect("stream() itself does not fail — the panic is inside next dispatch")
             .next_event()
@@ -1981,12 +1820,12 @@ mod tests {
         let mock = MockClient::new("unused").with_script_dir(dir.path());
         let provider = Provider::Mock(mock);
         provider
-            .stream(BuildOpts::new("mock-coder"), vec![Message::user("go")])
+            .stream(BuildOpts::new("mock-coder", 4096), vec![Message::user("go")])
             .await
             .expect("first stream call");
         // Second call for the same model: the queue is now empty.
         provider
-            .stream(BuildOpts::new("mock-coder"), vec![Message::user("go again")])
+            .stream(BuildOpts::new("mock-coder", 4096), vec![Message::user("go again")])
             .await
             .expect("second stream call panics inside, not here");
     }
@@ -2004,7 +1843,7 @@ mod tests {
         let config = config::BackendConfig::new("mock", config::BackendKind::Mock);
         let provider = Provider::from_backend(&config, &endpoint::Endpoints::default()).expect("build mock provider");
         let mut stream = provider
-            .stream(BuildOpts::new("mock-model"), vec![Message::user("go")])
+            .stream(BuildOpts::new("mock-model", 4096), vec![Message::user("go")])
             .await
             .expect("stream starts");
         let mut saw_text = String::new();
@@ -2162,9 +2001,8 @@ mod tests {
         let mut registry = LlmRegistry::new();
         let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
         registry.register("anthropic", provider);
-        registry.set_default("anthropic");
 
-        assert!(registry.default_provider().is_some());
+        assert!(registry.get("anthropic").is_some());
         assert_eq!(registry.list(), vec!["anthropic"]);
     }
 
@@ -2173,7 +2011,6 @@ mod tests {
         let mut registry = LlmRegistry::new();
         let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
         registry.register("anthropic", provider);
-        registry.set_default("anthropic");
 
         let mut aliases = HashMap::new();
         aliases.insert(
@@ -2245,8 +2082,6 @@ mod tests {
         assert_eq!(registry.context_window_for("anthropic", "anything"), None);
     }
 
-    // ── context_window_for_live: config override / live fallback / seam ──
-
     mod reasoning_builder_tests {
         use super::super::*;
 
@@ -2286,175 +2121,6 @@ mod tests {
                 Vec::new(),
             );
             assert!(reasoning_blocks(&message).is_empty());
-        }
-    }
-
-    mod context_window_for_live_tests {
-        use super::*;
-        use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
-
-        /// Build a registry with a `Provider::Claude` registered under
-        /// "anthropic", backed by `fake` instead of the real HTTP source —
-        /// the test seam. The backend map starts empty; tests add entries via
-        /// `set_backends` when they need to exercise the override-wins path.
-        fn registry_with_fake_claude(fake: FakeModelCapabilitySource) -> LlmRegistry {
-            let mut registry = LlmRegistry::new();
-            let client = claude::Client::new("fake-key").with_capability_source(Arc::new(fake));
-            registry.register("anthropic", Arc::new(Provider::Claude(client)));
-            registry
-        }
-
-        /// An mk backend's window is the service's `max_context`, read live,
-        /// so the context-window warning has a number for it.
-        ///
-        /// Falsified by a registry that answers `None` for an mk provider.
-        #[tokio::test]
-        async fn an_mk_backend_reports_the_service_window() {
-            let model = include_str!("../../../kaijutsu-mk/tests/fixtures/mk_model.json");
-            let (base, _) = kaijutsu_mk::test_server::serve(vec![kaijutsu_mk::test_server::reply(200, model)]).await;
-            let client = mk::Client::new("zorak-mk", &base, std::time::Duration::from_secs(5), HashMap::new()).unwrap();
-            let mut registry = LlmRegistry::new();
-            registry.register("zorak-mk", Arc::new(Provider::Mk(client)));
-            assert_eq!(registry.context_window_for_live("zorak-mk", "qwen").await, Some(32768));
-        }
-
-        #[tokio::test]
-        async fn config_override_wins_no_live_call_attempted() {
-            // The fake would answer with a DIFFERENT window than config —
-            // if the live path were consulted at all, this test would catch
-            // it via the mismatched value, and `call_count` pins it down
-            // directly: config must win WITHOUT ever touching the seam.
-            let fake = FakeModelCapabilitySource::always_none()
-                .with_response("claude-opus-4-8", Ok(Some(999)));
-            let mut registry = registry_with_fake_claude(fake);
-            let mut cfg = BackendConfig::new("anthropic", BackendKind::Anthropic);
-            cfg.models.insert(
-                "claude-opus-4-8".to_string(),
-                config::ModelInfo {
-                    context_window: Some(1_000_000),
-                    extra: None,
-                    tunables: Default::default(),
-                },
-            );
-            registry.set_backends(vec![cfg]);
-
-            let window = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
-            assert_eq!(
-                window,
-                Some(1_000_000),
-                "config value must win over the live fake's Some(999)"
-            );
-
-            // A second call also stays on the config value — proving config
-            // short-circuits every time, not just once before a cache warms.
-            let window_again = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
-            assert_eq!(window_again, Some(1_000_000));
-        }
-
-        #[tokio::test]
-        async fn live_value_used_when_config_absent_and_cached_on_second_call() {
-            let fake = FakeModelCapabilitySource::always_none()
-                .with_response("claude-sonnet-4-20250514", Ok(Some(200_000)));
-            let registry = registry_with_fake_claude(fake);
-            // No provider_configs at all — the honest gap this closes.
-
-            let window = registry
-                .context_window_for_live("anthropic", "claude-sonnet-4-20250514")
-                .await;
-            assert_eq!(
-                window,
-                Some(200_000),
-                "live lookup must supply the window when config has no entry"
-            );
-
-            // Second call must hit the client-side cache, not the fake again.
-            // We can't reach into the trait object's call_count from here
-            // (it's type-erased behind Arc<dyn ModelCapabilitySource>), so
-            // this is covered directly at the `claude::Client` level in
-            // `claude/mod.rs`'s own tests; here we just confirm the value is
-            // stable across repeated calls.
-            let window_again = registry
-                .context_window_for_live("anthropic", "claude-sonnet-4-20250514")
-                .await;
-            assert_eq!(window_again, Some(200_000));
-        }
-
-        #[tokio::test]
-        async fn unknown_model_stays_none_when_live_says_none() {
-            // Fake's default is Ok(None) for anything unscripted — mirrors a
-            // real 404 from the live API for a model id that doesn't exist.
-            let fake = FakeModelCapabilitySource::always_none();
-            let registry = registry_with_fake_claude(fake);
-
-            let window = registry
-                .context_window_for_live("anthropic", "definitely-not-a-real-model")
-                .await;
-            assert_eq!(window, None, "unknown model must resolve to None, never a guess");
-        }
-
-        #[tokio::test]
-        async fn live_lookup_failure_degrades_to_none_never_panics() {
-            let fake = FakeModelCapabilitySource::always_none().with_response(
-                "claude-opus-4-8",
-                Err(LlmError::NetworkError("connection refused".into())),
-            );
-            let registry = registry_with_fake_claude(fake);
-
-            let window = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
-            assert_eq!(
-                window, None,
-                "a network/auth failure must degrade to None, never fabricate a window"
-            );
-        }
-
-        #[tokio::test]
-        async fn non_claude_provider_falls_through_to_none_additive_not_replacement() {
-            // Non-Anthropic providers keep the config-only path — the live
-            // fallback is Anthropic-specific and must not silently apply to
-            // (say) DeepSeek just because a Claude client happens to also be
-            // registered under a different name.
-            let mut registry = LlmRegistry::new();
-            registry.register(
-                "deepseek",
-                Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))),
-            );
-            let window = registry
-                .context_window_for_live("deepseek", "deepseek-v4-pro")
-                .await;
-            assert_eq!(
-                window, None,
-                "non-Claude provider with no config entry must stay None, not attempt a live lookup"
-            );
-        }
-
-        #[tokio::test]
-        async fn both_null_together_invariant_holds_through_live_path() {
-            // Mirrors the kernel_db `context_used_pct` both-null-together
-            // guard, but exercised through the live-fallback resolution
-            // itself: when the live lookup resolves None, the percentage
-            // computed from it must also be None, never a fabricated 0%/NaN.
-            let fake = FakeModelCapabilitySource::always_none();
-            let registry = registry_with_fake_claude(fake);
-            let window = registry.context_window_for_live("anthropic", "unknown-model").await;
-            assert_eq!(window, None);
-
-            let usage = crate::kernel_db::ContextUsageRow {
-                context_id: kaijutsu_types::ContextId::new(),
-                provider: "anthropic".into(),
-                model: "unknown-model".into(),
-                input_tokens: 1000,
-                output_tokens: 200,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 0,
-                cache_ttl_secs: 0,
-                updated_at: 1,
-            };
-            let pct = crate::kernel_db::context_used_pct(&usage, window);
-            assert_eq!(
-                pct, None,
-                "window=None must yield pct=None — both null together, never a guessed pct"
-            );
         }
     }
 

@@ -22,7 +22,6 @@ use crate::kernel_db::ContextRow;
 use crate::llm::splice::{SpliceItem, plan_splice};
 
 use super::effect::{Classify, Effect};
-use super::parse::resolve_model_choice;
 use super::{KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug, Default)]
@@ -34,7 +33,7 @@ pub(crate) struct ForkArgs {
     /// Seed prompt; drives the child's turn
     #[arg(long)]
     prompt: Option<String>,
-    /// Preset to apply to the child
+    /// Preset whose fork filters select what the child copies
     #[arg(long)]
     preset: Option<String>,
     /// Working directory for the forked context's shell: an existing
@@ -42,19 +41,15 @@ pub(crate) struct ForkArgs {
     /// still exist
     #[arg(long)]
     pwd: Option<String>,
-    /// Model spec provider/model (or bare model)
-    #[arg(long, short = 'm')]
-    model: Option<String>,
-    /// Distillation model for compact forks
-    #[arg(long = "distill-model")]
-    distill_model: Option<String>,
     /// Start the child in staging state
     #[arg(long, visible_alias = "staging")]
     stage: bool,
     /// Move the session to the child after forking
     #[arg(long)]
     switch: bool,
-    /// Summarize earlier work; retain chosen instructions and the latest complete turn.
+    /// Summarize earlier work on the instance's `distill` slot (refuses when
+    /// the binding has none); retain chosen instructions and the latest
+    /// complete turn.
     /// Word guidance and input limit come from the source context's environment.
     #[arg(long, conflicts_with_all = ["preset", "include", "exclude"])]
     compact: bool,
@@ -69,14 +64,6 @@ pub(crate) struct ForkArgs {
     /// in the source. Ranges use the same grammar as --include.
     #[arg(long)]
     exclude: Vec<String>,
-}
-
-/// Resolved provider+model for a fork.
-struct ResolvedModel {
-    provider: Option<String>,
-    model: Option<String>,
-    /// True when `--model` was explicitly given (needs `configure_llm` call).
-    explicit: bool,
 }
 
 /// The fork-time interval selection, resolved at the fork instant from the
@@ -122,45 +109,6 @@ fn fmt_runs(runs: &[std::ops::Range<usize>]) -> String {
 }
 
 impl KjDispatcher {
-    /// Resolve the model for a fork: parse `--model`, validate provider, or inherit from parent.
-    async fn resolve_fork_model(
-        &self,
-        model_spec: Option<&str>,
-        source_id: ContextId,
-    ) -> Result<ResolvedModel, String> {
-        // Read parent's provider+model from DriftRouter (before any mutations)
-        let (parent_provider, parent_model) = {
-            let router = self.drift_router().read();
-            router
-                .get(source_id)
-                .map(|h| (h.provider.clone(), h.model.clone()))
-                .unwrap_or((None, None))
-        };
-
-        match model_spec {
-            Some(spec) => {
-                // Same resolver as `kj context set` — resolves configured
-                // aliases (`deepseek-lite`), validates an explicit provider, and
-                // fails loud on the `provider:model` colon footgun. Before this,
-                // fork skipped alias resolution and silently pinned a bare alias
-                // to the default provider (anthropic), shipping the literal name
-                // → turn-time `not_found_error: model: <alias>`.
-                let registry = self.kernel().llm().read().await;
-                let (provider, model) = resolve_model_choice(&registry, spec)?;
-                Ok(ResolvedModel {
-                    provider,
-                    model,
-                    explicit: true,
-                })
-            }
-            None => Ok(ResolvedModel {
-                provider: parent_provider,
-                model: parent_model,
-                explicit: false,
-            }),
-        }
-    }
-
     /// Recall a preset patch and compose it with the CLI ranges into the
     /// fork-time keep-set (`kept = (base ∩ ∪cli_inc) \ ∪exc`), resolved against
     /// the parent's fork-instant ordered snapshot.
@@ -484,12 +432,6 @@ impl KjDispatcher {
 
         let new_id = ContextId::new();
 
-        // Validate --model BEFORE any mutations
-        let resolved = match self.resolve_fork_model(args.model.as_deref(), source_id).await {
-            Ok(r) => r,
-            Err(e) => return KjResult::Err(format!("kj fork: {e}")),
-        };
-
         // One fork-instant timestamp threads through selection resolution AND the
         // copy, so both address the SAME block universe (no off-by-one from a
         // concurrent append between the two reads).
@@ -588,22 +530,20 @@ impl KjDispatcher {
         let admission = {
             let mut db = self.kernel_db().lock();
 
-            // Inherit workspace + cast from source — a fork is the same
-            // ensemble's continuation by default; `apply_preset` (below, if
-            // `--preset` was given) or a later `kj context set --cast` can
-            // still change it.
+            // Inherit the workspace from the source. The child joins the
+            // source's character instance and binding, so it runs on the
+            // source's model slots.
             let source_row = db.get_context(source_id).ok().flatten();
             let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
-            let source_cast = source_row.as_ref().and_then(|r| r.cast_id);
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
             let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
 
             let row = ContextRow {
                 context_id: new_id,
-                                label: label.clone(),
-                provider: resolved.provider.clone(),
-                model: resolved.model.clone(),
+                label: label.clone(),
+                provider: None,
+                model: None,
                 system_prompt: None,
                 context_state: if staging {
                     ContextState::Staging
@@ -623,7 +563,7 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: source_cast,
+                cast_id: None,
                 origin_host: None,
                 played_by: source_played_by,
                 // The forking context is the fork's senpai.
@@ -699,7 +639,7 @@ impl KjDispatcher {
             crate::runtime::admission::ContextAdmission::for_inserted(&row)
         };
 
-        // Register in DriftRouter (inherits parent's model)
+        // Register in DriftRouter
         {
             let mut drift = self.drift_router().write();
             if let Err(e) =
@@ -713,30 +653,6 @@ impl KjDispatcher {
             {
                 return KjResult::Err(format!("kj fork: failed to set staging state: {e}"));
             }
-            // If --model was explicit, override the inherited model
-            if resolved.explicit {
-                match (&resolved.provider, &resolved.model) {
-                    (Some(p), Some(m)) => {
-                        if let Err(e) = drift.configure_llm(new_id, p, m) {
-                            return KjResult::Err(format!(
-                                "kj fork: failed to configure model: {e}"
-                            ));
-                        }
-                    }
-                    _ => {
-                        return KjResult::Err(
-                            "kj fork: --model resolved without both provider and model".to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Apply preset if requested
-        if let Some(ref preset) = preset_label
-            && let Err(e) = self.apply_preset(new_id, preset).await
-        {
-            return KjResult::Err(format!("kj fork: failed to apply preset '{preset}': {e}"));
         }
 
         // If --prompt given, inject a Drift block
@@ -837,11 +753,6 @@ impl KjDispatcher {
         let prompt = args.prompt.clone();
         let pwd_override = args.pwd.clone();
         let staging = args.stage;
-        // M5-F5: optional cheaper model for the distillation step.
-        // Distillation is a one-shot summary — using Opus to summarize for
-        // a Haiku follow-up is wasteful. Fall through to the source
-        // context's chat model when not specified.
-        let distill_model = args.distill_model.clone();
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -862,12 +773,6 @@ impl KjDispatcher {
         }
 
         let new_id = ContextId::new();
-
-        // Validate --model BEFORE any mutations
-        let resolved = match self.resolve_fork_model(args.model.as_deref(), source_id).await {
-            Ok(r) => r,
-            Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
-        };
 
         let source_row = match self.kernel_db().lock().get_context(source_id) {
             Ok(Some(row)) => row,
@@ -892,10 +797,8 @@ impl KjDispatcher {
         };
 
         // Keep the native working state and the summary tied to one source version.
-        let summary = match self
-            .summarize_for_continuation(source_id, distill_model.as_deref())
-            .await
-        {
+        // The summary runs on the `distill` slot of the forking instance.
+        let summary = match self.summarize_for_continuation(source_id).await {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
         };
@@ -914,10 +817,7 @@ impl KjDispatcher {
 
         // Seed with distilled summary as a Drift block
         {
-            let source_model = {
-                let router = self.drift_router().read();
-                router.get(source_id).and_then(|h| h.model.clone())
-            };
+            let source_model = self.bound_model_name(source_id);
             // The distillation seed is a drift block, so it carries the
             // performer as its sender — same rule as the fork note/marker
             // below. The child's `created_by` (inserted further down) names
@@ -955,16 +855,15 @@ impl KjDispatcher {
             let mut db = self.kernel_db().lock();
 
             let source_ws = source_row.workspace_id;
-            let source_cast = source_row.cast_id;
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
             let source_played_by = source_row.played_by;
 
             let row = ContextRow {
                 context_id: new_id,
-                                label: label.clone(),
-                provider: resolved.provider.clone(),
-                model: resolved.model.clone(),
+                label: label.clone(),
+                provider: None,
+                model: None,
                 system_prompt: None,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 context_type: source_row.context_type.clone(),
@@ -980,7 +879,7 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: source_cast,
+                cast_id: None,
                 origin_host: None,
                 played_by: source_played_by,
                 // The forking context is the fork's senpai.
@@ -1013,23 +912,6 @@ impl KjDispatcher {
                 && let Err(e) = drift.set_state(new_id, ContextState::Staging)
             {
                 return KjResult::Err(format!("kj fork --compact: failed to set staging state: {e}"));
-            }
-            if resolved.explicit {
-                match (&resolved.provider, &resolved.model) {
-                    (Some(p), Some(m)) => {
-                        if let Err(e) = drift.configure_llm(new_id, p, m) {
-                            return KjResult::Err(format!(
-                                "kj fork --compact: failed to configure model: {e}"
-                            ));
-                        }
-                    }
-                    _ => {
-                        return KjResult::Err(
-                            "kj fork --compact: --model resolved without both provider and model"
-                                .to_string(),
-                        );
-                    }
-                }
             }
         }
 
@@ -1100,35 +982,6 @@ impl KjDispatcher {
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
-    /// Apply a preset's settings to a context (post-fork).
-    /// Apply a preset's settings to a newly forked context (post-fork).
-    ///
-    /// A preset's `cast_id` (when set) assigns that cast to the context —
-    /// this is orthogonal to the context's `provider`/`model` override
-    /// column, so an explicit `--model` given at fork time (applied just
-    /// before this runs — see the caller) is never clobbered: cast
-    /// assignment and the per-context model override are resolved in
-    /// priority order at turn time (explicit override wins, then cast slot,
-    /// then registry default — `crate::model_resolution::resolve_context_model`),
-    /// never by one overwriting the other's column.
-    async fn apply_preset(&self, context_id: ContextId, preset_label: &str) -> Result<(), String> {
-        let preset = {
-            let db = self.kernel_db().lock();
-            db.get_preset_by_label(preset_label)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("preset '{}' not found", preset_label))?
-        };
-
-        let db = self.kernel_db().lock();
-        if let Some(cast_id) = preset.cast_id {
-            db.update_cast(context_id, Some(cast_id))
-                .map_err(|e| e.to_string())?;
-        }
-        db.update_settings(context_id, preset.system_prompt.as_deref())
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
 
     /// Build the terminal result for a completed fork.
     ///
@@ -1190,7 +1043,7 @@ impl KjDispatcher {
         let admitted = self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
             score: None,
             context_id: new_id, after_block_id: after, content: note.into(),
-            principal_id: caller.principal_id, model: None, continuation_epoch: None,
+            principal_id: caller.principal_id, continuation_epoch: None,
         });
         if let Err(error) = admitted {
             tracing::warn!(context_id = %new_id, "fork turn was not admitted: {error}");
@@ -1404,111 +1257,6 @@ mod tests {
             contexts
                 .iter()
                 .any(|r| r.label.as_deref() == Some("branch"))
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_model_bare_alias_resolves_to_provider() {
-        // Regression: `kj fork --model <alias>` must resolve the alias to its
-        // real provider, not silently pin the literal alias on the default
-        // provider — the old fork bug where `deepseek-lite` landed on anthropic
-        // and only failed at the first turn.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-
-        // anthropic registered first → default provider; deepseek + alias added.
-        {
-            use crate::llm::{MockClient, ModelAlias, Provider};
-            use std::collections::HashMap;
-            use std::sync::Arc;
-            let mut reg = d.kernel().llm().write().await;
-            reg.register("anthropic", Arc::new(Provider::Mock(MockClient::new("a"))));
-            reg.register("deepseek", Arc::new(Provider::Mock(MockClient::new("d"))));
-            let mut aliases = HashMap::new();
-            aliases.insert(
-                s("deepseek-lite"),
-                ModelAlias {
-                    backend: s("deepseek"),
-                    model: s("deepseek-v4-flash"),
-                },
-            );
-            reg.set_model_aliases(aliases);
-        }
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--name"),
-                    s("child"),
-                    s("--model"),
-                    s("deepseek-lite"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        // The child must route to deepseek (the alias target), not the default.
-        let child = {
-            let db = d.kernel_db().lock();
-            db.list_active_contexts()
-                .unwrap()
-                .into_iter()
-                .find(|r| r.label.as_deref() == Some("child"))
-                .expect("child context exists")
-                .context_id
-        };
-        let router = d.drift_router().read();
-        let handle = router.get(child).expect("child has a drift handle");
-        assert_eq!(handle.provider.as_deref(), Some("deepseek"));
-        assert_eq!(handle.model.as_deref(), Some("deepseek-v4-flash"));
-    }
-
-    #[tokio::test]
-    async fn fork_model_colon_footgun_errors() {
-        // The `provider:model` colon form fails loud on the fork path too, not
-        // just `kj context set` — both share one resolver.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mut reg = d.kernel().llm().write().await;
-            reg.register("deepseek", Arc::new(Provider::Mock(MockClient::new("d"))));
-        }
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--name"),
-                    s("child"),
-                    s("--model"),
-                    s("deepseek:deepseek-v4-flash"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(
-            !result.is_ok(),
-            "colon form should fail: {}",
-            result.message()
-        );
-        assert!(
-            result.message().contains("provider:model"),
-            "expected slash hint, got: {}",
-            result.message()
         );
     }
 
@@ -2760,214 +2508,6 @@ mod tests {
         assert!(d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none(), "no child is left behind");
     }
 
-    /// Register a mock LLM provider on the kernel so --model validation passes.
-    async fn register_mock_provider(d: &super::super::KjDispatcher) {
-        use crate::llm::{MockClient, Provider};
-        use std::sync::Arc;
-        let mock = Arc::new(Provider::Mock(MockClient::new("mock response")));
-        let mut registry = d.kernel().llm().write().await;
-        registry.register("mock", mock);
-    }
-
-    /// Configure provider+model on a context in DriftRouter.
-    async fn configure_context_model(
-        d: &super::super::KjDispatcher,
-        id: kaijutsu_types::ContextId,
-        provider: &str,
-        model: &str,
-    ) {
-        let mut drift = d.drift_router().write();
-        let _ = drift.configure_llm(id, provider, model);
-    }
-
-    #[tokio::test]
-    async fn fork_inherits_parent_model_in_db() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-
-        // Set parent's model in DriftRouter
-        register_mock_provider(&d).await;
-        configure_context_model(&d, source, "mock", "mock-model").await;
-
-        let c = caller_with_context(source);
-        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        // Verify child inherited provider+model in DB
-        let db = d.kernel_db().lock();
-        let child = db
-            .find_context_by_label("child")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            child.provider.as_deref(),
-            Some("mock"),
-            "child should inherit parent provider"
-        );
-        assert_eq!(
-            child.model.as_deref(),
-            Some("mock-model"),
-            "child should inherit parent model"
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_model_flag_overrides_parent() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-
-        register_mock_provider(&d).await;
-        configure_context_model(&d, source, "mock", "mock-model").await;
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--name"),
-                    s("override"),
-                    s("--model"),
-                    s("mock/custom-model"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        // Verify child has overridden model in DB
-        let db = d.kernel_db().lock();
-        let child = db
-            .find_context_by_label("override")
-            .unwrap()
-            .unwrap();
-        assert_eq!(child.provider.as_deref(), Some("mock"));
-        assert_eq!(child.model.as_deref(), Some("custom-model"));
-
-        // And in DriftRouter
-        drop(db);
-        let drift = d.drift_router().read();
-        let handle = drift
-            .get(child.context_id)
-            .expect("child should be in DriftRouter");
-        assert_eq!(handle.provider.as_deref(), Some("mock"));
-        assert_eq!(handle.model.as_deref(), Some("custom-model"));
-    }
-
-    #[tokio::test]
-    async fn fork_invalid_provider_errors() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--name"),
-                    s("bad"),
-                    s("--model"),
-                    s("nonexistent/foo"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "should have failed: {}", result.message());
-        assert!(
-            result.message().contains("unknown provider"),
-            "expected 'unknown provider' error, got: {}",
-            result.message()
-        );
-
-        // Verify no context was created (mutation didn't happen)
-        let db = d.kernel_db().lock();
-        let found = db.find_context_by_label("bad").unwrap();
-        assert!(
-            found.is_none(),
-            "no context should have been created for invalid provider"
-        );
-    }
-
-    /// Bare model name (no provider/ prefix) should resolve provider from registry.
-    /// This is the bug that caused `kj fork --model claude-sonnet-4-6` to silently
-    /// keep the parent's model.
-    #[tokio::test]
-    async fn fork_bare_model_resolves_provider() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-
-        register_mock_provider(&d).await;
-        // Set mock as default so bare model names resolve to it
-        {
-            let mut registry = d.kernel().llm().write().await;
-            registry.set_default("mock");
-        }
-        configure_context_model(&d, source, "mock", "old-model").await;
-
-        let c = caller_with_context(source);
-        // Bare model name — no "mock/" prefix
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--name"),
-                    s("bare"),
-                    s("--model"),
-                    s("new-model"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        // Verify provider was resolved from registry default
-        let db = d.kernel_db().lock();
-        let child = db
-            .find_context_by_label("bare")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            child.provider.as_deref(),
-            Some("mock"),
-            "provider should be resolved from registry"
-        );
-        assert_eq!(child.model.as_deref(), Some("new-model"));
-
-        // And in DriftRouter
-        drop(db);
-        let drift = d.drift_router().read();
-        let handle = drift
-            .get(child.context_id)
-            .expect("child should be in DriftRouter");
-        assert_eq!(
-            handle.provider.as_deref(),
-            Some("mock"),
-            "DriftRouter provider should match"
-        );
-        assert_eq!(
-            handle.model.as_deref(),
-            Some("new-model"),
-            "DriftRouter model should match"
-        );
-    }
-
-    /// Default fork is POSIX-style: the caller stays on the parent. The child
-    /// id is surfaced via `data`, not by switching.
     #[tokio::test]
     async fn fork_default_stays_on_parent() {
         let d = test_dispatcher().await;
@@ -3210,32 +2750,6 @@ mod tests {
 
     // ── Track D: cast inherits/assigns across fork ───────────────────────
 
-    /// A plain fork is the same ensemble's continuation by default — the
-    /// child inherits the source's assigned cast, same convention as
-    /// `fork_inherits_workspace`.
-    #[tokio::test]
-    async fn fork_inherits_cast_from_source() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-
-        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
-        d.dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
-            .await;
-
-        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        let db = d.kernel_db().lock();
-        let child = db.find_context_by_label("child").unwrap().unwrap();
-        let cast = db.get_cast(child.cast_id.expect("cast inherited")).unwrap().unwrap();
-        assert_eq!(cast.label, "house");
-    }
-
     // ── A fork joins its source's character instance ──────────────────────
 
     /// A fork is the same performance's continuation: the child joins the
@@ -3276,9 +2790,14 @@ mod tests {
         d.block_store().create_document(second, crate::DocumentKind::Conversation, None).unwrap();
         let instance = {
             let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: character_id, name: "binder".into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            let cast = db.seed_test_cast(character_id, "mock", "mock-model", &["distill"]).unwrap();
             db.update_played_by(first, Some(character_id)).unwrap();
             let (instance, _) = db.context_instance(first).unwrap().unwrap();
-            db.append_binding(instance, None, None, second).unwrap();
+            db.append_binding(instance, Some(cast), None, second).unwrap();
             instance
         };
 
@@ -3318,118 +2837,17 @@ mod tests {
         assert_eq!(db.context_instance(child.context_id).unwrap(), None);
     }
 
-    /// A source with no cast forks a child with no cast — inheritance copies
-    /// the actual value, it doesn't invent one.
-    #[tokio::test]
-    async fn fork_of_uncast_source_leaves_child_uncast() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-
-        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        let db = d.kernel_db().lock();
-        let child = db.find_context_by_label("child").unwrap().unwrap();
-        assert!(child.cast_id.is_none());
-    }
-
-    /// A preset carrying a `cast_id` assigns it to the newly forked context
-    /// — the narrowed preset apply path (Track D replaces the old
-    /// provider/model preset columns with a cast reference).
-    #[tokio::test]
-    async fn fork_preset_with_cast_assigns_it_to_the_child() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-
-        d.dispatch(&[s("cast"), s("create"), s("fast-cast")], &c).await;
-        d.dispatch(
-            &[s("preset"), s("save"), s("fastify"), s("--cast"), s("fast-cast")],
-            &c,
-        )
-        .await;
-
-        let result = d
-            .dispatch(
-                &[s("fork"), s("--name"), s("child"), s("--preset"), s("fastify")],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "fork with preset failed: {}", result.message());
-
-        let db = d.kernel_db().lock();
-        let child = db.find_context_by_label("child").unwrap().unwrap();
-        let cast = db.get_cast(child.cast_id.expect("cast set by preset")).unwrap().unwrap();
-        assert_eq!(cast.label, "fast-cast");
-    }
-
-    /// "Explicit CLI flags still win": an explicit `--model` at fork time is
-    /// never clobbered by a preset's cast assignment — they are orthogonal
-    /// columns (`apply_preset`'s doc comment), resolved in priority order at
-    /// turn time, not by one overwriting the other's column.
-    #[tokio::test]
-    async fn fork_explicit_model_override_survives_preset_cast_assignment() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-
-        d.dispatch(&[s("cast"), s("create"), s("fast-cast")], &c).await;
-        d.dispatch(
-            &[s("preset"), s("save"), s("fastify"), s("--cast"), s("fast-cast")],
-            &c,
-        )
-        .await;
-        // Registered AFTER the cast/preset writes above: both mutate via
-        // `reload_llm_registry`, which rebuilds the registry live from the
-        // DB and would otherwise wipe this ad-hoc (non-persisted) provider.
-        register_mock_provider(&d).await;
-
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--name"),
-                    s("child"),
-                    s("--preset"),
-                    s("fastify"),
-                    s("--model"),
-                    s("mock/explicit-model"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        let db = d.kernel_db().lock();
-        let child = db.find_context_by_label("child").unwrap().unwrap();
-        assert_eq!(child.provider.as_deref(), Some("mock"), "explicit --model provider wins");
-        assert_eq!(child.model.as_deref(), Some("explicit-model"), "explicit --model wins");
-        let cast = db.get_cast(child.cast_id.expect("cast still assigned by preset")).unwrap().unwrap();
-        assert_eq!(cast.label, "fast-cast", "preset's cast assignment is untouched");
-    }
-
     // ====================================================================
     // POSIX parity across fork kinds: --prompt drives a turn, --switch moves
     // the caller, bare fork drives nothing. Mirrors the fork_full reference
     // tests above (fork_with_prompt_requests_turn / _without_ / _switch_).
     // ====================================================================
 
-    /// Register a mock LLM provider (set as default), configure it on `source`,
-    /// and seed `source` with a block so compact's distillation step (an LLM
-    /// call over non-empty content) can run in tests.
+    /// Register a mock LLM provider, give `source`'s character instance a
+    /// `distill` slot on it, and seed `source` with a block so compact's
+    /// distillation step (an LLM call over non-empty content) can run in tests.
+    /// A `source` that has an instance keeps it, and must give it a `distill`
+    /// slot itself.
     async fn setup_compact_source(
         d: &super::super::KjDispatcher,
         source: kaijutsu_types::ContextId,
@@ -3437,14 +2855,19 @@ mod tests {
     ) {
         use crate::llm::{MockClient, Provider};
         use std::sync::Arc;
+        d.kernel().llm().write().await.register("mock", Arc::new(Provider::Mock(MockClient::new("summary"))));
         {
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", Arc::new(Provider::Mock(MockClient::new("summary"))));
-            registry.set_default("mock");
-        }
-        {
-            let mut drift = d.drift_router().write();
-            let _ = drift.configure_llm(source, "mock", "mock-model");
+            let db = d.kernel_db().lock();
+            if db.get_character(principal).unwrap().is_none() {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: principal, name: format!("compact-{}", principal.short()), created_at: 0,
+                    retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            if db.context_instance_row(source).unwrap().is_none() {
+                db.seed_test_cast(principal, "mock", "mock-model", &["distill"]).unwrap();
+                db.assign_stand_in_instance(source, principal).unwrap();
+            }
         }
         // compact summarizes the source's included blocks; without content it
         // errors (see fork_compact_empty_source_errors).
@@ -3783,252 +3206,6 @@ mod tests {
         );
     }
 
-    /// Bug 3 (2026-07-04): a `--compact` distillation must run on the CALLING
-    /// context's OWN provider+model — the pair known to work — not the source's
-    /// model re-pinned on the registry's default provider. Here the caller runs
-    /// on anthropic while the registry default is deepseek; before the fix the
-    /// distill resolved the inherited model through the default provider and ran
-    /// on deepseek. Two providers with distinct canned summaries reveal which
-    /// one ran via the child's seed block.
-    #[tokio::test]
-    async fn fork_compact_distill_uses_calling_context_provider() {
-        use crate::llm::{MockClient, Provider};
-        use std::sync::Arc;
-
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        insert_text(&d, source, principal, "material to distill");
-
-        {
-            let mut reg = d.kernel().llm().write().await;
-            reg.register(
-                "anthropic",
-                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
-            );
-            reg.register(
-                "deepseek",
-                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
-            );
-            // Default provider is the WRONG one for an anthropic caller — the
-            // old resolver pinned the inherited model here.
-            reg.set_default("deepseek");
-        }
-        // The calling context runs on anthropic.
-        {
-            let mut drift = d.drift_router().write();
-            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
-        }
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &c)
-            .await;
-        assert!(result.is_ok(), "compact fork failed: {}", result.message());
-
-        let seed = ordered_contents(&d, child_id(&d, "child"));
-        assert!(
-            seed.iter().any(|c| c.contains("ANTHROPIC-DISTILL")),
-            "distill must run on the calling context's own provider (anthropic): {seed:?}"
-        );
-        assert!(
-            !seed.iter().any(|c| c.contains("DEEPSEEK-DISTILL")),
-            "distill must NOT fall to the registry default provider (deepseek): {seed:?}"
-        );
-    }
-
-    /// An explicit `--distill-model` overrides the calling-context default and
-    /// resolves through the registry (alias-aware) — locking that the Bug 3 fix
-    /// only changed the *default*, not the override.
-    #[tokio::test]
-    async fn fork_compact_distill_model_override_wins() {
-        use crate::llm::{MockClient, ModelAlias, Provider};
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        insert_text(&d, source, principal, "material to distill");
-
-        {
-            let mut reg = d.kernel().llm().write().await;
-            reg.register(
-                "anthropic",
-                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
-            );
-            reg.register(
-                "deepseek",
-                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
-            );
-            reg.set_default("anthropic");
-            let mut aliases = HashMap::new();
-            aliases.insert(
-                s("cheap"),
-                ModelAlias {
-                    backend: s("deepseek"),
-                    model: s("deepseek-flash"),
-                },
-            );
-            reg.set_model_aliases(aliases);
-        }
-        {
-            let mut drift = d.drift_router().write();
-            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
-        }
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--compact"),
-                    s("--name"),
-                    s("child"),
-                    s("--distill-model"),
-                    s("cheap"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "compact fork failed: {}", result.message());
-
-        let seed = ordered_contents(&d, child_id(&d, "child"));
-        assert!(
-            seed.iter().any(|c| c.contains("DEEPSEEK-DISTILL")),
-            "--distill-model must override to deepseek despite the anthropic caller/default: {seed:?}"
-        );
-    }
-
-    /// `--distill-model provider/model` (the slash form the failure hint
-    /// recommends) must bind the NAMED provider — same grammar as `--model`
-    /// via the shared `resolve_model_choice`. Before the fix the override went
-    /// through `registry.resolve_model`, which doesn't parse the slash: the
-    /// whole string rode as a literal model name on the DEFAULT provider, so
-    /// the error message suggested a syntax that then misparsed — the same
-    /// papercut class this sweep is killing.
-    #[tokio::test]
-    async fn fork_compact_distill_model_slash_form_binds_provider() {
-        use crate::llm::{MockClient, Provider};
-        use std::sync::Arc;
-
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        insert_text(&d, source, principal, "material to distill");
-
-        {
-            let mut reg = d.kernel().llm().write().await;
-            reg.register(
-                "anthropic",
-                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
-            );
-            reg.register(
-                "deepseek",
-                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
-            );
-            // Default + caller both anthropic: only real slash parsing can
-            // reach deepseek. The unfixed path pinned the whole spec on
-            // anthropic (which, being a mock, would even "succeed" — with the
-            // wrong provider's output).
-            reg.set_default("anthropic");
-        }
-        {
-            let mut drift = d.drift_router().write();
-            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
-        }
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--compact"),
-                    s("--name"),
-                    s("child"),
-                    s("--distill-model"),
-                    s("deepseek/deepseek-flash"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "compact fork failed: {}", result.message());
-
-        let seed = ordered_contents(&d, child_id(&d, "child"));
-        assert!(
-            seed.iter().any(|c| c.contains("DEEPSEEK-DISTILL")),
-            "slash-form --distill-model must bind the named provider: {seed:?}"
-        );
-        assert!(
-            !seed.iter().any(|c| c.contains("ANTHROPIC-DISTILL")),
-            "slash-form --distill-model must not ride the default provider: {seed:?}"
-        );
-    }
-
-    /// A slash-form `--distill-model` naming an unknown provider fails LOUD
-    /// before any mutation — same posture as `--model nonexistent/foo`. Before
-    /// the fix the unknown provider was silently swallowed: the whole spec
-    /// became a model name on the default provider and the typo only surfaced
-    /// (if at all) as a call-time provider error.
-    #[tokio::test]
-    async fn fork_compact_distill_model_unknown_provider_errors() {
-        use crate::llm::{MockClient, Provider};
-        use std::sync::Arc;
-
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        insert_text(&d, source, principal, "material to distill");
-        {
-            let mut reg = d.kernel().llm().write().await;
-            reg.register(
-                "anthropic",
-                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
-            );
-            reg.set_default("anthropic");
-        }
-
-        let c = caller_with_context(source);
-        let result = d
-            .dispatch(
-                &[
-                    s("fork"),
-                    s("--compact"),
-                    s("--name"),
-                    s("child"),
-                    s("--distill-model"),
-                    s("nonexistent/foo"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(
-            !result.is_ok(),
-            "unknown provider in --distill-model must fail: {}",
-            result.message()
-        );
-        assert!(
-            result.message().contains("unknown provider"),
-            "must fail through the shared resolver, naming the provider: {}",
-            result.message()
-        );
-        // Fails before any mutation — no child context was created.
-        let found = d.kernel_db().lock().find_context_by_label("child").unwrap();
-        assert!(found.is_none(), "failed distill resolution must not create a context");
-    }
-
     // ── block authorship: fork marker/note/compact seed ──
     //
     // A fork marker, a fork note, and the --compact distill seed are drift
@@ -4037,6 +3214,84 @@ mod tests {
     // own identity, and never the requester that opened the connection.
     // The child's `created_by` names the requester instead; the two
     // identities can differ and must not be conflated.
+
+    /// A compact fork's summary runs on the `distill` slot of the forking
+    /// instance's binding, not the slot of the context's own type.
+    ///
+    /// Falsified by distilling on the chat slot.
+    #[tokio::test]
+    async fn fork_compact_distills_on_the_forking_instances_distill_slot() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context_with_models(
+            &d, Some("source"), None, principal,
+            &[("default", "chatbackend", "chat-model"), ("distill", "distillbackend", "distill-model")],
+        );
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        insert_text(&d, source, principal, "material to distill");
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register("chatbackend", Arc::new(Provider::Mock(MockClient::new("CHAT-ANSWER"))));
+            reg.register("distillbackend", Arc::new(Provider::Mock(MockClient::new("DISTILL-ANSWER"))));
+        }
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "compact fork failed: {}", result.message());
+
+        let seed = ordered_contents(&d, child_id(&d, "child"));
+        assert!(seed.iter().any(|c| c.contains("DISTILL-ANSWER")), "{seed:?}");
+        assert!(!seed.iter().any(|c| c.contains("CHAT-ANSWER")), "{seed:?}");
+    }
+
+    /// A fork that asks for distillation from an instance with no `distill`
+    /// slot refuses, naming the cast and the fix, before it creates anything.
+    ///
+    /// Falsified by a compact fork that falls back to the chat model.
+    #[tokio::test]
+    async fn fork_compact_without_a_distill_slot_refuses_naming_the_cast_and_the_fix() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context_with_model(&d, Some("source"), None, principal, &["default"]);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        insert_text(&d, source, principal, "material to distill");
+        d.kernel().llm().write().await.register("mock", Arc::new(Provider::Mock(MockClient::new("MUST-NOT-RUN"))));
+
+        let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &c).await;
+        assert!(!result.is_ok(), "a compact fork with no distill slot must refuse");
+        let msg = result.message();
+        assert!(msg.contains("cannot distill"), "{msg}");
+        assert!(msg.contains("test-default-mock-mock-model"), "names the cast: {msg}");
+        assert!(msg.contains("has no distill slot") && msg.contains("kj cast slot set"), "names the fix: {msg}");
+        assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "no child was created");
+    }
+
+    /// `--model` and `--distill-model` are gone from `kj fork`: a child runs
+    /// on its instance's binding.
+    #[tokio::test]
+    async fn fork_takes_no_model_flags() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        let c = caller_with_context(source);
+        for flag in [vec![s("--model"), s("m")], vec![s("-m"), s("m")], vec![s("--distill-model"), s("m")]] {
+            let mut argv = vec![s("fork"), s("--name"), s("child")];
+            argv.extend(flag.clone());
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{flag:?} must be refused");
+            assert!(result.message().contains("unexpected argument"), "{flag:?}: {}", result.message());
+        }
+        assert!(d.kernel_db().lock().find_context_by_label("child").unwrap().is_none());
+    }
 
     /// The plain fork marker (`kj fork --name`) must carry the forking
     /// caller's performer, not the store's own identity. This fixture's
@@ -4123,27 +3378,16 @@ mod tests {
 
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal);
+        let source = register_context_with_model(&d, Some("source"), None, principal, &["distill"]);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
         insert_text(&d, source, principal, "material to distill");
 
-        {
-            let mut reg = d.kernel().llm().write().await;
-            reg.register(
-                "anthropic",
-                Arc::new(Provider::Mock(MockClient::new("DISTILL-SEED"))),
-            );
-            reg.set_default("anthropic");
-        }
-        // Distillation needs the calling context's OWN provider+model pair
-        // (see `fork_compact_distill_uses_calling_context_provider`) — a bare
-        // registry default isn't enough.
-        {
-            let mut drift = d.drift_router().write();
-            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
-        }
+        d.kernel().llm().write().await.register(
+            "mock",
+            Arc::new(Provider::Mock(MockClient::new("DISTILL-SEED"))),
+        );
 
         let c = caller_with_context(source);
         assert_ne!(

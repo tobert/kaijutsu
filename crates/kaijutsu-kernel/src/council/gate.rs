@@ -1711,21 +1711,24 @@ pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
     council.specs.iter().find(|s| s.case == CouncilCase::Shell)
 }
 
-/// The backend and model of the `role` slot in the cast `seat` resolves
-/// through (its own, else its performer's default), with that cast's id.
-/// `None` when the seat resolves no cast or the cast has no `role` slot.
-#[allow(clippy::type_complexity)]
+/// The backend and model of the `role` slot in the binding `seat` runs on.
+/// `None` when the seat belongs to no character instance or its binding has
+/// no `role` slot: the cast the binding was written from is not read again.
 pub(crate) fn seat_slot_backend(
     db: &crate::kernel_db::KernelDb,
-    seat: &crate::kernel_db::ContextRow,
+    seat: ContextId,
     role: &str,
-) -> crate::kernel_db::KernelDbResult<Option<(kaijutsu_types::CastId, crate::kernel_db::BackendRow, String)>> {
-    let Some(cast) = db.effective_cast(seat)? else { return Ok(None) };
-    let Some(slot) = db.get_cast_slot(cast.cast_id, role)? else { return Ok(None) };
-    let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id).ok_or_else(|| {
-        crate::kernel_db::KernelDbError::Validation(format!("cast {} slot {role} names a backend that does not exist", cast.label))
+) -> crate::kernel_db::KernelDbResult<Option<(crate::kernel_db::BackendRow, String)>> {
+    let crate::model_resolution::RoleSlot::Slot(bound) = crate::model_resolution::role_slot(db, seat, role)? else {
+        return Ok(None);
+    };
+    let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == bound.slot.backend_id).ok_or_else(|| {
+        crate::kernel_db::KernelDbError::Validation(format!(
+            "binding {} of {} slot {role} names a backend that does not exist",
+            bound.seq, bound.instance_name
+        ))
     })?;
-    Ok(Some((cast.cast_id, backend, slot.model)))
+    Ok(Some((backend, bound.slot.model)))
 }
 
 /// A council server a cast slot names, and the served model the slot names
@@ -1749,37 +1752,49 @@ pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow, model: &st
 }
 
 /// The council server and served model for `seat`'s gate decisions when
-/// the cast it resolves through has a [`GATE`] slot. `None` when it has no
-/// such slot, so `[council] server` and `model` decide. `Some(Err)` is a
-/// miss cause: the slot's backend is not a council server, and no other
-/// server stands in.
-fn cast_council_server(
+/// its binding has a [`GATE`] slot. `None` when it has no such slot, so the
+/// seat has no council. `Some(Err)` is a miss cause: the slot's backend is
+/// not a council server, and no other server stands in.
+fn bound_council_server(
     db: &crate::kernel_db::KernelDb,
     seat: ContextId,
 ) -> crate::kernel_db::KernelDbResult<Option<Result<SlotServer, String>>> {
-    let Some(row) = db.get_context(seat)? else { return Ok(None) };
-    let Some((_, backend, model)) = seat_slot_backend(db, &row, GATE)? else { return Ok(None) };
-    Ok(Some(council_address(&backend, &model).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
+    let Some((backend, model)) = seat_slot_backend(db, seat, GATE)? else { return Ok(None) };
+    Ok(Some(council_address(&backend, &model).map_err(|why| format!("the seat's binding slot `{GATE}` names {why}"))))
+}
+
+/// Where the gate's decisions for a seat go.
+pub(crate) enum SeatRoute {
+    /// The seat's binding has no [`GATE`] slot: the gate decides without a
+    /// council.
+    NoCouncil,
+    /// The council routed to the server the slot names, and the reviewer
+    /// chain of the actor. A slot that names no council server leaves the
+    /// config unrouted and makes the chain a miss for every decision, before
+    /// any server is asked.
+    Council(CouncilConfig, Result<ReviewerContextChain, String>),
 }
 
 /// Where the gate's decisions for `seat` go and what they read along the
-/// reviewer chain of `actor`: `council` routed to the server the seat's cast
-/// names, `None` when it names none, and the chain. A cast slot that names
-/// no council server makes the chain a miss for every decision, before any
-/// server is asked. `Err` is a fault reading the seat's cast.
+/// reviewer chain of `actor`. `Err` is a fault reading the seat's binding.
 pub(crate) fn seat_route(
     db: &crate::kernel_db::KernelDb,
     council: &CouncilConfig,
     seat: ContextId,
-    actor: PrincipalId,
-) -> Result<(Option<CouncilConfig>, Result<ReviewerContextChain, String>), String> {
-    let cast_server = cast_council_server(db, seat)
-        .map_err(|e| format!("the council could not read the seat's cast: {e} (fail-closed — a database fault, not a decision)"))?;
-    let chain = super::reviewer_contexts::reviewer_context_chain(db, council, seat, actor);
-    Ok(match cast_server {
-        None => (None, chain),
-        Some(Ok(slot)) => (Some(CouncilConfig { server: slot.server, model: Some(slot.model), ..council.clone() }), chain),
-        Some(Err(cause)) => (None, Err(cause)),
+    actor: Option<PrincipalId>,
+) -> Result<SeatRoute, String> {
+    let bound = bound_council_server(db, seat)
+        .map_err(|e| format!("the council could not read the seat's binding: {e} (fail-closed — a database fault, not a decision)"))?;
+    Ok(match bound {
+        None => SeatRoute::NoCouncil,
+        Some(Ok(slot)) => SeatRoute::Council(
+            CouncilConfig { server: slot.server, model: Some(slot.model), ..council.clone() },
+            match actor {
+                Some(actor) => super::reviewer_contexts::reviewer_context_chain(db, council, seat, actor),
+                None => Err(format!("context {} has no performer", seat.short())),
+            },
+        ),
+        Some(Err(cause)) => SeatRoute::Council(council.clone(), Err(cause)),
     })
 }
 
@@ -1845,8 +1860,11 @@ pub(crate) async fn consult(
     };
     let Some(council) = config.council_for(context_type.as_deref()) else { return Ok(None) };
     let Some(shell) = shell_spec(council) else { return Ok(None) };
-    let (routed, chain) = seat_route(&kernel.kernel_db().lock(), council, context_id, caller.actor_id)?;
-    let council = routed.as_ref().unwrap_or(council);
+    let (routed, chain) = match seat_route(&kernel.kernel_db().lock(), council, context_id, Some(caller.actor_id))? {
+        SeatRoute::NoCouncil => return Ok(None),
+        SeatRoute::Council(routed, chain) => (routed, chain),
+    };
+    let council = &routed;
     let resolve_cwd = cwd.clone().unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
     let facts = super::shell_case::gather(kernel, caller, context_id, command, &spec.planned, &resolve_cwd).await;
     let submission = Submission {

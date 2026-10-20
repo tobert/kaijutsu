@@ -4,7 +4,6 @@ mode = "contained"
 
 gate = """
 [council]
-server = "{council}"
 contexts = ["fleet-seat"]
 mode = "bump-only"
 escalate = { bumps = 3, minutes = 10 }

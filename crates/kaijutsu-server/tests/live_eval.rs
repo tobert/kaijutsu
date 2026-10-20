@@ -88,18 +88,13 @@ fn live_eval_wc_clone_skeleton() {
             .join_context(main, "live_eval")
             .await
             .expect("join_context");
-        kernel
-            .set_context_model(main, ANTHROPIC_PROVIDER, HAIKU_MODEL)
-            .await
-            .expect("set_context_model");
-
         // One real turn through Haiku. Keep the prompt short to keep
         // the run cheap and the assistant block focused.
         let prompt = "In 3 short bullet points, outline the smallest plausible \
                       design for a `wc` (word/line/byte counter) clone in Rust. \
                       No code yet — just the design.";
         let _prompt_id = kernel
-            .prompt(prompt, Some(HAIKU_MODEL), main)
+            .prompt(prompt, main)
             .await
             .expect("prompt");
 
@@ -344,41 +339,64 @@ fn setup_run_dirs(suffix: &str) -> (PathBuf, PathBuf) {
     (run_root, state_dir)
 }
 
-/// Write an `anthropic` backend reading `ANTHROPIC_API_KEY` and make Haiku
-/// the default model. Model config is SQL-native, so this writes the DB
-/// before the kernel opens it.
+/// Write an `anthropic` backend reading `ANTHROPIC_API_KEY` and a cast that
+/// runs Haiku for every context type the run creates, which the ephemeral
+/// performer plays. Model config is SQL-native, so this writes the DB before
+/// the kernel opens it.
 fn write_haiku_defaults(state_dir: &std::path::Path) {
-    use kaijutsu_kernel::kernel_db::{BackendRow, KernelDb, LlmDefaultsRow};
-    use kaijutsu_types::{BackendId, PrincipalId};
+    use kaijutsu_kernel::kernel_db::{BackendRow, CastRow, CastSlotRow, KernelDb};
+    use kaijutsu_types::{BackendId, CastId, PrincipalId};
 
     fs::create_dir_all(state_dir).expect("create state dir");
     let db = KernelDb::open(state_dir.join("kernel.db")).expect("open kernel db");
-    db.upsert_backend(&BackendRow {
-        backend_id: BackendId::new(),
-        name: ANTHROPIC_PROVIDER.to_string(),
-        kind: "anthropic".to_string(),
-        base_url: None,
-        api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
-        api_key_file: None,
-        key_optional: false,
-        request_timeout_secs: None,
-        idle_timeout_secs: None,
-        max_concurrent: None,
+    let backend = db
+        .upsert_backend(&BackendRow {
+            backend_id: BackendId::new(),
+            name: ANTHROPIC_PROVIDER.to_string(),
+            kind: "anthropic".to_string(),
+            base_url: None,
+            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            api_key_file: None,
+            key_optional: false,
+            request_timeout_secs: None,
+            idle_timeout_secs: None,
+            max_concurrent: None,
+            created_at: 0,
+            created_by: PrincipalId::system(),
+        })
+        .expect("write the anthropic backend");
+    let cast = CastRow {
+        cast_id: CastId::new(),
+        label: "haiku".to_string(),
+        description: None,
         created_at: 0,
         created_by: PrincipalId::system(),
-    })
-    .expect("write the anthropic backend");
-    db.set_llm_defaults(&LlmDefaultsRow {
-        default_backend: ANTHROPIC_PROVIDER.to_string(),
-        default_model: HAIKU_MODEL.to_string(),
-        max_tokens: Some(16384),
-        temperature: None,
-        top_p: None,
-        effort: None,
-        thinking_budget: None,
-        thinking_style: None,
-    })
-    .expect("point defaults at anthropic/haiku");
+    };
+    db.insert_cast(&cast).expect("write the haiku cast");
+    for role in ["default", "coder"] {
+        db.set_cast_slot(&CastSlotRow {
+            cast_id: cast.cast_id,
+            role: role.to_string(),
+            backend_id: backend.backend_id,
+            model: HAIKU_MODEL.to_string(),
+            max_tokens: Some(16384),
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+            loadout: None,
+            extra: None,
+        })
+        .expect("write a haiku slot");
+    }
+    kaijutsu_server::SshServerConfig::seed_ephemeral_performer(&db);
+    let performer = db
+        .get_character_by_name(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER)
+        .expect("read the performer")
+        .expect("the performer exists");
+    db.set_character_default_cast(performer.principal_id, Some(cast.cast_id))
+        .expect("point the performer at the haiku cast");
 }
 
 /// Local copy of the e2e_kj_workflow `shell_exec_wait_timeout` helper.
@@ -476,17 +494,11 @@ fn live_eval_conversation_session_slice_a() {
             .join_context(ctx_shell, "live_eval")
             .await
             .expect("join_context(shell_visibility)");
-        kernel
-            .set_context_model(ctx_shell, ANTHROPIC_PROVIDER, HAIKU_MODEL)
-            .await
-            .expect("set_context_model(shell_visibility)");
-
         // Turn 1: warm-up — locks one user+assistant exchange into the mailbox.
         let prior = count_done_assistant_text(&kernel, ctx_shell).await;
         kernel
             .prompt(
                 "Reply with just the single word READY and nothing else.",
-                Some(HAIKU_MODEL),
                 ctx_shell,
             )
             .await
@@ -552,7 +564,6 @@ fn live_eval_conversation_session_slice_a() {
             .prompt(
                 "What single word did the most recent shell command print? \
                  Reply with only that word, lowercase, nothing else.",
-                Some(HAIKU_MODEL),
                 ctx_shell,
             )
             .await
@@ -602,11 +613,6 @@ fn live_eval_conversation_session_slice_a() {
             .join_context(ctx_excl, "live_eval")
             .await
             .expect("join_context(exclude_noop)");
-        kernel
-            .set_context_model(ctx_excl, ANTHROPIC_PROVIDER, HAIKU_MODEL)
-            .await
-            .expect("set_context_model(exclude_noop)");
-
         let topic = "pineapples";
         let prior = count_done_assistant_text(&kernel, ctx_excl).await;
         kernel
@@ -615,7 +621,6 @@ fn live_eval_conversation_session_slice_a() {
                     "Remember that I am asking about {topic}. Just acknowledge with the \
                      single word ACK."
                 ),
-                Some(HAIKU_MODEL),
                 ctx_excl,
             )
             .await
@@ -643,7 +648,6 @@ fn live_eval_conversation_session_slice_a() {
             .prompt(
                 "What single topic did I ask about earlier? Reply with one lowercase \
                  word, no punctuation, nothing else.",
-                Some(HAIKU_MODEL),
                 ctx_excl,
             )
             .await
@@ -673,11 +677,6 @@ fn live_eval_conversation_session_slice_a() {
             .join_context(ctx_fork, "live_eval")
             .await
             .expect("join_context(fork_pre_exclude)");
-        kernel
-            .set_context_model(ctx_fork, ANTHROPIC_PROVIDER, HAIKU_MODEL)
-            .await
-            .expect("set_context_model(fork_pre_exclude)");
-
         let fork_topic = "bananas";
 
         // Turn 1: greeting — leaves an unambiguous user-message head on the
@@ -687,7 +686,6 @@ fn live_eval_conversation_session_slice_a() {
         kernel
             .prompt(
                 "Reply with exactly the word HELLO and nothing else.",
-                Some(HAIKU_MODEL),
                 ctx_fork,
             )
             .await
@@ -703,7 +701,6 @@ fn live_eval_conversation_session_slice_a() {
                     "I am asking about {fork_topic}. Reply with the single word ACK \
                      and nothing else — do NOT repeat the topic."
                 ),
-                Some(HAIKU_MODEL),
                 ctx_fork,
             )
             .await
@@ -794,7 +791,6 @@ fn live_eval_conversation_session_slice_a() {
                 "What topic did the user ask about earlier in this conversation? \
                  Reply with the single most relevant lowercase word, or the word \
                  'none' if no topic was raised. No punctuation, nothing else.",
-                Some(HAIKU_MODEL),
                 forked,
             )
             .await

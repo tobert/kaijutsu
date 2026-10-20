@@ -165,33 +165,10 @@ same `initialize` handler spawns `KernelBridge::attach_client_peer` the
 moment `clientInfo` arrives, replayed on reconnect like every other actor
 peer.
 
-Client identity now also feeds the `/config/client` cascade for cast selection
-(2026-08-17): `bridge::client_config_id` derives a **separate** slug —
-`acp-<name>`, not the peer nick's `acp/<name>` — because a `/config/client/<id>`
-path segment can't itself contain `/`. On `session/new`, for a genuinely
-fresh context only (never on `session/load`/`resume`, which must not stomp a
-cast already in effect), `KernelBridge::resolve_client_cast` reads
-`/config/client/<client_id>/cast.toml` then the shared
-`/config/client/default/cast.toml` (`{ cast = "<label>" }`); if either layer
-names a cast, `apply_client_cast_preset`
-(`lib.rs`) runs the same `kj context set --cast <label>` a human would type,
-via the existing `execute_kj` addressed-command path — no new RPC. Absence on
-both layers (the default — nobody has written a `cast.toml` yet) leaves the
-context on the LLM registry's row-stamped default, unchanged from before.
-Identity is ergonomic routing and presence, not a security boundary.
-
-Not done: nothing writes `/config/client/<id>/cast.toml` for an operator yet —
-it is a plain file (config is host files now, `docs/config-namespace.md`),
-so today that means `kj vi` or the file tools, by hand, per client.
-Client-identity-driven **presets** (system prompt alongside
-the cast) are also not built — `kj context set` has no `--preset` flag, only
-`--cast`; a preset applies today only at fork/apply time
-(`crates/kaijutsu-kernel/src/kj/preset.rs`). And there is still no
-handler-level test harness for `handle_new_session` itself (a fake
-`KernelBridge` seam; not tracked in `docs/issues.md`)
-— `apply_client_cast_preset`'s wiring is covered indirectly by unit tests on
-its pure pieces (`client_config_id`, `parse_cast_config` in `bridge.rs`), not
-by an end-to-end `session/new` test.
+Client identity is ergonomic routing and presence, not a security boundary.
+A session's context runs the model its performer's character instance binding
+gives its type; the client's identity chooses none (there is no per-client
+cast file, and no `kj context set --cast`).
 
 ### Rich prompt content
 
@@ -273,13 +250,10 @@ a Toad flight before the next one needs to start.
    idempotent for client retries; a successful request unbinds the session
    registry entry and stops its event pump, while context data remains
    recoverable in kj.
-3. **Client identity and presence — shipped.** `clientInfo` is retained,
-   `acp/<name>` attaches as a peer, and `session/new` on a fresh context now
-   feeds the `/config/client` cascade for cast selection (see "Client identity
-   and parity" above). Not done: a full preset (system prompt, not
-   just cast), and the seed data itself — nobody has written a
-   `/config/client/<id>/cast.toml` for toad/Zed/Happy yet, that's an operator
-   action.
+3. **Client identity and presence — shipped.** `clientInfo` is retained and
+   `acp/<name>` attaches as a peer (see "Client identity and parity" above).
+   Identity chooses no model: the session's context runs its performer
+   character's cast.
 4. **Commands and usage — shipped.** The curated kj-backed catalog and slash
    invocation path are built. The usage gauge is also built, but complete
    only as far as honesty permits: `UsageUpdate.used`/`.size` project the

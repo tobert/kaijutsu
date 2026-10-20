@@ -34,6 +34,7 @@ use crate::mcp::types::InstanceId;
 use crate::roster::{Availability, LivenessKind, PresenceSnapshotRow, RosterEntity, RosterRow};
 
 mod instances;
+use instances::read_opt_instance_id;
 pub use instances::{
     CharacterInstanceRow, InstanceBindingRow, InstanceMigrationNote, InstanceSlotRow,
 };
@@ -598,14 +599,16 @@ pub struct TurnStart {
     pub context_id: ContextId,
     /// The character that performed the turn.
     pub performer: PrincipalId,
-    /// Label of the cast whose slot answered; `None` when no cast did.
+    /// The character instance and binding `seq` the turn ran on. `None` for
+    /// a turn recorded before turns named them.
+    pub instance: Option<CharacterInstanceId>,
+    pub binding_seq: Option<i64>,
+    /// Label of the cast the binding was written from; `None` when it had none.
     pub cast: Option<String>,
-    /// The context type the cast slot was matched on.
+    /// The context type the binding slot was matched on.
     pub role: String,
     pub provider: String,
     pub model: String,
-    /// Which resolver tier answered (`ModelSource::tier`).
-    pub model_source: String,
     /// Unix milliseconds.
     pub started_at: i64,
 }
@@ -3050,6 +3053,8 @@ impl KernelDb {
             SENPAI_COLUMN_ALTER,
             "ALTER TABLE contexts ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
             "ALTER TABLE contexts ADD COLUMN binding_seq INTEGER",
+            "ALTER TABLE turns ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
+            "ALTER TABLE turns ADD COLUMN binding_seq INTEGER",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -4909,45 +4914,6 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Update a context's model assignment.
-    pub fn update_model(
-        &self,
-        id: ContextId,
-        provider: Option<&str>,
-        model: Option<&str>,
-    ) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE contexts SET provider = ?1, model = ?2 WHERE context_id = ?3",
-            params![provider, model, blob_param(id.as_bytes())],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
-        }
-        Ok(())
-    }
-
-    /// Set or clear the cast a context plays under. `None` clears it (the
-    /// context falls back to the registry default at resolution time — see
-    /// `crate::model_resolution::resolve_context_model`). Does NOT validate
-    /// that `cast_id` refers to an existing cast — the FK does that at the
-    /// SQL layer (`ON DELETE SET NULL`, so a removed cast quietly clears
-    /// every context that pointed at it rather than orphaning a dangling
-    /// reference); callers resolving a `--cast <label>` flag validate the
-    /// label against `list_casts`/`get_cast_by_label` BEFORE calling this.
-    pub fn update_cast(&self, id: ContextId, cast_id: Option<CastId>) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE contexts SET cast_id = ?1 WHERE context_id = ?2",
-            params![
-                cast_id.as_ref().map(|c| c.as_bytes().to_vec()),
-                blob_param(id.as_bytes())
-            ],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
-        }
-        Ok(())
-    }
-
     /// Test fixture: give `context` a character instance of `played_by`, the
     /// way creation does. The instance's senpai is the instance of the
     /// context named by the row's stored `senpai_ctx` when that context has
@@ -5004,6 +4970,91 @@ impl KernelDb {
             self.recast_test_instance(context, played_by)?;
         }
         self.assign_test_review(context, played_by, reviewer)
+    }
+
+    /// Test fixture: make `character` run `model` on `backend` for each of
+    /// `roles`. See [`Self::seed_test_cast_roles`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn seed_test_cast(
+        &self,
+        character: PrincipalId,
+        backend: &str,
+        model: &str,
+        roles: &[&str],
+    ) -> KernelDbResult<CastId> {
+        let entries: Vec<(&str, &str, &str)> = roles.iter().map(|role| (*role, backend, model)).collect();
+        self.seed_test_cast_roles(character, &entries)
+    }
+
+    /// Test fixture: make `character` run, for each `(role, backend, model)`,
+    /// that model on that backend, through a cast named for its entries that
+    /// `characters.default_cast_id` points at. A backend row is created
+    /// (kind `mock`, no key) when absent, and each slot sets `max_tokens`. An
+    /// instance started after this binds the slots; one started before keeps
+    /// the binding it has.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn seed_test_cast_roles(
+        &self,
+        character: PrincipalId,
+        entries: &[(&str, &str, &str)],
+    ) -> KernelDbResult<CastId> {
+        let label = format!(
+            "test-{}",
+            entries.iter().map(|(role, backend, model)| format!("{role}-{backend}-{model}")).collect::<Vec<_>>().join("--")
+        );
+        let cast = match self.get_cast_by_label(&label)? {
+            Some(cast) => cast,
+            None => {
+                let cast = CastRow {
+                    cast_id: CastId::new(),
+                    label,
+                    description: None,
+                    created_at: 0,
+                    created_by: PrincipalId::system(),
+                };
+                self.insert_cast(&cast)?;
+                cast
+            }
+        };
+        for (role, backend, model) in entries {
+            let backend_row = match self.get_backend_by_name(backend)? {
+                Some(row) => row,
+                None => {
+                    let row = BackendRow {
+                        backend_id: BackendId::new(),
+                        name: backend.to_string(),
+                        kind: "mock".to_string(),
+                        base_url: None,
+                        api_key_env: None,
+                        api_key_file: None,
+                        key_optional: true,
+                        request_timeout_secs: None,
+                        idle_timeout_secs: None,
+                        max_concurrent: None,
+                        created_at: 0,
+                        created_by: PrincipalId::system(),
+                    };
+                    self.upsert_backend(&row)?;
+                    row
+                }
+            };
+            self.set_cast_slot(&CastSlotRow {
+                cast_id: cast.cast_id,
+                role: role.to_string(),
+                backend_id: backend_row.backend_id,
+                model: model.to_string(),
+                max_tokens: Some(4096),
+                temperature: None,
+                top_p: None,
+                effort: None,
+                thinking_budget: None,
+                thinking_style: None,
+                loadout: None,
+                extra: None,
+            })?;
+        }
+        self.set_character_default_cast(character, Some(cast.cast_id))?;
+        Ok(cast.cast_id)
     }
 
     /// Test fixture: give `id` a stand-in instance of `played_by`, which a
@@ -6197,8 +6248,8 @@ impl KernelDb {
         self.conn.execute(
             "INSERT INTO turns (
                 turn_id, context_id, performer, cast_label, role,
-                provider, model, model_source, started_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                provider, model, model_source, started_at, instance_id, binding_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'binding', ?8, ?9, ?10)",
             params![
                 blob_param(turn.turn_id.as_bytes()),
                 blob_param(turn.context_id.as_bytes()),
@@ -6207,8 +6258,9 @@ impl KernelDb {
                 turn.role,
                 turn.provider,
                 turn.model,
-                turn.model_source,
                 turn.started_at,
+                turn.instance.as_ref().map(|i| i.as_bytes().to_vec()),
+                turn.binding_seq,
             ],
         )?;
         Ok(())
@@ -6256,8 +6308,8 @@ impl KernelDb {
     }
 
     const TURN_COLUMNS: &'static str = "turn_id, context_id, performer, cast_label, role, provider, model,
-        model_source, started_at, ended_at, stop_reason, llm_calls, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, reasoning_tokens";
+        started_at, ended_at, stop_reason, llm_calls, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens, reasoning_tokens, instance_id, binding_seq";
 
     fn read_turn_row(row: &rusqlite::Row<'_>) -> SqliteResult<TurnRow> {
         let turn_bytes: Vec<u8> = row.get(0)?;
@@ -6274,17 +6326,18 @@ impl KernelDb {
                 role: row.get(4)?,
                 provider: row.get(5)?,
                 model: row.get(6)?,
-                model_source: row.get(7)?,
-                started_at: row.get(8)?,
+                instance: read_opt_instance_id(row, 16)?,
+                binding_seq: row.get(17)?,
+                started_at: row.get(7)?,
             },
-            ended_at: row.get(9)?,
-            stop_reason: row.get(10)?,
-            llm_calls: row.get(11)?,
-            input_tokens: row.get(12)?,
-            output_tokens: row.get(13)?,
-            cache_read_tokens: row.get(14)?,
-            cache_write_tokens: row.get(15)?,
-            reasoning_tokens: row.get(16)?,
+            ended_at: row.get(8)?,
+            stop_reason: row.get(9)?,
+            llm_calls: row.get(10)?,
+            input_tokens: row.get(11)?,
+            output_tokens: row.get(12)?,
+            cache_read_tokens: row.get(13)?,
+            cache_write_tokens: row.get(14)?,
+            reasoning_tokens: row.get(15)?,
         })
     }
 
@@ -8384,30 +8437,28 @@ impl KernelDb {
 
     /// Delete a backend by name.
     ///
-    /// Refuses loudly while the defaults name it, or a cast slot or a model
-    /// alias still points at it. The FK would reject a slot's or an alias's
-    /// DELETE anyway, but a named list of the referents is the difference
-    /// between "fix this" and "SQLITE_CONSTRAINT".
+    /// Refuses loudly while a cast slot, a character instance's binding or a
+    /// model alias still points at it. The FK would reject the DELETE anyway,
+    /// but a named list of the referents is the difference between "fix this"
+    /// and "SQLITE_CONSTRAINT".
     pub fn delete_backend(&self, name: &str) -> KernelDbResult<()> {
         let Some(backend) = self.get_backend_by_name(name)? else {
             return Err(KernelDbError::NotFound(format!("backend '{name}'")));
         };
-        // The registry refuses to build when the defaults name a missing
-        // backend, so the default backend cannot be removed.
-        if let Some(defaults) = self.get_llm_defaults()?
-            && defaults.default_backend == backend.name
-        {
-            return Err(KernelDbError::Validation(format!(
-                "backend '{name}' is the default backend — make another one the default \
-                 first with `kj backend default set --backend <name> --model <model>`"
-            )));
-        }
         let id = blob_param(backend.backend_id.as_bytes());
         let slots: Vec<String> = {
             let mut stmt = self.conn.prepare(
                 "SELECT c.label || '/' || s.role FROM cast_slots s
                  JOIN casts c ON c.cast_id = s.cast_id
                  WHERE s.backend_id = ?1 ORDER BY 1",
+            )?;
+            stmt.query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
+        let bindings: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT lower(hex(instance_id)) || '#' || seq FROM instance_slots
+                 WHERE backend_id = ?1 ORDER BY 1",
             )?;
             stmt.query_map(params![id], |r| r.get::<_, String>(0))?
                 .collect::<SqliteResult<Vec<_>>>()?
@@ -8419,10 +8470,13 @@ impl KernelDb {
             stmt.query_map(params![id], |r| r.get::<_, String>(0))?
                 .collect::<SqliteResult<Vec<_>>>()?
         };
-        if !slots.is_empty() || !aliases.is_empty() {
+        if !slots.is_empty() || !aliases.is_empty() || !bindings.is_empty() {
             let mut parts = Vec::new();
             if !slots.is_empty() {
                 parts.push(format!("cast slots [{}]", slots.join(", ")));
+            }
+            if !bindings.is_empty() {
+                parts.push(format!("character instance bindings [{}]", bindings.join(", ")));
             }
             if !aliases.is_empty() {
                 parts.push(format!("aliases [{}]", aliases.join(", ")));
@@ -8937,19 +8991,6 @@ impl KernelDb {
                 })?;
                 self.get_cast(CastId::from_bytes(bytes))
             }
-            None => Ok(None),
-        }
-    }
-
-    /// The cast `row` resolves its models through: its own cast, else its
-    /// performer's default cast, else none (`model_resolution`). A
-    /// `cast_id` that names no cast row is treated as none.
-    pub fn effective_cast(&self, row: &ContextRow) -> KernelDbResult<Option<CastRow>> {
-        if let Some(cast_id) = row.cast_id {
-            return self.get_cast(cast_id);
-        }
-        match row.played_by {
-            Some(performer) => self.character_default_cast(performer),
             None => Ok(None),
         }
     }
@@ -11793,21 +11834,6 @@ mod tests {
         assert_eq!(ctx.forked_from, Some(parent_id));
         assert_eq!(ctx.created_by, creator);
 
-        // Verify update_model roundtrip
-        db.update_model(child_id, Some("deepseek"), Some("deepseek-r1"))
-            .unwrap();
-        let updated = db.get_context(child_id).unwrap().unwrap();
-        assert_eq!(updated.provider, Some("deepseek".into()));
-        assert_eq!(updated.model, Some("deepseek-r1".into()));
-
-        // Verify update_cast roundtrip, including clearing it back to None.
-        db.update_cast(child_id, None).unwrap();
-        let cleared = db.get_context(child_id).unwrap().unwrap();
-        assert_eq!(cleared.cast_id, None);
-        db.update_cast(child_id, Some(cast_id)).unwrap();
-        let recast = db.get_context(child_id).unwrap().unwrap();
-        assert_eq!(recast.cast_id, Some(cast_id));
-
         // A fixture's performer is the principal of the context's character
         // instance, and a context's character never changes.
         let character = PrincipalId::new();
@@ -13200,7 +13226,8 @@ mod tests {
             role: "coder".into(),
             provider: "anthropic".into(),
             model: "claude-haiku-5-5".into(),
-            model_source: "cast_slot".into(),
+            instance: None,
+            binding_seq: None,
             started_at: 1_000,
         }
     }

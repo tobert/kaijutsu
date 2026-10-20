@@ -7,7 +7,7 @@ use super::admission::ContextAdmission;
 use super::turn_request::{StartupRequest, TurnRequest, queue_startup};
 
 pub enum PromptSource {
-    Text { content: String, model: Option<String> },
+    Text { content: String },
     Draft { edge: Option<InputEdge> },
 }
 
@@ -36,8 +36,8 @@ pub async fn submit(
     // refused before it commits. Startup checks again for the race.
     super::turn_identity::resolve_for_context(kernel, context).await?;
     let documents = kernel.blocks();
-    let (after_block_id, model, tool_ctx, submit) = match source {
-        PromptSource::Text { content, model } => {
+    let (after_block_id, tool_ctx, submit) = match source {
+        PromptSource::Text { content } => {
             let tool_ctx = match super::shell_state::context_cwd(kernel, context)? {
                 Some(cwd) => ExecContext::new(principal, context, cwd, session, kernel.id()),
                 None => ExecContext::new_without_cwd(principal, context, session, kernel.id()),
@@ -48,7 +48,7 @@ pub async fn submit(
             let block = documents.insert_block_as(context, None, documents.last_block_id(context).as_ref(),
                 Role::User, BlockKind::Text, &content, Status::Done, ContentType::Plain, Some(principal))
                 .map_err(|error| format!("failed to insert user block: {error}"))?;
-            (block, model, Some(tool_ctx), None)
+            (block, Some(tool_ctx), None)
         }
         PromptSource::Draft { edge } => {
             let (block, _) = documents.submit_draft(context, principal, edge)
@@ -62,13 +62,13 @@ pub async fn submit(
                 reviewer_id: None, context_id: Some(context), session_id: session,
                 confirmed: false, rc_depth: 0, privileged: false,
                 cancel: lease.interrupt().cancel.child_token() };
-            (block, None, None, Some((info, caller)))
+            (block, None, Some((info, caller)))
         }
     };
     let startup = queue_startup(kernel, StartupRequest {
         admission, lease, request: TurnRequest {
             context_id: context, after_block_id, content: String::new(),
-            principal_id: principal, model, continuation_epoch: None, score: None,
+            principal_id: principal, continuation_epoch: None, score: None,
         },
         origin: crate::flows::TurnOrigin::Interactive, tool_ctx, session, submit,
         joins_live_turn: true,
@@ -101,7 +101,7 @@ pub(crate) fn follow_up(
     let _startup = queue_startup(kernel, StartupRequest {
         admission, lease, request: TurnRequest {
             context_id: context, after_block_id: block, content: String::new(),
-            principal_id: principal, model: None, continuation_epoch: None, score: None,
+            principal_id: principal, continuation_epoch: None, score: None,
         },
         origin: crate::flows::TurnOrigin::Interactive, tool_ctx: None, session,
         submit: None, joins_live_turn: false,

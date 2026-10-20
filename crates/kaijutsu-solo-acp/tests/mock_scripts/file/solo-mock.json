@@ -7,7 +7,7 @@
     "TextStart",
     {"TextDelta": "wrote it"},
     "TextEnd",
-    {"ToolUse": {"id": "solo-file-done", "name": "done", "input": {"status": "done", "summary": "wrote solo-wrote-this.txt"}}},
+    {"ToolUse": {"id": "solo-file-done", "name": "done", "input": {"status": "done", "feedback": "wrote solo-wrote-this.txt"}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ]
 ]

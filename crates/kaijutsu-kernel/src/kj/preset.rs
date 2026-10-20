@@ -1,4 +1,5 @@
-//! Preset subcommands: list, show, save, remove.
+//! Preset subcommands: list, show, save, remove. A preset holds fork filters
+//! (`kj fork --preset`); it names no model.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, PresetId};
@@ -10,7 +11,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "preset",
-    about = "Manage model presets",
+    about = "Manage fork presets",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -33,13 +34,6 @@ enum PresetCommand {
     Save {
         /// Preset label (resolver key)
         label: String,
-        /// Cast label — the named model ensemble this preset assigns at
-        /// fork/apply time (`kj cast show <label>`). Must already exist.
-        #[arg(long)]
-        cast: Option<String>,
-        /// System prompt text
-        #[arg(long = "system-prompt")]
-        system_prompt: Option<String>,
         /// Description text
         #[arg(long, alias = "description")]
         desc: Option<String>,
@@ -87,12 +81,7 @@ impl KjDispatcher {
         match parsed.command {
             PresetCommand::List => self.preset_list(),
             PresetCommand::Show { label } => self.preset_show(&label),
-            PresetCommand::Save {
-                label,
-                cast,
-                system_prompt,
-                desc,
-            } => self.preset_save(&label, cast, system_prompt, desc, caller),
+            PresetCommand::Save { label, desc } => self.preset_save(&label, desc, caller),
             PresetCommand::Remove { label } => self.preset_remove(&label),
             PresetCommand::Reseed => self.preset_reseed(caller),
         }
@@ -100,12 +89,6 @@ impl KjDispatcher {
 
     fn preset_list(&self) -> KjResult {
         let db = self.kernel_db().lock();
-        // Resolved once for the whole listing, never per-row (same
-        // convention as `kj context list`'s cast tag).
-        let casts: std::collections::HashMap<kaijutsu_types::CastId, String> = db
-            .list_casts()
-            .map(|cs| cs.into_iter().map(|c| (c.cast_id, c.label)).collect())
-            .unwrap_or_default();
         match db.list_presets() {
             Ok(presets) => {
                 // Iteration handles: preset labels are the resolver key
@@ -124,17 +107,12 @@ impl KjDispatcher {
                 let lines: Vec<String> = presets
                     .iter()
                     .map(|p| {
-                        let cast = p
-                            .cast_id
-                            .and_then(|id| casts.get(&id))
-                            .map(|label| format!("cast:{label}"))
-                            .unwrap_or_else(|| "(no cast)".to_string());
                         let desc = p
                             .description
                             .as_deref()
                             .map(|d| format!("  — {d}"))
                             .unwrap_or_default();
-                        format!("  {:<20} {}{}", p.label, cast, desc)
+                        format!("  {:<20}{}", p.label, desc)
                     })
                     .collect();
                 KjResult::ok_with_data(lines.join("\n"), labels)
@@ -151,20 +129,6 @@ impl KjDispatcher {
                 if let Some(desc) = &p.description {
                     lines.push(format!("Description: {desc}"));
                 }
-                let cast = p
-                    .cast_id
-                    .and_then(|id| db.get_cast(id).ok().flatten())
-                    .map(|c| c.label)
-                    .unwrap_or_else(|| "(no cast)".to_string());
-                lines.push(format!("Cast: {cast}"));
-                if let Some(ref sp) = p.system_prompt {
-                    let preview = if sp.len() > 80 {
-                        format!("{}...", &sp[..77])
-                    } else {
-                        sp.clone()
-                    };
-                    lines.push(format!("System: {preview}"));
-                }
                 KjResult::ok(lines.join("\n"))
             }
             Ok(None) => KjResult::Err(format!("kj preset show: '{}' not found", label)),
@@ -172,15 +136,8 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj preset save <label> [--cast label] [--system-prompt text] [--desc text]`
-    fn preset_save(
-        &self,
-        label: &str,
-        cast_spec: Option<String>,
-        system_prompt: Option<String>,
-        desc: Option<String>,
-        caller: &KjCaller,
-    ) -> KjResult {
+    /// `kj preset save <label> [--desc text]`
+    fn preset_save(&self, label: &str, desc: Option<String>, caller: &KjCaller) -> KjResult {
         if crate::seed_presets::is_reserved_preset_label(label) {
             return KjResult::Err(format!(
                 "kj preset save: '{label}' is a reserved factory preset; \
@@ -190,31 +147,6 @@ impl KjDispatcher {
 
         let db = self.kernel_db().lock();
 
-        // Resolve --cast BEFORE any mutation — an unknown label fails loud,
-        // listing the known casts, rather than silently saving a preset that
-        // references nothing.
-        let cast_id = match cast_spec.as_deref() {
-            Some(label) if !label.is_empty() => match db.get_cast_by_label(label) {
-                Ok(Some(cast)) => Some(cast.cast_id),
-                Ok(None) => {
-                    let known: Vec<String> = db
-                        .list_casts()
-                        .map(|casts| casts.iter().map(|c| c.label.clone()).collect())
-                        .unwrap_or_default();
-                    let known = if known.is_empty() {
-                        "(no casts configured — `kj cast create <label>` starts one)".to_string()
-                    } else {
-                        known.join(", ")
-                    };
-                    return KjResult::Err(format!(
-                        "kj preset save: unknown cast '{label}' — known casts: {known}"
-                    ));
-                }
-                Err(e) => return KjResult::Err(format!("kj preset save: {e}")),
-            },
-            _ => None,
-        };
-
         // Check if preset already exists → update
         match db.get_preset_by_label(label) {
             Ok(Some(existing)) => {
@@ -222,8 +154,8 @@ impl KjDispatcher {
                     preset_id: existing.preset_id,
                                         label: label.to_string(),
                     description: desc.or(existing.description),
-                    cast_id: cast_id.or(existing.cast_id),
-                    system_prompt: system_prompt.or(existing.system_prompt),
+                    cast_id: existing.cast_id,
+                    system_prompt: existing.system_prompt,
                     created_at: existing.created_at,
                     created_by: existing.created_by,
                 };
@@ -237,8 +169,8 @@ impl KjDispatcher {
                     preset_id: PresetId::new(),
                                         label: label.to_string(),
                     description: desc,
-                    cast_id,
-                    system_prompt,
+                    cast_id: None,
+                    system_prompt: None,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
                 };
@@ -428,58 +360,41 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("cast"), s("create"), s("research")], &c).await;
-
         let result = d
-            .dispatch(
-                &[
-                    s("preset"),
-                    s("save"),
-                    s("fast"),
-                    s("--cast"),
-                    s("research"),
-                    s("--desc"),
-                    s("Fast preset"),
-                ],
-                &c,
-            )
+            .dispatch(&[s("preset"), s("save"), s("fast"), s("--desc"), s("Fast preset")], &c)
             .await;
         assert!(result.is_ok(), "save failed: {}", result.message());
         assert!(result.message().contains("created"));
 
-        // List should show it, cast tag included.
         let result = d.dispatch(&[s("preset"), s("list")], &c).await;
         assert!(result.is_ok());
         assert!(
-            result.message().contains("fast") && result.message().contains("cast:research"),
+            result.message().contains("fast") && result.message().contains("Fast preset"),
             "msg: {}",
             result.message()
         );
 
-        // Show surfaces the resolved cast label too.
         let result = d.dispatch(&[s("preset"), s("show"), s("fast")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("Cast: research"), "msg: {}", result.message());
+        assert!(result.message().contains("Description: Fast preset"), "msg: {}", result.message());
     }
-
-    /// An unknown `--cast` label fails loud instead of silently saving a
-    /// preset that references nothing.
+    /// A preset names no model: `--cast` and `--system-prompt` are gone from
+    /// `kj preset save`.
+    ///
+    /// Falsified by restoring either flag.
     #[tokio::test]
-    async fn preset_save_rejects_unknown_cast() {
+    async fn preset_save_takes_no_cast_or_system_prompt() {
         let d = test_dispatcher().await;
         let ctx = register_context(&d, Some("ctx"), None, PrincipalId::new());
         let c = caller_with_context(ctx);
 
-        let result = d
-            .dispatch(
-                &[s("preset"), s("save"), s("fast"), s("--cast"), s("nonesuch")],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "unknown cast must be rejected");
-        assert!(result.message().contains("unknown cast"), "got: {}", result.message());
+        for flag in ["--cast", "--system-prompt"] {
+            let result = d.dispatch(&[s("preset"), s("save"), s("fast"), s(flag), s("x")], &c).await;
+            assert!(!result.is_ok(), "{flag} must be refused");
+            assert!(result.message().contains("unexpected argument"), "{flag}: {}", result.message());
+        }
+        assert!(d.kernel_db().lock().get_preset_by_label("fast").unwrap().is_none(), "a refusal saves nothing");
     }
-
     #[tokio::test]
     async fn preset_save_update() {
         let d = test_dispatcher().await;
@@ -487,24 +402,14 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("cast"), s("create"), s("a")], &c).await;
-        d.dispatch(&[s("cast"), s("create"), s("b")], &c).await;
-
-        // Create
-        d.dispatch(&[s("preset"), s("save"), s("p"), s("--cast"), s("a")], &c)
-            .await;
-
-        // Update same label, narrowing to a different cast.
-        let result = d
-            .dispatch(&[s("preset"), s("save"), s("p"), s("--cast"), s("b")], &c)
-            .await;
+        d.dispatch(&[s("preset"), s("save"), s("p"), s("--desc"), s("first")], &c).await;
+        let result = d.dispatch(&[s("preset"), s("save"), s("p"), s("--desc"), s("second")], &c).await;
         assert!(result.is_ok(), "update failed: {}", result.message());
         assert!(result.message().contains("updated"));
 
         let shown = d.dispatch(&[s("preset"), s("show"), s("p")], &c).await;
-        assert!(shown.message().contains("Cast: b"), "got: {}", shown.message());
+        assert!(shown.message().contains("Description: second"), "got: {}", shown.message());
     }
-
     #[tokio::test]
     async fn preset_remove_requires_latch() {
         let d = test_dispatcher().await;

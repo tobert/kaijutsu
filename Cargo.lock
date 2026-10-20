@@ -6702,7 +6702,6 @@ dependencies = [
  "serde_json",
  "shell-words",
  "tokio",
- "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",

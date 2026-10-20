@@ -2,7 +2,6 @@ description = "Bump-only with escalate after 3: two shell_write calls are bumped
 
 gate = """
 [council]
-server = "{council}"
 contexts = ["fleet-seat"]
 mode = "bump-only"
 escalate = { bumps = 3, minutes = 10 }

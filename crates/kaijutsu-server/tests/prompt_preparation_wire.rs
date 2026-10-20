@@ -99,7 +99,7 @@ fn disconnect_during_preparation(path: InputPath) {
             InputPath::Prompt => {
                 let kernel = submitting.clone();
                 tokio::task::spawn_local(async move {
-                    kernel.prompt("prompt survives disconnect", None, context).await.map(|_| ())
+                    kernel.prompt("prompt survives disconnect", context).await.map(|_| ())
                 })
             }
             InputPath::ChatSubmit => {

@@ -178,9 +178,6 @@ pub struct HookListener {
     /// kernel restart that killed the process) — exactly the case this
     /// exists to fix.
     pending_label_base: Mutex<Option<String>>,
-    /// Guards `set_context_model` (from `session.start`'s `model` field) to
-    /// at most one call per process.
-    context_model_set: Mutex<bool>,
     /// A `session.end` recorded for this listener's own session
     /// ([`should_record_session_end`]), not yet confirmed by process exit.
     /// Cleared by ANY later hook event (proof the session kept going) or
@@ -248,7 +245,6 @@ impl HookListener {
             session_id: Arc::new(Mutex::new(None)),
             agent_name: Arc::new(Mutex::new(None)),
             pending_label_base: Mutex::new(None),
-            context_model_set: Mutex::new(false),
             session_end_recorded: Mutex::new(false),
         }
     }
@@ -296,7 +292,6 @@ impl HookListener {
             session_id,
             agent_name,
             pending_label_base: Mutex::new(pending_label_base),
-            context_model_set: Mutex::new(false),
             session_end_recorded: Mutex::new(false),
         }
     }
@@ -609,35 +604,6 @@ impl HookListener {
                 if let Err(e) = self.insert_text_block(Role::System, &content).await {
                     author_error = Some(e);
                 }
-
-                // Remote-only follow-up, at most once per process: tell the
-                // kernel which model this context is talking to. Label
-                // stabilization now happens generally in `handle_connection`
-                // (`maybe_stabilize_label`), not gated to this event type —
-                // see that method's doc comment for why.
-                if let Some(ref remote) = self.remote
-                    && let Some(ctx_id) = self.context_id()
-                    && let Some(model) = event.model.as_deref()
-                    && let Some(provider) = provider_for_source(&event.source)
-                {
-                    // Recover a poisoned lock (rather than `.ok()`-skip like
-                    // `session_id` elsewhere) — this flag exists to stop a
-                    // *duplicate* RPC, so losing track of "already called"
-                    // under poisoning is the wrong failure mode.
-                    let already_set = {
-                        let mut guard =
-                            self.context_model_set.lock().unwrap_or_else(|e| e.into_inner());
-                        std::mem::replace(&mut *guard, true)
-                    };
-                    if !already_set {
-                        match remote.actor.set_context_model(ctx_id, provider, model).await {
-                            Ok(_) => {
-                                tracing::info!(source = %event.source, provider, model, "Set context model from session.start")
-                            }
-                            Err(e) => tracing::warn!("Failed to set context model: {e}"),
-                        }
-                    }
-                }
             }
 
             "session.end" => {
@@ -694,8 +660,7 @@ impl HookListener {
                     let stored = self.session_id.lock().ok().and_then(|g| g.clone());
                     if should_record_session_end(stored.as_deref(), event.session_id.as_deref()) {
                         // Recover a poisoned lock rather than `.ok()`-skip —
-                        // same reasoning as `context_model_set` above: losing
-                        // track of "a session.end was recorded" under
+                        // losing track of "a session.end was recorded" under
                         // poisoning is the wrong failure mode.
                         *self
                             .session_end_recorded
@@ -1267,18 +1232,6 @@ impl HookListener {
     }
 }
 
-/// Map a normalized hook source to the kernel provider which serves its model.
-///
-/// A source without an explicit mapping must not pin a context to an arbitrary
-/// provider: its model identifier may be meaningful only to that source.
-fn provider_for_source(source: &str) -> Option<&'static str> {
-    match source {
-        "claude-code" => Some("anthropic"),
-        "codex" => Some("codex-app"),
-        _ => None,
-    }
-}
-
 /// Truncate a string to `max_len` bytes at a char boundary.
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -1815,13 +1768,6 @@ mod tests {
             agent_type: None,
             trigger: None,
         }
-    }
-
-    #[test]
-    fn session_model_provider_is_explicitly_mapped_by_source() {
-        assert_eq!(provider_for_source("claude-code"), Some("anthropic"));
-        assert_eq!(provider_for_source("codex"), Some("codex-app"));
-        assert_eq!(provider_for_source("unrecognized-agent"), None);
     }
 
     fn local_listener_with_context() -> (HookListener, SharedBlockStore, ContextId) {

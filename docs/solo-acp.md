@@ -7,7 +7,7 @@ container — gets a working agent without anyone standing up a server first.
 
 `kaijutsu-acp` is the bridge to a kernel somebody else runs. This binary is
 that bridge plus the kernel, and the startup a person would otherwise do by
-hand: a state directory, keys, a root identity, config trees, model defaults,
+hand: a state directory, keys, a root identity, config trees, a model cast,
 and the performer character a model turn needs.
 
 The wire between the two halves is the real one. The kernel listens on
@@ -78,7 +78,8 @@ file the backend row names. It never belongs in this file.
 | `--unlist <path>` | Leave a path out of its parent's directory listing, so a walk from above (`find /`, `grep -r PATTERN /`, `ls /`) never reaches it; naming it still does (`docs/mounts.md`, "Unlisted paths"). Repeatable. Must be absolute and not `/`; it need not exist. The Harbor adapter unlists `/logs` and `/installed-agent`. |
 | `--headless` | Run a headless kernel (`docs/writing.md`, "Terms"), for a harness that sends a task and waits for it to end. A coder's turn then runs until it calls `done`: a text-only reply is answered with a notice instead of ending the prompt (`docs/conversation-session.md`, "Ending a task with done"). Leave it off for a client a person types into. The Harbor adapter passes it. |
 | `--gate-config <file>` | A gate policy to install verbatim, replacing the shipped default. |
-| `--max-tokens <N>` | The output token budget of every turn, reasoning included, written onto the chosen model's row. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the model's own budget (the DeepSeek model rows this binary writes carry 65536 at effort `high`), else the defaults' 16384. |
+| `--max-tokens <N>` | The output token budget of every turn, reasoning included, written onto the chosen model's row. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the model's own budget (the DeepSeek model rows this binary writes carry 65536 at effort `high`). A model whose row sets none refuses the start until this names one. |
+| `--council-server <URL>`, `--council-model <MODEL>` | The council server the gate decides on and the model it serves, written as the `gate` slot of this run's cast. Both or neither. Without them the session has no council. |
 | `--rc-overlay <dir>` | An rc variant to install over the seeded `/config/rc` tree, for A/B instruction sets (`contrib/bench/rc-variants/*/README.md`). The directory mirrors the rc tree's layout and holds only the files that differ; every regular file under it (a top-level `README.md` is skipped) replaces the file at the same relative path, unlinked first so a seeded symlink into `lib/` is replaced rather than written through. Refuses, before anything is replaced, if the directory is missing or empty, contains a symlink or another non-regular file, or names a file whose seeded parent directory does not exist. Idempotent: re-applying the same overlay against a persistent `--state-dir` is safe. |
 
 Zero flags works when exactly one of `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`,
@@ -136,10 +137,10 @@ A `--state-dir` keeps the kernel: its contexts, transcripts, characters, and
 settings are all there on the next run, and the connecting key is reused
 rather than regenerated. Two things follow.
 
-The model defaults are rewritten at every boot, so a second run with a
+The `solo` cast's slot is rewritten at every boot, so a second run with a
 different `--backend-kind` or `--model` changes what NEW sessions use. An
-existing context keeps the provider and model stamped on it, and `kj model`
-inside that session is what changes it.
+existing context keeps the model its binding was written with; rotate it
+(`kj context rotate`) to bind the new one.
 
 The root character is written once. A state directory that already belongs to
 a different live root refuses, loudly, rather than adding a second one — so a
@@ -155,19 +156,22 @@ Each step fails loudly, with what it was doing:
 3. Load or generate the connecting character's Ed25519 key.
 4. Make `solo` the root character and bind that key to it. `solo` owns the
    bridge's connection and is the reviewer every approval resolves to.
-5. Write the chosen provider's backend row, the chosen model's row, and the
-   model defaults. A kernel ships no backends, so a new state directory holds
-   only this one. The backend row names the provider's key variable and key
+5. Write the chosen provider's backend row, the chosen model's row, and a
+   `solo` cast whose slot for the context type runs the chosen model (with a
+   `gate` slot on the council server when `--council-server` is given). The
+   performer character plays that cast, so its instance binds the model when
+   the session's context is made. A kernel ships no backends, so a new state
+   directory holds only this one. The backend row names the provider's key variable and key
    file (`~/.deepseek-key` and the like). The model row carries the context
    window this binary knows for the model, and for DeepSeek a 65536 output
-   budget at effort `high`; a model it does not know gets no row. A new
-   defaults row carries a 16384 output budget. A reused state directory keeps
+   budget at effort `high`; a model it does not know gets no row, and
+   refuses the start unless `--max-tokens` names a budget. A reused state directory keeps
    the rows it has, with any edit made through `kj`, unless `--base-url`,
    `--api-key-env`, or `--no-key` says something different, which replaces
    the backend row; a row written without `--api-key-env` or `--no-key` keeps
    the provider's key file. The two timeouts change only their own columns of
-   the backend row. `--max-tokens` sets the chosen model's own output budget,
-   which outranks the defaults row; left out, the model's own budget stands.
+   the backend row. `--max-tokens` sets the chosen model's own output budget;
+   left out, the model's own budget stands.
 6. Create the performer character. A model turn needs a live performer
    distinct from its reviewer (`docs/approval-identity.md`), so `solo` reviews
    and `solo-coder` performs.

@@ -84,7 +84,7 @@ fn read_instance_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Charact
     })
 }
 
-fn read_opt_instance_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<CharacterInstanceId>> {
+pub(super) fn read_opt_instance_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<CharacterInstanceId>> {
     let bytes: Option<Vec<u8>> = row.get(idx)?;
     match bytes {
         Some(b) => CharacterInstanceId::try_from_slice(&b).map(Some).ok_or_else(|| {
@@ -727,6 +727,10 @@ impl KernelDb {
     }
 
     /// An instance's bindings, oldest first.
+    pub fn get_binding(&self, instance_id: CharacterInstanceId, seq: i64) -> KernelDbResult<Option<InstanceBindingRow>> {
+        Ok(self.list_instance_bindings(instance_id)?.into_iter().find(|b| b.seq == seq))
+    }
+
     pub fn list_instance_bindings(&self, instance_id: CharacterInstanceId) -> KernelDbResult<Vec<InstanceBindingRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT instance_id, seq, conversation_ctx, bound_at, cast_label, persona

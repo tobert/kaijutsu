@@ -3,7 +3,7 @@
     "TextStart",
     {"TextDelta": "solo mock speaking"},
     "TextEnd",
-    {"ToolUse": {"id": "solo-chat-done", "name": "done", "input": {"status": "done", "summary": "said something"}}},
+    {"ToolUse": {"id": "solo-chat-done", "name": "done", "input": {"status": "done", "feedback": "said something"}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ]
 ]

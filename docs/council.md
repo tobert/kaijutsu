@@ -260,9 +260,8 @@ else. A server whose `GET /council/v2/identity` fails, a 404 included, is a
 miss for every decision on it. The server keeps no context records: there
 are no server-side context ids, and a seat is sent whole each time.
 
-- **A decision runs on one served model.** `[council] model`, or a `gate`
-  slot's model, names it by its `model` or an alias; left out, it is the
-  server's only served model. Every build and decision sends the served
+- **A decision runs on one served model.** The `gate` slot's model names
+  it by its `model` or an alias. Every build and decision sends the served
   model's `model`, and a seat is held per served model. A name the server
   does not serve is a miss naming the models it serves, and so is leaving
   the name out on a server that serves several. A model that is not
@@ -413,15 +412,16 @@ grows with the gate.
   `<type>-<seat label>`; it does not start with `council-`, so the
   reviewer-chain walk never takes it for a character's council context. Each child
   keeps its own dialogue, so a judge sees only its own earlier opinions.
-- **The cast picks the model.** A context already resolves its model from
-  the cast slot named by its context_type (`model_resolution.rs`), and a
-  shadow inherits the seat's cast. A cast with a `judge` slot gives the
-  seat a judge, pointing at the megakernel, lfm2d, or Jev through
-  OpenRouter; a cast with no such slot gives none. "mk bumps", "lfm2d
-  bumps", and "Jev bumps" become casts. A seat with no cast of its own
-  uses its performer's default cast (`kj character set coder --cast
-  mk-judge`), so every seat a `coder` character plays gets the judge with
-  nothing to turn on per seat; to give a seat another cast, cast a character that has it.
+- **The binding picks the model.** A context's model is the slot for its
+  context_type in its instance's binding (`model_resolution.rs`), and a
+  shadow joins the seat's instance and binding. A binding with a `judge` slot
+  gives the seat a judge, pointing at the megakernel, lfm2d, or Jev through
+  OpenRouter; a binding with no such slot gives none. "mk bumps", "lfm2d
+  bumps", and "Jev bumps" become casts. A character names its cast
+  (`kj character set coder --cast mk-judge`), and each instance binds that
+  cast's slots when it starts or rotates, so every instance a `coder`
+  character runs gets the judge with nothing to turn on per seat; to give a
+  seat another cast, rotate it after the character's cast changes.
 - **Outward actions only.** Council time is limited on our hardware, so a
   shadow records what the seat does to the world, not what it reads. The
   gate already draws that line: the read-only `shell` tool runs no gate,
@@ -790,8 +790,6 @@ before any host file gains these lines.
 
 ```toml
 [council]
-server = "http://zorak:8090"
-model = "gemma-4"              # a served model's name or alias; optional when the server serves one
 contexts = ["council-system"]  # read for every decision
 reviewer_contexts = true        # compose council-<character> along the reviewer chain
 house_rules = true             # read the AGENTS.md above the seat's cwd; off by default
@@ -821,30 +819,24 @@ enabled = true
 contexts = ["council-amy", "council-banto"]
 ```
 
-`kj cast slot set mk-bumps gate --backend mk-zorak --model gemma-4` sends
-the gate decisions of every seat that resolves through cast `mk-bumps` to
-the served model `gemma-4` on the council server at backend `mk-zorak`'s
-`base_url`. A seat resolves its cast
-the way the judge does: its own cast, else its performer's default cast
-(`kj character set coder --cast mk-bumps`). A seat whose cast has no `gate`
-slot, or that resolves no cast, decides on `[council] server`. The slot's
-backend must have kind `mk` and a `base_url`; any other backend makes
-every decision on the submission a miss that names the backend, and no
-other server is asked in its place. The slot's `--model` names the served
-model and replaces `[council] model`; the served model's identity is
-recorded with each decision. The role is `gate`, not `council`, because `council` is a
-context type: a council context playing a cast with a `council` slot
-would take that slot as its chat model. `gate` is a reserved role: no
-context resolves its chat model from a `gate` slot, and `kj kohai
-create` and `kj context set` refuse `--type gate` as a cast role, not a
-context type. Step 7 of `docs/senpai-kohai.md` moves the gate to its own cast
-and removes the reserved role; to be decided in step 7: how the gate's cast
-is chosen. This section describes the `gate` slot until then. The cast chooses only the server and its served model;
-whether a type gets the council, `mode`, specs, thresholds, contexts, and
-`deadline_ms` stay in `gate.toml`. Every decision on the submission, program
-decisions included, and the observing reviewer contexts read after it go to
-the cast's server, under that server's endpoint
-concurrency limit (`docs/retries-and-ratelimits.md`).
+`gate.toml` names no council server and no served model. An instance decides on the `gate` slot of its
+binding: `kj cast slot set mk-bumps gate --backend mk-zorak --model gemma-4` sends the gate decisions of every
+instance whose binding was written from cast `mk-bumps` to the served model `gemma-4` on the council server at
+backend `mk-zorak`'s `base_url`. The character names the cast (`kj character set coder --cast mk-bumps`), and
+the binding copies the slot when the instance starts or rotates, so a cast change moves no running instance. An
+instance whose binding has no `gate` slot has no council: its gate decides without one, whatever `gate.toml`
+enables. A `[council] server` or `[council] model` key is refused as an unknown field. The slot's backend must have
+kind `mk` and a `base_url`; any other backend makes every decision on the submission a miss that names the
+backend, and no other server is asked in its place. The slot's `--model` names the served model; the served
+model's identity is recorded with each decision. The role is `gate`, not `council`, because `council` is a
+context type: a council context playing a cast with a `council` slot would take that slot as its chat model.
+`gate`, `judge` and `distill` are reserved roles: no context resolves its chat model from one, and `kj kohai
+create` and `kj context set` refuse `--type gate` as a cast role, not a context type. The binding chooses only
+the server and its served model; whether a type gets the council, `mode`, specs, thresholds, contexts, and
+`deadline_ms` stay in `gate.toml`. Every decision on the submission, program decisions included, and the
+observing reviewer contexts read after it go to the binding's server, under that server's endpoint concurrency
+limit (`docs/retries-and-ratelimits.md`). At startup the kernel builds the seats of each live context whose
+instance has a `gate` slot, on that slot's server.
 
 A context type's `contexts` replaces `[council] contexts` for that type.
 Omitting it keeps the shared list. The replacement must hold at least one
@@ -889,8 +881,8 @@ posts the spec again.
   it serves council v2. Long runs against it on zorak take the heavy lock
   (`flock -w 900 ~/.cache/zorak-heavy.lock`).
 - **lfm2d,** behind the same port once it serves council v2.
-- **A seat's cast can choose the server.** A `gate` slot whose backend
-  has kind `mk` names the server for that seat's decisions ("mk bumps",
+- **A seat's binding chooses the server.** A `gate` slot whose backend
+  has kind `mk` names the server for that instance's decisions ("mk bumps",
   "lfm2d bumps"); see "Configuration". A `gate` slot on a backend of any
   other kind, such as Jev through OpenRouter, is a miss.
 - **Jev through OpenRouter, for comparison only.** It speaks the gateway

@@ -127,10 +127,11 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `live.backend_kind` | The agent's `--backend-kind`, such as `deepseek`. |
 | `live.model` | The agent's `--model`, such as `deepseek-flash`. |
 | `live.api_key_file` | A file holding the API key; a leading `~/` is the home directory. The agent gets the key in an environment variable named with `--api-key-env`: a host agent from the runner, a contained one from the file mounted read-only. |
-| `[council]` | A council server for the run, whose address replaces `{council}` in `gate` and `prompt.gate`. Give `verdicts`, or `server`. A gate that names `{council}` with no `[council]`, or a `[council]` no gate names, is refused. See "Council scenarios". |
+| `[council]` | A council server for the run: the agent gets it as `--council-server` and `--council-model`, which write the `gate` slot of the performer's cast. Give `verdicts`, or `server` with the `model` it serves. See "Council scenarios". |
 | `council.verdicts` | A council the runner serves on 127.0.0.1: one verdict per decision, in order, and the last one repeats. Each is `proceed`, `try_harder`, or `do_less`. |
 | `council.undo` | The `undo` read every scripted decision carries: `reversible`, `normal`, or `irreversible`. Default: none. |
-| `council.server` | A real council server, such as `http://zorak:8090`, instead of `verdicts`. In contained mode, the host must be a name or a 127.0.0.0/8 address written as four dotted decimal numbers; a host a resolver reads as a number in another form, such as `2130706433`, `0x7f000001`, or `127.1`, is refused. The container reaches this server; see "The scenario is the network policy". |
+| `council.server` | A real council server, such as `http://zorak:8090`, instead of `verdicts`; give its served `model` too. In contained mode, the host must be a name or a 127.0.0.0/8 address written as four dotted decimal numbers; a host a resolver reads as a number in another form, such as `2130706433`, `0x7f000001`, or `127.1`, is refused. The container reaches this server; see "The scenario is the network policy". |
+| `council.model` | The model a real `server` serves, which the `gate` slot names. Required with `server`; refused with `verdicts`, whose council serves `fleet-council`. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events, text first; `events` gives the mock backend's raw events instead. See "Ending a task". |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
 | `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
@@ -333,7 +334,6 @@ kaijutsu-mcp (path D) have no ACP entry.
 ```toml
 gate = """
 [council]
-server = "{council}"
 contexts = ["fleet-seat"]
 mode = "bump-only"
 escalate = { bumps = 3, minutes = 10 }

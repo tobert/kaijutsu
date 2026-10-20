@@ -1,31 +1,25 @@
-//! "What model does this context play?" — the one function that answers
-//! that question.
+//! "What model does this context play?" Read the context's character
+//! instance binding; nothing else answers.
 //!
-//! Resolve a context's effective model from three sources, in priority order:
-//!
-//! 1. An explicit **per-context override** — the context row's own
-//!    `provider`/`model` columns, set via `kj context set --model` (or at
-//!    `create`/fork time). This always wins; it is the same mechanism
-//!    `kj model` already reports as `source: "context"`.
-//! 2. A **cast slot** matched on the context's `context_type`, except a
-//!    reserved role ([`RESERVED_ROLES`]) — the named
-//!    ensemble assigned via `kj kohai create --cast <label>` /
-//!    `kj context set --cast <label>` (`ContextRow::cast_id`, resolved to a
-//!    label by the caller) or inherited from a preset's `cast_id` at fork.
-//! 3. The **registry-wide default** backend/model (`kj backend`'s
-//!    `llm_defaults` row) — the same fallback `kj model` already reports as
-//!    `source: "default"`.
-//!
-//! Resolution uses already-read values and holds no database lock. The turn
-//! entry point in `runtime/llm_stream.rs` resolves the cast label and context
-//! type once, then passes them here with any explicit model override.
+//! A model call in context K runs on the `instance_slots` row for K's context
+//! type in the binding K was made with (`contexts.instance_id` and
+//! `contexts.binding_seq`). A context with no instance, or a binding with no
+//! slot for the type, has no model. No cast, `backend_models` row or registry
+//! default stands in.
 
-use crate::llm::{LlmRegistry, SlotTunables};
+use kaijutsu_types::{CharacterInstanceId, ContextId};
 
-/// Cast slot roles that are not context types. A `gate` slot names a seat's
-/// council server (`docs/council.md`, "Configuration"); no context takes a
-/// chat model from it, and no context may have its name as its type.
-pub const RESERVED_ROLES: &[&str] = &[crate::council::gate::GATE];
+use crate::kernel_db::{InstanceSlotRow, KernelDb, KernelDbError, KernelDbResult};
+use crate::llm::SlotTunables;
+
+/// Cast slot roles that are not context types. The `gate` slot names the
+/// council server for gate decisions, `judge` the server for the judge
+/// shadow, and `distill` the model that summarizes a fork. No context takes a
+/// chat model from them, and no context may have one as its type.
+pub const RESERVED_ROLES: &[&str] = &[crate::council::gate::GATE, crate::council::shadow::JUDGE, DISTILL];
+
+/// The cast slot role a fork's distillation runs on.
+pub const DISTILL: &str = "distill";
 
 /// Refuses `context_type` when it names a reserved cast role.
 pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
@@ -33,274 +27,241 @@ pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "'{context_type}' is a cast role, not a context type: a cast's `{context_type}` slot names \
-         the council server for the seats that play the cast; choose another --type"
+        "'{context_type}' is a cast role, not a context type: a cast's `{context_type}` slot configures \
+         a council or distillation model for the instances that play the cast; choose another --type"
     ))
 }
 
-/// Why [`resolve_context_model`] answered the way it did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelSource {
-    /// The context's own `provider`/`model` columns (`kj context set --model`,
-    /// or set at `create`/fork time).
-    ContextOverride,
-    /// A cast slot matched on the context's `context_type`. Carries the cast
-    /// label that answered, for display/logging.
-    CastSlot { cast: String },
-    /// The registry-wide default backend/model (`llm_defaults`).
-    RegistryDefault,
+/// The model a context runs, copied from its binding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextModel {
+    pub instance: CharacterInstanceId,
+    /// The binding `seq` the context runs on.
+    pub seq: i64,
+    pub character: String,
+    pub cast: Option<String>,
+    pub context_type: String,
+    /// Backend NAME, the registry key.
+    pub backend: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub context_window: Option<u64>,
+    /// The slot's optional parameters. `max_tokens` is not repeated here.
+    pub tunables: SlotTunables,
 }
 
-impl ModelSource {
-    /// The tier's stable name, as the `turns` table records it.
-    pub fn tier(&self) -> &'static str {
-        match self {
-            Self::ContextOverride => "context_override",
-            Self::CastSlot { .. } => "cast_slot",
-            Self::RegistryDefault => "default",
+/// Why a context has no model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoModelReason {
+    /// The context belongs to no character instance.
+    NoInstance,
+    /// The binding was written from a character with no cast.
+    NoCast,
+    /// The binding's cast has no slot for the role.
+    NoSlot { cast: String },
+}
+
+/// A context, or a role of its instance, that has no model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoModel {
+    pub context: String,
+    /// The instance's name; `None` when the context has no instance.
+    pub instance: Option<String>,
+    pub character: Option<String>,
+    /// The role looked up: the context's type, or `gate`, `judge`, `distill`.
+    pub role: String,
+    pub reason: NoModelReason,
+}
+
+impl NoModel {
+    /// One line for `kj kohai create`, `kj context rotate` and `kj context info`.
+    pub fn line(&self) -> String {
+        let instance = self.instance.as_deref().unwrap_or(&self.context);
+        match &self.reason {
+            NoModelReason::NoInstance => format!("{} has no character instance, so it runs no model", self.context),
+            NoModelReason::NoCast => format!(
+                "{instance} has no model for {}: {} has no cast",
+                self.role,
+                self.character.as_deref().unwrap_or("its character")
+            ),
+            NoModelReason::NoSlot { cast } => {
+                format!("{instance} has no model for {}: cast {cast} has no {} slot", self.role, self.role)
+            }
+        }
+    }
+
+    /// The refusal for a model turn: the character, the cast, the role and
+    /// the fix.
+    pub fn refusal(&self) -> String {
+        self.refusal_as("runs no model")
+    }
+
+    /// The refusal for a call that needs the role's slot, with `what` saying
+    /// what the context cannot do ("runs no model", "cannot distill"). It
+    /// leads with the cause and the fix: an error block's summary keeps only
+    /// the first 200 characters.
+    pub fn refusal_as(&self, what: &str) -> String {
+        let character = self.character.as_deref().unwrap_or("(none)");
+        match &self.reason {
+            NoModelReason::NoInstance => format!(
+                "{} belongs to no character instance, so it {what}. Start one: \
+                 `kj kohai create <label> --as <character> --type <type>`",
+                self.context
+            ),
+            NoModelReason::NoCast => format!(
+                "{} {what}: character {character} has no cast, so no {} slot. Fix: \
+                 `kj character set {character} --cast <cast>`, then `kj context rotate`",
+                self.context, self.role
+            ),
+            NoModelReason::NoSlot { cast } => format!(
+                "{} {what}: character {character}'s cast {cast} has no {} slot. Fix: \
+                 `kj cast slot set {cast} {} ...` or `kj character set {character} --cast <cast>`, \
+                 then `kj context rotate`",
+                self.context, self.role, self.role
+            ),
         }
     }
 }
 
-/// The resolved answer to "what model does this context play?"
+/// A role's answer on a binding.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedContextModel {
-    /// Backend NAME (e.g. `anthropic`, `deepseek`, `gpt`).
+pub enum ContextModelLookup {
+    Model(ContextModel),
+    None(NoModel),
+}
+
+impl ContextModelLookup {
+    /// The label of the cast the binding was written from, whether or not it
+    /// has a slot for the role.
+    pub fn cast(&self) -> Option<&str> {
+        match self {
+            Self::Model(m) => m.cast.as_deref(),
+            Self::None(NoModel { reason: NoModelReason::NoSlot { cast }, .. }) => Some(cast),
+            Self::None(_) => None,
+        }
+    }
+
+    /// The model, or the refusal text.
+    pub fn into_model(self) -> Result<ContextModel, String> {
+        match self {
+            Self::Model(m) => Ok(m),
+            Self::None(n) => Err(n.refusal()),
+        }
+    }
+}
+
+fn corrupt(what: String) -> KernelDbError {
+    KernelDbError::Validation(what)
+}
+
+/// The slot of `role` in the binding context `context_id` runs on, with the
+/// names around it. `role` is the context's type for a chat model, or a
+/// reserved role.
+pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbResult<RoleSlot> {
+    let context = db.context_name(context_id);
+    let Some((instance, seq)) = db.context_instance(context_id)? else {
+        return Ok(RoleSlot::None(NoModel {
+            context,
+            instance: None,
+            character: None,
+            role: role.to_string(),
+            reason: NoModelReason::NoInstance,
+        }));
+    };
+    let row = db
+        .get_instance(instance)?
+        .ok_or_else(|| corrupt(format!("context {context} names character instance {instance}, which has no row")))?;
+    let character = db
+        .get_character(row.principal_id)?
+        .map(|c| c.name)
+        .unwrap_or_else(|| row.principal_id.to_string());
+    let binding = db
+        .get_binding(instance, seq)?
+        .ok_or_else(|| corrupt(format!("context {context} runs binding {seq} of {instance}, which has no row")))?;
+    let instance_name = db.instance_name(instance);
+    let Some(slot) = db.binding_slot(instance, seq, role)? else {
+        let reason = match &binding.cast_label {
+            Some(cast) => NoModelReason::NoSlot { cast: cast.clone() },
+            None => NoModelReason::NoCast,
+        };
+        return Ok(RoleSlot::None(NoModel {
+            context,
+            instance: Some(instance_name),
+            character: Some(character),
+            role: role.to_string(),
+            reason,
+        }));
+    };
+    let backend = db
+        .list_backends()?
+        .into_iter()
+        .find(|b| b.backend_id == slot.backend_id)
+        .ok_or_else(|| corrupt(format!("binding {seq} of {instance} slot {role} names a backend that does not exist")))?
+        .name;
+    Ok(RoleSlot::Slot(BoundSlot { instance, seq, instance_name, character, cast: binding.cast_label, backend, slot }))
+}
+
+/// A binding slot with the names a caller reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSlot {
+    pub instance: CharacterInstanceId,
+    pub seq: i64,
+    pub instance_name: String,
+    pub character: String,
+    pub cast: Option<String>,
+    /// Backend NAME.
     pub backend: String,
-    pub model: String,
-    /// A cast seat's tunables, already resolved over its model's row and the
-    /// `llm_defaults` floor — `Some` only when [`ModelSource::CastSlot`]
-    /// answered. Use [`Self::tunables_in`] for what a turn runs.
-    pub tunables: Option<SlotTunables>,
-    pub source: ModelSource,
+    pub slot: InstanceSlotRow,
 }
 
-impl ResolvedContextModel {
-    /// The tunables a turn on this model runs: the cast seat's when one
-    /// answered, otherwise the model's own row over the `llm_defaults` floor.
-    pub fn tunables_in(&self, registry: &crate::llm::LlmRegistry) -> SlotTunables {
-        self.tunables
-            .clone()
-            .unwrap_or_else(|| registry.model_tunables(&self.backend, &self.model))
-    }
+/// What [`role_slot`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoleSlot {
+    Slot(BoundSlot),
+    None(NoModel),
 }
 
-/// Resolve the effective model for a context.
-///
-/// - `context_type`: the context's rc bucket (`coder`, `musician`, `mcp`, …)
-///   — the cast slot's ROLE key.
-/// - `context_provider` / `context_model`: the context row's own columns.
-///   `context_model.is_some()` is what makes this an override (a provider
-///   with no model is not enough) — mirrors `kj/model.rs`'s existing
-///   `row_model.is_some() -> source = "context"` rule, so the two surfaces
-///   can never disagree about what counts as "explicitly set".
-/// - `cast_label`: the context's assigned cast, already resolved from
-///   `ContextRow::cast_id` to its label by the caller (keeps this function
-///   DB-free) — `None` when the context has no cast assigned.
-/// - `registry`: for the cast-slot lookup and the final default fallback.
-///
-/// Returns `None` only when there is truly nothing to answer with: no
-/// override, no matching cast slot, and no registry default configured
-/// (`kj backend list` is empty). Never fabricates a model.
-pub fn resolve_context_model(
-    context_type: &str,
-    context_provider: Option<&str>,
-    context_model: Option<&str>,
-    cast_label: Option<&str>,
-    registry: &LlmRegistry,
-) -> Option<ResolvedContextModel> {
-    // 1. Explicit per-context override wins outright.
-    if let Some(model) = context_model {
-        let backend = context_provider
-            .map(str::to_string)
-            .or_else(|| registry.default_provider_name().map(str::to_string))?;
-        return Some(ResolvedContextModel {
-            backend,
-            model: model.to_string(),
-            tunables: None,
-            source: ModelSource::ContextOverride,
-        });
-    }
-
-    // 2. A cast slot matched on this context's context_type. A reserved
-    //    role's slot is never a chat model.
-    if let Some(label) = cast_label
-        && !RESERVED_ROLES.contains(&context_type)
-        && let Some(slot) = registry.resolved_slot(label, context_type)
-    {
-        return Some(ResolvedContextModel {
-            backend: slot.backend.clone(),
-            model: slot.model.clone(),
-            tunables: Some(slot.tunables.clone()),
-            source: ModelSource::CastSlot { cast: label.to_string() },
-        });
-    }
-
-    // 3. Registry-wide default.
-    let backend = registry.default_provider_name()?.to_string();
-    let model = registry.default_model()?.to_string();
-    Some(ResolvedContextModel {
-        backend,
-        model,
-        tunables: None,
-        source: ModelSource::RegistryDefault,
-    })
+fn non_negative(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| u64::try_from(v).ok())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::{BackendConfig, BackendKind, MockClient, Provider, ResolvedSlot};
-    use std::sync::Arc;
-
-    fn registry_with_default() -> LlmRegistry {
-        let mut reg = LlmRegistry::new();
-        reg.register("anthropic", Arc::new(Provider::Mock(MockClient::new("a"))));
-        reg.set_default("anthropic");
-        reg.set_default_model("claude-opus-4-8");
-        reg.set_backends(vec![BackendConfig::new("anthropic", BackendKind::Anthropic)]);
-        reg
-    }
-
-    /// Seat one cast slot (`house`/`coder` -> deepseek/deepseek-v4-pro) on an
-    /// otherwise-default registry.
-    fn registry_with_cast_slot() -> LlmRegistry {
-        let mut reg = registry_with_default();
-        reg.register("deepseek", Arc::new(Provider::Mock(MockClient::new("d"))));
-        reg.set_backends(vec![
-            BackendConfig::new("anthropic", BackendKind::Anthropic),
-            BackendConfig::new("deepseek", BackendKind::DeepSeek),
-        ]);
-        reg.set_cast_slots(vec![(
-            "house".to_string(),
-            ResolvedSlot {
-                role: "coder".to_string(),
-                backend: "deepseek".to_string(),
-                model: "deepseek-v4-pro".to_string(),
+/// The model context `context_id` runs, from its binding. `Err` is a fault
+/// reading the binding, or a chat slot with no `max_tokens` (which a binding
+/// write refuses).
+pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<ContextModelLookup> {
+    let context_type = db
+        .get_context(context_id)?
+        .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context_id.short())))?
+        .context_type;
+    match role_slot(db, context_id, &context_type)? {
+        RoleSlot::None(none) => Ok(ContextModelLookup::None(none)),
+        RoleSlot::Slot(bound) => {
+            let slot = &bound.slot;
+            let max_tokens = non_negative(slot.max_tokens).filter(|m| *m > 0).ok_or_else(|| {
+                corrupt(format!(
+                    "binding {} of {} slot {context_type} has no max_tokens, which every request carries",
+                    bound.seq, bound.instance_name
+                ))
+            })?;
+            Ok(ContextModelLookup::Model(ContextModel {
+                instance: bound.instance,
+                seq: bound.seq,
+                character: bound.character.clone(),
+                cast: bound.cast.clone(),
+                context_type,
+                backend: bound.backend.clone(),
+                model: slot.model.clone(),
+                max_tokens,
+                context_window: non_negative(slot.context_window),
                 tunables: SlotTunables {
-                    max_tokens: Some(8192),
-                    ..Default::default()
+                    max_tokens: None,
+                    temperature: slot.temperature,
+                    top_p: slot.top_p,
+                    effort: slot.effort.clone(),
+                    thinking_budget: non_negative(slot.thinking_budget),
+                    thinking_style: slot.thinking_style.clone(),
                 },
-                loadout: None,
-                extra: None,
-            },
-        )]);
-        reg
-    }
-
-    #[test]
-    fn explicit_override_wins_over_everything() {
-        let registry = registry_with_cast_slot();
-        let resolved = resolve_context_model(
-            "coder",
-            Some("anthropic"),
-            Some("claude-haiku-4-5"),
-            Some("house"),
-            &registry,
-        )
-        .expect("override present");
-        assert_eq!(resolved.backend, "anthropic");
-        assert_eq!(resolved.model, "claude-haiku-4-5");
-        assert_eq!(resolved.source, ModelSource::ContextOverride);
-        assert!(resolved.tunables.is_none());
-    }
-
-    #[test]
-    fn override_with_model_but_no_provider_falls_back_to_registry_default_provider() {
-        let registry = registry_with_default();
-        let resolved = resolve_context_model("coder", None, Some("claude-haiku-4-5"), None, &registry)
-            .expect("override present");
-        assert_eq!(resolved.backend, "anthropic", "registry default provider fills the gap");
-        assert_eq!(resolved.model, "claude-haiku-4-5");
-        assert_eq!(resolved.source, ModelSource::ContextOverride);
-    }
-
-    #[test]
-    fn cast_slot_wins_when_no_override_and_role_matches() {
-        let registry = registry_with_cast_slot();
-        let resolved = resolve_context_model("coder", None, None, Some("house"), &registry)
-            .expect("cast slot present");
-        assert_eq!(resolved.backend, "deepseek");
-        assert_eq!(resolved.model, "deepseek-v4-pro");
-        assert_eq!(resolved.source, ModelSource::CastSlot { cast: "house".to_string() });
-        assert_eq!(resolved.tunables.as_ref().unwrap().max_tokens, Some(8192));
-    }
-
-    #[test]
-    fn cast_assigned_but_role_has_no_seat_falls_through_to_registry_default() {
-        let registry = registry_with_cast_slot();
-        // "musician" has no slot in `house` — must fall through, not error.
-        let resolved = resolve_context_model("musician", None, None, Some("house"), &registry)
-            .expect("registry default present");
-        assert_eq!(resolved.backend, "anthropic");
-        assert_eq!(resolved.model, "claude-opus-4-8");
-        assert_eq!(resolved.source, ModelSource::RegistryDefault);
-    }
-
-    /// A cast's `gate` slot names a seat's council server, never a chat
-    /// model: a context whose type is `gate` does not take it.
-    ///
-    /// Falsified by matching the `gate` slot like any other role.
-    #[test]
-    fn the_reserved_gate_role_never_resolves_a_chat_model() {
-        let mut registry = registry_with_cast_slot();
-        registry.set_cast_slots(vec![(
-            "house".to_string(),
-            ResolvedSlot {
-                role: crate::council::gate::GATE.to_string(),
-                backend: "deepseek".to_string(),
-                model: "mk".to_string(),
-                tunables: SlotTunables::default(),
-                loadout: None,
-                extra: None,
-            },
-        )]);
-        let resolved = resolve_context_model(crate::council::gate::GATE, None, None, Some("house"), &registry)
-            .expect("registry default present");
-        assert_eq!(resolved.source, ModelSource::RegistryDefault);
-        assert_eq!(resolved.model, "claude-opus-4-8");
-    }
-
-    #[test]
-    fn unknown_cast_label_falls_through_to_registry_default() {
-        // The context's cast_id pointed at a cast that's since been removed
-        // (dangling label) — must not panic or error, just fall through.
-        let registry = registry_with_cast_slot();
-        let resolved = resolve_context_model("coder", None, None, Some("nonesuch"), &registry)
-            .expect("registry default present");
-        assert_eq!(resolved.source, ModelSource::RegistryDefault);
-    }
-
-    #[test]
-    fn no_override_no_cast_falls_through_to_registry_default() {
-        let registry = registry_with_default();
-        let resolved =
-            resolve_context_model("coder", None, None, None, &registry).expect("default present");
-        assert_eq!(resolved.backend, "anthropic");
-        assert_eq!(resolved.model, "claude-opus-4-8");
-        assert_eq!(resolved.source, ModelSource::RegistryDefault);
-    }
-
-    #[test]
-    fn nothing_configured_at_all_returns_none_never_fabricates() {
-        let registry = LlmRegistry::new();
-        let resolved = resolve_context_model("coder", None, None, None, &registry);
-        assert!(resolved.is_none());
-    }
-
-    /// A cast-id-to-label lookup is the caller's job (this function is
-    /// DB-free), but the whole point is that a REAL cast/slot round-trips
-    /// through `LlmRegistry` the same way `kj cast slot set` +
-    /// `LlmRegistry::resolved_slot` already do — this guards against a
-    /// second, diverging notion of "what a cast slot means" creeping in here.
-    #[test]
-    fn agrees_with_registry_resolved_slot_directly() {
-        let registry = registry_with_cast_slot();
-        let direct = registry.resolved_slot("house", "coder").expect("slot exists");
-        let resolved = resolve_context_model("coder", None, None, Some("house"), &registry)
-            .expect("resolves");
-        assert_eq!(resolved.backend, direct.backend);
-        assert_eq!(resolved.model, direct.model);
-        assert_eq!(resolved.tunables, Some(direct.tunables.clone()));
+            }))
+        }
     }
 }

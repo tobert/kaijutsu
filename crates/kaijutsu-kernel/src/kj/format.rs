@@ -2,24 +2,35 @@
 
 use std::collections::HashMap;
 
-use kaijutsu_types::{CastId, ContextId};
+use kaijutsu_types::ContextId;
 
 use crate::kernel_db::ContextRow;
 
-/// Look up a context row's cast label in the `cast_id -> label` map a caller
-/// builds once (e.g. from `KernelDb::list_casts`) — never a per-row DB call.
-/// Empty string when the context has no cast, or its `cast_id` is dangling
-/// (the cast was removed since the map was built).
-fn cast_tag(cast_id: Option<CastId>, casts: &HashMap<CastId, String>) -> String {
-    cast_id
-        .and_then(|id| casts.get(&id))
+/// What a context list shows of a context's character instance binding: the
+/// model its type runs, and the cast the binding was written from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextBound {
+    /// `backend/model`, or `None` when the binding has no slot for the type.
+    pub model: Option<String>,
+    pub cast: Option<String>,
+}
+
+/// The `[cast:<label>]` suffix for a context whose binding has a cast.
+fn cast_tag(bound: Option<&ContextBound>) -> String {
+    bound
+        .and_then(|b| b.cast.as_deref())
         .map(|label| format!(" [cast:{label}]"))
         .unwrap_or_default()
 }
 
+/// The model column: the binding's model, or "(no model)".
+fn model_column(bound: Option<&ContextBound>) -> &str {
+    bound.and_then(|b| b.model.as_deref()).unwrap_or("(no model)")
+}
+
 /// `[host:<name>]` tag for `format_context_table`/`format_context_tree` —
 /// same optional-suffix convention as `cast_tag`, but `origin_host` needs no
-/// map lookup (it's a plain string already on the row). Omitted entirely
+/// lookup (it's a plain string already on the row). Omitted entirely
 /// when unknown (old client, or a creation path with nothing to report —
 /// see `ContextRow::origin_host`'s doc comment), never rendered as "-" here:
 /// this is a tag list, and an unconditional "-" tag on every untouched row
@@ -34,14 +45,15 @@ fn origin_host_tag(origin_host: &Option<String>) -> String {
 /// Format a context list as a flat table.
 ///
 /// Marks the current context with `*` and ring-0 (promoted) contexts with a
-/// trailing `[ring0]` tag; `casts` resolves each row's `cast_id` to its label
-/// for an additional `[cast:<label>]` tag (omitted when uncast). A
+/// trailing `[ring0]` tag; `bound` carries each context's binding model and
+/// cast label for the model column and an additional `[cast:<label>]` tag
+/// (omitted when the binding has no cast). A
 /// `[host:<name>]` tag follows when `origin_host` is known — makes the
 /// fleet board self-evident from `kj context list` alone.
 pub fn format_context_table(
     contexts: &[ContextRow],
     current: Option<ContextId>,
-    casts: &HashMap<CastId, String>,
+    bound: &HashMap<ContextId, ContextBound>,
 ) -> String {
     if contexts.is_empty() {
         return "(no contexts)".to_string();
@@ -67,14 +79,14 @@ pub fn format_context_table(
             " "
         };
         let label = ctx.label.as_deref().unwrap_or("-");
-        let model = format_model(&ctx.provider, &ctx.model);
+        let model = model_column(bound.get(&ctx.context_id));
         let id_short = ctx.context_id.short();
         let ring0 = if ctx.promoted_at.is_some() {
             " [ring0]"
         } else {
             ""
         };
-        let cast = cast_tag(ctx.cast_id, casts);
+        let cast = cast_tag(bound.get(&ctx.context_id));
         let host = origin_host_tag(&ctx.origin_host);
         let age = format_age_compact(ctx.last_activity_at.unwrap_or(ctx.created_at));
         lines.push(format!(
@@ -117,13 +129,13 @@ pub(crate) fn format_age_compact(millis: i64) -> String {
 
 /// Format context DAG results as an indented tree.
 ///
-/// `dag` is a list of (ContextRow, depth) from the recursive CTE. `casts`
-/// resolves each row's `cast_id` to its label, same convention as
+/// `dag` is a list of (ContextRow, depth) from the recursive CTE. `bound`
+/// carries each context's binding model and cast label, same convention as
 /// `format_context_table` (including the `[host:<name>]` tag).
 pub fn format_context_tree(
     dag: &[(ContextRow, i64)],
     current: Option<ContextId>,
-    casts: &HashMap<CastId, String>,
+    bound: &HashMap<ContextId, ContextBound>,
 ) -> String {
     if dag.is_empty() {
         return "(no contexts)".to_string();
@@ -139,9 +151,9 @@ pub fn format_context_tree(
             " "
         };
         let label = ctx.label.as_deref().unwrap_or("-");
-        let model = format_model(&ctx.provider, &ctx.model);
+        let model = model_column(bound.get(&ctx.context_id));
         let id_short = ctx.context_id.short();
-        let cast = cast_tag(ctx.cast_id, casts);
+        let cast = cast_tag(bound.get(&ctx.context_id));
         let host = origin_host_tag(&ctx.origin_host);
 
         let prefix = if *depth > 0 { "└─ " } else { "" };
@@ -348,10 +360,6 @@ pub fn format_context_info(
         lines.push(format!("Context: {}", label_display));
     }
     lines.push(format!("ID:      {}", ctx.context_id.short()));
-    lines.push(format!(
-        "Model:   {}",
-        format_model(&ctx.provider, &ctx.model)
-    ));
     lines.push(format!("Type:    {}", ctx.context_type));
     if let Some(tid) = trace_id {
         lines.push(format!("Trace:   {}", hex32(tid)));
@@ -400,16 +408,6 @@ pub fn format_context_info(
     lines.join("\n")
 }
 
-/// Format provider/model as a display string.
-pub(crate) fn format_model(provider: &Option<String>, model: &Option<String>) -> String {
-    match (provider.as_deref(), model.as_deref()) {
-        (Some(p), Some(m)) => format!("{p}/{m}"),
-        (None, Some(m)) => m.to_string(),
-        (Some(p), None) => format!("{p}/(default)"),
-        (None, None) => "(no model)".to_string(),
-    }
-}
-
 /// Format a Unix-millis timestamp for display.
 pub(crate) fn format_timestamp(millis: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
@@ -433,7 +431,11 @@ pub(crate) fn format_timestamp(millis: i64) -> String {
 /// Format fork lineage chain for `kj context log`.
 ///
 /// Shows the chain from the starting context up to the root, with depth markers.
-pub fn format_fork_lineage(lineage: &[(ContextRow, i64)], current: Option<ContextId>) -> String {
+pub fn format_fork_lineage(
+    lineage: &[(ContextRow, i64)],
+    current: Option<ContextId>,
+    bound: &HashMap<ContextId, ContextBound>,
+) -> String {
     if lineage.is_empty() {
         return "(no lineage)".to_string();
     }
@@ -442,7 +444,7 @@ pub fn format_fork_lineage(lineage: &[(ContextRow, i64)], current: Option<Contex
     for (ctx, depth) in lineage {
         let marker = if Some(ctx.context_id) == current { "*" } else { " " };
         let label = ctx.label.as_deref().unwrap_or("-");
-        let model = format_model(&ctx.provider, &ctx.model);
+        let model = model_column(bound.get(&ctx.context_id));
         let id_short = ctx.context_id.short();
 
         let depth_indicator = if *depth == 0 {
@@ -717,30 +719,19 @@ mod tests {
     }
 
     #[test]
-    fn table_tags_cast_label_when_resolvable() {
-        let cast_id = CastId::new();
-        let mut cast = make_row(Some("cast-ctx"), ContextId::new());
-        cast.cast_id = Some(cast_id);
-        let uncast = make_row(Some("uncast-ctx"), ContextId::new());
-        let mut casts = HashMap::new();
-        casts.insert(cast_id, "house".to_string());
+    fn table_shows_the_binding_model_and_tags_the_cast() {
+        let with = make_row(Some("cast-ctx"), ContextId::new());
+        let without = make_row(Some("uncast-ctx"), ContextId::new());
+        let mut bound = HashMap::new();
+        bound.insert(
+            with.context_id,
+            ContextBound { model: Some("deepseek/flash".into()), cast: Some("house".into()) },
+        );
 
-        let output = format_context_table(&[cast, uncast], None, &casts);
+        let output = format_context_table(&[with, without], None, &bound);
         let lines: Vec<&str> = output.lines().collect();
-        assert!(lines[0].contains("[cast:house]"), "output: {output}");
-        assert!(!lines[1].contains("[cast:"), "output: {output}");
-    }
-
-    #[test]
-    fn table_omits_cast_tag_for_a_dangling_cast_id() {
-        // The cast was removed after the row was written but before this
-        // listing's `casts` map was built — must not panic or fabricate a
-        // label.
-        let mut row = make_row(Some("orphaned"), ContextId::new());
-        row.cast_id = Some(CastId::new());
-
-        let output = format_context_table(&[row], None, &HashMap::new());
-        assert!(!output.contains("[cast:"), "output: {output}");
+        assert!(lines[0].contains("deepseek/flash") && lines[0].contains("[cast:house]"), "output: {output}");
+        assert!(lines[1].contains("(no model)") && !lines[1].contains("[cast:"), "output: {output}");
     }
 
     #[test]
@@ -749,7 +740,6 @@ mod tests {
         let row = make_row(Some("test-ctx"), id);
         let output = format_context_info(&row, 2, 1, true, None);
         assert!(output.contains("test-ctx *"));
-        assert!(output.contains("anthropic/claude-opus-4-6"));
         assert!(output.contains("Children: 2"));
         assert!(output.contains("Drifts:  1"));
         // context_type always renders.
@@ -857,13 +847,6 @@ mod tests {
         let s = hex32(bytes);
         assert_eq!(s.len(), 32);
         assert_eq!(s, "0a0000000000000000000000000000ff");
-    }
-
-    #[test]
-    fn model_format_variants() {
-        assert_eq!(format_model(&Some("a".into()), &Some("b".into())), "a/b");
-        assert_eq!(format_model(&None, &Some("b".into())), "b");
-        assert_eq!(format_model(&None, &None), "(no model)");
     }
 
     #[test]

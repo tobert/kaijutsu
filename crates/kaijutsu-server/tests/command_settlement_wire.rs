@@ -570,7 +570,7 @@ fn pool_full_refuses_shell_structured_streaming_prompt_and_draft_submission() {
         let streaming = kj.execute("echo pool-full-stream").await;
         assert!(streaming.is_err(), "streaming submission must be refused while the pool is full: {streaming:?}");
 
-        let prompt = kj.prompt("pool-full prompt", None, context).await;
+        let prompt = kj.prompt("pool-full prompt", context).await;
         assert!(prompt.is_err(), "prompt submission must be refused while the pool is full: {prompt:?}");
 
         let draft_submit = kj.submit_input(context, false).await;

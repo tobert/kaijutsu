@@ -606,23 +606,13 @@ pub struct ContextCluster {
     pub label: String,
 }
 
-/// Preset template info from the server.
-///
-/// `provider`/`model` are RETIRED (Track D, 2026-08-03): a preset narrows to
-/// a cast reference instead of pinning a provider/model pair itself. The
-/// wire's `@3`/`@4` ordinals stay declared-but-unused (capnp ordinals are
-/// dense and never renumbered) — this mirror type simply drops the two
-/// dead fields and adds `cast_label`.
+/// Preset template info from the server. A preset holds fork filters and
+/// names no model.
 #[derive(Debug, Clone)]
 pub struct PresetInfo {
     pub id: Vec<u8>,
     pub label: String,
     pub description: String,
-    /// The cast this preset assigns at fork/apply time, resolved
-    /// kernel-side from `PresetRow::cast_id` — the wire ships the label,
-    /// never a bare id. Empty = the preset moves no model knobs (the three
-    /// factory presets' shape).
-    pub cast_label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1243,16 +1233,12 @@ impl KernelHandle {
     pub async fn prompt(
         &self,
         content: &str,
-        model: Option<&str>,
         context_id: ContextId,
     ) -> Result<String, RpcError> {
         let mut request = self.kernel.prompt_request();
         {
             let mut req = request.get().init_request();
             req.set_content(content);
-            if let Some(m) = model {
-                req.set_model(m);
-            }
             req.set_context_id(context_id.as_bytes());
         }
         {
@@ -1762,37 +1748,6 @@ impl KernelHandle {
         Ok((id, label))
     }
 
-    /// Set the LLM provider and model for a specific context.
-    #[tracing::instrument(skip(self), name = "rpc_client.set_context_model")]
-    pub async fn set_context_model(
-        &self,
-        context_id: ContextId,
-        provider: &str,
-        model: &str,
-    ) -> Result<bool, RpcError> {
-        let mut request = self.kernel.configure_llm_request();
-        {
-            let mut params = request.get();
-            params.set_provider(provider);
-            params.set_model(model);
-            params.set_context_id(context_id.as_bytes());
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let reader = response.get()?;
-        if reader.get_success() {
-            Ok(true)
-        } else {
-            let error = reader.get_error()?.to_string()?;
-            Err(RpcError::ServerError(error))
-        }
-    }
-
     /// View the drift staging queue.
     #[tracing::instrument(skip(self), name = "rpc_client.drift_queue")]
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, RpcError> {
@@ -2119,49 +2074,6 @@ impl KernelHandle {
         }
     }
 
-    // ========================================================================
-    // LLM Configuration
-    // ========================================================================
-
-    /// Get current LLM configuration
-    #[tracing::instrument(skip(self), name = "rpc_client.get_llm_config")]
-    pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, RpcError> {
-        let mut request = self.kernel.get_llm_config_request();
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let config = response.get()?.get_config()?;
-
-        let providers_reader = config.get_providers()?;
-        let mut providers = Vec::with_capacity(providers_reader.len() as usize);
-        for p in providers_reader.iter() {
-            let models: Vec<String> = if p.has_models() {
-                p.get_models()?
-                    .iter()
-                    .filter_map(|m| m.ok().and_then(|s| s.to_string().ok()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            providers.push(LlmProviderInfo {
-                name: p.get_name()?.to_string()?,
-                default_model: p.get_default_model()?.to_string()?,
-                available: p.get_available(),
-                models,
-            });
-        }
-
-        Ok(LlmConfigInfo {
-            default_provider: config.get_default_provider()?.to_string()?,
-            default_model: config.get_default_model()?.to_string()?,
-            providers,
-        })
-    }
-
     /// Read a kernel-owned config file's content (e.g. `theme.toml`). The kernel
     /// is the sole owner; this is how out-of-kernel surfaces (the app) read
     /// config without touching a host file. Returns the content on success or a
@@ -2177,39 +2089,6 @@ impl KernelHandle {
             return Err(RpcError::ServerError(error.to_string()));
         }
         Ok(reader.get_content()?.to_string()?)
-    }
-
-    /// Set the default LLM provider
-    #[tracing::instrument(skip(self), name = "rpc_client.set_default_provider")]
-    pub async fn set_default_provider(&self, provider: &str) -> Result<bool, RpcError> {
-        let mut request = self.kernel.set_default_provider_request();
-        request.get().set_provider(provider);
-        let response = request.send().promise.await?;
-        let result = response.get()?;
-        if !result.get_success() {
-            let error = result.get_error()?.to_str()?;
-            if !error.is_empty() {
-                return Err(RpcError::ServerError(error.to_string()));
-            }
-        }
-        Ok(result.get_success())
-    }
-
-    /// Set the default model for a provider
-    #[tracing::instrument(skip(self), name = "rpc_client.set_default_model")]
-    pub async fn set_default_model(&self, provider: &str, model: &str) -> Result<bool, RpcError> {
-        let mut request = self.kernel.set_default_model_request();
-        request.get().set_provider(provider);
-        request.get().set_model(model);
-        let response = request.send().promise.await?;
-        let result = response.get()?;
-        if !result.get_success() {
-            let error = result.get_error()?.to_str()?;
-            if !error.is_empty() {
-                return Err(RpcError::ServerError(error.to_string()));
-            }
-        }
-        Ok(result.get_success())
     }
 
     // =========================================================================
@@ -2261,7 +2140,6 @@ impl KernelHandle {
                 id: p.get_id()?.to_vec(),
                 label: p.get_label()?.to_string()?,
                 description: p.get_description()?.to_string()?,
-                cast_label: p.get_cast_label()?.to_string()?,
             });
         }
         Ok(result)
@@ -4524,28 +4402,6 @@ pub struct StagedDriftInfo {
     pub source_model: String,
     pub drift_kind: DriftKind,
     pub created_at: u64,
-}
-
-// ============================================================================
-// LLM Configuration Types
-// ============================================================================
-
-/// Information about a single LLM provider
-#[derive(Debug, Clone)]
-pub struct LlmProviderInfo {
-    pub name: String,
-    pub default_model: String,
-    pub available: bool,
-    /// All available model IDs for this provider (from aliases + default).
-    pub models: Vec<String>,
-}
-
-/// Current LLM configuration for a kernel
-#[derive(Debug, Clone)]
-pub struct LlmConfigInfo {
-    pub default_provider: String,
-    pub default_model: String,
-    pub providers: Vec<LlmProviderInfo>,
 }
 
 /// Shell variable value (mirrors kaish `ast::Value`).

@@ -342,12 +342,21 @@ enum Via {
 
 const BOTH: [Via; 2] = [Via::Rpc, Via::Tool];
 
+#[derive(Clone)]
 struct Setup {
     enabled: bool,
     deadline_ms: u64,
     /// Replaces the mock's address, for a server that is down.
     server: Option<String>,
     global: &'static str,
+    /// The seat's `gate` slot instead of the default one (the test model on
+    /// an `mk` backend at the mock's address).
+    gate_slot: Option<SlotSpec>,
+    /// The seat's `judge` slot; none gives the seat no judge shadow.
+    judge: Option<SlotSpec>,
+    /// The seat's `default` slot runs `mock-model` on the `mock` backend, so
+    /// a model turn can run on it.
+    chat: bool,
     /// `[council] reviewer_contexts`.
     reviewer_contexts: bool,
     /// The seat is reviewed by banto, a model character, and forked from a
@@ -370,12 +379,51 @@ struct Setup {
     escalate: Option<(u64, u64)>,
 }
 
+/// Where a slot's backend answers.
+#[derive(Clone)]
+enum Base {
+    /// The backend has no address.
+    None,
+    /// The rig's own council server.
+    Gate,
+    Url(String),
+}
+
+/// One council slot of a seat's cast: `model` on a backend named `backend` of
+/// `kind`, at `base`.
+#[derive(Clone)]
+struct SlotSpec {
+    model: &'static str,
+    backend: &'static str,
+    kind: &'static str,
+    base: Base,
+}
+
+impl SlotSpec {
+    /// A judge on a chat backend, which is hydrated whole and never primed.
+    fn chat_judge(model: &'static str) -> Self {
+        SlotSpec { model, backend: "judge-anthropic", kind: "anthropic", base: Base::None }
+    }
+
+    /// A slot on a council server (`mk` backend) at `base`.
+    fn council(backend: &'static str, base: Base) -> Self {
+        SlotSpec { model: "test-council", backend, kind: "mk", base }
+    }
+
+    fn at(self, model: &'static str) -> Self {
+        SlotSpec { model, ..self }
+    }
+}
+
 impl Default for Setup {
     fn default() -> Self {
         Setup {
             enabled: true,
             deadline_ms: 700,
             server: None,
+            gate_slot: None,
+            judge: None,
+            chat: false,
             global: "",
             reviewer_contexts: false,
             chain: false,
@@ -389,13 +437,12 @@ impl Default for Setup {
     }
 }
 
-fn gate_toml(server: &str, setup: &Setup) -> String {
+fn gate_toml(setup: &Setup) -> String {
     format!(
         r#"[global]
 {global}
 
 [council]
-server = "{server}"
 contexts = {contexts}
 reviewer_contexts = {reviewer_contexts}
 house_rules = {house_rules}
@@ -458,6 +505,84 @@ struct Rig {
     broker: Arc<Broker>,
     ctx: CallContext,
     mock: Mock,
+    /// Where a seat's default `gate` slot points.
+    gate_server: String,
+}
+
+/// Bind `character` to a cast with the council slots a seat needs, so an
+/// instance started for it afterwards runs on them: a `gate` slot (the
+/// default one at `gate_server` unless `gate` replaces it), a `judge` slot
+/// when `judge` is given, and a `default` model slot when `chat` is set. The
+/// character is created.
+fn bind_seat(
+    db: &crate::kernel_db::KernelDb,
+    character: PrincipalId,
+    name: &str,
+    gate_server: &str,
+    gate: Option<&SlotSpec>,
+    judge: Option<&SlotSpec>,
+    chat: bool,
+) {
+    use crate::kernel_db::{BackendRow, CastRow, CastSlotRow};
+    db.insert_character(&crate::kernel_db::CharacterRow {
+        principal_id: character, name: name.into(), created_at: 0, retired_at: None,
+        handoff_ctx: None, root_ctx: None, root: false,
+    })
+    .unwrap();
+    let default_gate = SlotSpec::council("gate-mk", Base::Gate);
+    let mut slots: Vec<(&str, SlotSpec, Option<i64>)> = vec![(super::gate::GATE, gate.cloned().unwrap_or(default_gate), None)];
+    if let Some(judge) = judge {
+        slots.push((super::shadow::JUDGE, judge.clone(), None));
+    }
+    if chat {
+        slots.push(("default", SlotSpec { model: "mock-model", backend: "mock", kind: "mock", base: Base::None }, Some(4096)));
+    }
+    let cast = CastRow {
+        cast_id: kaijutsu_types::CastId::new(),
+        label: format!("seat-{name}"),
+        description: None,
+        created_at: 0,
+        created_by: PrincipalId::system(),
+    };
+    db.insert_cast(&cast).unwrap();
+    for (role, spec, max_tokens) in slots {
+        let backend = db
+            .upsert_backend(&BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(),
+                name: spec.backend.into(),
+                kind: spec.kind.into(),
+                base_url: match &spec.base {
+                    Base::None => None,
+                    Base::Gate => Some(gate_server.to_string()),
+                    Base::Url(url) => Some(url.clone()),
+                },
+                api_key_env: None,
+                api_key_file: None,
+                key_optional: true,
+                request_timeout_secs: None,
+                idle_timeout_secs: None,
+                max_concurrent: None,
+                created_at: 0,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap();
+        db.set_cast_slot(&CastSlotRow {
+            cast_id: cast.cast_id,
+            role: role.into(),
+            backend_id: backend.backend_id,
+            model: spec.model.into(),
+            max_tokens,
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+            loadout: None,
+            extra: None,
+        })
+        .unwrap();
+    }
+    db.set_character_default_cast(character, Some(cast.cast_id)).unwrap();
 }
 
 async fn rig(via: Via, setup: Setup) -> Rig {
@@ -475,7 +600,7 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     let mock = serve().await;
     let server = setup.server.clone().unwrap_or_else(|| mock.base.clone());
     let vfs = d.kernel().vfs();
-    vfs.write_all(std::path::Path::new("/config/kernel/gate.toml"), gate_toml(&server, &setup).as_bytes())
+    vfs.write_all(std::path::Path::new("/config/kernel/gate.toml"), gate_toml(&setup).as_bytes())
         .await
         .unwrap();
     let _ = vfs.mkdir(std::path::Path::new("/config/kernel/council"), 0o755).await;
@@ -531,12 +656,16 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     };
     let context_id = crate::kj::test_helpers::register_context(&d, Some("council-seat"), parent, actor);
     d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
-    d.kernel_db().lock().assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();
+    {
+        let db = d.kernel_db().lock();
+        bind_seat(&db, actor, "council-seat-performer", &server, setup.gate_slot.as_ref(), setup.judge.as_ref(), setup.chat);
+        db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();
+    }
     let mut binding = ContextToolBinding::new();
     binding.grant(Capability::Facade("shell_write".into()));
     broker.set_binding(context_id, binding).await.unwrap();
     let ctx = CallContext::new(actor, context_id, SessionId::new(), d.kernel_id()).with_actor(actor, Some(reviewer));
-    Rig { via, d, broker, ctx, mock }
+    Rig { via, d, broker, ctx, mock, gate_server: server }
 }
 
 impl Rig {
@@ -586,11 +715,29 @@ impl Rig {
     /// A second seat of the default type, labeled `label`, with its own
     /// performer and the rig seat's reviewer.
     async fn other_seat(&self, label: &str) -> CallContext {
+        self.other_seat_on(label, true).await
+    }
+
+    /// [`Self::other_seat`] whose cast has a `gate` slot at the rig's server
+    /// only when `gate` is set. A seat with no `gate` slot has no council.
+    async fn other_seat_on(&self, label: &str, gate: bool) -> CallContext {
         let actor = PrincipalId::new();
         let reviewer = self.ctx.reviewer_id;
         let context_id = crate::kj::test_helpers::register_context(&self.d, Some(label), None, actor);
         self.d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
-        self.d.kernel_db().lock().assign_test_review(context_id, Some(actor), reviewer).unwrap();
+        {
+            let db = self.d.kernel_db().lock();
+            if gate {
+                bind_seat(&db, actor, &format!("{label}-performer"), &self.gate_server, None, None, false);
+            } else {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: actor, name: format!("{label}-performer"), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                })
+                .unwrap();
+            }
+            db.assign_test_review(context_id, Some(actor), reviewer).unwrap();
+        }
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         self.broker.set_binding(context_id, binding).await.unwrap();
@@ -675,11 +822,7 @@ impl Rig {
     fn seat_a_root(&self) {
         let db = self.d.kernel_db();
         let db = db.lock();
-        db.insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: self.ctx.actor_id, name: format!("root-{}", self.ctx.actor_id), created_at: 0,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
-        })
-        .unwrap();
+        db.update_character_root(self.ctx.actor_id, true).unwrap();
     }
 
     async fn finish(self) {
@@ -1068,7 +1211,7 @@ async fn a_council_miss_asks_and_records_its_cause() {
     ];
     for (name, setup, arrange, cause) in cases {
         for via in BOTH {
-            let setup = Setup { server: setup.server.clone(), ..setup };
+            let setup = setup.clone();
             let rig = rig(via, setup).await;
             if let Some(arrange) = arrange {
                 arrange(&rig.mock);
@@ -1602,7 +1745,7 @@ async fn a_context_type_reads_its_own_council_without_changing_other_types() {
         let rig = rig(via, Setup::default()).await;
         live_context(rig.d.kernel(), "council-amy");
         live_context(rig.d.kernel(), "council-banto");
-        let toml = format!("{}\n[context_type.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n", gate_toml(&rig.mock.base, &Setup::default()));
+        let toml = format!("{}\n[context_type.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n", gate_toml(&Setup::default()));
         rig.d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
         rig.mock.set(allow_each);
         rig.submit("echo inherited").await.unwrap();
@@ -1689,8 +1832,8 @@ async fn one_deadline_bounds_prepare_and_the_decision_together() {
     }
 }
 
-/// A model seat on a tool rig: the performer has a model character sheet, a
-/// scripted mock model is the default provider and records each request,
+/// A model seat on a tool rig: the performer's cast gives its binding a
+/// `default` slot on the mock model, which records each request,
 /// and `/scratch` is a host directory the commands leave markers in.
 struct Seat {
     rig: Rig,
@@ -1728,13 +1871,9 @@ impl Seat {
 
     /// A seat whose model makes the call in the background when `background`.
     async fn calling(council: &'static [[f64; 3]], background: bool) -> Self {
-        let rig = rig(Via::Tool, Setup::default()).await;
+        let rig = rig(Via::Tool, Setup { chat: true, ..Setup::default() }).await;
         rig.mock.answers(council);
         let kernel = rig.d.kernel();
-        kernel.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: rig.ctx.actor_id, name: "council-seat-performer".into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-        }).unwrap();
         let scratch = tempfile::tempdir().unwrap();
         kernel.mount("/scratch", crate::vfs::LocalBackend::new(scratch.path())).await;
         let (mock, sent) = crate::llm::MockClient::new("")
@@ -1743,8 +1882,6 @@ impl Seat {
         {
             let mut registry = kernel.llm().write().await;
             registry.register("mock", Arc::new(crate::llm::Provider::Mock(mock)));
-            assert!(registry.set_default("mock"));
-            registry.set_default_model("mock-model");
         }
         kernel.start_approval_delivery().unwrap();
         let turns = kernel.turn_flows().subscribe("turn.*");
@@ -1770,7 +1907,7 @@ impl Seat {
             admission, lease: kernel.turns().begin(context),
             request: crate::runtime::turn_request::TurnRequest {
                 context_id: context, after_block_id: after, content: String::new(),
-                principal_id: amy, model: None, continuation_epoch: None, score: None,
+                principal_id: amy, continuation_epoch: None, score: None,
             },
             origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None, joins_live_turn: false,
         }, None, slot).unwrap().await.unwrap().unwrap();
@@ -2169,7 +2306,7 @@ async fn a_spec_reads_its_own_contexts_and_no_other_spec_does() {
     for via in BOTH {
         let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
         live_context(rig.d.kernel(), "code");
-        let toml = gate_toml(&rig.mock.base, &Setup { programs: true, ..Setup::default() })
+        let toml = gate_toml(&Setup { programs: true, ..Setup::default() })
             .replace("case = \"program\"", "case = \"program\"\ncontexts = [\"code\"]");
         rig.d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
         rig.write("/work/fix.py", "print('fixed')\n").await;
@@ -2988,74 +3125,6 @@ async fn without_a_mode_the_gate_is_a_gatekeeper() {
     }
 }
 
-/// Gives the rig's seat a cast whose `judge` slot names `model`, so the seat
-/// gets a judge shadow (`docs/council.md`, "Shadow context").
-fn give_judge_cast(rig: &Rig, model: &str) {
-    give_judge_cast_on(rig, model, "anthropic", None);
-}
-
-/// [`give_judge_cast`] on a backend of `kind`, at `base_url` when given.
-fn give_judge_cast_on(rig: &Rig, model: &str, kind: &str, base_url: Option<&str>) {
-    give_cast_slot(rig, rig.ctx.context_id, super::shadow::JUDGE, model, &format!("judge-{kind}"), kind, base_url);
-}
-
-/// Gives `seat` a new cast with one `role` slot naming `model` on the
-/// backend `backend` of `kind`, at `base_url` when given.
-fn give_cast_slot(
-    rig: &Rig,
-    seat: kaijutsu_types::ContextId,
-    role: &str,
-    model: &str,
-    backend: &str,
-    kind: &str,
-    base_url: Option<&str>,
-) {
-    use crate::kernel_db::{CastRow, CastSlotRow};
-    let db = rig.d.kernel_db();
-    let db = db.lock();
-    let cast_id = kaijutsu_types::CastId::new();
-    db.insert_cast(&CastRow {
-        cast_id,
-        label: format!("{role}-{model}-{}", seat.short()),
-        description: None,
-        created_at: 0,
-        created_by: PrincipalId::system(),
-    })
-    .unwrap();
-    let backend_row = db
-        .upsert_backend(&crate::kernel_db::BackendRow {
-            backend_id: kaijutsu_types::BackendId::new(),
-            name: backend.into(),
-            kind: kind.into(),
-            base_url: base_url.map(str::to_owned),
-            api_key_env: None,
-            api_key_file: None,
-            key_optional: true,
-            request_timeout_secs: None,
-            idle_timeout_secs: None,
-            max_concurrent: None,
-            created_at: 0,
-            created_by: PrincipalId::system(),
-        })
-        .unwrap();
-    db.set_cast_slot(&CastSlotRow {
-        cast_id,
-        role: role.into(),
-        backend_id: backend_row.backend_id,
-        model: model.into(),
-        max_tokens: None,
-        temperature: None,
-        top_p: None,
-        effort: None,
-        thinking_budget: None,
-        thinking_style: None,
-        loadout: None,
-        extra: None,
-    })
-    .unwrap();
-    db.update_cast(seat, Some(cast_id)).unwrap();
-}
-
 /// The seat's judge shadows: its live children of type `judge`.
 fn judge_shadows(rig: &Rig) -> Vec<crate::kernel_db::ContextRow> {
     let children = rig.d.kernel_db().lock().fork_children(rig.ctx.context_id).unwrap();
@@ -3080,8 +3149,7 @@ fn dialogue(rig: &Rig, shadow: kaijutsu_types::ContextId) -> Vec<(kaijutsu_types
 #[tokio::test]
 async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     use kaijutsu_types::Role::{Model, User};
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
-    give_judge_cast(&rig, "judge-model");
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
     rig.mock.answers(&ALLOW);
     rig.submit("echo static").await.unwrap();
     rig.submit("touch /work/marker").await.unwrap();
@@ -3117,8 +3185,7 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
 /// shows in the history as a second attempt.
 #[tokio::test]
 async fn a_bump_is_recorded_in_the_shadow_with_its_flavor() {
-    let rig = rig(Via::Tool, bumper(3)).await;
-    give_judge_cast(&rig, "judge-model");
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::chat_judge("judge-model")), ..bumper(3) }).await;
     rig.mock.bumper_says(TRY_HARDER);
     refusal_text(Via::Tool, rig.submit("touch /work/marker").await);
     let shadows = judge_shadows(&rig);
@@ -3147,9 +3214,7 @@ async fn a_seat_without_a_judge_slot_gets_no_shadow() {
 /// and the `judge` type's stance.
 #[tokio::test]
 async fn a_judge_on_a_council_server_is_primed_with_each_call() {
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
-    let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
     rig.submit("echo one").await.unwrap();
     assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     let puts = rig.mock.wait_for_builds("shadow", 1).await;
@@ -3179,9 +3244,7 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
 #[tokio::test]
 async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     const JUDGE_ASKS: [[f64; 3]; 3] = [[-4.0, -0.03, -5.0], [-3.5, -0.04, -5.0], [-4.0, -0.02, -6.0]];
-    let rig = rig(Via::Tool, Setup::default()).await;
-    let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
     rig.mock.set(|req| {
         if Rig::read_ids(req).len() == 3 { Reply::ok(answer(req, &JUDGE_ASKS)) } else { allow_each(req) }
     });
@@ -3220,50 +3283,31 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     rig.finish().await;
 }
 
-/// A seat with no cast of its own gets a judge from its performer's default
-/// cast, and the shadow plays that cast.
+/// The gate and the judge shadow read the binding the seat's instance runs
+/// on. Moving the character to a cast with neither slot changes nothing for
+/// the running instance: its decisions still go to its gate slot's server,
+/// and its judge shadow is still made.
 ///
-/// Falsified by reading only the seat's own cast: no shadow.
+/// Falsified by reading the character's live cast.
 #[tokio::test]
-async fn a_seat_gets_a_judge_from_its_performer_s_default_cast() {
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
-    give_judge_cast(&rig, "judge-model");
-    let cast = {
-        let db = rig.d.kernel_db();
-        let db = db.lock();
-        let cast = db.get_context(rig.ctx.context_id).unwrap().unwrap().cast_id.unwrap();
-        db.update_cast(rig.ctx.context_id, None).unwrap();
-        db.insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: rig.ctx.actor_id,
-            name: "coder".into(),
-            created_at: 0,
-            retired_at: None,
-            handoff_ctx: None,
-            root_ctx: None,
-            root: false,
-        })
-        .unwrap();
-        db.set_character_default_cast(rig.ctx.actor_id, Some(cast)).unwrap();
-        cast
-    };
-    rig.submit("echo performer").await.unwrap();
-    let shadows = judge_shadows(&rig);
-    assert_eq!(shadows.len(), 1, "the performer's default cast has a judge slot");
-    assert_eq!(shadows[0].cast_id, Some(cast));
+async fn a_cast_change_moves_neither_the_gate_nor_the_judge_of_a_running_instance() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
+    rig.d.kernel_db().lock().set_character_default_cast(rig.ctx.actor_id, None).unwrap();
+    rig.mock.answers(&ALLOW);
+    rig.submit("touch /work/still-judged").await.unwrap_or_else(|e| panic!("the bound gate slot allows: {e:?}"));
+    assert_eq!(rig.mock.decisions().len(), 1, "the decision went to the bound gate slot's server");
+    assert_eq!(judge_shadows(&rig).len(), 1, "the bound judge slot still gives the seat a shadow");
     rig.finish().await;
 }
-
 /// A shadow whose `judge` create lifecycle wrote no stance is never sent:
 /// priming fails loudly rather than send a dialogue with no framing.
 #[tokio::test]
 async fn a_shadow_without_its_stance_is_not_primed() {
     use crate::vfs::VfsOps;
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
     for (path, _) in JUDGE_RC {
         rig.d.kernel().vfs().unlink(std::path::Path::new(path)).await.unwrap();
     }
-    let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
     rig.submit("echo one").await.unwrap();
     assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     rig.submit("echo two").await.unwrap();
@@ -3280,30 +3324,28 @@ fn decisions_in(rig: &Rig, ctx: &CallContext) -> Vec<CouncilDecision> {
     approval_ledger::council::list_council_decisions_for_context(db.conn_for_ledger(), &context, 10).unwrap()
 }
 
-/// A seat whose cast has a `gate` slot on a council server decides there,
-/// while a seat with no such slot decides on `[council] server`. Each
-/// decision is recorded on the seat that made it.
+/// A seat's `gate` slot decides which council server its decisions go to:
+/// each seat on its own slot's server. Each decision is recorded on the seat
+/// that made it.
 ///
-/// Falsified by reading `[council] server` for every seat (server B gets no
+/// Falsified by deciding every seat on one server (server B gets no
 /// decision), or by letting one seat's cast move another seat's decisions.
 #[tokio::test]
-async fn a_seat_whose_cast_names_a_council_server_decides_there() {
+async fn a_seat_whose_gate_slot_names_a_council_server_decides_there() {
     for via in BOTH {
-        let rig = rig(via, Setup::default()).await;
         let server_b = serve().await;
+        let rig = rig(via, Setup { gate_slot: Some(SlotSpec::council("council-b", Base::Url(server_b.base.clone()))), ..Setup::default() }).await;
         rig.mock.answers(&ALLOW);
         server_b.answers(&ALLOW);
-        let base_b = server_b.base.clone();
-        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "test-council", "council-b", "mk", Some(&base_b));
         let plain = rig.other_seat("plain-seat").await;
 
         rig.submit("touch /work/cast").await.unwrap_or_else(|e| panic!("{via:?}: server B allows: {e:?}"));
-        assert_eq!(server_b.decisions().len(), 1, "{via:?}: the cast's server decides the cast seat's call");
-        assert!(rig.mock.decisions().is_empty(), "{via:?}: [council] server is not asked for the cast seat");
+        assert_eq!(server_b.decisions().len(), 1, "{via:?}: the slot's server decides the seat's call");
+        assert!(rig.mock.decisions().is_empty(), "{via:?}: the other server is not asked for this seat");
 
         rig.submit_in(&plain, "touch /work/plain").await.unwrap_or_else(|e| panic!("{via:?}: server A allows: {e:?}"));
-        assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: a seat with no gate slot decides on [council] server");
-        assert_eq!(server_b.decisions().len(), 1, "{via:?}: the other seat's cast does not move this seat");
+        assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: the other seat decides on its own slot's server");
+        assert_eq!(server_b.decisions().len(), 1, "{via:?}: the other seat's slot does not move this seat");
 
         let cast_seat = decisions_in(&rig, &rig.ctx);
         assert_eq!(cast_seat.len(), 1, "{via:?}");
@@ -3311,6 +3353,24 @@ async fn a_seat_whose_cast_names_a_council_server_decides_there() {
         let plain_seat = decisions_in(&rig, &plain);
         assert_eq!(plain_seat.len(), 1, "{via:?}");
         assert_eq!(plain_seat[0].decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// An instance with no `gate` slot has no council: its gate decides without
+/// one, so no server is asked and no council decision is recorded, whatever
+/// gate.toml enables.
+///
+/// Falsified by deciding a seat with no gate slot on any server.
+#[tokio::test]
+async fn a_seat_with_no_gate_slot_has_no_council() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        rig.mock.answers(&ALLOW);
+        let bare = rig.other_seat_on("bare-seat", false).await;
+        assert_pending(via, rig.submit_in(&bare, "touch /work/bare").await);
+        assert!(rig.mock.decisions().is_empty(), "{via:?}: no server is asked for a seat with no gate slot");
+        assert!(decisions_in(&rig, &bare).is_empty(), "{via:?}: no council decision is recorded");
         rig.finish().await;
     }
 }
@@ -3329,9 +3389,9 @@ async fn a_gate_slot_that_names_no_council_server_is_a_miss_naming_it() {
     ];
     for (backend, kind, base_url, cause) in cases {
         for via in BOTH {
-            let rig = rig(via, Setup::default()).await;
+            let slot = SlotSpec { model: "some-model", backend, kind, base: base_url.map_or(Base::None, |u| Base::Url(u.to_string())) };
+            let rig = rig(via, Setup { gate_slot: Some(slot), ..Setup::default() }).await;
             rig.mock.answers(&ALLOW);
-            give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "some-model", backend, kind, base_url);
             assert_pending(via, rig.submit("touch /work/slot").await);
             assert!(rig.mock.decisions().is_empty(), "{backend} {via:?}: [council] server is never asked instead");
             let ask = rig.only_ask();
@@ -3354,11 +3414,9 @@ async fn a_gate_slot_that_names_no_council_server_is_a_miss_naming_it() {
 #[tokio::test]
 async fn a_gate_slot_naming_a_model_the_server_lacks_is_a_miss_naming_it() {
     for via in BOTH {
-        let rig = rig(via, Setup::default()).await;
         let server_b = serve().await;
         server_b.answers(&ALLOW);
-        let base_b = server_b.base.clone();
-        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "gemma-4", "council-b", "mk", Some(&base_b));
+        let rig = rig(via, Setup { gate_slot: Some(SlotSpec::council("council-b", Base::Url(server_b.base.clone())).at("gemma-4")), ..Setup::default() }).await;
         assert_pending(via, rig.submit("touch /work/slot").await);
         assert!(server_b.decisions().is_empty(), "{via:?}: no decision runs on another model");
         let recorded = the_decision(&rig, &rig.only_ask()).decision.miss_cause.clone().unwrap();
@@ -3376,13 +3434,13 @@ async fn a_gate_slot_naming_a_model_the_server_lacks_is_a_miss_naming_it() {
 #[tokio::test]
 async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observations_there() {
     for via in BOTH {
-        let rig = rig(via, Setup { programs: true, reviewer_contexts: true, chain: true, ..Setup::default() }).await;
+        let server_b = serve().await;
+        let rig = rig(via, Setup { programs: true, reviewer_contexts: true, chain: true, gate_slot: Some(SlotSpec::council("council-b", Base::Url(server_b.base.clone()))), ..Setup::default() }).await;
         let amy = live_context(rig.d.kernel(), "council-amy");
         append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
         let banto = live_context(rig.d.kernel(), "council-banto");
         append_dialogue(rig.d.kernel(), banto, &["only touch the parser crate"]);
         let banto_id = rig.context_of("council-banto");
-        let server_b = serve().await;
         let observed = banto_id.clone();
         server_b.set(move |req| {
             if Rig::read_ids(req) == [observed.clone()] {
@@ -3393,7 +3451,6 @@ async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observation
                 allow_each(req)
             }
         });
-        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "test-council", "council-b", "mk", Some(&server_b.base));
         rig.write("/work/fix.py", "print('fixed')\n").await;
         rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: server B allows: {e:?}"));
 
@@ -3427,11 +3484,10 @@ async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observation
 /// three-context read), or priming the shadow there.
 #[tokio::test]
 async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() {
-    let rig = rig(Via::Tool, Setup::default()).await;
     let judge_server = serve().await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
     judge_server.set(allow_each);
     rig.mock.set(allow_each);
-    give_judge_cast_on(&rig, "test-council", "mk", Some(&judge_server.base));
     rig.submit("echo two-servers").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
     let rows = rig.observations(&decision.decision_id, 1).await;
@@ -3460,11 +3516,9 @@ async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() 
 /// sends a request over the limit.
 #[tokio::test]
 async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
-    let rig = rig(Via::Tool, Setup::default()).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
     rig.mock.limit_contexts(2);
     rig.mock.set(allow_each);
-    let base = rig.mock.base.clone();
-    give_judge_cast_on(&rig, "test-council", "mk", Some(&base));
     rig.submit("echo at-limit").await.unwrap_or_else(|e| panic!("a decision at the limit still allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
     assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
@@ -3487,9 +3541,8 @@ async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
 /// Falsified by dropping the slot silently: no observation is recorded.
 #[tokio::test]
 async fn a_judge_slot_with_no_council_address_records_a_miss_naming_it() {
-    let rig = rig(Via::Tool, Setup::default()).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::None)), ..Setup::default() }).await;
     rig.mock.set(allow_each);
-    give_judge_cast_on(&rig, "test-council", "mk", None);
     rig.submit("echo no-address").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
     assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);

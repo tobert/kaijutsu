@@ -31,7 +31,8 @@ makes a local/tenchi coder viable).
 
 ## The chain to walk once by hand, then script
 1. `kj cast list` — confirm the fast cast label (ds4/deepseek or qwen-flash).
-2. Create the coder from Amy's console: `kj kohai create --as <coder-char> --cast <fast>`
+2. Point the coder character at the fast cast (`kj character set <coder-char> --cast <fast>`), then create it from
+   Amy's console: `kj kohai create --as <coder-char>`
    (check `kj kohai create --help` for the cwd / context-type flags; scope cwd
    to demo/). Performer = coder, senpai = Amy's console, so Amy reviews → the
    sheet's decision keys are LIVE for Amy (unlike a self-performed ask).

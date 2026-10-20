@@ -816,8 +816,12 @@ fn test_coder_stance_is_the_same_for_every_model() {
     });
 }
 
+/// A context made through the wire runs the model its character instance's
+/// binding gives its type, and nothing is stamped on its row.
+///
+/// Falsified by reading any model from the row or a registry default.
 #[test]
-fn test_rpc_created_context_does_not_stamp_the_registry_default() {
+fn test_rpc_created_context_runs_its_bindings_model() {
     run_local(async {
         let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
         let client = connect_client(addr).await;
@@ -835,29 +839,10 @@ fn test_rpc_created_context_does_not_stamp_the_registry_default() {
         let data: serde_json::Value = serde_json::from_str(&output)
             .unwrap_or_else(|e| panic!("kj context info --json did not emit JSON ({e}): {output}"));
 
-        assert!(
-            data["provider"].is_null(),
-            "RPC-created row.provider must be null (never stamped with the \
-             registry default) — matching `kj kohai create`: {data}"
-        );
-        assert!(
-            data["model"].is_null(),
-            "RPC-created row.model must be null (never stamped with the \
-             registry default) — matching `kj kohai create`: {data}"
-        );
-        assert_eq!(
-            data["resolved_model"].as_str(),
-            Some("claude-haiku-4-5"),
-            "resolution must still reach the registry default live, through \
-             `resolve_context_model`, even with a null row: {data}"
-        );
-        assert_eq!(
-            data["resolved_source"].as_str(),
-            Some("default"),
-            "resolved_source must read \"default\" (live registry fallback), \
-             not \"context\" (which implies an explicit override that was \
-             never given): {data}"
-        );
+        assert_eq!(data["resolved_model"].as_str(), Some("claude-haiku-4-5"), "{data}");
+        assert_eq!(data["resolved_backend"].as_str(), Some("mock"), "{data}");
+        assert_eq!(data["cast_label"].as_str(), Some("mock"), "{data}");
+        assert!(data.get("resolved_source").is_none(), "no resolver tier remains: {data}");
     });
 }
 

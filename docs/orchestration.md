@@ -117,9 +117,8 @@ think for it.
 ### 2. Fork to explore
 
 ```bash
-kj fork --name probe-kid                                             # inherits parent's binding
-kj fork --name fast-check --model anthropic/claude-haiku-4-5-20251001
-kj fork --name compact-summary --compact --distill-model haiku       # cheap-then-expensive
+kj fork --name probe-kid                                             # joins the parent's binding
+kj fork --name compact-summary --compact                             # distills on the instance's `distill` slot
 kj fork --name approach-a --prompt "investigate the auth module"     # injects a starting drift
 ```
 
@@ -179,16 +178,19 @@ invoke moves action between peers.
 
 ### 5. Cheap-then-expensive
 
-A common shape: ask Haiku to compress, hand the result to Opus.
+A common shape: a cheap model compresses, the instance's own model continues.
+Give the cast a `distill` slot on the cheap model and a slot for the context
+type on the expensive one:
 
 ```bash
-kj fork --name big-task --compact \
-        --distill-model claude-haiku-4-5-20251001 \
-        --model claude-opus-4
+kj cast slot set house distill --backend anthropic --model claude-haiku-4-5-20251001
+kj cast slot set house coder   --backend anthropic --model claude-opus-4
+kj fork --name big-task --compact
 ```
 
-The parent's history compresses through Haiku into a short summary; the
-child starts with that summary plus an Opus binding. Tokens saved, lineage
+The parent's history compresses through the `distill` slot into a short
+summary; the child starts with that summary on the instance's binding. A
+cast with no `distill` slot refuses the compact fork. Tokens saved, lineage
 preserved. Pattern works whenever the upstream context is heavy and the
 forward work needs a bigger model.
 

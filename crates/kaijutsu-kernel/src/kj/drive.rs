@@ -175,7 +175,7 @@ impl KjDispatcher {
         let (turn_id, work_id) = match self.kernel().request_turn_admitted(crate::runtime::turn_request::TurnRequest {
             score,
             context_id: target, after_block_id: after, content: seed,
-            principal_id: caller.principal_id, model: None, continuation_epoch: None,
+            principal_id: caller.principal_id, continuation_epoch: None,
         }, slot, admission) {
             Ok(crate::runtime::turn_request::TurnAdmission::Accepted { turn_id, work_id }) => (turn_id, work_id),
             Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),

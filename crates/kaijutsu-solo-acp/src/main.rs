@@ -147,9 +147,21 @@ struct Cli {
     /// the chosen model's row. Must be greater than zero — zero and negative
     /// values are refused. A value the provider rejects as above its own
     /// per-model ceiling is refused by the provider, not by this flag.
-    /// Default: the model's own budget (65536 for DeepSeek), else 16384.
+    /// Default: the model's own budget (65536 for DeepSeek). A model whose
+    /// row sets none refuses the start until this names one.
     #[arg(long, value_name = "N")]
     max_tokens: Option<NonZeroU64>,
+
+    /// Council server the gate decides on: the address of an `mk` backend,
+    /// written as the `gate` slot of this run's cast. Without it the session
+    /// has no council. Needs `--council-model`.
+    #[arg(long, value_name = "URL", requires = "council_model")]
+    council_server: Option<String>,
+
+    /// The served model the council's decisions run on. Needs
+    /// `--council-server`.
+    #[arg(long, value_name = "MODEL", requires = "council_server")]
+    council_model: Option<String>,
 
     /// An rc variant to install over the seeded `/config/rc` tree, for A/B
     /// instruction sets. The directory mirrors the rc tree's layout and holds
@@ -312,7 +324,11 @@ fn run(cli: Cli) -> Result<()> {
 
     let key = state::ensure_client_key(&solo.client_key_path())?;
     let max_tokens = cli.max_tokens.map(|n| n.get() as i64);
-    state::prepare_rows(&solo, ROOT_CHARACTER, &cli.character, &key, &choice, max_tokens)?;
+    let council = match (&cli.council_server, &cli.council_model) {
+        (Some(server), Some(model)) => Some(state::CouncilGate { server: server.clone(), model: model.clone() }),
+        _ => None,
+    };
+    state::prepare_rows(&solo, ROOT_CHARACTER, &cli.character, &cli.context_type, &key, &choice, max_tokens, council.as_ref())?;
 
     let mut config = kernel::solo_server_config(&solo, &cli.mount)?;
     config.unlisted = cli.unlist.clone();

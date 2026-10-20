@@ -1,27 +1,21 @@
-//! `kj model` / `kj models` — model discovery and inspection.
+//! `kj models` — model discovery.
 //!
-//! Two read-only verbs, no capability gate (discovery is not escalation):
+//! A read-only verb, no capability gate (discovery is not escalation). It
+//! enumerates the configured providers, each provider's known models, and the
+//! friendly aliases — the specs you can hand to `kj cast slot set --model`.
+//! The structured `.data` is an array of those specs (alias names +
+//! fully-qualified `provider/model`) so `for m in $(kj models)` iterates usable
+//! handles, per the kj list-data convention. A context's model is not here:
+//! `kj context info` shows the model its binding gives it.
 //!
-//! - `kj models` enumerates the configured providers, each provider's known
-//!   models, and the friendly `--model` aliases — the specs you can hand to
-//!   `kj context set --model …`. The structured `.data` is an array of those
-//!   specs (alias names + fully-qualified `provider/model`) so
-//!   `for m in $(kj models)` iterates usable handles, per the kj list-data
-//!   convention.
-//! - `kj model` reports the *effective* model for a context — the column on
-//!   the context row when set, otherwise the registry default it falls through
-//!   to. Defaults to the current context; `--context <ref>` targets another.
-//!   The `.data` is an inspect-style object.
-//!
-//! Both read the LLM registry behind its async `RwLock`, so the dispatch leaves
-//! are async.
+//! The dispatch reads the LLM registry behind its async `RwLock`, so it is
+//! async.
 
 use clap::Parser;
 use kaijutsu_types::ContentType;
 
 use super::effect::{Classify, Effect};
-use super::refs;
-use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjDispatcher, KjResult};
 
 /// `kj models` is pure discovery — no positionals, no value flags. The empty
 /// struct exists so help routes through the shared `clap_help_for` path for
@@ -31,26 +25,11 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "models",
-    about = "List configured LLM providers, their models, and --model aliases",
+    about = "List configured LLM providers, their models, and aliases",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
 pub(crate) struct ModelsArgs {}
-
-/// `kj model` — report the effective model for a context. The only knob is
-/// `--context <ref>`, which targets a context other than the caller's current.
-#[derive(Parser, Debug)]
-#[command(
-    name = "model",
-    about = "Report the effective model for a context and the tunables a turn on it runs",
-    disable_help_subcommand = true,
-    no_binary_name = true
-)]
-pub(crate) struct ModelArgs {
-    /// Target context: . (default) | .parent | <label> | <hex prefix>
-    #[arg(long, short = 'c')]
-    context: Option<String>,
-}
 
 impl KjDispatcher {
     /// `kj models` — list providers, their models, and `--model` aliases.
@@ -64,15 +43,13 @@ impl KjDispatcher {
         }
 
         let registry = self.kernel().llm().read().await;
-        let default_provider = registry.default_provider_name().map(str::to_string);
-        let default_model = registry.default_model().map(str::to_string);
 
         // Providers in stable, sorted order. Each provider reports the models
         // its client knows about, enriched with the config-declared default.
         let mut provider_names: Vec<String> = registry.list().iter().map(|s| s.to_string()).collect();
         provider_names.sort();
 
-        // `specs` accumulates every string a caller could pass to `--model`:
+        // `specs` accumulates every string a caller could name a model by:
         // each alias name, plus the fully-qualified `provider/model` for each
         // known model. This is the iteration-friendly `.data` payload.
         let mut specs: Vec<String> = Vec::new();
@@ -86,9 +63,7 @@ impl KjDispatcher {
         for name in &provider_names {
             // Everything the DB knows this backend can serve (its
             // `backend_models` rows plus every model an alias points at),
-            // unioned with whatever the client advertises. A backend row has
-            // no `default_model` of its own any more — the kernel-wide
-            // default lives in `llm_defaults`.
+            // unioned with whatever the client advertises.
             let mut models: Vec<String> = registry
                 .get(name)
                 .map(|p| {
@@ -102,32 +77,19 @@ impl KjDispatcher {
             models.sort();
             models.dedup();
 
-            let is_default_provider = default_provider.as_deref() == Some(name.as_str());
             let kind = registry
                 .backend_config(name)
                 .map(|b| b.kind.as_str())
                 .unwrap_or("?");
-            let header = if is_default_provider {
-                format!("### {name} _({kind}, default backend)_")
-            } else {
-                format!("### {name} _({kind})_")
-            };
-            lines.push(header);
+            lines.push(format!("### {name} _({kind})_"));
             if models.is_empty() {
                 lines.push("- _(no models advertised)_".to_string());
             }
             for m in &models {
                 let mut marks: Vec<String> = Vec::new();
-                if is_default_provider && default_model.as_deref() == Some(m.as_str()) {
-                    marks.push("registry default".to_string());
-                }
-                // Context window, when configured — the same resolution
-                // `kj model` uses (`BackendConfig::context_window`, read from
-                // the `backend_models` table), so this listing can never
-                // disagree with the single-context verb. Unconfigured models
-                // get no annotation here (silence is the "unknown" signal in
-                // this listing; `kj model`'s JSON is the surface that must
-                // say so explicitly).
+                // Context window, when configured in the `backend_models`
+                // table. Unconfigured models get no annotation (silence is
+                // the "unknown" signal in this listing).
                 if let Some(w) = registry.backend_config(name).and_then(|c| c.context_window(m)) {
                     marks.push(format!("{w} ctx"));
                 }
@@ -142,7 +104,7 @@ impl KjDispatcher {
             lines.push(String::new());
         }
 
-        // Aliases: the friendly `--model` names, grouped after providers.
+        // Aliases: the friendly model names, grouped after providers.
         let aliases = registry.model_aliases();
         if !aliases.is_empty() {
             let mut alias_names: Vec<&String> = aliases.keys().collect();
@@ -156,13 +118,6 @@ impl KjDispatcher {
             lines.push(String::new());
         }
 
-        if let Some(model) = &default_model {
-            let prov = default_provider.as_deref().unwrap_or("?");
-            lines.push(format!("_Default: `{prov}/{model}`_"));
-        } else if let Some(prov) = &default_provider {
-            lines.push(format!("_Default provider: `{prov}` (no default model set)_"));
-        }
-
         specs.sort();
         specs.dedup();
 
@@ -171,143 +126,6 @@ impl KjDispatcher {
             lines.join("\n"),
             ContentType::Markdown,
             serde_json::Value::Array(specs.into_iter().map(serde_json::Value::String).collect()),
-        )
-    }
-
-    /// `kj model` — report the effective model for a context.
-    pub(crate) async fn dispatch_model(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Bare `kj model` (no argv) reports the current context's model, so
-        // empty argv parses cleanly to `ModelArgs { context: None }` — no
-        // early help return needed here (unlike subcommand-bearing modules).
-        let parsed = match ModelArgs::try_parse_from(argv) {
-            Ok(p) => p,
-            Err(e) => {
-                // `--help` / `-h` come through as DisplayHelp; route them to
-                // ok-ephemeral so kaish prints the help and exits 0.
-                if matches!(
-                    e.kind(),
-                    clap::error::ErrorKind::DisplayHelp
-                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-                ) {
-                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
-                }
-                return KjResult::Err(format!("kj model: {e}"));
-            }
-        };
-        let ctx_ref = parsed.context;
-
-        // Read the context row: explicit provider/model columns, plus the
-        // context_type + cast label the turn path resolves through.
-        let (ctx_id, row_provider, row_model, context_type, cast_label) = {
-            let db = self.kernel_db().lock();
-            let ctx_id = match refs::resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj model: {e}")),
-            };
-            match db.get_context(ctx_id) {
-                Ok(Some(row)) => {
-                    let cast_label = db.effective_cast(&row).ok().flatten().map(|c| c.label);
-                    (ctx_id, row.provider, row.model, row.context_type, cast_label)
-                }
-                Ok(None) => {
-                    return KjResult::Err(format!(
-                        "kj model: context {} not found",
-                        ctx_id.short()
-                    ));
-                }
-                Err(e) => return KjResult::Err(format!("kj model: {e}")),
-            }
-        };
-
-        // Effective model via `resolve_context_model` — the SAME ladder the
-        // turn path walks (explicit override → cast slot on context_type →
-        // registry default), so this verb can never disagree with what a
-        // turn actually runs. Acquire the registry lock unconditionally —
-        // the context-window lookup below needs it regardless of `source`.
-        let registry = self.kernel().llm().read().await;
-        let resolved = crate::model_resolution::resolve_context_model(
-            &context_type,
-            row_provider.as_deref(),
-            row_model.as_deref(),
-            cast_label.as_deref(),
-            &registry,
-        );
-        let tunables = resolved.as_ref().map(|r| r.tunables_in(&registry));
-        let (provider, model, source) = match resolved {
-            Some(r) => {
-                let source = match &r.source {
-                    crate::model_resolution::ModelSource::ContextOverride => "context".to_string(),
-                    crate::model_resolution::ModelSource::CastSlot { cast } => {
-                        format!("cast {cast}")
-                    }
-                    crate::model_resolution::ModelSource::RegistryDefault => "default".to_string(),
-                };
-                (Some(r.backend), Some(r.model), source)
-            }
-            None => (None, None, "default".to_string()),
-        };
-
-        // Context window for the effective model, via the SAME
-        // config-then-live resolution `context info` uses (config wins as
-        // an override; a live Anthropic lookup fills the gaps config never
-        // had — see `LlmRegistry::context_window_for_live`) — never a
-        // second, possibly-diverging lookup. `None` here is a real
-        // "unknown", not a fabricated default: a consumer rendering a
-        // "% of context used" gauge must show "unknown" rather than compute
-        // a confidently wrong percentage against a guessed denominator.
-        let context_window = match (&provider, &model) {
-            (Some(p), Some(m)) => registry.context_window_for_live(p, m).await,
-            _ => None,
-        };
-
-        let display = match (&provider, &model) {
-            (Some(p), Some(m)) => format!("{p}/{m}"),
-            (None, Some(m)) => m.clone(),
-            _ => "(none configured)".to_string(),
-        };
-
-        let window_display = match context_window {
-            Some(w) => w.to_string(),
-            None => "unknown".to_string(),
-        };
-
-        let mut message = match source.as_str() {
-            "context" => format!("{}: {display} [context: {window_display}]", ctx_id.short()),
-            "default" => format!(
-                "{}: {display} (registry default) [context: {window_display}]",
-                ctx_id.short()
-            ),
-            cast => format!(
-                "{}: {display} (via {cast}) [context: {window_display}]",
-                ctx_id.short()
-            ),
-        };
-        // The tunables the turn would run, so a truncation is explained here
-        // rather than discovered mid-turn.
-        if let Some(t) = &tunables {
-            let mut knobs = Vec::new();
-            if let Some(v) = t.max_tokens { knobs.push(format!("max_tokens={v}")); }
-            if let Some(v) = &t.effort { knobs.push(format!("effort={v}")); }
-            if let Some(v) = t.temperature { knobs.push(format!("temperature={v}")); }
-            if let Some(v) = t.top_p { knobs.push(format!("top_p={v}")); }
-            if let Some(v) = t.thinking_budget { knobs.push(format!("thinking_budget={v}")); }
-            if let Some(v) = &t.thinking_style { knobs.push(format!("thinking_style={v}")); }
-            if !knobs.is_empty() {
-                message.push_str(&format!(" {}", knobs.join(" ")));
-            }
-        }
-
-        KjResult::ok_ephemeral_with_data(
-            message,
-            ContentType::Plain,
-            serde_json::json!({
-                "context_id": ctx_id.to_hex(),
-                "provider": provider,
-                "model": model,
-                "source": source,
-                "context_window": context_window,
-                "tunables": tunables,
-            }),
         )
     }
 }
@@ -320,52 +138,25 @@ impl Classify for ModelsArgs {
     }
 }
 
-impl Classify for ModelArgs {
-    fn effect(&self) -> Effect {
-        // Reports the effective model for a context; never writes.
-        Effect::Read
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::kj::test_helpers::*;
-    use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
     use crate::llm::ModelAlias;
     use crate::llm::{BackendConfig, BackendKind, Provider, claude, deepseek};
-    use kaijutsu_types::PrincipalId;
 
     fn s(v: &str) -> String {
         v.to_string()
     }
 
-    /// Seed the test kernel's registry with two providers, a config default,
-    /// and an alias so the discovery verbs have something to report.
-    ///
-    /// `dispatch_model` now resolves context windows via
-    /// `context_window_for_live`, which falls through to a real
-    /// `GET /v1/models/{id}` call for any Anthropic model config leaves
-    /// unconfigured (exactly the "claude-haiku-4-5-20251001" scenario the
-    /// tests below deliberately exercise) — so the registered Claude client
-    /// gets a `FakeModelCapabilitySource` instead of the real HTTP source.
-    /// It answers `Ok(None)` for everything, matching what these tests
-    /// already expect ("unconfigured → null"): the fake stands in for "the
-    /// live API doesn't know this model either," not for exercising the
-    /// live-value-found path (that's covered in `llm/mod.rs` and
-    /// `llm/claude/mod.rs`'s own tests). Substituting the capability
-    /// source at the seam — not a flag — keeps `cargo test` from ever
-    /// touching the network here.
+    /// Seed the test kernel's registry with two providers and an alias so
+    /// the discovery verb has something to report.
     async fn seed_registry(d: &crate::kj::KjDispatcher) {
         let mut reg = d.kernel().llm().write().await;
-        let claude_client = claude::Client::new("fake")
-            .with_capability_source(Arc::new(FakeModelCapabilitySource::always_none()));
-        reg.register("anthropic", Arc::new(Provider::Claude(claude_client)));
+        reg.register("anthropic", Arc::new(Provider::Claude(claude::Client::new("fake"))));
         reg.register("deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))));
-        reg.set_default("anthropic");
-        reg.set_default_model("claude-opus-4-8");
         reg.set_backends(vec![{
             let mut c = BackendConfig::new("anthropic", BackendKind::Anthropic);
             // Only "claude-opus-4-8" carries a configured window — the
@@ -406,10 +197,6 @@ mod tests {
         assert!(msg.contains("anthropic"), "lists the anthropic backend: {msg}");
         assert!(msg.contains("deepseek"), "lists the deepseek backend: {msg}");
         assert!(msg.contains("fast"), "lists the alias: {msg}");
-        assert!(
-            msg.contains("default backend"),
-            "marks the default backend: {msg}"
-        );
     }
 
     #[tokio::test]
@@ -425,7 +212,7 @@ mod tests {
         };
         let arr = data.as_array().expect("data is an array");
         let specs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-        // The alias name is a usable `--model` spec...
+        // The alias name is a usable model spec...
         assert!(specs.contains(&"fast"), "alias spec present: {specs:?}");
         // ...as is a fully-qualified provider/model.
         assert!(
@@ -455,210 +242,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_reports_context_column_when_set() {
-        let d = test_dispatcher().await;
-        seed_registry(&d).await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("c"), None, principal);
-        // Give the context its own model column.
-        {
-            let db = d.kernel_db().lock();
-            db.update_model(ctx, Some("deepseek"), Some("deepseek-r1")).unwrap();
-        }
-        let c = caller_with_context(ctx);
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert_eq!(data["model"], "deepseek-r1");
-        assert_eq!(data["provider"], "deepseek");
-        assert_eq!(data["source"], "context", "column-set → source=context");
-        // "deepseek" has no configured models at all in seed_registry — the
-        // window must be an explicit null, never a fabricated number.
-        assert!(
-            data["context_window"].is_null(),
-            "unconfigured provider → context_window is null, not a guess: {data:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_reports_configured_context_window() {
-        let d = test_dispatcher().await;
-        seed_registry(&d).await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("c"), None, principal);
-        {
-            let db = d.kernel_db().lock();
-            db.update_model(ctx, Some("anthropic"), Some("claude-opus-4-8"))
-                .unwrap();
-        }
-        let c = caller_with_context(ctx);
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        let message = result.message().to_string();
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert_eq!(data["context_window"], 1_000_000);
-        assert!(
-            message.contains("1000000"),
-            "human-readable text also surfaces the window: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_reports_unknown_context_window_explicitly_not_a_default() {
-        let d = test_dispatcher().await;
-        seed_registry(&d).await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("c"), None, principal);
-        // "claude-haiku-4-5-20251001" is a real model on a configured
-        // provider, but seed_registry deliberately never gave it a
-        // context_window entry.
-        {
-            let db = d.kernel_db().lock();
-            db.update_model(ctx, Some("anthropic"), Some("claude-haiku-4-5-20251001"))
-                .unwrap();
-        }
-        let c = caller_with_context(ctx);
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        let message = result.message().to_string();
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert!(
-            data["context_window"].is_null(),
-            "an unconfigured model on a configured provider must still resolve to null: {data:?}"
-        );
-        assert!(
-            message.contains("unknown"),
-            "human-readable text says unknown, not a fabricated number: {message}"
-        );
-    }
-
-    /// End-to-end wiring check (unlike the registry/client-level tests in
-    /// `llm/mod.rs` and `llm/claude/mod.rs`): a model config leaves
-    /// unconfigured resolves through `kj model`'s live fallback when the
-    /// (faked) Anthropic API knows about it — closing the exact gap
-    /// `claude-sonnet-4-20250514` has in the backend model metadata.
-    #[tokio::test]
-    async fn model_resolves_context_window_via_live_fallback_when_config_absent() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        {
-            let mut reg = d.kernel().llm().write().await;
-            let fake = FakeModelCapabilitySource::always_none()
-                .with_response("claude-sonnet-4-20250514", Ok(Some(200_000)));
-            let client = claude::Client::new("fake").with_capability_source(Arc::new(fake));
-            reg.register("anthropic", Arc::new(Provider::Claude(client)));
-            // Deliberately NO provider_configs entry for this model — the
-            // honest-gap scenario the live fallback exists to close.
-            reg.set_backends(vec![BackendConfig::new("anthropic", BackendKind::Anthropic)]);
-        }
-        let ctx = register_context(&d, Some("c"), None, principal);
-        {
-            let db = d.kernel_db().lock();
-            db.update_model(ctx, Some("anthropic"), Some("claude-sonnet-4-20250514"))
-                .unwrap();
-        }
-        let c = caller_with_context(ctx);
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        let message = result.message().to_string();
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert_eq!(
-            data["context_window"], 200_000,
-            "config has no entry, so the live fallback must supply the window: {data:?}"
-        );
-        assert!(
-            message.contains("200000"),
-            "human-readable text also surfaces the live-resolved window: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_falls_back_to_registry_default() {
-        let d = test_dispatcher().await;
-        seed_registry(&d).await;
-        let principal = PrincipalId::new();
-        // Fresh context with no model column.
-        let ctx = register_context(&d, Some("c"), None, principal);
-        let c = caller_with_context(ctx);
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        assert!(
-            result.message().contains("registry default"),
-            "message flags the fallback"
-        );
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert_eq!(data["model"], "claude-opus-4-8", "uses registry default model");
-        assert_eq!(data["provider"], "anthropic");
-        assert_eq!(data["source"], "default", "no column → source=default");
-        assert_eq!(
-            data["context_window"], 1_000_000,
-            "the registry-default model has a configured window too"
-        );
-    }
-
-    /// `kj context set --model <alias>` resolves the alias to a concrete
-    /// provider+model BEFORE persisting (see `kj/context.rs`'s
-    /// `context_set_resolves_model_alias`). `kj model`'s context-window
-    /// answer must agree with the registry's own `resolve_alias` — this
-    /// guards against introducing a second, possibly-diverging resolution
-    /// path for "what model does this alias mean".
-    #[tokio::test]
-    async fn model_alias_resolution_agrees_with_registry_resolve_alias() {
-        let d = test_dispatcher().await;
-        seed_registry(&d).await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("c"), None, principal);
-        let c = caller_with_context(ctx);
-
-        let set_result = d
-            .dispatch(&[s("context"), s("set"), s("--model"), s("fast")], &c)
-            .await;
-        assert!(set_result.is_ok(), "context set failed: {}", set_result.message());
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
-            other => panic!("expected data, got {other:?}"),
-        };
-
-        let (expected_provider, expected_model) = {
-            let registry = d.kernel().llm().read().await;
-            let (p, m) = registry.resolve_alias("fast").expect("fast alias configured");
-            (p.to_string(), m.to_string())
-        };
-        assert_eq!(data["provider"], expected_provider);
-        assert_eq!(data["model"], expected_model);
-        assert_eq!(data["source"], "context", "alias set via context set → source=context");
-        // "fast" resolves to claude-haiku-4-5-20251001, which seed_registry
-        // leaves unconfigured — the alias path must not invent a window.
-        assert!(
-            data["context_window"].is_null(),
-            "alias-resolved model with no configured window is still null: {data:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn models_annotates_a_model_with_its_configured_context_window() {
         let d = test_dispatcher().await;
         seed_registry(&d).await;
@@ -671,197 +254,5 @@ mod tests {
             msg.contains("claude-opus-4-8") && msg.contains("1000000"),
             "listing annotates the configured model with its window: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn model_without_active_context_errors() {
-        let d = test_dispatcher().await;
-        seed_registry(&d).await;
-        let c = KjCaller_no_context();
-
-        let result = d.dispatch(&[s("model")], &c).await;
-        assert!(!result.is_ok(), "no context → error");
-    }
-
-    // A caller with no active context, for the no-context error path.
-    #[allow(non_snake_case)]
-    fn KjCaller_no_context() -> crate::kj::KjCaller {
-        let mut c = test_caller();
-        c.context_id = None;
-        c
-    }
-
-    /// The 2026-08-03 deepseek-review P0: `kj model` answered from its own
-    /// two-rung ladder (row column → registry default) while the turn path
-    /// resolved through the cast slot — a cast-seated context showed the
-    /// default model here but RAN the cast's model. Both surfaces now walk
-    /// `resolve_context_model`, so this pins the cast rung end-to-end
-    /// through the kj verbs and the DB-reloaded registry.
-    #[tokio::test]
-    async fn model_reports_the_cast_slot_the_turn_path_would_run() {
-        let d = test_dispatcher().await;
-        {
-            let db = d.kernel_db().lock();
-            crate::test_backends::example_backends(&db);
-        }
-        d.reload_llm_registry().await.unwrap();
-        // `context create` forks the structural edge from the caller's
-        // context, so the caller needs a real registered one (FK).
-        let principal = PrincipalId::new();
-        let parent =
-            crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
-        let c = crate::kj::test_helpers::caller_with_context(parent);
-        crate::kj::test_helpers::give_character(&d, &c);
-
-        d.dispatch(&[s("cast"), s("create"), s("band")], &c).await;
-        let r = d
-            .dispatch(
-                &[
-                    s("cast"),
-                    s("slot"),
-                    s("set"),
-                    s("band"),
-                    s("coder"),
-                    s("--backend"),
-                    s("deepseek"),
-                    s("--model"),
-                    s("deepseek-v4-pro"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(r.is_ok(), "slot set failed: {}", r.message());
-        let r = d
-            .dispatch(
-                &[
-                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
-                    s("probe"),
-                    s("--type"),
-                    s("coder"),
-                    s("--cast"),
-                    s("band"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(r.is_ok(), "context create failed: {}", r.message());
-
-        let result = d.dispatch(&[s("model"), s("--context"), s("probe")], &c).await;
-        assert!(result.is_ok(), "model failed: {}", result.message());
-        let msg = result.message();
-        assert!(
-            msg.contains("deepseek/deepseek-v4-pro"),
-            "reports the cast slot's model, not the registry default: {msg}"
-        );
-        assert!(msg.contains("via cast band"), "names the cast as the source: {msg}");
-        assert!(msg.contains("max_tokens=65536") && msg.contains("effort=high"), "{msg}");
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(v), .. } => v,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert_eq!(data["source"], "cast band");
-        assert_eq!(data["provider"], "deepseek");
-        assert_eq!(data["model"], "deepseek-v4-pro");
-        // The floor pins deepseek-v4-pro's window, so the gauge input rides
-        // along instead of "unknown".
-        assert_eq!(data["context_window"], 1_000_000);
-        // The slot sets no tunables, so the model's own row answers.
-        assert_eq!(data["tunables"]["max_tokens"], 65536);
-        assert_eq!(data["tunables"]["effort"], "high");
-    }
-
-    /// A context with no cast of its own resolves through its performer's
-    /// default cast, and a context's own cast wins over it. Clearing the
-    /// default falls through to the registry default.
-    ///
-    /// Falsified by reading only the context's cast (the first probe reports
-    /// the registry default) or by letting the performer's default win over
-    /// the context's own cast.
-    #[tokio::test]
-    async fn model_resolves_through_the_performers_default_cast() {
-        let d = test_dispatcher().await;
-        {
-            let db = d.kernel_db().lock();
-            crate::test_backends::example_backends(&db);
-        }
-        d.reload_llm_registry().await.unwrap();
-        let principal = PrincipalId::new();
-        let parent = crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
-        let c = crate::kj::test_helpers::caller_with_context(parent);
-        crate::kj::test_helpers::give_character(&d, &c);
-        for (cast, model) in [("band", "deepseek-v4-pro"), ("house", "deepseek-flash")] {
-            assert!(d.dispatch(&[s("cast"), s("create"), s(cast)], &c).await.is_ok());
-            let r = d
-                .dispatch(
-                    &[s("cast"), s("slot"), s("set"), s(cast), s("coder"), s("--backend"), s("deepseek"), s("--model"), s(model)],
-                    &c,
-                )
-                .await;
-            assert!(r.is_ok(), "slot set failed: {}", r.message());
-        }
-        assert!(d.dispatch(&[s("character"), s("create"), s("coder")], &c).await.is_ok());
-        let r = d.dispatch(&[s("character"), s("set"), s("coder"), s("--cast"), s("band")], &c).await;
-        assert!(r.is_ok(), "character set --cast failed: {}", r.message());
-        let shown = d.dispatch(&[s("character"), s("show"), s("coder")], &c).await;
-        assert!(shown.message().contains("Default cast:    band"), "{}", shown.message());
-
-        let coder = d.kernel_db().lock().get_character_by_name("coder").unwrap().unwrap().principal_id;
-        let played = |label: &str, cast: Option<&str>| {
-            let mut argv = vec![s("kohai"), s("create"), s("--as"), s("coder"), s(label), s("--type"), s("coder")];
-            if let Some(cast) = cast {
-                argv.extend([s("--cast"), s(cast)]);
-            }
-            argv
-        };
-        for (label, cast) in [("probe", None), ("own", Some("house"))] {
-            let r = d.dispatch(&played(label, cast), &c).await;
-            assert!(r.is_ok(), "context create failed: {}", r.message());
-            let db = d.kernel_db().lock();
-            let id = db.find_context_by_label(label).unwrap().unwrap().context_id;
-            assert_eq!(db.get_context(id).unwrap().unwrap().played_by, Some(coder));
-        }
-        let source = |result: crate::kj::KjResult| match result {
-            crate::kj::KjResult::Ok { data: Some(v), .. } => (v["model"].as_str().unwrap().to_string(), v["source"].as_str().unwrap().to_string()),
-            other => panic!("expected data, got {other:?}"),
-        };
-
-        let probe = source(d.dispatch(&[s("model"), s("--context"), s("probe")], &c).await);
-        assert_eq!(probe, (s("deepseek-v4-pro"), s("cast band")), "the performer's default cast answers");
-        let own = source(d.dispatch(&[s("model"), s("--context"), s("own")], &c).await);
-        assert_eq!(own, (s("deepseek-flash"), s("cast house")), "the context's own cast wins");
-
-        let r = d.dispatch(&[s("character"), s("set"), s("coder"), s("--no-cast")], &c).await;
-        assert!(r.is_ok(), "character set --no-cast failed: {}", r.message());
-        let cleared = source(d.dispatch(&[s("model"), s("--context"), s("probe")], &c).await);
-        assert_eq!(cleared.1, "default", "with no default cast the registry default answers");
-    }
-
-    /// A context with no cast seat runs its model's own tunables, the same
-    /// resolution the turn path uses: here the floor's 16384 would truncate
-    /// DeepSeek's reasoning, and the model row's 65536 must win.
-    #[tokio::test]
-    async fn model_reports_the_model_row_tunables_without_a_cast() {
-        let d = test_dispatcher().await;
-        {
-            let db = d.kernel_db().lock();
-            crate::test_backends::example_backends(&db);
-        }
-        d.reload_llm_registry().await.unwrap();
-        let principal = PrincipalId::new();
-        let parent =
-            crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
-        let c = crate::kj::test_helpers::caller_with_context(parent);
-        crate::kj::test_helpers::give_character(&d, &c);
-        let r = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("plain"), s("-m"), s("deepseek/deepseek-flash")], &c).await;
-        assert!(r.is_ok(), "context create failed: {}", r.message());
-
-        let result = d.dispatch(&[s("model"), s("--context"), s("plain")], &c).await;
-        let data = match result {
-            crate::kj::KjResult::Ok { data: Some(v), .. } => v,
-            other => panic!("expected data, got {other:?}"),
-        };
-        assert_eq!(data["source"], "context");
-        assert_eq!(data["tunables"]["max_tokens"], 65536, "the model row wins over the 16384 floor");
-        assert_eq!(data["tunables"]["effort"], "high");
     }
 }

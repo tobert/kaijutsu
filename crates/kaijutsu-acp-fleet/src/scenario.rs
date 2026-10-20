@@ -20,10 +20,6 @@ use crate::client::PermissionAnswer;
 use crate::container::Endpoint;
 use crate::council::{Script, Undo, Verdict};
 
-/// The text a scenario's `gate` uses for the council server's address. The
-/// runner replaces it with the `[council]` server.
-pub const COUNCIL_PLACEHOLDER: &str = "{council}";
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
@@ -131,12 +127,22 @@ pub struct Council {
     /// A real council server, such as `http://zorak:8090`.
     #[serde(default)]
     pub server: Option<String>,
+    /// The model a real council server serves. Needed with `server`; the
+    /// scripted council serves its own.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Council {
     /// The script for a council the runner serves, or `None` for a real one.
     pub fn script(&self) -> Option<Script> {
         (self.server.is_none()).then(|| Script { verdicts: self.verdicts.clone(), undo: self.undo })
+    }
+
+    /// The model the gate's decisions run on: the scripted council's, or the
+    /// real server's `model`.
+    pub fn served_model(&self) -> &str {
+        self.model.as_deref().unwrap_or(crate::council::SERVED_MODEL)
     }
 }
 
@@ -403,35 +409,27 @@ impl Scenario {
                 );
             }
         }
-        let placeholder = self
-            .gate
-            .iter()
-            .chain(self.prompt.iter().filter_map(|p| p.gate.as_ref()))
-            .any(|g| g.contains(COUNCIL_PLACEHOLDER));
-        match &self.council {
-            Some(council) => {
-                match (&council.server, council.verdicts.is_empty()) {
-                    (Some(_), false) => bail!("[council] give `verdicts` for a scripted council or `server` for a real one, not both"),
-                    (None, true) => bail!("[council] needs `verdicts`, at least one, or a `server`"),
-                    (Some(server), true) if council.undo.is_some() => {
-                        bail!("[council] `undo` scripts the scripted council's answers; the server {server} answers for itself")
-                    }
-                    (Some(server), true) if !server.starts_with("http://") && !server.starts_with("https://") => {
-                        bail!("[council] `server` {server:?} must start with http:// or https://")
-                    }
-                    (Some(server), true) if self.mode == Mode::Contained => {
-                        Endpoint::from_url(server).context("[council] `server`")?;
-                    }
-                    _ => {}
+        if let Some(council) = &self.council {
+            match (&council.server, council.verdicts.is_empty()) {
+                (Some(_), false) => bail!("[council] give `verdicts` for a scripted council or `server` for a real one, not both"),
+                (None, true) => bail!("[council] needs `verdicts`, at least one, or a `server`"),
+                (Some(server), true) if council.undo.is_some() => {
+                    bail!("[council] `undo` scripts the scripted council's answers; the server {server} answers for itself")
                 }
-                if !placeholder {
-                    bail!("[council] is set, but no `gate` names it: write `server = \"{COUNCIL_PLACEHOLDER}\"` under the gate's [council]");
+                (Some(server), true) if !server.starts_with("http://") && !server.starts_with("https://") => {
+                    bail!("[council] `server` {server:?} must start with http:// or https://")
                 }
+                (Some(_), true) if council.model.as_deref().is_none_or(|m| m.trim().is_empty()) => {
+                    bail!("[council] a real `server` needs the `model` it serves, which the gate slot names")
+                }
+                (Some(server), true) if self.mode == Mode::Contained => {
+                    Endpoint::from_url(server).context("[council] `server`")?;
+                }
+                (None, false) if council.model.is_some() => {
+                    bail!("[council] the scripted council serves its own model; `model` goes with a real `server`")
+                }
+                _ => {}
             }
-            None if placeholder => {
-                bail!("a `gate` names {COUNCIL_PLACEHOLDER}, but the scenario has no [council] to put there")
-            }
-            None => {}
         }
         for path in self.files.keys() {
             workspace_relative(path)?;
@@ -820,7 +818,7 @@ exists = true
         format!("gate = {gate:?}\n{MINIMAL}\n[council]\n{council}\n")
     }
 
-    const COUNCIL_GATE: &str = "[council]\nserver = \"{council}\"\n";
+    const COUNCIL_GATE: &str = "[council]\ncontexts = [\"seat\"]\n";
 
     #[test]
     fn a_scripted_council_reads_its_verdicts_in_order() {
@@ -828,24 +826,26 @@ exists = true
         let script = Scenario::parse(&text, "council").unwrap().council.unwrap().script().unwrap();
         assert_eq!(script.verdicts, [Verdict::TryHarder, Verdict::DoLess, Verdict::Proceed]);
         assert_eq!(script.undo, Some(Undo::Irreversible));
-        let real = with_council("server = \"http://zorak:8090\"", COUNCIL_GATE);
+        let real = with_council("server = \"http://zorak:8090\"\nmodel = \"gemma\"", COUNCIL_GATE);
         assert!(Scenario::parse(&real, "real").unwrap().council.unwrap().script().is_none(), "a real server is not scripted");
     }
 
     #[test]
-    fn a_council_needs_exactly_one_source_and_a_gate_that_names_it() {
+    fn a_council_needs_exactly_one_source_and_a_real_server_names_its_model() {
         let both = with_council("verdicts = [\"proceed\"]\nserver = \"http://zorak:8090\"", COUNCIL_GATE);
         assert!(refusal(&both).contains("not both"), "{}", refusal(&both));
         let neither = with_council("", COUNCIL_GATE);
         assert!(refusal(&neither).contains("needs `verdicts`"), "{}", refusal(&neither));
         let unknown = with_council("verdicts = [\"maybe\"]", COUNCIL_GATE);
         assert!(refusal(&unknown).contains("maybe"), "{}", refusal(&unknown));
-        let unnamed = with_council("verdicts = [\"proceed\"]", "[global]\n");
-        assert!(refusal(&unnamed).contains("no `gate` names it"), "{}", refusal(&unnamed));
         let undo_on_real = with_council("server = \"http://zorak:8090\"\nundo = \"normal\"", COUNCIL_GATE);
         assert!(refusal(&undo_on_real).contains("answers for itself"), "{}", refusal(&undo_on_real));
-        let orphan = format!("gate = {COUNCIL_GATE:?}\n{MINIMAL}");
-        assert!(refusal(&orphan).contains("no [council]"), "{}", refusal(&orphan));
+        let unmodeled = with_council("server = \"http://zorak:8090\"", COUNCIL_GATE);
+        assert!(refusal(&unmodeled).contains("needs the `model`"), "{}", refusal(&unmodeled));
+        let model_on_script = with_council("verdicts = [\"proceed\"]\nmodel = \"gemma\"", COUNCIL_GATE);
+        assert!(refusal(&model_on_script).contains("serves its own model"), "{}", refusal(&model_on_script));
+        let scripted = Scenario::parse(&with_council("verdicts = [\"proceed\"]", COUNCIL_GATE), "scripted").unwrap();
+        assert_eq!(scripted.council.unwrap().served_model(), crate::council::SERVED_MODEL);
     }
 
     #[test]
@@ -855,7 +855,7 @@ exists = true
         };
         let scenario = Scenario::parse(&restart("verdicts = [\"proceed\"]"), "scripted").unwrap();
         assert_eq!(scenario.prompt[0].council_verdicts, [Verdict::DoLess]);
-        let real = restart("server = \"http://zorak:8090\"");
+        let real = restart("server = \"http://zorak:8090\"\nmodel = \"gemma\"");
         assert!(refusal(&real).contains("has no `verdicts`"), "{}", refusal(&real));
         let none = MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\ncouncil_verdicts = [\"do_less\"]");
         assert!(refusal(&none).contains("has no `verdicts`"), "{}", refusal(&none));
@@ -865,10 +865,10 @@ exists = true
     fn a_contained_council_is_scripted_or_a_named_server() {
         let contained = |council: &str| format!("mode = \"contained\"\n{}", with_council(council, COUNCIL_GATE));
         Scenario::parse(&contained("verdicts = [\"proceed\"]"), "scripted").unwrap();
-        Scenario::parse(&contained("server = \"http://zorak:8090\""), "named").unwrap();
-        let address = contained("server = \"http://192.168.1.5:8090\"");
+        Scenario::parse(&contained("server = \"http://zorak:8090\"\nmodel = \"gemma\""), "named").unwrap();
+        let address = contained("server = \"http://192.168.1.5:8090\"\nmodel = \"gemma\"");
         assert!(refusal(&address).contains("name the host"), "{}", refusal(&address));
-        Scenario::parse(&with_council("server = \"http://192.168.1.5:8090\"", COUNCIL_GATE), "host").unwrap();
+        Scenario::parse(&with_council("server = \"http://192.168.1.5:8090\"\nmodel = \"gemma\"", COUNCIL_GATE), "host").unwrap();
     }
 
     #[test]

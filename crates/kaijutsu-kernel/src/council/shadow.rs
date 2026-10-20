@@ -4,7 +4,7 @@
 //! The gate is the shadow's only writer. [`record_call`] runs before the
 //! gate decides and appends the call as a user turn; [`record_outcome`] runs
 //! after and appends what the gate did as the model turn after it. A seat
-//! has a judge shadow when its cast has a [`JUDGE`] slot; the shadow is
+//! has a judge shadow when its binding has a [`JUDGE`] slot; the shadow is
 //! created on the first call the gate evaluates for that seat.
 //!
 //! A new shadow runs the `judge` type's `create` rc lifecycle, whose stance
@@ -412,10 +412,6 @@ fn append(kernel: &crate::Kernel, shadow: ContextId, role: Role, text: String) -
         .map_err(|e| e.to_string())
 }
 
-/// The seat's live judge shadow, created when the cast the seat resolves
-/// through (its own, else its performer's default) has a [`JUDGE`] slot and
-/// no shadow exists yet. The shadow is found by its fork
-/// edge and type, never by its label.
 /// Runs the new shadow's `judge` `create` lifecycle, which writes its
 /// stance. A failure is logged; a shadow with no stance is never sent to a
 /// council server (`projection::project_shadow`).
@@ -448,7 +444,10 @@ async fn run_create_lifecycle(kernel: &crate::Kernel, shadow: ContextId) {
     }
 }
 
-/// Returns the judge and whether this call created its shadow.
+/// The seat's live judge shadow, created when the binding the seat runs on
+/// has a [`JUDGE`] slot and no shadow exists yet. The shadow is found by its
+/// fork edge and type, never by its label. Returns the judge and whether this
+/// call created its shadow.
 fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Option<(Judge, bool)>> {
     let _create = CREATE.lock();
     let (row, judge) = {
@@ -456,7 +455,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         let Some(seat_row) = db.get_context(seat)? else {
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
-        let Some((cast_id, server)) = judge_slot(&db, &seat_row)? else { return Ok(None) };
+        let Some(server) = judge_slot(&db, seat)? else { return Ok(None) };
         let mut judge = Judge {
             shadow: seat,
             seat_name: seat_row.label.clone().unwrap_or_else(|| seat.short()),
@@ -473,7 +472,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
                 "seat context {seat} belongs to no character instance, so its judge shadow has none to join"
             )));
         };
-        let mut row = shadow_row(&seat_row, cast_id);
+        let mut row = shadow_row(&seat_row);
         row.played_by = seat_row.played_by;
         db.in_transaction(|db| {
             crate::kj::context::insert_new_context_rows(db, &row, crate::kj::context::InstancePlacement::Join { instance, seq })
@@ -492,28 +491,27 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
     Ok(Some((judge, true)))
 }
 
-/// The seat's judge slot: the cast it resolves through, and the council
-/// server and served model the judge reads on, its backend's address and
-/// the slot's model when its kind is `mk`, or why that backend names none.
-/// `None` for the server is a chat backend, whose judge is not read yet.
-/// `None` overall: the seat's cast has no [`JUDGE`] slot.
-#[allow(clippy::type_complexity)]
+/// The seat's judge slot in the binding it runs on: the council server and
+/// served model the judge reads on, its backend's address and the slot's
+/// model when its kind is `mk`, or why that backend names none. `None` for
+/// the server is a chat backend, whose judge is not read yet. `None` overall:
+/// the seat's binding has no [`JUDGE`] slot.
 fn judge_slot(
     db: &crate::kernel_db::KernelDb,
-    seat: &ContextRow,
-) -> KernelDbResult<Option<(kaijutsu_types::CastId, Option<Result<SlotServer, String>>)>> {
-    let Some((cast_id, backend, model)) = super::gate::seat_slot_backend(db, seat, JUDGE)? else { return Ok(None) };
+    seat: ContextId,
+) -> KernelDbResult<Option<Option<Result<SlotServer, String>>>> {
+    let Some((backend, model)) = super::gate::seat_slot_backend(db, seat, JUDGE)? else { return Ok(None) };
     let server = match backend.kind.as_str() {
         "mk" => Some(super::gate::council_address(&backend, &model)),
         _ => None,
     };
-    Ok(Some((cast_id, server)))
+    Ok(Some(server))
 }
 
 /// The council server and served model a seat's judge reads on, when its
-/// cast has a [`JUDGE`] slot on an `mk` backend with an address.
-pub(crate) fn judge_server(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbResult<Option<SlotServer>> {
-    Ok(judge_slot(db, seat)?.and_then(|(_, server)| server).and_then(Result::ok))
+/// binding has a [`JUDGE`] slot on an `mk` backend with an address.
+pub(crate) fn judge_server(db: &crate::kernel_db::KernelDb, seat: ContextId) -> KernelDbResult<Option<SlotServer>> {
+    Ok(judge_slot(db, seat)?.flatten().and_then(Result::ok))
 }
 
 /// The labels a judge read sends before the shadow: `[council] contexts`
@@ -525,9 +523,9 @@ pub(crate) fn judge_labels(
     super::reviewer_contexts::ReviewerContextChain::default().decision_labels(council, spec)
 }
 
-/// A judge shadow's row: a fork child of the seat playing the seat's cast.
-/// The caller gives it the seat's instance.
-fn shadow_row(seat: &ContextRow, cast_id: kaijutsu_types::CastId) -> ContextRow {
+/// A judge shadow's row: a fork child of the seat. The caller gives it the
+/// seat's instance.
+fn shadow_row(seat: &ContextRow) -> ContextRow {
     let seat_name = seat.label.clone().unwrap_or_else(|| seat.context_id.short());
     ContextRow {
         context_id: ContextId::new(),
@@ -549,7 +547,7 @@ fn shadow_row(seat: &ContextRow, cast_id: kaijutsu_types::CastId) -> ContextRow 
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
-        cast_id: Some(cast_id),
+        cast_id: None,
         origin_host: None,
         played_by: None,
         // A fork child of the seat.

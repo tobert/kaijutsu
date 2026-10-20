@@ -2127,11 +2127,6 @@ impl Kernel {
         self.llm.write().await.register(name, provider);
     }
 
-    /// Set the default LLM provider.
-    pub async fn set_default_llm(&self, name: &str) -> bool {
-        self.llm.write().await.set_default(name)
-    }
-
     /// Get the LLM registry (for direct access).
     pub fn llm(&self) -> &RwLock<LlmRegistry> {
         &self.llm
@@ -3553,20 +3548,10 @@ mod tests {
             "fake-key",
         )));
         kernel.register_llm("anthropic", provider).await;
-        kernel.set_default_llm("anthropic").await;
 
         // Check provider is listed
         let providers = kernel.list_llm_providers().await;
         assert_eq!(providers, vec!["anthropic"]);
-    }
-
-    #[tokio::test]
-    async fn test_llm_no_provider() {
-        let kernel = Kernel::new_ephemeral("test").await;
-
-        // Should fail gracefully without provider
-        let result = kernel.llm().read().await.prompt("Hello").await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]

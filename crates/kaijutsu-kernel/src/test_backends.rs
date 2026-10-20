@@ -2,12 +2,11 @@
 //! needs one writes its own rows.
 //!
 //! [`example_backends`] writes `anthropic`, `deepseek`, `gpt`, and `ollama`
-//! with a few model rows, and makes `deepseek/deepseek-flash` the default
-//! with a `max_tokens` of 16384.
+//! with a few model rows.
 
 use kaijutsu_types::{BackendId, PrincipalId};
 
-use crate::kernel_db::{BackendModelRow, BackendRow, KernelDb, LlmDefaultsRow, ModelTunablesRow};
+use crate::kernel_db::{BackendModelRow, BackendRow, KernelDb, ModelTunablesRow};
 
 /// Write one backend row and return it.
 pub(crate) fn backend(
@@ -47,7 +46,7 @@ fn model(db: &KernelDb, backend: &BackendRow, model_id: &str, window: u64, tunab
     .expect("write a test model row");
 }
 
-/// Write the four example backends, their model rows, and the defaults.
+/// Write the four example backends and their model rows.
 pub(crate) fn example_backends(db: &KernelDb) {
     let anthropic = backend(
         db, "anthropic", "anthropic", None,
@@ -75,16 +74,4 @@ pub(crate) fn example_backends(db: &KernelDb) {
         Some("OPENAI_API_KEY"), Some("~/.openai-key.txt"), false,
     );
     backend(db, "ollama", "openai", Some("http://localhost:11434/v1"), None, None, true);
-
-    db.set_llm_defaults(&LlmDefaultsRow {
-        default_backend: "deepseek".to_string(),
-        default_model: "deepseek-flash".to_string(),
-        max_tokens: Some(16384),
-        temperature: None,
-        top_p: None,
-        effort: None,
-        thinking_budget: None,
-        thinking_style: None,
-    })
-    .expect("write the test defaults");
 }

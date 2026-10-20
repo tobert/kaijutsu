@@ -220,7 +220,7 @@ if text.count("[context_type.mcp]") != 1:
         f"{path}: expected exactly one [context_type.mcp] tier, "
         f"found {text.count('[context_type.mcp]')}"
     )
-extra = ["kj character", "kj backend", "kj cast", "kj context set", "kj model"]
+extra = ["kj character", "kj backend", "kj cast", "kj context set"]
 out = []
 inside = False
 for line in text.splitlines():
@@ -243,12 +243,16 @@ if [[ "$MODEL_MODE" == "mock" ]]; then
   echo "== pointing the kernel at the mock backend"
   "${KJMCP[@]}" \
     "kj backend set mock --kind mock --key-optional" \
-    "kj backend default set --backend mock --model bench-mock"
+    "kj cast create bench" \
+    "kj cast slot set bench coder --backend mock --model bench-mock --max-tokens 4096" \
+    "kj character set $PERFORMER --cast bench"
 else
   echo "== pointing the kernel at deepseek-v4-flash"
   "${KJMCP[@]}" \
     "kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY --api-key-file ~/.deepseek-key" \
-    "kj backend default set --backend deepseek --model deepseek-v4-flash"
+    "kj cast create bench" \
+    "kj cast slot set bench coder --backend deepseek --model deepseek-v4-flash --max-tokens 65536" \
+    "kj character set $PERFORMER --cast bench"
 fi
 
 cat > "$RUN_DIR/env.sh" <<ENV

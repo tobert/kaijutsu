@@ -87,6 +87,9 @@ impl Script {
 const CHOSEN: f64 = -0.001;
 
 /// The template the scripted council reports in its identity and decisions.
+/// The model the scripted council serves: the `gate` slot's model.
+pub const SERVED_MODEL: &str = "fleet-council";
+
 const TEMPLATE: &str = "mk-letters-1:0123456789abcdef";
 
 fn identity() -> Value {

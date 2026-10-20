@@ -21,8 +21,9 @@
 //! sent again when it changes and every [`PIN_RENEW`], off the decision's
 //! path. A seat's [`Slot`] keeps only its current body, and a pinner
 //! forgets seats nothing current reaches before it sends the set.
-//! [`build_seats`] builds the configured seats when the kernel starts, and
-//! [`build_context_seats`] the seats that depend on one proposing seat.
+//! [`build_seats`] builds the seats of the live contexts when the kernel
+//! starts, and [`build_context_seats`] the seats that depend on one proposing
+//! seat.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
@@ -747,35 +748,38 @@ impl Pinner {
     }
 }
 
-/// Builds every council seat the kernel's gate config names, so the first
-/// decision finds them held and pinned: for each council and each of its
-/// specs, `[council] contexts` and the spec's own. The seats that depend on
-/// a proposing seat are [`build_context_seats`]'s. An absent config and
-/// each failure are logged and leave the seats to the first decision.
+/// Builds the council seats of every live context whose type has a council
+/// and whose binding has a `gate` slot, so the first decision finds them held
+/// and pinned: for each such context and each of its council's specs,
+/// `[council] contexts` and the spec's own, and the seats that depend on the
+/// context ([`plan_context_seats`]). The servers are the slots', so a config
+/// with no instance bound to a `gate` slot builds nothing. An absent config
+/// and each failure are logged and leave the seats to the first decision.
 pub(crate) async fn build_seats(kernel: &crate::Kernel) {
-    let config = match crate::kj::gate_policy::load_config(kernel.vfs()).await {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::warn!(error = %e, "council seats are not built at startup: the gate config does not load");
-            return;
+    let live: Vec<ContextId> = {
+        let db = kernel.kernel_db().lock();
+        match db.list_active_contexts() {
+            Ok(rows) => rows.into_iter().map(|r| r.context_id).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "council seats are not built at startup: the contexts do not list");
+                return;
+            }
         }
     };
     let mut done: HashSet<(String, String, Vec<String>)> = HashSet::new();
-    for council in config.councils() {
-        for spec in &council.specs {
-            let labels = super::reviewer_contexts::ReviewerContextChain::default().decision_labels(council, spec);
-            if !done.insert((council.server.clone(), spec.name.clone(), labels.clone())) {
+    for context in live {
+        let builds = match plan_context_seats(kernel, context).await {
+            Ok((builds, _)) => builds,
+            Err(cause) => {
+                tracing::warn!(context = %context.short(), %cause, "council seats are not planned at startup");
                 continue;
             }
-            let deadline = tokio::time::Instant::now() + SHADOW_PRIME_TIMEOUT;
-            let waits = SlotWaits::default();
-            let sync = kernel.council_sync();
-            let council = CouncilConfig { deadline_ms: SHADOW_PRIME_TIMEOUT.as_millis() as u64, ..council.clone() };
-            match sync.prepare_labels(kernel, &council, &spec.name, &labels, None, &[], deadline, &waits).await {
-                Ok(prepared) => tracing::info!(server = %council.server, spec = %spec.name, seats = prepared.contexts.len(), "council seats built"),
-                Err(PrepareMiss(cause)) => tracing::warn!(server = %council.server, spec = %spec.name, %cause, "council seats are not built at startup"),
-            }
-        }
+        };
+        let builds: Vec<SeatBuild> = builds
+            .into_iter()
+            .filter(|b| b.seat.is_some() || done.insert((b.council.server.clone(), b.spec.clone(), b.labels.clone())))
+            .collect();
+        build_context_seats(kernel, context, builds).await;
     }
 }
 
@@ -805,10 +809,11 @@ impl SeatBuild {
 /// What the gate's decisions for `context` read on the seats that depend
 /// on it: under each of its council's shell and program specs, the labels
 /// along the reviewer chain of its performer and the house rules of its
-/// workspace, routed to the server its cast names; each observing reviewer
-/// context alone under `direction-check`; and, when its cast has an `mk`
-/// judge, the judge read's labels and house rules on the judge's server.
-/// Empty when its type has no council. Waits on no server.
+/// workspace, routed to the server its binding's `gate` slot names; each
+/// observing reviewer context alone under `direction-check`; and, when its
+/// binding has an `mk` judge, the judge read's labels and house rules on the
+/// judge's server. Empty when its type has no council or its binding has no
+/// `gate` slot. Waits on no server.
 ///
 /// The second value says why the reviewer chain is left out: a context
 /// with no performer, or a chain that does not resolve yet. The labels are
@@ -828,11 +833,11 @@ pub(crate) async fn plan_context_seats(
         .map_err(|e| format!("context {} cannot be read: {e}", context.short()))?
         .ok_or_else(|| format!("context {} has no row", context.short()))?;
     let Some(council) = config.council_for(Some(&row.context_type)) else { return Ok((Vec::new(), None)) };
-    let (routed, chain) = match row.played_by {
-        Some(actor) => super::gate::seat_route(&db, council, context, actor)?,
-        None => (None, Err(format!("context {} has no performer", context.short()))),
+    let (routed, chain) = match super::gate::seat_route(&db, council, context, row.played_by)? {
+        super::gate::SeatRoute::NoCouncil => return Ok((Vec::new(), None)),
+        super::gate::SeatRoute::Council(routed, chain) => (routed, chain),
     };
-    let council = routed.as_ref().unwrap_or(council);
+    let council = &routed;
     let (chain, without_chain) = match chain {
         Ok(chain) => (chain, None),
         Err(cause) => (super::reviewer_contexts::ReviewerContextChain::default(), Some(cause)),
@@ -861,7 +866,7 @@ pub(crate) async fn plan_context_seats(
             added: Vec::new(),
         });
     }
-    let judge = super::shadow::judge_server(&db, &row)
+    let judge = super::shadow::judge_server(&db, context)
         .map_err(|e| format!("the judge slot of context {} cannot be read: {e}", context.short()))?;
     if let (Some(judge), Some(spec)) = (judge, shell) {
         let seat_name = row.label.clone().unwrap_or_else(|| context.short());
@@ -1461,19 +1466,21 @@ mod tests {
         assert!(r.mock.calls("PUT").is_empty(), "{:?}", r.mock.calls("PUT"));
     }
 
-    /// At startup the kernel builds and pins each configured council's
-    /// seats: `[council] contexts` under each spec.
+    /// At startup the kernel builds and pins the council seats of each live
+    /// context whose instance binds a `gate` slot: `[council] contexts` under
+    /// each spec, on the slot's server.
     ///
-    /// Falsified by seats that wait for the first decision.
+    /// Falsified by seats that wait for the first decision, or by building on
+    /// a server no gate slot names.
     #[tokio::test]
     async fn build_seats_builds_and_pins_the_configured_seats() {
         let r = rig_on(serve_pinning().await).await;
         let gate = format!(
-            "[council]\nserver = \"{}\"\ncontexts = [\"reviewer\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
+            "[council]\ncontexts = [\"reviewer\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
              [[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.98\nmass_floor = -0.05\n\n\
-             [context_type.coder.council]\nenabled = true\n",
-            r.mock.base
+             [context_type.coder.council]\nenabled = true\n"
         );
+        coder_on_the_mock_council(&r);
         std::fs::write(r.config.path().join("gate.toml"), gate).unwrap();
         let loaded = crate::kj::gate_policy::load_config(r.kernel.vfs()).await.expect("the gate config loads");
         assert_eq!(loaded.councils().count(), 1);
@@ -1658,6 +1665,67 @@ mod tests {
     }
 
     /// A seat with a brief and narration, labeled `label`, working in `cwd`.
+    /// A live `coder` context whose instance binds a `gate` slot on the mock
+    /// council server, so the startup build and the context plans find a
+    /// council for it.
+    fn coder_on_the_mock_council(r: &Rig) -> ContextId {
+        use crate::kernel_db::{BackendRow, CastRow, CastSlotRow, CharacterRow};
+        use kaijutsu_types::PrincipalId;
+        let character = PrincipalId::new();
+        let db = r.kernel.kernel_db().lock();
+        db.insert_character(&CharacterRow {
+            principal_id: character, name: "council-coder".into(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        })
+        .unwrap();
+        let backend = db
+            .upsert_backend(&BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(),
+                name: "council-mk".into(),
+                kind: "mk".into(),
+                base_url: Some(r.mock.base.clone()),
+                api_key_env: None,
+                api_key_file: None,
+                key_optional: true,
+                request_timeout_secs: None,
+                idle_timeout_secs: None,
+                max_concurrent: None,
+                created_at: 0,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap();
+        let cast = CastRow {
+            cast_id: kaijutsu_types::CastId::new(),
+            label: "coder-council".into(),
+            description: None,
+            created_at: 0,
+            created_by: PrincipalId::system(),
+        };
+        db.insert_cast(&cast).unwrap();
+        db.set_cast_slot(&CastSlotRow {
+            cast_id: cast.cast_id,
+            role: "gate".into(),
+            backend_id: backend.backend_id,
+            model: "m".into(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+            loadout: None,
+            extra: None,
+        })
+        .unwrap();
+        db.set_character_default_cast(character, Some(cast.cast_id)).unwrap();
+        drop(db);
+        let coder = live_context(&r.kernel, "coder-seat");
+        let db = r.kernel.kernel_db().lock();
+        db.update_context_type(coder, "coder").unwrap();
+        db.assign_stand_in_instance(coder, character).unwrap();
+        coder
+    }
+
     fn seat_in(r: &Rig, label: &str, cwd: Option<&str>) -> ContextId {
         let seat = live_context(&r.kernel, label);
         append_dialogue(&r.kernel, seat, &["recover the records", "The WAL is XORed."]);
@@ -1807,10 +1875,9 @@ mod tests {
         append_dialogue(&r.kernel, other, &["never delete originals"]);
         let gate = |label: &str| {
             format!(
-                "[council]\nserver = \"{}\"\ncontexts = [\"{label}\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n\
+                "[council]\ncontexts = [\"{label}\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n\
                  [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
-                 [context_type.coder.council]\nenabled = true\n",
-                r.mock.base
+                 [context_type.coder.council]\nenabled = true\n"
             )
         };
         std::fs::write(r.config.path().join("gate.toml"), gate("reviewer")).unwrap();

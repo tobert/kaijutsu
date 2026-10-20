@@ -94,7 +94,7 @@ fn assert_usage(turn: &Turn) {
 }
 
 async fn plain_turn(client: &Client, model: &str) {
-    let opts = BuildOpts::new(model).with_max_tokens(1024).with_system("Answer in one short sentence.");
+    let opts = BuildOpts::new(model, 4096).with_max_tokens(1024).with_system("Answer in one short sentence.");
     let turn = run_turn(client, opts, vec![Message::user("Name one primary color.")]).await;
     assert!(!turn.text.trim().is_empty(), "{turn:?}");
     assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"), "{turn:?}");
@@ -104,7 +104,7 @@ async fn plain_turn(client: &Client, model: &str) {
 /// `effort` turns thinking on for DeepSeek, which otherwise relies on the
 /// server default; Anthropic models think by default.
 fn thinking_opts(model: &str) -> BuildOpts {
-    BuildOpts::new(model).with_max_tokens(4096).with_effort("high")
+    BuildOpts::new(model, 4096).with_max_tokens(4096).with_effort("high")
 }
 
 async fn thinking_turn(client: &Client, model: &str) {
@@ -213,7 +213,7 @@ async fn live_deepseek_tool_round_trip_replays_thinking() {
 async fn live_deepseek_unknown_model_is_an_invalid_request() {
     if let Some((client, _)) = deepseek() {
         let err = client
-            .stream(BuildOpts::new("no-such-model").with_max_tokens(16), vec![Message::user("hi")])
+            .stream(BuildOpts::new("no-such-model", 4096).with_max_tokens(16), vec![Message::user("hi")])
             .await
             .err()
             .expect("the open fails");
@@ -251,7 +251,7 @@ async fn live_anthropic_tool_round_trip_replays_thinking() {
 #[ignore = "live: needs KJ_LIVE_ANTHROPIC_KEY_FILE"]
 async fn live_anthropic_effort_is_accepted_beside_adaptive_thinking() {
     if let Some((client, _)) = anthropic() {
-        let opts = BuildOpts::new("claude-sonnet-5-5").with_max_tokens(1024).with_effort("low");
+        let opts = BuildOpts::new("claude-sonnet-5-5", 4096).with_max_tokens(1024).with_effort("low");
         let turn = run_turn(&client, opts, vec![Message::user("Reply with the single word: ready.")]).await;
         assert!(!turn.text.is_empty(), "{turn:?}");
     }

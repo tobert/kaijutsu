@@ -102,13 +102,21 @@ impl McpServerLike for KernelInfoServer {
         }
 
         let context_type = row.map(|row| row.context_type);
+        // The model the context's binding gives its type; absent when the
+        // binding has no such slot.
+        let bound = crate::model_resolution::context_model(&self.kernel_db.lock(), ctx.context_id)
+            .map_err(|e| McpError::Protocol(format!("whoami: failed to read the model binding: {e}")))?;
+        let (provider, model) = match &bound {
+            crate::model_resolution::ContextModelLookup::Model(m) => (Some(m.backend.as_str()), Some(m.model.as_str())),
+            crate::model_resolution::ContextModelLookup::None(_) => (None, None),
+        };
 
         let info = serde_json::json!({
             "context_id": ctx.context_id.to_hex(),
             "context_id_short": ctx.context_id.short(),
             "label": handle.and_then(|h| h.label.as_deref()),
-            "model": handle.and_then(|h| h.model.as_deref()),
-            "provider": handle.and_then(|h| h.provider.as_deref()),
+            "model": model,
+            "provider": provider,
             "context_type": context_type,
             "trace_id": handle.map(|h| hex32(h.trace_id)),
             "forked_from": handle.and_then(|h| h.forked_from.map(|p| p.short())),

@@ -631,7 +631,7 @@ mod tests {
     use crate::llm::ToolDefinition;
 
     fn opts(model: &str) -> BuildOpts {
-        BuildOpts::new(model)
+        BuildOpts::new(model, 4096)
     }
 
     /// Shadows `super::build_request` for the Anthropic dialect.

@@ -43,14 +43,13 @@
 # Council: a System 1 model check that may allow a statement the tiers
 # above leave to the human. It is off. To turn it on, uncomment the
 # sections below and enable it per context type. The file refuses to load
-# on an unknown field, a bad URL, a threshold naming no spec, or two
-# thresholds for one spec. See docs/council.md, "Configuration".
+# on an unknown field, a threshold naming no spec, or two thresholds for one
+# spec. The council server is not named here: an instance decides on the
+# `gate` slot of its binding (`kj cast slot set <cast> gate --backend <mk
+# backend> --model <served model>`), and an instance with no `gate` slot has
+# no council. See docs/council.md, "Configuration".
 #
 #   [council]
-#   server = "http://zorak:8090"            # http:// or https:// URL; a seat whose cast has a `gate` slot
-#                                           # decides on that slot's mk backend instead
-#   model = "gemma-4"                       # a served model's name or alias; may be left out when the server
-#                                           # serves one model. A `gate` slot's model replaces it
 #   contexts = ["council-system"]           # distinct context labels, at least one
 #   pool = { method = "loglinear", weights = "mass" }   # linear|loglinear, uniform|mass
 #   deadline_ms = 700                       # integer > 0; bounds the whole decision, preparing the server included; sent as timeout_ms

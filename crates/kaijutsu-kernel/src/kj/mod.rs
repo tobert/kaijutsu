@@ -696,13 +696,6 @@ impl KjDispatcher {
         if cmd == "models" {
             return self.dispatch_models(&argv[1..]).await;
         }
-        // `kj model` reports a context's effective model; it defaults to the
-        // current context but accepts `--context <ref>`, so like `kj transport`
-        // it resolves its own target rather than relying on the active-context
-        // gate below (which would reject `--context` from an unjoined session).
-        if cmd == "model" {
-            return self.dispatch_model(&argv[1..], caller).await;
-        }
         // `kj kaish primer` composes audience-general kaish guidance
         // (kaish-help) — no context needed, same exemption rationale as
         // `kj models`.
@@ -892,38 +885,32 @@ impl KjDispatcher {
             .map_err(|e| e.to_string())
     }
 
-    /// Summarize a context's blocks via LLM.
+    /// The model a context's binding gives its type, for provenance. `None`
+    /// when the binding has no slot for the type or cannot be read.
+    pub(crate) fn bound_model_name(&self, context_id: ContextId) -> Option<String> {
+        match crate::model_resolution::context_model(&self.kernel_db().lock(), context_id) {
+            Ok(crate::model_resolution::ContextModelLookup::Model(m)) => Some(m.model),
+            Ok(crate::model_resolution::ContextModelLookup::None(_)) => None,
+            Err(e) => {
+                tracing::warn!(context = %context_id, "model binding unreadable: {e}");
+                None
+            }
+        }
+    }
+
+    /// Summarize a context's blocks via LLM, on the `distill` slot of the
+    /// binding the context itself runs on.
     ///
-    /// Used by `fork --compact`, `drift pull`, and `drift merge`.
-    /// Resolves the model from the context's DriftRouter entry, falling back
-    /// to the registry default.
+    /// Used by `drift push --summarize`. A binding with no `distill` slot
+    /// refuses, naming the cast and the fix.
     pub(crate) async fn summarize(
         &self,
         context_id: ContextId,
         directed_prompt: Option<&str>,
     ) -> Result<String, String> {
-        self.summarize_with_model(context_id, directed_prompt, None).await
-    }
-
-    /// Same as [`summarize`] but with an explicit model override (M5-F5).
-    /// Use a cheaper model for distillation than the source context's
-    /// chat model — `kj fork --compact --distill-model haiku` style.
-    /// Pass `None` to inherit from the source context (existing behavior).
-    ///
-    /// Treats the summarized context as its own caller, so the cross-cast
-    /// refusal in [`summarize_with_model_for_caller`] can never fire here —
-    /// correct for `fork --compact`, which always distills the forking
-    /// caller's own context.
-    pub(crate) async fn summarize_with_model(
-        &self,
-        context_id: ContextId,
-        directed_prompt: Option<&str>,
-        distill_model: Option<&str>,
-    ) -> Result<String, String> {
-        self.summarize_with_model_for_caller_purpose(
+        self.summarize_for_caller_purpose(
             context_id,
             directed_prompt,
-            distill_model,
             Some(context_id),
             DistillationPurpose::DriftBrief,
         )
@@ -934,55 +921,43 @@ impl KjDispatcher {
     ///
     /// This is deliberately separate from drift briefing: continuation has a
     /// structured handoff instruction and its own source-context word target.
+    /// The forking context's instance pays: its `distill` slot runs it.
     pub(crate) async fn summarize_for_continuation(
         &self,
         context_id: ContextId,
-        distill_model: Option<&str>,
     ) -> Result<String, String> {
-        self.summarize_with_model_for_caller_purpose(
+        self.summarize_for_caller_purpose(
             context_id,
             None,
-            distill_model,
             Some(context_id),
             DistillationPurpose::Continuation,
         )
         .await
     }
 
-    /// Same as [`summarize_with_model`], but names the CALLER's context
-    /// separately from the SOURCE being summarized — the shape `drift pull`
-    /// and `drift merge` need, where the caller distilling the material may
-    /// not be the context that holds it.
-    ///
-    /// With no explicit `--distill-model` and a caller that differs from the
-    /// source, a caller whose own (provider, model) pair does not match the
-    /// source's is REFUSED rather than silently billed on the source's
-    /// cast. The refusal is skipped — today's behavior keeps running — when
-    /// the caller has no resolvable pair, when the source has none, or when
-    /// caller and source are the same context (always true for
-    /// `fork --compact` and `drift merge`; never true for `drift pull`).
-    pub(crate) async fn summarize_with_model_for_caller(
+    /// Summarize `context_id` on the `distill` slot of the CALLER's binding,
+    /// which differs from the source for `drift pull`: the caller asked for
+    /// the summary and pays for it, so a cheap caller can pull from an
+    /// expensive context.
+    pub(crate) async fn summarize_for_caller(
         &self,
         context_id: ContextId,
         directed_prompt: Option<&str>,
-        distill_model: Option<&str>,
         caller_context_id: Option<ContextId>,
     ) -> Result<String, String> {
-        self.summarize_with_model_for_caller_purpose(
+        self.summarize_for_caller_purpose(
             context_id,
             directed_prompt,
-            distill_model,
             caller_context_id,
             DistillationPurpose::DriftBrief,
         )
         .await
     }
 
-    async fn summarize_with_model_for_caller_purpose(
+    async fn summarize_for_caller_purpose(
         &self,
         context_id: ContextId,
         directed_prompt: Option<&str>,
-        distill_model: Option<&str>,
         caller_context_id: Option<ContextId>,
         purpose: DistillationPurpose,
     ) -> Result<String, String> {
@@ -1004,111 +979,42 @@ impl KjDispatcher {
         )?;
         let system_prompt = purpose.load_system_prompt(self.kernel()).await?;
 
-        let registry = self.kernel.llm().read().await;
-
-        // The SOURCE context's own effective (backend, model) pair, and —
-        // only when the caller is a different context — the CALLER's own
-        // pair. Resolved through the SAME ladder the turn path walks
-        // (`resolve_context_model`: explicit context override → cast slot on
-        // context_type → registry default), not read off the `DriftRouter`
-        // handle: that handle is populated only for a context with an
-        // explicit per-context model override, so a cast-slot or
-        // default-resolved context always answered `(None, None)` there and
-        // the cross-cast refusal below silently never fired for the common
-        // case of an unpinned caller pulling from a pinned expensive source.
-        let ctx_pair = self.resolve_context_pair(context_id, &registry);
-        let caller_pair = caller_context_id
-            .filter(|id| *id != context_id)
-            .and_then(|id| self.resolve_context_pair(id, &registry));
-
-        // Distillation model resolution:
-        //   1. explicit `--distill-model` → the SAME grammar as `--model`
-        //      (`resolve_model_choice`): `provider/model` slash form with a
-        //      validated provider, registry aliases, the loud
-        //      `provider:model` colon footgun, bare name → default provider.
-        //      Before this, the override went through `resolve_model`, which
-        //      doesn't parse the slash — so the very `provider/model` form the
-        //      failure hint below recommends rode as a literal model name on
-        //      the default provider, and an unknown provider was silently
-        //      swallowed instead of failing loud.
-        //   2. else, when the caller differs from the source and both resolve
-        //      to a complete pair: REFUSE if the pairs differ, instead of
-        //      billing the caller on whatever cast the source happens to run
-        //      — a cheap caller pulling from an expensive context must say so.
-        //   3. else the source context's OWN provider+model (the known-good
-        //      pair). This previously used only the context's *model*, re-pinned
-        //      on the registry's *default provider* via `resolve_model` — so a
-        //      caller on `anthropic` whose registry default was `deepseek` would
-        //      try to distill anthropic's model on deepseek, the cross-provider
-        //      `not_found_error` papercut. Using the pair keeps distill on the
-        //      source's own provider.
-        //   4. else the registry default.
-        let (provider, provider_name, model) = match distill_model {
-            Some(spec) => {
-                let (p_name, m) = parse::resolve_model_choice(&registry, spec)
-                    .map_err(|e| format!("--distill-model '{spec}': {e}"))?;
-                let (Some(p_name), Some(m)) = (p_name, m) else {
-                    return Err(format!(
-                        "--distill-model '{spec}' did not resolve to a provider/model pair \
-                         — pass `provider/model` or a configured alias"
-                    ));
-                };
-                let provider = registry.get(&p_name).ok_or_else(|| {
-                    format!("--distill-model '{spec}': provider '{p_name}' is not registered")
-                })?;
-                (provider, p_name, m)
-            }
-            None => {
-                if let (Some((sp, sm)), Some((cp, cm))) = (&ctx_pair, &caller_pair)
-                    && (sp != cp || sm != cm)
-                {
-                    return Err(format!(
-                        "distillation would silently switch casts: the source context \
-                         ({}) runs {sp}/{sm}, the calling context runs {cp}/{cm} — pass an \
-                         explicit `--distill-model provider/model` (or a configured alias) \
-                         to confirm the cross-cast distill",
-                        context_id.short()
-                    ));
-                }
-                match ctx_pair {
-                    Some((p_name, m)) => {
-                        let provider = registry.get(&p_name).ok_or_else(|| {
-                            format!(
-                                "distillation: the source context's provider '{p_name}' is not \
-                                 registered — pass an explicit `--distill-model provider/model`"
-                            )
-                        })?;
-                        (provider, p_name, m)
-                    }
-                    // The source context resolved to no pair at all (row
-                    // unreadable/missing and no registry default); fall to
-                    // the registry default rather than erroring outright.
-                    None => {
-                        let name = registry
-                            .default_provider_name()
-                            .ok_or("no LLM configured")?
-                            .to_string();
-                        let p = registry.default_provider().ok_or("no LLM configured")?;
-                        let m = registry
-                            .default_model()
-                            .ok_or("no default model configured")?
-                            .to_string();
-                        (p, name, m)
-                    }
-                }
-            }
+        // The model comes from the `distill` slot of the caller's binding and
+        // nowhere else. No registry default or the source's model stands in.
+        let caller = caller_context_id.unwrap_or(context_id);
+        let bound = {
+            let db = self.kernel_db().lock();
+            crate::model_resolution::role_slot(&db, caller, crate::model_resolution::DISTILL)
+                .map_err(|e| format!("could not read the distill slot: {e}"))?
         };
+        let bound = match bound {
+            crate::model_resolution::RoleSlot::Slot(bound) => bound,
+            crate::model_resolution::RoleSlot::None(none) => return Err(none.refusal_as("cannot distill")),
+        };
+        let max_tokens = bound
+            .slot
+            .max_tokens
+            .and_then(|m| u64::try_from(m).ok())
+            .filter(|m| *m > 0)
+            .ok_or_else(|| {
+                format!(
+                    "the distill slot of {} has no max_tokens, which every request carries",
+                    bound.instance_name
+                )
+            })?;
+        let provider_name = bound.backend.clone();
+        let model = bound.slot.model.clone();
+        let provider = self.kernel.llm().read().await.get(&provider_name).ok_or_else(|| {
+            format!(
+                "distillation: backend '{provider_name}' of the distill slot is not registered \
+                 (missing key? see `kj backend show {provider_name}`)"
+            )
+        })?;
 
         provider
-            .prompt_with_system(&model, Some(&system_prompt), &user_prompt)
+            .prompt_with_system(&model, max_tokens, Some(&system_prompt), &user_prompt)
             .await
-            .map_err(|e| {
-                format!(
-                    "LLM summarization failed on {provider_name}/{model}: {e} — if the \
-                     provider and model don't match, pass an explicit \
-                     `--distill-model provider/model`"
-                )
-            })
+            .map_err(|e| format!("LLM summarization failed on {provider_name}/{model}: {e}"))
     }
 
     fn distillation_limits(
@@ -1134,46 +1040,6 @@ impl KjDispatcher {
             context_id,
         )?;
         Ok((word_target, input_bytes))
-    }
-
-    /// Resolve a context's effective (backend, model) pair through the same
-    /// ladder the turn path walks — explicit per-context override, else a
-    /// cast slot matched on `context_type`, else the registry default
-    /// (`model_resolution::resolve_context_model`).
-    ///
-    /// The override tier reads the `DriftRouter` handle, not the context
-    /// row's `provider`/`model` columns — that is the field
-    /// `llm_stream.rs`'s `spawn_llm_for_prompt` actually reads for a live
-    /// turn (`ctx_provider_name`/`ctx_model`), and every production write
-    /// path keeps the two in sync (`apply_context_config` writes both the DB
-    /// row and the handle in the same call). The row is still read here for
-    /// `context_type` and `cast_id` — the DriftRouter handle carries
-    /// neither, so the cast-slot tier has no other source.
-    ///
-    /// `None` only when the context row cannot be read (removed context, DB
-    /// error) or when nothing in the ladder can answer (no registry default
-    /// configured) — never a guess standing in for an unresolvable pair.
-    fn resolve_context_pair(
-        &self,
-        context_id: ContextId,
-        registry: &crate::llm::LlmRegistry,
-    ) -> Option<(String, String)> {
-        let row = self.kernel_db().lock().get_context(context_id).ok().flatten()?;
-        let (provider_override, model_override) = self
-            .drift
-            .read()
-            .get(context_id)
-            .map(|h| (h.provider.clone(), h.model.clone()))
-            .unwrap_or((None, None));
-        let cast_label = self.kernel_db().lock().effective_cast(&row).ok().flatten().map(|c| c.label);
-        let resolved = crate::model_resolution::resolve_context_model(
-            &row.context_type,
-            provider_override.as_deref(),
-            model_override.as_deref(),
-            cast_label.as_deref(),
-            registry,
-        )?;
-        Some((resolved.backend, resolved.model))
     }
 }
 
@@ -1591,6 +1457,44 @@ pub(crate) mod test_helpers {
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         principal_id
+    }
+
+    /// Register a context played by `created_by` whose character instance
+    /// binds a cast giving each of `roles` the model `mock-model` on the
+    /// `mock` backend. The character is created when absent.
+    pub fn register_context_with_model(
+        dispatcher: &KjDispatcher,
+        label: Option<&str>,
+        forked_from: Option<ContextId>,
+        created_by: PrincipalId,
+        roles: &[&str],
+    ) -> ContextId {
+        let entries: Vec<(&str, &str, &str)> = roles.iter().map(|role| (*role, "mock", "mock-model")).collect();
+        register_context_with_models(dispatcher, label, forked_from, created_by, &entries)
+    }
+
+    /// Like [`register_context_with_model`], with a `(role, backend, model)`
+    /// per slot.
+    pub fn register_context_with_models(
+        dispatcher: &KjDispatcher,
+        label: Option<&str>,
+        forked_from: Option<ContextId>,
+        created_by: PrincipalId,
+        entries: &[(&str, &str, &str)],
+    ) -> ContextId {
+        {
+            let db = dispatcher.kernel_db().lock();
+            if db.get_character(created_by).unwrap().is_none() {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: created_by, name: format!("model-{}", created_by.short()), created_at: 0,
+                    retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            db.seed_test_cast_roles(created_by, entries).unwrap();
+        }
+        let context = register_context(dispatcher, label, forked_from, created_by);
+        dispatcher.kernel_db().lock().assign_stand_in_instance(context, created_by).unwrap();
+        context
     }
 
     /// The test reviewer's root context, registered on first use: labeled
@@ -2462,7 +2366,7 @@ mod house_verb_tests {
     async fn worker_seat_keeps_worker_verbs() {
         let d = test_dispatcher().await;
         let caller = caller_bound(&d, "worker", &worker_binding());
-        for line in ["wait", "block list", "drift queue", "context list", "stage status", "models", "model", "search foo"] {
+        for line in ["wait", "block list", "drift queue", "context list", "stage status", "models", "search foo"] {
             let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
             assert!(!result.message().contains(REFUSAL), "{line} was refused as a house verb: {}", result.message());
         }

@@ -444,10 +444,14 @@ pub(crate) struct CouncilThreshold {
 /// The `[council]` section with its specs and thresholds.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CouncilConfig {
+    /// The council server decisions go to: the address of the backend of an
+    /// instance's `gate` (or `judge`) slot. gate.toml names none, so a config
+    /// it loads holds an empty address until the gate routes it to a slot
+    /// ([`crate::council::gate::seat_route`]); a config never reaches a
+    /// server unrouted.
     pub(crate) server: String,
-    /// `[council] model`: the served model the server's decisions run on,
-    /// by its `model` or an alias. `None` is the server's only served
-    /// model; a server that serves several makes that a miss.
+    /// The served model the server's decisions run on, by its `model` or an
+    /// alias: the slot's model. Empty-address configs hold `None`.
     pub(crate) model: Option<String>,
     pub(crate) contexts: Vec<String>,
     pub(crate) pool_method: CouncilPoolMethod,
@@ -502,9 +506,6 @@ impl CouncilConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CouncilToml {
-    server: String,
-    #[serde(default)]
-    model: Option<String>,
     contexts: Vec<String>,
     pool: CouncilPoolToml,
     deadline_ms: i64,
@@ -743,16 +744,6 @@ impl GateConfig {
 
     fn council_from(raw: &CouncilToml) -> Result<CouncilConfig, GateConfigError> {
         let err = |m: String| GateConfigError::Parse(m);
-        let rest = raw
-            .server
-            .strip_prefix("http://")
-            .or_else(|| raw.server.strip_prefix("https://"));
-        if !rest.is_some_and(|r| !r.is_empty() && !r.contains(char::is_whitespace)) {
-            return Err(err(format!(
-                "[council] server: `{}` must be an http:// or https:// URL with a host",
-                raw.server
-            )));
-        }
         if raw.contexts.is_empty() {
             return Err(err("[council] contexts: must list at least one context label".into()));
         }
@@ -931,12 +922,9 @@ impl GateConfig {
                 mass_floor: t.mass_floor,
             });
         }
-        if raw.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
-            return Err(err("[council] model is empty; name a served model or leave the key out".to_string()));
-        }
         Ok(CouncilConfig {
-            server: raw.server.clone(),
-            model: raw.model.clone(),
+            server: String::new(),
+            model: None,
             contexts: raw.contexts.clone(),
             pool_method,
             pool_weights,
@@ -2991,7 +2979,6 @@ uncovered = "allow"
 
     const COUNCIL_FULL: &str = r#"
 [council]
-server = "http://zorak:8090"
 contexts = ["reviewer", "system-rules"]
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700
@@ -3029,7 +3016,8 @@ enabled = false
     fn a_full_council_config_round_trips() {
         let cfg = config(COUNCIL_FULL);
         let c = cfg.council().expect("council declared");
-        assert_eq!(c.server, "http://zorak:8090");
+        assert_eq!(c.server, "", "gate.toml names no server; a slot does");
+        assert_eq!(c.model, None);
         assert_eq!(c.contexts, ["reviewer", "system-rules"]);
         assert_eq!(c.pool_method, CouncilPoolMethod::LogLinear);
         assert_eq!(c.pool_weights, CouncilPoolWeights::Mass);
@@ -3044,13 +3032,17 @@ enabled = false
         assert_eq!(c.thresholds[0].mass_floor, -0.05);
     }
 
+    /// The council server and model come from an instance's `gate` slot, so
+    /// gate.toml refuses both keys as unknown.
+    ///
+    /// Falsified by adding `server` back to `CouncilToml`.
     #[test]
-    fn the_council_model_is_the_servers_only_one_unless_named() {
-        assert_eq!(config(COUNCIL_FULL).council().unwrap().model, None);
-        let named = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmodel = \"gemma-4\""));
-        assert_eq!(named.council().unwrap().model.as_deref(), Some("gemma-4"));
-        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmodel = \" \""));
-        assert!(m.contains("[council] model is empty"), "{m}");
+    fn a_council_server_or_model_key_is_refused_as_unknown() {
+        for key in ["server = \"http://zorak:8090\"", "model = \"gemma-4\""] {
+            let m = council_err(&council_with("deadline_ms = 700", &format!("deadline_ms = 700\n{key}")));
+            let name = key.split(' ').next().unwrap();
+            assert!(m.contains("unknown field") && m.contains(name), "{key}: {m}");
+        }
     }
 
     #[test]
@@ -3245,15 +3237,6 @@ enabled = false
             let m = council_err(&text);
             assert!(m.contains("extra") || m.contains("retries"), "{m}");
         }
-    }
-
-    #[test]
-    fn a_bad_council_server_is_rejected_naming_the_field() {
-        for bad in ["zorak:8090", "ftp://zorak", "http://", "http://a b"] {
-            let m = council_err(&council_with("http://zorak:8090", bad));
-            assert!(m.contains("[council] server") && m.contains("http"), "{bad}: {m}");
-        }
-        config(&council_with("http://zorak:8090", "https://zorak.example:8090"));
     }
 
     #[test]

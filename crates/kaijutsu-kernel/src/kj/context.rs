@@ -6,9 +6,8 @@ use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, PrincipalId}
 use crate::kernel_db::{ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
 use super::format::{
-    format_context_info, format_context_table, format_context_tree, format_fork_lineage,
+    ContextBound, format_context_info, format_context_table, format_context_tree, format_fork_lineage,
 };
-use super::parse::resolve_model_choice;
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -29,9 +28,6 @@ pub(crate) struct ContextArgs {
 /// both clap variants. Mirrors [`ContextConfig`] (the internal apply struct).
 #[derive(Args, Debug, Default)]
 pub(crate) struct ContextConfigArgs {
-    /// Model spec `provider/model` or a bare model name (resolved to default provider)
-    #[arg(long, short = 'm')]
-    model: Option<String>,
     /// Stored legacy prompt value; not included in model instructions. Use rc instruction blocks
     #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
@@ -45,22 +41,15 @@ pub(crate) struct ContextConfigArgs {
     /// Context type selecting the /config/rc lifecycle bundle
     #[arg(long = "type")]
     type_: Option<String>,
-    /// Cast label — the named model ensemble this context plays under
-    /// (`kj cast show <label>`). Must already exist; to clear an assigned
-    /// cast use `kj context unset --cast`.
-    #[arg(long)]
-    cast: Option<String>,
 }
 
 impl From<ContextConfigArgs> for ContextConfig {
     fn from(a: ContextConfigArgs) -> Self {
         ContextConfig {
-            model_spec: a.model,
             system_prompt: a.system_prompt,
             cwd_spec: a.cwd,
             env_spec: a.env,
             type_spec: a.type_,
-            cast_spec: a.cast,
             egress: None,
         }
     }
@@ -75,7 +64,8 @@ enum ContextCommand {
         #[arg(long, short = 't')]
         tree: bool,
     },
-    /// Show a context's metadata (default: current).
+    /// Show a context's metadata (default: current), including the model its
+    /// instance's binding gives it, or why it has none.
     Info {
         /// Context to show. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
@@ -141,8 +131,7 @@ enum ContextCommand {
         #[command(flatten)]
         config: ContextConfigArgs,
     },
-    /// Remove an env var from a context, or clear its assigned cast or
-    /// model.
+    /// Remove an env var from a context.
     Unset {
         /// Context to update. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
@@ -150,15 +139,6 @@ enum ContextCommand {
         /// Env var key to remove
         #[arg(long)]
         env: Option<String>,
-        /// Clear the context's assigned cast (falls back to the registry
-        /// default at resolution time)
-        #[arg(long)]
-        cast: bool,
-        /// Clear the context's own model, set by `create -m` or `set -m`
-        /// and copied by `rotate`. The context then resolves its model
-        /// through its cast or the registry default; `kj model` shows which
-        #[arg(long)]
-        model: bool,
     },
     /// Show fork lineage from a context up to root (default: current).
     Log {
@@ -281,20 +261,16 @@ enum ContextCommand {
 /// Settable context configuration shared by `create` and `set`.
 ///
 /// These are the knobs that can be applied to an existing context row:
-/// model, system prompt, working directory, an env var, and the rc-dispatch
+/// system prompt, working directory, an env var, and the rc-dispatch
 /// `context_type`. `create` reuses the same surface so a context can be born
 /// fully configured (fork-parity) instead of needing a follow-up
 /// `kj context set`.
 #[derive(Default)]
 struct ContextConfig {
-    model_spec: Option<String>,
     system_prompt: Option<String>,
     cwd_spec: Option<String>,
     env_spec: Vec<String>,
     type_spec: Option<String>,
-    /// `--cast <label>` — resolved + validated against `list_casts` in
-    /// [`KjDispatcher::resolve_context_config`] before any mutation.
-    cast_spec: Option<String>,
     egress: Option<EgressAssignment>,
 }
 
@@ -306,13 +282,6 @@ struct EgressAssignment {
     allow: Vec<String>,
     deny: Vec<String>,
     caller_actor: kaijutsu_types::PrincipalId,
-}
-
-/// A `--model` spec resolved against the LLM registry: a bare model name has
-/// had its provider filled in from the registry default (matching `kj fork`).
-struct ResolvedModel {
-    provider: Option<String>,
-    model: Option<String>,
 }
 
 /// How a new context row joins a character instance
@@ -389,35 +358,40 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
     Ok(())
 }
 
+/// The binding model and cast of each listed context, read once for the
+/// whole listing from the bindings and nothing else.
+fn context_bindings<'a>(
+    db: &KernelDb,
+    rows: impl Iterator<Item = &'a ContextRow>,
+) -> KernelDbResult<std::collections::HashMap<ContextId, ContextBound>> {
+    let mut bound = std::collections::HashMap::new();
+    for row in rows {
+        let found = crate::model_resolution::context_model(db, row.context_id)?;
+        bound.insert(
+            row.context_id,
+            ContextBound {
+                model: match &found {
+                    crate::model_resolution::ContextModelLookup::Model(m) => Some(format!("{}/{}", m.backend, m.model)),
+                    crate::model_resolution::ContextModelLookup::None(_) => None,
+                },
+                cast: found.cast().map(str::to_string),
+            },
+        );
+    }
+    Ok(bound)
+}
+
 impl KjDispatcher {
-    /// Validate user-supplied config and resolve `--model`/`--cast` BEFORE
-    /// any mutation.
-    ///
-    /// Checks provider existence and `--env KEY=VALUE` shape, and resolves a
-    /// bare model name (no `provider/` prefix) to the
-    /// registry's default provider — erroring if none is configured, exactly
-    /// like `kj fork`. A `--cast <label>` is resolved against `list_casts`
-    /// the same way: an unknown label fails loud, listing the known casts,
-    /// rather than silently leaving the context uncast. Pure checks plus a
-    /// registry read and a `kernel_db` read, no writes, so callers can bail
-    /// out cleanly without leaving a half-configured (or orphan) context
-    /// behind. Returns the resolved model / cast when the corresponding flag
-    /// was given, else `None`.
+    /// Validate user-supplied config BEFORE any mutation: the `--env
+    /// KEY=VALUE` shape, a context type that is not a reserved cast role, and
+    /// a `--cwd` the shell enters. No writes, so callers can bail out cleanly
+    /// without leaving a half-configured (or orphan) context behind.
     async fn resolve_context_config(
         &self,
         cfg: &ContextConfig,
         caller: &KjCaller,
         cwd_check_context: ContextId,
-    ) -> Result<(Option<ResolvedModel>, Option<kaijutsu_types::CastId>), String> {
-        let resolved_model = match cfg.model_spec {
-            Some(ref spec) if !spec.is_empty() => {
-                let registry = self.kernel().llm().read().await;
-                let (provider, model) = resolve_model_choice(&registry, spec)?;
-                Some(ResolvedModel { provider, model })
-            }
-            _ => None,
-        };
-
+    ) -> Result<(), String> {
         if let Some(env) = cfg.env_spec.iter().find(|e| !e.contains('=')) {
             return Err(format!("--env requires KEY=VALUE format, got '{env}'"));
         }
@@ -430,31 +404,7 @@ impl KjDispatcher {
             self.check_cwd(caller, cwd_check_context, cwd).await.map_err(|e| format!("--cwd {e}"))?;
         }
 
-        let resolved_cast = match cfg.cast_spec {
-            Some(ref label) if !label.is_empty() => {
-                let db = self.kernel_db().lock();
-                match db.get_cast_by_label(label) {
-                    Ok(Some(cast)) => Some(cast.cast_id),
-                    Ok(None) => {
-                        let known: Vec<String> = db
-                            .list_casts()
-                            .map(|casts| casts.iter().map(|c| c.label.clone()).collect())
-                            .unwrap_or_default();
-                        let known = if known.is_empty() {
-                            "(no casts configured — `kj cast create <label>` starts one)"
-                                .to_string()
-                        } else {
-                            known.join(", ")
-                        };
-                        return Err(format!("unknown cast '{label}' — known casts: {known}"));
-                    }
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-            _ => None,
-        };
-
-        Ok((resolved_model, resolved_cast))
+        Ok(())
     }
 
     /// Check that `cwd` is a directory the shell's `cd` enters, through a
@@ -469,43 +419,18 @@ impl KjDispatcher {
 
     /// Apply already-validated config to an existing context row and return
     /// the human-readable change list. Assumes [`Self::resolve_context_config`]
-    /// has already run, so the model is pre-resolved and not re-checked here —
-    /// only DB I/O errors surface. The model column is updated in the DB; the
-    /// DriftRouter is reconfigured whenever both provider and model are present
-    /// (which, post-resolution, is every non-degenerate `--model` spec).
+    /// has already run, so only DB I/O errors surface.
     async fn apply_context_config(
         &self,
         target_id: ContextId,
         cfg: &ContextConfig,
-        resolved_model: Option<&ResolvedModel>,
-        resolved_cast: Option<kaijutsu_types::CastId>,
     ) -> Result<Vec<String>, String> {
         // One transaction: a failure on a later field (an `--env` key is
         // validated at write time) must not leave an earlier one committed.
-        let (changes, model_for_drift) = {
+        let changes = {
             let guard = self.kernel_db().lock();
             let applied = guard.in_transaction(|db| {
                 let mut changes = Vec::new();
-                let mut model_for_drift: Option<(String, String)> = None;
-
-                if let Some(rm) = resolved_model {
-                    db.update_model(target_id, rm.provider.as_deref(), rm.model.as_deref())?;
-                    // `model_spec` is the original argv string — guaranteed present
-                    // here since `resolved_model` is Some only when it was given.
-                    let spec = cfg.model_spec.as_deref().unwrap_or("?");
-                    changes.push(format!("model={spec}"));
-                    if let (Some(p), Some(m)) = (&rm.provider, &rm.model) {
-                        model_for_drift = Some((p.clone(), m.clone()));
-                    }
-                }
-
-                if let Some(cast_id) = resolved_cast {
-                    db.update_cast(target_id, Some(cast_id))?;
-                    // `cast_spec` is the original argv label — guaranteed present
-                    // here since `resolved_cast` is Some only when it was given.
-                    let label = cfg.cast_spec.as_deref().unwrap_or("?");
-                    changes.push(format!("cast={label}"));
-                }
 
                 if cfg.system_prompt.is_some() {
                     let current = db
@@ -562,16 +487,11 @@ impl KjDispatcher {
                     }
                 }
 
-                Ok((changes, model_for_drift))
+                Ok(changes)
             });
             applied.map_err(|e| e.to_string())?
         };
         // db lock released here
-
-        if let Some((p, m)) = model_for_drift {
-            let mut drift = self.drift_router().write();
-            let _ = drift.configure_llm(target_id, &p, &m);
-        }
 
         Ok(changes)
     }
@@ -643,8 +563,8 @@ impl KjDispatcher {
             ContextCommand::Set { context, egress_allow, egress_deny, config } => {
                 self.context_set(context.as_deref(), &egress_allow, &egress_deny, config.into(), caller).await
             }
-            ContextCommand::Unset { context, env, cast, model } => {
-                self.context_unset(context.as_deref(), env.as_deref(), cast, model, caller)
+            ContextCommand::Unset { context, env } => {
+                self.context_unset(context.as_deref(), env.as_deref(), caller)
             }
             ContextCommand::Log { context } => self.context_log(context.as_deref(), caller),
             ContextCommand::Archive { context, children: false, .. } => match context {
@@ -679,17 +599,14 @@ impl KjDispatcher {
 
     async fn context_list(&self, tree: bool, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        // Resolved once per listing, never per-row — the operator-scale
-        // `casts` table is small and this keeps the list a single DB round
-        // trip beyond the context query itself.
-        let casts: std::collections::HashMap<kaijutsu_types::CastId, String> = db
-            .list_casts()
-            .map(|cs| cs.into_iter().map(|c| (c.cast_id, c.label)).collect())
-            .unwrap_or_default();
         if tree {
             match db.context_dag() {
                 Ok(dag) => {
-                    let text = format_context_tree(&dag, caller.context_id, &casts);
+                    let bound = match context_bindings(&db, dag.iter().map(|(row, _)| row)) {
+                        Ok(bound) => bound,
+                        Err(e) => return KjResult::Err(format!("kj context list: {e}")),
+                    };
+                    let text = format_context_tree(&dag, caller.context_id, &bound);
                     let ids = context_handles(dag.iter().map(|(row, _)| row));
                     KjResult::ok_with_data(text, ids)
                 }
@@ -698,7 +615,11 @@ impl KjDispatcher {
         } else {
             match db.list_active_contexts() {
                 Ok(contexts) => {
-                    let text = format_context_table(&contexts, caller.context_id, &casts);
+                    let bound = match context_bindings(&db, contexts.iter()) {
+                        Ok(bound) => bound,
+                        Err(e) => return KjResult::Err(format!("kj context list: {e}")),
+                    };
+                    let text = format_context_table(&contexts, caller.context_id, &bound);
                     let ids = context_handles(contexts.iter());
                     KjResult::ok_with_data(text, ids)
                 }
@@ -726,8 +647,7 @@ impl KjDispatcher {
             turn_totals,
             workspace_paths,
             workspace_label,
-            cast_label,
-            cast_from_performer,
+            bound_model,
             played_by_name,
         ) = {
             let db = self.kernel_db().lock();
@@ -798,11 +718,12 @@ impl KjDispatcher {
                 .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
                 .map(|ws| ws.label);
 
-            // The cast the context resolves through: its own, else its
-            // performer's default (`KernelDb::effective_cast`). A dangling id
-            // (cast removed between reads) shows as absent, not an error.
-            let cast_label = db.effective_cast(&row).ok().flatten().map(|c| c.label);
-            let cast_from_performer = row.cast_id.is_none() && cast_label.is_some();
+            // The model the context's binding gives its type, or why it has
+            // none. A binding that cannot be read is an error, not "none".
+            let bound_model = match crate::model_resolution::context_model(&db, target_id) {
+                Ok(found) => found,
+                Err(e) => return KjResult::Err(format!("kj context info: model binding: {e}")),
+            };
 
             // Resolve the performer's name for live and archived contexts.
             // Retirement preserves both the sheet and this relationship.
@@ -825,63 +746,34 @@ impl KjDispatcher {
                 turn_totals,
                 workspace_paths,
                 workspace_label,
-                cast_label,
-                cast_from_performer,
+                bound_model,
                 played_by_name,
             )
         };
 
-        // Context-window denominator: resolved kernel-side (never shipped to
-        // the client as raw inputs to derive) via the same
-        // `LlmRegistry::context_window_for_live(provider, model)` `kj model`
-        // already uses — the configured backend model metadata wins as an override; absent
-        // that, a live Anthropic `GET /v1/models/{id}` lookup (cached) fills
-        // the honest gaps config never had (e.g. `claude-sonnet-4-20250514`,
-        // deliberately unset in the backend model metadata). `None` when neither source
-        // knows the window — the two fields below MUST both be `null` in
-        // that case, never a guessed denominator standing in for one. The
-        // percentage itself comes from
-        // `context_used_pct` — the ONE percentage-math site, shared with the
-        // wire's `contextUsedPct` (`ContextHandleInfo` /
-        // `kaijutsu-server/src/rpc.rs::list_contexts`) so the two surfaces
-        // can never disagree.
-        // Resolved effective model: the SAME ladder the turn path walks
-        // (explicit context override → cast slot on context_type → registry
-        // default) via `resolve_context_model` — so a consumer of this JSON
-        // never has to re-derive the resolution ladder from the raw
-        // `provider`/`model` columns above (deepseek review P4). `kj model`
-        // already resolves the identical way; kept in lockstep so the two
-        // surfaces can never disagree. The registry read lock is acquired
-        // unconditionally — the context-window lookup below needs it too.
-        let registry = self.kernel().llm().read().await;
-        let resolved = crate::model_resolution::resolve_context_model(
-            &row.context_type,
-            row.provider.as_deref(),
-            row.model.as_deref(),
-            cast_label.as_deref(),
-            &registry,
-        );
-        let (resolved_backend, resolved_model, resolved_source) = match &resolved {
-            Some(r) => {
-                let source = match &r.source {
-                    crate::model_resolution::ModelSource::ContextOverride => {
-                        "context".to_string()
-                    }
-                    crate::model_resolution::ModelSource::CastSlot { cast } => {
-                        format!("cast {cast}")
-                    }
-                    crate::model_resolution::ModelSource::RegistryDefault => {
-                        "default".to_string()
-                    }
-                };
-                (Some(r.backend.clone()), Some(r.model.clone()), source)
+        // Context-window denominator: the binding slot's window, resolved
+        // kernel-side (never shipped to the client as raw inputs to derive).
+        // `None` when the slot holds none: the two fields below MUST both be
+        // `null` in that case, never a guessed denominator standing in for
+        // one. The percentage itself comes from `context_used_pct`, the ONE
+        // percentage-math site, shared with the wire's `contextUsedPct`
+        // (`ContextHandleInfo` / `kaijutsu-server/src/rpc.rs::list_contexts`)
+        // so the two surfaces can never disagree.
+        let resolved_cast = bound_model.cast().map(str::to_string);
+        let (resolved_backend, resolved_model, bound_window) = match &bound_model {
+            crate::model_resolution::ContextModelLookup::Model(m) => {
+                (Some(m.backend.clone()), Some(m.model.clone()), m.context_window.map(|w| (m.backend.clone(), m.model.clone(), w)))
             }
-            None => (None, None, "default".to_string()),
+            crate::model_resolution::ContextModelLookup::None(_) => (None, None, None),
         };
-
         let (context_window, context_used_pct) = match &usage {
             Some(u) => {
-                let window = registry.context_window_for_live(&u.provider, &u.model).await;
+                // The window belongs to the bound model: usage recorded on
+                // another model has no window here.
+                let window = bound_window
+                    .as_ref()
+                    .filter(|(backend, model, _)| *backend == u.provider && *model == u.model)
+                    .map(|(_, _, w)| *w);
                 let pct = crate::kernel_db::context_used_pct(u, window);
                 (window, pct)
             }
@@ -896,12 +788,13 @@ impl KjDispatcher {
             trace_id,
         );
 
-        {
-            let display = match (&resolved_backend, &resolved_model) {
-                (Some(b), Some(m)) => format!("{b}/{m}"),
-                _ => "(none configured)".to_string(),
-            };
-            info.push_str(&format!("\nResolved: {display} ({resolved_source})"));
+        match &bound_model {
+            crate::model_resolution::ContextModelLookup::Model(m) => {
+                info.push_str(&format!("\nModel:    {}/{}", m.backend, m.model));
+            }
+            crate::model_resolution::ContextModelLookup::None(none) => {
+                info.push_str(&format!("\nModel:    {}", none.line()));
+            }
         }
 
         // The document version a client hydrates against (`docs/change-feed.md`).
@@ -975,9 +868,8 @@ impl KjDispatcher {
             }
         }
 
-        if let Some(ref label) = cast_label {
-            let from = if cast_from_performer { " (the performer's default)" } else { "" };
-            info.push_str(&format!("\nCast:    {label}{from}"));
+        if let Some(ref label) = resolved_cast {
+            info.push_str(&format!("\nCast:    {label}"));
         }
 
         if let Some(ref name) = played_by_name {
@@ -1028,8 +920,6 @@ impl KjDispatcher {
         let mut record = serde_json::json!({
             "context_id": row.context_id.to_hex(),
             "label": row.label,
-            "provider": row.provider,
-            "model": row.model,
             "context_state": format!("{:?}", row.context_state),
             "context_type": row.context_type,
             // Advisory: the registering client's self-reported hostname
@@ -1047,25 +937,23 @@ impl KjDispatcher {
             "workspace_id": row.workspace_id.map(|id| id.to_hex()),
             "workspace_label": workspace_label,
             "preset_id": row.preset_id.map(|id| id.to_hex()),
-            "cast_id": row.cast_id.map(|id| id.to_hex()),
-            "cast_label": cast_label,
+            "cast_label": resolved_cast,
             // The character whose performance this context is, and its
             // kernel-owned name — `null` together when nobody plays it (a
             // score context, a file document, a pre-character row). See
             // `ContextRow::played_by`'s doc comment.
             "played_by": row.played_by.map(|id| id.to_hex()),
             "played_by_name": played_by_name,
-            // Resolved effective model — same ladder as `kj model` and the
-            // turn path (`resolve_context_model`): explicit context
-            // override → cast slot on context_type → registry default.
-            // `resolved_source` is one of "context" | "cast <label>" |
-            // "default". Both `resolved_backend`/`resolved_model` are
-            // `null` together only when nothing is configured anywhere
-            // (no registry default either) — an honest absence, never a
-            // fabricated fallback.
+            // The model the context's binding gives its type. Both
+            // `resolved_backend` and `resolved_model` are `null` together
+            // when the binding has no slot for the type; `model_absent`
+            // then says why. An honest absence, never a fallback.
             "resolved_backend": resolved_backend,
             "resolved_model": resolved_model,
-            "resolved_source": resolved_source,
+            "model_absent": match &bound_model {
+                crate::model_resolution::ContextModelLookup::None(none) => Some(none.line()),
+                _ => None,
+            },
             "cwd": shell.as_ref().and_then(|s| s.cwd.clone()),
             "env": env_vars.iter()
                 .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
@@ -1078,10 +966,9 @@ impl KjDispatcher {
             // honest absence, not a fabricated zero. `context_window` /
             // `context_used_pct` are resolved kernel-side (never derived
             // client-side, per the thin-client convention) via
-            // `LlmRegistry::context_window_for(provider, model)`; both are
-            // `null` together whenever the window isn't configured for this
-            // model (e.g. `claude-sonnet-4-20250514` deliberately has none) —
-            // never a fabricated denominator standing in for an unknown one.
+            // the binding slot's window; both are `null` together whenever
+            // the slot holds none — never a fabricated denominator standing
+            // in for an unknown one.
             "usage": usage.as_ref().map(|u| serde_json::json!({
                 "provider": u.provider,
                 "model": u.model,
@@ -1139,13 +1026,16 @@ impl KjDispatcher {
             let start = &turn.start;
             let performer = names(start.performer);
             let ended = turn.stop_reason.as_deref().unwrap_or("running");
+            let instance = match (&start.instance, start.binding_seq) {
+                (Some(id), Some(seq)) => format!("instance {} binding {seq}", db.instance_name(*id)),
+                _ => "no instance".to_string(),
+            };
             text.push_str(&format!(
-                "{} {} {performer} {}/{} ({}, cast {}, role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}\n",
+                "{} {} {performer} {}/{} ({instance}, cast {}, role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}\n",
                 start.turn_id.short(),
                 start.started_at,
                 start.provider,
                 start.model,
-                start.model_source,
                 start.cast.as_deref().unwrap_or("-"),
                 start.role,
                 turn.llm_calls,
@@ -1164,7 +1054,8 @@ impl KjDispatcher {
                 "role": start.role,
                 "provider": start.provider,
                 "model": start.model,
-                "model_source": start.model_source,
+                "instance": start.instance.map(|id| id.to_hex()),
+                "binding_seq": start.binding_seq,
                 "started_at": start.started_at,
                 "ended_at": turn.ended_at,
                 "stop_reason": turn.stop_reason,
@@ -1186,7 +1077,7 @@ impl KjDispatcher {
     /// `rc sections → <situation>` assembly `spawn_llm_for_prompt`
     /// builds for a real turn (`crates/kaijutsu-server/src/llm_stream.rs`),
     /// reusing the same pure pieces (`build_system_prompt`,
-    /// `extract_system_prompt_sections`, `resolve_context_model`) so this
+    /// `extract_system_prompt_sections`, `context_model`) so this
     /// view cannot drift from what actually ships to the model — it is not
     /// a second implementation of the assembly, only a read-only caller of
     /// the same one.
@@ -1197,21 +1088,19 @@ impl KjDispatcher {
     /// are simply omitted. Previewing a prompt is exactly the thing you
     /// want to do while a context's model is still unconfigured.
     ///
-    /// Model source and the staging guard both now mirror the turn path
+    /// Model source and the staging guard both mirror the turn path
     /// exactly:
     ///
-    /// - **Model source.** Both sides call the same `resolve_context_model`,
-    ///   fed the live DriftRouter handle's `provider`/`model` — never the
-    ///   KernelDb row — so a preview can't show a `<model>` the turn would
-    ///   not pick. (The RPC `--model` override remains a legitimate
-    ///   divergence: a preview has no future turn argument to reflect.)
+    /// - **Model source.** Both sides call the same `context_model`, which
+    ///   reads the context's binding, so a preview can't show a `<model>`
+    ///   the turn would not pick.
     /// - **Staging.** A `Staging` context is refused here exactly as
     ///   `spawn_llm_for_prompt` refuses it, instead of rendering a prompt
     ///   that could not actually run.
     async fn context_prompt(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         // Same !Send guard-scoping constraint as context_info: KernelDb's
         // parking_lot::MutexGuard must not cross an `.await` below.
-        let (target_id, row, cast_label, performer, _) = {
+        let (target_id, row, bound_model, performer, _) = {
             let db = self.kernel_db().lock();
 
             // Resolve target context (default: current)
@@ -1226,7 +1115,10 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context prompt: {e}")),
             };
 
-            let cast_label = db.effective_cast(&row).ok().flatten().map(|c| c.label);
+            let bound_model = match crate::model_resolution::context_model(&db, target_id) {
+                Ok(found) => found,
+                Err(e) => return KjResult::Err(format!("kj context prompt: model binding: {e}")),
+            };
 
             let character = |principal_id: PrincipalId| -> Result<crate::llm::CharacterIdentity, KjResult> {
                 let sheet = db.get_character(principal_id)
@@ -1241,7 +1133,7 @@ impl KjDispatcher {
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            (target_id, row, cast_label, performer, ())
+            (target_id, row, bound_model, performer, ())
         };
         // The senpai this context answers to, the same fact the turn path
         // reads (llm_stream.rs).
@@ -1250,17 +1142,16 @@ impl KjDispatcher {
             Err(error) => return KjResult::Err(format!("kj context prompt: character instance: {error}")),
         };
 
-        // Situational label/state/provider/model come from the live
-        // DriftRouter handle, NOT the KernelDb row — mirroring exactly what
+        // Situational label and state come from the live DriftRouter
+        // handle, NOT the KernelDb row — mirroring exactly what
         // `spawn_llm_for_prompt` reads for a real turn (llm_stream.rs). A
-        // resolved target_id with no drift handle renders all four absent,
-        // same as the turn path would — an honest gap, not a row fallback
-        // that would make this view lie about what the turn path sees.
-        let (ctx_label, ctx_state, ctx_provider_name, ctx_model) = {
+        // resolved target_id with no drift handle renders both absent, same
+        // as the turn path would.
+        let (ctx_label, ctx_state) = {
             let drift = self.drift_router().read();
             match drift.get(target_id) {
-                Some(h) => (h.label.clone(), Some(h.state), h.provider.clone(), h.model.clone()),
-                None => (None, None, None, None),
+                Some(h) => (h.label.clone(), Some(h.state)),
+                None => (None, None),
             }
         };
 
@@ -1275,24 +1166,12 @@ impl KjDispatcher {
             );
         }
 
-        // Resolved effective model — same ladder `context_info` and the
-        // turn path use (explicit override → cast slot → registry
-        // default), fed from the same source the turn path reads
-        // (DriftRouter handle, not the KernelDb row — see fn doc comment).
-        // Unlike the turn path, an unresolved model does not error here.
-        let resolved = {
-            let registry = self.kernel().llm().read().await;
-            crate::model_resolution::resolve_context_model(
-                &row.context_type,
-                ctx_provider_name.as_deref(),
-                ctx_model.as_deref(),
-                cast_label.as_deref(),
-                &registry,
-            )
-        };
-        let (resolved_backend, resolved_model) = match &resolved {
-            Some(r) => (Some(r.backend.clone()), Some(r.model.clone())),
-            None => (None, None),
+        // The model the binding gives the context's type. Unlike the turn
+        // path, a context with no model does not error here: previewing a
+        // prompt is what you do before fixing the cast.
+        let (resolved_backend, resolved_model) = match &bound_model {
+            crate::model_resolution::ContextModelLookup::Model(m) => (Some(m.backend.clone()), Some(m.model.clone())),
+            crate::model_resolution::ContextModelLookup::None(_) => (None, None),
         };
 
         // rc sections: the (Role::System, BlockKind::Text) blocks the rc
@@ -1310,7 +1189,7 @@ impl KjDispatcher {
             context_id: Some(target_id),
             context_label: ctx_label.clone(),
             context_state: ctx_state,
-            provider: ctx_provider_name,
+            provider: resolved_backend.clone(),
             model: resolved_model.clone(),
             performer,
             instance,
@@ -1578,15 +1457,14 @@ impl KjDispatcher {
             }
         }
 
-        // Validate + resolve the rest before any mutation so a typo'd
-        // --model/--cast/--env can't leave an orphan context behind.
+        // Validate the rest before any mutation so a typo'd --env or --cwd
+        // can't leave an orphan context behind.
         let Some(cwd_check_context) = parent_id.or(caller.context_id) else {
             return KjResult::Err("kj kohai create: no parent context".into());
         };
-        let (resolved_model, resolved_cast) = match self.resolve_context_config(&cfg, caller, cwd_check_context).await {
-            Ok(r) => r,
-            Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
-        };
+        if let Err(e) = self.resolve_context_config(&cfg, caller, cwd_check_context).await {
+            return KjResult::Err(format!("kj kohai create: {e}"));
+        }
         let new_id = ContextId::new();
 
         // Resolve the performer before validating its model assignment. The
@@ -1656,13 +1534,10 @@ impl KjDispatcher {
             }
         }
 
-        // Apply settable config (model, cast, system-prompt, cwd,
-        // env) now that the row and drift handle exist. Validated above;
-        // only DB I/O errors surface here.
-        let config_changes = match self
-            .apply_context_config(new_id, &cfg, resolved_model.as_ref(), resolved_cast)
-            .await
-        {
+        // Apply settable config (system-prompt, cwd, env) now that the row
+        // and drift handle exist. Validated above; only DB I/O errors surface
+        // here.
+        let config_changes = match self.apply_context_config(new_id, &cfg).await {
             Ok(changes) => changes,
             Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
         };
@@ -1704,6 +1579,16 @@ impl KjDispatcher {
             msg.push('\n');
             msg.push_str(&line);
         }
+        // Say so when the binding gives the new instance no model for its type.
+        let no_model = match crate::model_resolution::context_model(&self.kernel_db().lock(), new_id) {
+            Ok(crate::model_resolution::ContextModelLookup::None(none)) => Some(none.line()),
+            Ok(_) => None,
+            Err(e) => Some(format!("could not read the model binding: {e}")),
+        };
+        if let Some(line) = &no_model {
+            msg.push('\n');
+            msg.push_str(line);
+        }
         // Report whether the retained context received a usable loadout.
         match self.has_usable_loadout(new_id) {
             Ok(true) => {}
@@ -1719,6 +1604,7 @@ impl KjDispatcher {
         }
         KjResult::ok_with_data(msg, serde_json::json!({
             "context_id": new_id.to_hex(),
+            "no_model": no_model,
         }))
     }
 
@@ -1975,7 +1861,7 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--cwd path] [--env KEY=VALUE] [--type t]`
+    /// `kj context set <ctx> [--system-prompt text] [--cwd path] [--env KEY=VALUE] [--type t]`
     async fn context_set(
         &self,
         target_arg: Option<&str>,
@@ -1993,11 +1879,10 @@ impl KjDispatcher {
             }
         };
 
-        // Validate + resolve the model/cast/cwd before touching the DB.
-        let (resolved_model, resolved_cast) = match self.resolve_context_config(&cfg, caller, target_id).await {
-            Ok(r) => r,
-            Err(e) => return KjResult::Err(format!("kj context set: {e}")),
-        };
+        // Validate the env and cwd before touching the DB.
+        if let Err(e) = self.resolve_context_config(&cfg, caller, target_id).await {
+            return KjResult::Err(format!("kj context set: {e}"));
+        }
 
         // `--egress-allow`/`--egress-deny` need authority over the target
         // (`docs/egress.md`, "Who changes the list").
@@ -2022,10 +1907,7 @@ impl KjDispatcher {
             cfg.egress = Some(EgressAssignment { allow, deny, caller_actor: caller.actor_id });
         }
 
-        match self
-            .apply_context_config(target_id, &cfg, resolved_model.as_ref(), resolved_cast)
-            .await
-        {
+        match self.apply_context_config(target_id, &cfg).await {
             Ok(changes) if changes.is_empty() => {
                 KjResult::ok("no changes specified".to_string())
             }
@@ -2046,8 +1928,6 @@ impl KjDispatcher {
         &self,
         target_arg: Option<&str>,
         env_key: Option<&str>,
-        clear_cast: bool,
-        clear_model: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let db = self.kernel_db().lock();
@@ -2062,32 +1942,8 @@ impl KjDispatcher {
                 Ok(false) => KjResult::Err(format!("kj context unset: env var '{}' not set", key)),
                 Err(e) => KjResult::Err(format!("kj context unset: {e}")),
             }
-        } else if clear_cast {
-            match db.update_cast(target_id, None) {
-                Ok(()) => KjResult::ok("cleared cast".to_string()),
-                Err(e) => KjResult::Err(format!("kj context unset: {e}")),
-            }
-        } else if clear_model {
-            let had = match db.get_context(target_id) {
-                Ok(Some(row)) => row.provider.is_some() || row.model.is_some(),
-                Ok(None) => return KjResult::Err(format!("kj context unset: context {} not found", target_id.short())),
-                Err(e) => return KjResult::Err(format!("kj context unset: {e}")),
-            };
-            if let Err(e) = db.update_model(target_id, None, None) {
-                return KjResult::Err(format!("kj context unset: {e}"));
-            }
-            drop(db);
-            // The turn path reads the live handle, so it must agree with the row.
-            if let Err(e) = self.drift_router().write().clear_llm(target_id) {
-                return KjResult::Err(format!("kj context unset: {e}"));
-            }
-            if had {
-                KjResult::ok("cleared model; `kj model` shows what it resolves to now".to_string())
-            } else {
-                KjResult::ok("no model was set".to_string())
-            }
         } else {
-            KjResult::Err("kj context unset: requires --env KEY, --cast, or --model".to_string())
+            KjResult::Err("kj context unset: requires --env KEY".to_string())
         }
     }
 
@@ -2214,7 +2070,11 @@ impl KjDispatcher {
 
         match db.fork_lineage(target_id) {
             Ok(lineage) => {
-                let text = format_fork_lineage(&lineage, caller.context_id);
+                let bound = match context_bindings(&db, lineage.iter().map(|(row, _)| row)) {
+                    Ok(bound) => bound,
+                    Err(e) => return KjResult::Err(format!("kj context log: {e}")),
+                };
+                let text = format_fork_lineage(&lineage, caller.context_id, &bound);
                 let handles = context_handles(lineage.iter().map(|(row, _)| row));
                 KjResult::ok_with_data(text, handles)
             }
@@ -2455,6 +2315,9 @@ impl KjDispatcher {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            provider: None,
+            model: None,
+            cast_id: None,
             ..predecessor.clone()
         };
         let admission = {
@@ -2481,9 +2344,6 @@ impl KjDispatcher {
             let mut drift = self.drift_router().write();
             if let Err(e) = drift.register(successor_id, None, parent, caller.principal_id) {
                 return KjResult::Err(format!("kj context rotate: {e}"));
-            }
-            if let (Some(provider), Some(model)) = (&successor.provider, &successor.model) {
-                let _ = drift.configure_llm(successor_id, provider, model);
             }
         }
 
@@ -2555,9 +2415,24 @@ impl KjDispatcher {
         if moved > 0 {
             msg.push_str(" (the character's handoff log now points at it)");
         }
+        // Say so when the new binding gives the instance no model for its type.
+        let no_model = if is_handoff_log {
+            None
+        } else {
+            match crate::model_resolution::context_model(&self.kernel_db().lock(), successor_id) {
+                Ok(crate::model_resolution::ContextModelLookup::None(none)) => Some(none.line()),
+                Ok(_) => None,
+                Err(e) => Some(format!("could not read the model binding: {e}")),
+            }
+        };
+        if let Some(line) = &no_model {
+            msg.push('\n');
+            msg.push_str(line);
+        }
         KjResult::ok_with_data(msg, serde_json::json!({
             "context_id": successor_id.to_hex(),
             "rotated_from": predecessor.context_id.to_hex(),
+            "no_model": no_model,
         }))
     }
 
@@ -3244,7 +3119,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let error = d.apply_context_config(context, &cfg, None, None).await.unwrap_err();
+        let error = d.apply_context_config(context, &cfg).await.unwrap_err();
         assert!(error.contains("authority changed"), "{error}");
         assert!(d.kernel_db().lock().list_context_egress(context).unwrap().is_empty());
     }
@@ -3736,8 +3611,8 @@ mod tests {
         let db = d.kernel_db().lock();
         db.update_played_by(root, Some(amy)).unwrap();
         db.write_stored_root_ctx(amy, Some(root)).unwrap();
+        db.seed_test_cast(banto, "mock", "mock-banto", &["default"]).unwrap();
         db.update_played_by(seat, Some(banto)).unwrap();
-        db.update_model(seat, Some("mock"), Some("mock-banto")).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
         db.set_context_env(seat, "ROTATED_FROM", "an-older-seat").unwrap();
@@ -3762,6 +3637,9 @@ mod tests {
     async fn rotate_carries_the_seat_to_its_successor_body() {
         let f = rotation_fixture().await;
         let before = f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap();
+        // The character's cast moves to another model after the seat was bound:
+        // the running seat keeps its binding, the successor reads the new one.
+        f.d.kernel_db().lock().seed_test_cast(f.banto, "mock", "mock-banto-next", &["default"]).unwrap();
         let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
         assert!(rotated.is_ok(), "{}", rotated.message());
         let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
@@ -3779,15 +3657,19 @@ mod tests {
         assert!(new.promoted_at.is_some(), "the successor takes the ring seat");
         assert_eq!(new.forked_from, Some(f.root), "created from the predecessor's own parent");
         assert_eq!(new.context_type, before.context_type);
-        assert_eq!(new.cast_id, before.cast_id);
         assert_eq!((new.played_by, new.senpai_ctx), (before.played_by, before.senpai_ctx));
-        assert_eq!((new.provider.as_deref(), new.model.as_deref()), (Some("mock"), Some("mock-banto")));
         assert_eq!(new.system_prompt.as_deref(), Some("seat prompt"));
         assert_eq!(new.workspace_id, before.workspace_id);
         let env: std::collections::HashMap<_, _> = db.get_context_env(successor).unwrap().into_iter().map(|e| (e.key, e.value)).collect();
         assert_eq!(env.get("SEAT_VAR").map(String::as_str), Some("kept"));
         assert_eq!(env.get("ROTATED_FROM"), Some(&f.seat.to_hex()), "names the predecessor it replaced, by id");
         assert_eq!(db.get_context_shell(successor).unwrap().and_then(|shell| shell.cwd).as_deref(), Some("/tmp/seat"));
+        let model_of = |ctx| match crate::model_resolution::context_model(&db, ctx).unwrap() {
+            crate::model_resolution::ContextModelLookup::Model(m) => m.model,
+            other => panic!("expected a model, got {other:?}"),
+        };
+        assert_eq!(model_of(f.seat), "mock-banto", "the predecessor keeps the binding it was made with");
+        assert_eq!(model_of(successor), "mock-banto-next", "the successor's binding is read fresh from the character's cast");
         let (instance, first_seq) = db.context_instance(f.seat).unwrap().expect("the seat belongs to an instance");
         assert_eq!(db.context_instance(successor).unwrap(), Some((instance, first_seq + 1)), "the successor is the same instance on the next binding");
         assert_eq!(db.instance_conversation(instance).unwrap(), Some(successor), "the instance's conversation is the newest binding's");
@@ -4523,102 +4405,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn context_set_model() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal);
-
-        // Register mock provider so validation passes
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-        }
-
-        let c = caller_with_context(ctx);
-        let result = d
-            .dispatch(
-                &[
-                    s("context"),
-                    s("set"),
-                    s("."),
-                    s("--model"),
-                    s("mock/test-model"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "set failed: {}", result.message());
-        assert!(
-            result.message().contains("model="),
-            "msg: {}",
-            result.message()
-        );
-
-        // Verify in DriftRouter
-        let router = d.drift_router().read();
-        let handle = router.get(ctx).unwrap();
-        assert_eq!(handle.provider.as_deref(), Some("mock"));
-        assert_eq!(handle.model.as_deref(), Some("test-model"));
-    }
-
-    /// `unset --model` clears a pinned model from the row and the live
-    /// handle, so the context resolves through its cast or the registry
-    /// default again. Rotation copies a pin, so one set long ago outlives a
-    /// change of default without this.
+    /// `--env` validates its key at write time, after `--system-prompt` has
+    /// already been written. One failed field must leave the row as it was.
     ///
-    /// Falsified by an unset that clears only the row: the turn path reads
-    /// the handle and keeps the pin.
-    #[tokio::test]
-    async fn context_unset_model_returns_to_the_default() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("pinned"), None, principal);
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            d.kernel().llm().write().await.register("mock", mock);
-        }
-        let c = caller_with_context(ctx);
-        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--model"), s("mock/pinned-model")], &c).await;
-        assert!(set.is_ok(), "set failed: {}", set.message());
-
-        let result = d.dispatch(&[s("context"), s("unset"), s("."), s("--model")], &c).await;
-        assert!(result.is_ok(), "unset failed: {}", result.message());
-        assert!(result.message().contains("cleared model"), "msg: {}", result.message());
-        {
-            let router = d.drift_router().read();
-            let handle = router.get(ctx).unwrap();
-            assert_eq!((handle.provider.as_deref(), handle.model.as_deref()), (None, None));
-        }
-        let row = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
-        assert_eq!((row.provider.as_deref(), row.model.as_deref()), (None, None));
-
-        let again = d.dispatch(&[s("context"), s("unset"), s("."), s("--model")], &c).await;
-        assert!(again.is_ok(), "a second unset is a no-op: {}", again.message());
-        assert!(again.message().contains("no model was set"), "msg: {}", again.message());
-    }
-
-    /// `--env` validates its key at write time, after `--model` has already
-    /// been written. One failed field must leave the row as it was.
+    /// Falsified by applying the fields outside one transaction.
     #[tokio::test]
     async fn context_set_partial_failure_commits_nothing() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("atomic"), None, principal);
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-        }
         let before = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
-        assert!(before.model.is_none(), "fixture starts without a model");
+        assert!(before.system_prompt.is_none(), "fixture starts without a system prompt");
 
         let c = caller_with_context(ctx);
         let result = d
@@ -4627,8 +4424,8 @@ mod tests {
                     s("context"),
                     s("set"),
                     s("."),
-                    s("--model"),
-                    s("mock/test-model"),
+                    s("--system-prompt"),
+                    s("changed"),
                     s("--env"),
                     s("1BAD=y"),
                 ],
@@ -4639,111 +4436,14 @@ mod tests {
 
         let after = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
         assert_eq!(
-            after.model, before.model,
-            "model must not be committed when a later field fails"
+            after.system_prompt, before.system_prompt,
+            "the system prompt must not be committed when a later field fails"
         );
         assert!(
             d.kernel_db().lock().get_context_env(ctx).unwrap().is_empty(),
             "no env row either"
         );
     }
-
-    #[tokio::test]
-    async fn context_set_invalid_provider_errors() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal);
-
-        let c = caller_with_context(ctx);
-        let result = d
-            .dispatch(
-                &[
-                    s("context"),
-                    s("set"),
-                    s("."),
-                    s("--model"),
-                    s("nonexistent/foo"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "should fail: {}", result.message());
-        assert!(
-            result.message().contains("unknown provider"),
-            "expected 'unknown provider' error, got: {}",
-            result.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn context_set_colon_provider_model_errors_with_slash_hint() {
-        // The `provider:model` footgun: a bare spec whose `:`-prefix names a
-        // real provider almost certainly meant the slash form. Fail loud at
-        // set time with a hint, instead of silently storing the literal on the
-        // default provider and only erroring at turn time.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal);
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-        }
-
-        let c = caller_with_context(ctx);
-        let result = d
-            .dispatch(
-                &[
-                    s("context"),
-                    s("set"),
-                    s("."),
-                    s("--model"),
-                    s("mock:test-model"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "colon form should fail: {}", result.message());
-        assert!(
-            result.message().contains("provider:model")
-                && result.message().contains("mock/test-model"),
-            "expected slash hint, got: {}",
-            result.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn context_set_bare_colon_model_is_not_mistaken_for_provider() {
-        // An ollama-style tag like `gemma4:31b` must NOT trip the provider:model
-        // hint — `gemma4` is not a registered provider. This collision is the
-        // reason the parser separates on `/`, never `:`.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal);
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-        }
-
-        let c = caller_with_context(ctx);
-        let result = d
-            .dispatch(
-                &[s("context"), s("set"), s("."), s("--model"), s("gemma4:31b")],
-                &c,
-            )
-            .await;
-        assert!(
-            !result.message().contains("provider:model"),
-            "ollama-style tag must not trip the provider:model hint: {}",
-            result.message()
-        );
-    }
-
     #[tokio::test]
     async fn context_hydrate_sets_marks_tail_and_clears() {
         let d = test_dispatcher().await;
@@ -5822,7 +5522,7 @@ mod tests {
         db.begin_turn(&crate::TurnStart {
             turn_id, context_id: ctx, performer: PrincipalId::new(), cast: Some("house".into()),
             role: "coder".into(), provider: "deepseek".into(), model: "deepseek-flash".into(),
-            model_source: "cast_slot".into(), started_at: at,
+            instance: None, binding_seq: None, started_at: at,
         }).unwrap();
         db.add_turn_usage(turn_id, crate::RawUsage { input, output: 3, cache_read: 7, cache_write: 0, reasoning: 1 }).unwrap();
         db.finish_turn(turn_id, at + 5, "end_turn").unwrap();
@@ -5853,7 +5553,7 @@ mod tests {
         assert!(listed.is_ok(), "{}", listed.message());
         let msg = listed.message();
         assert!(msg.find(&second.short()).unwrap() < msg.find(&first.short()).unwrap(), "newest first: {msg}");
-        assert!(msg.contains("house") && msg.contains("deepseek/deepseek-flash") && msg.contains("cast_slot")
+        assert!(msg.contains("house") && msg.contains("deepseek/deepseek-flash") && msg.contains("no instance")
             && msg.contains("end_turn"), "{msg}");
         let KjResult::Ok { data: Some(data), .. } = &listed else { panic!("turns carries a record") };
         assert_eq!(data.as_array().unwrap().len(), 2);
@@ -6002,80 +5702,73 @@ mod tests {
         }
     }
 
-    /// `kj context info`'s JSON carries the raw `provider`/`model` row
-    /// columns, but a consumer that wants to know what will ACTUALLY run
-    /// has to walk the resolution ladder itself (deepseek review P4). This
-    /// asserts the structured record and the human text both surface the
-    /// SAME resolved backend/model/source `resolve_context_model` (and `kj
-    /// model`) would produce — for an explicit context override, so
-    /// `resolved_source` must read "context".
+    /// `kj context info` reports the model the context's binding gives its
+    /// type, in the text and in the structured record, and the cast the
+    /// binding was written from.
+    ///
+    /// Falsified by reading a model from anywhere but the binding.
     #[tokio::test]
-    async fn context_info_data_carries_the_resolved_effective_model() {
+    async fn context_info_data_carries_the_bindings_model() {
         use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("resolved-ctx"), None, principal);
-
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-        }
+        let ctx = register_context_with_model(&d, Some("resolved-ctx"), None, principal, &["default"]);
 
         let c = caller_with_context(ctx);
-        let set = d
-            .dispatch(
-                &[s("context"), s("set"), s("."), s("--model"), s("mock/test-model")],
-                &c,
-            )
-            .await;
-        assert!(set.is_ok(), "set failed: {}", set.message());
-
         let result = d.dispatch(&[s("context"), s("info")], &c).await;
         assert!(result.is_ok(), "info failed: {}", result.message());
         assert!(
-            result.message().contains("Resolved: mock/test-model (context)"),
-            "human text must show the resolved model: {}",
+            result.message().contains("Model:    mock/mock-model"),
+            "human text must show the bound model: {}",
             result.message()
         );
+        assert!(result.message().contains("Cast:    test-default-mock-mock-model"), "{}", result.message());
 
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 assert_eq!(v["resolved_backend"], "mock");
-                assert_eq!(v["resolved_model"], "test-model");
-                assert_eq!(v["resolved_source"], "context");
+                assert_eq!(v["resolved_model"], "mock-model");
+                assert_eq!(v["cast_label"], "test-default-mock-mock-model");
+                assert!(v["model_absent"].is_null(), "{v}");
+                assert!(v.get("resolved_source").is_none(), "no resolver tier remains: {v}");
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
     }
 
-    /// The other end of the ladder: a fresh context with no override, no
-    /// cast, and a registry with no default at all must resolve to
-    /// `null`/`null`/"default" — an honest absence, never a fabricated
-    /// fallback pair.
+    /// A context whose binding has no slot for its type reports no model, and
+    /// says why: the same line `kj kohai create` and `kj context rotate`
+    /// print. A context with no instance says so.
+    ///
+    /// Falsified by an info that names any other model.
     #[tokio::test]
-    async fn context_info_data_resolved_model_is_null_when_nothing_configured() {
+    async fn context_info_says_why_the_binding_has_no_model() {
         use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("unresolved-ctx"), None, principal);
-
-        let c = caller_with_context(ctx);
+        let bare = register_context(&d, Some("unbound-ctx"), None, principal);
+        let c = caller_with_context(bare);
         let result = d.dispatch(&[s("context"), s("info")], &c).await;
         assert!(result.is_ok(), "info failed: {}", result.message());
+        match result {
+            KjResult::Ok { data: Some(v), message, .. } => {
+                assert!(v["resolved_backend"].is_null() && v["resolved_model"].is_null(), "got {v}");
+                assert!(v["model_absent"].as_str().unwrap().contains("no character instance"), "got {v}");
+                assert!(message.contains("runs no model"), "{message}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
 
+        let slotless = register_context_with_model(&d, Some("slotless-ctx"), None, PrincipalId::new(), &["musician"]);
+        let result = d.dispatch(&[s("context"), s("info")], &caller_with_context(slotless)).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
-                assert!(v["resolved_backend"].is_null(), "got {v}");
-                assert!(v["resolved_model"].is_null(), "got {v}");
-                assert_eq!(v["resolved_source"], "default");
+                let line = v["model_absent"].as_str().expect("a reason");
+                assert!(line.contains("has no model for default: cast test-musician-mock-mock-model has no default slot"), "{line}");
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
     }
-
     /// The flip side: once `LlmRegistry::context_window_for` resolves a real
     /// window (mirroring how it's populated from the backend model metadata in
     /// production), `kj context info --json` must compute the percentage
@@ -6087,30 +5780,38 @@ mod tests {
     async fn context_info_usage_pct_computed_when_window_known() {
         use crate::kj::KjResult;
         let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
+        let _ = PrincipalId::new();
 
         // A 100_000-token window on a "mock/big-model" pair — chosen so the
         // fill fractions below (25%, 200%) are exactly representable in
-        // binary floating point, ruling out an epsilon-fudged assertion.
-        {
-            use crate::llm::{BackendConfig, BackendKind, ModelInfo};
-            // Named "mock" to match the context rows below; the KIND is what
-            // picks a client, and nothing here builds one.
-            let mut cfg = BackendConfig::new("mock", BackendKind::Mock);
-            cfg.models.insert(
-                "big-model".to_string(),
-                ModelInfo {
+        // binary floating point, ruling out an epsilon-fudged assertion. The
+        // window reaches a context through its binding's slot, copied from the
+        // model's row when the binding is written.
+        let with_window = |label: &str| {
+            let character = PrincipalId::new();
+            {
+                let db = d.kernel_db().lock();
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: character, name: format!("windowed-{label}"), created_at: 0,
+                    retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+                db.seed_test_cast(character, "mock", "big-model", &["default"]).unwrap();
+                let backend = db.get_backend_by_name("mock").unwrap().unwrap();
+                db.set_backend_model(&crate::kernel_db::BackendModelRow {
+                    backend_id: backend.backend_id,
+                    model_id: "big-model".into(),
                     context_window: Some(100_000),
                     extra: None,
                     tunables: Default::default(),
-                },
-            );
-            let mut registry = d.kernel().llm().write().await;
-            registry.set_backends(vec![cfg]);
-        }
+                }).unwrap();
+            }
+            let context = register_context(&d, Some(label), None, character);
+            d.kernel_db().lock().assign_stand_in_instance(context, character).unwrap();
+            context
+        };
 
         // Comfortably under the window: 20_000 + 5_000 = 25_000 / 100_000 = 25%.
-        let ctx_under = register_context(&d, Some("usage-window-under"), None, principal);
+        let ctx_under = with_window("usage-window-under");
         {
             let db = d.kernel_db().lock();
             db.set_context_usage(&crate::kernel_db::ContextUsageRow {
@@ -6146,7 +5847,7 @@ mod tests {
 
         // Past the window: 150_000 + 50_000 = 200_000 / 100_000 = 200% — must
         // be reported as 200, not clamped to 100.
-        let ctx_over = register_context(&d, Some("usage-window-over"), None, principal);
+        let ctx_over = with_window("usage-window-over");
         {
             let db = d.kernel_db().lock();
             db.set_context_usage(&crate::kernel_db::ContextUsageRow {
@@ -6179,356 +5880,103 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn context_set_bare_model_resolves_default_provider() {
-        // `--model <bare>` (no provider) resolves the provider from the
-        // registry default and configures the live DriftRouter handle —
-        // parity with `kj fork`. Before the fix it only touched the DB column.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal);
-
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-            assert!(registry.set_default("mock"), "default should set");
-        }
-
-        let c = caller_with_context(ctx);
-        let result = d
-            .dispatch(
-                &[s("context"), s("set"), s("."), s("--model"), s("bare-model")],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "set failed: {}", result.message());
-
-        let router = d.drift_router().read();
-        let handle = router.get(ctx).unwrap();
-        assert_eq!(
-            handle.provider.as_deref(),
-            Some("mock"),
-            "bare model should resolve the default provider"
-        );
-        assert_eq!(handle.model.as_deref(), Some("bare-model"));
-    }
-
-    #[tokio::test]
-    async fn context_set_bare_model_no_default_errors() {
-        // A bare model name with no default provider configured must error,
-        // not silently update only the DB column.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal);
-
-        let c = caller_with_context(ctx);
-        let result = d
-            .dispatch(
-                &[s("context"), s("set"), s("."), s("--model"), s("orphan-model")],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "should fail: {}", result.message());
-        assert!(
-            result.message().contains("no provider configured"),
-            "msg: {}",
-            result.message()
-        );
-        assert!(result.message().contains("kj backend default set"), "msg: {}", result.message());
-    }
-
-    #[tokio::test]
-    async fn context_create_with_model_configures_drift() {
-        // create parity with fork: `--model` is applied inline, not via a
-        // follow-up `kj context set`.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-
-        // Register mock provider so validation passes.
-        {
-            use crate::llm::{MockClient, Provider};
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("mock", mock);
-        }
-
-        let c = caller_with_context(parent);
-
-        crate::kj::test_helpers::give_character(&d, &c);
-        let result = d
-            .dispatch(
-                &[
-                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
-                    s("kid"),
-                    s("--model"),
-                    s("mock/test-model"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let id = {
-            let db = d.kernel_db().lock();
-            db.resolve_context("kid").expect("kid should exist")
-        };
-        let router = d.drift_router().read();
-        let handle = router.get(id).expect("kid registered in drift");
-        assert_eq!(handle.provider.as_deref(), Some("mock"));
-        assert_eq!(handle.model.as_deref(), Some("test-model"));
-    }
-
-    #[tokio::test]
-    async fn context_create_resolves_model_alias() {
-        // `--model local` must expand the registry alias to its concrete
-        // provider/model BEFORE storage — otherwise "local" ships to the default
-        // provider at turn time and 404s (`not_found_error: model: local`).
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-
-        // Register a provider + a `local` alias pointing at it.
-        {
-            use crate::llm::ModelAlias;
-            use crate::llm::{MockClient, Provider};
-            use std::collections::HashMap;
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("lemonade")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("lemonade", mock);
-            let mut aliases = HashMap::new();
-            aliases.insert(
-                "local".to_string(),
-                ModelAlias {
-                    backend: "lemonade".to_string(),
-                    model: "Gemma-4-E4B-it-GGUF".to_string(),
-                },
-            );
-            registry.set_model_aliases(aliases);
-        }
-
-        let c = caller_with_context(parent);
-
-        crate::kj::test_helpers::give_character(&d, &c);
-        let result = d
-            .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid"), s("--model"), s("local")],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let id = {
-            let db = d.kernel_db().lock();
-            db.resolve_context("kid").expect("kid should exist")
-        };
-        // Both the drift handle and the persisted row carry the RESOLVED target,
-        // never the literal alias "local".
-        {
-            let router = d.drift_router().read();
-            let handle = router.get(id).expect("kid registered in drift");
-            assert_eq!(handle.provider.as_deref(), Some("lemonade"));
-            assert_eq!(handle.model.as_deref(), Some("Gemma-4-E4B-it-GGUF"));
-        }
-        let db = d.kernel_db().lock();
-        let row = db.get_context(id).unwrap().expect("kid row");
-        assert_eq!(row.provider.as_deref(), Some("lemonade"));
-        assert_eq!(
-            row.model.as_deref(),
-            Some("Gemma-4-E4B-it-GGUF"),
-            "stored model must be the resolved alias target, not 'local'"
-        );
-    }
-
-    #[tokio::test]
-    async fn context_set_resolves_model_alias() {
-        // The same resolution must apply to `kj context set --model <alias>`
-        // (create and set share `resolve_context_config`).
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let target = register_context(&d, Some("target"), None, principal);
-
-        {
-            use crate::llm::ModelAlias;
-            use crate::llm::{MockClient, Provider};
-            use std::collections::HashMap;
-            use std::sync::Arc;
-            let mock = Arc::new(Provider::Mock(MockClient::new("lemonade")));
-            let mut registry = d.kernel().llm().write().await;
-            registry.register("lemonade", mock);
-            let mut aliases = HashMap::new();
-            aliases.insert(
-                "local".to_string(),
-                ModelAlias {
-                    backend: "lemonade".to_string(),
-                    model: "Gemma-4-E4B-it-GGUF".to_string(),
-                },
-            );
-            registry.set_model_aliases(aliases);
-        }
-
-        let c = caller_with_context(target);
-        let result = d
-            .dispatch(&[s("context"), s("set"), s("--model"), s("local")], &c)
-            .await;
-        assert!(result.is_ok(), "set failed: {}", result.message());
-
-        let db = d.kernel_db().lock();
-        let row = db.get_context(target).unwrap().expect("target row");
-        assert_eq!(row.provider.as_deref(), Some("lemonade"));
-        assert_eq!(row.model.as_deref(), Some("Gemma-4-E4B-it-GGUF"));
-    }
-
     // ── Track D: cast-on-context ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn context_create_with_cast_assigns_it() {
+    async fn context_info_and_list_surface_the_cast_label_and_model() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let c = caller_with_context(parent);
-        crate::kj::test_helpers::give_character(&d, &c);
-
-        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
-
-        let result = d
-            .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid"), s("--cast"), s("house")],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let db = d.kernel_db().lock();
-        let id = db.resolve_context("kid").expect("kid should exist");
-        let row = db.get_context(id).unwrap().expect("kid row");
-        let cast = db.get_cast(row.cast_id.expect("cast_id set")).unwrap().unwrap();
-        assert_eq!(cast.label, "house");
-    }
-
-    #[tokio::test]
-    async fn context_create_with_unknown_cast_fails_loud_listing_known_casts() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let c = caller_with_context(parent);
-        crate::kj::test_helpers::give_character(&d, &c);
-
-        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
-
-        let result = d
-            .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid"), s("--cast"), s("nonesuch")],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "unknown cast must be rejected");
-        assert!(
-            result.message().contains("unknown cast") && result.message().contains("house"),
-            "error should list known casts: {}",
-            result.message()
-        );
-
-        // The context must not have been created (orphan-context guard).
-        let db = d.kernel_db().lock();
-        assert!(db.resolve_context("kid").is_err(), "kid must not exist");
-    }
-
-    #[tokio::test]
-    async fn context_set_assigns_and_unset_clears_cast() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let target = register_context(&d, Some("target"), None, principal);
+        let target = register_context_with_model(&d, Some("staffed"), None, principal, &["default"]);
         let c = caller_with_context(target);
-
-        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
-
-        let result = d
-            .dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
-            .await;
-        assert!(result.is_ok(), "set --cast failed: {}", result.message());
-        {
-            let db = d.kernel_db().lock();
-            let row = db.get_context(target).unwrap().unwrap();
-            let cast = db.get_cast(row.cast_id.expect("cast_id set")).unwrap().unwrap();
-            assert_eq!(cast.label, "house");
-        }
-
-        let result = d
-            .dispatch(&[s("context"), s("unset"), s("--cast")], &c)
-            .await;
-        assert!(result.is_ok(), "unset --cast failed: {}", result.message());
-        let db = d.kernel_db().lock();
-        let row = db.get_context(target).unwrap().unwrap();
-        assert!(row.cast_id.is_none(), "cast cleared");
-    }
-
-    #[tokio::test]
-    async fn context_info_and_list_surface_the_cast_label() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let target = register_context(&d, Some("staffed"), None, principal);
-        let c = caller_with_context(target);
-
-        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
-        d.dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
-            .await;
 
         let info = d.dispatch(&[s("context"), s("info")], &c).await;
         assert!(info.is_ok());
-        assert!(info.message().contains("Cast:    house"), "info: {}", info.message());
+        assert!(info.message().contains("Cast:    test-default-mock-mock-model"), "info: {}", info.message());
 
         let list = d.dispatch(&[s("context"), s("list")], &c).await;
         assert!(list.is_ok());
-        assert!(list.message().contains("[cast:house]"), "list: {}", list.message());
+        assert!(list.message().contains("[cast:test-default-mock-mock-model]"), "list: {}", list.message());
+        assert!(list.message().contains("mock/mock-model"), "list: {}", list.message());
     }
-
-    /// `docs/issues.md`, "`kj kohai create --cast` has no test that info
-    /// reports the cast": `kj kohai create --cast <label>` must resolve
-    /// its model through the cast slot and report it in `kj context info`,
-    /// same as `kj context set --cast` above.
+    /// `kj kohai create --as <character>` binds the character's cast: the new
+    /// context's info reports the cast, and a character whose cast has no slot
+    /// for the type is told so at create.
+    ///
+    /// Falsified by a create that prints nothing when the binding has no slot.
     #[tokio::test]
-    async fn context_create_with_cast_surfaces_the_cast_label() {
+    async fn kohai_create_reports_the_bound_cast_and_a_missing_slot() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("staffing-parent"), None, principal);
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
-
-        d.dispatch(&[s("cast"), s("create"), s("budget")], &c).await;
+        let performer = d.kernel_db().lock().get_character_by_name("kohai-tester").unwrap().unwrap().principal_id;
+        d.kernel_db().lock().seed_test_cast(performer, "mock", "mock-model", &["default"]).unwrap();
 
         let create = d
-            .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("staffed-child"), s("--cast"), s("budget")],
-                &c,
-            )
+            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("staffed-child")], &c)
             .await;
-        assert!(create.is_ok(), "create --cast failed: {}", create.message());
+        assert!(create.is_ok(), "create failed: {}", create.message());
+        assert!(!create.message().contains("has no model"), "a slot exists, so nothing is reported: {}", create.message());
 
-        let child_caller = caller_with_context(
-            d.kernel_db()
-                .lock()
-                .find_context_by_label("staffed-child")
-                .unwrap()
-                .expect("staffed-child should exist")
-                .context_id,
+        let child = d.kernel_db().lock().find_context_by_label("staffed-child").unwrap().unwrap().context_id;
+        let info = d.dispatch(&[s("context"), s("info")], &caller_with_context(child)).await;
+        assert!(info.message().contains("Cast:    test-default-mock-mock-model"), "info: {}", info.message());
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info returns structured data: {info:?}") };
+        assert_eq!(data["cast_label"], "test-default-mock-mock-model", "info json: {data}");
+
+        // Another type has no slot in that cast.
+        let slotless = d
+            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("slotless-child"), s("--type"), s("coder")], &c)
+            .await;
+        assert!(slotless.is_ok(), "create failed: {}", slotless.message());
+        assert!(
+            slotless.message().contains("has no model for coder: cast test-default-mock-mock-model has no coder slot"),
+            "{}", slotless.message()
         );
-
-        let info = d.dispatch(&[s("context"), s("info")], &child_caller).await;
-        assert!(info.is_ok());
-        assert!(info.message().contains("Cast:    budget"), "info: {}", info.message());
-
-        let KjResult::Ok { data: Some(data), .. } = &info else {
-            panic!("context info returns structured data: {info:?}");
-        };
-        assert_eq!(data["cast_label"], "budget", "info json: {data}");
     }
 
+    /// A character with no cast says so at create.
+    #[tokio::test]
+    async fn kohai_create_says_when_the_character_has_no_cast() {
+        let d = test_dispatcher().await;
+        let parent = register_context(&d, Some("castless-parent"), None, PrincipalId::new());
+        let c = caller_with_context(parent);
+        crate::kj::test_helpers::give_character(&d, &c);
+        let create = d
+            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("castless-child")], &c)
+            .await;
+        assert!(create.is_ok(), "create failed: {}", create.message());
+        assert!(
+            create.message().contains("has no model for default: kohai-tester has no cast"),
+            "{}", create.message()
+        );
+    }
+
+    /// `--model`, `-m` and `--cast` are gone from `kj kohai create`, and
+    /// `--model`, `--cast` from `kj context set` and `unset`: a model comes
+    /// from the character's cast, bound when its instance starts.
+    #[tokio::test]
+    async fn the_model_and_cast_flags_are_gone_from_create_set_and_unset() {
+        let d = test_dispatcher().await;
+        let parent = register_context(&d, Some("flag-parent"), None, PrincipalId::new());
+        let c = caller_with_context(parent);
+        crate::kj::test_helpers::give_character(&d, &c);
+        for argv in [
+            vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("--model"), s("x")],
+            vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("-m"), s("x")],
+            vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("--cast"), s("x")],
+            vec![s("context"), s("set"), s("--model"), s("x")],
+            vec![s("context"), s("set"), s("--cast"), s("x")],
+            vec![s("context"), s("unset"), s("--model")],
+            vec![s("context"), s("unset"), s("--cast")],
+        ] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{argv:?} must be refused");
+            assert!(result.message().contains("unexpected argument"), "{argv:?}: {}", result.message());
+        }
+        assert!(d.kernel_db().lock().find_context_by_label("a").unwrap().is_none());
+    }
     #[tokio::test]
     async fn context_create_name_alias() {
         // `--name` / `-n` is accepted as an alias for the positional label,
@@ -6875,43 +6323,6 @@ mod tests {
             }
             other => panic!("musician create must send BeatCommand::Attach, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn context_create_invalid_provider_leaves_no_orphan() {
-        // A bad `--model` must be rejected BEFORE the context is created —
-        // crashing the command is preferred over leaving an orphan context.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-
-        let c = caller_with_context(parent);
-
-        crate::kj::test_helpers::give_character(&d, &c);
-        let result = d
-            .dispatch(
-                &[
-                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
-                    s("kid"),
-                    s("--model"),
-                    s("nonexistent/foo"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "should fail: {}", result.message());
-        assert!(
-            result.message().contains("unknown provider"),
-            "msg: {}",
-            result.message()
-        );
-
-        // No half-created context left behind.
-        let db = d.kernel_db().lock();
-        assert!(
-            db.resolve_context("kid").is_err(),
-            "failed create must not leave an orphan context"
-        );
     }
 
     /// `kj context list` must emit a JSON array of resolver-friendly handles
@@ -7399,59 +6810,6 @@ mod tests {
             !msg.contains("current marker"),
             "explicit ref must NOT leak the caller's current context: {msg}"
         );
-    }
-
-    /// Regression: model-source half of `kj context prompt` matching the
-    /// turn path. Forces the KernelDb row and the live DriftRouter handle
-    /// apart (the divergence `apply_context_config` normally prevents by
-    /// writing both together) and asserts the verb reports the handle's
-    /// model, matching what `spawn_llm_for_prompt` would actually pick —
-    /// not the row's.
-    #[tokio::test]
-    async fn context_prompt_model_follows_drift_handle_not_row() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("modelctx"), None, principal);
-        d.block_store()
-            .create_document(ctx, crate::DocumentKind::Conversation, None)
-            .unwrap();
-
-        // Row says one model; the live handle (what the turn path reads)
-        // says another. A real caller can't normally produce this split —
-        // `apply_context_config` writes both together — but a preview
-        // racing a `kj context set`, or a future path that updates one
-        // without the other, can.
-        {
-            let db = d.kernel_db().lock();
-            db.update_model(ctx, Some("row-provider"), Some("row-only-model"))
-                .unwrap();
-        }
-        {
-            let mut drift = d.drift_router().write();
-            drift
-                .configure_llm(ctx, "handle-provider", "handle-only-model")
-                .unwrap();
-        }
-
-        let c = caller_with_context(ctx);
-        let result = d.dispatch(&[s("context"), s("prompt")], &c).await;
-        assert!(result.is_ok(), "prompt failed: {}", result.message());
-        match result {
-            KjResult::Ok { data: Some(v), .. } => {
-                assert_eq!(
-                    v["resolved_model"].as_str(),
-                    Some("handle-only-model"),
-                    "resolved_model must come from the DriftRouter handle (the turn path's \
-                     source), not the KernelDb row: {v:?}"
-                );
-                assert_eq!(
-                    v["resolved_backend"].as_str(),
-                    Some("handle-provider"),
-                    "resolved_backend must come from the DriftRouter handle: {v:?}"
-                );
-            }
-            other => panic!("expected Ok with data, got {other:?}"),
-        }
     }
 
     /// Regression: staging half of `kj context prompt` matching the turn

@@ -120,7 +120,7 @@ fn interactive_turn_pushes_completed_with_its_output_block() {
         kernel.subscribe_turn_events(callback).await.unwrap();
 
         kernel
-            .prompt("write a phrase", None, ctx)
+            .prompt("write a phrase", ctx)
             .await
             .expect("prompt accepted");
 
@@ -190,7 +190,7 @@ fn cancelled_turn_pushes_a_cancelled_stop_reason() {
         kernel.subscribe_turn_events(callback).await.unwrap();
 
         kernel
-            .prompt("write a phrase", None, ctx)
+            .prompt("write a phrase", ctx)
             .await
             .expect("prompt accepted");
 
@@ -411,8 +411,6 @@ fn timed_drives_keep_admission_targets_through_the_client() {
                         StreamEvent::TextDelta(abc.into()), StreamEvent::TextEnd]])
                 } else { MockClient::new(if case == "malformed" { "not music" } else { abc }) };
                 registry.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
-                assert!(registry.set_default("mock"));
-                registry.set_default_model("mock-model");
             }
             let before = kj.get_blocks(score, &BlockQuery::All).await.unwrap().len();
             let admitted_at = timeline.lock().playhead();

@@ -44,6 +44,8 @@ fn spawn_with_replies(replies: Value) -> AcpClient {
         .arg("mock")
         .arg("--model")
         .arg("solo-mock")
+        .arg("--max-tokens")
+        .arg("4096")
         .env("KJ_MOCK_SCRIPT_DIR", scripts)
         .env("TMPDIR", scratch_dir("tmp"))
         .env("RUST_LOG", "info");

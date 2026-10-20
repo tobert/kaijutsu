@@ -71,13 +71,16 @@ runs: `auth.db` is WAL and never cached.
 
 ## Configure a model backend
 
-A new kernel has no model backends and no default model, so a model turn
-fails with how to add one. Configure one from a client's shell after the
+A new kernel has no model backends and no cast, so a model turn
+fails with how to add them. Configure them from a client's shell after the
 first start:
 
 ```bash
 kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY
-kj backend default set --backend deepseek --model deepseek-flash
+kj backend model set deepseek deepseek-flash --max-tokens 16384
+kj cast create house
+kj cast slot set house coder --backend deepseek --model deepseek-flash
+kj character set <name> --cast house   # then `kj context rotate` to bind it
 ```
 
 The key reaches the kernel through the container's environment or a file

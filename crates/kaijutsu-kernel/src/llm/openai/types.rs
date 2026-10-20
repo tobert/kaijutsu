@@ -27,8 +27,6 @@
 
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_MAX_TOKENS: u64 = 8192;
-
 // ============================================================================
 // Request types (POST /chat/completions body)
 // ============================================================================
@@ -92,20 +90,6 @@ pub struct ChatRequest {
     /// enabled still bills reasoning tokens; this is the real off-switch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingMode>,
-}
-
-impl ChatRequest {
-    /// Default max_tokens when [`crate::llm::BuildOpts`] leaves it at the
-    /// generous kernel default — DeepSeek rejects requests whose
-    /// `max_tokens` exceeds the per-model ceiling, so we don't blindly
-    /// forward 64k.
-    pub fn clamp_max_tokens(requested: u64) -> u64 {
-        if requested == 0 {
-            DEFAULT_MAX_TOKENS
-        } else {
-            requested
-        }
-    }
 }
 
 /// DeepSeek's structural thinking mode override. Only the `Disabled` variant

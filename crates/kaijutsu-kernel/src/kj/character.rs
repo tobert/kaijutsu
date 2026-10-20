@@ -72,8 +72,8 @@ enum CharacterCommand {
         /// Make this character an ordinary one that a model can play.
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
-        /// The cast a context this character plays uses when the context
-        /// has no cast of its own. A context's own `--cast` wins.
+        /// The cast each new instance of this character binds. A running
+        /// instance keeps its binding until `kj context rotate`.
         #[arg(long, value_name = "CAST", conflicts_with = "no_cast")]
         cast: Option<String>,
         /// Clear the default cast.

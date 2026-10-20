@@ -16,7 +16,6 @@ pub struct TurnRequest {
     pub after_block_id: BlockId,
     pub content: String,
     pub principal_id: PrincipalId,
-    pub model: Option<String>,
     pub continuation_epoch: Option<i64>,
     pub score: Option<crate::hyoushigi::model::ScoreIntent>,
 }
@@ -80,7 +79,7 @@ impl Kernel {
         self.turn_flows().publish(TurnFlow::Requested {
             turn_id,
             context_id: request.context_id, after_block_id: request.after_block_id,
-            content: request.content, principal_id: request.principal_id, model: request.model,
+            content: request.content, principal_id: request.principal_id,
             continuation_epoch: request.continuation_epoch,
         });
         // The worker cannot publish a terminal event ahead of Requested.
@@ -165,7 +164,7 @@ pub(crate) fn queue_startup(
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err("turn cancelled before model startup".into()),
-                    result = spawn_admitted_turn(&host, request.context_id, request.model.as_deref(),
+                    result = spawn_admitted_turn(&host, request.context_id,
                         &request.after_block_id, tool_ctx, request.principal_id, origin,
                         request.continuation_epoch, lease, admission) => result,
                 }
@@ -246,7 +245,7 @@ mod tests {
         let mut requested = dispatcher.kernel().turn_flows().subscribe("turn.requested");
         let result = dispatcher.kernel().request_turn(TurnRequest {
             score: None, context_id: context, after_block_id: anchor,
-            content: String::new(), principal_id: principal, model: None, continuation_epoch: None,
+            content: String::new(), principal_id: principal, continuation_epoch: None,
         });
         dispatcher.kernel().shutdown_runtime_worker().await.unwrap();
         let error = result.expect_err("archived context must not admit a headless turn");
@@ -273,7 +272,7 @@ mod tests {
         dispatcher.kernel().request_turn(TurnRequest {
             score: None,
             context_id: context, after_block_id: anchor, content: String::new(),
-            principal_id: principal, model: None, continuation_epoch: None,
+            principal_id: principal, continuation_epoch: None,
         }).unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv())
             .await.unwrap().unwrap();
@@ -319,7 +318,7 @@ mod tests {
         let result = queue_startup(&kernel, StartupRequest {
             admission, lease,
             request: TurnRequest { context_id: context, after_block_id: input, content: String::new(),
-                principal_id: principal, model: None, continuation_epoch: None, score: None },
+                principal_id: principal, continuation_epoch: None, score: None },
             origin: TurnOrigin::Interactive, tool_ctx: None, session: caller.session_id,
             submit: Some((crate::rc::SubmitInfo { input_block: input, edge_block: None,
                 edge_shown: None, log_tail: None, turn_live: false }, caller)),

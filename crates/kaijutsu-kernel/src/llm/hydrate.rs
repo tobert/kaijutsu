@@ -1081,7 +1081,7 @@ mod pairing_repair_tests {
             let mock = MockClient::new("").with_scripted_stream(vec![vec![]]);
             let script = mock.scripted.as_ref().unwrap().clone();
             let provider = Provider::Mock(mock);
-            let result = provider.stream(BuildOpts::new("mock"), messages).await;
+            let result = provider.stream(BuildOpts::new("mock", 4096), messages).await;
             match result {
                 Err(LlmError::InvalidRequest(detail)) => {
                     assert!(detail.contains(id), "error must name {id}: {detail}");
@@ -1113,7 +1113,7 @@ mod pairing_repair_tests {
         let mock = MockClient::new("").with_scripted_stream(vec![vec![]]);
         let script = mock.scripted.as_ref().unwrap().clone();
         let provider = Provider::Mock(mock);
-        assert!(provider.stream(BuildOpts::new("mock"), out).await.is_ok());
+        assert!(provider.stream(BuildOpts::new("mock", 4096), out).await.is_ok());
         assert!(script.lock().is_empty(), "valid pairing must reach the backend");
     }
 

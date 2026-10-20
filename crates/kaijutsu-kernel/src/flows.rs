@@ -1509,8 +1509,6 @@ pub enum TurnFlow {
         /// Requester who supplied the seed. The assigned performer authors
         /// model output and tools.
         principal_id: PrincipalId,
-        /// Model override, or None to use the context's configured model.
-        model: Option<String>,
         /// Existing continuation epoch for an automatic resumption. `None`
         /// starts a new explicit continuation window.
         #[serde(default)]
@@ -2210,7 +2208,6 @@ mod tests {
             after_block_id: after,
             content: "explore the auth module".into(),
             principal_id: principal,
-            model: Some("claude-haiku-4-5".into()),
             continuation_epoch: None,
         });
         assert_eq!(delivered, 1, "exactly one subscriber should receive it");
@@ -2224,14 +2221,12 @@ mod tests {
                 after_block_id,
                 content,
                 principal_id,
-                model,
                 continuation_epoch,
             } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(after_block_id, after);
                 assert_eq!(content, "explore the auth module");
                 assert_eq!(principal_id, principal);
-                assert_eq!(model.as_deref(), Some("claude-haiku-4-5"));
                 assert_eq!(continuation_epoch, None);
             }
             other => panic!("expected Requested, got {other:?}"),
@@ -2657,7 +2652,6 @@ mod tests {
                 after_block_id: after,
                 content: "go".into(),
                 principal_id: principal,
-                model: None,
                 continuation_epoch: None,
             },
             TurnFlow::Completed {

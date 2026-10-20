@@ -38,7 +38,7 @@ pub use rpc::{
     AskAnswer, AskListing, AuthorBlock, Completion, CompletionKind, ContextCluster, ContextInfo, ContextMcpRefusal,
     ContextMcpServerDecl, ContextMembership,
     EditorState, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
-    LlmConfigInfo, LlmProviderInfo, McpResource, MountSpec, PeerInfo, PresetInfo,
+    McpResource, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellSubmission, ShellValue, SimilarContext,
     SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolSchema, TrackInfo,
     VersionSnapshot, VfsActivityEntry, VfsFileType,

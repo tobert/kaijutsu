@@ -66,10 +66,11 @@ impl Client {
     pub async fn prompt(
         &self,
         model: &str,
+        max_tokens: u64,
         system: Option<&str>,
         prompt: &str,
     ) -> LlmResult<String> {
-        self.0.prompt(model, system, prompt).await
+        self.0.prompt(model, max_tokens, system, prompt).await
     }
 
     /// Start a streaming completion.
@@ -128,7 +129,7 @@ mod tests {
 
         let text = Client::new("fake-key")
             .with_base_url(format!("http://127.0.0.1:{port}"))
-            .prompt("deepseek-v4-flash", None, "hi")
+            .prompt("deepseek-v4-flash", 4096, None, "hi")
             .await
             .expect("prompt round-trip against loopback");
         assert_eq!(text, "ok", "response must parse through the real path");
@@ -163,7 +164,7 @@ mod tests {
             _ => return,
         };
         let client = Client::new(api_key);
-        let opts = BuildOpts::new("deepseek-v4-flash")
+        let opts = BuildOpts::new("deepseek-v4-flash", 4096)
             .with_max_tokens(128)
             .with_system("You are friendly. Respond briefly.");
         let mut stream = client

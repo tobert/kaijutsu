@@ -182,11 +182,12 @@ impl Client {
     pub async fn prompt(
         &self,
         model: &str,
+        max_tokens: u64,
         system: Option<&str>,
         prompt: &str,
     ) -> LlmResult<String> {
         let messages = vec![Message::user(prompt)];
-        let mut opts = BuildOpts::new(model).with_max_tokens(4096);
+        let mut opts = BuildOpts::new(model, max_tokens);
         if let Some(sys) = system {
             opts = opts.with_system(sys);
         }
@@ -579,7 +580,7 @@ mod tests {
 
         let text = Client::new("test-backend")
             .with_base_url(format!("http://127.0.0.1:{port}/v1"))
-            .prompt("m", None, "hi")
+            .prompt("m", 4096, None, "hi")
             .await
             .expect("prompt round-trip against loopback");
         assert_eq!(text, "ok", "response must parse through the real path");
@@ -695,7 +696,7 @@ data: [DONE]
         let model = std::env::var("OPENAI_COMPAT_MODEL")
             .unwrap_or_else(|_| "Gemma-4-E4B-it-GGUF".to_string());
         let client = Client::new("lemonade").with_base_url(base_url);
-        let opts = BuildOpts::new(model)
+        let opts = BuildOpts::new(model, 4096)
             .with_max_tokens(512)
             .with_system("You are friendly. Respond briefly.");
         let mut stream = client
@@ -742,7 +743,7 @@ data: [DONE]
         let (base, seen) = serve(vec![sse(SIMPLE)]).await;
         let tmp = tempfile::tempdir().unwrap();
         let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 2, Some(tmp.path().to_path_buf()));
-        let opts = BuildOpts::new("qwen3.8-flash").with_system("be brief").with_trace(trace);
+        let opts = BuildOpts::new("qwen3.8-flash", 4096).with_system("be brief").with_trace(trace);
         let _stream = Client::new("alibaba")
             .with_base_url(&base)
             .stream(opts, vec![Message::user("let's do a thing")])
@@ -772,7 +773,7 @@ data: [DONE]
         let client = client.with_request_timeout(std::time::Duration::from_millis(100));
         let tmp = tempfile::tempdir().unwrap();
         let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 1, Some(tmp.path().to_path_buf()));
-        let opts = || BuildOpts::new("m").with_trace(trace.clone());
+        let opts = || BuildOpts::new("m", 4096).with_trace(trace.clone());
         // The first request is sent (and cools the endpoint): one dump.
         assert!(client.stream(opts(), vec![Message::user("a")]).await.is_err());
         wait_for_files(tmp.path(), 1).await;
@@ -795,7 +796,7 @@ data: [DONE]
         use kaijutsu_mk::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(SIMPLE)]).await;
         let (client, endpoint) = limited(&base);
-        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         assert_eq!(endpoint.status().in_flight, 1);
         while let Some(ev) = stream.next_event().await {
             if matches!(ev, StreamEvent::Done { .. }) {
@@ -814,7 +815,7 @@ data: [DONE]
         busy.headers.push(("retry-after", "3".into()));
         let (base, _) = serve(vec![busy]).await;
         let (client, endpoint) = limited(&base);
-        let err = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.err().unwrap();
+        let err = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 429);
@@ -832,7 +833,7 @@ data: [DONE]
         let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\ndata: [DONE]\n\n";
         let (base, _) = serve(vec![sse(cut)]).await;
         let (client, endpoint) = limited(&base);
-        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         let mut events = Vec::new();
         while let Some(ev) = stream.next_event().await {
             events.push(ev);
@@ -852,7 +853,7 @@ data: [DONE]
         use kaijutsu_mk::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(SIMPLE)]).await;
         let (client, endpoint) = limited(&base);
-        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
         assert_eq!(endpoint.busy_in_a_row(), 1);

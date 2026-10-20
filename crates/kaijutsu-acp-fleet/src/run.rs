@@ -21,7 +21,7 @@ use crate::container::{self, Endpoint, Reach};
 use crate::council::ScriptedCouncil;
 use crate::relay::Relay;
 use crate::scenario::{
-    Answer, COUNCIL_PLACEHOLDER, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative,
+    Answer, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative,
 };
 use crate::shape::{self, PromptWire, Transcript};
 
@@ -41,6 +41,10 @@ pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// The model name the agent is started with, and so the mock script's file stem.
 pub const MOCK_MODEL: &str = "fleet-mock";
+
+/// The output budget the mock model runs with: its row sets none, and every
+/// request carries `max_tokens`.
+pub const MOCK_MAX_TOKENS: &str = "4096";
 
 /// The environment variable a live run hands the agent its API key in. The
 /// runner never puts the key on a command line or in its output, and
@@ -353,7 +357,7 @@ fn drive(
         (Some(scripted), _) => Some(scripted.base().to_string()),
         (None, server) => server.map(str::to_string),
     };
-    std::fs::write(scratch.fleet.join("gate.toml"), gate_policy(scenario, council.as_deref()))
+    std::fs::write(scratch.fleet.join("gate.toml"), gate_policy(scenario))
         .context("write the gate policy")?;
     let overlay = &scenario.rc;
     for (path, body) in overlay {
@@ -386,8 +390,13 @@ fn drive(
                     .arg("mock")
                     .arg("--model")
                     .arg(MOCK_MODEL)
+                    .arg("--max-tokens")
+                    .arg(MOCK_MAX_TOKENS)
                     .env("KJ_MOCK_SCRIPT_DIR", scratch.fleet.join("mock")),
             };
+            if let (Some(server), Some(council)) = (&council, &scenario.council) {
+                command = command.arg("--council-server").arg(server).arg("--council-model").arg(council.served_model());
+            }
             command = command
                 .arg("--gate-config")
                 .arg(scratch.fleet.join("gate.toml"))
@@ -410,9 +419,12 @@ fn drive(
             let rc = format!("{}/rc", container::FLEET);
             let mut args = match &scenario.live {
                 Some(live) => vec!["--backend-kind", &live.backend_kind, "--model", &live.model, "--api-key-env", LIVE_KEY_ENV],
-                None => vec!["--backend-kind", "mock", "--model", MOCK_MODEL],
+                None => vec!["--backend-kind", "mock", "--model", MOCK_MODEL, "--max-tokens", MOCK_MAX_TOKENS],
             };
             args.extend(["--gate-config", &gate]);
+            if let (Some(server), Some(council)) = (&council, &scenario.council) {
+                args.extend(["--council-server", server.as_str(), "--council-model", council.served_model()]);
+            }
             if !overlay.is_empty() {
                 args.extend(["--rc-overlay", &rc]);
             }
@@ -454,7 +466,7 @@ fn drive(
     agent.set_trace(config.trace);
     agent.set_secrets(secrets.to_vec());
     let result =
-        converse(&mut agent, scenario, &session_cwd, scratch, council.as_deref(), scripted.as_ref(), config.timeout, failures, notes)
+        converse(&mut agent, scenario, &session_cwd, scratch, scripted.as_ref(), config.timeout, failures, notes)
             .map(|wire| *transcript = Some(wire));
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
@@ -533,23 +545,13 @@ pub const YOLO_GATE: &str = "\
 uncovered = \"allow\"
 ";
 
-/// The gate policy for a run: the scenario's, or the mode's default, with
-/// the council server's address in place of [`COUNCIL_PLACEHOLDER`].
-fn gate_policy(scenario: &Scenario, council: Option<&str>) -> String {
+/// The gate policy for a run: the scenario's, or the mode's default. The
+/// council server comes from the agent's `--council-server`, not the policy.
+fn gate_policy(scenario: &Scenario) -> String {
     match (&scenario.gate, scenario.mode) {
-        (Some(gate), _) => with_council(gate, council),
+        (Some(gate), _) => gate.clone(),
         (None, Mode::Host) => SHIPPED_GATE.to_string(),
         (None, Mode::Contained) => YOLO_GATE.to_string(),
-    }
-}
-
-/// `gate` with the council server's address in place of
-/// [`COUNCIL_PLACEHOLDER`]. The loader refuses a placeholder with no
-/// `[council]`, so `None` leaves nothing to replace.
-fn with_council(gate: &str, council: Option<&str>) -> String {
-    match council {
-        Some(base) => gate.replace(COUNCIL_PLACEHOLDER, base),
-        None => gate.to_string(),
     }
 }
 
@@ -562,7 +564,6 @@ fn converse(
     scenario: &Scenario,
     workspace: &Path,
     scratch: &Scratch,
-    council: Option<&str>,
     scripted: Option<&ScriptedCouncil>,
     timeout: Duration,
     failures: &mut Vec<String>,
@@ -584,7 +585,7 @@ fn converse(
         let permissions_before = sent.permissions;
         if let Some(gate) = &prompt.gate {
             let path = scratch.state.join("config").join("kernel").join("gate.toml");
-            std::fs::write(&path, with_council(gate, council))
+            std::fs::write(&path, gate)
                 .with_context(|| format!("{label}: replace {}", path.display()))?;
         }
         let answered_before = scripted.map_or(0, |s| s.answered().len());
@@ -1149,17 +1150,11 @@ mod tests {
 
     #[test]
     fn each_mode_has_its_own_default_gate() {
-        assert_eq!(gate_policy(&scenario(""), None), SHIPPED_GATE);
-        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\""), None).parse().unwrap();
+        assert_eq!(gate_policy(&scenario("")), SHIPPED_GATE);
+        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\"")).parse().unwrap();
         assert_eq!(contained["global"]["uncovered"].as_str(), Some("allow"));
         let own = scenario("gate = \"[global]\\nallow = [\\\"mkdir\\\"]\\n\"");
-        assert_eq!(gate_policy(&own, None), "[global]\nallow = [\"mkdir\"]\n");
-    }
-
-    #[test]
-    fn the_gate_gets_the_council_servers_address() {
-        let council = scenario("gate = \"[council]\\nserver = \\\"{council}\\\"\\n\"\n[council]\nverdicts = [\"proceed\"]");
-        assert_eq!(gate_policy(&council, Some("http://127.0.0.1:9")), "[council]\nserver = \"http://127.0.0.1:9\"\n");
+        assert_eq!(gate_policy(&own), "[global]\nallow = [\"mkdir\"]\n");
     }
 
     #[test]

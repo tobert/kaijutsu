@@ -1,8 +1,8 @@
 # The assistant stance: the fleet-coordination seat. The seat is durable and
 # models rotate through it. A helper model observes and reports; the spine
 # model interprets and signs the seat's records. The branch is chosen from
-# `.resolved_model`, the effective model; the row's `.model` is only the
-# per-context override and reads null when a context inherits a default.
+# `.resolved_model`, the model the context's character instance binding gives
+# its type; it reads null when the binding has no slot for the type.
 set -e
 model="$(kj context info --json | jq -r '.resolved_model')"
 
