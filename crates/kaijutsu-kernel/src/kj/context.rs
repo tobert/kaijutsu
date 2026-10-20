@@ -290,9 +290,9 @@ struct EgressAssignment {
 pub(crate) enum InstancePlacement {
     /// The context belongs to no instance (a handoff log, scratch).
     None,
-    /// The context is the conversation of a new instance of the row's
-    /// performer, under `senpai`.
-    Start { senpai: Option<kaijutsu_types::CharacterInstanceId> },
+    /// The context is the conversation of a new instance of `performer`,
+    /// under `senpai`.
+    Start { performer: kaijutsu_types::PrincipalId, senpai: Option<kaijutsu_types::CharacterInstanceId> },
     /// The context is the next conversation of an existing instance: a
     /// rotation appends the next binding, read fresh from the static settings.
     Append { instance: kaijutsu_types::CharacterInstanceId },
@@ -314,10 +314,7 @@ fn insert_new_context_checked(db: &KernelDb, row: &ContextRow, placement: Instan
 pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement: InstancePlacement) -> KernelDbResult<()> {
     let default_ws = db.get_or_create_default_workspace(row.created_by)?;
     let performer = match placement {
-        InstancePlacement::Start { .. } => {
-            let performer = row.played_by.ok_or_else(|| {
-                KernelDbError::Validation("a context that starts an instance names its performer".into())
-            })?;
+        InstancePlacement::Start { performer, .. } => {
             if db.get_character(performer)?.filter(|sheet| sheet.retired_at.is_none()).is_none() {
                 return Err(KernelDbError::Validation("performer must name a live character".into()));
             }
@@ -337,13 +334,12 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
     db.insert_context_with_document(row, default_ws)?;
     match placement {
         InstancePlacement::None => {}
-        InstancePlacement::Start { senpai } => {
-            let performer = performer.expect("a start names its performer");
+        InstancePlacement::Start { performer, senpai } => {
             db.start_character_instance(performer, senpai, row.context_id, row.created_by)?;
         }
         InstancePlacement::Append { instance } => {
             let performer = performer.expect("an append names its instance's character");
-            let cast = db.character_default_cast(performer)?.map(|cast| cast.cast_id);
+            let cast = db.character_cast(performer)?.map(|cast| cast.cast_id);
             db.append_binding(instance, cast, None, row.context_id)?;
         }
         InstancePlacement::Join { instance, seq } => db.join_instance(row.context_id, instance, seq)?,
@@ -1031,12 +1027,11 @@ impl KjDispatcher {
                 _ => "no instance".to_string(),
             };
             text.push_str(&format!(
-                "{} {} {performer} {}/{} ({instance}, cast {}, role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}\n",
+                "{} {} {performer} {}/{} ({instance}, role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}\n",
                 start.turn_id.short(),
                 start.started_at,
                 start.provider,
                 start.model,
-                start.cast.as_deref().unwrap_or("-"),
                 start.role,
                 turn.llm_calls,
                 turn.input_tokens,
@@ -1050,7 +1045,6 @@ impl KjDispatcher {
                 "context_id": start.context_id.to_hex(),
                 "performer": start.performer.to_hex(),
                 "performer_name": performer,
-                "cast": start.cast,
                 "role": start.role,
                 "provider": start.provider,
                 "model": start.model,
@@ -1346,7 +1340,7 @@ impl KjDispatcher {
         // root of, or else the instance of the caller's own context. A caller
         // with no context has nothing to answer to, and the kernel does not
         // guess one.
-        let (senpai_instance, senpai_conversation) = {
+        let senpai_instance = {
             let db = self.kernel_db().lock();
             let (context, via_flag) = match senpai {
                 Some(senpai) => match super::refs::resolve_context_arg(Some(senpai), caller, &db) {
@@ -1380,7 +1374,7 @@ impl KjDispatcher {
                 }
             }
             match db.instance_conversation(instance.instance_id) {
-                Ok(Some(conversation)) => (instance.instance_id, conversation),
+                Ok(Some(_)) => instance.instance_id,
                 Ok(None) => return KjResult::Err(format!(
                     "kj kohai create: character instance {} has no conversation", instance.instance_id.short()
                 )),
@@ -1497,8 +1491,6 @@ impl KjDispatcher {
             let row = ContextRow {
                 context_id: new_id,
                 label: Some(label.to_string()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
                 context_type,
@@ -1514,13 +1506,11 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
-                played_by: Some(performer),
-                senpai_ctx: Some(senpai_conversation),
+                played_by: None,
             };
             let db = self.kernel_db().lock();
-            if let Err(e) = insert_new_context_checked(&db, &row, InstancePlacement::Start { senpai: Some(senpai_instance) }) {
+            if let Err(e) = insert_new_context_checked(&db, &row, InstancePlacement::Start { performer, senpai: Some(senpai_instance) }) {
                 return KjResult::Err(format!("kj kohai create: {e}"));
             }
             crate::runtime::admission::ContextAdmission::for_inserted(&row)
@@ -1766,8 +1756,6 @@ impl KjDispatcher {
             let row = ContextRow {
                 context_id: new_id,
                 label: Some(SCRATCH_LABEL.to_string()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
@@ -1783,10 +1771,8 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
@@ -2315,9 +2301,7 @@ impl KjDispatcher {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            provider: None,
-            model: None,
-            cast_id: None,
+            played_by: None,
             ..predecessor.clone()
         };
         let admission = {
@@ -2902,7 +2886,7 @@ mod tests {
             second.message()
         );
         let scratch = d.kernel_db().lock().find_context_by_label("scratch").unwrap().unwrap();
-        assert_eq!(scratch.senpai_ctx, None, "scratch is a system context with no parent and no senpai");
+        assert_eq!(d.kernel_db().lock().senpai_conversation_of(scratch.context_id).unwrap(), None, "scratch is a system context with no parent and no senpai");
     }
 
     #[tokio::test]
@@ -3290,10 +3274,10 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let default = db.find_context_by_label("kohai-default").unwrap().unwrap();
-        assert_eq!((default.forked_from, default.senpai_ctx), (Some(caller_ctx), Some(caller_ctx)));
+        assert_eq!((default.forked_from, db.senpai_conversation_of(default.context_id).unwrap()), (Some(caller_ctx), Some(caller_ctx)));
         let named = db.find_context_by_label("kohai-parented").unwrap().unwrap();
         assert_eq!(named.forked_from, Some(elsewhere), "--parent still sets provenance");
-        assert_eq!(named.senpai_ctx, Some(caller_ctx), "but the senpai is the context the create ran from");
+        assert_eq!(db.senpai_conversation_of(named.context_id).unwrap(), Some(caller_ctx), "but the senpai is the context the create ran from");
     }
 
     /// A create from no context has no senpai to name, and the kernel does
@@ -3610,7 +3594,6 @@ mod tests {
         let seat = register_context(&d, Some("banto"), Some(root), amy);
         let db = d.kernel_db().lock();
         db.update_played_by(root, Some(amy)).unwrap();
-        db.write_stored_root_ctx(amy, Some(root)).unwrap();
         db.seed_test_cast(banto, "mock", "mock-banto", &["default"]).unwrap();
         db.update_played_by(seat, Some(banto)).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
@@ -3657,7 +3640,8 @@ mod tests {
         assert!(new.promoted_at.is_some(), "the successor takes the ring seat");
         assert_eq!(new.forked_from, Some(f.root), "created from the predecessor's own parent");
         assert_eq!(new.context_type, before.context_type);
-        assert_eq!((new.played_by, new.senpai_ctx), (before.played_by, before.senpai_ctx));
+        assert_eq!(new.played_by, before.played_by);
+        assert_eq!(db.senpai_conversation_of(successor).unwrap(), db.senpai_conversation_of(before.context_id).unwrap());
         assert_eq!(new.system_prompt.as_deref(), Some("seat prompt"));
         assert_eq!(new.workspace_id, before.workspace_id);
         let env: std::collections::HashMap<_, _> = db.get_context_env(successor).unwrap().into_iter().map(|e| (e.key, e.value)).collect();
@@ -4118,11 +4102,11 @@ mod tests {
             let db = d.kernel_db().lock();
             let ws = db.get_or_create_default_workspace(amy).unwrap();
             db.insert_context_with_document(&crate::kernel_db::ContextRow {
-                context_id: bare, label: Some(s("bare-caller")), provider: None, model: None, system_prompt: None,
+                context_id: bare, label: Some(s("bare-caller")), system_prompt: None,
                 context_state: ContextState::Live, context_type: s("default"), created_at: 1, created_by: amy,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
                 concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                cast_id: None, origin_host: None, played_by: Some(amy), senpai_ctx: None,
+                origin_host: None, played_by: None,
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
@@ -4209,8 +4193,6 @@ mod tests {
         let row = crate::kernel_db::ContextRow {
             context_id,
             label: Some(s("must-not-insert")),
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: s("default"),
@@ -4226,12 +4208,10 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
-            played_by: Some(performer),
-            senpai_ctx: None,
+            played_by: None,
         };
-        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, InstancePlacement::Start { senpai: None }).unwrap_err();
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, InstancePlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("performer must name a live character"), "{error}");
         let db = d.kernel_db().lock();
         assert!(db.get_context(context_id).unwrap().is_none());
@@ -4257,8 +4237,6 @@ mod tests {
         let row = crate::kernel_db::ContextRow {
             context_id,
             label: Some(s("must-not-self-review")),
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: s("default"),
@@ -4274,12 +4252,10 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
-            played_by: Some(performer),
-            senpai_ctx: None,
+            played_by: None,
         };
-        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, InstancePlacement::Start { senpai: None }).unwrap_err();
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, InstancePlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("nobody reviews") && error.to_string().contains("reviewer-changed-after-validation"), "{error}");
         let db = d.kernel_db().lock();
         assert!(db.get_context(context_id).unwrap().is_none());
@@ -5520,7 +5496,7 @@ mod tests {
         let db = d.kernel_db().lock();
         let turn_id = kaijutsu_types::TurnId::new();
         db.begin_turn(&crate::TurnStart {
-            turn_id, context_id: ctx, performer: PrincipalId::new(), cast: Some("house".into()),
+            turn_id, context_id: ctx, performer: PrincipalId::new(),
             role: "coder".into(), provider: "deepseek".into(), model: "deepseek-flash".into(),
             instance: None, binding_seq: None, started_at: at,
         }).unwrap();
@@ -5530,7 +5506,7 @@ mod tests {
     }
 
     /// `kj context info` totals the context's turns, and `kj context turns`
-    /// lists them newest first with the cast, model and tier that answered.
+    /// lists them newest first with the model and role that answered.
     #[tokio::test]
     async fn context_info_totals_turns_and_turns_lists_them() {
         use crate::kj::KjResult;
@@ -5553,7 +5529,7 @@ mod tests {
         assert!(listed.is_ok(), "{}", listed.message());
         let msg = listed.message();
         assert!(msg.find(&second.short()).unwrap() < msg.find(&first.short()).unwrap(), "newest first: {msg}");
-        assert!(msg.contains("house") && msg.contains("deepseek/deepseek-flash") && msg.contains("no instance")
+        assert!(msg.contains("deepseek/deepseek-flash") && msg.contains("no instance")
             && msg.contains("end_turn"), "{msg}");
         let KjResult::Ok { data: Some(data), .. } = &listed else { panic!("turns carries a record") };
         assert_eq!(data.as_array().unwrap().len(), 2);
@@ -6647,8 +6623,7 @@ mod tests {
         assert!(!root_situation.contains("<senpai"), "a root console has no senpai: {root_situation}");
         assert!(root_situation.contains("<instance label=\"amy\""), "{root_situation}");
 
-        // The edge is the instance's: moving it changes the fact, whatever
-        // the stored column says.
+        // The edge is the instance's: moving it changes the fact.
         {
             let db = d.kernel_db().lock();
             let lane_instance = db.context_instance(lane).unwrap().unwrap().0;

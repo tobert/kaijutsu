@@ -16,7 +16,7 @@ use kaijutsu_types::{BackendId, CastId, CharacterInstanceId, ContextId, Principa
 
 use super::{
     BackendModelRow, CAST_SLOT_COLS, CastRow, CastSlotRow, KernelDb, KernelDbError, KernelDbResult,
-    LlmDefaultsRow, ModelTunablesRow, blob_param, now_millis, read_backend_id, read_context_id,
+    ModelTunablesRow, blob_param, now_millis, read_backend_id, read_context_id,
     read_opt_cast_id, read_opt_context_id, read_opt_principal_id, read_principal_id, row_to_cast_slot,
 };
 
@@ -420,7 +420,7 @@ impl KernelDb {
         conversation_ctx: ContextId,
         created_by: PrincipalId,
     ) -> KernelDbResult<CharacterInstanceRow> {
-        let cast = self.character_default_cast(principal_id)?.map(|cast| cast.cast_id);
+        let cast = self.character_cast(principal_id)?.map(|cast| cast.cast_id);
         self.start_instance(principal_id, senpai, cast, None, conversation_ctx, created_by)
     }
 
@@ -797,6 +797,19 @@ impl MigCtx {
     }
 }
 
+/// The `llm_defaults` row as the migration reads it, where the table still
+/// exists.
+struct OldLlmDefaults {
+    default_backend: String,
+    default_model: String,
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    effort: Option<String>,
+    thinking_budget: Option<i64>,
+    thinking_style: Option<String>,
+}
+
 struct MigCharacter {
     handoff_ctx: Option<ContextId>,
     root_ctx: Option<ContextId>,
@@ -809,7 +822,7 @@ struct Catalog {
     slots: HashMap<CastId, Vec<CastSlotRow>>,
     backend_by_name: HashMap<String, BackendId>,
     models: HashMap<(BackendId, String), BackendModelRow>,
-    defaults: Option<LlmDefaultsRow>,
+    defaults: Option<OldLlmDefaults>,
 }
 
 impl Catalog {
@@ -858,25 +871,29 @@ impl Catalog {
                 models.insert((row.backend_id, row.model_id.clone()), row);
             }
         }
-        let defaults = conn
-            .query_row(
-                "SELECT default_backend, default_model, max_tokens, temperature, top_p, effort,
-                        thinking_budget, thinking_style FROM llm_defaults WHERE id = 1",
-                [],
-                |r| {
-                    Ok(LlmDefaultsRow {
-                        default_backend: r.get(0)?,
-                        default_model: r.get(1)?,
-                        max_tokens: r.get(2)?,
-                        temperature: r.get(3)?,
-                        top_p: r.get(4)?,
-                        effort: r.get(5)?,
-                        thinking_budget: r.get(6)?,
-                        thinking_style: r.get(7)?,
-                    })
-                },
-            )
-            .optional()?;
+        let defaults = if KernelDb::has_table(conn, "llm_defaults")? {
+            conn
+                .query_row(
+                    "SELECT default_backend, default_model, max_tokens, temperature, top_p, effort,
+                            thinking_budget, thinking_style FROM llm_defaults WHERE id = 1",
+                    [],
+                    |r| {
+                        Ok(OldLlmDefaults {
+                            default_backend: r.get(0)?,
+                            default_model: r.get(1)?,
+                            max_tokens: r.get(2)?,
+                            temperature: r.get(3)?,
+                            top_p: r.get(4)?,
+                            effort: r.get(5)?,
+                            thinking_budget: r.get(6)?,
+                            thinking_style: r.get(7)?,
+                        })
+                    },
+                )
+                .optional()?
+        } else {
+            None
+        };
         Ok(Self { casts, slots, backend_by_name, models, defaults })
     }
 

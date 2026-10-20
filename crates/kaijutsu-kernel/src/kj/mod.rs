@@ -1603,7 +1603,7 @@ pub(crate) mod test_helpers {
         // Contexts registered under `context` are its kohai, each run by a
         // stand-in character.
         let children: Vec<ContextId> = db.list_all_contexts().unwrap().into_iter()
-            .filter(|row| row.senpai_ctx == Some(context) && row.context_id != context)
+            .filter(|row| row.forked_from == Some(context) && row.context_id != context)
             .map(|row| row.context_id)
             .collect();
         for child in children {
@@ -1657,8 +1657,6 @@ pub(crate) mod test_helpers {
             let row = crate::kernel_db::ContextRow {
                 context_id: id,
                 label: label.map(|s| s.to_string()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
@@ -1674,13 +1672,14 @@ pub(crate) mod test_helpers {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
                 // A context registered under a parent answers to it, as a create or a fork would.
-                senpai_ctx: forked_from,
             };
             db.insert_context(&row).unwrap();
+            // A context registered under a parent answers to it once both
+            // have instances, as a create or a fork would.
+            db.note_senpai_intent(id, forked_from).unwrap();
 
             // Grant test contexts a fully-capable loadout by default so the kj
             // capability gates don't trip verb-*mechanics* tests. Capability

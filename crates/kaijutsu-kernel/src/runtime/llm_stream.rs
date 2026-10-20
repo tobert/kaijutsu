@@ -698,11 +698,6 @@ pub(super) async fn spawn_admitted_turn(
         },
         None => {
             let db = kernel_db.lock();
-            let current = db.get_context(context_id).map_err(|error| error.to_string())?
-                .ok_or("context disappeared during turn preparation")?;
-            if current.played_by != Some(identity.actor) {
-                return Err("performer changed during turn preparation; submit a new drive".into());
-            }
             Some(db.begin_continuation(context_id, kaijutsu_types::now_millis() as i64)
                 .map_err(|error| format!("Could not open continuation window: {error}"))?.epoch)
         },
@@ -719,7 +714,6 @@ pub(super) async fn spawn_admitted_turn(
         performer: performer.principal_id,
         instance: Some(bound.instance),
         binding_seq: Some(bound.seq),
-        cast: bound.cast.clone(),
         role: context_type.clone(),
         provider: backend_name,
         model: model_name.clone(),
@@ -6589,8 +6583,6 @@ mod usage_tests {
             db.insert_context(&crate::ContextRow {
                 context_id: ctx,
                 label: None,
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
@@ -6606,10 +6598,8 @@ mod usage_tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             })
             .unwrap();
             for bp in breakpoints {
@@ -6630,7 +6620,7 @@ mod usage_tests {
         let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         // `Some` provenance means a started turn has a row to add counts to.
         kernel_db.lock().begin_turn(&crate::TurnStart {
-            turn_id: turn_lease.id(), context_id: ctx, performer: actor, cast: None,
+            turn_id: turn_lease.id(), context_id: ctx, performer: actor,
             role: "default".into(), provider: "mock".into(), model: "mock-model".into(),
             instance: None, binding_seq: None, started_at: kaijutsu_types::now_millis() as i64,
         }).unwrap();
@@ -7852,22 +7842,22 @@ mod lifetime_tests {
             let senpai = ContextId::new();
             let ws = db.get_or_create_default_workspace(reviewer).unwrap();
             db.insert_context_with_document(&crate::ContextRow {
-                context_id: senpai, label: Some("reviewer-seat".into()), provider: None, model: None, system_prompt: None,
+                context_id: senpai, label: Some("reviewer-seat".into()), system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "default".into(), created_at: 0, created_by: reviewer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(reviewer), senpai_ctx: None,
+                demoted_at: None, paused_at: None, origin_host: None,
+                played_by: None,
             }, ws).unwrap();
             db.insert_context(&crate::ContextRow {
-                context_id: context, label: None, provider: None, model: None, system_prompt: None,
+                context_id: context, label: None, system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "default".into(), created_at: 0, created_by: reviewer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(actor), senpai_ctx: Some(senpai),
+                demoted_at: None, paused_at: None, origin_host: None,
+                played_by: None,
             }).unwrap();
             db.update_played_by(senpai, Some(reviewer)).unwrap();
             // The performer's cast gives its binding a `default` slot only
@@ -7877,6 +7867,7 @@ mod lifetime_tests {
                 db.seed_test_cast(actor, "mock", "mock-model", &["default"]).unwrap();
             }
             db.update_played_by(context, Some(actor)).unwrap();
+            db.set_context_senpai(context, Some(senpai)).unwrap();
         }
         if let Some(mock) = mock {
             kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));
@@ -7895,13 +7886,13 @@ mod lifetime_tests {
         let db = kernel.kernel_db().lock();
         let ws = db.get_or_create_default_workspace(creator).unwrap();
         db.insert_context_with_document(&crate::ContextRow {
-            context_id: context, label: None, provider: None, model: None, system_prompt: None,
+            context_id: context, label: None, system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".into(), created_at: 0, created_by: creator,
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
             preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-            demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-            played_by: None, senpai_ctx: None,
+            demoted_at: None, paused_at: None, origin_host: None,
+            played_by: None,
         }, ws).unwrap();
         context
     }
@@ -7965,7 +7956,6 @@ mod lifetime_tests {
         assert_eq!((turn.start.provider.as_str(), turn.start.model.as_str()), ("mock", "mock-model"));
         let (instance, seq) = db.context_instance(context).unwrap().expect("the context has an instance");
         assert_eq!((turn.start.instance, turn.start.binding_seq), (Some(instance), Some(seq)), "the row names the binding it ran on");
-        assert_eq!(turn.start.cast.as_deref(), Some("test-default-mock-mock-model"), "the row names the cast the binding was written from");
         assert!(turn.ended_at.is_some_and(|ended| ended >= turn.start.started_at));
         assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(
@@ -8014,7 +8004,7 @@ mod lifetime_tests {
         let lease = kernel.turns().begin(context);
         let performer = kernel.kernel_db().lock().get_context(context).unwrap().unwrap().played_by.unwrap();
         kernel.kernel_db().lock().begin_turn(&crate::TurnStart {
-            turn_id: lease.id(), context_id: context, performer, cast: None, role: "default".into(),
+            turn_id: lease.id(), context_id: context, performer, role: "default".into(),
             provider: "mock".into(), model: "mock-model".into(), instance: None, binding_seq: None, started_at: 1,
         }).unwrap();
         let error = spawn_admitted_turn(&kernel, context, &after, call.clone(), call.principal_id,
@@ -8618,14 +8608,14 @@ mod lifetime_tests {
             let instance = db.context_instance_row(context).unwrap().unwrap();
             let ws = db.get_or_create_default_workspace(performer).unwrap();
             db.insert_context_with_document(&crate::ContextRow {
-                context_id: successor, label: None, provider: None, model: None, system_prompt: None,
+                context_id: successor, label: None, system_prompt: None,
                 context_state: ContextState::Live, context_type: "default".into(), created_at: 0, created_by: performer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(performer), senpai_ctx: None,
+                demoted_at: None, paused_at: None, origin_host: None,
+                played_by: None,
             }, ws).unwrap();
-            let cast = db.character_default_cast(performer).unwrap().unwrap();
+            let cast = db.character_cast(performer).unwrap().unwrap();
             db.append_binding(instance.instance_id, Some(cast.cast_id), None, successor).unwrap();
             (successor, cast.label)
         };

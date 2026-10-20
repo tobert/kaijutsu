@@ -32,7 +32,7 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
         let row = kernel.kernel_db.lock().get_context(lane).unwrap().unwrap();
         assert_eq!(row.forked_from, Some(parent.context_id));
         assert_eq!(row.created_by, root.principal_id);
-        assert_eq!(row.senpai_ctx, Some(parent.context_id), "the context it was created from is its senpai");
+        assert_eq!(kernel.kernel_db.lock().senpai_conversation_of(lane).unwrap(), Some(parent.context_id), "the context it was created from is its senpai");
         assert_eq!(row.context_type, "coder");
         let performer = kernel.kernel_db.lock().get_character_by_name(PERFORMER).unwrap().unwrap();
         assert_eq!(row.played_by, Some(performer.principal_id), "the context is the conversation of an instance of the named character");

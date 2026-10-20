@@ -358,8 +358,6 @@ impl KjDispatcher {
         let row = ContextRow {
             context_id: new_id,
             label: Some(label.clone()),
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "handoff".to_string(),
@@ -375,10 +373,8 @@ impl KjDispatcher {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         db.insert_context_with_document(&row, default_ws)
             .map_err(|e| e.to_string())?;

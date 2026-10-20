@@ -128,8 +128,6 @@ macro_rules! performer_sql {
 pub struct ContextRow {
     pub context_id: ContextId,
     pub label: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub context_state: ContextState,
     pub context_type: String,
@@ -165,12 +163,6 @@ pub struct ContextRow {
     /// attachment wakeup fire) and rejects turn-starts loudly (seam: kernel
     /// turn-start).
     pub paused_at: Option<i64>,
-    /// The cast this context plays under, or `None` for "no ensemble
-    /// assigned" — resolution falls through to the registry default in that
-    /// case (see `crate::model_resolution::resolve_context_model`). Distinct
-    /// from `provider`/`model` above: those are an explicit PER-CONTEXT
-    /// override that always wins over a cast slot when set.
-    pub cast_id: Option<CastId>,
     /// Advisory hostname the registering client self-reported (`gethostname`
     /// on the kaijutsu-mcp side today), or `None` when unknown — an old
     /// client that never called `setContextOriginHost`, a creation path with
@@ -185,13 +177,20 @@ pub struct ContextRow {
     pub origin_host: Option<String>,
     /// The character whose performance this context is, or `None` for a
     /// context with no character instance (a score context, a file document,
-    /// the handoff log). Reads return the principal of the context's
-    /// character instance; the stored column is written alongside on a new
-    /// row and read by nothing. See `docs/senpai-kohai.md`, "The model".
+    /// the handoff log). Read from the context's character instance; no
+    /// column stores it, and `write_context` refuses a row that sets it. See
+    /// `docs/senpai-kohai.md`, "The model".
     pub played_by: Option<PrincipalId>,
-    /// Stored for the column's removal; nothing reads it for logic. The senpai
-    /// edge is `character_instances.senpai_instance`.
-    pub senpai_ctx: Option<ContextId>,
+}
+
+/// The columns of a pre-instance `contexts` row that `senpai-edges-v1` reads.
+struct OldContext {
+    context_id: ContextId,
+    label: Option<String>,
+    created_at: i64,
+    forked_from: Option<ContextId>,
+    archived_at: Option<i64>,
+    played_by: Option<PrincipalId>,
 }
 
 /// One explicit model-drive epoch that may receive automatic continuation.
@@ -227,9 +226,16 @@ impl ContextRow {
     }
 }
 
-/// Adds the senpai edge to a `contexts` table written before it existed.
-const SENPAI_COLUMN_ALTER: &str =
-    "ALTER TABLE contexts ADD COLUMN senpai_ctx BLOB REFERENCES contexts(context_id)";
+/// Columns a database written before character instances may lack, added so
+/// `senpai-edges-v1` and `instances-v1` can read them; the drop that follows
+/// `instances-v1` removes them. Each is `(table, column, definition)`.
+const PRE_INSTANCE_COLUMNS: [(&str, &str, &str); 5] = [
+    ("contexts", "cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
+    ("contexts", "played_by", "BLOB"),
+    ("contexts", "senpai_ctx", "BLOB REFERENCES contexts(context_id)"),
+    ("characters", "root_ctx", "BLOB REFERENCES contexts(context_id) ON DELETE SET NULL"),
+    ("characters", "default_cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
+];
 
 /// Hard cap on the number of contexts holding a ring-0 seat
 /// (`promoted_at IS NOT NULL AND archived_at IS NULL`) at once. Ring 0
@@ -470,13 +476,6 @@ pub struct PresetRow {
     pub preset_id: PresetId,
     pub label: String,
     pub description: Option<String>,
-    /// The cast this preset assigns at fork/apply time, or `None` for "move
-    /// no model knobs" (the three factory presets' shape). Narrowed from the
-    /// old `provider`/`model` columns (Track D, 2026-08-03): a preset now
-    /// references a cast rather than pinning a provider/model pair directly
-    /// — "cast = who plays; preset = patch recall over verb args."
-    pub cast_id: Option<CastId>,
-    pub system_prompt: Option<String>,
     pub created_at: i64,
     pub created_by: PrincipalId,
 }
@@ -603,8 +602,6 @@ pub struct TurnStart {
     /// a turn recorded before turns named them.
     pub instance: Option<CharacterInstanceId>,
     pub binding_seq: Option<i64>,
-    /// Label of the cast the binding was written from; `None` when it had none.
-    pub cast: Option<String>,
     /// The context type the binding slot was matched on.
     pub role: String,
     pub provider: String,
@@ -812,16 +809,11 @@ CREATE TABLE IF NOT EXISTS workspace_paths (
 );
 
 -- ── Presets ─────────────────────────────────────────────────────
--- `cast_id` replaces the old `provider`/`model` columns (Track D,
--- 2026-08-03): a preset NARROWS to a cast reference rather than pinning a
--- provider/model pair itself. NULL means "move no model knobs" — the three
--- factory presets' shape.
+-- A preset recalls fork filters (`preset_args`); it names no model.
 CREATE TABLE IF NOT EXISTS presets (
     preset_id    BLOB NOT NULL PRIMARY KEY,
     label        TEXT NOT NULL UNIQUE,
     description  TEXT,
-    cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
-    system_prompt TEXT,
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL
 );
@@ -864,8 +856,6 @@ CREATE TABLE IF NOT EXISTS contexts (
     context_id   BLOB NOT NULL PRIMARY KEY
         REFERENCES documents(document_id) ON DELETE CASCADE,
     label        TEXT,
-    provider     TEXT,
-    model        TEXT,
     system_prompt TEXT,
     context_state TEXT NOT NULL DEFAULT 'live',
     context_type TEXT NOT NULL DEFAULT 'default',
@@ -881,22 +871,9 @@ CREATE TABLE IF NOT EXISTS contexts (
     promoted_at  INTEGER,
     demoted_at   INTEGER,
     paused_at    INTEGER,
-    -- The cast this context plays under (NULL = no ensemble assigned, falls
-    -- through to the registry default). Distinct from `provider`/`model`
-    -- above, which are an explicit per-context override that always wins.
-    cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     -- Advisory hostname the registering client self-reported at creation
     -- (NULL = unknown). See `ContextRow::origin_host`'s doc comment.
     origin_host  TEXT,
-    -- The character whose performance this context is (NULL = nobody plays
-    -- it). A bare principal id, same as `created_by` — the kernel never
-    -- reads `auth.db`, so no FK reaches it. See `ContextRow::played_by`'s
-    -- doc comment.
-    played_by    BLOB,
-    -- The senpai context: who this context answers to. NULL only for a root
-    -- console and the parentless system contexts. No ON DELETE action: history
-    -- is retained, and a delete that would orphan a kohai must fail loudly.
-    senpai_ctx   BLOB REFERENCES contexts(context_id),
     -- The character instance this context belongs to and the binding `seq` it
     -- runs on (NULL = none: scratch, the handoff log, system contexts). Both
     -- are set once and never changed; a trigger refuses the change.
@@ -1125,23 +1102,22 @@ CREATE TABLE IF NOT EXISTS context_usage (
 -- One row per model turn, keyed on the `TurnId` the runtime minted. The row
 -- is written when the turn starts and finished when it ends; `ended_at` NULL
 -- means the turn is running or the kernel stopped before it could say. It
--- names who performed the turn, under which cast and role, and which
--- provider and model answered through which resolver tier. The token columns
+-- names who performed the turn, under which role, and which provider and
+-- model answered; `instance_id` and `binding_seq` name the binding it ran on.
+-- The token columns
 -- are the provider's RAW counts summed over every call in the turn, so they
 -- are spend: Claude's `input_tokens` excludes the cache columns, DeepSeek's
 -- already includes `cache_read_tokens`. `context_usage` stays the last-call
 -- fill gauge and normalizes `input_tokens`; the two never mix. History is
--- retained: no ON DELETE action on `context_id`, and `performer` and
--- `cast_label` are names as the turn saw them, with no foreign key.
+-- retained: no ON DELETE action on `context_id`, and `performer` is a name as
+-- the turn saw it, with no foreign key.
 CREATE TABLE IF NOT EXISTS turns (
     turn_id            BLOB    NOT NULL PRIMARY KEY,
     context_id         BLOB    NOT NULL REFERENCES contexts(context_id),
     performer          BLOB    NOT NULL,
-    cast_label         TEXT,
     role               TEXT    NOT NULL,
     provider           TEXT    NOT NULL,
     model              TEXT    NOT NULL,
-    model_source       TEXT    NOT NULL,
     started_at         INTEGER NOT NULL,
     ended_at           INTEGER,
     stop_reason        TEXT,
@@ -1476,8 +1452,8 @@ CREATE TABLE IF NOT EXISTS backend_models (
     model_id       TEXT NOT NULL,
     context_window INTEGER CHECK (context_window IS NULL OR context_window > 0),
     extra          TEXT,
-    -- This model's own tunables on this backend, between a cast slot and the
-    -- llm_defaults floor. NULL falls through to the floor.
+    -- This model's own tunables on this backend. A binding copies them into a
+    -- slot whose own column is NULL.
     max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
     temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
     top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
@@ -1485,22 +1461,6 @@ CREATE TABLE IF NOT EXISTS backend_models (
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
     PRIMARY KEY (backend_id, model_id)
-);
-
--- Global LLM defaults (singleton, id=1 — same pin as the `kernel` table).
--- The kernel-wide default backend/model plus the tunable floor a cast slot
--- falls back to when its own column is NULL. A NULL tunable means "provider
--- default" and that is a real answer, not a missing one.
-CREATE TABLE IF NOT EXISTS llm_defaults (
-    id               INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    default_backend  TEXT    NOT NULL,
-    default_model    TEXT    NOT NULL CHECK (default_model != ''),
-    max_tokens       INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
-    temperature      REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
-    top_p            REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
-    effort           TEXT,
-    thinking_budget  INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
-    thinking_style   TEXT
 );
 
 -- ── Casts (named ensembles) ────────────────────────────────────
@@ -1516,8 +1476,8 @@ CREATE TABLE IF NOT EXISTS casts (
     created_by  BLOB NOT NULL
 );
 
--- One role's seat in a cast. A NULL tunable falls back to `llm_defaults` at
--- resolution time (see `ResolvedSlot`). `loadout` is a stub for a future
+-- One role's seat in a cast. A NULL tunable takes the model's `backend_models`
+-- value when a binding copies the slot. `loadout` is a stub for a future
 -- capability/loadout reference — stored, no consumer yet.
 CREATE TABLE IF NOT EXISTS cast_slots (
     cast_id         BLOB NOT NULL REFERENCES casts(cast_id) ON DELETE CASCADE,
@@ -1559,14 +1519,10 @@ CREATE TABLE IF NOT EXISTS characters (
     -- between contexts, not a column here — see docs/character.md, "Roots
     -- and rotation".
     root             INTEGER NOT NULL DEFAULT 0,
-    -- A root character's root context: type `root`, labeled with the
-    -- character's name, played by it, with no parent. NULL for an ordinary
-    -- character. SET NULL on delete for the same reason as `handoff_ctx`.
-    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    -- The cast a context this character plays resolves through when the
-    -- context has no cast of its own (docs/character.md, "A character has a
-    -- default cast"). Removing the cast clears it.
-    default_cast_id  BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
+    -- The cast whose slots a new binding of this character's instance copies
+    -- (docs/senpai-kohai.md, "The model"). Read only when a binding is
+    -- written. Removing the cast clears it.
+    cast_id          BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -2462,8 +2418,7 @@ impl KernelDb {
     /// Move `context`'s instance under the instance of `senpai`, or make it a
     /// top with `None`. Refuses an instance that is its own senpai, a cycle, a
     /// missing row, and a context with no instance. Who may move it, and the
-    /// pending-ask rule, belong to the caller. The context's stored
-    /// `senpai_ctx` is written alongside and read by nothing.
+    /// pending-ask rule, belong to the caller.
     pub fn set_context_senpai(&self, context: ContextId, senpai: Option<ContextId>) -> KernelDbResult<()> {
         let instance = self.require_context_instance(context)?;
         let senpai_instance = match senpai {
@@ -2471,16 +2426,23 @@ impl KernelDb {
             None => None,
         };
         self.set_senpai_instance(instance.instance_id, senpai_instance)?;
-        self.conn.execute(
-            "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
-            params![senpai.as_ref().map(|id| id.as_bytes().to_vec()), blob_param(context.as_bytes())],
-        )?;
         // The migration's note stands until the senpai is set again.
         self.conn.execute(
             "DELETE FROM senpai_migration_report WHERE context_id = ?1",
             params![blob_param(context.as_bytes())],
         )?;
         Ok(())
+    }
+
+    /// Test fixture: the conversation of the senpai instance of `context`'s
+    /// instance, or `None` for a top or a context with no instance.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn senpai_conversation_of(&self, context: ContextId) -> KernelDbResult<Option<ContextId>> {
+        let Some(instance) = self.context_instance_row(context)? else { return Ok(None) };
+        match instance.senpai_instance {
+            Some(senpai) => self.instance_conversation(senpai),
+            None => Ok(None),
+        }
     }
 
     /// The conversations of the live kohai of `context`'s instance: the active
@@ -3035,6 +2997,10 @@ impl KernelDb {
                      embedding_config names an embedding service (docs/synthesis.md)");
             }
         }
+        // A database written before character instances still has the columns
+        // the instance model replaced; `contexts.provider` is in every such
+        // database and in no other. Decided before anything below changes it.
+        let pre_instance = Self::has_column(conn, "contexts", "provider")?;
         let alters = [
             "ALTER TABLE context_continuations ADD COLUMN invalidated_through INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE approval_pair_handoffs ADD COLUMN abandoned_reason TEXT",
@@ -3046,11 +3012,8 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN demoted_at INTEGER",
             "ALTER TABLE contexts ADD COLUMN paused_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
-            "ALTER TABLE contexts ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
-            "ALTER TABLE contexts ADD COLUMN played_by BLOB",
-            SENPAI_COLUMN_ALTER,
             "ALTER TABLE contexts ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
             "ALTER TABLE contexts ADD COLUMN binding_seq INTEGER",
             "ALTER TABLE turns ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
@@ -3063,8 +3026,6 @@ impl KernelDb {
                  CHECK (max_concurrent IS NULL OR max_concurrent > 0)",
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
-            "ALTER TABLE characters ADD COLUMN default_cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
             "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
             "ALTER TABLE backend_models ADD COLUMN temperature REAL \
                  CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
@@ -3130,11 +3091,29 @@ impl KernelDb {
         conn.execute_batch("DROP TABLE IF EXISTS approval_identity_config")?;
         Self::remove_retired_classifier(conn)?;
         Self::migrate_house_capability(conn)?;
-        Self::migrate_senpai_edges(conn)?;
-        Self::drop_old_routing(conn)?;
+        if pre_instance {
+            Self::ensure_pre_instance_columns(conn)?;
+            Self::migrate_senpai_edges(conn)?;
+            Self::drop_old_routing(conn)?;
+        }
         Self::drop_structural_edges(conn)?;
         Self::ensure_instance_guards(conn)?;
-        Self::migrate_instances(conn)?;
+        if pre_instance {
+            Self::migrate_instances(conn)?;
+            Self::drop_pre_instance_columns(conn)?;
+        }
+        Ok(())
+    }
+
+    /// Add the pre-instance columns a very old database lacks, so the two
+    /// migrations that read them find them. Only called on a database that
+    /// still has `contexts.provider`.
+    fn ensure_pre_instance_columns(conn: &Connection) -> KernelDbResult<()> {
+        for (table, column, definition) in PRE_INSTANCE_COLUMNS {
+            if !Self::has_column(conn, table, column)? {
+                conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+            }
+        }
         Ok(())
     }
 
@@ -3452,7 +3431,6 @@ impl KernelDb {
         };
         let has_provider = columns.iter().any(|c| c == "provider");
         let has_model = columns.iter().any(|c| c == "model");
-        let has_cast = columns.iter().any(|c| c == "cast_id");
 
         if has_provider || has_model {
             let provider_expr = if has_provider { "provider" } else { "NULL" };
@@ -3483,12 +3461,6 @@ impl KernelDb {
         }
         if has_model {
             conn.execute("ALTER TABLE presets DROP COLUMN model", [])?;
-        }
-        if !has_cast {
-            conn.execute(
-                "ALTER TABLE presets ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
-                [],
-            )?;
         }
         Ok(())
     }
@@ -3629,17 +3601,19 @@ impl KernelDb {
         }
         let tx = conn.unchecked_transaction()?;
 
-        let contexts: Vec<ContextRow> = {
+        let contexts: Vec<OldContext> = {
             let mut stmt = tx.prepare(
-                "SELECT context_id, label, provider, model,
-                        system_prompt, context_state, context_type,
-                        created_at, created_by, forked_from, fork_kind,
-                        archived_at, workspace_id, preset_id, concluded_at,
-                        last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host,
-                        played_by, senpai_ctx
+                "SELECT context_id, label, created_at, forked_from, archived_at, played_by
                  FROM contexts ORDER BY created_at, context_id",
             )?;
-            stmt.query_map([], row_to_context_row)?.collect::<SqliteResult<_>>()?
+            stmt.query_map([], |r| Ok(OldContext {
+                context_id: read_context_id(r, 0)?,
+                label: r.get(1)?,
+                created_at: r.get(2)?,
+                forked_from: read_opt_context_id(r, 3)?,
+                archived_at: r.get(4)?,
+                played_by: read_opt_principal_id(r, 5)?,
+            }))?.collect::<SqliteResult<_>>()?
         };
         let characters: HashMap<PrincipalId, CharacterRow> = {
             let mut stmt = tx.prepare(
@@ -3671,12 +3645,12 @@ impl KernelDb {
         } else {
             HashMap::new()
         };
-        let by_id: HashMap<ContextId, &ContextRow> = contexts.iter().map(|c| (c.context_id, c)).collect();
+        let by_id: HashMap<ContextId, &OldContext> = contexts.iter().map(|c| (c.context_id, c)).collect();
         let root_owner: HashMap<ContextId, PrincipalId> = characters.values()
             .filter_map(|c| c.root_ctx.map(|ctx| (ctx, c.principal_id))).collect();
-        let holder = |c: &ContextRow| c.played_by.or_else(|| root_owner.get(&c.context_id).copied());
+        let holder = |c: &OldContext| c.played_by.or_else(|| root_owner.get(&c.context_id).copied());
         let name_of = |p: PrincipalId| characters.get(&p).map_or_else(|| p.short(), |c| c.name.clone());
-        let describe = |c: &ContextRow| c.label.as_ref().map_or_else(
+        let describe = |c: &OldContext| c.label.as_ref().map_or_else(
             || c.context_id.short(), |l| format!("{l} ({})", c.context_id.short()),
         );
 
@@ -3687,7 +3661,7 @@ impl KernelDb {
         }
 
         // The strict ancestors of `c` on `forked_from`, nearest first.
-        let ancestors = |c: &ContextRow| -> Result<Vec<&ContextRow>, String> {
+        let ancestors = |c: &OldContext| -> Result<Vec<&OldContext>, String> {
             let mut chain = Vec::new();
             let mut seen = HashSet::from([c.context_id]);
             let mut next = c.forked_from;
@@ -3704,7 +3678,7 @@ impl KernelDb {
             Ok(chain)
         };
 
-        let plan = |c: &ContextRow| -> Plan {
+        let plan = |c: &OldContext| -> Plan {
             let (reviewer_id, director_id) = old_routing.get(&c.context_id).copied().unwrap_or((None, None));
             let override_reviewer = reviewer_id.map(|r| (r, "explicit reviewer override".to_string())).or_else(|| {
                 let director = director_id?;
@@ -3894,6 +3868,79 @@ impl KernelDb {
         tx.commit()?;
         if !dropped.is_empty() {
             info!(dropped = %dropped.join(", "), "dropped the routing the senpai edge replaced");
+        }
+        Ok(())
+    }
+
+    /// Drop what character instances replaced (`docs/senpai-kohai.md`,
+    /// "Removed"), in one transaction: `contexts.{senpai_ctx, played_by,
+    /// cast_id, provider, model}`, `characters.root_ctx`,
+    /// `presets.{cast_id, system_prompt}`, `turns.{cast_label, model_source}`
+    /// and the table `llm_defaults`; and rename `characters.default_cast_id`
+    /// to `characters.cast_id`. Runs only once [`Self::migrate_instances`] has
+    /// recorded its mapping, which read them; a mapping that refused leaves
+    /// them for the next open.
+    ///
+    /// None of these columns sits under an index, trigger, view, `CHECK` or
+    /// table-level foreign key, so each is a plain `DROP COLUMN`; a
+    /// column-level `REFERENCES` goes with its column. Each step is guarded by
+    /// what is still there, so a database already on the new shape does
+    /// nothing. The preset values and the turn columns are logged before they
+    /// go; `senpai_migration_report` stays, because `kj senpai show` prints its
+    /// notes until the senpai is set again.
+    fn drop_pre_instance_columns(conn: &Connection) -> KernelDbResult<()> {
+        let mapped: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
+            [Self::INSTANCES_MIGRATION], |row| row.get(0),
+        )?;
+        if !mapped {
+            return Err(KernelDbError::Validation(
+                "the pre-instance columns cannot be dropped before the instance migration has mapped them".into(),
+            ));
+        }
+        let tx = conn.unchecked_transaction()?;
+        if Self::has_column(&tx, "presets", "cast_id")? || Self::has_column(&tx, "presets", "system_prompt")? {
+            let cast = if Self::has_column(&tx, "presets", "cast_id")? { "cast_id IS NOT NULL" } else { "0" };
+            let prompt = if Self::has_column(&tx, "presets", "system_prompt")? { "system_prompt IS NOT NULL" } else { "0" };
+            let mut stmt = tx.prepare(&format!("SELECT label FROM presets WHERE {cast} OR {prompt} ORDER BY label"))?;
+            let labels: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<SqliteResult<_>>()?;
+            for label in labels {
+                info!(preset = %label, "dropping the cast and system prompt of a preset; a preset keeps only its fork filters");
+            }
+        }
+        if Self::has_column(&tx, "turns", "model_source")? {
+            let turns: i64 = tx.query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?;
+            info!(turns, "dropping turns.cast_label and turns.model_source; a turn keeps its binding");
+        }
+        let mut dropped = Vec::new();
+        for (table, column) in [
+            ("contexts", "senpai_ctx"),
+            ("contexts", "played_by"),
+            ("contexts", "cast_id"),
+            ("contexts", "provider"),
+            ("contexts", "model"),
+            ("characters", "root_ctx"),
+            ("presets", "cast_id"),
+            ("presets", "system_prompt"),
+            ("turns", "cast_label"),
+            ("turns", "model_source"),
+        ] {
+            if Self::has_column(&tx, table, column)? {
+                tx.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])?;
+                dropped.push(format!("{table}.{column}"));
+            }
+        }
+        if Self::has_column(&tx, "characters", "default_cast_id")? {
+            tx.execute("ALTER TABLE characters RENAME COLUMN default_cast_id TO cast_id", [])?;
+            dropped.push("characters.default_cast_id (renamed to cast_id)".to_string());
+        }
+        if Self::has_table(&tx, "llm_defaults")? {
+            tx.execute("DROP TABLE llm_defaults", [])?;
+            dropped.push("llm_defaults".to_string());
+        }
+        tx.commit()?;
+        if !dropped.is_empty() {
+            info!(dropped = %dropped.join(", "), "dropped what character instances replaced");
         }
         Ok(())
     }
@@ -4816,28 +4863,32 @@ impl KernelDb {
         if let Some(ref label) = row.label {
             validate_label(label)?;
         }
+        if row.played_by.is_some() {
+            return Err(KernelDbError::Validation(format!(
+                "context {} sets played_by, which is read from its character instance; start the instance instead",
+                row.context_id.short()
+            )));
+        }
 
         conn.execute(
                 "INSERT INTO contexts (
-                context_id, label, provider, model,
+                context_id, label,
                 system_prompt, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
-                last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-                origin_host, played_by, senpai_ctx
+                last_activity_at, promoted_at, demoted_at, paused_at,
+                origin_host
             ) VALUES (
-                ?1, ?2, ?3, ?4,
-                ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23
+                ?1, ?2,
+                ?3, ?4, ?5,
+                ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17,
+                ?18
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
                     row.label,
-                    row.provider,
-                    row.model,
                     row.system_prompt,
                     row.context_state.as_str(),
                     row.context_type,
@@ -4853,10 +4904,7 @@ impl KernelDb {
                     row.promoted_at,
                     row.demoted_at,
                     row.paused_at,
-                    row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.origin_host,
-                    row.played_by.as_ref().map(|id| id.as_bytes().to_vec()),
-                    row.senpai_ctx.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -4872,11 +4920,11 @@ impl KernelDb {
     /// Get a context by ID.
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label, provider, model,
+            concat!("SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, ", performer_sql!("contexts"), " AS played_by, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
              FROM contexts WHERE context_id = ?1"),
         )?;
 
@@ -4914,13 +4962,51 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Test fixture: record that `context` should answer to `senpai` once both
+    /// have instances. [`Self::update_played_by`] places an instance under the
+    /// senpai's instance when it starts, and attaches any instance already
+    /// waiting on this context, so a fixture may build a chain in either
+    /// order. The note lives in a temporary table of this connection.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn note_senpai_intent(&self, context: ContextId, senpai: Option<ContextId>) -> KernelDbResult<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS test_senpai_intent (context_id BLOB NOT NULL PRIMARY KEY, senpai_ctx BLOB)",
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO test_senpai_intent (context_id, senpai_ctx) VALUES (?1, ?2)",
+            params![blob_param(context.as_bytes()), senpai.as_ref().map(|id| id.as_bytes().to_vec())],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn has_senpai_intent_table(&self) -> KernelDbResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = 'test_senpai_intent')",
+            [], |r| r.get(0),
+        )?)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn senpai_intent(&self, context: ContextId) -> KernelDbResult<Option<ContextId>> {
+        if !self.has_senpai_intent_table()? {
+            return Ok(None);
+        }
+        Ok(self.conn
+            .query_row(
+                "SELECT senpai_ctx FROM test_senpai_intent WHERE context_id = ?1",
+                params![blob_param(context.as_bytes())],
+                |r| read_opt_context_id(r, 0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Test fixture: give `context` a character instance of `played_by`, the
-    /// way creation does. The instance's senpai is the instance of the
-    /// context named by the row's stored `senpai_ctx` when that context has
-    /// one, and any instance already waiting on `context` as its stored
-    /// senpai is attached to the new one, so fixtures may build a chain in
-    /// either order. A context that already has this character's instance is
-    /// left alone; `None` and a different character refuse.
+    /// way creation does. The instance is placed under the instance of the
+    /// context [`Self::note_senpai_intent`] named, when that has one. A
+    /// context that already has this character's instance is left alone;
+    /// `None` and a different character refuse.
     #[cfg(any(test, feature = "test-util"))]
     pub fn update_played_by(
         &self,
@@ -4947,10 +5033,6 @@ impl KernelDb {
         self.conn.execute(
             "UPDATE character_instances SET principal_id = ?1 WHERE instance_id = ?2",
             params![blob_param(played_by.as_bytes()), blob_param(instance.instance_id.as_bytes())],
-        )?;
-        self.conn.execute(
-            "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
-            params![blob_param(played_by.as_bytes()), blob_param(id.as_bytes())],
         )?;
         Ok(())
     }
@@ -4988,7 +5070,7 @@ impl KernelDb {
 
     /// Test fixture: make `character` run, for each `(role, backend, model)`,
     /// that model on that backend, through a cast named for its entries that
-    /// `characters.default_cast_id` points at. A backend row is created
+    /// `characters.cast_id` points at. A backend row is created
     /// (kind `mock`, no key) when absent, and each slot sets `max_tokens`. An
     /// instance started after this binds the slots; one started before keeps
     /// the binding it has.
@@ -5053,7 +5135,7 @@ impl KernelDb {
                 extra: None,
             })?;
         }
-        self.set_character_default_cast(character, Some(cast.cast_id))?;
+        self.set_character_cast(character, Some(cast.cast_id))?;
         Ok(cast.cast_id)
     }
 
@@ -5076,7 +5158,7 @@ impl KernelDb {
     /// a fixture may rewrite its character, which no kernel path does.
     #[cfg(any(test, feature = "test-util"))]
     fn assign_instance_as(&self, id: ContextId, played_by: PrincipalId, created_by: PrincipalId) -> KernelDbResult<CharacterInstanceId> {
-        let row = self.get_context(id)?
+        self.get_context(id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
         if let Some(existing) = self.context_instance_row(id)? {
             if existing.principal_id == played_by {
@@ -5087,10 +5169,6 @@ impl KernelDb {
                     "UPDATE character_instances SET principal_id = ?1, created_by = ?1 WHERE instance_id = ?2",
                     params![blob_param(played_by.as_bytes()), blob_param(existing.instance_id.as_bytes())],
                 )?;
-                self.conn.execute(
-                    "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
-                    params![blob_param(played_by.as_bytes()), blob_param(id.as_bytes())],
-                )?;
                 return Ok(existing.instance_id);
             }
             return Err(KernelDbError::Validation(format!(
@@ -5098,22 +5176,19 @@ impl KernelDb {
                 id.short()
             )));
         }
-        let senpai = match row.senpai_ctx {
+        let senpai = match self.senpai_intent(id)? {
             Some(senpai_ctx) => self.context_instance_row(senpai_ctx)?.map(|i| i.instance_id),
             None => None,
         };
         let instance = self.start_character_instance(played_by, senpai, id, created_by)?;
-        self.conn.execute(
-            "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
-            params![blob_param(played_by.as_bytes()), blob_param(id.as_bytes())],
-        )?;
         // Instances whose conversation named this context as its senpai
         // before it had one.
-        let waiting: Vec<CharacterInstanceId> = {
+        let waiting: Vec<CharacterInstanceId> = if self.has_senpai_intent_table()? {
             let mut stmt = self.conn.prepare(
                 "SELECT i.instance_id FROM character_instances i
                  JOIN contexts c ON c.instance_id = i.instance_id
-                 WHERE i.senpai_instance IS NULL AND c.senpai_ctx = ?1 AND c.context_id != ?1
+                 JOIN temp.test_senpai_intent n ON n.context_id = c.context_id
+                 WHERE i.senpai_instance IS NULL AND n.senpai_ctx = ?1 AND c.context_id != ?1
                    AND i.instance_id != ?2",
             )?;
             let rows = stmt.query_map(
@@ -5126,6 +5201,8 @@ impl KernelDb {
                 },
             )?;
             rows.collect::<SqliteResult<_>>()?
+        } else {
+            Vec::new()
         };
         for waiting in waiting {
             self.set_senpai_instance(waiting, Some(instance.instance_id))?;
@@ -5160,19 +5237,22 @@ impl KernelDb {
             None => {
                 let seat = ContextId::new();
                 let ws = self.get_or_create_default_workspace(reviewer)?;
-                let mut row = ContextRow {
-                    context_id: seat, label: Some(label), provider: None, model: None, system_prompt: None,
+                let row = ContextRow {
+                    context_id: seat, label: Some(label), system_prompt: None,
                     context_state: ContextState::Live, context_type: "default".into(),
                     created_at: now_millis(), created_by: reviewer, forked_from: None, fork_kind: None,
                     archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
                     last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                    cast_id: None, origin_host: None, played_by: Some(reviewer), senpai_ctx: None,
+                    origin_host: None, played_by: None,
                 };
                 // The reviewer's own senpai is where the context answered
                 // before, so the climb continues where the old walk did.
-                row.senpai_ctx = self.get_context(context)?.and_then(|c| c.senpai_ctx);
+                let previous = self.senpai_conversation_of(context)?;
                 self.insert_context_with_document(&row, ws)?;
                 self.assign_instance(seat, reviewer)?;
+                if let Some(previous) = previous {
+                    self.set_context_senpai(seat, Some(previous))?;
+                }
                 seat
             }
         };
@@ -5531,11 +5611,11 @@ impl KernelDb {
     /// List active (non-archived) contexts.
     pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label, provider, model,
+            concat!("SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, ", performer_sql!("contexts"), " AS played_by, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)"),
@@ -5548,11 +5628,11 @@ impl KernelDb {
     /// List all contexts (including archived).
     pub fn list_all_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label, provider, model,
+            concat!("SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, ", performer_sql!("contexts"), " AS played_by, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)"),
         )?;
@@ -5599,11 +5679,11 @@ impl KernelDb {
     /// Get the live children of a context: the contexts forked from it.
     pub fn fork_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT c.context_id, c.label, c.provider, c.model,
+            concat!("SELECT c.context_id, c.label,
                     c.system_prompt, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, ", performer_sql!("c"), " AS played_by, c.senpai_ctx
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.origin_host, ", performer_sql!("c"), " AS played_by
              FROM contexts c
              WHERE c.forked_from = ?1 AND c.archived_at IS NULL
              ORDER BY c.created_at, c.context_id"),
@@ -5668,12 +5748,12 @@ impl KernelDb {
                 JOIN contexts c ON c.context_id = lineage.ctx_id
                 WHERE c.forked_from IS NOT NULL
             )
-            SELECT c.context_id, c.label, c.provider, c.model,
+            SELECT c.context_id, c.label,
                    c.system_prompt, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, ", performer_sql!("c"), " AS played_by, c.senpai_ctx, lineage.depth
+                   c.origin_host, ", performer_sql!("c"), " AS played_by, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth"),
@@ -5681,7 +5761,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(23)?;
+            let depth: i64 = row.get(19)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -5761,15 +5841,12 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO presets (
-                preset_id, label, description, cast_id,
-                system_prompt, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                preset_id, label, description, created_at, created_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     blob_param(row.preset_id.as_bytes()),
                     row.label,
                     row.description,
-                    row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
-                    row.system_prompt,
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
                 ],
@@ -5783,8 +5860,7 @@ impl KernelDb {
     /// Get a preset by ID.
     pub fn get_preset(&self, id: PresetId) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, label, description, cast_id,
-                    system_prompt, created_at, created_by
+            "SELECT preset_id, label, description, created_at, created_by
              FROM presets WHERE preset_id = ?1",
         )?;
 
@@ -5799,8 +5875,7 @@ impl KernelDb {
     /// Get a preset by label.
     pub fn get_preset_by_label(&self, label: &str) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, label, description, cast_id,
-                    system_prompt, created_at, created_by
+            "SELECT preset_id, label, description, created_at, created_by
              FROM presets WHERE label = ?1",
         )?;
 
@@ -5815,8 +5890,7 @@ impl KernelDb {
     /// List all presets.
     pub fn list_presets(&self) -> KernelDbResult<Vec<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, label, description, cast_id,
-                    system_prompt, created_at, created_by
+            "SELECT preset_id, label, description, created_at, created_by
              FROM presets
              ORDER BY label",
         )?;
@@ -5833,14 +5907,11 @@ impl KernelDb {
             .conn
             .execute(
                 "UPDATE presets SET
-                label = ?1, description = ?2, cast_id = ?3,
-                system_prompt = ?4
-             WHERE preset_id = ?5",
+                label = ?1, description = ?2
+             WHERE preset_id = ?3",
                 params![
                     row.label,
                     row.description,
-                    row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
-                    row.system_prompt,
                     blob_param(row.preset_id.as_bytes()),
                 ],
             )
@@ -6247,14 +6318,13 @@ impl KernelDb {
     pub fn begin_turn(&self, turn: &TurnStart) -> KernelDbResult<()> {
         self.conn.execute(
             "INSERT INTO turns (
-                turn_id, context_id, performer, cast_label, role,
-                provider, model, model_source, started_at, instance_id, binding_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'binding', ?8, ?9, ?10)",
+                turn_id, context_id, performer, role,
+                provider, model, started_at, instance_id, binding_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 blob_param(turn.turn_id.as_bytes()),
                 blob_param(turn.context_id.as_bytes()),
                 blob_param(turn.performer.as_bytes()),
-                turn.cast,
                 turn.role,
                 turn.provider,
                 turn.model,
@@ -6307,7 +6377,7 @@ impl KernelDb {
         Ok(())
     }
 
-    const TURN_COLUMNS: &'static str = "turn_id, context_id, performer, cast_label, role, provider, model,
+    const TURN_COLUMNS: &'static str = "turn_id, context_id, performer, role, provider, model,
         started_at, ended_at, stop_reason, llm_calls, input_tokens, output_tokens,
         cache_read_tokens, cache_write_tokens, reasoning_tokens, instance_id, binding_seq";
 
@@ -6322,22 +6392,21 @@ impl KernelDb {
                 turn_id,
                 context_id: read_context_id(row, 1)?,
                 performer: read_principal_id(row, 2)?,
-                cast: row.get(3)?,
-                role: row.get(4)?,
-                provider: row.get(5)?,
-                model: row.get(6)?,
-                instance: read_opt_instance_id(row, 16)?,
-                binding_seq: row.get(17)?,
-                started_at: row.get(7)?,
+                role: row.get(3)?,
+                provider: row.get(4)?,
+                model: row.get(5)?,
+                instance: read_opt_instance_id(row, 15)?,
+                binding_seq: row.get(16)?,
+                started_at: row.get(6)?,
             },
-            ended_at: row.get(8)?,
-            stop_reason: row.get(9)?,
-            llm_calls: row.get(10)?,
-            input_tokens: row.get(11)?,
-            output_tokens: row.get(12)?,
-            cache_read_tokens: row.get(13)?,
-            cache_write_tokens: row.get(14)?,
-            reasoning_tokens: row.get(15)?,
+            ended_at: row.get(7)?,
+            stop_reason: row.get(8)?,
+            llm_calls: row.get(9)?,
+            input_tokens: row.get(10)?,
+            output_tokens: row.get(11)?,
+            cache_read_tokens: row.get(12)?,
+            cache_write_tokens: row.get(13)?,
+            reasoning_tokens: row.get(14)?,
         })
     }
 
@@ -7944,11 +8013,11 @@ impl KernelDb {
     /// archived rows carry it, so the label is free to give again.
     pub fn find_context_by_label(&self, label: &str) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label, provider, model,
+            concat!("SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, ", performer_sql!("contexts"), " AS played_by, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
              FROM contexts WHERE label = ?1 AND archived_at IS NULL"),
         )?;
 
@@ -8164,23 +8233,10 @@ pub struct BackendModelRow {
     pub tunables: ModelTunablesRow,
 }
 
-/// A model's tunables on its backend. They apply between a cast slot and the
-/// `llm_defaults` floor, field by field; `None` falls through to the floor.
+/// A model's tunables on its backend. A binding copies each into a slot whose
+/// own value is `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelTunablesRow {
-    pub max_tokens: Option<i64>,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub effort: Option<String>,
-    pub thinking_budget: Option<i64>,
-    pub thinking_style: Option<String>,
-}
-
-/// The singleton `llm_defaults` row.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LlmDefaultsRow {
-    pub default_backend: String,
-    pub default_model: String,
     pub max_tokens: Option<i64>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -8239,7 +8295,7 @@ impl CharacterRow {
     }
 }
 
-/// One role's seat in a cast. NULL tunables cascade to `llm_defaults`.
+/// One role's seat in a cast. A NULL tunable takes the model's `backend_models` value when a binding copies the slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CastSlotRow {
     pub cast_id: CastId,
@@ -8581,82 +8637,6 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    // ── llm_defaults ────────────────────────────────────────────────────
-
-    /// The singleton defaults row, or `None` until an operator runs
-    /// `kj backend default set`. `None` is a real state, not an error: a
-    /// kernel ships no defaults, and a model turn reports it.
-    pub fn get_llm_defaults(&self) -> KernelDbResult<Option<LlmDefaultsRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT default_backend, default_model, max_tokens, temperature, top_p,
-                    effort, thinking_budget, thinking_style
-             FROM llm_defaults WHERE id = 1",
-        )?;
-        Ok(stmt
-            .query_row([], |row| {
-                Ok(LlmDefaultsRow {
-                    default_backend: row.get(0)?,
-                    default_model: row.get(1)?,
-                    max_tokens: row.get(2)?,
-                    temperature: row.get(3)?,
-                    top_p: row.get(4)?,
-                    effort: row.get(5)?,
-                    thinking_budget: row.get(6)?,
-                    thinking_style: row.get(7)?,
-                })
-            })
-            .optional()?)
-    }
-
-    /// Replace the singleton defaults row. Range checks run here — loud
-    /// rejection, never a clamp: a silently clamped temperature is a turn
-    /// that answers differently than the operator asked for.
-    pub fn set_llm_defaults(&self, row: &LlmDefaultsRow) -> KernelDbResult<()> {
-        validate_tunables(
-            row.max_tokens,
-            row.temperature,
-            row.top_p,
-            row.thinking_budget,
-        )?;
-        if row.default_model.trim().is_empty() {
-            return Err(KernelDbError::Validation(
-                "default_model must not be empty".to_string(),
-            ));
-        }
-        if self.get_backend_by_name(&row.default_backend)?.is_none() {
-            return Err(KernelDbError::Validation(format!(
-                "default backend '{}' does not exist — create it first \
-                 (`kj backend set {} --kind …`)",
-                row.default_backend, row.default_backend
-            )));
-        }
-        self.conn.execute(
-            "INSERT INTO llm_defaults (id, default_backend, default_model, max_tokens,
-                                       temperature, top_p, effort, thinking_budget, thinking_style)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO UPDATE SET
-                 default_backend = excluded.default_backend,
-                 default_model = excluded.default_model,
-                 max_tokens = excluded.max_tokens,
-                 temperature = excluded.temperature,
-                 top_p = excluded.top_p,
-                 effort = excluded.effort,
-                 thinking_budget = excluded.thinking_budget,
-                 thinking_style = excluded.thinking_style",
-            params![
-                row.default_backend,
-                row.default_model,
-                row.max_tokens,
-                row.temperature,
-                row.top_p,
-                row.effort,
-                row.thinking_budget,
-                row.thinking_style,
-            ],
-        )?;
-        Ok(())
-    }
-
     // ── casts ───────────────────────────────────────────────────────────
 
     /// Create a cast. Fails loudly on a duplicate label (case-insensitive).
@@ -8849,8 +8829,8 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
@@ -8858,7 +8838,6 @@ impl KernelDb {
                     row.retired_at,
                     row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                     row.root,
-                    row.root_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -8905,30 +8884,6 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// Write the stored `characters.root_ctx` column. Nothing reads it: a
-    /// character's root console is the conversation of its root instance
-    /// (`CharacterRow::root_ctx`).
-    pub fn write_stored_root_ctx(
-        &self,
-        principal_id: PrincipalId,
-        ctx: Option<ContextId>,
-    ) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE characters SET root_ctx = ?1 WHERE principal_id = ?2",
-            params![
-                ctx.as_ref().map(|c| c.as_bytes().to_vec()),
-                blob_param(principal_id.as_bytes())
-            ],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!(
-                "character {}",
-                principal_id.short()
-            )));
-        }
-        Ok(())
-    }
-
     /// Set (or clear) a character's handoff-log context. Called exactly
     /// once per character in the ordinary case, by `kj handoff`'s
     /// get-or-create path, under the same lock that just confirmed the
@@ -8960,11 +8915,11 @@ impl KernelDb {
     /// Set or clear a character's `root` flag. A root has no model: it
     /// cannot be cast as a context's performer and turn identity refuses
     /// it (`docs/character.md`, "Roots and rotation").
-    /// Set or clear the cast that contexts this character plays resolve
-    /// through when they have no cast of their own.
-    pub fn set_character_default_cast(&self, principal_id: PrincipalId, cast_id: Option<CastId>) -> KernelDbResult<()> {
+    /// Set or clear the cast whose slots a new binding of this character's
+    /// instance copies.
+    pub fn set_character_cast(&self, principal_id: PrincipalId, cast_id: Option<CastId>) -> KernelDbResult<()> {
         let updated = self.conn.execute(
-            "UPDATE characters SET default_cast_id = ?1 WHERE principal_id = ?2",
+            "UPDATE characters SET cast_id = ?1 WHERE principal_id = ?2",
             params![cast_id.map(|c| c.as_bytes().to_vec()), blob_param(principal_id.as_bytes())],
         )?;
         if updated == 0 {
@@ -8973,12 +8928,12 @@ impl KernelDb {
         Ok(())
     }
 
-    /// The character's default cast, or `None` when it has none or no sheet.
-    pub fn character_default_cast(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CastRow>> {
+    /// The character's cast, or `None` when it has none or no sheet.
+    pub fn character_cast(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CastRow>> {
         let cast_id: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT default_cast_id FROM characters WHERE principal_id = ?1",
+                "SELECT cast_id FROM characters WHERE principal_id = ?1",
                 params![blob_param(principal_id.as_bytes())],
                 |row| row.get(0),
             )
@@ -8987,7 +8942,7 @@ impl KernelDb {
         match cast_id {
             Some(bytes) => {
                 let bytes: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
-                    KernelDbError::Validation(format!("character {} has a malformed default cast id", principal_id.short()))
+                    KernelDbError::Validation(format!("character {} has a malformed cast id", principal_id.short()))
                 })?;
                 self.get_cast(CastId::from_bytes(bytes))
             }
@@ -9049,12 +9004,12 @@ impl KernelDb {
     /// `principal_id` — the set `kj character retire` archives.
     pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label, provider, model,
+            concat!("SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-             origin_host, ", performer_sql!("contexts"), " AS played_by, senpai_ctx
+                    last_activity_at, promoted_at, demoted_at, paused_at,
+             origin_host, ", performer_sql!("contexts"), " AS played_by
              FROM contexts
              WHERE instance_id IN (SELECT instance_id FROM character_instances WHERE principal_id = ?1)
                AND archived_at IS NULL"),
@@ -9198,33 +9153,29 @@ fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
 }
 
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
-    let state_str: String = row.get(5)?;
-    let fork_kind_str: Option<String> = row.get(10)?;
+    let state_str: String = row.get(3)?;
+    let fork_kind_str: Option<String> = row.get(8)?;
 
     Ok(ContextRow {
         context_id: read_context_id(row, 0)?,
         label: row.get(1)?,
-        provider: row.get(2)?,
-        model: row.get(3)?,
-        system_prompt: row.get(4)?,
+        system_prompt: row.get(2)?,
         context_state: context_state_from_sql(&state_str),
-        context_type: row.get(6)?,
-        created_at: row.get(7)?,
-        created_by: read_principal_id(row, 8)?,
-        forked_from: read_opt_context_id(row, 9)?,
+        context_type: row.get(4)?,
+        created_at: row.get(5)?,
+        created_by: read_principal_id(row, 6)?,
+        forked_from: read_opt_context_id(row, 7)?,
         fork_kind: fork_kind_from_sql(fork_kind_str)?,
-        archived_at: row.get(11)?,
-        workspace_id: read_opt_workspace_id(row, 12)?,
-        preset_id: read_opt_preset_id(row, 13)?,
-        concluded_at: row.get(14)?,
-        last_activity_at: row.get(15)?,
-        promoted_at: row.get(16)?,
-        demoted_at: row.get(17)?,
-        paused_at: row.get(18)?,
-        cast_id: read_opt_cast_id(row, 19)?,
-        origin_host: row.get(20)?,
-        played_by: read_opt_principal_id(row, 21)?,
-        senpai_ctx: read_opt_context_id(row, 22)?,
+        archived_at: row.get(9)?,
+        workspace_id: read_opt_workspace_id(row, 10)?,
+        preset_id: read_opt_preset_id(row, 11)?,
+        concluded_at: row.get(12)?,
+        last_activity_at: row.get(13)?,
+        promoted_at: row.get(14)?,
+        demoted_at: row.get(15)?,
+        paused_at: row.get(16)?,
+        origin_host: row.get(17)?,
+        played_by: read_opt_principal_id(row, 18)?,
     })
 }
 
@@ -9243,10 +9194,8 @@ fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
         preset_id: read_preset_id(row, 0)?,
         label: row.get(1)?,
         description: row.get(2)?,
-        cast_id: read_opt_cast_id(row, 3)?,
-        system_prompt: row.get(4)?,
-        created_at: row.get(5)?,
-        created_by: read_principal_id(row, 6)?,
+        created_at: row.get(3)?,
+        created_by: read_principal_id(row, 4)?,
     })
 }
 
@@ -9588,13 +9537,66 @@ impl KernelDb {
 // Test helpers
 // ============================================================================
 
+/// Give a fresh database the schema one written before character instances
+/// had: the columns and table `drop_pre_instance_columns` removes. Idempotent.
+/// Rows in those columns are written with raw SQL, since no `KernelDb` method
+/// writes them.
+#[cfg(test)]
+fn into_pre_instance(db: &KernelDb) {
+    let c = &db.conn;
+    if KernelDb::has_column(c, "characters", "cast_id").unwrap() {
+        c.execute("ALTER TABLE characters RENAME COLUMN cast_id TO default_cast_id", []).unwrap();
+    }
+    for (table, column, definition) in [
+        ("contexts", "provider", "TEXT"),
+        ("contexts", "model", "TEXT"),
+        ("presets", "cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
+        ("presets", "system_prompt", "TEXT"),
+        ("turns", "cast_label", "TEXT"),
+        ("turns", "model_source", "TEXT NOT NULL DEFAULT 'binding'"),
+    ].into_iter().chain(PRE_INSTANCE_COLUMNS) {
+        if !KernelDb::has_column(c, table, column).unwrap() {
+            c.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []).unwrap();
+        }
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS llm_defaults (
+            id               INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+            default_backend  TEXT    NOT NULL,
+            default_model    TEXT    NOT NULL CHECK (default_model != ''),
+            max_tokens       INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+            temperature      REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+            top_p            REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+            effort           TEXT,
+            thinking_budget  INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+            thinking_style   TEXT
+        );",
+    ).unwrap();
+}
+
+/// Write the stored `characters.root_ctx` of a character that predates instances.
+#[cfg(test)]
+fn set_stored_root_ctx(db: &KernelDb, character: PrincipalId, ctx: ContextId) {
+    db.conn.execute(
+        "UPDATE characters SET root_ctx = ?1 WHERE principal_id = ?2",
+        params![blob_param(ctx.as_bytes()), blob_param(character.as_bytes())],
+    ).unwrap();
+}
+
+/// Write the stored `contexts.played_by` of a context that predates instances.
+#[cfg(test)]
+fn set_stored_played_by(db: &KernelDb, ctx: ContextId, played_by: Option<PrincipalId>) {
+    db.conn.execute(
+        "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
+        params![played_by.as_ref().map(|p| p.as_bytes().to_vec()), blob_param(ctx.as_bytes())],
+    ).unwrap();
+}
+
 #[cfg(test)]
 fn make_context_row(label: Option<&str>) -> ContextRow {
     ContextRow {
         context_id: ContextId::new(),
         label: label.map(String::from),
-        provider: None,
-        model: None,
         system_prompt: None,
         context_state: ContextState::Live,
         context_type: "default".to_string(),
@@ -9610,10 +9612,8 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
-        cast_id: None,
         origin_host: None,
         played_by: None,
-        senpai_ctx: None,
     }
 }
 
@@ -9961,8 +9961,6 @@ mod tests {
             preset_id: pid,
             label: label.into(),
             description: None,
-            cast_id: None,
-            system_prompt: None,
             created_at: now_millis(),
             created_by: PrincipalId::new(),
         })
@@ -10236,17 +10234,18 @@ mod tests {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let [coder, banto, judge] = seed_characters(&db, &["coder", "banto", "judge"])[..] else { unreachable!() };
+        into_pre_instance(&db);
         db.conn.execute("ALTER TABLE contexts ADD COLUMN reviewer_id BLOB", []).unwrap();
-        let mut seat = make_context_row(Some("seat"));
-        seat.played_by = Some(banto);
+        let seat = make_context_row(Some("seat"));
         insert_context_with_doc(&db, &seat, ws_id);
-        let mut judge_seat = make_context_row(Some("judge-seat"));
-        judge_seat.played_by = Some(judge);
+        set_stored_played_by(&db, seat.context_id, Some(banto));
+        let judge_seat = make_context_row(Some("judge-seat"));
         insert_context_with_doc(&db, &judge_seat, ws_id);
+        set_stored_played_by(&db, judge_seat.context_id, Some(judge));
         let mut lane = make_context_row(Some("lane"));
         lane.forked_from = Some(seat.context_id);
-        lane.played_by = Some(coder);
         insert_context_with_doc(&db, &lane, ws_id);
+        set_stored_played_by(&db, lane.context_id, Some(coder));
         db.conn.execute(
             "UPDATE contexts SET reviewer_id = ?1 WHERE context_id = ?2",
             params![blob_param(judge.as_bytes()), blob_param(lane.context_id.as_bytes())],
@@ -10255,7 +10254,7 @@ mod tests {
 
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
 
-        assert_eq!(db.get_context(lane.context_id).unwrap().unwrap().senpai_ctx, Some(seat.context_id));
+        assert_eq!(db.senpai_conversation_of(lane.context_id).unwrap(), Some(seat.context_id));
         assert!(db.senpai_migration_report().unwrap().is_empty());
         let has_reviewer: bool = db.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'reviewer_id')", [], |r| r.get(0),
@@ -10527,37 +10526,12 @@ mod tests {
 
     // ── Context model pins + Track D preset cast narrowing ──────────────
 
-    /// A context's model belongs to its context row: opening the DB keeps a
-    /// pin to any backend name, including one called `openai`.
-    #[test]
-    fn opening_the_db_keeps_every_context_model_pin() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kernel.db");
-        let pins = [(Some("zorak"), Some("qwen3.8-27b")), (Some("openai"), Some("gpt-5.6")), (None, Some("bare-model"))];
-        let ids: Vec<ContextId> = {
-            let db = KernelDb::open(&path).unwrap();
-            let ws_id = setup_test_db(&db);
-            pins.iter().map(|(provider, model)| {
-                let mut row = make_context_row(None);
-                row.provider = provider.map(str::to_string);
-                row.model = model.map(str::to_string);
-                insert_context_with_doc(&db, &row, ws_id);
-                row.context_id
-            }).collect()
-        };
-        let db = KernelDb::open(&path).unwrap();
-        for (id, (provider, model)) in ids.iter().zip(pins) {
-            let row = db.get_context(*id).unwrap().unwrap();
-            assert_eq!((row.provider.as_deref(), row.model.as_deref()), (provider, model));
-        }
-    }
-
     /// `migrate_preset_cast_narrowing` against a pre-Track-D `presets` table
-    /// (still carrying `provider`/`model`): the legacy columns are dropped,
-    /// `cast_id` is added, and a preset that had a provider/model loses it —
-    /// no automatic cast mapping is attempted, `cast_id` stays NULL.
+    /// (still carrying `provider`/`model`): the legacy columns are dropped
+    /// and a preset that had a provider/model loses it; no cast column is
+    /// added.
     #[test]
-    fn preset_cast_narrowing_drops_legacy_columns_and_leaves_cast_id_null() {
+    fn preset_cast_narrowing_drops_the_legacy_columns() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE casts (
@@ -10598,16 +10572,7 @@ mod tests {
         };
         assert!(!columns.contains(&"provider".to_string()), "provider column dropped");
         assert!(!columns.contains(&"model".to_string()), "model column dropped");
-        assert!(columns.contains(&"cast_id".to_string()), "cast_id column added");
-
-        let cast_id: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT cast_id FROM presets WHERE label = 'legacy-research'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(cast_id.is_none(), "no automatic provider/model -> cast mapping");
+        assert!(!columns.contains(&"cast_id".to_string()), "no cast column is added");
 
         // Idempotent re-run: already-migrated columns, no-op.
         KernelDb::migrate_preset_cast_narrowing(&conn).unwrap();
@@ -11177,33 +11142,10 @@ mod tests {
         let creator = PrincipalId::new();
         let now = now_millis();
 
-        // Two casts so the "update" step below can move the reference, not
-        // just leave it at None.
-        let research_cast = CastId::new();
-        db.insert_cast(&CastRow {
-            cast_id: research_cast,
-            label: "research".to_string(),
-            description: None,
-            created_at: now,
-            created_by: creator,
-        })
-        .unwrap();
-        let fast_cast = CastId::new();
-        db.insert_cast(&CastRow {
-            cast_id: fast_cast,
-            label: "fast".to_string(),
-            description: None,
-            created_at: now,
-            created_by: creator,
-        })
-        .unwrap();
-
         let mut preset = PresetRow {
             preset_id: PresetId::new(),
                         label: "opus-research".into(),
             description: Some("Deep research preset".into()),
-            cast_id: Some(research_cast),
-            system_prompt: None,
             created_at: now,
             created_by: creator,
         };
@@ -11215,19 +11157,13 @@ mod tests {
             .get_preset_by_label("opus-research")
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.cast_id, Some(research_cast));
+        assert_eq!(loaded.description.as_deref(), Some("Deep research preset"));
 
-        // Update — narrow to a different cast
-        preset.cast_id = Some(fast_cast);
+        // Update
+        preset.description = Some("Shallow research preset".into());
         db.update_preset(&preset).unwrap();
         let loaded = db.get_preset(preset.preset_id).unwrap().unwrap();
-        assert_eq!(loaded.cast_id, Some(fast_cast));
-
-        // A cast removed out from under a preset clears the reference
-        // (ON DELETE SET NULL) rather than leaving a dangling id.
-        db.delete_cast(fast_cast).unwrap();
-        let after_cast_removed = db.get_preset(preset.preset_id).unwrap().unwrap();
-        assert_eq!(after_cast_removed.cast_id, None);
+        assert_eq!(loaded.description.as_deref(), Some("Shallow research preset"));
 
         // Delete
         assert!(db.delete_preset(preset.preset_id).unwrap());
@@ -11697,9 +11633,7 @@ mod tests {
 
         let row = ContextRow {
             context_id: ContextId::new(),
-                        label: Some("test".into()),
-            provider: Some("anthropic".into()),
-            model: Some("opus".into()),
+            label: Some("test".into()),
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -11715,10 +11649,8 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
 
         let ctx = row.to_context();
@@ -11738,23 +11670,10 @@ mod tests {
         let creator = PrincipalId::new();
         let parent_id = ContextId::new();
 
-        // A cast to exercise the cast_id round-trip below.
-        let cast_id = CastId::new();
-        db.insert_cast(&CastRow {
-            cast_id,
-            label: "house".to_string(),
-            description: None,
-            created_at: 500,
-            created_by: creator,
-        })
-        .unwrap();
-
         // Insert parent first (forked_from FK requires it to exist)
         let parent = ContextRow {
             context_id: parent_id,
-                        label: Some("parent".into()),
-            provider: Some("anthropic".into()),
-            model: Some("claude-opus-4-6".into()),
+            label: Some("parent".into()),
             system_prompt: Some("You are helpful.".into()),
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -11770,20 +11689,16 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
-        // Insert child forked from parent, playing under `cast_id`.
+        // Insert child forked from parent.
         let child_id = ContextId::new();
         let child = ContextRow {
             context_id: child_id,
-                        label: Some("child-fork".into()),
-            provider: Some("google".into()),
-            model: Some("gemini-2.0-flash".into()),
+            label: Some("child-fork".into()),
             system_prompt: Some("Be concise.".into()),
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -11799,10 +11714,8 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: Some(cast_id),
             origin_host: None,
             played_by: None,
-            senpai_ctx: Some(parent_id),
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -11810,8 +11723,6 @@ mod tests {
         let recovered = db.get_context(child_id).unwrap().expect("child not found");
         assert_eq!(recovered.context_id, child_id);
         assert_eq!(recovered.label, Some("child-fork".into()));
-        assert_eq!(recovered.provider, Some("google".into()));
-        assert_eq!(recovered.model, Some("gemini-2.0-flash".into()));
         assert_eq!(recovered.system_prompt, Some("Be concise.".into()));
         assert_eq!(recovered.created_at, 2000);
         assert_eq!(recovered.created_by, creator);
@@ -11820,14 +11731,11 @@ mod tests {
         assert!(recovered.archived_at.is_none());
         assert!(recovered.workspace_id.is_none());
         assert!(recovered.preset_id.is_none());
-        assert_eq!(recovered.cast_id, Some(cast_id));
         assert_eq!(recovered.played_by, None, "NULL played_by preserves today's behavior");
-        assert_eq!(recovered.senpai_ctx, Some(parent_id));
 
         // Verify list_active_contexts returns both
         let active = db.list_active_contexts().unwrap();
         assert_eq!(active.len(), 2);
-        assert_eq!(active.iter().find(|row| row.context_id == child_id).unwrap().senpai_ctx, Some(parent_id));
 
         // Verify to_context() preserves forked_from
         let ctx = recovered.to_context();
@@ -11872,9 +11780,7 @@ mod tests {
 
         let row = ContextRow {
             context_id: ctx_id,
-                        label: Some("fk-test".into()),
-            provider: None,
-            model: None,
+            label: Some("fk-test".into()),
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -11890,10 +11796,8 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(
@@ -12070,10 +11974,12 @@ mod tests {
         holder: Option<PrincipalId>,
     ) -> ContextRow {
         let mut row = make_context_row(Some(label));
-        row.senpai_ctx = senpai.map(|s| s.context_id);
         insert_context_with_doc(db, &row, ws_id);
         if let Some(holder) = holder {
             db.update_played_by(row.context_id, Some(holder)).unwrap();
+        }
+        if let Some(senpai) = senpai {
+            db.set_context_senpai(row.context_id, Some(senpai.context_id)).unwrap();
         }
         row.played_by = holder;
         row
@@ -12135,8 +12041,7 @@ mod tests {
         assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, None, "a character that is not a root has no console");
         db.update_character_root(amy, true).unwrap();
         let console = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
-        db.write_stored_root_ctx(amy, Some(ContextId::new())).ok();
-        assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, Some(console.context_id), "the instance decides, not the stored column");
+        assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, Some(console.context_id), "the root instance's conversation is the console");
         let lane = senpai_ctx_row(&db, ws_id, "lane", Some(&console), Some(coder));
 
         assert_eq!(db.context_holder(console.context_id).unwrap(), Some(amy));
@@ -12236,8 +12141,8 @@ mod tests {
     }
 
     /// A context with no character instance routes nothing: it refuses,
-    /// naming the context, whether it is the ask's context or has an
-    /// instance-less context named as its stored senpai.
+    /// naming the context; an instance with no senpai edge has nobody above
+    /// it.
     #[test]
     fn route_review_refuses_a_context_with_no_instance() {
         let db = KernelDb::temporary().unwrap();
@@ -12248,9 +12153,9 @@ mod tests {
         assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
         let text = error.to_string();
         assert!(text.contains("no-instance") && text.contains("no character instance"), "{text}");
-        let lane = senpai_ctx_row(&db, ws_id, "under-bare", Some(&bare), Some(coder));
+        let lane = senpai_ctx_row(&db, ws_id, "under-bare", None, Some(coder));
         let text = db.route_review(ReviewQuery::ask(lane.context_id, coder)).unwrap_err().to_string();
-        assert!(text.contains("has no senpai above it") || text.contains("nobody reviews"), "an instance-less stored senpai is not an edge: {text}");
+        assert!(text.contains("has no senpai above it") || text.contains("nobody reviews"), "an instance with no senpai edge has nobody above it: {text}");
     }
 
     /// An archived senpai is climbed through (it still answers for what was
@@ -12314,9 +12219,9 @@ mod tests {
 
         let mut lane = make_context_row(Some("routed-lane"));
         lane.forked_from = Some(seat.context_id);
-        lane.senpai_ctx = Some(judge_seat.context_id);
         insert_context_with_doc(&db, &lane, ws_id);
         db.update_played_by(lane.context_id, Some(coder)).unwrap();
+        db.set_context_senpai(lane.context_id, Some(judge_seat.context_id)).unwrap();
 
         assert_eq!(
             db.route_review(ReviewQuery::ask(lane.context_id, coder)).unwrap(),
@@ -12411,9 +12316,9 @@ mod tests {
         let seat = senpai_ctx_row(&db, ws_id, "banto", Some(&amy_root), Some(banto));
         let mut lane = make_context_row(Some("forked-from-amy-answers-to-bob"));
         lane.forked_from = Some(seat.context_id);
-        lane.senpai_ctx = Some(bob_root.context_id);
         insert_context_with_doc(&db, &lane, ws_id);
         db.update_played_by(lane.context_id, Some(coder)).unwrap();
+        db.set_context_senpai(lane.context_id, Some(bob_root.context_id)).unwrap();
 
         assert_eq!(db.lineage_root(lane.context_id).unwrap(), bob);
         let top = db.lineage_top_instance(instance_of(&db, &lane)).unwrap();
@@ -12497,22 +12402,6 @@ mod tests {
         assert!(matches!(error, KernelDbError::NotFound(_)), "{error}");
     }
 
-    /// The stored `senpai_ctx` round-trips through the context row, and a row
-    /// with none reads back as `None`.
-    #[test]
-    fn senpai_ctx_round_trips_through_the_context_row() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-        let top = senpai_ctx_row(&db, ws_id, "rt-top", None, None);
-        let kid = senpai_ctx_row(&db, ws_id, "rt-kid", Some(&top), None);
-        assert_eq!(db.get_context(top.context_id).unwrap().unwrap().senpai_ctx, None);
-        assert_eq!(db.get_context(kid.context_id).unwrap().unwrap().senpai_ctx, Some(top.context_id));
-        let listed = db.list_all_contexts().unwrap();
-        assert_eq!(listed.iter().find(|r| r.context_id == kid.context_id).unwrap().senpai_ctx, Some(top.context_id));
-        let lineage = db.fork_lineage(kid.context_id).unwrap();
-        assert_eq!(lineage[0].0.senpai_ctx, Some(top.context_id), "every context select reads the edge");
-    }
-
     /// Moving a context's instance under a new senpai refuses a self edge, a
     /// cycle, a missing senpai and a context with no instance; `None` makes
     /// it a top. The edge is the instance's, so it moves every context of
@@ -12530,7 +12419,7 @@ mod tests {
 
         db.set_context_senpai(c.context_id, Some(d.context_id)).unwrap();
         assert_eq!(edge(&c), Some(instance_of(&db, &d)));
-        assert_eq!(db.get_context(c.context_id).unwrap().unwrap().senpai_ctx, Some(d.context_id));
+        assert_eq!(db.senpai_conversation_of(c.context_id).unwrap(), Some(d.context_id));
         db.set_context_senpai(c.context_id, None).unwrap();
         assert_eq!(edge(&c), None);
         db.set_context_senpai(c.context_id, Some(b.context_id)).unwrap();
@@ -12633,6 +12522,7 @@ mod tests {
     /// `contexts.reviewer_id`, `contexts.director_id` and the delegation
     /// tables. Idempotent.
     fn ensure_old_routing_schema(db: &KernelDb) {
+        into_pre_instance(db);
         for sql in ["ALTER TABLE contexts ADD COLUMN reviewer_id BLOB", "ALTER TABLE contexts ADD COLUMN director_id BLOB"] {
             match db.conn.execute(sql, []) {
                 Ok(_) => {}
@@ -12699,9 +12589,10 @@ mod tests {
         ensure_old_routing_schema(db);
         let mut row = make_context_row(Some(label));
         row.forked_from = forked_from.map(|p| p.context_id);
-        row.played_by = played_by;
         row.created_at = created_at;
         insert_context_with_doc(db, &row, ws_id);
+        set_stored_played_by(db, row.context_id, played_by);
+        row.played_by = played_by;
         row
     }
 
@@ -12714,6 +12605,12 @@ mod tests {
                 blob_param(ctx.context_id.as_bytes()),
             ],
         ).unwrap();
+    }
+
+    /// The open steps from the senpai mapping through the routing drop.
+    fn senpai_open_steps(conn: &Connection) -> KernelDbResult<()> {
+        KernelDb::migrate_senpai_edges(conn)?;
+        KernelDb::drop_old_routing(conn)
     }
 
     /// Run the senpai migration the way an upgrading kernel does: the marker is absent.
@@ -12731,7 +12628,10 @@ mod tests {
     }
 
     fn senpai_of(db: &KernelDb, ctx: &ContextRow) -> Option<ContextId> {
-        db.get_context(ctx.context_id).unwrap().unwrap().senpai_ctx
+        db.conn.query_row(
+            "SELECT senpai_ctx FROM contexts WHERE context_id = ?1",
+            [blob_param(ctx.context_id.as_bytes())], |r| read_opt_context_id(r, 0),
+        ).unwrap()
     }
 
     fn report_of(db: &KernelDb) -> Vec<(ContextId, Option<ContextId>, String)> {
@@ -12820,7 +12720,7 @@ mod tests {
         db.update_character_root(bob, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
         let bob_console = old_context(&db, ws_id, "bob", None, Some(bob), 2);
-        db.write_stored_root_ctx(bob, Some(bob_console.context_id)).unwrap();
+        set_stored_root_ctx(&db, bob, bob_console.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 3);
         let older = old_context(&db, ws_id, "judge-old", Some(&root), Some(judge), 4);
         let newer = old_context(&db, ws_id, "judge-new", Some(&root), Some(judge), 5);
@@ -12856,6 +12756,24 @@ mod tests {
         }
     }
 
+    /// The migration runs once: a later call does not recompute senpai edges
+    /// that were moved since.
+    #[test]
+    fn senpai_migration_runs_once() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [banto, coder] = seed_characters(&db, &["banto", "coder"])[..] else { unreachable!() };
+        let top = old_context(&db, ws_id, "once-top", None, Some(banto), 1);
+        let other = old_context(&db, ws_id, "once-other", None, Some(banto), 2);
+        let kid = old_context(&db, ws_id, "once-kid", Some(&top), Some(coder), 3);
+        run_senpai_migration(&db).unwrap();
+        assert_eq!(senpai_of(&db, &kid), Some(top.context_id));
+
+        set_stored_senpai(&db, &kid, &other);
+        KernelDb::migrate_senpai_edges(&db.conn).unwrap();
+        assert_eq!(senpai_of(&db, &kid), Some(other.context_id), "the marker keeps the moved edge");
+    }
+
     /// On a database with the old routing (an override, a delegation, the
     /// two tables), opening maps every context to its senpai first, then
     /// drops `contexts.reviewer_id`, `contexts.director_id` and both
@@ -12879,7 +12797,7 @@ mod tests {
         old_delegation(&db, banto, judge, amy);
         db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::SENPAI_MIGRATION]).unwrap();
 
-        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        senpai_open_steps(&db.conn).unwrap();
         run_instance_migration(&db).unwrap();
 
         assert_eq!(senpai_of(&db, &lane), Some(seat.context_id));
@@ -12900,7 +12818,7 @@ mod tests {
             assert_eq!(db.route_review(ReviewQuery::ask(ctx.context_id, coder)).unwrap().reviewer(), reviewer, "{:?}", ctx.label);
         }
 
-        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        senpai_open_steps(&db.conn).unwrap();
         assert_eq!(report_of(&db).len(), 2, "a second open changes nothing");
     }
 
@@ -12920,7 +12838,7 @@ mod tests {
         set_old_routing(&db, &bad, Some(banto), Some(nobody));
         db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::SENPAI_MIGRATION]).unwrap();
 
-        let error = KernelDb::apply_additive_migrations(&db.conn).unwrap_err().to_string();
+        let error = senpai_open_steps(&db.conn).unwrap_err().to_string();
         assert!(error.contains("bad") && error.contains("nobody"), "{error}");
         assert!(has_column(&db, "contexts", "reviewer_id") && has_column(&db, "contexts", "director_id"), "a refused mapping drops nothing");
         assert!(has_table(&db, "approval_reviewer_delegations"));
@@ -12928,7 +12846,7 @@ mod tests {
         set_old_routing(&db, &bad, Some(banto), None);
         set_stored_senpai(&db, &bad, &seat);
         db.conn.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [KernelDb::SENPAI_MIGRATION]).unwrap();
-        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        senpai_open_steps(&db.conn).unwrap();
         assert!(!has_column(&db, "contexts", "reviewer_id") && !has_column(&db, "contexts", "director_id"));
         assert!(!has_table(&db, "approval_reviewer_delegations") && !has_table(&db, "approval_reviewer_delegation_events"));
         assert_eq!(senpai_of(&db, &bad), Some(seat.context_id), "the recorded mapping is kept");
@@ -12996,42 +12914,6 @@ mod tests {
         assert!(report[0].2.contains("archived") && report[0].2.contains("nobody"), "{report:?}");
     }
 
-    /// The column alter applies to a `contexts` table that predates it, and a
-    /// second application is the duplicate-column error `open` ignores.
-    #[test]
-    fn the_senpai_column_alter_applies_to_a_table_that_predates_it() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE contexts (context_id BLOB PRIMARY KEY, label TEXT)").unwrap();
-        conn.execute(SENPAI_COLUMN_ALTER, []).unwrap();
-        let again = conn.execute(SENPAI_COLUMN_ALTER, []).unwrap_err();
-        assert!(is_duplicate_column_error(&again), "{again}");
-    }
-
-    /// The migration runs once. A later open does not recompute senpai edges
-    /// that were moved since, and a fresh database records the marker with nothing to map.
-    #[test]
-    fn senpai_migration_runs_once_and_a_fresh_database_records_the_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kernel.db");
-        let (kid, top, other) = {
-            let db = KernelDb::open(&path).unwrap();
-            let marker: bool = db.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)", [KernelDb::SENPAI_MIGRATION], |r| r.get(0),
-            ).unwrap();
-            assert!(marker, "a fresh database records the marker");
-            let ws_id = setup_test_db(&db);
-            let top = senpai_ctx_row(&db, ws_id, "once-top", None, None);
-            let other = senpai_ctx_row(&db, ws_id, "once-other", None, None);
-            let mut kid = old_context(&db, ws_id, "once-kid", Some(&top), None, 1);
-            set_stored_senpai(&db, &kid, &other);
-            kid.senpai_ctx = Some(other.context_id);
-            (kid, top, other)
-        };
-        let db = KernelDb::open(&path).unwrap();
-        assert_eq!(senpai_of(&db, &kid), Some(other.context_id), "reopening keeps the moved edge");
-        assert_ne!(senpai_of(&db, &kid), Some(top.context_id));
-    }
-
     /// A kernel.db opened with no senpai marker and no report table maps its edges on `open`.
     #[test]
     fn opening_a_pre_senpai_database_adds_the_column_and_maps_the_edges() {
@@ -13052,8 +12934,8 @@ mod tests {
             (lane, seat, root, amy)
         };
         let db = KernelDb::open(&path).unwrap();
-        assert_eq!(senpai_of(&db, &lane), Some(seat.context_id));
-        assert_eq!(senpai_of(&db, &seat), Some(root.context_id));
+        assert_eq!(db.senpai_conversation_of(lane.context_id).unwrap(), Some(seat.context_id));
+        assert_eq!(db.senpai_conversation_of(seat.context_id).unwrap(), Some(root.context_id));
         assert_eq!(db.lineage_root(lane.context_id).unwrap(), amy);
     }
 
@@ -13222,7 +13104,6 @@ mod tests {
             turn_id: TurnId::new(),
             context_id: ctx,
             performer: PrincipalId::new(),
-            cast: Some("house".into()),
             role: "coder".into(),
             provider: "anthropic".into(),
             model: "claude-haiku-5-5".into(),

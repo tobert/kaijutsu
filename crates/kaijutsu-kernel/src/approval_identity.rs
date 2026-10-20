@@ -127,15 +127,22 @@ mod tests {
         let db = kernel.kernel_db().lock();
         let ws = db.get_or_create_default_workspace(PrincipalId::system()).unwrap();
         db.insert_context_with_document(&ContextRow {
-            context_id, label: Some(label.into()), provider: None, model: None, system_prompt: None,
+            context_id, label: Some(label.into()), system_prompt: None,
             context_state: kaijutsu_types::ContextState::Live, context_type: "default".into(),
             created_at: kaijutsu_types::now_millis() as i64, created_by: PrincipalId::system(),
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
             concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-            cast_id: None, origin_host: None, played_by, senpai_ctx: senpai,
+            origin_host: None, played_by: None,
         }, ws).unwrap();
         if let Some(performer) = played_by {
             db.update_played_by(context_id, Some(performer)).unwrap();
+        }
+        // A context with no instance has no edge, and is not a senpai.
+        if let Some(senpai) = senpai
+            && played_by.is_some()
+            && db.context_instance_row(senpai).unwrap().is_some()
+        {
+            db.set_context_senpai(context_id, Some(senpai)).unwrap();
         }
         context_id
     }

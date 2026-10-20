@@ -269,11 +269,10 @@ CREATE TABLE IF NOT EXISTS characters (
     retired_at       INTEGER,                     -- characters retire; never deleted
     -- arrive with later slices:
     root             INTEGER NOT NULL DEFAULT 0, -- no model; see "Roots and rotation"
-    default_cast_id  BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
+    cast_id          BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     rc_dir           TEXT,                        -- default /config/rc/character/<name>
     memory_root      TEXT,                        -- host path; NULL = no memory of its own
-    handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
+    handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
 ```
 

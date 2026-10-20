@@ -1147,8 +1147,6 @@ impl KjDispatcher {
                             let row = crate::kernel_db::ContextRow {
                                 context_id: id,
                                 label: Some(label.clone()),
-                                provider: None,
-                                model: None,
                                 system_prompt: None,
                                 context_state: kaijutsu_types::ContextState::Live,
                                 context_type: "default".to_string(),
@@ -1164,10 +1162,8 @@ impl KjDispatcher {
                                 promoted_at: None,
                                 demoted_at: None,
                                 paused_at: None,
-                                cast_id: None,
                                 origin_host: None,
                                 played_by: None,
-                                senpai_ctx: None,
                             };
                             db.insert_well_known_context(&row, ws, crate::kernel_db::WellKnownRole::LostFound)
                                 .map_err(|e| format!("failed to publish lost+found context: {e}"))

@@ -414,8 +414,6 @@ mod tests {
         let row = ContextRow {
             context_id: ctx_id,
             label: Some("test-ctx".to_string()),
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -431,10 +429,8 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         db.insert_context_with_document(&row, ws).expect("create context");
         (Arc::new(parking_lot::Mutex::new(db)), ctx_id)

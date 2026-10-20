@@ -72,7 +72,7 @@ async fn start_creates_the_root_context_once() {
 /// or defaults row, and a restart adds none. An operator's rows survive a
 /// restart as they are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_kernel_starts_with_no_llm_backend_and_no_default() {
+async fn a_new_kernel_starts_with_no_llm_backend() {
     let tmp = tempfile::tempdir().unwrap();
     support::init_root(tmp.path(), "amy");
 
@@ -80,7 +80,6 @@ async fn a_new_kernel_starts_with_no_llm_backend_and_no_default() {
     {
         let db = shared.kernel_db.lock();
         assert!(db.list_backends().unwrap().is_empty(), "a new kernel has no backends");
-        assert_eq!(db.get_llm_defaults().unwrap(), None, "a new kernel has no default model");
     }
     assert!(shared.kernel.llm().read().await.list().is_empty());
     {
@@ -108,7 +107,6 @@ async fn a_new_kernel_starts_with_no_llm_backend_and_no_default() {
     let db = restarted.kernel_db.lock();
     let names: Vec<String> = db.list_backends().unwrap().into_iter().map(|b| b.name).collect();
     assert_eq!(names, vec!["zorak"], "a restart adds no backend and keeps the operator's");
-    assert_eq!(db.get_llm_defaults().unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

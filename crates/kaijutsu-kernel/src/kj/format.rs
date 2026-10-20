@@ -673,8 +673,6 @@ mod tests {
         ContextRow {
             context_id: id,
                         label: label.map(|s| s.to_string()),
-            provider: Some("anthropic".to_string()),
-            model: Some("claude-opus-4-6".to_string()),
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -690,10 +688,8 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         }
     }
 

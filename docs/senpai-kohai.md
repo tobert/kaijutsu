@@ -210,7 +210,8 @@ Step 5 (instances and bindings):
 
 - Columns `contexts.senpai_ctx`, `contexts.played_by`, `contexts.cast_id`, `contexts.provider`, `contexts.model`,
   `characters.root_ctx`, `presets.cast_id`, `presets.system_prompt`, `turns.cast_label`
-  and `turns.model_source`; table `llm_defaults`; the `senpai_migration_report` table once its rows map.
+  and `turns.model_source`; table `llm_defaults`. `characters.default_cast_id` is renamed `cast_id`. The
+  `senpai_migration_report` table stays: `kj senpai show` prints a context's notes until its senpai is set again.
 - `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj kohai create -m|--model|--cast`;
   `kj fork --model`; `kj model` (`kj context info` shows the model); `kj backend default`;
   `kj preset save --cast|--system-prompt`. `kj models` (discovery) stays.

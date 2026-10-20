@@ -472,8 +472,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
                 "seat context {seat} belongs to no character instance, so its judge shadow has none to join"
             )));
         };
-        let mut row = shadow_row(&seat_row);
-        row.played_by = seat_row.played_by;
+        let row = shadow_row(&seat_row);
         db.in_transaction(|db| {
             crate::kj::context::insert_new_context_rows(db, &row, crate::kj::context::InstancePlacement::Join { instance, seq })
         })?;
@@ -530,8 +529,6 @@ fn shadow_row(seat: &ContextRow) -> ContextRow {
     ContextRow {
         context_id: ContextId::new(),
         label: Some(shadow_label(&seat_name)),
-        provider: None,
-        model: None,
         system_prompt: None,
         context_state: ContextState::Live,
         context_type: JUDGE.into(),
@@ -547,11 +544,8 @@ fn shadow_row(seat: &ContextRow) -> ContextRow {
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
-        cast_id: None,
         origin_host: None,
         played_by: None,
-        // A fork child of the seat.
-        senpai_ctx: Some(seat.context_id),
     }
 }
 

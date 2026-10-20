@@ -268,10 +268,8 @@ case = "shell"
         let f = forest().await;
         let system = character(&f.kernel, "system", false);
         let system_seat = live_context_with(&f.kernel, "system-seat", |r| r.played_by = Some(system));
-        let ctx = live_context_with(&f.kernel, "odd", |r| {
-            r.played_by = Some(f.coder);
-            r.senpai_ctx = Some(system_seat);
-        });
+        let ctx = live_context_with(&f.kernel, "odd", |r| r.played_by = Some(f.coder));
+        f.kernel.kernel_db().lock().set_context_senpai(ctx, Some(system_seat)).unwrap();
         let error = f.chain(REVIEWER_CONTEXTS_ON, ctx, f.coder).unwrap_err();
         assert!(error.contains("council-system"), "{error}");
     }

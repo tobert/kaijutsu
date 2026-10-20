@@ -1717,7 +1717,7 @@ mod tests {
             extra: None,
         })
         .unwrap();
-        db.set_character_default_cast(character, Some(cast.cast_id)).unwrap();
+        db.set_character_cast(character, Some(cast.cast_id)).unwrap();
         drop(db);
         let coder = live_context(&r.kernel, "coder-seat");
         let db = r.kernel.kernel_db().lock();

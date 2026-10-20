@@ -535,15 +535,10 @@ impl KjDispatcher {
             // source's model slots.
             let source_row = db.get_context(source_id).ok().flatten();
             let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
-            // A fork is the same performance's continuation by default —
-            // whoever plays the source plays the child too.
-            let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
 
             let row = ContextRow {
                 context_id: new_id,
                 label: label.clone(),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: if staging {
                     ContextState::Staging
@@ -563,11 +558,8 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
-                played_by: source_played_by,
-                // The forking context is the fork's senpai.
-                senpai_ctx: Some(source_id),
+                played_by: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -855,15 +847,10 @@ impl KjDispatcher {
             let mut db = self.kernel_db().lock();
 
             let source_ws = source_row.workspace_id;
-            // A fork is the same performance's continuation by default —
-            // whoever plays the source plays the child too.
-            let source_played_by = source_row.played_by;
 
             let row = ContextRow {
                 context_id: new_id,
                 label: label.clone(),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 context_type: source_row.context_type.clone(),
@@ -879,11 +866,8 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
-                played_by: source_played_by,
-                // The forking context is the fork's senpai.
-                senpai_ctx: Some(source_id),
+                played_by: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -2150,41 +2134,54 @@ mod tests {
         assert_eq!(row.created_by, c.principal_id, "created_by names the requester, not the performer");
     }
 
-    /// A fork answers to the context it was forked from, whoever forked it.
+    /// A fork continues its source's performance: it joins the source's
+    /// instance and binding, so it answers to the same senpai.
     #[tokio::test]
-    async fn fork_makes_the_forking_context_the_senpai() {
+    async fn fork_joins_the_source_instance() {
         let d = test_dispatcher().await;
         let requester = PrincipalId::new();
         let top = register_context(&d, Some("senpai-fork-top"), None, requester);
         let source = register_context(&d, Some("senpai-fork-src"), Some(top), requester);
+        {
+            let db = d.kernel_db().lock();
+            db.assign_stand_in_instance(top, PrincipalId::new()).unwrap();
+            db.assign_stand_in_instance(source, PrincipalId::new()).unwrap();
+            db.set_context_senpai(source, Some(top)).unwrap();
+        }
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         let c = caller_with_context(source);
 
         let result = d.dispatch(&[s("fork"), s("--name"), s("senpai-fork-child")], &c).await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
-        let child_ctx = child_id(&d, "senpai-fork-child");
-        let child = d.kernel_db().lock().get_context(child_ctx).unwrap().unwrap();
-        assert_eq!(child.forked_from, Some(source));
-        assert_eq!(child.senpai_ctx, Some(source), "the forking context is the fork's senpai");
-        assert_ne!(
-            d.kernel_db().lock().get_context(source).unwrap().unwrap().senpai_ctx,
-            child.senpai_ctx,
-            "the fork does not inherit the source's own senpai"
-        );
+        let child = child_id(&d, "senpai-fork-child");
+        let db = d.kernel_db().lock();
+        assert_eq!(db.get_context(child).unwrap().unwrap().forked_from, Some(source));
+        assert_eq!(db.context_instance(child).unwrap(), db.context_instance(source).unwrap(), "the fork runs on its source's instance and binding");
+        assert_eq!(db.senpai_conversation_of(child).unwrap(), Some(top), "so it answers to its source's senpai");
     }
 
     #[tokio::test]
-    async fn compact_fork_makes_the_forking_context_the_senpai() {
+    async fn compact_fork_joins_the_source_instance() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("senpai-compact-src"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            let performer = PrincipalId::new();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: performer, name: "compactor".into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            db.seed_test_cast(performer, "mock", "mock-model", &["default", "distill"]).unwrap();
+            db.assign_stand_in_instance(source, performer).unwrap();
+        }
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         setup_compact_source(&d, source, principal).await;
         let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("senpai-compact-child")], &caller_with_context(source)).await;
         assert!(result.is_ok(), "{}", result.message());
-        let child_ctx = child_id(&d, "senpai-compact-child");
-        let child = d.kernel_db().lock().get_context(child_ctx).unwrap().unwrap();
-        assert_eq!(child.senpai_ctx, Some(source));
+        let child = child_id(&d, "senpai-compact-child");
+        let db = d.kernel_db().lock();
+        assert_eq!(db.context_instance(child).unwrap(), db.context_instance(source).unwrap());
     }
 
     #[tokio::test]

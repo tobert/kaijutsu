@@ -1,12 +1,12 @@
 use rusqlite::params;
 
-use kaijutsu_types::WorkspaceId;
+use kaijutsu_types::{DocKind, PresetId, TurnId, WorkspaceId};
 
 use super::*;
 use crate::kernel_db::{
-    BackendModelRow, BackendRow, CastRow, CastSlotRow, CharacterRow, ContextRow, LlmDefaultsRow,
-    ModelTunablesRow, blob_param, insert_context_with_doc, make_context_row, now_millis,
-    setup_test_db,
+    BackendModelRow, BackendRow, CastRow, CastSlotRow, CharacterRow, ContextRow, DocumentRow, ModelTunablesRow,
+    blob_param, insert_context_with_doc, into_pre_instance, make_context_row, now_millis,
+    set_stored_played_by, setup_test_db,
 };
 
 struct World {
@@ -16,10 +16,25 @@ struct World {
     deepseek: BackendId,
     /// Next `created_at` a test context takes, so creation order is explicit.
     clock: std::cell::Cell<i64>,
+    /// Whether the database has the pre-instance columns a migration reads.
+    legacy: bool,
 }
 
+/// A database on the current schema.
 fn world() -> World {
+    build_world(false)
+}
+
+/// A database with the schema `instances-v1` migrates from.
+fn legacy_world() -> World {
+    build_world(true)
+}
+
+fn build_world(legacy: bool) -> World {
     let db = KernelDb::temporary().unwrap();
+    if legacy {
+        into_pre_instance(&db);
+    }
     let ws = setup_test_db(&db);
     let backend = |name: &str, kind: &str| {
         db.upsert_backend(&BackendRow {
@@ -41,7 +56,7 @@ fn world() -> World {
     };
     let anthropic = backend("anthropic", "anthropic");
     let deepseek = backend("deepseek", "deepseek");
-    World { db, ws, anthropic, deepseek, clock: std::cell::Cell::new(1_000) }
+    World { db, ws, anthropic, deepseek, clock: std::cell::Cell::new(1_000), legacy }
 }
 
 impl World {
@@ -107,10 +122,11 @@ impl World {
     }
 
     fn default_cast(&self, character: PrincipalId, cast: CastId) {
+        let column = if self.legacy { "default_cast_id" } else { "cast_id" };
         self.db
             .conn
             .execute(
-                "UPDATE characters SET default_cast_id = ?1 WHERE principal_id = ?2",
+                &format!("UPDATE characters SET {column} = ?1 WHERE principal_id = ?2"),
                 params![blob_param(cast.as_bytes()), blob_param(character.as_bytes())],
             )
             .unwrap();
@@ -134,13 +150,17 @@ impl World {
     }
 
     fn ctx(&self, label: &str, ty: &str, played_by: Option<PrincipalId>, forked_from: Option<&ContextRow>) -> ContextRow {
+        assert!(self.legacy || played_by.is_none(), "only a legacy database stores a performer; start an instance instead");
         let mut row = make_context_row(Some(label));
         row.context_type = ty.into();
-        row.played_by = played_by;
         row.forked_from = forked_from.map(|f| f.context_id);
         row.created_at = self.clock.get();
         self.clock.set(self.clock.get() + 1);
         insert_context_with_doc(&self.db, &row, self.ws);
+        if played_by.is_some() {
+            set_stored_played_by(&self.db, row.context_id, played_by);
+        }
+        row.played_by = played_by;
         row
     }
 
@@ -213,7 +233,7 @@ fn start_copies_the_cast_and_fills_unset_parameters_from_the_model_row() {
     coder.temperature = Some(0.2);
     w.db.set_cast_slot(&coder).unwrap();
     let who = w.character("coder");
-    let conv = w.ctx("conv", "coder", Some(who), None);
+    let conv = w.ctx("conv", "coder", None, None);
 
     let instance = w.db.start_instance(who, None, Some(house), Some("be terse"), conv.context_id, who).unwrap();
 
@@ -238,12 +258,12 @@ fn a_later_cast_change_moves_no_binding_and_an_appended_binding_reads_it_fresh()
     let w = world();
     let house = w.house();
     let who = w.character("coder");
-    let first = w.ctx("first", "coder", Some(who), None);
+    let first = w.ctx("first", "coder", None, None);
     let instance = w.db.start_instance(who, None, Some(house), None, first.context_id, who).unwrap();
 
     w.model_row(w.anthropic, "claude-x", ModelTunablesRow { max_tokens: Some(9000), ..Default::default() }, None);
     w.slot(house, "coder", w.anthropic, "claude-x", None);
-    let second = w.ctx("second", "coder", Some(who), None);
+    let second = w.ctx("second", "coder", None, None);
     let binding = w.db.append_binding(instance.instance_id, Some(house), None, second.context_id).unwrap();
 
     assert_eq!(binding.seq, 2);
@@ -262,7 +282,7 @@ fn a_slot_with_no_max_tokens_anywhere_refuses_naming_cast_role_and_model() {
     let bare = w.cast("bare");
     w.slot(bare, "coder", w.deepseek, "no-row-model", None);
     let who = w.character("coder");
-    let conv = w.ctx("conv", "coder", Some(who), None);
+    let conv = w.ctx("conv", "coder", None, None);
 
     let error = w.db.start_instance(who, None, Some(bare), None, conv.context_id, who).unwrap_err().to_string();
 
@@ -275,7 +295,7 @@ fn a_slot_with_no_max_tokens_anywhere_refuses_naming_cast_role_and_model() {
 
     let house = w.house();
     let instance = w.db.start_instance(who, None, Some(house), None, conv.context_id, who).unwrap();
-    let next = w.ctx("next", "coder", Some(who), None);
+    let next = w.ctx("next", "coder", None, None);
     w.slot(house, "coder", w.deepseek, "no-row-model", None);
     let error = w.db.append_binding(instance.instance_id, Some(house), None, next.context_id).unwrap_err().to_string();
     assert!(error.contains("house") && error.contains("coder") && error.contains("no-row-model"), "{error}");
@@ -288,11 +308,11 @@ fn a_binding_may_have_no_slot_for_a_role() {
     let w = world();
     let house = w.house();
     let who = w.character("coder");
-    let with_cast = w.ctx("with-cast", "coder", Some(who), None);
+    let with_cast = w.ctx("with-cast", "coder", None, None);
     let instance = w.db.start_instance(who, None, Some(house), None, with_cast.context_id, who).unwrap();
     assert!(w.db.binding_slot(instance.instance_id, 1, "musician").unwrap().is_none());
 
-    let castless = w.ctx("castless", "coder", Some(who), None);
+    let castless = w.ctx("castless", "coder", None, None);
     let other = w.db.start_instance(who, None, None, None, castless.context_id, who).unwrap();
     assert!(w.db.binding_slot(other.instance_id, 1, "coder").unwrap().is_none());
     assert!(w.db.list_binding_slots(other.instance_id, 1).unwrap().is_empty());
@@ -304,8 +324,8 @@ fn bindings_slots_and_context_membership_are_never_changed() {
     let w = world();
     let house = w.house();
     let who = w.character("coder");
-    let conv = w.ctx("conv", "coder", Some(who), None);
-    let other = w.ctx("other", "coder", Some(who), None);
+    let conv = w.ctx("conv", "coder", None, None);
+    let other = w.ctx("other", "coder", None, None);
     let instance = w.db.start_instance(who, None, Some(house), None, conv.context_id, who).unwrap();
     let second = w.db.start_instance(who, None, None, None, other.context_id, who).unwrap();
 
@@ -342,8 +362,8 @@ fn bindings_slots_and_context_membership_are_never_changed() {
 fn an_instance_is_inactive_while_its_conversation_is_archived() {
     let w = world();
     let who = w.character("coder");
-    let conv = w.ctx("conv", "coder", Some(who), None);
-    let fork = w.ctx("fork", "coder", Some(who), Some(&conv));
+    let conv = w.ctx("conv", "coder", None, None);
+    let fork = w.ctx("fork", "coder", None, Some(&conv));
     let instance = w.db.start_instance(who, None, None, None, conv.context_id, who).unwrap().instance_id;
     w.db.join_instance(fork.context_id, instance, 1).unwrap();
     assert!(w.db.instance_is_active(instance).unwrap());
@@ -363,16 +383,14 @@ fn an_instance_is_inactive_while_its_conversation_is_archived() {
     assert!(matches!(w.db.instance_is_active(CharacterInstanceId::new()).unwrap_err(), KernelDbError::NotFound(_)));
 }
 
-/// Every reader of a context's performer gets the principal of its instance,
-/// whatever the stored `played_by` column holds; a root's console is its root
-/// instance's conversation whatever the stored `root_ctx` says.
+/// Every reader of a context's performer gets the principal of its instance;
+/// a root's console is its root instance's conversation.
 #[test]
 fn the_performer_and_the_root_console_are_read_from_the_instance() {
     let w = world();
     let who = w.character("coder");
-    let other = w.character("other");
-    let conv = w.ctx("conv", "coder", Some(other), None);
-    assert_eq!(w.db.get_context(conv.context_id).unwrap().unwrap().played_by, None, "a stored performer without an instance performs nothing");
+    let conv = w.ctx("conv", "coder", None, None);
+    assert_eq!(w.db.get_context(conv.context_id).unwrap().unwrap().played_by, None, "a context with no instance performs nothing");
     w.db.start_instance(who, None, None, None, conv.context_id, who).unwrap();
     for read in [
         w.db.get_context(conv.context_id).unwrap().unwrap(),
@@ -381,17 +399,15 @@ fn the_performer_and_the_root_console_are_read_from_the_instance() {
         w.db.list_all_contexts().unwrap().into_iter().find(|r| r.context_id == conv.context_id).unwrap(),
         w.db.fork_lineage(conv.context_id).unwrap().remove(0).0,
     ] {
-        assert_eq!(read.played_by, Some(who), "the instance's character, not the stored {other:?}");
+        assert_eq!(read.played_by, Some(who), "the instance's character");
     }
     assert_eq!(w.db.contexts_played_by(who).unwrap().len(), 1);
-    assert!(w.db.contexts_played_by(other).unwrap().is_empty(), "the stored column plays nothing");
 
     let amy = w.character("amy");
     w.db.update_character_root(amy, true).unwrap();
     let console = w.ctx("amy-console", "root", None, None);
     assert_eq!(w.db.get_character(amy).unwrap().unwrap().root_ctx, None);
     w.db.start_instance(amy, None, None, None, console.context_id, amy).unwrap();
-    w.db.write_stored_root_ctx(amy, Some(conv.context_id)).unwrap();
     for sheet in [
         w.db.get_character(amy).unwrap().unwrap(),
         w.db.get_character_by_name("amy").unwrap().unwrap(),
@@ -401,19 +417,43 @@ fn the_performer_and_the_root_console_are_read_from_the_instance() {
     }
 }
 
+/// A row that sets `played_by` is refused: the performer is the instance's
+/// character, and no column stores it.
+#[test]
+fn a_context_row_that_sets_the_performer_is_refused() {
+    let w = world();
+    let who = w.character("coder");
+    let mut row = make_context_row(Some("sets-played-by"));
+    w.db.insert_document(&DocumentRow {
+        document_id: row.context_id,
+        workspace_id: w.ws,
+        doc_kind: DocKind::Conversation,
+        language: None,
+        path: None,
+        created_at: row.created_at,
+        created_by: row.created_by,
+    }).unwrap();
+    row.played_by = Some(who);
+    let error = w.db.insert_context(&row).unwrap_err().to_string();
+    assert!(error.contains("played_by") && error.contains("instance"), "{error}");
+    assert!(w.db.get_context(row.context_id).unwrap().is_none());
+    row.played_by = None;
+    w.db.insert_context(&row).expect("the same row without a performer is accepted");
+}
+
 #[test]
 fn a_context_joins_one_instance_once() {
     let w = world();
     let house = w.house();
     let who = w.character("coder");
-    let conv = w.ctx("conv", "coder", Some(who), None);
-    let fork = w.ctx("fork", "coder", Some(who), Some(&conv));
+    let conv = w.ctx("conv", "coder", None, None);
+    let fork = w.ctx("fork", "coder", None, Some(&conv));
     let instance = w.db.start_instance(who, None, Some(house), None, conv.context_id, who).unwrap();
 
     w.db.join_instance(fork.context_id, instance.instance_id, 1).unwrap();
     assert_eq!(w.db.context_instance(fork.context_id).unwrap(), Some((instance.instance_id, 1)));
     assert!(w.db.join_instance(fork.context_id, instance.instance_id, 1).is_err(), "no second join");
-    let late = w.ctx("late", "coder", Some(who), None);
+    let late = w.ctx("late", "coder", None, None);
     assert!(w.db.join_instance(late.context_id, instance.instance_id, 9).is_err(), "a seq with no binding");
     assert_eq!(w.db.context_instance(late.context_id).unwrap(), None);
 
@@ -426,7 +466,7 @@ fn a_context_joins_one_instance_once() {
 
 #[test]
 fn a_rotation_chain_becomes_one_instance() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -453,7 +493,7 @@ fn a_rotation_chain_becomes_one_instance() {
 
 #[test]
 fn a_fork_child_joins_its_source_and_a_fork_by_another_performer_starts_a_kohai() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let [lead, coder] = [w.character("lead"), w.character("coder")];
     w.default_cast(lead, house);
@@ -479,7 +519,7 @@ fn a_fork_child_joins_its_source_and_a_fork_by_another_performer_starts_a_kohai(
 
 #[test]
 fn a_judge_shadow_joins_the_instance_it_judges() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -502,7 +542,7 @@ fn a_judge_shadow_joins_the_instance_it_judges() {
 
 #[test]
 fn a_shared_cast_is_copied_into_each_binding() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let [one, two] = [w.character("one"), w.character("two")];
     w.default_cast(one, house);
@@ -526,7 +566,7 @@ fn a_shared_cast_is_copied_into_each_binding() {
 
 #[test]
 fn a_context_with_an_override_keeps_its_model() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -553,18 +593,12 @@ fn a_context_with_an_override_keeps_its_model() {
 
 #[test]
 fn a_context_resolved_through_llm_defaults_keeps_that_model() {
-    let w = world();
-    w.db.set_llm_defaults(&LlmDefaultsRow {
-        default_backend: "deepseek".into(),
-        default_model: "ds-lite".into(),
-        max_tokens: Some(1000),
-        temperature: Some(0.5),
-        top_p: None,
-        effort: None,
-        thinking_budget: None,
-        thinking_style: None,
-    })
-    .unwrap();
+    let w = legacy_world();
+    w.exec(
+        "INSERT INTO llm_defaults (id, default_backend, default_model, max_tokens, temperature)
+         VALUES (1, 'deepseek', 'ds-lite', 1000, 0.5)",
+        [],
+    );
     let who = w.character("plain");
     let ctx = w.ctx("plain", "coder", Some(who), None);
 
@@ -580,7 +614,7 @@ fn a_context_resolved_through_llm_defaults_keeps_that_model() {
 
 #[test]
 fn max_tokens_is_pinned_slot_then_model_then_defaults_then_64000() {
-    let w = world();
+    let w = legacy_world();
     w.model_row(w.deepseek, "with-row", ModelTunablesRow { max_tokens: Some(7000), ..Default::default() }, None);
     let cast = w.cast("pins");
     w.slot(cast, "coder", w.deepseek, "ds-slot", Some(1234));
@@ -606,7 +640,7 @@ fn max_tokens_is_pinned_slot_then_model_then_defaults_then_64000() {
 
 #[test]
 fn an_unresolvable_context_gets_a_binding_with_no_slot_and_is_listed() {
-    let w = world();
+    let w = legacy_world();
     let who = w.character("lost");
     let ctx = w.ctx("lost", "coder", Some(who), None);
 
@@ -622,7 +656,7 @@ fn an_unresolvable_context_gets_a_binding_with_no_slot_and_is_listed() {
 
 #[test]
 fn a_cycle_refuses_the_whole_migration_naming_the_contexts() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -647,7 +681,7 @@ fn a_cycle_refuses_the_whole_migration_naming_the_contexts() {
 
 #[test]
 fn an_instance_whose_senpai_would_be_itself_refuses() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -663,7 +697,7 @@ fn an_instance_whose_senpai_would_be_itself_refuses() {
 
 #[test]
 fn a_senpai_cycle_between_instances_refuses() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let [one, two] = [w.character("one"), w.character("two")];
     w.default_cast(one, house);
@@ -681,7 +715,7 @@ fn a_senpai_cycle_between_instances_refuses() {
 
 #[test]
 fn a_handoff_context_gets_no_instance_and_a_root_console_has_no_senpai() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let [coder, amy] = [w.character("coder"), w.character("amy")];
     w.default_cast(coder, house);
@@ -709,7 +743,7 @@ fn a_handoff_context_gets_no_instance_and_a_root_console_has_no_senpai() {
 
 #[test]
 fn values_the_migration_does_not_carry_are_reported() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let [lead, coder, other] = [w.character("lead"), w.character("coder"), w.character("other")];
     for who in [lead, coder, other] {
@@ -741,7 +775,7 @@ fn values_the_migration_does_not_carry_are_reported() {
 
 #[test]
 fn live_instances_without_a_gate_or_distill_slot_are_listed() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let thin = w.cast("thin");
     w.slot(thin, "coder", w.deepseek, "ds-flash", None);
@@ -768,7 +802,7 @@ fn live_instances_without_a_gate_or_distill_slot_are_listed() {
 
 #[test]
 fn an_archived_context_that_cannot_be_mapped_is_left_without_an_instance_and_listed() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -790,7 +824,7 @@ fn an_archived_context_that_cannot_be_mapped_is_left_without_an_instance_and_lis
 
 #[test]
 fn an_overriding_fork_newer_than_the_conversation_does_not_displace_it() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -814,7 +848,7 @@ fn an_overriding_fork_newer_than_the_conversation_does_not_displace_it() {
 
 #[test]
 fn a_gate_slot_needs_no_max_tokens_but_a_coder_slot_does() {
-    let w = world();
+    let w = legacy_world();
     let council = w.db.upsert_backend(&BackendRow {
         backend_id: BackendId::new(),
         name: "council".into(),
@@ -849,7 +883,7 @@ fn a_gate_slot_needs_no_max_tokens_but_a_coder_slot_does() {
 
 #[test]
 fn the_migration_runs_once() {
-    let w = world();
+    let w = legacy_world();
     let house = w.house();
     let who = w.character("coder");
     w.default_cast(who, house);
@@ -862,4 +896,118 @@ fn the_migration_runs_once() {
     assert_eq!(w.count("character_instances"), 1);
     assert_eq!(w.instance(&later), None, "a marked database is left alone");
     assert!(w.instance(&seat).is_some());
+}
+
+// ── Dropping what the instance model replaced ───────────────────────
+
+/// Every column and table the instance model replaced, as `(table, column)`; a
+/// column of `None` is the whole table.
+const DROPPED: [(&str, Option<&str>); 11] = [
+    ("contexts", Some("senpai_ctx")),
+    ("contexts", Some("played_by")),
+    ("contexts", Some("cast_id")),
+    ("contexts", Some("provider")),
+    ("contexts", Some("model")),
+    ("characters", Some("root_ctx")),
+    ("presets", Some("cast_id")),
+    ("presets", Some("system_prompt")),
+    ("turns", Some("cast_label")),
+    ("turns", Some("model_source")),
+    ("llm_defaults", None),
+];
+
+fn exists(w: &World, (table, column): (&str, Option<&str>)) -> bool {
+    match column {
+        Some(column) => KernelDb::has_column(&w.db.conn, table, column).unwrap(),
+        None => KernelDb::has_table(&w.db.conn, table).unwrap(),
+    }
+}
+
+/// An open on a database at the previous schema runs `instances-v1` first,
+/// which reads the old columns, and drops them after: the instances and
+/// bindings carry what the columns held, the columns and `llm_defaults` are
+/// gone, `characters.default_cast_id` is `characters.cast_id`, and rows in the
+/// tables that lost columns survive. A second open does nothing.
+#[test]
+fn an_open_carries_the_old_columns_into_instances_then_drops_them() {
+    let w = legacy_world();
+    let house = w.house();
+    let who = w.character("coder");
+    w.default_cast(who, house);
+    let lead = w.character("lead");
+    w.default_cast(lead, house);
+    let seat = w.ctx("seat", "coder", Some(lead), None);
+    let overridden = w.ctx("overridden", "coder", Some(who), Some(&seat));
+    w.set_override(&overridden, "anthropic", "claude-x");
+    w.exec(
+        "UPDATE characters SET root_ctx = ?1 WHERE principal_id = ?2",
+        params![blob_param(seat.context_id.as_bytes()), blob_param(who.as_bytes())],
+    );
+    w.exec(
+        "INSERT INTO presets (preset_id, label, cast_id, system_prompt, created_at, created_by)
+         VALUES (?1, 'with-cast', ?2, 'be terse', 0, ?3)",
+        params![PresetId::new().as_bytes().as_slice(), blob_param(house.as_bytes()), blob_param(who.as_bytes())],
+    );
+    w.exec(
+        "INSERT INTO turns (turn_id, context_id, performer, cast_label, role, provider, model, model_source, started_at)
+         VALUES (?1, ?2, ?3, 'house', 'coder', 'deepseek', 'ds-flash', 'cast', 1)",
+        params![TurnId::new().as_bytes().as_slice(), blob_param(seat.context_id.as_bytes()), blob_param(who.as_bytes())],
+    );
+    w.exec(
+        "INSERT INTO llm_defaults (id, default_backend, default_model) VALUES (1, 'deepseek', 'ds-flash')",
+        [],
+    );
+    w.exec(
+        "INSERT INTO senpai_migration_report (context_id, senpai_ctx, note, old_reviewer, recorded_at)
+         VALUES (?1, NULL, 'kept for kj senpai show', NULL, 1)",
+        params![blob_param(overridden.context_id.as_bytes())],
+    );
+    for dropped in DROPPED {
+        assert!(exists(&w, dropped), "{dropped:?} is there before the open");
+    }
+    assert!(KernelDb::has_column(&w.db.conn, "characters", "default_cast_id").unwrap());
+
+    KernelDb::apply_additive_migrations(&w.db.conn).unwrap();
+
+    for dropped in DROPPED {
+        assert!(!exists(&w, dropped), "{dropped:?} is gone after the open");
+    }
+    assert!(!KernelDb::has_column(&w.db.conn, "characters", "default_cast_id").unwrap());
+    assert_eq!(w.db.character_cast(who).unwrap().map(|c| c.label), Some("house".to_string()), "characters.cast_id holds the old default cast");
+    assert_eq!(w.db.get_context(seat.context_id).unwrap().unwrap().played_by, Some(lead), "the performer was carried into an instance before the column went");
+    let (instance, seq) = w.db.context_instance(overridden.context_id).unwrap().expect("the override joined an instance");
+    let slot = w.db.binding_slot(instance, seq, "coder").unwrap().expect("the override's slot");
+    assert_eq!((slot.backend_id, slot.model.as_str()), (w.anthropic, "claude-x"), "the override was carried into the binding");
+    assert_eq!(w.db.senpai_conversation_of(overridden.context_id).unwrap(), Some(seat.context_id), "the senpai edge was carried");
+    assert_eq!(w.count("turns"), 1, "a turn survives the loss of its columns");
+    assert_eq!(w.count("presets"), 1, "a preset survives the loss of its columns");
+    assert_eq!(w.count("senpai_migration_report"), 1, "kj senpai show still reads the report");
+
+    KernelDb::apply_additive_migrations(&w.db.conn).unwrap();
+    assert_eq!(w.db.context_instance(overridden.context_id).unwrap(), Some((instance, seq)), "a second open changes nothing");
+}
+
+/// The drop refuses before `instances-v1` has recorded its mapping: the
+/// columns it reads are still there for the next try.
+#[test]
+fn the_drop_refuses_before_the_instance_migration_has_run() {
+    let w = legacy_world();
+    let error = KernelDb::drop_pre_instance_columns(&w.db.conn).unwrap_err().to_string();
+    assert!(error.contains("before the instance migration"), "{error}");
+    for dropped in DROPPED {
+        assert!(exists(&w, dropped), "{dropped:?} stays");
+    }
+}
+
+/// A database on the current schema, which never had the columns, opens
+/// without either migration and without the columns.
+#[test]
+fn a_new_database_has_none_of_the_dropped_columns_and_runs_neither_migration() {
+    let w = world();
+    for dropped in DROPPED {
+        assert!(!exists(&w, dropped), "{dropped:?} is not in a new database");
+    }
+    assert!(KernelDb::has_column(&w.db.conn, "characters", "cast_id").unwrap());
+    assert_eq!(w.count("kernel_migrations WHERE name IN ('senpai-edges-v1', 'instances-v1')"), 0);
+    KernelDb::apply_additive_migrations(&w.db.conn).unwrap();
 }

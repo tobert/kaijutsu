@@ -152,10 +152,8 @@ impl KjDispatcher {
             Ok(Some(existing)) => {
                 let updated = PresetRow {
                     preset_id: existing.preset_id,
-                                        label: label.to_string(),
+                    label: label.to_string(),
                     description: desc.or(existing.description),
-                    cast_id: existing.cast_id,
-                    system_prompt: existing.system_prompt,
                     created_at: existing.created_at,
                     created_by: existing.created_by,
                 };
@@ -167,10 +165,8 @@ impl KjDispatcher {
             Ok(None) => {
                 let row = PresetRow {
                     preset_id: PresetId::new(),
-                                        label: label.to_string(),
+                    label: label.to_string(),
                     description: desc,
-                    cast_id: None,
-                    system_prompt: None,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
                 };

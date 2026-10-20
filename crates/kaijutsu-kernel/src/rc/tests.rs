@@ -977,7 +977,9 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             .expect("rc created child context");
         assert_eq!(child.created_by, caller.principal_id, "Amy requested the work");
         assert_eq!(child.played_by, Some(coder));
-        assert_eq!(child.senpai_ctx, Some(lookup_context_id(&d, "lead-work")), "the lead's context is its coder's senpai");
+        let lead_work = lookup_context_id(&d, "lead-work");
+        let senpai = d.kernel_db().lock().senpai_conversation_of(child_id).unwrap();
+        assert_eq!(senpai, Some(lead_work), "the lead's context is its coder's senpai");
         assert_eq!(
             d.kernel().resolve_context_review(child_id).await.unwrap().reviewer.principal_id,
             lead,

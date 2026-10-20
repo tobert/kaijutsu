@@ -523,7 +523,7 @@ mod tests {
         )), "{}", refused.message());
         let moved = d.dispatch(&[s("senpai"), s("set"), lane.clone(), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
         assert!(moved.is_ok(), "{}", moved.message());
-        assert_eq!(d.kernel_db().lock().get_context(h.lane).unwrap().unwrap().senpai_ctx, Some(h.judge_seat));
+        assert_eq!(d.kernel_db().lock().senpai_conversation_of(h.lane).unwrap(), Some(h.judge_seat));
         assert_eq!(d.kernel().resolve_context_review(h.lane).await.unwrap().reviewer.name, "judge");
         {
             let db = d.kernel_db().lock();
@@ -569,7 +569,7 @@ mod tests {
         assert!(outcome.ask.is_some());
         let pending = d.dispatch(&set(h.lane, h.judge_seat), &caller(h.amy, h.root)).await;
         assert!(!pending.is_ok() && pending.message().contains("pending asks"), "{}", pending.message());
-        assert_eq!(d.kernel_db().lock().get_context(h.lane).unwrap().unwrap().senpai_ctx, Some(h.seat), "every refusal changed nothing");
+        assert_eq!(d.kernel_db().lock().senpai_conversation_of(h.lane).unwrap(), Some(h.seat), "every refusal changed nothing");
     }
 
     /// Setting the senpai again clears the migration's note, which `kj
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!((bindings[0].seq, bindings[0].conversation_ctx, bindings[0].cast_label.as_deref()), (1, fresh.context_id, Some("band")));
         assert_eq!(fresh.played_by, Some(h.coder));
-        assert_eq!(fresh.senpai_ctx, Some(h.seat), "the stored senpai agrees");
+        assert_eq!(db.senpai_conversation_of(fresh.context_id).unwrap(), Some(h.seat), "its senpai's conversation is the caller's");
         drop(db);
         assert_eq!(d.kernel().resolve_context_review(fresh.context_id).await.unwrap().reviewer.name, "banto");
     }
@@ -663,9 +663,10 @@ mod tests {
         let made = d.dispatch(&create("by-root", &["--senpai", "judge-seat", "--parent", "lane"]), &caller(h.amy, h.root)).await;
         assert!(made.is_ok(), "{}", made.message());
         let row = d.kernel_db().lock().find_context_by_label("by-root").unwrap().unwrap();
-        assert_eq!((row.senpai_ctx, row.forked_from), (Some(h.judge_seat), Some(h.lane)), "--senpai routes and --parent records provenance");
+        assert_eq!(row.forked_from, Some(h.lane), "--parent records provenance");
         {
             let db = d.kernel_db().lock();
+            assert_eq!(db.senpai_conversation_of(row.context_id).unwrap(), Some(h.judge_seat), "--senpai routes");
             let judge_instance = db.context_instance(h.judge_seat).unwrap().unwrap().0;
             assert_eq!(db.context_instance_row(row.context_id).unwrap().unwrap().senpai_instance, Some(judge_instance));
         }
@@ -673,7 +674,8 @@ mod tests {
         let own = d.dispatch(&create("by-holder", &["--senpai", "banto-seat"]), &caller(h.banto, h.lane)).await;
         assert!(own.is_ok(), "banto holds banto-seat: {}", own.message());
         let row = d.kernel_db().lock().find_context_by_label("by-holder").unwrap().unwrap();
-        assert_eq!((row.senpai_ctx, row.forked_from), (Some(h.seat), Some(h.lane)));
+        assert_eq!(row.forked_from, Some(h.lane));
+        assert_eq!(d.kernel_db().lock().senpai_conversation_of(row.context_id).unwrap(), Some(h.seat));
     }
 
     /// `kj senpai report` lands the text in the senpai's log as a drift
@@ -730,9 +732,8 @@ mod tests {
     }
 
     /// A verb that takes an instance accepts any of its contexts, and the
-    /// edge it reads is the instance's: moving the instance's senpai without
-    /// touching any stored column changes where `show`, `report` and `list`
-    /// look.
+    /// edge it reads is the instance's: moving the instance's senpai changes
+    /// where `show`, `report` and `list` look.
     #[tokio::test]
     async fn the_senpai_verbs_name_an_instance_by_any_context_and_read_the_instance_edge() {
         let d = test_dispatcher().await;
@@ -762,9 +763,9 @@ mod tests {
         assert!(reported.is_ok(), "{}", reported.message());
         assert_eq!((drifts(h.seat), drifts(h.root)), (1, 0), "a fork reports to its instance's senpai");
 
-        // The instance edge moves; the stored column still says the seat.
+        // The instance edge moves.
         d.kernel_db().lock().set_senpai_instance(lane_instance, Some(root_instance)).unwrap();
-        assert_eq!(d.kernel_db().lock().get_context(h.lane).unwrap().unwrap().senpai_ctx, Some(h.seat));
+        assert_eq!(d.kernel_db().lock().senpai_conversation_of(h.lane).unwrap(), Some(h.root));
         let shown = d.dispatch(&[s("senpai"), s("show"), s("lane")], &caller(h.amy, h.root)).await;
         assert!(shown.message().contains(&format!("senpai: amy ({}), amy", h.root.short())), "{}", shown.message());
         let reported = d.dispatch(&[s("senpai"), s("report"), s("after the move")], &caller(h.coder, fork)).await;

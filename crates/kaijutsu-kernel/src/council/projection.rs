@@ -243,8 +243,6 @@ pub(super) mod fixtures {
         let mut row = ContextRow {
             context_id: id,
             label: Some(label.to_string()),
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -260,26 +258,28 @@ pub(super) mod fixtures {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         edit(&mut row);
-        // A context made under a parent answers to it, as a create or a fork would.
-        if row.senpai_ctx.is_none() {
-            row.senpai_ctx = row.forked_from;
-        }
+        // The performer is not a column: it becomes the context's instance.
+        let performer = row.played_by.take();
         {
             let db = kernel.kernel_db().lock();
             let ws = db
                 .get_or_create_default_workspace(PrincipalId::system())
                 .expect("default workspace");
             db.insert_context_with_document(&row, ws).expect("insert context");
-            // A performer is the character of the context's instance, under
-            // the instance of its stored senpai.
-            if let Some(performer) = row.played_by {
+            // A performer is the character of the context's instance. A
+            // context made under a parent whose instance exists answers to it,
+            // as a create would.
+            if let Some(performer) = performer {
                 db.update_played_by(id, Some(performer)).expect("give the context its instance");
+                if let Some(parent) = row.forked_from
+                    && db.context_instance_row(parent).expect("read the parent's instance").is_some()
+                {
+                    db.set_context_senpai(id, Some(parent)).expect("place the instance under its parent's");
+                }
             }
         }
         kernel

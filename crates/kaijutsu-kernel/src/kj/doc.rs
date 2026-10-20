@@ -88,15 +88,13 @@ struct DocListRow {
     /// Block count if the document is resident in the in-memory store.
     /// Documents persisted but not yet hydrated return None.
     block_count: Option<usize>,
-    /// Conversation metadata when a contexts row exists (label, model, etc.).
+    /// Conversation metadata when a contexts row exists (label, fork parent).
     context: Option<DocContextSummary>,
 }
 
 #[derive(Serialize)]
 struct DocContextSummary {
     label: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
     forked_from: Option<String>,
 }
 
@@ -181,8 +179,6 @@ impl KjDispatcher {
                     let row = db.get_context(d.document_id).ok().flatten();
                     let summary = row.map(|r| DocContextSummary {
                         label: r.label,
-                        provider: r.provider,
-                        model: r.model,
                         forked_from: r.forked_from.map(|id| id.to_hex()),
                     });
                     (d.document_id, summary)
@@ -203,8 +199,6 @@ impl KjDispatcher {
                     .map(|e| e.doc.block_count()),
                 context: ctx.as_ref().map(|c| DocContextSummary {
                     label: c.label.clone(),
-                    provider: c.provider.clone(),
-                    model: c.model.clone(),
                     forked_from: c.forked_from.clone(),
                 }),
             })
@@ -221,7 +215,7 @@ impl KjDispatcher {
         }
         let mut out = String::new();
         for r in &rows {
-            // `<short_id> <kind>[/<lang>] [N blocks] [label="..." model=...]`
+            // `<short_id> <kind>[/<lang>] [N blocks] [label=... forked_from=...]`
             // A UUID document id shows its entropy-tail short(); non-UUID ids
             // (config paths, symlinks) fall back to a leading slice.
             let short = match ContextId::parse(&r.document_id) {
@@ -244,16 +238,6 @@ impl KjDispatcher {
                         && !l.is_empty()
                     {
                         bits.push(format!("label={l}"));
-                    }
-                    if let Some(p) = &c.provider
-                        && !p.is_empty()
-                    {
-                        bits.push(format!("provider={p}"));
-                    }
-                    if let Some(m) = &c.model
-                        && !m.is_empty()
-                    {
-                        bits.push(format!("model={m}"));
                     }
                     if let Some(f) = &c.forked_from {
                         let short = ContextId::parse(f)
@@ -702,11 +686,10 @@ mod tests {
         );
     }
 
-    /// `provider` and `forked_from` used to ride only the (now-deleted)
-    /// `--json` envelope; they show alongside `label`/`model` in the human
-    /// listing now, in the same `[bits]` style.
+    /// `forked_from` shows beside `label` in the human listing, in the same
+    /// `[bits]` style.
     #[tokio::test]
-    async fn doc_list_shows_provider_and_forked_from_in_human_output() {
+    async fn doc_list_shows_forked_from_in_human_output() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context_with_doc(&d, Some("parent"), principal);
@@ -728,8 +711,6 @@ mod tests {
             db.insert_context(&crate::kernel_db::ContextRow {
                 context_id: child,
                 label: Some("child".to_string()),
-                provider: Some("anthropic".to_string()),
-                model: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
@@ -745,10 +726,8 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             })
             .unwrap();
         }
@@ -762,7 +741,7 @@ mod tests {
         let result = d.dispatch(&[s("doc"), s("list")], &c).await;
         assert!(result.is_ok(), "list failed: {}", result.message());
         let message = result.message();
-        assert!(message.contains("provider=anthropic"), "got: {message}");
+        assert!(message.contains("label=child"), "got: {message}");
         assert!(
             message.contains(&format!("forked_from={}", parent.short())),
             "got: {message}"

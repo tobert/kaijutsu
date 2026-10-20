@@ -5955,8 +5955,6 @@ mod tests {
             .insert_context(&ContextRow {
                 context_id: ctx,
                 label: None,
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
@@ -5972,10 +5970,8 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             })
             .unwrap();
 
@@ -7488,8 +7484,6 @@ mod tests {
             .insert_context(&ContextRow {
                 context_id: ctx,
                 label: None,
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
@@ -7505,10 +7499,8 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             })
             .unwrap();
 

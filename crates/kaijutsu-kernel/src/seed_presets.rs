@@ -94,8 +94,6 @@ fn insert_factory_preset(
         preset_id,
         label: fp.label.to_string(),
         description: Some(fp.description.to_string()),
-        cast_id: None,
-        system_prompt: None,
         created_at: kaijutsu_types::now_millis() as i64,
         created_by,
     })?;
@@ -135,9 +133,6 @@ mod tests {
         assert_eq!(base_of(&db, "full"), "full");
         assert_eq!(base_of(&db, "window"), "window");
         assert_eq!(base_of(&db, "spawn"), "spawn");
-        // Factory presets move no model knobs.
-        let full = db.get_preset_by_label("full").unwrap().unwrap();
-        assert!(full.cast_id.is_none());
     }
 
     #[test]

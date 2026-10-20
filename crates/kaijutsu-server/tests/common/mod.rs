@@ -174,7 +174,7 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
     // An ephemeral kernel has its performer; an offline home does not, and a
     // test there points its own character at the `mock` cast.
     if let Some(performer) = db.get_character_by_name(PERFORMER).expect("read the ephemeral performer") {
-        db.set_character_default_cast(performer.principal_id, Some(cast.cast_id))
+        db.set_character_cast(performer.principal_id, Some(cast.cast_id))
             .expect("point the performer at the mock cast");
     }
 }
@@ -247,8 +247,7 @@ pub fn seed_turn_identity(
         .expect("assign the performer");
     // A context answers to its senpai's holder. One made from a context
     // nobody performs has no reviewer, so home it under a root console.
-    let routable = db.get_context(context).ok().flatten()
-        .and_then(|row| row.senpai_ctx)
+    let routable = db.senpai_conversation_of(context).ok().flatten()
         .is_some_and(|senpai| db.context_holder(senpai).ok().flatten().is_some());
     if !routable {
         let console = db.list_characters(false).expect("list characters").into_iter()

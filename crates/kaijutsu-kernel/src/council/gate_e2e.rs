@@ -582,7 +582,7 @@ fn bind_seat(
         })
         .unwrap();
     }
-    db.set_character_default_cast(character, Some(cast.cast_id)).unwrap();
+    db.set_character_cast(character, Some(cast.cast_id)).unwrap();
 }
 
 async fn rig(via: Via, setup: Setup) -> Rig {
@@ -3292,7 +3292,7 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
 #[tokio::test]
 async fn a_cast_change_moves_neither_the_gate_nor_the_judge_of_a_running_instance() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
-    rig.d.kernel_db().lock().set_character_default_cast(rig.ctx.actor_id, None).unwrap();
+    rig.d.kernel_db().lock().set_character_cast(rig.ctx.actor_id, None).unwrap();
     rig.mock.answers(&ALLOW);
     rig.submit("touch /work/still-judged").await.unwrap_or_else(|e| panic!("the bound gate slot allows: {e:?}"));
     assert_eq!(rig.mock.decisions().len(), 1, "the decision went to the bound gate slot's server");

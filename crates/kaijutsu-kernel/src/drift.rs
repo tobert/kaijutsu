@@ -1301,8 +1301,6 @@ pub fn ensure_drift_queue_context(
                 let row = ContextRow {
                     context_id: id,
                     label: Some("drift-queue".to_string()),
-                    provider: None,
-                    model: None,
                     system_prompt: None,
                     context_state: ContextState::Live,
                     context_type: "default".to_string(),
@@ -1318,10 +1316,8 @@ pub fn ensure_drift_queue_context(
                     promoted_at: None,
                     demoted_at: None,
                     paused_at: None,
-                    cast_id: None,
                     origin_host: None,
                     played_by: None,
-                    senpai_ctx: None,
                 };
                 db.insert_well_known_context(&row, ws, WellKnownRole::DriftQueue)
                     .map_err(|e| format!("failed to publish drift-queue context: {e}"))

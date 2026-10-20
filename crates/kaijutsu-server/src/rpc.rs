@@ -1277,8 +1277,6 @@ fn bootstrap_discovered_context(
     let row = ContextRow {
         context_id,
         label: None,
-        provider: None,
-        model: None,
         system_prompt: None,
         context_state: kaijutsu_types::ContextState::Live,
         context_type: "default".to_string(),
@@ -1294,10 +1292,8 @@ fn bootstrap_discovered_context(
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
-        cast_id: None,
         origin_host: None,
         played_by: None,
-        senpai_ctx: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -1343,8 +1339,6 @@ mod context_bootstrap_tests {
         let row = ContextRow {
             context_id,
             label: Some(label.to_string()),
-            provider: Some("anthropic".into()),
-            model: Some("claude-opus-4-8".into()),
             system_prompt: None,
             context_state: kaijutsu_types::ContextState::Live,
             context_type: "coder".to_string(),
@@ -1360,10 +1354,8 @@ mod context_bootstrap_tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -1458,7 +1450,6 @@ mod context_bootstrap_tests {
         assert_eq!(after.created_by, original.created_by);
         assert_eq!(after.created_at, original.created_at);
         assert_eq!(after.context_type, original.context_type);
-        assert_eq!(after.model, original.model);
     }
 
     /// Cold start runs on every restart; the second restart must be as quiet

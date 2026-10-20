@@ -400,8 +400,6 @@ impl BeatScheduler {
             let row = ContextRow {
                 context_id: score_ctx,
                 label: Some(label.clone()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "score".to_string(),
@@ -417,10 +415,8 @@ impl BeatScheduler {
                 paused_at: None,
                 workspace_id: None,
                 preset_id: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             };
             db.insert_context_with_document(&row, ws).map_err(|e| {
                 format!("beat: creating score context for {}: {e}", track_id.as_str())
@@ -3981,8 +3977,6 @@ mod tests {
                 &ContextRow {
                     context_id: ctx,
                     label: Some("bass".to_string()),
-                    provider: None,
-                    model: None,
                     system_prompt: None,
                     context_state: ContextState::Live,
                     context_type: "musician".to_string(),
@@ -3998,10 +3992,8 @@ mod tests {
                     promoted_at: None,
                     demoted_at: None,
                     paused_at: None,
-                    cast_id: None,
                     origin_host: None,
                     played_by: None,
-                    senpai_ctx: None,
                 },
                 ws,
             )
@@ -4034,8 +4026,6 @@ mod tests {
                 &ContextRow {
                     context_id: ctx,
                     label: Some("archived-tick".to_string()),
-                    provider: None,
-                    model: None,
                     system_prompt: None,
                     context_state: ContextState::Live,
                     context_type: "musician".to_string(),
@@ -4051,10 +4041,8 @@ mod tests {
                     promoted_at: None,
                     demoted_at: None,
                     paused_at: None,
-                    cast_id: None,
                     origin_host: None,
                     played_by: None,
-                    senpai_ctx: None,
                 },
                 workspace,
             )
@@ -4930,13 +4918,13 @@ mod tests {
             let db = kernel.kernel_db().lock();
             let workspace = db.get_or_create_default_workspace(performer).unwrap();
             db.insert_context_with_document(&ContextRow {
-                context_id: context, label: None, provider: None, model: None, system_prompt: None,
+                context_id: context, label: None, system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "musician".into(), created_at: 0, created_by: performer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
-                played_by: Some(performer), senpai_ctx: None,
+                demoted_at: None, paused_at: None, origin_host: None,
+                played_by: None,
             }, workspace).unwrap();
             db.update_played_by(context, Some(performer)).unwrap();
         }
@@ -5459,8 +5447,6 @@ mod tests {
                 &ContextRow {
                     context_id: ctx_b,
                     label: Some("lead".to_string()),
-                    provider: None,
-                    model: None,
                     system_prompt: None,
                     context_state: ContextState::Live,
                     context_type: "musician".to_string(),
@@ -5476,10 +5462,8 @@ mod tests {
                     promoted_at: None,
                     demoted_at: None,
                     paused_at: None,
-                    cast_id: None,
                     origin_host: None,
                     played_by: None,
-                    senpai_ctx: None,
                 },
                 ws,
             )

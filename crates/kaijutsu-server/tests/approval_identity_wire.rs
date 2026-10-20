@@ -92,7 +92,7 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         let work = create_context(&lead_kj, "coder-work").await.unwrap();
         let row = kernel.kernel_db.lock().get_context(work).unwrap().unwrap();
         assert_eq!(row.created_by, lead);
-        assert!(row.senpai_ctx.is_some(), "the creating context is the new context's senpai");
+        assert!(kernel.kernel_db.lock().senpai_conversation_of(work).unwrap().is_some(), "the creating context is the new context's senpai");
         let coder_client = connect(addr, coder_key, "coder").await;
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
         kernel.kernel_db.lock().assign_test_review_recasting(work, Some(coder), None).unwrap();

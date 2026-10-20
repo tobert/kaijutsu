@@ -52,9 +52,6 @@ fn insert_context_row(
     db.insert_context(&ContextRow {
         context_id: ctx_id,
         label: None,
-        senpai_ctx: None,
-        provider: None,
-        model: None,
         system_prompt: None,
         context_state: ContextState::Live,
         context_type: "default".to_string(),
@@ -70,7 +67,6 @@ fn insert_context_row(
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
-        cast_id: None,
         origin_host: None,
         played_by: None,
     })
@@ -1477,9 +1473,6 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
         g.insert_context(&ContextRow {
             context_id: ctx_id,
                         label: None,
-                        senpai_ctx: None,
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
@@ -1495,7 +1488,6 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
         })

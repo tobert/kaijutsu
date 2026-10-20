@@ -441,7 +441,7 @@ pub fn prepare_rows(
         })
         .context("give the cast a gate slot on the council server")?;
     }
-    db.set_character_default_cast(performer_id, Some(cast.cast_id))
+    db.set_character_cast(performer_id, Some(cast.cast_id))
         .with_context(|| format!("point {performer} at the {SOLO_CAST} cast"))?;
 
     Ok(())
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(slot.backend_id, db.get_backend_by_name("deepseek").unwrap().unwrap().backend_id);
         let performer = db.get_character_by_name("solo-coder").unwrap().expect("the performer");
         assert_eq!(
-            db.character_default_cast(performer.principal_id).unwrap().map(|c| c.label).as_deref(),
+            db.character_cast(performer.principal_id).unwrap().map(|c| c.label).as_deref(),
             Some("solo"),
             "the performer plays the solo cast"
         );

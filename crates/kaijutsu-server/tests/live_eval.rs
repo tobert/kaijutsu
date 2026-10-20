@@ -395,7 +395,7 @@ fn write_haiku_defaults(state_dir: &std::path::Path) {
         .get_character_by_name(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER)
         .expect("read the performer")
         .expect("the performer exists");
-    db.set_character_default_cast(performer.principal_id, Some(cast.cast_id))
+    db.set_character_cast(performer.principal_id, Some(cast.cast_id))
         .expect("point the performer at the haiku cast");
 }
 

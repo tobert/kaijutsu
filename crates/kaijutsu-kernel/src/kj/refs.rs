@@ -177,8 +177,6 @@ mod tests {
         let row = crate::kernel_db::ContextRow {
             context_id: ctx_id,
             label: Some("root".to_string()),
-            provider: None,
-            model: None,
             system_prompt: None,
             context_state: kaijutsu_types::ContextState::Live,
             context_type: "default".to_string(),
@@ -194,10 +192,8 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            cast_id: None,
             origin_host: None,
             played_by: None,
-            senpai_ctx: None,
         };
         let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(&row, ws_id).unwrap();
@@ -234,8 +230,6 @@ mod tests {
             &crate::kernel_db::ContextRow {
                 context_id: grandparent_id,
                 label: Some("grandparent".to_string()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
@@ -251,10 +245,8 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             },
             ws_id,
         )
@@ -265,8 +257,6 @@ mod tests {
             &crate::kernel_db::ContextRow {
                 context_id: parent_id,
                 label: Some("parent".to_string()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
@@ -282,10 +272,8 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             },
             ws_id,
         )
@@ -296,8 +284,6 @@ mod tests {
             &crate::kernel_db::ContextRow {
                 context_id: child_id,
                 label: Some("child".to_string()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
@@ -313,10 +299,8 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
                 played_by: None,
-                senpai_ctx: None,
             },
             ws_id,
         )

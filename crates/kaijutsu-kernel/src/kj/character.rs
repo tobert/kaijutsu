@@ -366,8 +366,6 @@ impl KjDispatcher {
             let row = ContextRow {
                 context_id: new_id,
                 label: Some(sheet.name.clone()),
-                provider: None,
-                model: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: ROOT_CONTEXT_TYPE.to_string(),
@@ -383,16 +381,14 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
-                cast_id: None,
                 origin_host: None,
-                played_by: Some(character),
-                senpai_ctx: None,
+                played_by: None,
             };
             db.in_transaction(|db| {
                 let default_ws = db.get_or_create_default_workspace(requester)?;
                 db.insert_context_with_document(&row, default_ws)?;
                 db.start_character_instance(character, None, new_id, requester)?;
-                db.write_stored_root_ctx(character, Some(new_id))
+                Ok(())
             })
             .map_err(|e| format!("could not create the root context '{}': {e}", sheet.name))?;
             let admission = crate::runtime::admission::ContextAdmission::for_inserted(&row);
@@ -482,7 +478,7 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.get_character_by_name(name) {
             Ok(Some(row)) => {
-                let default_cast = match db.character_default_cast(row.principal_id) {
+                let default_cast = match db.character_cast(row.principal_id) {
                     Ok(cast) => cast.map(|c| c.label),
                     Err(e) => return KjResult::Err(format!("kj character show: {e}")),
                 };
@@ -551,7 +547,7 @@ impl KjDispatcher {
                 Err(e) => return Err(KjResult::Err(format!("kj character set: {e}"))),
             },
         };
-        db.set_character_default_cast(row.principal_id, cast_id)
+        db.set_character_cast(row.principal_id, cast_id)
             .map_err(|e| KjResult::Err(format!("kj character set: {e}")))
     }
 
@@ -1123,7 +1119,7 @@ mod tests {
         assert_eq!(row.forked_from, None);
         assert_eq!(row.created_by, caller.principal_id, "the requester stays the creator");
         assert!(row.archived_at.is_none());
-        assert_eq!(row.senpai_ctx, None, "a root console answers to nobody: it confirms itself");
+        assert_eq!(d.kernel_db().lock().senpai_conversation_of(root_ctx).unwrap(), None, "a root console answers to nobody: it confirms itself");
         {
             let db = d.kernel_db().lock();
             let instance = db.context_instance_row(root_ctx).unwrap().expect("the root console is the conversation of an instance");
@@ -1235,7 +1231,6 @@ mod tests {
             let db = d.kernel_db().lock();
             db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
             db.update_played_by(ctx, Some(character)).expect("update_played_by");
-            db.write_stored_root_ctx(character, Some(ctx)).expect("set_character_root_ctx");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
         assert_eq!(d.has_usable_loadout(ctx), Ok(false), "precondition: no binding");
@@ -1278,7 +1273,6 @@ mod tests {
             let db = d.kernel_db().lock();
             db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
             db.update_played_by(ctx, Some(amy)).expect("update_played_by");
-            db.write_stored_root_ctx(amy, Some(ctx)).expect("set_character_root_ctx");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
 

@@ -165,8 +165,10 @@ Rules:
   (`llm::Role::System`) is a `system` message at its point; see
   `docs/conversation-session.md`, "Kernel instructions".
 - An `effort` outside the four tokens above is an error, not a pass-through.
-  The tunables cascade (cast slot, model row, `llm_defaults`) chooses it, so
-  `thinking: false` for routine turns is a model-row or cast setting.
+  The character instance's slot chooses it: the cast slot's value, or the
+  model row's where the slot leaves it unset, copied when the binding is
+  made. So `thinking: false` for routine turns is a model-row or cast
+  setting.
 - The service has no tool-call ids. The adapter makes an id for each call
   (`mk-<turn>-<index>`), matches results to calls by position, and refuses a
   history whose result count differs from its call count.
