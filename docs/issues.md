@@ -16,6 +16,17 @@ panics: "MockClient script for model 'solo-mock' exhausted after 2 turn(s)"
 and without `S36-house-rules.kai`, so they predate it. Find which change added
 the extra call, then fix the scripts or the loop.
 
+## Three tests fail on main at `87e70c20` (2026-10-19)
+
+- `kaijutsu-tui` `terminal_fit`: `ctrl_a_r_rotates_the_seat_and_follows_its_successor`
+  (the `operator` capability gate refuses `kj context rotate`) and
+  `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` (a vi
+  document-cache miss).
+- `kaijutsu-solo-acp --features test-mock --test acp_fleet`, scenario
+  `council-escalates`: it expects the bump text "needs more care first", which
+  `assets/defaults/council/shell-bump.json` no longer carries ("back it up,
+  check it, or find a safer way first"). Update the scenario's expectation.
+
 ## Anticipation and commitment — iteration order
 
 The kernel coordinates anticipation and commitment on the shared pulse.
