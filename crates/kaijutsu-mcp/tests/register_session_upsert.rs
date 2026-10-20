@@ -136,6 +136,54 @@ fn a_new_session_is_created_under_the_only_root_context() {
     });
 }
 
+/// A root connection with no `--character` has nobody to play the context,
+/// so registration refuses and names the option and its variable.
+#[test]
+fn a_root_session_without_a_character_refuses_and_names_the_option() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await.with_character(None);
+        let mut raw = String::new();
+        for _ in 0..100 {
+            raw = mcp
+                .register_session(Parameters(RegisterSessionRequest {
+                    label: Some("no-performer".to_string()),
+                    context_type: None,
+                }))
+                .await;
+            if !raw.contains("not ready") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(raw.contains("--character") && raw.contains("KAIJUTSU_CHARACTER"), "{raw}");
+        assert!(raw.contains(SshServerConfig::EPHEMERAL_ROOT), "{raw}");
+    });
+}
+
+/// With `--character`, the root connection's session context is played by
+/// that character.
+#[test]
+fn a_root_session_with_a_character_creates_a_context_that_character_plays() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let reg = register_with_retry(&mcp, "has-performer").await;
+        assert!(reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg}");
+        let id = reg["context_id"].as_str().expect("the reply names the context").to_string();
+        let Backend::Remote(remote) = mcp.backend() else { unreachable!("connect_mcp is remote") };
+        let id = kaijutsu_types::ContextId::parse(&id).expect("a context id");
+        let info = remote
+            .actor
+            .execute_kj_quiet(id, vec!["context".into(), "info".into(), id.to_hex()])
+            .await
+            .expect("run kj context info");
+        assert_eq!(info.exit_code, 0, "{}", info.stderr);
+        let played_by = info.data.as_ref().and_then(|d| d.get("played_by_name")).and_then(|n| n.as_str());
+        assert_eq!(played_by, Some(SshServerConfig::EPHEMERAL_PERFORMER));
+    });
+}
+
 /// With several root contexts and no named parent, registration refuses and
 /// lists them instead of choosing one.
 #[test]

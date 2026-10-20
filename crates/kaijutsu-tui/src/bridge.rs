@@ -186,12 +186,12 @@ impl KernelBridge {
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         let cwd = client_cwd();
         // A context is an instance of a character: the one named with
-        // `--character`, else this seat's own, which the kernel refuses for a
-        // root character, naming it.
-        let performer = match &self.character {
-            Some(character) => character.clone(),
-            None => self.actor.whoami().await.context("whoami")?.username,
-        };
+        // `--character`, else this seat's own, which must not be a root.
+        let performer = self
+            .actor
+            .performer_for_new_contexts(parent.context_id, self.character.as_deref(), "--character <name>")
+            .await
+            .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         let created = self
             .actor
             .create_context_in_client_cwd(parent.context_id, target, &self.context_type, &performer, cwd.as_deref())

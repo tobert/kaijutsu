@@ -115,6 +115,10 @@ pub enum CreateContextError {
     Call(CallError),
     /// The kernel ran `kj kohai create` and refused, with its message.
     Refused(String),
+    /// A `kj` read gave no answer to decide on. `kj character show` reports
+    /// a missing character and a failed lookup the same untyped way, so this
+    /// is not a refusal.
+    Unread(String),
 }
 
 impl CreateContextError {
@@ -144,7 +148,7 @@ impl std::fmt::Display for CreateContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Call(error) => write!(f, "{error}"),
-            Self::Refused(message) => f.write_str(message),
+            Self::Refused(message) | Self::Unread(message) => f.write_str(message),
         }
     }
 }
@@ -168,6 +172,44 @@ impl ActorHandle {
             .await
             .map_err(CreateContextError::Call)?;
         context_id_from_create_result(&result).map_err(CreateContextError::Refused)
+    }
+
+    /// The character that performs the contexts this session creates.
+    ///
+    /// `named` (`--character`) wins. Otherwise it is this connection's own
+    /// character, which must not be a root: a root performs only its root
+    /// console, so a root connection with no `named` is refused with
+    /// `how_to_name`, the client's own words for naming one.
+    pub async fn performer_for_new_contexts(
+        &self,
+        parent: ContextId,
+        named: Option<&str>,
+        how_to_name: &str,
+    ) -> Result<String, CreateContextError> {
+        if let Some(named) = named {
+            return Ok(named.to_string());
+        }
+        let me = self.whoami().await.map_err(CreateContextError::Call)?;
+        let sheet = self
+            .execute_kj_quiet(parent, vec!["character".into(), "show".into(), me.username.clone()])
+            .await
+            .map_err(CreateContextError::Call)?;
+        let root = sheet
+            .data
+            .as_ref()
+            .and_then(|data| data.get("root"))
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                CreateContextError::Unread(format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))
+            })?;
+        if root {
+            return Err(CreateContextError::Refused(format!(
+                "{} is a root character, and a root performs only its root console: a context is an instance of \
+                 a character with a model. Name one with {how_to_name}, or connect with a non-root character's key",
+                me.username
+            )));
+        }
+        Ok(me.username)
     }
 
     /// Create from `parent` in `cwd`, the client's own working directory.

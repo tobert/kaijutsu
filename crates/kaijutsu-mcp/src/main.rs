@@ -108,7 +108,9 @@ struct ServeArgs {
 
     /// The live, non-root character that performs new session contexts. Falls
     /// back to `KAIJUTSU_CHARACTER`; a flag wins over its variable. Default:
-    /// this connection's own character, which must not be a root.
+    /// this connection's own character. A root character performs only its
+    /// root console, so a root connection must set this; without it
+    /// registration refuses.
     #[arg(long)]
     character: Option<String>,
 }

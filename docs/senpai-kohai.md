@@ -346,6 +346,11 @@ answer the old code would have given.
 - **`getLlmConfig`** went with the other model RPCs, and the ACP client's `cast.toml` preset went with the
   client's model choice. solo-acp writes its own `solo` cast and requires `--max-tokens` when the model's row has
   no output budget.
+- **Creating a context from a root's session.** A root character performs only its root console, so a root's
+  `kaijutsu-tui` or `kaijutsu-mcp` session names the character that plays what it creates: `--character <name>`
+  on both, and `KAIJUTSU_CHARACTER` for MCP (the flag wins). The name goes to `kj kohai create --as`; there is
+  no new wire method. Without it the session's own character plays, and a root refuses with an error that
+  names the option. Both clients ask `ActorHandle::performer_for_new_contexts`, so the refusal reads the same.
 
 ## Open (step 5)
 
@@ -354,12 +359,9 @@ answer the old code would have given.
   the predecessor stays live but the instance's newest binding names the unlabeled successor, so a retry would
   rotate from it. Proposed: an append-only `binding_commits` table, written by `commit_rotation`; the instance's
   conversation is the conversation of its newest committed binding.
-- **Creating a context from a root's session.** A root character performs only its root console, so a root's
-  TUI or MCP session names the character that plays what it creates: `--character` on `kaijutsu-tui` and
-  `kaijutsu-mcp` (and `KAIJUTSU_CHARACTER` for MCP). Without it such a session refuses to create a context.
-- **An inactive senpai instance.** Routing reads only whether the senpai's character is retired, so asks still
-  go to a senpai whose conversation is archived, while `kj senpai report` and `kj senpai set` onto it refuse.
-  The alternative is to refuse the ask, naming the archived senpai, until it is promoted or the kohai is moved.
+- **Archiving a senpai that has live kohai.** Asks to a senpai whose conversation is archived stay pending,
+  and a person finds and approves them there. To keep this rare, archiving a senpai's conversation while it has
+  live kohai should either refuse, naming them, or raise an ask. Not decided yet.
 
 The sections below record what each step built. Steps 1-3 built the context-edge version that step 5 replaces;
 where they conflict with the sections above, the sections above win.

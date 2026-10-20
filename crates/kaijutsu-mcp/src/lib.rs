@@ -784,6 +784,7 @@ impl RegisterFailure {
     fn create(message: String, error: &kaijutsu_client::CreateContextError) -> Self {
         match error {
             kaijutsu_client::CreateContextError::Refused(_) => Self::Verdict(message),
+            kaijutsu_client::CreateContextError::Unread(_) => Self::Fault(message),
             kaijutsu_client::CreateContextError::Call(e) => Self::call(message, e),
         }
     }
@@ -2077,35 +2078,14 @@ impl KaijutsuMcp {
                 "register_session: no parent named; creating under the kernel's only root context",
             );
         }
-        let me = actor.whoami().await.map_err(|e| {
-            RegisterFailure::call(format!("could not read this connection's identity: {e}"), &e)
-        })?;
-        let sheet = actor
-            .execute_kj_quiet(parent.context_id, vec!["character".into(), "show".into(), me.username.clone()])
+        let performer = actor
+            .performer_for_new_contexts(
+                parent.context_id,
+                self.character.as_deref(),
+                "--character <name> (or KAIJUTSU_CHARACTER)",
+            )
             .await
-            .map_err(|e| RegisterFailure::call(format!("could not read character '{}': {e}", me.username), &e))?;
-        let root = sheet
-            .data
-            .as_ref()
-            .and_then(|data| data.get("root"))
-            .and_then(serde_json::Value::as_bool)
-            // `kj character show` reports a missing character and a failed
-            // lookup the same untyped way, so this cannot be a verdict.
-            .ok_or_else(|| {
-                RegisterFailure::Fault(format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))
-            })?;
-        let performer = match &self.character {
-            Some(character) => character.clone(),
-            None if root => {
-                return Err(RegisterFailure::Verdict(format!(
-                    "{} is a root character, and a root performs only its root console: a session context is an \
-                     instance of a character with a model. Name one with --character <name> (or KAIJUTSU_CHARACTER), \
-                     or connect with a non-root character's key",
-                    me.username
-                )));
-            }
-            None => me.username,
-        };
+            .map_err(|e| RegisterFailure::create(e.to_string(), &e))?;
         Ok(SessionCreate { parent, performer, cwd: client_cwd() })
     }
 
@@ -3333,6 +3313,8 @@ mod tests {
         assert_eq!(RegisterFailure::create("m".into(), &refused), RegisterFailure::Verdict("m".into()));
         let timed_out = kaijutsu_client::CreateContextError::Call(CallError::Timeout(std::time::Duration::from_secs(1)));
         assert_eq!(RegisterFailure::create("m".into(), &timed_out), RegisterFailure::Fault("m".into()));
+        let unread = kaijutsu_client::CreateContextError::Unread("character 'x' has no sheet".into());
+        assert_eq!(RegisterFailure::create("m".into(), &unread), RegisterFailure::Fault("m".into()));
         assert_eq!(
             RegisterFailure::Verdict("no parent".into()).doing("Error choosing"),
             RegisterFailure::Verdict("Error choosing: no parent".into())

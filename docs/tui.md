@@ -10,6 +10,11 @@ is room to trip on a new combination.
 ssh seat: `ssh -t zorak kaijutsu-tui` and play. It is **not** a kernel
 subsystem, and it is **not** a Bevy frontend — see "Roads not taken" for both.
 
+`--context <label>` joins that context or creates it, as a child of `--parent` or of the kernel's only live
+root context. A context is played by a character. The default is the session's own character; a root character
+performs only its root console, so a root's session names another with `--character <name>`, and without it the
+create refuses with an error that names the option.
+
 ```text
 terminal (wezterm, Blink, a plain xterm)
    │  keys + cells

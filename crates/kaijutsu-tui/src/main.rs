@@ -63,7 +63,9 @@ struct Cli {
     parent: Option<String>,
 
     /// The live, non-root character that performs a context `--context`
-    /// creates. Default: this seat's own character, which must not be a root.
+    /// creates. Default: this session's own character. A root character
+    /// performs only its root console, so a root's session must pass this; without it the
+    /// create refuses.
     #[arg(long)]
     character: Option<String>,
 
