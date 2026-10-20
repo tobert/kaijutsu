@@ -477,6 +477,19 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
             crate::kj::context::insert_new_context_rows(db, &row, crate::kj::context::InstancePlacement::Join { instance, seq })
         })?;
         judge.shadow = row.context_id;
+        if judge.server.is_none() {
+            // The shadow row is already written, so a fault here names the
+            // backend as unread rather than failing the creation.
+            let backend = match super::gate::seat_slot_backend(&db, seat, JUDGE) {
+                Ok(Some((backend, _))) => format!("{} (kind {})", backend.name, backend.kind),
+                Ok(None) => "none".into(),
+                Err(e) => format!("unread: {e}"),
+            };
+            tracing::warn!(
+                %seat, shadow = %judge.shadow, instance = %instance, binding = seq, %backend,
+                "shadow: the judge slot is not on an mk backend, so this judge shadow is created but its judge is never read"
+            );
+        }
         (row, judge)
     };
     kernel

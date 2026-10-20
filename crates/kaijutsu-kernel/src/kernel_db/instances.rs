@@ -320,7 +320,8 @@ impl KernelDb {
 
     /// Copy `cast`'s slots into binding `(instance_id, seq)`. A parameter the
     /// slot leaves unset takes the model's `backend_models` value; nothing
-    /// else supplies one. A slot with no `max_tokens` in either place refuses.
+    /// else supplies one. A slot with no `max_tokens` in either place refuses, and so does
+    /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`.
     fn copy_cast_slots(&self, instance_id: CharacterInstanceId, seq: i64, cast: &CastRow) -> KernelDbResult<()> {
         for slot in self.list_cast_slots(cast.cast_id)? {
             let model_row = self
@@ -338,6 +339,24 @@ impl KernelDb {
                      every request carries max_tokens, so set it on one of them",
                     cast.label, slot.role, slot.model
                 )));
+            }
+            if !names_council_server(&slot.role) && tunables.thinking_style.as_deref() == Some("budget") {
+                let Some(budget) = tunables.thinking_budget else {
+                    return Err(KernelDbError::Validation(format!(
+                        "cast {} slot {} runs model {} with thinking_style=budget and no thinking_budget in the slot or in its \
+                         backend_models row; set one of them",
+                        cast.label, slot.role, slot.model
+                    )));
+                };
+                if let Some(max) = max_tokens
+                    && budget >= max
+                {
+                    return Err(KernelDbError::Validation(format!(
+                        "cast {} slot {} runs model {} with thinking_budget ({budget}) not below max_tokens ({max}); \
+                         lower the budget or raise max_tokens",
+                        cast.label, slot.role, slot.model
+                    )));
+                }
             }
             let values = SlotValues::new(
                 slot.backend_id,

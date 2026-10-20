@@ -154,8 +154,8 @@ struct TunableFlags {
     /// Extended-thinking token budget
     #[arg(long = "thinking-budget")]
     thinking_budget: Option<u64>,
-    /// Extended-thinking style token
-    #[arg(long = "thinking-style")]
+    /// Extended-thinking style: budget needs --thinking-budget below max tokens
+    #[arg(long = "thinking-style", value_parser = ["off", "auto", "adaptive", "budget"])]
     thinking_style: Option<String>,
     /// Unset a tunable: max-tokens, temperature, top-p, effort,
     /// thinking-budget, or thinking-style. Repeat for more

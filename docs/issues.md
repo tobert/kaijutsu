@@ -733,17 +733,14 @@ producer measuring council latency must use its own wall time.
 
 ## Model tunables: follow-ups from the kaibo review (2026-10-06)
 
-- **Two writers store an unresolved model string.** `kj cast slot set`
-  stores `--model` verbatim, and RPC `configure_llm`
-  (`kaijutsu-server/src/rpc.rs`) persists the raw provider and model. An
-  alias or a `provider/model` form there becomes the wire model and the
-  tunables key, so the model row is skipped and the floor applies. `kj
-  context set` and `kj fork` resolve through `resolve_model_choice`; these
-  two should too.
-- **`kj model` can show a knob the wire drops.** Claude drops temperature
-  and top_p whenever thinking is on, and `effort` rides only the adaptive
-  tier; codex-app maps only model and effort. `kj model` prints the
-  resolved values regardless.
+- **`kj cast slot set` stores `--model` verbatim.** An alias, a
+  `provider/model` form or a typo is copied into every binding made from
+  the cast, and binding slots never change, so only a rotation after a
+  cast fix repairs an instance. Such a slot matches no `backend_models`
+  row, so its `context_window` is unknown and the turn fails at the
+  provider in the provider's words. Resolve the model at cast write, or
+  refuse a model the backend's rows do not hold (a policy call: model
+  discovery may lag the rows).
 - **`unknown_kind_in_the_table_is_fatal` cannot fail for its name**
   (`llm/db_config.rs`): it never puts an unparseable kind in the table, so
   `load_backends` skipping one would stay green.

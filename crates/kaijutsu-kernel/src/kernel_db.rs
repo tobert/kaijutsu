@@ -8560,7 +8560,7 @@ impl KernelDb {
             )));
         }
         let t = &row.tunables;
-        validate_tunables(t.max_tokens, t.temperature, t.top_p, t.thinking_budget)?;
+        validate_tunables(t.max_tokens, t.temperature, t.top_p, t.thinking_budget, t.thinking_style.as_deref())?;
         self.conn.execute(
             "INSERT INTO backend_models (backend_id, model_id, context_window, extra,
                  max_tokens, temperature, top_p, effort, thinking_budget, thinking_style)
@@ -8752,6 +8752,7 @@ impl KernelDb {
             row.temperature,
             row.top_p,
             row.thinking_budget,
+            row.thinking_style.as_deref(),
         )?;
         self.conn.execute(
             &format!(
@@ -9090,6 +9091,10 @@ impl KernelDb {
     }
 }
 
+/// The `thinking_style` tokens the providers accept; `llm/claude/build.rs`
+/// refuses any other at turn build.
+pub const THINKING_STYLES: [&str; 4] = ["off", "auto", "adaptive", "budget"];
+
 /// Range-check the shared tunable knobs. Loud rejection, never a clamp — the
 /// SQL CHECKs say the same thing, but a Rust-side error names the knob and
 /// the legal range instead of surfacing `SQLITE_CONSTRAINT`.
@@ -9098,6 +9103,7 @@ fn validate_tunables(
     temperature: Option<f64>,
     top_p: Option<f64>,
     thinking_budget: Option<i64>,
+    thinking_style: Option<&str>,
 ) -> KernelDbResult<()> {
     if let Some(v) = max_tokens
         && v <= 0
@@ -9125,6 +9131,14 @@ fn validate_tunables(
     {
         return Err(KernelDbError::Validation(format!(
             "thinking_budget must be a positive integer (got {v})"
+        )));
+    }
+    if let Some(v) = thinking_style
+        && !THINKING_STYLES.contains(&v)
+    {
+        return Err(KernelDbError::Validation(format!(
+            "thinking_style must be one of {} (got {v:?})",
+            THINKING_STYLES.join(", ")
         )));
     }
     Ok(())

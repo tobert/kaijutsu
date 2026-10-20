@@ -276,6 +276,110 @@ fn a_later_cast_change_moves_no_binding_and_an_appended_binding_reads_it_fresh()
     assert_eq!(w.db.context_instance(second.context_id).unwrap(), Some((instance.instance_id, 2)));
 }
 
+/// A slot row with the given thinking knobs and a `max_tokens` of 4096.
+fn thinking_slot(w: &World, cast: CastId, role: &str, style: Option<&str>, budget: Option<i64>) {
+    let mut row = w.slot(cast, role, w.deepseek, "think-model", Some(4096));
+    row.thinking_style = style.map(str::to_string);
+    row.thinking_budget = budget;
+    w.db.set_cast_slot(&row).unwrap();
+}
+
+fn start_error(w: &World, cast: CastId) -> String {
+    let name = format!("thinker-{}", cast.short());
+    let who = w.character(&name);
+    let conv = w.ctx(&name, "coder", None, None);
+    w.db.start_instance(who, None, Some(cast), None, conv.context_id, who).unwrap_err().to_string()
+}
+
+#[test]
+fn an_unknown_thinking_style_is_refused_on_cast_slot_and_model_row_writes() {
+    let w = world();
+    let cast = w.cast("typo");
+    let mut row = w.slot(cast, "coder", w.deepseek, "ds-flash", Some(4096));
+    row.thinking_style = Some("budgett".into());
+    let error = w.db.set_cast_slot(&row).unwrap_err().to_string();
+    assert!(error.contains("thinking_style") && error.contains("budgett"), "{error}");
+
+    let error = w
+        .db
+        .set_backend_model(&BackendModelRow {
+            backend_id: w.deepseek,
+            model_id: "typo-model".into(),
+            context_window: None,
+            extra: None,
+            tunables: ModelTunablesRow { thinking_style: Some("on".into()), ..Default::default() },
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("thinking_style") && error.contains("on"), "{error}");
+
+    for style in ["off", "auto", "adaptive", "budget"] {
+        row.thinking_style = Some(style.into());
+        w.db.set_cast_slot(&row).unwrap_or_else(|e| panic!("{style} must be accepted: {e}"));
+    }
+}
+
+#[test]
+fn a_budget_slot_with_no_thinking_budget_refuses_at_binding_naming_cast_role_and_model() {
+    let w = world();
+    let cast = w.cast("nobudget");
+    thinking_slot(&w, cast, "coder", Some("budget"), None);
+
+    let error = start_error(&w, cast);
+
+    for needle in ["nobudget", "coder", "think-model", "thinking_budget"] {
+        assert!(error.contains(needle), "{needle} missing from: {error}");
+    }
+    assert_eq!(w.count("instance_bindings"), 0, "a refused start writes nothing");
+}
+
+#[test]
+fn a_budget_slot_takes_its_thinking_budget_from_the_model_row() {
+    let w = world();
+    w.model_row(
+        w.deepseek,
+        "think-model",
+        ModelTunablesRow { thinking_budget: Some(1024), ..Default::default() },
+        None,
+    );
+    let cast = w.cast("rowbudget");
+    thinking_slot(&w, cast, "coder", Some("budget"), None);
+    let who = w.character("thinker");
+    let conv = w.ctx("conv", "coder", None, None);
+
+    w.db.start_instance(who, None, Some(cast), None, conv.context_id, who).unwrap();
+}
+
+#[test]
+fn a_thinking_budget_not_below_max_tokens_refuses_at_binding() {
+    let w = world();
+    for (label, budget) in [("equal", 4096), ("over", 5000)] {
+        let cast = w.cast(label);
+        thinking_slot(&w, cast, "coder", Some("budget"), Some(budget));
+        let error = start_error(&w, cast);
+        for needle in [label, "coder", "think-model", "thinking_budget", "max_tokens"] {
+            assert!(error.contains(needle), "{needle} missing from: {error}");
+        }
+    }
+    let cast = w.cast("below");
+    thinking_slot(&w, cast, "coder", Some("budget"), Some(4095));
+    let who = w.character("fine");
+    let conv = w.ctx("conv2", "coder", None, None);
+    w.db.start_instance(who, None, Some(cast), None, conv.context_id, who).unwrap();
+}
+
+#[test]
+fn a_council_server_slot_is_exempt_from_the_thinking_checks() {
+    let w = world();
+    let cast = w.cast("council");
+    thinking_slot(&w, cast, "gate", Some("budget"), None);
+    thinking_slot(&w, cast, "judge", Some("budget"), Some(9000));
+    let who = w.character("thinker");
+    let conv = w.ctx("conv", "coder", None, None);
+
+    w.db.start_instance(who, None, Some(cast), None, conv.context_id, who).unwrap();
+}
+
 #[test]
 fn a_slot_with_no_max_tokens_anywhere_refuses_naming_cast_role_and_model() {
     let w = world();
