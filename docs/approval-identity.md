@@ -1,8 +1,8 @@
 # Approval identity
 
-Every context that does work answers to one other context: its **senpai**. The holder of the senpai context
-reviews the work. The character performing an operation cannot approve it, from any context, except the
-self-confirmation at a root context, which nobody else may answer. The design and its decisions are in
+Every character instance that does work answers to one other character instance: its **senpai**. The senpai's
+character reviews the work. The character performing an operation cannot approve it, from any context, except the
+self-confirmation at a root console, which nobody else may answer. The design and its decisions are in
 `docs/senpai-kohai.md`; this file is the approval contract that follows from it. There is no configured default
 reviewer, no per-context override, and no grant that moves review from one character to another.
 
@@ -12,89 +12,95 @@ kj kohai create repair --type coder --as coder
 kj senpai show repair
 ```
 
-`kj kohai create` makes `repair` a kohai of the calling context. Run from Amy's root context, Amy's console is
-its senpai and Amy reviews coder. Run from banto's seat, banto's seat is its senpai and banto reviews coder.
-Creating a context does not grant review authority to anyone beyond what the senpai edge gives.
+`kj kohai create` starts an instance of coder, with `repair` as its conversation, as a kohai of the caller's
+instance. Run from Amy's root console, Amy's console is its senpai and Amy reviews coder. Run from banto's
+conversation, banto's instance is its senpai and banto reviews coder. Creating a context does not grant review
+authority to anyone beyond what the senpai edge gives.
 
 ## The senpai edge
 
-`contexts.senpai_ctx` names the senpai context. It is null only for a root context (a root character's console)
-and for the system contexts that have no parent (scratch, the handoff log, the drift queue, lost+found, the beat
-score). The edge points at a context, not at a character, so the same seat can be reached again after a rotation.
+`character_instances.senpai_instance` names the senpai instance. It is null only for a root console. A context
+belongs to at most one instance (`contexts.instance_id`); a context with none (scratch, the handoff log, the drift
+queue, lost+found, the beat score) routes nothing. The edge points at an instance, not at a context, so a rotation,
+which starts a new conversation in the same instance, moves neither the senpai nor the kohai.
 
-- The **holder** of a context is the character that answers for it: its performer (`played_by`), or, for a root
-  context, the root character that owns it (`characters.root_ctx`). A context with neither has no holder, and an
-  edge that points at it is refused.
-- The **kohai** of a context are the live contexts whose `senpai_ctx` is that context.
+- The **character** of an instance answers for it, and never changes.
+- The **kohai** of an instance are the live instances whose `senpai_instance` is that instance.
 - The chain never has a cycle. Setting an edge that would close one is refused.
 
-`kj senpai show [<ctx>]` prints the senpai (label and id), its holder, the lineage root, and who would review an ask
-by the context's performer. `kj kohai list [<ctx>]` lists the live kohai with type and performer.
+`kj senpai show [<ctx>]` prints the instance, its senpai (label and character), the lineage root, and who would
+review an ask by its character. `kj kohai list [<ctx>]` lists the live kohai with character and type. Each takes
+any context of an instance and uses that context's instance.
 
 ## Routing
 
 The reviewer of an ask raised in context K by actor A:
 
-1. Let S be `senpai_ctx(K)`. If S is null and A is a live root character, the ask is a self-confirmation. If S is
-   null and A is anyone else, resolution refuses and names A and K.
-2. The reviewer is `holder(S)` when it is live and is not A.
-3. When `holder(S)` is A, climb: K becomes S, and repeat from 1. A banto that forks itself answers to the banto's
-   own senpai.
-4. A retired holder refuses by name. It never substitutes another character.
+1. Let I be K's instance. A context with no instance refuses, naming K.
+2. Let S be `senpai_instance(I)`. If S is null (I is a root console): when A is I's live root character, the ask
+   is a self-confirmation; otherwise resolution refuses and names A and K.
+3. The reviewer is S's character when it is live and is not A.
+4. When S's character is A, climb: I becomes S, and repeat from 2. A banto that forks itself stays in its own
+   instance, so its fork answers to the banto's senpai.
+5. A retired character refuses by name. It never substitutes another character.
 
 One resolver does this. Every ask, the model-turn check, `kj senpai show` and `kj ledger escalate` use it.
 
 ```
-coder lane ──senpai──► banto seat ──senpai──► amy (root console)
-  ask by coder          holder: banto           holder: amy
-  reviewer: banto       ask by banto            ask by amy
-                        reviewer: amy           self-confirmation
+coder lane ──senpai──► banto instance ──senpai──► amy (root console)
+  ask by coder          character: banto         character: amy
+  reviewer: banto       ask by banto             ask by amy
+                        reviewer: amy            self-confirmation
 ```
 
-**Self-confirmation.** At a root context the actor is its own holder. The ask is raised with the actor as its
+**Self-confirmation.** At a root console the actor is the instance's own character. The ask is raised with the actor as its
 reviewer, the actor alone may answer it, and the ledger records the answer as a self-confirmation. A root character
 can never be cast, so self-confirmation is a human's act. A model turn refuses to start when its performer would
 review itself.
 
-**Escalation** runs the same climb past the context that yielded the current reviewer, and refuses at a context
-with no senpai, naming it.
+**Escalation** runs the same climb past the instance that yielded the current reviewer, and refuses at an
+instance with no senpai, naming it.
 
-**Lineage root.** The holder at the top of the senpai chain. It must be a live root character, or the lookup
+**Lineage root.** The character at the top of the senpai chain. It must be a live root character, or the lookup
 refuses with the reason.
 
 ## Authority
 
-One rule: **the holder of a context's senpai, or its lineage root**, may
+One rule: **the character of an instance's senpai, or its lineage root**, may
 
-- move it to another senpai (`kj senpai set <ctx> <senpai-ctx>`);
+- move it to another senpai (`kj senpai set <ctx> <senpai-ctx>`, each naming any context of its instance);
 - escalate its asks;
 - rotate it (its own performer may also rotate it, with no ask);
 - archive it.
 
-A refusal names the rule: "only <ctx>'s senpai (<holder>) or its lineage root (<root>) may <act>". Also true:
+An rc lifecycle may also act on another context of its own instance, so the coder's archive rc archives its
+judge shadows.
 
-- A root character can never be cast, by any caller.
+A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root (<root>) may <act>". Also true:
+
+- A root character never performs an instance other than its root console.
 - `kj kohai create --as` needs the Operator capability and a live character caller, and raises no ask. The new
-  context's senpai is the caller's context, or the `--senpai <ctx>` the caller has authority over.
+  instance's senpai is the caller's instance, or the `--senpai <ctx>` instance the caller has authority over.
 - A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own
   senpai (`docs/egress.md`).
-- An assignment change refuses while the context has pending asks. Performer and reviewer must resolve to live,
-  distinct characters.
+- A senpai move refuses while any context of the instance has pending asks. Performer and reviewer must resolve
+  to live, distinct characters.
 
-Fork, rotate and create set the edge: `kj fork` makes the forking context the fork's senpai; `kj context rotate`
-gives the successor the predecessor's senpai and moves the predecessor's kohai to the successor. Regular client
-creation leaves the performer unset, so model work still needs an explicit performing character.
+Create sets the edge, and nothing else moves it but `kj senpai set`: `kj fork` joins the forking context's
+instance, and `kj context rotate` starts a new conversation in the same instance, so neither touches the senpai or
+the kohai. Every client creation names its performer with `--as`.
 
 ## Three identities
 
 | Field | Meaning |
 |---|---|
 | `principal_id` | Authenticated requester; retained for capability and redemption scope |
-| `actor_id` | Character performing this invocation; the context's `played_by` for kernel model work |
+| `actor_id` | Character performing this invocation; the character of the context's instance for kernel model work |
 | `reviewer_id` | Effective reviewer snapshotted on the invocation or ask (a field of the ask, not a column of the context) |
 
-The context row carries `senpai_ctx`, the edge the reviewer is resolved from; it
-records no reviewer of its own, so nothing is copied from `created_by`.
+The context row carries `instance_id`; its instance carries the senpai edge the
+reviewer is resolved from. Neither records a reviewer of its own, so nothing is
+copied from `created_by`.
 
 The kernel resolves a model turn's identity before it starts. Tools,
 read-only and writable shells, nested `kj` commands, and hook bodies preserve
@@ -130,9 +136,12 @@ kaijutsu-acp --character coder
 ```
 
 `--parent <label>` names the context new sessions are created under; without
-it, the kernel's only live root context is used. The connected character
-becomes the performer, the new context is a kohai of the context that
-creates it, and the reviewer follows the senpai edge. Without `--character`, use ACP session loading
+it, the kernel's only live root console is used. The named character
+becomes the performer, the new instance is a kohai of the instance of the
+context that creates it, and the reviewer follows the senpai edge.
+`kaijutsu-tui` and `kaijutsu-mcp` take the same `--character` (MCP also reads
+`KAIJUTSU_CHARACTER`); a root's connection needs it, since a root performs
+only its root console. Without `--character`, use ACP session loading
 to attach to an already configured context. The flag selects a character;
 `--context-type` still selects the rc bundle.
 
@@ -148,7 +157,7 @@ kj ledger cancel <request-id>
 
 An ask snapshots its requester, performer, and reviewer. `show` reports all
 three plus the deciding character. The assigned reviewer may allow or deny.
-The assigned reviewer, the holder of the ask context's senpai, or its lineage
+The assigned reviewer, the character of the ask context's senpai, or its lineage
 root may pass a pending ask up the senpai chain with `escalate`. Naming the
 next reviewer with `--to`, or taking the ask over, is the lineage root's
 alone; this lets Amy reclaim an ask in her lineage when its reviewer is
@@ -242,7 +251,7 @@ is not seen by that call.
 
 For example, Amy answers banto's ask for `kj drive lane-1 --prompt ...`
 with `--remember character --family`. Banto then drives any lane whose senpai it holds with no ask. It still
-asks to drive a context whose senpai Amy holds, including its own seat, and
+asks to drive a context whose senpai Amy holds, including its own conversation, and
 the rule does not reach another character. An exact rule (`--remember
 character` without `--family`) checks the target too, so the same statement
 asks again after its target gets another senpai.
@@ -258,8 +267,8 @@ and `python3 -m unittest` teaches bare `python3`, because its first
 argument is a flag. The answer names the keys it learned. Prefer an exact
 rule when a family key is wider than intended.
 
-The rule binds the character, not the context type: another seat of the
-same type is not covered. The reviewer who answers the ask makes the rule
+The rule binds the character, not the context type: another character's
+context of the same type is not covered. The reviewer who answers the ask makes the rule
 and alone can forget it, and the rule applies even where another
 character reviews this character's work. `kj ledger rules` shows the
 scope as `character <name>`. Grants that need no first ask, through
@@ -400,18 +409,17 @@ superseded request need explicit linkage so rotation does not duplicate work.
   Having no default expiry does not change those policies. Restart survival and
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.
-- Reviewer resolution is one function over `contexts.senpai_ctx` (the climb above). It replaces
-  `KernelDb::effective_approval_reviewer` and `Kernel::resolve_review_assignment`. A retired holder
-  refuses by name. `kj ledger escalate` without `--to` runs the same climb past the current reviewer
-  and refuses at a context with no senpai.
+- Reviewer resolution is one function over `character_instances.senpai_instance` (the climb above,
+  `KernelDb::route_review`). A retired senpai character refuses by name. `kj ledger escalate` without
+  `--to` runs the same climb past the current reviewer and refuses at an instance with no senpai.
 - Self-confirmation: an ask whose reviewer is its own actor is answerable only by that actor, and the
-  decision is recorded as a self-confirmation. A context with no senpai self-confirms only for a live
-  root character (`CharacterRow::root`) and refuses for anyone else. The performer-cannot-approve rule
+  decision is recorded as a self-confirmation. An instance with no senpai self-confirms only for the live
+  root character whose console it is (`CharacterRow::root`) and refuses for anyone else. The performer-cannot-approve rule
   holds for every other ask.
 - Character rules: `approval_rules` and `approval_rule_families` record the ask's `actor_id`, and scope
   `character` matches it. The kernel decides the target condition per command
   (`kj::gate_policy::serves_character`) and passes it to the ledger's match
   (`approval_ledger::rules::RuleMatch`); `kj ledger allow` refuses a character allow over a `kj` call
   the condition does not read (`gate_policy::character_rule_refusal`).
-- Authority: the one rule above, checked at each act it governs. The lineage root is the holder at the top of
-  the senpai chain.
+- Authority: the one rule above, checked at each act it governs. The lineage root is the character at the top
+  of the senpai chain.

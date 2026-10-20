@@ -143,6 +143,9 @@ One rule: **the character of an instance's senpai, or its lineage root**, may:
 - rotate it (its own character may also rotate it, as today);
 - archive it.
 
+An rc lifecycle running in a context may also act on another context of the same instance, so the coder's
+archive rc archives its own judge shadows (`coder/archive/S10-shadows.kai`).
+
 The refusal names the rule: "only <instance>'s senpai (<character>) or its lineage root (<root>) may <act>".
 An instance's character never changes, so there is no recast act; to put another character on the work, start an
 instance of it.
@@ -323,6 +326,32 @@ answer the old code would have given.
   noise, since the MCP client brings its own model and the context is more of a log, and it hurts nothing. A
   later direction: MCP offers a way to chat with kaijutsu's characters instead.
 
+## Decided while building step 5 (lead, within Amy's decisions)
+
+- **Edge directions.** A push from any context of an instance to the other instance's conversation runs with no
+  ask, up to the senpai or down to a kohai. A push to a context of the other instance that is not its
+  conversation keeps the gate. Within one instance, "down" covers forks of forks (the `forked_from` chain).
+- **Distillation** for `kj drift pull|merge` runs on the caller's instance's `distill` slot, as a fork's does.
+- **A judge shadow's performer** reads as its instance's character, because the shadow joins that instance.
+  Retiring the character archives its shadows with its other contexts.
+- **Rotating a handoff log** is allowed for the character that owns it and for any live root character.
+- **`kj senpai set`** checks for pending asks in every context of the instance, not only the one named.
+- **A backend named by a binding cannot be deleted**: bindings are append-only and keep their backend.
+- **`getLlmConfig`** went with the other model RPCs, and the ACP client's `cast.toml` preset went with the
+  client's model choice. solo-acp writes its own `solo` cast and requires `--max-tokens` when the model's row has
+  no output budget.
+
+## Open (step 5)
+
+- **A rotation that fails after create.** The successor's binding is appended when the successor is created,
+  because its create rc needs the instance. When the loadout check or the predecessor's archive rc then fails,
+  the predecessor stays live but the instance's newest binding names the unlabeled successor, so a retry would
+  rotate from it. Proposed: an append-only `binding_commits` table, written by `commit_rotation`; the instance's
+  conversation is the conversation of its newest committed binding.
+- **Creating a context from a root's session.** A root character performs only its root console, so a root's
+  TUI or MCP session names the character that plays what it creates: `--character` on `kaijutsu-tui` and
+  `kaijutsu-mcp` (and `KAIJUTSU_CHARACTER` for MCP). Without it such a session refuses to create a context.
+
 The sections below record what each step built. Steps 1-3 built the context-edge version that step 5 replaces;
 where they conflict with the sections above, the sections above win.
 
@@ -332,7 +361,7 @@ Choices made conservatively where the design was silent. None is a new rule; eac
 
 - **Create with no calling context** refuses. The design names the caller's context as the senpai; a caller with none (a bare `--parent` from a client that has not run from a context) has nothing to answer to, and the kernel does not pick one.
 - **Cold-start discovery** (`bootstrap_discovered_context` in the server) mints contexts with no senpai, like the other parentless system contexts. The design's list of null-senpai system contexts does not name it. A non-root actor in one refuses at the top.
-- **Judge shadows** (a fork child of a seat) take the seat as senpai, per the fork rule.
+- **Judge shadows** (a fork child of the context they judge) take that context as senpai, per the fork rule.
 - **Migration, performer-less contexts**: with no performer there is no actor, so the old resolver has no single answer. The migration maps them to the nearest strict ancestor that has a holder, which is what a create or fork from that ancestor would have set.
 - **Migration, retired holder on the old walk**: mapped to the ancestor whose holder is retired. The old resolver refused by name there; the new one refuses by name at the same context, so behaviour is preserved and startup is not blocked. An override naming a retired character has no such context and refuses the migration.
 - **Migration, archived contexts** map like live ones (a live context's chain passes through them). An archived context that cannot be mapped is left a top and reported instead of refusing; only live ones refuse.
@@ -343,7 +372,7 @@ Choices made conservatively where the design was silent. None is a new rule; eac
 
 - **Escalation** climbs past the context the current reviewer holds, as designed. An ask whose reviewer was set by hand (`escalate --to`) to a character holding no senpai on the chain has no context to climb from; it refuses and asks for an explicit `--to`.
 - **Dead guard**: `insert_new_context_rows` still checks that a performer is not its own reviewer. Under the senpai climb that cannot happen (the climb passes the actor), so the check is unreachable; step 2 may remove it.
-- **Test fixtures**: contexts registered under a parent (`register_context`, council `live_context_with`) now take the parent as senpai, mirroring create and fork. `KernelDb::assign_test_review` replaces the reviewer override in fixtures: the reviewer holds a seat, and the context is placed under it. A held senpai is required, so fixtures that created a context from a context nobody performs now give that context a performer.
+- **Test fixtures**: contexts registered under a parent (`register_context`, council `live_context_with`) now take the parent as senpai, mirroring create and fork. `KernelDb::assign_test_review` replaces the reviewer override in fixtures: the reviewer holds a context, and the context is placed under it. A held senpai is required, so fixtures that created a context from a context nobody performs now give that context a performer.
 - **Tests rewritten for the new model** (old to new): `lineage_root_repairs_a_retired_explicit_reviewer` removed (covers `--reviewer`, step 2); `explicit_reviewer_can_assign_a_performer_when_the_lineage_root_is_retired` is now `the_senpai_holder_can_assign_a_performer_when_the_lineage_root_is_retired`; `context_info_keeps_metadata_when_explicit_reviewer_is_retired` is now `..._when_the_senpai_holder_is_retired`; `final_assignment_rejects_reviewer_revoked_after_precheck` and the egress twin move the senpai instead of revoking a delegation; `final_context_insert_rejects_a_reviewer_changed_to_the_performer` is now `..._a_performer_nobody_can_review`; `a_forked_from_cycle_fails_the_listing_and_the_escalation_loudly` is now a senpai cycle; the escalate tests expect "at the top" and a held root console; `context_review_assignment_belongs_to_the_director` drops the self-review step (unreachable); the server wire test `amy_default_and_director_delegation_route_approval_over_the_wire` is now `..._and_escalation_...` (delegation steps removed).
 - **Verified**: `cargo test -p kaijutsu-kernel` 4107 passed, 0 failed, 19 ignored; `kaijutsu-server` and `approval-ledger` pass; fmt clean; clippy on kaijutsu-kernel lib 77 warnings (baseline ~78), none in new code.
 
@@ -359,7 +388,7 @@ The docs rewrite (`4a5c8be3`..`ff20a31c`) found these gaps in the spec. Steps 2 
 5. Egress authority follows the one authority rule.
 6. `kj ledger escalate --to <character>` and the lineage root's take-over stay, as lineage-root-only overrides on
    top of the climb.
-7. Fix container.md: "senpai" is the supervising session outside the container; "banto" is the director seat.
+7. Fix container.md: "senpai" is the supervising session outside the container; "banto" is the director character.
 8. Step 5's replacement for a one-off `kj context set --model`, and step 7's home for `[council] server` and the
    per-slot backend choice, go to Amy when those steps start.
 9. Step 2 also removes the stale doc comment naming `responsible_character_above` (kernel_db.rs ~8562).
@@ -394,8 +423,8 @@ Choices made where the design was silent, the smaller shape each time.
   root), so a reviewer reached by one climb can pass the ask on again. `--to` and taking an ask over are the
   lineage root's alone; with no live lineage root nobody may use `--to`.
 - **Archive inside an rc lifecycle**: a nested `kj context archive` from an rc lifecycle (privileged, `rc_depth >
-  0`) is not checked again. The shipped coder archive bucket archives the seat's judge shadows, whose senpai the
-  seat holds, not whoever archived the seat; the verb that started the lifecycle was checked.
+  0`) is not checked again. The shipped coder archive bucket archives the coder's judge shadows, whose senpai the
+  coder context holds, not whoever archived the coder; the verb that started the lifecycle was checked.
 - **Archiving a holderless top**: a parentless system context with no holder has no senpai and no lineage root, so
   `kj context archive` refuses it for everyone. Nothing in the shipped rc or bootstrap archives one.
 - **The old columns** are on `contexts` (`contexts.reviewer_id`, `contexts.director_id`), not on `characters`.
@@ -420,7 +449,7 @@ Choices made where the design was silent, the smaller shape each time.
   council contexts answer to.
 - **Pre-existing failures**: `kaijutsu-tui` `terminal_fit` tests `ctrl_a_r_rotates_the_seat_and_follows_its_successor`
   and `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` fail on `3260b9a6` as well: the coder probe
-  seat lacks operator for `kj context rotate`.
+  context lacks operator for `kj context rotate`.
 
 ## Open (step 3)
 
@@ -444,12 +473,12 @@ Choices made where the design was silent, the smaller shape each time.
   left out when the senpai has no label. A context with no senpai has no element. A senpai with no row stops
   the turn. `kj context prompt` reads the same fact and no longer resolves the reviewer, so it no longer refuses
   where review routing would; the turn still does.
-- **A nested archive in an rc lifecycle** (step 2 follow-up 1) passes when the seat, the context whose lifecycle
-  runs, is the target's senpai, and only then. A lifecycle has no more power than its seat: neither the seat's
+- **A nested archive in an rc lifecycle** (step 2 follow-up 1) passes when the context whose lifecycle runs is
+  the target's senpai, and only then. A lifecycle has no more power than its context: neither that context's
   holder nor whoever started the lifecycle lends it anything (Amy, 2026-10-19). The shipped coder archive
-  bucket needs no more, since the seat is its judge shadows' senpai.
+  bucket needs no more, since the coder context is its judge shadows' senpai.
 - **The council bench contexts** (`contrib/bench/rc-variants/council/coder/create/S04..S06`, step 2 follow-up 2)
-  are made with `kj kohai create` inside the first coder's create lifecycle, so they answer to that coder seat.
+  are made with `kj kohai create` inside the first coder's create lifecycle, so they answer to that coder context.
   They raise no asks, so the edge routes nothing for them today.
 - **bootstrap.sh** cannot put banto under senpai's context: that context is made later, when senpai's MCP session
   registers. banto starts under Amy's root console, and the script prints the `kj senpai set` Amy runs once

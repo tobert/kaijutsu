@@ -28,7 +28,7 @@ system it belongs to: "We are a cybernetic system focused on software
 engineering" for the coder, "...on coordinating people and models across
 contexts" for the director. Then it says who answers for us: the human in our
 system is accountable for our work, and our work reflects on them. From there
-it speaks in the inclusive we. The seat, its performer, and the human are one
+it speaks in the inclusive we. The context, its performer, and the human are one
 system, so a stance says what we do, not what you must do. The default stance
 still speaks in the second person and is next to move.
 
@@ -39,7 +39,7 @@ infer, and where we guessed. Saying that we guessed, and how confident we are,
 is part of the loop: a wrong guess caught by our own check is the system
 working.
 
-A stance may give a seat a character to play when that helps the performer
+A stance may give a context a character to play when that helps the performer
 hold the role. The director plays a banto, the head clerk of an old merchant
 house who keeps the ledger and makes the house run. A character is written as
 behavior, never as a label, and its temper is about the work, never the
@@ -58,16 +58,17 @@ own prompts may use any language. No stance branches on the model name;
 per-model specializations wait for comparative evidence.
 
 The kernel adds runtime facts in a `<situation>` block, including the performing
-character and the context's senpai (stable IDs and names):
-`<senpai context="<label>" id="<id>" character="<name>"/>`, beside the performer. The senpai
-replaces the old `<reviewer>` fact. The reviewer of the seat's own asks is the senpai's
-holder, or the climb past it; `kj senpai show` prints it. rc supplies the instruction
+character, the context's character instance and its senpai:
+`<instance label="<label>" character="<name>"/>` and
+`<senpai instance="<label>" character="<name>"/>`, where a label is the instance's
+conversation's label. The reviewer of the context's own asks is the senpai's
+character, or the climb past it; `kj senpai show` prints it. rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
 
-Director is the operator's seat. Its `S00-stance.kai` writes one line naming
-the system, the character recorded in `played_by` (below) and the senpai from the kernel
+Director is the operator's context type. Its `S00-stance.kai` writes one line naming
+the system, the character that performs it and the senpai from the kernel
 fact, then reads its companion, which says "our senpai". Persona text belongs to the
-character that plays the seat, not to the context type. To be decided in step 6: where
+character that plays the context, not to the context type. To be decided in step 6: where
 the sheet stores it, and the new name of the `director` type, which predates characters
 (`docs/senpai-kohai.md`, follow-ups 6). Until then the persona stays in this file. `S06-kj-help.kai` reads `S06-kj-help.md`: a short narrative of kj
 (contexts, turns, forks, drift, asks) and the operator's most-used commands,
@@ -78,7 +79,7 @@ demand. The stance and narrative together are about 4.5 KB; they replaced a
 The coder has its own binding (`coder/create/S10-binding.kai`): one shell
 (`shell_write`, with the shell-operation tools it projects), the file tools,
 tasks, and `done`, plus the person's input facades. Every tool schema rides on
-every request, so the roster is the seat's largest cost. The shell tools'
+every request, so the roster is the context's largest cost. The shell tools'
 descriptions carry the one statement of what kaish is and what a call returns;
 no rc seeds a separate kaish primer, and `help syntax` holds the language
 reference. The coder stance's working rules adapt DeepSeek Harness's tool
@@ -86,7 +87,7 @@ rules (MIT).
 
 The toolie is a read-only explorer modeled on kaibo's explorer. Its binding
 (`toolie/create/S10-binding.kai`) grants `facade:shell` alone, so its model has
-one tool, the read-only `shell`, and the person's shell box in a toolie seat is
+one tool, the read-only `shell`, and the person's shell box in a toolie context is
 the same read-only shell. Its stance (`toolie/create/S00-stance.md`) adapts
 kaibo's explorer preamble: read files whole with their line numbers, read in
 spans past the 8 KiB result preview, follow each name to its definition, and
@@ -188,11 +189,11 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 
-`kj kohai create banto --type director --as banto` records
-Banto's principal in `played_by`, while `created_by` remains the requester.
-The character must exist and be live; unknown or retired names fail before
-creating a context. Omitting `--as` leaves `played_by` unset on this `kj` path.
-The caller's context becomes its senpai, and the reviewer follows that edge
+`kj kohai create banto --type director --as banto` starts a character
+instance of banto, while `created_by` remains the requester. `--as` is
+required; the character must exist and be live, and unknown or retired names
+fail before creating a context. The caller's instance becomes its senpai, and
+the reviewer follows that edge
 (`docs/approval-identity.md`). Model output and tools use the performer;
 the model turn refuses missing or self-reviewing identities. This does not
 load a character rc bundle. See `docs/character.md`, "Current implementation".
@@ -294,32 +295,34 @@ kj context rotate banto
 kj context prompt banto
 ```
 
-A seat writes its handoff note before it stops; its stance asks for it
-and the handoff block carries the command. Rotating a cold seat therefore
+A context writes its handoff note before it stops; its stance asks for it
+and the handoff block carries the command. Rotating a cold context therefore
 needs no turn from it. In the TUI, `Ctrl+A r` prefills `kj context rotate `
 and follows the successor. Rotation never prompts: the successor runs
 `create` rc and waits for its first prompt. When the predecessor left no
 note, the successor still has the predecessor excerpt below, and a senpai
-may read the archived seat's blocks.
+may read the archived context's blocks.
 
-`kj context rotate` creates a successor from the predecessor's own parent. It
-copies the type, performer, senpai, system prompt, workspace, env, and cwd,
-moves the predecessor's kohai to itself, sets `ROTATED_FROM` to the
-predecessor's id, and runs the `create` lifecycle. The hydration window is not
+`kj context rotate` creates a successor conversation in the predecessor's
+character instance, on the instance's next binding, read fresh from the
+character's cast. It copies the type, system prompt, workspace, env, and cwd,
+sets `ROTATED_FROM` to the predecessor's id, and runs the `create` lifecycle.
+The senpai and the kohai point at the instance, so they do not move. The hydration window is not
 copied; a musician's create lifecycle sets its own. When the successor has a
 usable loadout, the predecessor's `archive` lifecycle runs, then one
 transaction archives the predecessor and gives the
-successor its label, ring seat, and any character's `root_ctx` pointer. When
+successor its label and ring position. When
 it has none, the predecessor stays live, and the error names the unlabeled
 successor so you can read its Error blocks and remove it. The character that
-plays the context, the holder of its senpai, or its lineage root may rotate it. A root context rotates
-the same way.
+plays the context, its senpai's character, or its lineage root may rotate it. A root console rotates
+the same way. Rotating a character's handoff log points `characters.handoff_ctx` at
+the successor.
 
-A context's model is its performer's cast slot for the context's type, so a
-successor with the same performer runs the same model. To run another model,
-cast a character whose cast has it. (Today a context can still pin its own model
-with `kj context set`; step 5 of `docs/senpai-kohai.md` removes that override
-once each turn records its model.)
+A context's model is the slot for its type in its instance's binding. A
+successor gets the next binding, so it runs whatever the character's cast
+holds at rotation. To move a running instance to another model, change the
+cast and rotate; to run two models side by side, start a second instance of a
+character whose cast has the other one.
 
 `ROTATED_FROM` names the predecessor. `S17-predecessor.kai` reads
 up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes

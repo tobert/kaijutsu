@@ -71,26 +71,31 @@ publicly or to repositories we do not own.
 ## Characters and prompts
 
 A **character** is the persistent someone a name resolves to, human or model.
-Its identity is a `PrincipalId`; its sheet lives in `kernel.db`. Today the
-sheet holds name, creation/retirement timestamps, and an optional handoff
-context. `auth.db` binds credentials to principals; it does not own character
-names. `kj character` manages sheets, and `kj handoff note|tail` accesses
-their logs. Retirement archives contexts whose `played_by` names the
-character.
+Its identity is a `PrincipalId`; its sheet lives in `kernel.db` and holds
+static settings: name, root flag, creation/retirement timestamps, its cast,
+and its handoff log. `auth.db` binds credentials to principals; it does not
+own character names. `kj character` manages sheets, and `kj handoff
+note|tail` accesses their logs. Retirement archives the contexts of the
+character's instances.
+
+A **character instance** is one run of one character: `kj kohai create
+<label> --as <character> --type <t>` starts it with its conversation, and
+its character never changes. A **binding** copies the character's cast slots
+into the instance when it is written; every model call reads the binding for
+its context's type and nothing else, so editing a cast moves no running
+instance. A fork joins its source's instance and binding; `kj context
+rotate` starts a new conversation on the instance's next binding, read fresh.
+Every working instance answers to one **senpai** instance (`kj senpai
+show`): its asks, reports and escalations go to the senpai's character, and
+the senpai's character or the lineage root moves, rotates and archives it.
 
 We keep requester, performer, context type, and cast distinct. `created_by`
-names the requester who created a context; `played_by` records its performer
-when set. A `context_type` selects the seat's rc bundle and gate tier; a cast
-selects models for types, and a context's model is its performer's cast slot
-for its type. `kj kohai create --as <character>` sets the performer
-explicitly; omitting it leaves the performer unset on this path. Every working
-context has one **senpai** context (`kj senpai show`), and its asks, reports and
-escalations go to the holder of that senpai; the holder of the senpai, or the
-lineage root, casts, moves, rotates and archives it. Model turns require a live
-performer and a distinct reviewer. Provider output and tools carry the
-performer; the connection keeps its own identity. `forked_from` is provenance
-only. There is no reviewer override and no delegation. See
-`docs/senpai-kohai.md` and `docs/approval-identity.md`.
+names the requester who created a context; the performer is its instance's
+character. A `context_type` selects the context's rc bundle, gate tier and
+cast slot. Model turns require a live performer and a distinct reviewer.
+Provider output and tools carry the performer; the connection keeps its own
+identity. `forked_from` is provenance only. See `docs/senpai-kohai.md` and
+`docs/approval-identity.md`.
 Composition with character rc remains planned. Rc directory and memory root
 are planned sheet fields. Persona text moves onto the character in the
 senpai/kohai stack (step 6); see `docs/character.md`, "Current implementation"
@@ -100,7 +105,7 @@ Banto is a character that plays the `director` type, which is reworked in that
 stack. Its context is created with `--as banto`; director instructions and handoff
 injection read the performer metadata. The old `KJ_CHARACTER` environment
 bridge did not set identity and is no longer read by the shipped scripts.
-`kj context rotate` replaces a seat and sets `ROTATED_FROM`, which loads
+`kj context rotate` replaces a conversation and sets `ROTATED_FROM`, which loads
 predecessor prose. See `docs/prompts.md`, "Rotating a context".
 
 Each context type owns its whole stance through rc, with no shared base and no
@@ -110,10 +115,10 @@ blocks; the kernel adds runtime facts.
 We read `docs/prompts.md` before changing prompt composition or rc
 instructions. It owns the implemented contract and the register;
 `docs/oss-comparisons.md` owns the research. Stances speak in our voice: they
-open on the cybernetic system the seat belongs to, name the human who is
+open on the cybernetic system the context belongs to, name the human who is
 accountable, and say what we do in the inclusive we. They stay plain and
 literal for readers who are not English-first, they are ASCII except Japanese terms glossed
-with romaji and a closing 頑張って, and they may give a seat a character
+with romaji and a closing 頑張って, and they may give a context a character
 written as behavior.
 Collaboration guidance and task procedure live in the type, syntax in
 help/schema, and changing observations in notifications. Character-specific rc
