@@ -4938,6 +4938,7 @@ mod tests {
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
                 played_by: Some(performer), senpai_ctx: None,
             }, workspace).unwrap();
+            db.update_played_by(context, Some(performer)).unwrap();
         }
         sched.play(&track, base);
 

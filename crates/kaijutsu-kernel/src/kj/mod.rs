@@ -1361,6 +1361,7 @@ pub(crate) mod test_helpers {
                 handoff_ctx: None, root_ctx: None, root: true,
             })
             .unwrap();
+            seed_test_performer(&db);
         }
         let workspace = kernel_db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
         let blocks = shared_block_store_with_db(kernel_db.clone(), workspace, PrincipalId::system());
@@ -1429,6 +1430,7 @@ pub(crate) mod test_helpers {
         ));
         let ws_id = {
             let db = kernel_db.lock();
+            seed_test_performer(&db);
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap()
         };
@@ -1575,6 +1577,22 @@ pub(crate) mod test_helpers {
         *REVIEWER.get_or_init(PrincipalId::new)
     }
 
+    /// The live, non-root character `kj kohai create --as` casts in tests.
+    pub const TEST_PERFORMER: &str = "kohai-tester";
+
+    /// Insert [`TEST_PERFORMER`] unless it exists.
+    pub fn seed_test_performer(db: &KernelDb) -> PrincipalId {
+        if let Some(sheet) = db.get_character_by_name(TEST_PERFORMER).unwrap() {
+            return sheet.principal_id;
+        }
+        let principal_id = PrincipalId::new();
+        db.insert_character(&crate::kernel_db::CharacterRow {
+            principal_id, name: TEST_PERFORMER.to_string(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        principal_id
+    }
+
     /// The test reviewer's root context, registered on first use: labeled
     /// `amy`, played by the root character `amy`, with no parent. `amy` is
     /// the lineage root of every context registered under it.
@@ -1592,7 +1610,10 @@ pub(crate) mod test_helpers {
     /// asks through the walk.
     pub fn register_rooted_context(dispatcher: &KjDispatcher, label: Option<&str>, created_by: PrincipalId) -> ContextId {
         let root = register_root_context(dispatcher);
-        register_context(dispatcher, label, Some(root), created_by)
+        let context = register_context(dispatcher, label, Some(root), created_by);
+        // The creator runs it, as an instance under `amy`'s console.
+        dispatcher.kernel_db().lock().assign_stand_in_instance(context, created_by).unwrap();
+        context
     }
 
     /// Create a caller with a specific context_id.
@@ -1616,7 +1637,9 @@ pub(crate) mod test_helpers {
     pub fn registered_caller(dispatcher: &KjDispatcher) -> KjCaller {
         let mut caller = test_caller();
         let root = register_root_context(dispatcher);
-        caller.context_id = Some(register_context(dispatcher, None, Some(root), caller.principal_id));
+        let context = register_context(dispatcher, None, Some(root), caller.principal_id);
+        dispatcher.kernel_db().lock().assign_stand_in_instance(context, caller.principal_id).unwrap();
+        caller.context_id = Some(context);
         caller
     }
 
@@ -1641,6 +1664,10 @@ pub(crate) mod test_helpers {
 
     /// Give `caller`'s actor a live character sheet if it has none, so it may
     /// `kj kohai create` (`docs/senpai-kohai.md`, "Creating and moving").
+    ///
+    /// A caller's registered context that belongs to no instance becomes an
+    /// instance of the actor, so the caller's `kj kohai create` has an
+    /// instance to answer to.
     pub fn give_character(dispatcher: &KjDispatcher, caller: &KjCaller) {
         let db = dispatcher.kernel_db().lock();
         if db.get_character(caller.actor_id).unwrap().is_none() {
@@ -1649,11 +1676,18 @@ pub(crate) mod test_helpers {
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
+        if let Some(context) = caller.context_id
+            && db.get_context(context).unwrap().is_some()
+            && db.context_instance_row(context).unwrap().is_none()
+        {
+            db.assign_stand_in_instance(context, caller.actor_id).unwrap();
+        }
     }
 
     /// A confirmed caller acting as a new live character that performs
     /// `context`, so it holds the senpai of every kohai of `context` and has
-    /// authority over them (`docs/senpai-kohai.md`, "Authority").
+    /// authority over them (`docs/senpai-kohai.md`, "Authority"). Contexts
+    /// already registered under `context` become its kohai.
     pub fn confirmed_holder_caller(dispatcher: &KjDispatcher, context: ContextId) -> KjCaller {
         let caller = confirmed_caller(context);
         let db = dispatcher.kernel_db().lock();
@@ -1662,6 +1696,17 @@ pub(crate) mod test_helpers {
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         db.update_played_by(context, Some(caller.actor_id)).unwrap();
+        // Contexts registered under `context` are its kohai, each run by a
+        // stand-in character.
+        let children: Vec<ContextId> = db.list_all_contexts().unwrap().into_iter()
+            .filter(|row| row.senpai_ctx == Some(context) && row.context_id != context)
+            .map(|row| row.context_id)
+            .collect();
+        for child in children {
+            if db.context_instance_row(child).unwrap().is_none() {
+                db.assign_stand_in_instance(child, PrincipalId::new()).unwrap();
+            }
+        }
         caller
     }
 
@@ -1873,7 +1918,7 @@ mod help_footgun_tests {
         let caller = test_caller();
 
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("help")], &caller)
+            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("help")], &caller)
             .await;
 
         // It rendered help (ephemeral Ok), not a creation/switch result.
@@ -1924,7 +1969,7 @@ mod help_footgun_tests {
         let caller = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &caller);
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--name"), s("help")], &caller)
+            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("--name"), s("help")], &caller)
             .await;
         assert!(
             !matches!(&result, KjResult::Ok { message, .. } if message.to_lowercase().contains("usage")),

@@ -4,9 +4,7 @@
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    "TextStart",
-    {"TextDelta": "report: done"},
-    "TextEnd",
-    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+    {"ToolUse": {"id": "coder-a-2", "name": "done", "input": {"status": "done", "feedback": "report: done"}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ]
 ]

@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{create_context, run_local};
+use common::run_local;
 use kaijutsu_client::{KernelHandle, KeySource, LedgerPush, RpcClient, SshClient, SshConfig, ledger_events_channel};
 use kaijutsu_kernel::kernel_db::CharacterRow;
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
@@ -85,8 +85,12 @@ impl Rig {
         let (amy_kj, _) = amy_client.bind_kernel().await.unwrap();
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
         let (lead_kj, _) = lead_client.bind_kernel().await.unwrap();
-        let work = create_context(&amy_kj, "ledger-rpc-work").await.unwrap();
-        kernel.kernel_db.lock().update_context_performer(work, Some(coder)).unwrap();
+        let parent = kaijutsu_client::choose_parent(None, &amy_kj.list_contexts().await.unwrap()).unwrap();
+        let created = amy_kj
+            .execute_kj_quiet(parent.context_id, &kaijutsu_client::context_create_argv("ledger-rpc-work", "default", "coder", None))
+            .await
+            .unwrap();
+        let work = kaijutsu_client::context_id_from_create_result(&created).unwrap();
         kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("ledger-rpc-gate".into()), match_instance: None,
             match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(work),
@@ -206,7 +210,7 @@ fn a_reviewer_reads_and_answers_the_ledger_without_a_context() {
 fn a_takeover_is_a_recorded_reassignment_then_an_answer() {
     run_local(async {
         let rig = Rig::new().await;
-        rig.kernel.kernel_db.lock().assign_test_review(rig.work, Some(rig.coder), Some(rig.lead)).unwrap();
+        rig.kernel.kernel_db.lock().assign_test_review_recasting(rig.work, Some(rig.coder), Some(rig.lead)).unwrap();
         let request_id = rig.raise("echo take-over").await;
         let card = rig.amy_kj.get_ask(&request_id).await.unwrap().unwrap().summary;
         assert_eq!(card.reviewer.as_ref().map(|p| p.id), Some(rig.lead));

@@ -1953,8 +1953,8 @@ mod tests {
         assert_eq!(target("--confirm context archive"), Context(None));
         assert_eq!(target("context archive --children lane"), Unread);
         assert_eq!(target("kohai create child --type coder --as coder"), NewChild);
-        assert_eq!(target("kohai create child --parent lane"), NewChild, "--parent is provenance only");
-        assert_eq!(target("kohai create child --senpai lane"), NewUnder("lane".into()));
+        assert_eq!(target("kohai create child --as coder --parent lane"), NewChild, "--parent is provenance only");
+        assert_eq!(target("kohai create child --as coder --senpai lane"), NewUnder("lane".into()));
         assert_eq!(target("context create child"), Unread, "kj context create is gone");
         assert_eq!(target("context set lane --model m"), Unread);
         assert_eq!(target("fork"), Unread);
@@ -2001,7 +2001,7 @@ mod tests {
     fn env_argument_keeps_the_context_type_allow() {
         let cfg = config("[context_type.mcp]\nallow = [\"kj kohai create\"]\n");
         let v = first_verdict(
-            "kj kohai create banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
+            "kj kohai create banto-probe --as banto --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
             &cfg,
             Some("mcp"),
         );
@@ -2083,7 +2083,7 @@ mod tests {
             assert_eq!(builtin_key_of(&first_verdict("kj kohai create --help", &cfg, context_type)), "kj kohai --help",
                 "{context_type:?}");
         }
-        assert_eq!(first_verdict("kj kohai create x > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
+        assert_eq!(first_verdict("kj kohai create x --as coder > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
             "a redirect still keeps the allow from covering, and no builtin covers it");
         let asks = config("[global]\nask = [\"kj kohai create\"]\n");
         assert!(matches!(first_verdict("kj kohai create --help", &asks, None), PolicyVerdict::Ask(_)),
@@ -2407,16 +2407,16 @@ deny = ["kj kohai create"]
              [context_type.explorer]\nallow = [\"kj kohai create\"]\n",
         );
         // Within global: the specific deny beats the general allow.
-        assert!(matches!(first_verdict("kj kohai create x", &cfg, None), PolicyVerdict::Deny(_)));
+        assert!(matches!(first_verdict("kj kohai create x --as coder", &cfg, None), PolicyVerdict::Deny(_)));
         assert!(matches!(first_verdict("kj context list", &cfg, None), PolicyVerdict::Allow(_)));
         // The context_type layer sits above global.
-        let v = first_verdict("kj kohai create x", &cfg, Some("explorer"));
+        let v = first_verdict("kj kohai create x --as coder", &cfg, Some("explorer"));
         assert_eq!(
             allow_keys(&v),
             vec![(Layer::ContextTypeConfig("explorer".into()), "kj kohai create".to_string())]
         );
         assert!(matches!(
-            first_verdict("kj kohai create x", &cfg, Some("coder")),
+            first_verdict("kj kohai create x --as coder", &cfg, Some("coder")),
             PolicyVerdict::Deny(_)
         ));
     }

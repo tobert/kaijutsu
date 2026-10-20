@@ -98,7 +98,7 @@ async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
         key_source,
         insecure: true,
     };
-    KaijutsuMcp::connect_with_config(config, "cold-reads-e2e-test", None)
+    KaijutsuMcp::connect_with_config(config, "cold-reads-e2e-test", None).with_character(Some(SshServerConfig::EPHEMERAL_PERFORMER.to_string()))
 }
 
 /// Auto-register with retry — the freshly-spawned actor needs a moment to

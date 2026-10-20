@@ -783,7 +783,7 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         let contexts = writer.list_contexts().await.expect("list contexts");
         let parent = kaijutsu_client::choose_parent(None, &contexts).expect("the root context");
         let ctx = writer
-            .create_context_under(parent.context_id, "resilience", "default", None, None)
+            .create_context_under(parent.context_id, "resilience", "default", "performer", None)
             .await
             .expect("create ctx");
         writer.join_context(ctx).await.expect("writer join");

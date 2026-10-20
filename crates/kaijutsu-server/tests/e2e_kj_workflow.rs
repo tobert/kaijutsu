@@ -616,7 +616,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
                 })
                 .unwrap();
             }
-            db.assign_test_review(main_ctx, Some(coder), Some(lead))
+            db.assign_test_review_recasting(main_ctx, Some(coder), Some(lead))
                 .unwrap();
         }
 

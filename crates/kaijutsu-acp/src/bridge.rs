@@ -424,7 +424,7 @@ impl KernelBridge {
             tracing::warn!(parent = %parent.label, "no --parent given; creating under the kernel's only root context");
         }
         self.actor
-            .create_context_under(parent.context_id, label, &self.context_type, Some(character), Some(cwd))
+            .create_context_under(parent.context_id, label, &self.context_type, character, Some(cwd))
             .await
             .map_err(|e| {
                 if e.is_cwd_refusal() {

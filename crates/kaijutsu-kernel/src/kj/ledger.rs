@@ -2655,10 +2655,11 @@ mod tests {
         {
             // The root context now answers to its own descendant.
             let db = d.kernel_db().lock();
-            let root = db.get_context(ctx).unwrap().unwrap().senpai_ctx.expect("the caller's context has a senpai");
+            let instance = db.context_instance_row(ctx).unwrap().expect("the caller's context belongs to an instance");
+            let root = instance.senpai_instance.expect("the caller's instance has a senpai");
             db.conn_for_ledger().execute(
-                "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
-                rusqlite::params![ctx.as_bytes().as_slice(), root.as_bytes().as_slice()],
+                "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
+                rusqlite::params![instance.instance_id.as_bytes().as_slice(), root.as_bytes().as_slice()],
             ).unwrap();
             let error = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap_err();
             assert!(error.contains("cycle") && error.contains(&ask.request_id), "{error}");
@@ -3380,9 +3381,12 @@ mod tests {
         let banto = character("banto");
         let kei = character("kei");
         // Each context's senpai is its parent here (`register_context`).
-        let context = |label: &str, parent, played_by| {
+        // A lane with no named performer is run by a stand-in worker: every
+        // context that routes needs an instance.
+        let worker = character("worker");
+        let context = |label: &str, parent, played_by: Option<PrincipalId>| {
             let id = register_context(d, Some(label), Some(parent), amy);
-            d.kernel_db().lock().update_played_by(id, played_by).unwrap();
+            d.kernel_db().lock().update_played_by(id, Some(played_by.unwrap_or(worker))).unwrap();
             id
         };
         let banto_seat = context("banto-seat", root, Some(banto));
@@ -3491,10 +3495,10 @@ mod tests {
 
         for (source, expected) in [
             ("kj kohai create c2 --type coder --as coder", Allowed),
-            ("kj kohai create c3 --senpai banto-seat", Allowed),
-            ("kj kohai create c4 --parent amy-lane", Allowed),
-            ("kj kohai create c5 --senpai amy-lane", Pending),
-            ("kj kohai create c6 --senpai lane-b", Pending),
+            ("kj kohai create c3 --as coder --senpai banto-seat", Allowed),
+            ("kj kohai create c4 --as coder --parent amy-lane", Allowed),
+            ("kj kohai create c5 --as coder --senpai amy-lane", Pending),
+            ("kj kohai create c6 --as coder --senpai lane-b", Pending),
         ] {
             let outcome = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
             assert_eq!(outcome.verdict, expected, "{source}: {}", outcome.reason);
@@ -4120,17 +4124,14 @@ mod tests {
         coder_a.actor_id = actor_a;
         coder_a.reviewer_id = Some(reviewer);
         coder_a.context_id = Some(context);
-        d.kernel_db
-            .lock()
-            .assign_test_review(context, Some(actor_a), Some(reviewer))
-            .unwrap();
-
-        let first = gate_once(&d, &coder_a, shell_spec("performer-swap", "echo reviewed")).await;
-        let request_id = first.ask.expect("the first ask").request_id;
+        // The context's character is `actor_b`; the ask is `actor_a`'s.
         d.kernel_db
             .lock()
             .assign_test_review(context, Some(actor_b), Some(reviewer))
             .unwrap();
+
+        let first = gate_once(&d, &coder_a, shell_spec("performer-swap", "echo reviewed")).await;
+        let request_id = first.ask.expect("the first ask").request_id;
 
         let reviewer_call = answering_seat();
         let refused = d
@@ -4362,6 +4363,7 @@ mod tests {
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let console = register_context(d, None, None, principal_id);
+        d.kernel_db().lock().update_played_by(console, Some(principal_id)).unwrap();
         KjCaller {
             principal_id,
             actor_id: principal_id,
@@ -4403,7 +4405,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("kohai"), s("create"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
+                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
                 &c,
             )
             .await;
@@ -4436,7 +4438,7 @@ mod tests {
         let created = d
             .dispatch(
                 &[
-                    s("kohai"), s("create"),
+                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
                     s("ledger-run-show-ctx"),
                     s("--type"),
                     s("ledgertest2"),
@@ -4482,7 +4484,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("kohai"), s("create"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
+                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
                 &c,
             )
             .await;

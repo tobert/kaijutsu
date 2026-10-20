@@ -346,7 +346,8 @@ fn a_destroy_verb_without_confirm_exits_2() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder"]);
+    assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
+    let create = home.run(&["kj", "--", "kohai", "create", "--as", "bob", "lane", "--type", "coder"]);
     assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
     let archive = home.run(&["kj", "--", "context", "archive", "lane"]);

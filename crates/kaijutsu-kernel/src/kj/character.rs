@@ -391,7 +391,8 @@ impl KjDispatcher {
             db.in_transaction(|db| {
                 let default_ws = db.get_or_create_default_workspace(requester)?;
                 db.insert_context_with_document(&row, default_ws)?;
-                db.set_character_root_ctx(character, Some(new_id))
+                db.start_character_instance(character, None, new_id, requester)?;
+                db.write_stored_root_ctx(character, Some(new_id))
             })
             .map_err(|e| format!("could not create the root context '{}': {e}", sheet.name))?;
             let admission = crate::runtime::admission::ContextAdmission::for_inserted(&row);
@@ -845,8 +846,8 @@ mod tests {
         let KjResult::Ok { data: Some(serde_json::Value::Array(rows)), .. } = result else {
             panic!("expected a JSON array, got {result:?}");
         };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].as_str().unwrap().len(), 32, "list must carry full ids, never short forms");
+        assert_eq!(rows.len(), 2, "amy, and the performer fixture the test dispatcher seeds");
+        assert!(rows.iter().all(|row| row.as_str().unwrap().len() == 32), "list must carry full ids, never short forms");
     }
 
     /// `show` on an unknown name fails loudly — no silent fallback to a
@@ -1049,6 +1050,13 @@ mod tests {
         assert_eq!(row.created_by, caller.principal_id, "the requester stays the creator");
         assert!(row.archived_at.is_none());
         assert_eq!(row.senpai_ctx, None, "a root console answers to nobody: it confirms itself");
+        {
+            let db = d.kernel_db().lock();
+            let instance = db.context_instance_row(root_ctx).unwrap().expect("the root console is the conversation of an instance");
+            assert_eq!((instance.principal_id, instance.senpai_instance), (sheet.principal_id, None), "a root instance has no senpai");
+            assert_eq!(db.context_instance(root_ctx).unwrap(), Some((instance.instance_id, 1)));
+            assert_eq!(db.instance_conversation(instance.instance_id).unwrap(), Some(root_ctx));
+        }
 
         let KjResult::Ok { data: Some(data), .. } =
             d.dispatch(&[s("character"), s("show"), s("sovereign")], &caller).await
@@ -1153,7 +1161,7 @@ mod tests {
             let db = d.kernel_db().lock();
             db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
             db.update_played_by(ctx, Some(character)).expect("update_played_by");
-            db.set_character_root_ctx(character, Some(ctx)).expect("set_character_root_ctx");
+            db.write_stored_root_ctx(character, Some(ctx)).expect("set_character_root_ctx");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
         assert_eq!(d.has_usable_loadout(ctx), Ok(false), "precondition: no binding");
@@ -1196,7 +1204,7 @@ mod tests {
             let db = d.kernel_db().lock();
             db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
             db.update_played_by(ctx, Some(amy)).expect("update_played_by");
-            db.set_character_root_ctx(amy, Some(ctx)).expect("set_character_root_ctx");
+            db.write_stored_root_ctx(amy, Some(ctx)).expect("set_character_root_ctx");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
 

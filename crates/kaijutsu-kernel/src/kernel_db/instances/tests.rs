@@ -335,6 +335,72 @@ fn bindings_slots_and_context_membership_are_never_changed() {
     assert_eq!(w.db.context_instance(conv.context_id).unwrap(), Some((instance.instance_id, 1)));
 }
 
+/// An instance is live while its conversation is: archiving the newest
+/// binding's conversation makes it inactive, and promoting it makes it live
+/// again. Forks and other contexts of the instance do not decide.
+#[test]
+fn an_instance_is_inactive_while_its_conversation_is_archived() {
+    let w = world();
+    let who = w.character("coder");
+    let conv = w.ctx("conv", "coder", Some(who), None);
+    let fork = w.ctx("fork", "coder", Some(who), Some(&conv));
+    let instance = w.db.start_instance(who, None, None, None, conv.context_id, who).unwrap().instance_id;
+    w.db.join_instance(fork.context_id, instance, 1).unwrap();
+    assert!(w.db.instance_is_active(instance).unwrap());
+
+    w.db.archive_context(fork.context_id).unwrap();
+    assert!(w.db.instance_is_active(instance).unwrap(), "an archived fork leaves the instance live");
+    w.db.archive_context(conv.context_id).unwrap();
+    assert!(!w.db.instance_is_active(instance).unwrap(), "an archived conversation makes the instance inactive");
+
+    let next = w.ctx("next", "coder", None, None);
+    w.db.append_binding(instance, None, None, next.context_id).unwrap();
+    assert!(w.db.instance_is_active(instance).unwrap(), "the newest binding's conversation decides, not the first");
+    w.db.archive_context(next.context_id).unwrap();
+    assert!(!w.db.instance_is_active(instance).unwrap());
+    w.db.promote_context(next.context_id).unwrap();
+    assert!(w.db.instance_is_active(instance).unwrap(), "promoting the conversation makes the instance live again");
+    assert!(matches!(w.db.instance_is_active(CharacterInstanceId::new()).unwrap_err(), KernelDbError::NotFound(_)));
+}
+
+/// Every reader of a context's performer gets the principal of its instance,
+/// whatever the stored `played_by` column holds; a root's console is its root
+/// instance's conversation whatever the stored `root_ctx` says.
+#[test]
+fn the_performer_and_the_root_console_are_read_from_the_instance() {
+    let w = world();
+    let who = w.character("coder");
+    let other = w.character("other");
+    let conv = w.ctx("conv", "coder", Some(other), None);
+    assert_eq!(w.db.get_context(conv.context_id).unwrap().unwrap().played_by, None, "a stored performer without an instance performs nothing");
+    w.db.start_instance(who, None, None, None, conv.context_id, who).unwrap();
+    for read in [
+        w.db.get_context(conv.context_id).unwrap().unwrap(),
+        w.db.find_context_by_label("conv").unwrap().unwrap(),
+        w.db.list_active_contexts().unwrap().into_iter().find(|r| r.context_id == conv.context_id).unwrap(),
+        w.db.list_all_contexts().unwrap().into_iter().find(|r| r.context_id == conv.context_id).unwrap(),
+        w.db.fork_lineage(conv.context_id).unwrap().remove(0).0,
+    ] {
+        assert_eq!(read.played_by, Some(who), "the instance's character, not the stored {other:?}");
+    }
+    assert_eq!(w.db.contexts_played_by(who).unwrap().len(), 1);
+    assert!(w.db.contexts_played_by(other).unwrap().is_empty(), "the stored column plays nothing");
+
+    let amy = w.character("amy");
+    w.db.update_character_root(amy, true).unwrap();
+    let console = w.ctx("amy-console", "root", None, None);
+    assert_eq!(w.db.get_character(amy).unwrap().unwrap().root_ctx, None);
+    w.db.start_instance(amy, None, None, None, console.context_id, amy).unwrap();
+    w.db.write_stored_root_ctx(amy, Some(conv.context_id)).unwrap();
+    for sheet in [
+        w.db.get_character(amy).unwrap().unwrap(),
+        w.db.get_character_by_name("amy").unwrap().unwrap(),
+        w.db.list_characters(false).unwrap().into_iter().find(|c| c.principal_id == amy).unwrap(),
+    ] {
+        assert_eq!(sheet.root_ctx, Some(console.context_id));
+    }
+}
+
 #[test]
 fn a_context_joins_one_instance_once() {
     let w = world();

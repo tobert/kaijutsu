@@ -297,18 +297,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reassigned_recipient_records_suppression_without_writing_a_notice() {
+    async fn a_recipient_that_another_character_performs_records_suppression_without_writing_a_notice() {
         let dispatcher = test_dispatcher_persistent().await;
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("changed-notice-recipient"), None, actor);
-        kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        // The notice names `actor`; the context belongs to an instance of someone else.
+        kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
         let receipt = super::super::tool_command::create_operation(kernel, &call, "never run", None).unwrap();
         let source = Source::Shell(receipt.operation_id.clone());
         prepare(&kernel.kernel_db().lock(), &source, "completion for the original performer").unwrap();
-        kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(PrincipalId::new())).unwrap();
         deliver(kernel, &source, &tokio_util::sync::CancellationToken::new()).await.unwrap();
         let status = summary(&kernel.kernel_db().lock(), &source).unwrap().unwrap();
         assert_eq!(status["status"], "suppressed");

@@ -46,6 +46,9 @@ pub struct KernelBridge {
     actor: ActorHandle,
     context_type: String,
     parent: Option<String>,
+    /// The character that performs a context this client creates. `None` is
+    /// this seat's own character, which must not be a root.
+    character: Option<String>,
 }
 
 impl KernelBridge {
@@ -59,6 +62,7 @@ impl KernelBridge {
         config: SshConfig,
         context_type: String,
         parent: Option<String>,
+        character: Option<String>,
         connect_timeout: std::time::Duration,
     ) -> Result<Self> {
         let client = connect_ssh(config.clone())
@@ -136,6 +140,7 @@ impl KernelBridge {
             actor,
             context_type,
             parent,
+            character,
         })
     }
 
@@ -151,7 +156,7 @@ impl KernelBridge {
     #[cfg(test)]
     pub(crate) fn never_answers_for_test() -> Self {
         let (actor, _cmds) = ActorHandle::never_answers_for_test();
-        Self { actor, context_type: "default".to_string(), parent: None }
+        Self { actor, context_type: "default".to_string(), parent: None, character: None }
     }
 
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
@@ -180,9 +185,16 @@ impl KernelBridge {
         let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &self.list_contexts().await?)
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         let cwd = client_cwd();
+        // A context is an instance of a character: the one named with
+        // `--character`, else this seat's own, which the kernel refuses for a
+        // root character, naming it.
+        let performer = match &self.character {
+            Some(character) => character.clone(),
+            None => self.actor.whoami().await.context("whoami")?.username,
+        };
         let created = self
             .actor
-            .create_context_in_client_cwd(parent.context_id, target, &self.context_type, None, cwd.as_deref())
+            .create_context_in_client_cwd(parent.context_id, target, &self.context_type, &performer, cwd.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         if let Some(refused) = &created.cwd_refused {

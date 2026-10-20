@@ -394,7 +394,7 @@ impl JoinedContext {
 /// Where `register_session` creates a new context, and who performs it.
 struct SessionCreate {
     parent: kaijutsu_client::ParentChoice,
-    performer: Option<String>,
+    performer: String,
     /// This process's working directory, the host agent's project. The
     /// kernel may run on another host and refuse it.
     cwd: Option<String>,
@@ -835,6 +835,10 @@ pub struct KaijutsuMcp {
     /// id. `None` chooses the kernel's only live root context
     /// (`kaijutsu_client::choose_parent`).
     parent: Option<String>,
+    /// The character that performs the contexts `register_session` creates.
+    /// `None` is this connection's own character, which must not be a root:
+    /// a root performs only its root console.
+    character: Option<String>,
     /// Holds tool calls until startup registration settles.
     startup: StartupGate,
 }
@@ -865,6 +869,7 @@ impl KaijutsuMcp {
             context_name: "local".to_string(),
             agent_name: Arc::new(Mutex::new(None)),
             parent: None,
+            character: None,
             startup: StartupGate::open(),
         }
     }
@@ -962,6 +967,7 @@ impl KaijutsuMcp {
                 cc_session_id.map(|_| "claude-code".to_string()),
             )),
             parent: None,
+            character: None,
             startup: StartupGate::open(),
         }
     }
@@ -975,6 +981,13 @@ impl KaijutsuMcp {
     /// Name the context `register_session` creates its context under.
     pub fn with_parent(mut self, parent: Option<String>) -> Self {
         self.parent = parent;
+        self
+    }
+
+    /// Name the character that performs the contexts `register_session`
+    /// creates. Needed when this connection's own character is a root.
+    pub fn with_character(mut self, character: Option<String>) -> Self {
+        self.character = character;
         self
     }
 
@@ -2019,7 +2032,7 @@ impl KaijutsuMcp {
             let candidate = Self::find_available_suffixed_label(actor, base_label).await?;
             match actor
                 .create_context_in_client_cwd(
-                    create.parent.context_id, &candidate, context_type, create.performer.as_deref(), create.cwd.as_deref(),
+                    create.parent.context_id, &candidate, context_type, &create.performer, create.cwd.as_deref(),
                 )
                 .await
             {
@@ -2049,8 +2062,8 @@ impl KaijutsuMcp {
     }
 
     /// Choose the parent for a new session context and the performer to
-    /// record. The performer is this connection's character unless that
-    /// character is a root, which has no model and cannot be cast.
+    /// record. The performer is this connection's character. A root has no
+    /// model and cannot be cast, so a root connection refuses.
     async fn prepare_session_create(&self, actor: &ActorHandle) -> Result<SessionCreate, RegisterFailure> {
         let contexts = actor
             .list_contexts()
@@ -2081,7 +2094,19 @@ impl KaijutsuMcp {
             .ok_or_else(|| {
                 RegisterFailure::Fault(format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))
             })?;
-        Ok(SessionCreate { parent, performer: (!root).then_some(me.username), cwd: client_cwd() })
+        let performer = match &self.character {
+            Some(character) => character.clone(),
+            None if root => {
+                return Err(RegisterFailure::Verdict(format!(
+                    "{} is a root character, and a root performs only its root console: a session context is an \
+                     instance of a character with a model. Name one with --character <name> (or KAIJUTSU_CHARACTER), \
+                     or connect with a non-root character's key",
+                    me.username
+                )));
+            }
+            None => me.username,
+        };
+        Ok(SessionCreate { parent, performer, cwd: client_cwd() })
     }
 
     async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
@@ -2303,7 +2328,7 @@ impl KaijutsuMcp {
                         create.parent.context_id,
                         &requested_label,
                         &context_type,
-                        create.performer.as_deref(),
+                        &create.performer,
                         create.cwd.as_deref(),
                     )
                     .await

@@ -8,6 +8,9 @@ use std::time::Duration;
 use common::{root_key_source, run_local, start_server};
 use kaijutsu_client::{ActorHandle, CallError, SshConfig, spawn_actor};
 
+/// The live, non-root character the contexts below are made as.
+const PERFORMER: &str = kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER;
+
 async fn connected_actor(addr: std::net::SocketAddr) -> ActorHandle {
     let actor = spawn_actor(SshConfig {
         host: addr.ip().to_string(), port: addr.port(), username: "amy".into(),
@@ -36,7 +39,7 @@ fn a_client_directory_the_kernel_sees_becomes_the_cwd_and_one_it_cannot_is_repor
         let here = dir.path().to_str().unwrap();
 
         let created = actor
-            .create_context_in_client_cwd(parent.context_id, "in-client-cwd", "default", None, Some(here))
+            .create_context_in_client_cwd(parent.context_id, "in-client-cwd", "default", PERFORMER, Some(here))
             .await
             .unwrap();
         assert_eq!(created.cwd_refused, None);
@@ -48,7 +51,7 @@ fn a_client_directory_the_kernel_sees_becomes_the_cwd_and_one_it_cannot_is_repor
         let elsewhere = dir.path().join("only-on-the-client");
         let elsewhere = elsewhere.to_str().unwrap();
         let created = actor
-            .create_context_in_client_cwd(parent.context_id, "elsewhere", "default", None, Some(elsewhere))
+            .create_context_in_client_cwd(parent.context_id, "elsewhere", "default", PERFORMER, Some(elsewhere))
             .await
             .unwrap();
         let refused = created.cwd_refused.expect("the refusal is reported");
@@ -57,7 +60,7 @@ fn a_client_directory_the_kernel_sees_becomes_the_cwd_and_one_it_cannot_is_repor
 
         // Any other refusal is still an error.
         let error = actor
-            .create_context_in_client_cwd(parent.context_id, "elsewhere", "default", None, Some(here))
+            .create_context_in_client_cwd(parent.context_id, "elsewhere", "default", PERFORMER, Some(here))
             .await
             .expect_err("a label conflict is not a cwd refusal");
         assert!(error.is_label_conflict(), "{error}");

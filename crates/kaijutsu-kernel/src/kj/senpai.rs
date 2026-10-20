@@ -67,8 +67,10 @@ pub(crate) struct KohaiArgs {
 
 #[derive(Subcommand, Debug)]
 enum KohaiCommand {
-    /// Create a context that answers to this one. Label is positional or
-    /// `--name`. Needs the operator capability and a live character caller.
+    /// Start an instance of a character, with a new context as its
+    /// conversation, that answers to this context's instance. Label is
+    /// positional or `--name`. Needs the operator capability and a live
+    /// character caller.
     #[command(alias = "new")]
     Create {
         /// Label (positional form; or use --name)
@@ -80,14 +82,15 @@ enum KohaiCommand {
         /// Defaults to the current context
         #[arg(long, short = 'p')]
         parent: Option<String>,
-        /// Context the new one answers to. Defaults to the current context;
-        /// another context needs the caller to hold it or be its lineage root
+        /// A context of the instance the new one answers to. Defaults to the
+        /// current context; another instance needs the caller to be its
+        /// character or its lineage root
         #[arg(long)]
         senpai: Option<String>,
-        /// Existing live character performing model work. The holder of the
-        /// new context's senpai reviews it
-        #[arg(long = "as", value_name = "CHARACTER")]
-        character: Option<String>,
+        /// The live, non-root character the new instance runs. Its senpai's
+        /// character reviews its asks
+        #[arg(long = "as", value_name = "CHARACTER", required = true)]
+        character: String,
         #[command(flatten)]
         config: Box<ContextConfigArgs>,
     },
@@ -184,7 +187,7 @@ impl KjDispatcher {
                     name.or(label).as_deref(),
                     parent.as_deref(),
                     senpai.as_deref(),
-                    character.as_deref(),
+                    &character,
                     *config,
                     caller,
                 ))
@@ -361,18 +364,20 @@ fn move_kohai(db: &KernelDb, target: ContextId, senpai: ContextId, caller: &KjCa
     let senpai_row = db.get_context(senpai).map_err(|e| e.to_string())?
         .ok_or_else(|| format!("senpai context {} not found", senpai.short()))?;
     db.context_authority(target, caller.actor_id, GovernedAct::Move).map_err(|e| e.to_string())??;
-    db.may_place_under(senpai, caller.actor_id).map_err(|e| e.to_string())??;
-    if senpai_row.is_archived() {
+    let senpai_instance = db.context_instance_row(senpai).map_err(|e| e.to_string())?.ok_or_else(|| {
+        format!(
+            "{} has no live holder: it belongs to no character instance, so nobody would answer for {}",
+            display(&senpai_row), display(&row)
+        )
+    })?;
+    db.may_place_under(senpai_instance.instance_id, caller.actor_id).map_err(|e| e.to_string())??;
+    if !db.instance_is_active(senpai_instance.instance_id).map_err(|e| e.to_string())? {
         return Err(format!("{} is archived; a context answers to a live senpai", display(&senpai_row)));
     }
-    let holder = db.context_holder(senpai).map_err(|e| e.to_string())?;
-    let live = match holder {
-        Some(holder) => db.get_character(holder).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none()),
-        None => false,
-    };
+    let live = db.get_character(senpai_instance.principal_id).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none());
     if !live {
         return Err(format!(
-            "{} has no live holder (nobody live performs it and it is no live root's console), so nobody would answer for {}",
+            "{} has no live holder: its character is retired, so nobody would answer for {}",
             display(&senpai_row), display(&row)
         ));
     }
@@ -548,14 +553,48 @@ mod tests {
         assert!(none.message().contains("has no live kohai"), "{}", none.message());
     }
 
-    /// `--senpai` names another senpai only when the caller holds it or is
-    /// its lineage root; `--parent` is provenance only and may differ.
+    /// `kj kohai create` starts an instance of the named character whose
+    /// conversation is the new context. Its senpai is the caller's instance,
+    /// and binding `seq` 1 copies the character's cast.
+    #[tokio::test]
+    async fn kohai_create_starts_an_instance_under_the_callers_instance_on_binding_one() {
+        let d = test_dispatcher().await;
+        let h = house(&d);
+        let admin = test_caller();
+        assert!(d.dispatch(&[s("cast"), s("create"), s("band")], &admin).await.is_ok());
+        let set = d.dispatch(&[s("character"), s("set"), s("coder"), s("--cast"), s("band")], &admin).await;
+        assert!(set.is_ok(), "{}", set.message());
+
+        let made = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("coder"), s("fresh")], &caller(h.banto, h.seat)).await;
+        assert!(made.is_ok(), "{}", made.message());
+
+        let db = d.kernel_db().lock();
+        let fresh = db.find_context_by_label("fresh").unwrap().unwrap();
+        let (instance_id, seq) = db.context_instance(fresh.context_id).unwrap().expect("the new context is in an instance");
+        assert_eq!(seq, 1);
+        let instance = db.get_instance(instance_id).unwrap().unwrap();
+        assert_eq!(instance.principal_id, h.coder);
+        assert_eq!(instance.created_by, h.banto, "the requester started it");
+        let seat_instance = db.context_instance(h.seat).unwrap().unwrap().0;
+        assert_eq!(instance.senpai_instance, Some(seat_instance), "its senpai is the caller's instance");
+        let bindings = db.list_instance_bindings(instance_id).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!((bindings[0].seq, bindings[0].conversation_ctx, bindings[0].cast_label.as_deref()), (1, fresh.context_id, Some("band")));
+        assert_eq!(fresh.played_by, Some(h.coder));
+        assert_eq!(fresh.senpai_ctx, Some(h.seat), "the stored senpai agrees");
+        drop(db);
+        assert_eq!(d.kernel().resolve_context_review(fresh.context_id).await.unwrap().reviewer.name, "banto");
+    }
+
+    /// `--senpai` names the instance of any context it is given, and only
+    /// when the caller's character is that instance's character or its
+    /// lineage root; `--parent` is provenance only and may differ.
     #[tokio::test]
     async fn kohai_create_senpai_needs_the_caller_to_hold_it_or_be_its_root() {
         let d = test_dispatcher().await;
         let h = house(&d);
         let create = |label: &str, extra: &[&str]| {
-            let mut argv = vec![s("kohai"), s("create"), s(label)];
+            let mut argv = vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s(label)];
             argv.extend(extra.iter().map(|a| s(a)));
             argv
         };
@@ -568,6 +607,11 @@ mod tests {
         assert!(made.is_ok(), "{}", made.message());
         let row = d.kernel_db().lock().find_context_by_label("by-root").unwrap().unwrap();
         assert_eq!((row.senpai_ctx, row.forked_from), (Some(h.judge_seat), Some(h.lane)), "--senpai routes and --parent records provenance");
+        {
+            let db = d.kernel_db().lock();
+            let judge_instance = db.context_instance(h.judge_seat).unwrap().unwrap().0;
+            assert_eq!(db.context_instance_row(row.context_id).unwrap().unwrap().senpai_instance, Some(judge_instance));
+        }
 
         let own = d.dispatch(&create("by-holder", &["--senpai", "banto-seat"]), &caller(h.banto, h.lane)).await;
         assert!(own.is_ok(), "banto holds banto-seat: {}", own.message());
@@ -619,11 +663,11 @@ mod tests {
     async fn kohai_create_needs_a_live_character_caller() {
         let d = test_dispatcher().await;
         let h = house(&d);
-        let nobody = d.dispatch(&[s("kohai"), s("create"), s("orphan")], &caller(PrincipalId::new(), h.root)).await;
+        let nobody = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(PrincipalId::new(), h.root)).await;
         assert!(!nobody.is_ok());
         assert!(nobody.message().contains("no character sheet"), "{}", nobody.message());
         d.kernel_db().lock().retire_character(h.sibling, 1).unwrap();
-        let retired = d.dispatch(&[s("kohai"), s("create"), s("orphan")], &caller(h.sibling, h.other)).await;
+        let retired = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(h.sibling, h.other)).await;
         assert!(!retired.is_ok() && retired.message().contains("is retired"), "{}", retired.message());
         assert!(d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none());
     }

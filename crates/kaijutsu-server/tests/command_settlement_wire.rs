@@ -192,8 +192,6 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
         let kernel = kernel_rx.await.unwrap();
         let client = connect_client(addr).await;
         let (kj, _) = client.bind_kernel().await.unwrap();
-        let context = create_context(&kj, "requester-performer").await.unwrap();
-        let requester = kernel.kernel_db.lock().get_context(context).unwrap().unwrap().created_by;
         let performer = kaijutsu_types::PrincipalId::new();
         {
             let db = kernel.kernel_db.lock();
@@ -202,10 +200,8 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
-        let set = kj.execute_kj_quiet(context, &[
-            "context".into(), "set".into(), context.to_hex(), "--as".into(), "distinct-performer".into(),
-        ]).await.unwrap();
-        assert_eq!(set.exit_code, 0, "{}", set.stderr);
+        let context = create_context_as(&kj, "requester-performer", "distinct-performer").await.unwrap();
+        let requester = kernel.kernel_db.lock().get_context(context).unwrap().unwrap().created_by;
         assert_eq!(kernel.kernel_db.lock().get_context(context).unwrap().unwrap().played_by, Some(performer));
         assert_ne!(requester, performer);
         kj.join_context(context, "requester-performer").await.unwrap();

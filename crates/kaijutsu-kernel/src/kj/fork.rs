@@ -3236,13 +3236,13 @@ mod tests {
         assert_eq!(cast.label, "house");
     }
 
-    // ── Character slice 1: fork copies `played_by` ────────────────────────
+    // ── A fork joins its source's character instance ──────────────────────
 
-    /// A fork is the same performance's continuation by default — the child
-    /// inherits the source's `played_by`, same convention as
-    /// `fork_inherits_cast_from_source`/`fork_inherits_workspace`.
+    /// A fork is the same performance's continuation: the child joins the
+    /// source's instance, on the same binding `seq`, so it is performed by
+    /// the same character.
     #[tokio::test]
-    async fn fork_copies_played_by_from_source() {
+    async fn fork_joins_the_instance_and_binding_of_its_source() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let character_id = PrincipalId::new();
@@ -3259,11 +3259,46 @@ mod tests {
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
         assert_eq!(child.played_by, Some(character_id));
+        let source_instance = db.context_instance(source).unwrap().expect("the source has an instance");
+        assert_eq!(db.context_instance(child.context_id).unwrap(), Some(source_instance), "same instance, same binding seq");
+        assert_eq!(db.list_instance_bindings(source_instance.0).unwrap().len(), 1, "a fork writes no binding");
     }
 
-    /// A source nobody plays forks a child nobody plays — NULL `played_by`
-    /// preserves today's behavior exactly, it isn't a marker that invents a
-    /// performer.
+    /// A fork of a rotated conversation joins the binding that conversation
+    /// runs on, not the instance's first.
+    #[tokio::test]
+    async fn fork_joins_the_binding_its_source_runs_on() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let character_id = PrincipalId::new();
+        let first = register_context(&d, Some("first"), None, principal);
+        let second = register_context(&d, Some("second"), None, principal);
+        d.block_store().create_document(second, crate::DocumentKind::Conversation, None).unwrap();
+        let instance = {
+            let db = d.kernel_db().lock();
+            db.update_played_by(first, Some(character_id)).unwrap();
+            let (instance, _) = db.context_instance(first).unwrap().unwrap();
+            db.append_binding(instance, None, None, second).unwrap();
+            instance
+        };
+
+        for compact in [false, true] {
+            let name = if compact { "compact-child" } else { "full-child" };
+            let mut argv = vec![s("fork")];
+            if compact {
+                argv.push(s("--compact"));
+                setup_compact_source(&d, second, principal).await;
+            }
+            argv.extend([s("--name"), s(name)]);
+            let result = d.dispatch(&argv, &caller_with_context(second)).await;
+            assert!(result.is_ok(), "{name}: {}", result.message());
+            let child = child_id(&d, name);
+            assert_eq!(d.kernel_db().lock().context_instance(child).unwrap(), Some((instance, 2)), "{name}");
+        }
+    }
+
+    /// A source with no instance forks a child with none: no performer is
+    /// invented.
     #[tokio::test]
     async fn fork_of_unplayed_source_leaves_child_unplayed() {
         let d = test_dispatcher().await;
@@ -3280,6 +3315,7 @@ mod tests {
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
         assert_eq!(child.played_by, None);
+        assert_eq!(db.context_instance(child.context_id).unwrap(), None);
     }
 
     /// A source with no cast forks a child with no cast — inheritance copies

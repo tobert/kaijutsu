@@ -182,7 +182,7 @@ async fn seats() -> Seats {
     kernel
         .kernel_db
         .lock()
-        .assign_test_review(worker, Some(worker_principal), Some(approver_principal))
+        .assign_test_review_recasting(worker, Some(worker_principal), Some(approver_principal))
         .unwrap();
     Seats {
         _worker_client: worker_client,
@@ -820,7 +820,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         s.kernel
             .kernel_db
             .lock()
-            .assign_test_review(s.worker, Some(replacement), Some(reviewer))
+            .assign_test_review_recasting(s.worker, Some(replacement), Some(reviewer))
             .unwrap();
 
         s.answer(&ask, true).await;
@@ -847,7 +847,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         s.kernel
             .kernel_db
             .lock()
-            .assign_test_review(s.worker, Some(original_performer), Some(reviewer))
+            .assign_test_review_recasting(s.worker, Some(original_performer), Some(reviewer))
             .unwrap();
         let retry = s.raise(&code).await;
         assert_ne!(retry, ask, "restoring the performer must require a new approval");
@@ -1305,7 +1305,7 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
             .route_review(kaijutsu_kernel::kernel_db::ReviewQuery::ask(s.worker, actor))
             .expect("worker routes to its senpai's holder")
             .reviewer();
-        s.kernel.kernel_db.lock().assign_test_review(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
+        s.kernel.kernel_db.lock().assign_test_review_recasting(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
         let mut binding = s.kernel.kernel.broker().binding(&blocker_ctx).await.unwrap();
         binding.grant(kaijutsu_kernel::mcp::Capability::Exec);
         s.kernel.kernel.broker().set_binding(blocker_ctx, binding).await.unwrap();

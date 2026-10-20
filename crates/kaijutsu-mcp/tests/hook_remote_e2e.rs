@@ -84,7 +84,7 @@ async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
         key_source,
         insecure: true,
     };
-    KaijutsuMcp::connect_with_config(config, "hook-e2e-test", None)
+    KaijutsuMcp::connect_with_config(config, "hook-e2e-test", None).with_character(Some(SshServerConfig::EPHEMERAL_PERFORMER.to_string()))
 }
 
 /// Auto-register with retry — the freshly-spawned actor needs a moment to
@@ -174,7 +174,7 @@ fn rename_context_rpc_renames_and_refuses_taken_labels() {
         let parent = kaijutsu_client::choose_parent(None, &contexts).expect("the root context");
         let other = remote
             .actor
-            .create_context_under(parent.context_id, "rename-e2e-other", "default", None, None)
+            .create_context_under(parent.context_id, "rename-e2e-other", "default", "performer", None)
             .await
             .expect("create second context");
         let err = remote

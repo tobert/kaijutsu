@@ -287,7 +287,7 @@ async fn boot() -> Scenario {
         .expect("create amy-home");
     amy.join_context(amy_home, "amy").await.expect("join amy-home");
     // amy performs her own home: a context other contexts answer to must have a holder.
-    kernel.kernel_db.lock().assign_test_review(amy_home, Some(amy_principal), None).expect("amy plays amy-home");
+    kernel.kernel_db.lock().assign_test_review_recasting(amy_home, Some(amy_principal), None).expect("amy plays amy-home");
 
     Scenario {
         _amy_client: amy_client,
@@ -367,13 +367,12 @@ fn kaijutsu_session_scenario() {
 
         // ------------------------------------------------------------
         // Turn 1a: amy submits a prompt in banto's seat. banto's mock script
-        // forks lane-a and lane-b, then assigns each lane's performer
-        // itself (`kj context set lane-x --as coder-x`), as the director
-        // that forked them (guidance, Amy 2026-09-15, "yes banto can cast
-        // its own children"; `docs/approval-identity.md`, the assignment
-        // paragraph).
+        // creates lane-a and lane-b, each an instance of its coder
+        // character under banto's own instance (`kj kohai create lane-x
+        // --as coder-x`; `docs/senpai-kohai.md`, "Creating, forking,
+        // rotating").
         //
-        // banto directs the lanes it forked, so banto's own turn assigns
+        // banto directs the lanes it created, so banto's own turn names
         // their performers.
         // ------------------------------------------------------------
         let (callback, mut turn_rx) = turn_events_channel(64);

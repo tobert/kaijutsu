@@ -467,8 +467,17 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
             judge.shadow = existing.context_id;
             return Ok(Some((judge, false)));
         }
-        let row = shadow_row(&seat_row, cast_id);
-        db.in_transaction(|db| crate::kj::context::insert_new_context_rows(db, &row))?;
+        // A shadow belongs to its seat's instance, on the seat's binding.
+        let Some((instance, seq)) = db.context_instance(seat)? else {
+            return Err(KernelDbError::Validation(format!(
+                "seat context {seat} belongs to no character instance, so its judge shadow has none to join"
+            )));
+        };
+        let mut row = shadow_row(&seat_row, cast_id);
+        row.played_by = seat_row.played_by;
+        db.in_transaction(|db| {
+            crate::kj::context::insert_new_context_rows(db, &row, crate::kj::context::InstancePlacement::Join { instance, seq })
+        })?;
         judge.shadow = row.context_id;
         (row, judge)
     };
@@ -516,8 +525,8 @@ pub(crate) fn judge_labels(
     super::reviewer_contexts::ReviewerContextChain::default().decision_labels(council, spec)
 }
 
-/// A judge shadow's row: a fork child of the seat playing the seat's cast,
-/// with no performer.
+/// A judge shadow's row: a fork child of the seat playing the seat's cast.
+/// The caller gives it the seat's instance.
 fn shadow_row(seat: &ContextRow, cast_id: kaijutsu_types::CastId) -> ContextRow {
     let seat_name = seat.label.clone().unwrap_or_else(|| seat.context_id.short());
     ContextRow {
@@ -543,7 +552,7 @@ fn shadow_row(seat: &ContextRow, cast_id: kaijutsu_types::CastId) -> ContextRow 
         cast_id: Some(cast_id),
         origin_host: None,
         played_by: None,
-        // A fork child of the seat: the seat is its senpai.
+        // A fork child of the seat.
         senpai_ctx: Some(seat.context_id),
     }
 }

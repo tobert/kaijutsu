@@ -1739,6 +1739,7 @@ mod tests {
         direct.actor_id = actor;
         direct.principal_id = actor;
         let context = register_context(&d, Some("root-direct-gate"), None, direct.principal_id);
+        d.kernel_db.lock().update_played_by(context, Some(actor)).unwrap();
         direct.context_id = Some(context);
         direct.reviewer_id = None;
 
@@ -2911,7 +2912,7 @@ mod tests {
             "[global]\nallow = [\"kj kohai create\"]\n[context_type.explorer]\ndeny = [\"kj kohai create\"]\n",
         );
 
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj kohai create x").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj kohai create x --as coder").unwrap();
         let outcome =
             run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
@@ -2919,7 +2920,7 @@ mod tests {
 
         // Another context of no particular type gets the global allow.
         let other = registered_caller(&d);
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj kohai create x").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj kohai create x --as coder").unwrap();
         let outcome =
             run_gate(d.kernel(), &other, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);

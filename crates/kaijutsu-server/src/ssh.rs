@@ -292,6 +292,33 @@ impl SshServerConfig {
     /// The name of the root character `ephemeral()` creates.
     pub const EPHEMERAL_ROOT: &'static str = "tester";
 
+    /// The name of the live, non-root character `ephemeral()` also creates. A
+    /// root performs only its root console, so a test that makes a context
+    /// with `kj kohai create --as` names this one.
+    pub const EPHEMERAL_PERFORMER: &'static str = "performer";
+
+    /// Create [`Self::EPHEMERAL_PERFORMER`] in `kernel_db` unless it exists.
+    pub fn seed_ephemeral_performer(kernel_db: &kaijutsu_kernel::kernel_db::KernelDb) {
+        if kernel_db
+            .get_character_by_name(Self::EPHEMERAL_PERFORMER)
+            .expect("read the ephemeral performer")
+            .is_some()
+        {
+            return;
+        }
+        kernel_db
+            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                principal_id: PrincipalId::new(),
+                name: Self::EPHEMERAL_PERFORMER.to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .expect("create the ephemeral performer character");
+    }
+
     /// Create a test config in a fresh temporary directory.
     ///
     /// Runs `init` there: a root character named [`Self::EPHEMERAL_ROOT`]
@@ -346,6 +373,7 @@ impl SshServerConfig {
                 Some("ephemeral root"),
             )
             .expect("init the ephemeral root character");
+            Self::seed_ephemeral_performer(&kernel_db);
         }
 
         Self {

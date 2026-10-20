@@ -73,20 +73,18 @@ pub fn choose_parent(explicit: Option<&str>, contexts: &[ContextInfo]) -> Result
     }
 }
 
-/// The `kj` argv that creates `label` of `context_type`, played by
-/// `performer` when one is given, with its shell in `cwd` when one is given.
+/// The `kj` argv that creates `label` of `context_type`, run by the live,
+/// non-root character `performer`, with its shell in `cwd` when one is given.
 /// The create lifecycle runs in that cwd.
-pub fn context_create_argv(label: &str, context_type: &str, performer: Option<&str>, cwd: Option<&str>) -> Vec<String> {
+pub fn context_create_argv(label: &str, context_type: &str, performer: &str, cwd: Option<&str>) -> Vec<String> {
     let mut argv = vec![
         "kohai".to_string(), "create".to_string(),
         label.to_string(),
         "--type".to_string(),
         context_type.to_string(),
+        "--as".to_string(),
+        performer.to_string(),
     ];
-    if let Some(performer) = performer {
-        argv.push("--as".to_string());
-        argv.push(performer.to_string());
-    }
     if let Some(cwd) = cwd {
         argv.push("--cwd".to_string());
         argv.push(cwd.to_string());
@@ -162,7 +160,7 @@ impl ActorHandle {
         parent: ContextId,
         label: &str,
         context_type: &str,
-        performer: Option<&str>,
+        performer: &str,
         cwd: Option<&str>,
     ) -> Result<ContextId, CreateContextError> {
         let result = self
@@ -185,7 +183,7 @@ impl ActorHandle {
         parent: ContextId,
         label: &str,
         context_type: &str,
-        performer: Option<&str>,
+        performer: &str,
         cwd: Option<&str>,
     ) -> Result<CreatedContext, CreateContextError> {
         match self.create_context_under(parent, label, context_type, performer, cwd).await {
@@ -289,14 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn argv_names_the_performer_and_cwd_only_when_given() {
-        assert_eq!(context_create_argv("lane", "coder", None, None), ["kohai", "create", "lane", "--type", "coder"]);
+    fn argv_always_names_the_performer_and_names_the_cwd_only_when_given() {
         assert_eq!(
-            context_create_argv("lane", "coder", Some("coder"), None),
+            context_create_argv("lane", "coder", "coder", None),
             ["kohai", "create", "lane", "--type", "coder", "--as", "coder"]
         );
         assert_eq!(
-            context_create_argv("lane", "coder", Some("coder"), Some("/app")),
+            context_create_argv("lane", "coder", "coder", Some("/app")),
             ["kohai", "create", "lane", "--type", "coder", "--as", "coder", "--cwd", "/app"]
         );
     }

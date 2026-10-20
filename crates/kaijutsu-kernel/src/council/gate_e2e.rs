@@ -3093,7 +3093,11 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     let shadow = &shadows[0];
     assert_eq!(shadow.forked_from, Some(rig.ctx.context_id));
     assert_eq!(shadow.label.as_deref(), Some("judge-council-seat"));
-    assert!(shadow.played_by.is_none(), "the kernel asks a shadow's model, not a performer");
+    {
+        let db = rig.d.kernel_db().lock();
+        let seat = db.context_instance(rig.ctx.context_id).unwrap().expect("the seat belongs to an instance");
+        assert_eq!(db.context_instance(shadow.context_id).unwrap(), Some(seat), "a shadow joins its seat's instance, on the seat's binding");
+    }
 
     let turns = dialogue(&rig, shadow.context_id);
     let roles: Vec<_> = turns.iter().map(|(r, _)| *r).collect();

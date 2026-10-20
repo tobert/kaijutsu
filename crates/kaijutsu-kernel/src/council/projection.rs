@@ -276,6 +276,11 @@ pub(super) mod fixtures {
                 .get_or_create_default_workspace(PrincipalId::system())
                 .expect("default workspace");
             db.insert_context_with_document(&row, ws).expect("insert context");
+            // A performer is the character of the context's instance, under
+            // the instance of its stored senpai.
+            if let Some(performer) = row.played_by {
+                db.update_played_by(id, Some(performer)).expect("give the context its instance");
+            }
         }
         kernel
             .blocks()

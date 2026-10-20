@@ -162,23 +162,28 @@ pub fn kernel_drafts(server: &EphemeralServer) -> Vec<String> {
     })
 }
 
-/// Give every context a performer, so a submit is accepted rather than
-/// refused before it commits. The ephemeral kernel has no model, so the
-/// turn itself then fails to start, after the user message lands.
+/// Check that every context but the root seat has a performer, so a submit
+/// is accepted rather than refused before it commits. The client under test
+/// creates its contexts as the ephemeral kernel's performer character
+/// (`--character`), so they have one. The ephemeral kernel has no model, so
+/// the turn itself then fails to start, after the user message lands.
 pub fn cast_a_performer(server: &EphemeralServer) {
     with_kernel(server, async |kernel| {
         let contexts = kernel.list_contexts().await.expect("list contexts");
-        // The root seat holds `operator`, which assigning a performer needs.
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
-        let run = async |context: kaijutsu_types::ContextId, argv: &[&str]| {
-            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-            let result = kernel.execute_kj_quiet(context, &argv).await.expect("run kj");
-            assert_eq!(result.exit_code, 0, "kj {argv:?}: {}", result.stderr);
-        };
-        run(root, &["character", "create", "probe-performer"]).await;
         for info in contexts.iter().filter(|info| info.id != root) {
-            let id = info.id.to_hex();
-            run(root, &["context", "set", &id, "--as", "probe-performer"]).await;
+            let result = kernel
+                .execute_kj_quiet(root, &["context".to_string(), "info".to_string(), info.id.to_hex()])
+                .await
+                .expect("run kj context info");
+            assert_eq!(result.exit_code, 0, "kj context info: {}", result.stderr);
+            let played_by = result.data.as_ref().and_then(|data| data.get("played_by_name")).and_then(|name| name.as_str());
+            assert_eq!(
+                played_by,
+                Some(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER),
+                "context {} should be performed by the character the client created it as",
+                info.label
+            );
         }
     })
 }
@@ -333,6 +338,8 @@ impl TuiSession {
         cmd.arg(server.port().to_string());
         cmd.arg("--user");
         cmd.arg("test_user");
+        cmd.arg("--character");
+        cmd.arg(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER);
         cmd.arg("--insecure");
         cmd.arg("--key-file");
         cmd.arg(key_path);

@@ -105,6 +105,12 @@ struct ServeArgs {
     /// root contexts and no parent named, registration fails and lists them.
     #[arg(long)]
     parent: Option<String>,
+
+    /// The live, non-root character that performs new session contexts. Falls
+    /// back to `KAIJUTSU_CHARACTER`; a flag wins over its variable. Default:
+    /// this connection's own character, which must not be a root.
+    #[arg(long)]
+    character: Option<String>,
 }
 
 /// Hook client arguments.
@@ -202,6 +208,9 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             )
             .with_parent(args.parent.clone().or_else(|| {
                 std::env::var("KAIJUTSU_PARENT").ok().filter(|value| !value.trim().is_empty())
+            }))
+            .with_character(args.character.clone().or_else(|| {
+                std::env::var("KAIJUTSU_CHARACTER").ok().filter(|value| !value.trim().is_empty())
             }))
             .with_startup_gate(gate.clone());
             (mcp, Some(gate))

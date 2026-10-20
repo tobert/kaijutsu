@@ -22,10 +22,11 @@ use kaijutsu_server::{AuthDb, SshServer, SshServerConfig};
 use kaijutsu_types::PrincipalId;
 use russh::keys::{Algorithm, PrivateKey};
 
-/// A normal wire-created context has a requester but no performer. Creating
-/// a context does not silently make the connected human the model actor.
+/// A wire-created context has a requester and a performer: the requester is
+/// the connected human, the performer the character the create names. Creating
+/// a context does not make the connected human the model actor.
 #[test]
-fn create_context_leaves_played_by_unset() {
+fn create_context_records_the_requester_and_the_named_performer() {
     run_local(async {
         let (addr, kernel) = start_server_with_kernel_handle().await;
         let client = connect_client(addr).await;
@@ -52,11 +53,13 @@ fn create_context_leaves_played_by_unset() {
             "connect_client authenticates with the root character's own bound key, so the \
              connecting principal IS the root character"
         );
+        let performer = kernel.kernel_db.lock().get_character_by_name(PERFORMER).unwrap().unwrap();
         assert_eq!(
             row.played_by,
-            None,
-            "ordinary context creation records its requester, not an inferred performer"
+            Some(performer.principal_id),
+            "the performer is the character the create names, not the requester"
         );
+        assert_ne!(row.played_by, Some(root.principal_id));
         assert!(row.senpai_ctx.is_some(), "ordinary context creation records a senpai");
         assert_eq!(
             row.senpai_ctx, row.forked_from,
@@ -124,7 +127,7 @@ fn create_context_refuses_a_characterless_principal() {
         client.retain_ssh_session(ssh_client);
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let refused = create_context(&kj, "played-by-null-test").await.unwrap_err();
+        let refused = create_context_as(&kj, "played-by-null-test", "anyone").await.unwrap_err();
 
         assert!(
             kernel.kernel_db.lock().get_character(unmapped).unwrap().is_none(),

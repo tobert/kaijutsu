@@ -193,8 +193,9 @@ pub async fn start_server_with_mock_llm_kernel_handle(
     (addr, kernel)
 }
 
-/// Arrange the identity a model turn needs on an ephemeral kernel: a
-/// performer assigned to `context`. The reviewer is left unset on the
+/// Arrange the identity a model turn needs on an ephemeral kernel: the
+/// character that performs `context`, a new one when the context has no
+/// instance yet. The reviewer is left unset on the
 /// context, so the turn resolves it through the walk to the ephemeral root
 /// character that plays the root context above it.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
@@ -210,8 +211,13 @@ pub fn seed_turn_identity(
         retired_at: None,
         handoff_ctx: None, root_ctx: None, root: false,
     };
-    let performer = sheet("mock-performer");
     let db = kernel.kernel_db.lock();
+    // A context made by `create_context` is already an instance of a
+    // character; that character is its performer.
+    if let Some(instance) = db.context_instance_row(context).expect("read the context's instance") {
+        return instance.principal_id;
+    }
+    let performer = sheet("mock-performer");
     db.insert_character(&performer)
         .expect("seed the performer's character sheet");
     db.assign_test_review(context, Some(performer.principal_id), None)
@@ -323,6 +329,7 @@ pub async fn start_state_dir_server(state_dir: std::path::PathBuf) -> StateDirSe
             Some("state dir root"),
         )
         .expect("init root character for state dir");
+        SshServerConfig::seed_ephemeral_performer(&kernel_db);
     }
     register_root_key(addr, Arc::new(root_key));
 
@@ -487,24 +494,47 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
         .expect("RPC client init failed")
 }
 
-/// Create `label` of type `default` through `kj kohai create`, run from
-/// the kernel's only root context (`kaijutsu_client::choose_parent`).
+/// The live, non-root character `create_context` casts: the ephemeral
+/// kernel's own (`SshServerConfig::EPHEMERAL_PERFORMER`), since its root
+/// performs only its root console.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub const PERFORMER: &str = kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER;
+
+/// Create `label` of type `default` as [`PERFORMER`] through `kj kohai create`,
+/// run from the kernel's only root context (`kaijutsu_client::choose_parent`).
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijutsu_types::ContextId, String> {
     create_context_typed(kernel, label, "default").await
 }
 
-/// Create `label` of `context_type` through `kj kohai create`, run from
-/// the kernel's only root context.
+/// [`create_context`] with a `context_type`.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context_typed(
     kernel: &KernelHandle,
     label: &str,
     context_type: &str,
 ) -> Result<kaijutsu_types::ContextId, String> {
+    create_context_typed_as(kernel, label, context_type, PERFORMER).await
+}
+
+/// Create `label` of type `default` as the live, non-root `character`.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn create_context_as(kernel: &KernelHandle, label: &str, character: &str) -> Result<kaijutsu_types::ContextId, String> {
+    create_context_typed_as(kernel, label, "default", character).await
+}
+
+/// Create `label` of `context_type` as `character` through `kj kohai create`,
+/// run from the kernel's only root context.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn create_context_typed_as(
+    kernel: &KernelHandle,
+    label: &str,
+    context_type: &str,
+    character: &str,
+) -> Result<kaijutsu_types::ContextId, String> {
     let contexts = kernel.list_contexts().await.map_err(|e| e.to_string())?;
     let parent = kaijutsu_client::choose_parent(None, &contexts)?;
-    let argv = kaijutsu_client::context_create_argv(label, context_type, None, None);
+    let argv = kaijutsu_client::context_create_argv(label, context_type, character, None);
     let result = kernel.execute_kj_quiet(parent.context_id, &argv).await.map_err(|e| e.to_string())?;
     kaijutsu_client::context_id_from_create_result(&result)
 }

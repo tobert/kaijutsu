@@ -176,6 +176,18 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj handoff note: {e}")),
         };
+        match self.kernel_db().lock().get_context(ctx) {
+            Ok(Some(row)) if row.is_archived() => return KjResult::Err(format!(
+                "kj handoff note: {}'s handoff log {} is archived, so it takes no new notes; \
+                 `kj context promote {}` restores it, or `kj context rotate` of a live log starts a fresh one",
+                target.name, ctx.short(), ctx.short()
+            )),
+            Ok(Some(_)) => {}
+            Ok(None) => return KjResult::Err(format!(
+                "kj handoff note: {}'s handoff log {} has no row", target.name, ctx.short()
+            )),
+            Err(e) => return KjResult::Err(format!("kj handoff note: {e}")),
+        }
 
         let block_id = match self.block_store().insert_block_as(
             ctx,
@@ -365,7 +377,7 @@ impl KjDispatcher {
             paused_at: None,
             cast_id: None,
             origin_host: None,
-            played_by: Some(target.principal_id),
+            played_by: None,
             senpai_ctx: None,
         };
         db.insert_context_with_document(&row, default_ws)

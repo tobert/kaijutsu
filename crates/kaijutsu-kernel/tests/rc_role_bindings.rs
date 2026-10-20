@@ -127,7 +127,23 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         privileged: false,
         cancel: tokio_util::sync::CancellationToken::new(),
     };
-    let argv: Vec<String> = ["kohai", "create", label, "--type", context_type]
+    // The context is an instance of a live, non-root character; a root cannot be cast.
+    {
+        let db = h.db.lock();
+        if db.get_character_by_name("performer").unwrap().is_none() {
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                principal_id: kaijutsu_types::PrincipalId::new(),
+                name: "performer".to_string(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: false,
+            })
+            .unwrap();
+        }
+    }
+    let argv: Vec<String> = ["kohai", "create", "--as", "performer", label, "--type", context_type]
         .iter()
         .map(|s| s.to_string())
         .collect();

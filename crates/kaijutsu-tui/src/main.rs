@@ -62,6 +62,11 @@ struct Cli {
     #[arg(long)]
     parent: Option<String>,
 
+    /// The live, non-root character that performs a context `--context`
+    /// creates. Default: this seat's own character, which must not be a root.
+    #[arg(long)]
+    character: Option<String>,
+
     /// Seconds to wait for the kernel connection before giving up.
     ///
     /// The actor retries a failed handshake forever with backoff, so without
@@ -164,6 +169,7 @@ async fn run(cli: Cli) -> Result<()> {
         config,
         cli.context_type,
         cli.parent,
+        cli.character,
         std::time::Duration::from_secs(cli.connect_timeout),
     )
     .await?;

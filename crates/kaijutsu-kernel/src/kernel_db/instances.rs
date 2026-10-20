@@ -242,6 +242,31 @@ fn assign_context(conn: &Connection, context_id: ContextId, instance_id: Charact
     })
 }
 
+/// Make `child` join the instance and binding `seq` its `source` runs on. A
+/// source with no instance gives the child none.
+pub(super) fn join_source_instance(conn: &Connection, source: ContextId, child: ContextId) -> KernelDbResult<()> {
+    let row: Option<(Option<Vec<u8>>, Option<i64>)> = conn
+        .query_row(
+            "SELECT instance_id, binding_seq FROM contexts WHERE context_id = ?1",
+            params![blob_param(source.as_bytes())],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Err(KernelDbError::NotFound(format!("context {}", source.short()))),
+        Some((None, None)) => Ok(()),
+        Some((Some(bytes), Some(seq))) => {
+            let instance_id = CharacterInstanceId::try_from_slice(&bytes)
+                .ok_or_else(|| KernelDbError::Validation(format!("context {} has an invalid instance id", source.short())))?;
+            assign_context(conn, child, instance_id, seq)
+        }
+        Some(_) => Err(KernelDbError::Validation(format!(
+            "context {} has only one of instance_id and binding_seq",
+            source.short()
+        ))),
+    }
+}
+
 fn row_to_slot(row: &rusqlite::Row<'_>) -> SqliteResult<InstanceSlotRow> {
     Ok(InstanceSlotRow {
         instance_id: read_instance_id(row, 0)?,
@@ -376,13 +401,47 @@ impl KernelDb {
         conversation_ctx: ContextId,
         created_by: PrincipalId,
     ) -> KernelDbResult<CharacterInstanceRow> {
-        let tx = self.conn.unchecked_transaction()?;
-        let instance_id = CharacterInstanceId::new();
-        let started_at = now_millis();
-        insert_instance(&self.conn, instance_id, principal_id, senpai, started_at, created_by)?;
-        self.write_instance_binding(instance_id, 1, conversation_ctx, cast, persona)?;
-        tx.commit()?;
-        Ok(CharacterInstanceRow { instance_id, principal_id, senpai_instance: senpai, started_at, created_by })
+        self.atomically(|db| {
+            let instance_id = CharacterInstanceId::new();
+            let started_at = now_millis();
+            insert_instance(&db.conn, instance_id, principal_id, senpai, started_at, created_by)?;
+            db.write_instance_binding(instance_id, 1, conversation_ctx, cast, persona)?;
+            Ok(CharacterInstanceRow { instance_id, principal_id, senpai_instance: senpai, started_at, created_by })
+        })
+    }
+
+    /// Start an instance of `principal_id` on the cast it names today
+    /// (`characters.default_cast_id`; none gives a binding with no slots).
+    /// The persona is unset until characters carry one.
+    pub fn start_character_instance(
+        &self,
+        principal_id: PrincipalId,
+        senpai: Option<CharacterInstanceId>,
+        conversation_ctx: ContextId,
+        created_by: PrincipalId,
+    ) -> KernelDbResult<CharacterInstanceRow> {
+        let cast = self.character_default_cast(principal_id)?.map(|cast| cast.cast_id);
+        self.start_instance(principal_id, senpai, cast, None, conversation_ctx, created_by)
+    }
+
+    /// Run `f` atomically: its own transaction when none is open, else a
+    /// savepoint inside the caller's, so a refusal inside `f` leaves none of
+    /// its writes behind.
+    fn atomically<T>(&self, f: impl FnOnce(&Self) -> KernelDbResult<T>) -> KernelDbResult<T> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(f);
+        }
+        self.conn.execute_batch("SAVEPOINT instance_write")?;
+        match f(self) {
+            Ok(out) => {
+                self.conn.execute_batch("RELEASE SAVEPOINT instance_write")?;
+                Ok(out)
+            }
+            Err(error) => {
+                self.conn.execute_batch("ROLLBACK TO SAVEPOINT instance_write; RELEASE SAVEPOINT instance_write")?;
+                Err(error)
+            }
+        }
     }
 
     /// Append the next binding to `instance_id`, copied fresh from `cast`, with
@@ -395,18 +454,17 @@ impl KernelDb {
         persona: Option<&str>,
         conversation_ctx: ContextId,
     ) -> KernelDbResult<InstanceBindingRow> {
-        let tx = self.conn.unchecked_transaction()?;
-        if self.get_instance(instance_id)?.is_none() {
-            return Err(KernelDbError::NotFound(format!("character instance {}", instance_id.short())));
-        }
-        let seq: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM instance_bindings WHERE instance_id = ?1",
-            params![blob_param(instance_id.as_bytes())],
-            |r| r.get(0),
-        )?;
-        let binding = self.write_instance_binding(instance_id, seq, conversation_ctx, cast, persona)?;
-        tx.commit()?;
-        Ok(binding)
+        self.atomically(|db| {
+            if db.get_instance(instance_id)?.is_none() {
+                return Err(KernelDbError::NotFound(format!("character instance {}", instance_id.short())));
+            }
+            let seq: i64 = db.conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM instance_bindings WHERE instance_id = ?1",
+                params![blob_param(instance_id.as_bytes())],
+                |r| r.get(0),
+            )?;
+            db.write_instance_binding(instance_id, seq, conversation_ctx, cast, persona)
+        })
     }
 
     /// Fix `context_id` to binding `(instance_id, seq)`, once. A fork joins
@@ -457,6 +515,139 @@ impl KernelDb {
                 |r| read_context_id(r, 0),
             )
             .optional()?)
+    }
+
+    /// The instance a context belongs to, or `None`.
+    pub fn context_instance_row(&self, context_id: ContextId) -> KernelDbResult<Option<CharacterInstanceRow>> {
+        match self.context_instance(context_id)? {
+            Some((instance_id, _)) => Ok(Some(self.get_instance(instance_id)?.ok_or_else(|| {
+                KernelDbError::NotFound(format!("character instance {} of context {}", instance_id.short(), context_id.short()))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The instance a context belongs to; a context with none is refused,
+    /// naming it.
+    pub(super) fn require_context_instance(&self, context_id: ContextId) -> KernelDbResult<CharacterInstanceRow> {
+        self.context_instance_row(context_id)?.ok_or_else(|| {
+            KernelDbError::Validation(format!(
+                "context {} belongs to no character instance, so it has no senpai and routes nothing; \
+                 a context gets its instance from `kj kohai create --as <character>`, or by forking one that has it",
+                self.context_name(context_id)
+            ))
+        })
+    }
+
+    /// `label (short-id)` of a context, or its short id when it has no row or label.
+    pub fn context_name(&self, context_id: ContextId) -> String {
+        match self.get_context(context_id) {
+            Ok(Some(row)) => Self::context_display(&row),
+            _ => context_id.short(),
+        }
+    }
+
+    /// An instance named by its conversation: `label (short-id)`. An instance
+    /// has no label of its own.
+    pub fn instance_name(&self, instance_id: CharacterInstanceId) -> String {
+        match self.instance_conversation(instance_id) {
+            Ok(Some(conversation)) => self.context_name(conversation),
+            _ => instance_id.short(),
+        }
+    }
+
+    /// Whether the instance is live: its conversation, the `conversation_ctx`
+    /// of its newest binding, is not archived. Archiving the conversation
+    /// makes the instance inactive; promoting it makes the instance live again.
+    pub fn instance_is_active(&self, instance_id: CharacterInstanceId) -> KernelDbResult<bool> {
+        let conversation = self.instance_conversation(instance_id)?.ok_or_else(|| {
+            KernelDbError::NotFound(format!("character instance {} has no binding", instance_id.short()))
+        })?;
+        let row = self.get_context(conversation)?.ok_or_else(|| {
+            KernelDbError::NotFound(format!("conversation {} of character instance {}", conversation.short(), instance_id.short()))
+        })?;
+        Ok(!row.is_archived())
+    }
+
+    /// The instances whose senpai is `instance_id`, oldest first, active or not.
+    pub fn senpai_edge_kohai(&self, instance_id: CharacterInstanceId) -> KernelDbResult<Vec<CharacterInstanceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT instance_id, principal_id, senpai_instance, started_at, created_by
+             FROM character_instances WHERE senpai_instance = ?1 ORDER BY started_at, instance_id",
+        )?;
+        let rows = stmt.query_map(params![blob_param(instance_id.as_bytes())], |r| {
+            Ok(CharacterInstanceRow {
+                instance_id: read_instance_id(r, 0)?,
+                principal_id: read_principal_id(r, 1)?,
+                senpai_instance: read_opt_instance_id(r, 2)?,
+                started_at: r.get(3)?,
+                created_by: read_principal_id(r, 4)?,
+            })
+        })?;
+        Ok(rows.collect::<SqliteResult<_>>()?)
+    }
+
+    /// The instance at the top of `instance_id`'s senpai chain (the one with no
+    /// senpai). A cycle or a senpai that has no row is corruption and refuses.
+    pub fn lineage_top_instance(&self, instance_id: CharacterInstanceId) -> KernelDbResult<CharacterInstanceRow> {
+        let mut current = instance_id;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(KernelDbError::Validation(format!(
+                    "instance {} is its own senpai ancestor; the senpai chain has a cycle",
+                    self.instance_name(current)
+                )));
+            }
+            let row = self.get_instance(current)?.ok_or_else(|| {
+                KernelDbError::NotFound(format!("character instance {} is missing, so its lineage root cannot be found", current.short()))
+            })?;
+            match row.senpai_instance {
+                Some(senpai) => current = senpai,
+                None => return Ok(row),
+            }
+        }
+    }
+
+    /// Point `instance_id` at a new senpai instance, or make it a top with
+    /// `None`. Refuses an instance that is its own senpai, a cycle, and a
+    /// missing row. Who may move it, and the pending-ask rule, belong to the
+    /// caller. The edge is the one mutable column of the dynamic layer.
+    pub fn set_senpai_instance(&self, instance_id: CharacterInstanceId, senpai: Option<CharacterInstanceId>) -> KernelDbResult<()> {
+        if self.get_instance(instance_id)?.is_none() {
+            return Err(KernelDbError::NotFound(format!("character instance {} has no row to move", instance_id.short())));
+        }
+        if let Some(senpai) = senpai {
+            if senpai == instance_id {
+                return Err(KernelDbError::Validation(format!(
+                    "instance {} cannot be its own senpai",
+                    self.instance_name(instance_id)
+                )));
+            }
+            let target = self.get_instance(senpai)?.ok_or_else(|| {
+                KernelDbError::NotFound(format!("senpai instance {} has no row", senpai.short()))
+            })?;
+            let mut visited = HashSet::new();
+            let mut walk = target.senpai_instance;
+            while let Some(above) = walk {
+                if above == instance_id {
+                    return Err(KernelDbError::Validation(format!(
+                        "making {} the senpai of {} would close a senpai cycle",
+                        self.instance_name(senpai),
+                        self.instance_name(instance_id)
+                    )));
+                }
+                if !visited.insert(above) {
+                    break; // an existing loop above; not ours to report here
+                }
+                walk = self.get_instance(above)?.and_then(|r| r.senpai_instance);
+            }
+        }
+        self.conn.execute(
+            "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
+            params![senpai.as_ref().map(|s| s.as_bytes().to_vec()), blob_param(instance_id.as_bytes())],
+        )?;
+        Ok(())
     }
 
     /// The slot for `role` in binding `(instance_id, seq)`. A binding with no

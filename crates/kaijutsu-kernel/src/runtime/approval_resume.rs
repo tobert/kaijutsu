@@ -1606,7 +1606,10 @@ mod lifetime_tests {
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("late-pair-link"), None, actor);
-            kernel.kernel_db().lock().assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
+            // A context's character never changes, so the "changed performer"
+            // case is a context performed by someone other than the ask's actor.
+            let performer = if changed_performer { PrincipalId::new() } else { actor };
+            kernel.kernel_db().lock().assign_test_review(context, Some(performer), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let source = "echo approved-once";
             let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
@@ -1627,9 +1630,6 @@ mod lifetime_tests {
             let (command, output) = test_pair(kernel, context, actor, source);
             let owner = if changed_performer { crate::PairOwner::Turn } else { crate::PairOwner::Session };
             kernel.kernel_db().lock().link_ask_blocks(&request, &command, &output, owner).unwrap();
-            if changed_performer {
-                kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
-            }
             let action = act_on_executable_answer(kernel, context, actor, &answer, &scanned, "reviewer", &tokio_util::sync::CancellationToken::new()).await;
             assert!(if changed_performer { matches!(action, ExecAction::Tell(_)) } else { matches!(action, ExecAction::Settled) },
                 "a fresh link determines session delivery or performer rejection");
@@ -1938,13 +1938,12 @@ mod lifetime_tests {
             let completed = kernel.blocks().block_snapshots(context).unwrap();
             assert_eq!(completed.iter().filter(|b| b.content == "approved-once\n").count(), 1,
                 "{owner:?}: approved source must run after storage recovers: {completed:?}");
-            kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
             assert!(matches!(act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await,
                 ExecAction::Settled));
             let repeated = kernel.blocks().block_snapshots(context).unwrap();
             assert_eq!(repeated.len(), completed.len());
             for (completed, repeated) in completed.iter().zip(repeated.iter()) {
-                assert_eq!(repeated.status, completed.status, "a spent approval cannot overwrite accepted output after reassignment");
+                assert_eq!(repeated.status, completed.status, "a spent approval cannot overwrite accepted output when it is acted on again");
                 assert_eq!(repeated.stderr, completed.stderr);
                 assert_eq!(repeated.content, completed.content);
             }

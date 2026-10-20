@@ -50,7 +50,7 @@ fn spawn_connected_mcp(scratch: &Scratch, port: u16) -> Child {
         .write_openssh_file(&key, Default::default())
         .expect("write test key");
     Command::new(env!("CARGO_BIN_EXE_kaijutsu-mcp"))
-        .args(["--connect", "--host", "127.0.0.1", "--port", &port.to_string(), "--key-file"])
+        .args(["--connect", "--host", "127.0.0.1", "--port", &port.to_string(), "--character", "performer", "--key-file"])
         .arg(&key)
         .env("XDG_RUNTIME_DIR", &scratch.0)
         .env_remove("KAIJUTSU_KEY_FINGERPRINT")
@@ -160,7 +160,7 @@ fn a_session_started_before_the_kernel_joins_once_it_answers() {
     let session_id = format!("{:08x}-late-kernel", std::process::id());
     let label_suffix = format!("-{}", &session_id[..8]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_kaijutsu-mcp"))
-        .args(["--connect", "--insecure", "--host", "127.0.0.1", "--port", &port.to_string(), "--key-file"])
+        .args(["--connect", "--insecure", "--host", "127.0.0.1", "--port", &port.to_string(), "--character", "performer", "--key-file"])
         .arg(&key_path)
         .env("XDG_RUNTIME_DIR", &scratch.0)
         .env("CLAUDECODE", "1")
@@ -170,6 +170,7 @@ fn a_session_started_before_the_kernel_joins_once_it_answers() {
         .env_remove("KAIJUTSU_KEY_FINGERPRINT")
         .env_remove("KAIJUTSU_KEY_FILE")
         .env_remove("KAIJUTSU_PARENT")
+        .env_remove("KAIJUTSU_CHARACTER")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

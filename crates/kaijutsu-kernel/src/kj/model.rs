@@ -734,7 +734,7 @@ mod tests {
         let r = d
             .dispatch(
                 &[
-                    s("kohai"), s("create"),
+                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
                     s("probe"),
                     s("--type"),
                     s("coder"),
@@ -807,7 +807,7 @@ mod tests {
 
         let coder = d.kernel_db().lock().get_character_by_name("coder").unwrap().unwrap().principal_id;
         let played = |label: &str, cast: Option<&str>| {
-            let mut argv = vec![s("kohai"), s("create"), s(label), s("--type"), s("coder")];
+            let mut argv = vec![s("kohai"), s("create"), s("--as"), s("coder"), s(label), s("--type"), s("coder")];
             if let Some(cast) = cast {
                 argv.extend([s("--cast"), s(cast)]);
             }
@@ -818,7 +818,7 @@ mod tests {
             assert!(r.is_ok(), "context create failed: {}", r.message());
             let db = d.kernel_db().lock();
             let id = db.find_context_by_label(label).unwrap().unwrap().context_id;
-            db.assign_test_review(id, Some(coder), None).unwrap();
+            assert_eq!(db.get_context(id).unwrap().unwrap().played_by, Some(coder));
         }
         let source = |result: crate::kj::KjResult| match result {
             crate::kj::KjResult::Ok { data: Some(v), .. } => (v["model"].as_str().unwrap().to_string(), v["source"].as_str().unwrap().to_string()),
@@ -852,7 +852,7 @@ mod tests {
             crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
         let c = crate::kj::test_helpers::caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
-        let r = d.dispatch(&[s("kohai"), s("create"), s("plain"), s("-m"), s("deepseek/deepseek-flash")], &c).await;
+        let r = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("plain"), s("-m"), s("deepseek/deepseek-flash")], &c).await;
         assert!(r.is_ok(), "context create failed: {}", r.message());
 
         let result = d.dispatch(&[s("model"), s("--context"), s("plain")], &c).await;

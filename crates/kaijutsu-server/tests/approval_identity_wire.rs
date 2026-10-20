@@ -95,7 +95,7 @@ fn amy_default_and_escalation_route_approval_over_the_wire() {
         assert!(row.senpai_ctx.is_some(), "the creating context is the new context's senpai");
         let coder_client = connect(addr, coder_key, "coder").await;
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
-        kernel.kernel_db.lock().assign_test_review(work, Some(coder), None).unwrap();
+        kernel.kernel_db.lock().assign_test_review_recasting(work, Some(coder), None).unwrap();
         kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId("identity-wire-gate".into()), match_instance: None,
             match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(work),

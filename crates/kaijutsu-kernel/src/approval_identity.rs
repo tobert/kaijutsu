@@ -134,21 +134,34 @@ mod tests {
             concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
             cast_id: None, origin_host: None, played_by, senpai_ctx: senpai,
         }, ws).unwrap();
+        if let Some(performer) = played_by {
+            db.update_played_by(context_id, Some(performer)).unwrap();
+        }
         context_id
     }
 
+    fn instance_of(kernel: &Kernel, context: ContextId) -> kaijutsu_types::CharacterInstanceId {
+        kernel.kernel_db().lock().context_instance_row(context).unwrap().expect("the fixture gave the context an instance").instance_id
+    }
+
     #[tokio::test]
-    async fn a_top_context_confirms_a_root_and_refuses_anyone_else() {
+    async fn a_root_console_confirms_its_root_and_refuses_anyone_else() {
         let (kernel, ids) = kernel_with_characters(&["amy", "coder"]).await;
-        let top = context(&kernel, "top", None, None);
+        let top = context(&kernel, "top", None, Some(ids[0]));
         let error = kernel.resolve_context_review_for(top, ids[1]).await.unwrap_err();
         assert!(error.contains("coder") && error.contains("top") && error.contains("root"), "{error}");
         assert!(kernel.resolve_context_review_for(top, ids[0]).await.is_err(), "amy is not a root yet");
         kernel.kernel_db().lock().update_character_root(ids[0], true).unwrap();
         let review = kernel.resolve_context_review_for(top, ids[0]).await.unwrap();
         assert_eq!((review.reviewer.principal_id, review.source), (ids[0], ReviewSource::SelfConfirmation));
-        let error = kernel.resolve_context_review(top).await.unwrap_err();
+        let review = kernel.resolve_context_review(top).await.unwrap();
+        assert_eq!((review.reviewer.principal_id, review.source), (ids[0], ReviewSource::SelfConfirmation), "its own performer routes the same way");
+
+        let bare = context(&kernel, "bare", None, None);
+        let error = kernel.resolve_context_review(bare).await.unwrap_err();
         assert!(error.contains("no performer"), "a context nobody plays has no actor to route for: {error}");
+        let error = kernel.resolve_context_review_for(bare, ids[0]).await.unwrap_err();
+        assert!(error.contains("bare") && error.contains("no character instance"), "a context with no instance routes nothing, even for a root: {error}");
     }
 
     #[tokio::test]
@@ -170,10 +183,12 @@ mod tests {
         let error = kernel.resolve_context_review(lane).await.unwrap_err();
         assert!(error.contains("lead") && error.contains("retired"), "{error}");
 
+        // A context with no instance is not a senpai: the child below it is a
+        // top of its own, held by a non-root, and nobody reviews it.
         let unheld = context(&kernel, "unheld", Some(root), None);
         let child = context(&kernel, "child-of-unheld", Some(unheld), Some(*coder));
         let error = kernel.resolve_context_review(child).await.unwrap_err();
-        assert!(error.contains("unheld"), "{error}");
+        assert!(error.contains("child-of-unheld") && error.contains("no senpai"), "{error}");
     }
 
     #[tokio::test]
@@ -183,9 +198,9 @@ mod tests {
         kernel.kernel_db().lock().update_character_root(*amy, true).unwrap();
         let root = context(&kernel, "amy", None, Some(*amy));
         let seat = context(&kernel, "lead-seat", Some(root), Some(*lead));
-        assert!(kernel.validate_model_review_assignment(ReviewFrom::Senpai(seat), *coder).await.is_ok());
+        assert!(kernel.validate_model_review_assignment(ReviewFrom::Senpai(instance_of(&kernel, seat)), *coder).await.is_ok());
         // The performer is the holder of its own senpai: the climb goes past it.
-        let review = kernel.validate_model_review_assignment(ReviewFrom::Senpai(seat), *lead).await.unwrap();
+        let review = kernel.validate_model_review_assignment(ReviewFrom::Senpai(instance_of(&kernel, seat)), *lead).await.unwrap();
         assert_eq!(review.reviewer.principal_id, *amy);
         // A root confirms its own direct statements, but is never a model performer.
         assert!(kernel.resolve_context_review_for(root, *amy).await.is_ok());

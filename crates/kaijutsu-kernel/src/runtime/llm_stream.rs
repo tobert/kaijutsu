@@ -7937,6 +7937,8 @@ mod lifetime_tests {
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
                 played_by: Some(actor), senpai_ctx: Some(senpai),
             }).unwrap();
+            db.update_played_by(senpai, Some(reviewer)).unwrap();
+            db.update_played_by(context, Some(actor)).unwrap();
         }
         if let Some(mock) = mock {
             let mut registry = kernel.llm().write().await;
@@ -7948,6 +7950,25 @@ mod lifetime_tests {
             BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(reviewer)).unwrap();
         let call = crate::ExecContext::new(reviewer, context, "/", SessionId::new(), kernel.id());
         (kernel, context, after, call)
+    }
+
+    /// A live context that belongs to no character instance, so nobody
+    /// performs it.
+    fn bare_context(kernel: &Kernel, creator: PrincipalId) -> ContextId {
+        let context = ContextId::new();
+        kernel.blocks().create_document(context, DocumentKind::Conversation, None).unwrap();
+        let db = kernel.kernel_db().lock();
+        let ws = db.get_or_create_default_workspace(creator).unwrap();
+        db.insert_context_with_document(&crate::ContextRow {
+            context_id: context, label: None, provider: None, model: None, system_prompt: None,
+            context_state: ContextState::Live,
+            context_type: "default".into(), created_at: 0, created_by: creator,
+            forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+            preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+            demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
+            played_by: None, senpai_ctx: None,
+        }, ws).unwrap();
+        context
     }
 
     fn call_with(
@@ -8501,9 +8522,9 @@ mod lifetime_tests {
     /// The caller's "it failed" is then the whole truth.
     #[tokio::test]
     async fn a_submit_without_a_performer_is_refused_before_the_input_commits() {
-        let (kernel, context, _after, call) = fixture(Some(MockClient::new(""))).await;
+        let (kernel, _performed, _after, call) = fixture(Some(MockClient::new(""))).await;
         let player = call.principal_id;
-        kernel.kernel_db().lock().update_context_performer(context, None).unwrap();
+        let context = bare_context(&kernel, player);
         kernel.blocks().edit_draft(context, player, 0, "keep me", 0).unwrap();
         let landed = kernel.blocks().non_draft_snapshots(context).unwrap().len();
 
@@ -8557,16 +8578,10 @@ mod lifetime_tests {
     /// a headless turn's transcript carries the same text, once.
     #[tokio::test]
     async fn a_context_without_a_performer_names_the_missing_performer() {
-        let (kernel, context, after, call) = fixture(Some(MockClient::new(""))).await;
-        let director = PrincipalId::new();
-        {
-            let db = kernel.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: director, name: "banto".into(), created_at: 0, retired_at: None,
-                handoff_ctx: None, root_ctx: None, root: false,
-            }).unwrap();
-            db.assign_test_review(context, None, Some(director)).unwrap();
-        }
+        let (kernel, _performed, _after, call) = fixture(Some(MockClient::new(""))).await;
+        let context = bare_context(&kernel, call.principal_id);
+        let after = kernel.blocks().insert_block_as(context, None, None, Role::User,
+            BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(call.principal_id)).unwrap();
         let error = spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None, kernel.turns().begin(context),
             kernel.admit_context(context).unwrap()).await.unwrap_err();
@@ -8599,23 +8614,6 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
-    async fn explicit_preparation_cannot_open_an_epoch_for_a_replaced_performer() {
-        let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![]))).await;
-        let held = kernel.llm().write().await;
-        let startup = spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
-            call.principal_id, TurnOrigin::Interactive, None, kernel.turns().begin(context),
-            kernel.admit_context(context).unwrap());
-        tokio::pin!(startup);
-        assert!(futures::poll!(&mut startup).is_pending(), "provider selection waits after resolving identity");
-        kernel.kernel_db().lock().assign_test_review(context, None, Some(call.principal_id)).unwrap();
-        drop(held);
-        let error = startup.await.unwrap_err();
-        assert!(error.contains("performer changed during turn preparation"), "{error}");
-        assert_eq!(kernel.kernel_db().lock().continuation_epoch(context).unwrap(), None);
-        assert!(!kernel.turn_in_flight(context));
-    }
-
-    #[tokio::test]
     async fn accepted_inference_survives_signoff_and_a_new_explicit_epoch() {
         for signoff in [true, false] {
             let (kernel, context, after, call) = fixture(Some(MockClient::new("accepted answer"))).await;
@@ -8643,54 +8641,6 @@ mod lifetime_tests {
                 [context.as_bytes().as_slice()], |row| row.get(0),
             ).unwrap();
             assert!(unstamped, "an old turn cannot refresh a closed or newer window");
-            kernel.shutdown_runtime_worker().await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn reassignment_rejects_queued_continuation_before_provider_entry() {
-        use super::super::turn_request::TurnRequest;
-        for after_claim in [false, true] {
-            // An empty script panics on provider entry: no inference is allowed.
-            let (kernel, context, after, call) = fixture(Some(
-                MockClient::new("").with_scripted_stream(vec![]))).await;
-            let replacement = PrincipalId::new();
-            let epoch = {
-                let db = kernel.kernel_db().lock();
-                db.insert_character(&crate::kernel_db::CharacterRow {
-                    principal_id: replacement, name: "replacement".into(), created_at: 0,
-                    retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-                }).unwrap();
-                let now = kaijutsu_types::now_millis() as i64;
-                let epoch = db.begin_continuation(context, now).unwrap().epoch;
-                db.record_continuation_request(context, epoch, now).unwrap();
-                db.record_continuation_yield(context, epoch, now).unwrap();
-                epoch
-            };
-            let mut failures = kernel.turn_flows().subscribe("turn.failed");
-            let session = kernel.turns().conversations().get_or_create(context);
-            let held_conversation = session.lock().await;
-            let releases = if after_claim {
-                start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
-                    call.principal_id, TurnOrigin::Autonomous, Some(epoch)).await.unwrap();
-                None
-            } else {
-                let releases = crate::kj::test_helpers::park_runtime_pool(&kernel).await;
-                kernel.request_turn(TurnRequest {
-                    score: None, context_id: context, after_block_id: after,
-                    content: String::new(), principal_id: call.principal_id,
-                    model: None, continuation_epoch: Some(epoch),
-                }).unwrap();
-                Some(releases)
-            };
-            kernel.kernel_db().lock().assign_test_review(context, Some(replacement), Some(call.principal_id)).unwrap();
-            drop(held_conversation);
-            drop(releases);
-            let event = tokio::time::timeout(Duration::from_secs(3), failures.recv()).await
-                .expect("stale continuation must settle").unwrap();
-            let TurnFlow::Failed { error, .. } = event.payload else { panic!("expected failed continuation") };
-            assert!(error.contains("continuation") && error.contains("closed"), "{after_claim}: {error}");
-            assert!(!kernel.turn_in_flight(context));
             kernel.shutdown_runtime_worker().await.unwrap();
         }
     }
