@@ -1,10 +1,10 @@
 # Senpai and kohai
 
-A character at work is a **character instance**: one run of one character, with its own conversation, its own
-senpai, and the settings it runs on. Every character instance that does work answers to one other character
-instance: its **senpai**. It is that instance's **kohai**. The senpai edge is the only thing that routes asks,
-reports and escalations. It replaces the reviewer override, the director column, delegation grants and the review
-walk over `forked_from`.
+A character at work in a context is a **context character**: the fusion of one character with one context, with
+the senpai that context answers to and the model settings it runs on. Every context a character plays answers to
+one other context: its **senpai**. It is that context's **kohai**. The senpai edge is the only thing that routes
+asks, reports and escalations. It replaces the reviewer override, the director column, delegation grants and the
+review walk over `forked_from`.
 
 Decided by Amy on 2026-10-18 (interview with senpai, the supervising Claude session of the nagaya run):
 
@@ -36,47 +36,68 @@ come from six places (a per-context override, the context's cast, the performer'
 a preset's cast at fork time, and hidden `max_tokens` floors), so a character change could recast a live
 conversation, and a missing model fell back to a default.
 
+Decided by Amy on 2026-10-20, after step 5 was first built on character instances that spanned contexts:
+
+- One context character per context. "why does an instance need to have a conversation? I get why a
+  conversation has an instance." The name: "context_characters ... is a better name than 'character instance'
+  anyways since it's the fusion of a character with a context."
+- Casts melt into characters: "melt them, it's too complex having both layers."
+- Point-in-time settings are what `kj kohai create` options set. A context character could be updated at
+  runtime, "since they'd be isolated. If freezing simplifies things, we can freeze it."
+- Rotation does not move kohai in the kernel: "A rotating senpai knows who its kohai are so we should figure out
+  a handoff rather than trying to embed to much of this in kaijutsu." The successor adopts them ("successor
+  adopts"). "asks that get caught in between should get queued. the new senpai could do a quick query for any
+  lingering asks in rc".
+- A fork takes the forking context as its senpai, so drift along the edge covers drift between a context and its
+  forks ("yep").
+
+Why: an instance that spanned contexts had to point back at its current conversation, and the kernel inferred
+that pointer from the newest binding. A rotation that failed after create left the pointer on the unlabeled
+successor, and whether an instance was active depended on whether that inferred conversation was archived, so
+archiving one context ended an instance. One record per context removes the pointer and both inferences.
+
 ## The model
 
-Two layers. Static settings are edited in place. The dynamic layer is appended to and never modified.
+Two layers. Static settings are edited in place. A context character is written when its context is made; only
+its `senpai_ctx` changes after that, through `kj senpai set`.
 
 ```
-static     characters           principal_id, name, root, created_at, retired_at, persona (step 6), cast_id,
-                                handoff_ctx
-           casts, cast_slots    a reusable model team: one slot per role
-dynamic    character_instances  instance_id, principal_id, senpai_instance, started_at,
-                                created_by
-           instance_bindings    instance_id, seq, conversation_ctx, bound_at, cast_label, persona
-           instance_slots       instance_id, seq, role, backend_id, model, max_tokens, context_window,
-                                temperature, top_p, effort, thinking_budget, thinking_style
-contexts                        instance_id, binding_seq, context_type, forked_from, ...
-turns                           turn_id, context_id, instance_id, binding_seq, provider, model, raw tokens, ...
+static     characters           principal_id, name, root, created_at, retired_at, handoff_ctx, root_ctx,
+                                persona (step 6)
+           character_slots      principal_id, role, backend_id, model, max_tokens, temperature, top_p, effort,
+                                thinking_budget, thinking_style
+dynamic    context_characters   context_id, principal_id, senpai_ctx, persona, created_at
+           context_slots        context_id, role, backend_id, model, max_tokens, context_window, temperature,
+                                top_p, effort, thinking_budget, thinking_style
+contexts                        context_type, forked_from, label, archived_at, ...
+turns                           turn_id, context_id, provider, model, raw tokens, ...
 ```
 
 - **A character** is the persistent someone a name resolves to. Keys in `auth.db` bind to it. Its row holds
-  static settings only: its name, the root flag, its persona (step 6) and the cast it uses. Editing them changes
-  no running instance.
-- **A cast** is a reusable model team: one slot per role, where a role is a context type, or `judge`, `gate` or `distill`.
-  Many characters may name one cast.
-- **A character instance** is one run of one character. `kj kohai create` starts it. Its senpai is another
-  character instance. Its character never changes. It is live while its conversation is live.
-- **A binding** is the settings an instance runs on: the character's persona and a copy of its cast's slots, as
-  they were when the binding was written. Binding `seq` 1 is written when the instance starts. A rotation appends
-  the next `seq`, read fresh from the static settings, together with the instance's new conversation. Nothing
-  else writes a binding, and no binding row is ever changed.
-- **A context** belongs to at most one character instance and runs on one binding `seq`, both fixed when the
-  context is made. The instance's **conversation** is the `conversation_ctx` of its newest binding. Its other
-  contexts are forks, its judge shadow, and contexts its rc lifecycle makes. A context with no instance (scratch,
-  the handoff log, the drift queue, lost+found, the beat score, cold-start discovery) runs no turns and routes
-  nothing.
-- **The root console** of a root character is a character instance with no senpai. Each root character has at
-  most one live root instance. `characters.root_ctx` goes; the root console is that instance's conversation.
-- **The kohai** of an instance are the live instances whose `senpai_instance` is that instance. The senpai chain
-  never has a cycle. Setting an edge that would close one is refused.
-- **The handoff log** belongs to the character: `characters.handoff_ctx`, as today. Every instance of the
-  character writes and reads the same log, so a new instance sees the old one's notes. A rotation reads the
-  predecessor conversation's handoff as it does today. For a fresh log, `kj context rotate` of the handoff context
-  points `characters.handoff_ctx` at its successor.
+  static settings only: its name, the root flag, its persona (step 6) and its handoff log. Editing them changes
+  no context.
+- **A character slot** is the model a character uses for one role, where a role is a context type, or `judge`,
+  `gate` or `distill`. A NULL parameter takes the model's `backend_models` value when a context character is
+  written. There are no casts: each character holds its own slots.
+- **A context character** is one character in one context: `context_characters`, keyed by `context_id`. It
+  names the character (`principal_id`), the context's senpai (`senpai_ctx`, another context), and the persona,
+  and its `context_slots` hold a copy of every character slot as it was when the context was made, with unset
+  parameters filled from `backend_models` and the create options applied. A trigger refuses a change to
+  `principal_id`, `persona` and the slots. `persona` is NULL until step 6 gives characters a persona.
+- **A context with no context character** (scratch, the handoff log, the drift queue, lost+found, the beat score,
+  cold-start discovery) runs no turns and routes nothing.
+- **A context's performer** is its context character's `principal_id`. `contexts.played_by` stays gone.
+- **The root console** of a root character is `characters.root_ctx`, a pointer like `handoff_ctx`. A context
+  with no senpai must be its character's root console, so each root character has one. Rotating the root
+  console moves the pointer at the commit, as it moves `handoff_ctx`. A root console cannot be forked, moved
+  under a senpai, or archived: each would leave the root character performing a context other than its root
+  console, or with none.
+- **Live** means not archived. A concluded context is live; verbs that refuse a concluded target say so.
+- **The kohai** of a context are the live contexts whose `senpai_ctx` is that context. The senpai chain never
+  has a cycle. Setting an edge that would close one is refused.
+- **The handoff log** belongs to the character: `characters.handoff_ctx`, as today. Every context of the
+  character writes and reads the same log. A rotation reads the predecessor's handoff as it does today. For a
+  fresh log, `kj context rotate` of the handoff context points `characters.handoff_ctx` at its successor.
 
 What stays as it is:
 
@@ -86,119 +107,166 @@ What stays as it is:
 
 ## Where a model comes from
 
-Every model call reads the character instance and nothing else. A model turn in context K runs on the slot for
-K's context type in the binding K was made with. A call with no instance runs no model.
+Every model call reads the context's own `context_slots` and nothing else. A model turn in context K runs on K's
+slot for K's context type. A context with no context character runs no model.
 
-- Writing a binding copies everything a call needs into `instance_slots`: the cast slot's backend, model and
-  parameters, and for each parameter the slot leaves unset, the value in the model's `backend_models` row,
-  context window included. After that no call reads the cast or `backend_models`; they are catalogs read when a
-  binding is written. Kaijutsu supplies no parameter value of its own.
-- `max_tokens`, which every provider request carries, must come from the cast slot or the model's row. A binding
-  whose slot has neither refuses when it is written, naming the cast, the role and the model. An unset optional
-  parameter (temperature, top_p, effort, thinking) is left out of the request. A context window neither holds
-  shows as unknown.
-- A binding with no slot for K's type gives K no model. `kj kohai create` and `kj context rotate` say so in their
-  output ("<instance> has no model for <type>: cast <cast> has no <type> slot", or "<character> has no cast"),
-  and `kj context info` shows the same line. A model turn in K refuses before any provider work, naming the
-  character, the cast, the type and the fix (`kj cast slot set` or `kj character set <name> --cast`, then
-  `kj context rotate`).
-- The judge shadow runs on the `judge` slot of its instance's binding, and the gate on the `gate` slot, so a cast
-  change moves neither in a running instance. Both read the binding, not the live cast: `seat_slot_backend`'s
-  `effective_cast` lookup goes. An instance with no `gate` slot has no council: its gate decides without one.
-  `[council] server` and `[council] model` in `gate.toml` are gone (Amy, 2026-10-19: "Remove it now").
-- A judge shadow belongs to one conversation, as today: the coder's archive rc archives it when a rotation
-  archives the predecessor, and the successor's first gate call makes a new one on the successor's binding.
-- A fork's distillation runs on the forking instance's `distill` slot (Amy, 2026-10-19), so a cheap model can
-  summarize for an expensive conversation. With no `distill` slot, a fork that asks for distillation refuses,
-  naming the cast and the fix. A one-shot prompt takes `max_tokens` from the slot it runs on.
+- Writing a context character copies everything a call needs into `context_slots`: each character slot's
+  backend, model and parameters, and for each parameter the slot leaves unset, the value in the model's
+  `backend_models` row, context window included. After that no call reads `character_slots` or
+  `backend_models`; they are catalogs read when a context character is written. Kaijutsu supplies no parameter
+  value of its own.
+- `max_tokens`, which every provider request carries, must come from the character slot, a create option or the
+  model's row. A slot with none refuses when the context character is written, naming the character, the role
+  and the model. A `gate` or `judge` slot names a council server and the model it serves, and needs no
+  `max_tokens`. A `judge` or `gate` slot whose backend is not a council server refuses when it is written.
+  `context_window` comes from the slot's model row in `backend_models`, or is unknown. An unset optional parameter
+  (temperature, top_p, effort, thinking) is left out of the request. A context window none holds shows as
+  unknown.
+- A context with no slot for its type has no model. `kj kohai create` and `kj context rotate` say so in their
+  output ("<context> has no model for <type>: <character> has no <type> slot"), and `kj context info` shows the
+  same line. A model turn in K refuses before any provider work, naming the character, the type and the fix
+  (`kj character slot set`, then `kj context rotate`).
+- The judge shadow runs on its own `judge` slot and the gate on K's `gate` slot. The two are independent: a
+  context with no `gate` slot has no council, and its gate decides without one; a context with a `gate` slot and
+  no `judge` slot runs its council with no judge.
+- A judge shadow belongs to one context. The gate makes it as a fork of that context, so it copies the context
+  character and takes the context as its senpai. `kj senpai set` refuses to move a judge shadow. The coder's
+  archive rc archives it when a rotation archives the predecessor, and the successor's first gate call makes a
+  new one.
+- A fork's distillation runs on the forking context's `distill` slot, and `kj drift pull|merge` on the caller's
+  `distill` slot, so a cheap model can summarize for an
+  expensive conversation. With no `distill` slot, a fork that asks for distillation refuses, naming the
+  character and the fix. A one-shot prompt takes `max_tokens` from the slot it runs on.
 - A backend's connection facts (`base_url`, keys, timeouts, `max_concurrent`) are read live. They are
   infrastructure, not a model choice.
-- To move a running instance to another model or persona, change the static settings and rotate it. To run two
-  models side by side, start a second instance of a character whose cast has the other model.
+- To move a context to another model or persona, change the character's slots and rotate it. To run two models
+  side by side, create a context with a create option, or play a second character.
+- Slots are frozen after create. No verb edits a running context's slots; one can be added later, since each
+  context's copy is its own.
 
 ## Routing
 
 Reviewer of an ask raised in context K by actor A:
 
-1. Let I be K's instance. A context with no instance refuses, naming K.
-2. Let S be `senpai_instance(I)`. If S is null (I is a root console): when A is I's live root character, the ask
-   is a self-confirmation; otherwise refuse, naming A and K.
-3. The reviewer is S's character when that character is not retired and is not A. S's conversation may be
-   archived; an inactive senpai instance still reviews.
-4. When S's character is A, climb: I := S, and repeat from 2.
+1. K with no context character refuses, naming K.
+2. Let S be K's `senpai_ctx`. If S is null (K is a root console): when A is K's live root character, the ask is a
+   self-confirmation; otherwise refuse, naming A and K.
+3. The reviewer is S's character when that character is not retired, is not A, and is not K's performer. S may
+   be archived; asks route to a character, so an archived senpai's character still reviews.
+4. When S's character is A or K's performer, climb: K := S, and repeat from 2. A fork's performer is its
+   forking context's character, so an ask in a fork, by anyone, climbs past that character.
 5. A retired character refuses by name. It never substitutes another character.
 
 There is one resolver.
 
-- **Escalation** runs the same climb, past the instance that yielded the current reviewer, and refuses at an
-  instance with no senpai, naming it.
+- **Escalation** runs the same climb from the ask's context, skipping senpai until one is held by a character
+  other than the current reviewer, and refuses at a context with no senpai, naming it. `kj ledger escalate --to`
+  and the lineage root's take-over stay as step 2 built them.
 - **Lineage root**: the character at the top of the senpai chain. It must be a live root character, or refuse
   with the reason.
 
 ## Authority
 
-One rule: **the character of an instance's senpai, or its lineage root**, may:
+One rule: **the character of a context's senpai, or its lineage root**, may:
 
 - move it to another senpai (`kj senpai set`);
 - escalate its asks;
 - rotate it (its own character may also rotate it, as today);
-- archive it.
+- archive it;
+- change its egress (`kj context set --egress-allow|--egress-deny`).
 
-A verb nested in an rc lifecycle uses a narrower rule in place of this one, with the context whose lifecycle
-runs as the actor: it may act on that context's kohai and on the other contexts of its instance, so the coder's
-archive rc archives its own judge shadows (`coder/archive/S10-shadows.kai`). The context's character lends the
-lifecycle nothing.
+**Placing under a senpai.** `kj kohai create --senpai <ctx>` and `kj senpai set` share one rule over the new
+senpai: the actor plays it, holds its senpai, or is its lineage root. A new edge refuses an archived senpai. A
+copied edge (fork, rotate) keeps the senpai it copies, archived or not.
 
-The refusal names the rule: "only <instance>'s senpai (<character>) or its lineage root (<root>) may <act>".
-An instance's character never changes, so there is no recast act; to put another character on the work, start an
-instance of it.
+**A handoff log** has no context character. Its owner and any live root character may rotate it.
 
-Unchanged: a root character never performs an instance other than its root console; the performer can never
-review its own work; a model turn refuses to start when its performer would review itself; a move refuses while
-the instance has pending asks.
+**Character slots** are written with `kj character slot set|unset`, which needs the `ConfigWrite` capability, as
+`kj character set` does today.
+
+A verb nested in an rc lifecycle uses a narrower rule in place of this one, with the context whose lifecycle runs
+as the actor: it may act on that context's kohai, so the coder's archive rc archives its own judge shadows
+(`coder/archive/S10-shadows.kai`). In a rotate lifecycle it may also act on the predecessor's kohai (see "Rotation
+hands off its kohai"). The context's character lends the lifecycle nothing. A selection such as `--children`
+that names a context the rule does not cover refuses, naming it.
+
+The refusal names the rule: "only <context>'s senpai (<character>) or its lineage root (<root>) may <act>". A
+context's character never changes, so there is no recast act; to put another character on the work, create a
+context for it.
+
+Unchanged: a root character never performs a context other than its root console; the performer can never review
+its own work; a model turn refuses to start when its performer would review itself.
 
 ## Creating, forking, rotating
 
-- `kj kohai create <label> --as <character> --type <t> [--senpai <instance>] [--parent <ctx>] [--cwd <dir>]
-  [--env K=V]...` starts a character instance and its conversation. `--as` is required. The senpai is the
-  caller's instance, or `--senpai <instance>` when the caller's character holds that instance or is its lineage
-  root. `--parent` sets the conversation's `forked_from` only. It writes binding `seq` 1 from the character's
-  persona and cast. It needs the Operator capability and a live character caller.
-- `kj fork`: the child joins the forking context's instance and runs on the same binding `seq`.
-- `kj context rotate <instance-or-ctx>`: a new conversation in the same instance, with the next binding `seq`
-  read fresh from the static settings. The kohai and the senpai do not move: they point at the instance.
-- `kj context rotate` of a character's handoff log points `characters.handoff_ctx` at the successor. A context
-  with no instance has no loadout to check, so rotate skips that check for it; a context with no instance that
-  is not a handoff log refuses rotation. `kj handoff note` refuses an archived log.
-- `kj context archive` archives only the context it names. Archiving an instance's conversation makes the
-  instance inactive: reports to it and `kj senpai set` onto it refuse, and its forks stay live. Contexts that
-  should go with it go by their type's archive rc, as the coder's judge shadows do today
-  (`coder/archive/S10-shadows.kai`). `kj context promote` of the conversation makes the instance live again.
-- `kj senpai set <instance> <senpai-instance>`: moves a kohai. It needs the authority rule over the moved
-  instance and the same rule over the new senpai (see "Decided while building step 5"), refuses with pending
-  asks, refuses a cycle, and refuses an inactive senpai instance.
-- `kj senpai show [<instance-or-ctx>]`, `kj kohai list [<instance-or-ctx>]`, `kj senpai report "<text>"` work on
-  instances; given a context, they use its instance.
-- `kj context info` shows the context's instance, its binding `seq`, and the model for its type (or why it has
-  none). `kj character show` lists the character's live instances.
-- **Addresses.** An instance has no label of its own. It is named by its conversation's label, which a rotation
-  carries to the new conversation as it does today. A verb that takes an instance accepts any of the instance's
-  contexts and uses that context's instance.
+- `kj kohai create <label> --as <character> --type <t> [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
+  [--env K=V]... [--model <backend>/<model>] [--max-tokens N] [--effort E]` makes a context and its context
+  character. `--as` is required. The senpai is the caller's context, or `--senpai <ctx>` under "Placing under a
+  senpai". `--parent` sets `forked_from` only. The slots
+  are copied from the character. `--model`, `--max-tokens` and `--effort` replace the slot for `<t>` in the copy
+  and are the only create options; unset parameters of a `--model` override are filled from that model's
+  `backend_models` row. It needs the Operator capability and a live character caller.
+- `kj fork`: the child gets a copy of the forking context's context character, slots included, with the forking
+  context as its senpai. Asks from a fork climb past its performer to the forking context's senpai (Routing,
+  rule 4). A root console cannot be forked.
+- `kj context rotate <ctx>`: a new context for the same character, with slots copied fresh from the character.
+  It copies, as today, the type, env, cwd and shell, and the predecessor's senpai; its `forked_from` is the
+  predecessor's parent, so the successor is a sibling. The label and ring position move at the commit. The
+  kernel moves no kohai (see "Rotation hands off its kohai").
+- `kj context rotate` of a character's handoff log points `characters.handoff_ctx` at the successor. A handoff
+  log has no context character, so rotate skips the loadout check for it; any other context with no context
+  character refuses rotation. `kj handoff note` refuses an archived log.
+- `kj context archive` archives the context it names, and with `--children` the selection it names. The kernel
+  moves no kohai: their asks still reach the archived senpai's character, and reports to it refuse until they
+  are moved (`kj senpai set`) or the senpai is promoted. Unresolved asks raised *in* the archived context are
+  swept with a note, as today; asks raised in its kohai are not touched. Contexts that should go with it go by
+  their type's archive rc, as the coder's judge shadows do today (`coder/archive/S10-shadows.kai`).
+- `kj senpai set <ctx> <senpai-ctx>`: moves a kohai. It needs the authority rule over the moved context and
+  "Placing under a senpai" over the new one. It refuses a cycle, a root console, and a judge shadow. It refuses
+  while a pending ask would change reviewer: it re-resolves every pending ask raised in the moved context and in
+  the contexts below it whose climb passes through it, and refuses, naming the asks, when any reviewer would
+  differ.
+- `kj senpai show [<ctx>]`, `kj kohai list [<ctx>]`, `kj senpai report "<text>"` default to the caller's context.
+  `kj kohai list` shows kohai whose senpai is archived, so they are easy to find.
+- `kj ledger list --reviewer <character>` lists only the asks whose reviewer is that character.
+- `kj context info` shows the context's character, its senpai, and the model for its type (or why it has none).
+  `kj character show` lists the character's live contexts.
+
+## Rotation hands off its kohai
+
+The kernel does not move kohai on rotation. The rotating character knows its kohai, and the handoff carries them:
+
+1. Rotate creates the successor and runs its create rc, runs the predecessor's archive rc, and commits: the
+   predecessor is archived and the successor takes its label, ring position, `handoff_ctx` and `root_ctx`
+   pointers, in one transaction. The kohai still name the predecessor.
+2. After the commit, rotate runs the successor's **rotate** rc (`/config/rc/<type>/rotate/`), with
+   `ROTATED_FROM` naming the predecessor. A director's rotate rc takes the kohai with
+   `kj senpai set <kohai> <successor>` and then lists the asks waiting for its character with
+   `kj ledger list --reviewer <character>`, so the asks raised during the rotation are in front of it. The
+   character may also take its kohai by hand.
+3. Until the kohai are taken, their asks reach the same character (the predecessor's) and wait in the ledger,
+   and their reports refuse, naming the archived senpai.
+
+A rotation that fails before the commit leaves the predecessor live and labeled, with its kohai, and the
+successor unlabeled; the error names the successor, and rotate archives it before returning. A rotate rc that
+fails after the commit undoes nothing: the rotation stands, the error names the kohai not yet taken, and
+`kj kohai list` of the predecessor shows them.
 
 ## Reports and drift
 
-- `kj senpai report "<text>"` puts the text in the senpai instance's conversation as a drift block.
-- `kj drift push` along the edge, from a context of a kohai instance to its senpai's conversation or back, runs
-  with no ask. Within one instance, a push from the conversation down to one of its forks runs with no ask. A
-  push from a fork up to the conversation runs with no ask when the instance's own character made the fork (the
-  fork's `created_by`), as a context forks itself the way Claude Code forks a subagent; a fork a person made
-  keeps today's gate on the way up. Any other drift target keeps today's gate. A `gate.toml` key on `kj drift push` still wins over the
-  edge (Amy, 2026-10-19).
+- `kj senpai report "<text>"` puts the text in the senpai context as a drift block.
+- `kj drift push` along the edge, one hop from a context to its senpai or to one of its kohai, runs with no ask,
+  with one exception: a push up from a fork whose `created_by` is not its character keeps today's gate. That
+  proxy treats a fork a person made, and a judge shadow (made by `system`), as not the context's own; a person
+  connected with the fork's character's key reads as the character. A context forks itself the way Claude Code
+  forks a subagent, and its pushes up run with no ask. A push two or more hops away keeps today's gate. A
+  `gate.toml` key on `kj drift push` still wins over the edge.
 
 ## What a context sees
 
-- The `<situation>` block names the instance and its senpai:
-  `<instance label="<label>" character="<name>"/>` and `<senpai instance="<label>" character="<name>"/>`.
+- The `<situation>` block names the context's character and its senpai: `<character name="<name>"/>` and
+  `<senpai id="<short id>" context="<label>" character="<name>"/>`. As step 3 built it, `character` is named
+  even when retired, `context` is left out when the senpai has no label, and a root console has no `<senpai>`.
 - The rc persona text (director S00-stance) says "our senpai" and reads the name from the kernel fact.
 
 ## Removed (hard cut)
@@ -210,114 +278,144 @@ Steps 1-3 (context edge):
   `kj context create` (now `kj kohai create`).
 - The `forked_from` review walk, `responsible_character_above`, and the duplicate resolver.
 
-Step 5 (instances and bindings):
+Step 5 (context characters):
 
-- Columns `contexts.senpai_ctx`, `contexts.played_by`, `contexts.cast_id`, `contexts.provider`, `contexts.model`,
-  `characters.root_ctx`, `presets.cast_id` and `presets.system_prompt`; table `llm_defaults`; and the
-  unreleased `turns.cast_label` and `turns.model_source`, which never reached a deployed database. `characters.default_cast_id` is renamed `cast_id`. The
+- Columns `contexts.senpai_ctx` (moves to `context_characters`), `contexts.played_by`, `contexts.cast_id`,
+  `contexts.provider`, `contexts.model`, and the character's cast column (`default_cast_id` on main, `cast_id`
+  after the first build); `characters.root_ctx` stays, as the root console's pointer;
+  `presets.cast_id` and `presets.system_prompt`; tables `casts`, `cast_slots` and `llm_defaults`; and the
+  unreleased `turns.cast_label` and `turns.model_source`, which never reached a deployed database. The
   `senpai_migration_report` table stays: `kj senpai show` prints a context's notes until its senpai is set again.
-- `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj kohai create -m|--model|--cast`;
+- `kj cast` (every subcommand; `kj character slot set|unset|list` replaces `kj cast slot`) and
+  `kj character set --cast`.
+- `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj kohai create --cast`;
   `kj fork --model`; `kj model` (`kj context info` shows the model); `kj backend default`;
   `kj preset save --cast|--system-prompt`. `kj models` (discovery) stays.
-- RPC `configureLlm`, `setDefaultProvider` and `setDefaultModel`; the client's `set_context_model`. The wire's
-  `ContextHandleInfo.provider` and `.model` carry the binding's model for the context's type; `.castLabel` carries
-  the binding's cast label.
+- RPC `configureLlm`, `setDefaultProvider`, `setDefaultModel` and `getLlmConfig`; the client's
+  `set_context_model`. The wire's `ContextHandleInfo.provider` and `.model` carry the context's slot for its
+  type; `.castLabel` goes.
 - The MCP `session.start` hook's model write; the live `GET /v1/models` lookup for a context window (a window that
   `backend_models` does not hold shows as unknown); the DriftRouter handle's provider/model copy and the turn's
   explicit `model` argument that outranks it, with the wire `prompt` method's `model` parameter
   (`kaijutsu-client` `prompt(content, model, ctx)`).
 - `kj fork --distill-model`; `[council] server` and `[council] model` in `gate.toml`; every read of
-  `backend_models` or `cast_slots` that chooses a model outside writing a binding. `kj cast slot set` reads the
-  model row only to warn about the slot it writes.
+  `backend_models` or `character_slots` that chooses a model outside writing a context character.
+  `kj character slot set` reads the model row only to warn about the slot it writes.
 - Every value kaijutsu supplies on its own: the 64000 `max_tokens` floor (`LlmRegistry::max_output_tokens`),
   `BuildOpts::new`'s 64000 (`BuildOpts` takes `max_tokens` from its caller), the openai-compatible client's 8192
   for a zero, and the one-shot prompts' 4096.
-- Every resolver below the binding: `model_resolution.rs`'s override, registry-default rungs and
+- Every resolver below the context's slots: `model_resolution.rs`'s override, registry-default rungs and
   `ModelSource`; `effective_cast` and its fall back to the performer's cast; the override's borrow of the
   current default backend; `LlmRegistry::prompt` and its first-advertised model; the tunable floor
   (`default_tunables`, `SlotTunables::over` onto it); `resolve_model_choice`'s bare name onto the default
   backend, and distillation's registry-default fall back.
-- `characters.default_cast_id` becomes `characters.cast_id`, read only when a binding is written.
+- From the first build of step 5: `character_instances`, `instance_bindings`, `instance_slots`,
+  `instance_migration_report`, `contexts.instance_id` and `.binding_seq`, `turns.instance_id` and
+  `.binding_seq`, and the derivations of an instance's conversation, its activity and the root console.
+- `cast_slots.loadout` and `.extra` are not carried into `character_slots`: they had no reader.
 
 Presets keep only their fork filters (`kj fork --preset full|window|spawn`).
 
 ## Migration
 
-The migration from the context-edge schema runs once, in one transaction, and logs every value it drops, as
-`migrate_preset_cast_narrowing` does. It never invents a value: each instance and binding it writes records an
-answer the old code would have given.
+The migration runs once, in one transaction, after step 1's. It records every value it drops and every context
+it cannot map in `context_character_migration_report` (kinds: `dropped`, `unmapped`, `no_slot`, `no_gate_slot`,
+`no_distill_slot`, `no_character_slot`), which `kj senpai show` reads. It never invents a value: each row it
+writes records an answer the old code would have given. The one exception is a judge shadow's character, which
+the old row did not have; the new model requires it, and it is the character of the context the shadow judges.
 
-1. **Root consoles.** Each root character's `root_ctx` becomes its root instance, with no senpai.
-2. **Instances.** Contexts are grouped into instances in creation order. A context with a performer joins the
-   instance of its `forked_from` source when the source has the same performer and the context was forked or
-   rotated from it; otherwise it starts an instance of its performer. "Same performer" means the current
-   `played_by`: `kj context set --as` rewrote it in place, and no history of it exists. A rotation's link is
-   its `ROTATED_FROM` env value, because a successor's `forked_from` is its predecessor's parent; a value that
-   does not parse as a context id is logged and ignored. A context with no performer joins the instance of its
+1. **Character slots.** Each character gets a copy of its cast's slots. A character with no cast gets none; the
+   migration lists it with the roles its live contexts use (`no_character_slot`), because a rotation copies
+   fresh from the character and would lose the model. We add those slots before deploy. A cast no character
+   names is dropped and logged with its slots.
+2. **Context characters.** Each context with a performer gets a context character of its performer, with its
    `senpai_ctx`. A judge shadow (type `judge` with no performer, found by `forked_from` with archived rows
-   included) joins the instance of the context it judges. A context with neither a performer nor a
-   `senpai_ctx` has no instance, and neither has any character's `handoff_ctx`, which has a performer.
-3. **Edges.** An instance's senpai is the instance of its first context's `senpai_ctx`. An instance whose mapped
-   senpai would be itself or would close a cycle refuses the migration, naming the contexts.
-4. **Bindings.** Each context gets the binding its next turn, its judge and its gate would have used under the old
-   resolver (override, context cast, default cast and `llm_defaults` included), resolved from the rows as they
-   stand at migration. `max_tokens` is what the old code sent: the slot's, the model row's, `llm_defaults`', or
-   64000 when all are unset, written into the slot. A binding gets a `gate` or `distill` slot only from the
-   cast's own slot. The migration cannot read `gate.toml`, so it lists each live instance whose cast has no
-   `gate` slot, and each whose cast has no `distill` slot; we add them with `kj cast slot set` before deploy.
-   Contexts of one instance with equal resolutions share a `seq`; a different resolution starts the
-   next `seq`, in creation order of each resolution's first context, except that the conversation's resolution
-   (rule 5) takes the last `seq`, so the newest binding names the conversation. A binding's slots are a copy of
-   the whole effective cast, with the context's own type slot replaced by an override or filled from
-   `llm_defaults`, so a judge shadow shares its conversation's `seq`. A context the old resolver could not resolve gets a binding with no slot for its
-   type, and the migration lists it.
-5. **Conversation.** An instance's conversation is its newest live context that is not a fork child of another of
-   its contexts or a judge shadow. No stored marker says an rc lifecycle made a context; one made as a fork
-   child is caught by the fork clause. With none, its newest context of those kinds
-   is its conversation, and the instance is inactive when that context is archived.
-6. **Labels.** Labels stay on contexts; the migration moves none.
-7. **Handoff.** `characters.handoff_ctx` stays where it is.
-8. Archived contexts map like live ones; an archived context that cannot be mapped is left with no instance and
-   listed, as step 1 did. Only live contexts refuse.
+   included) gets the character of the context it judges, with that context as its senpai. A context with no
+   performer that is not a judge shadow gets none, whether or not it has a `senpai_ctx`, and is listed when it
+   has one. No character's `handoff_ctx` gets one.
+3. **Edges.** `senpai_ctx` is copied as step 1 left it. A self-edge or a cycle among live contexts refuses the
+   migration, naming the contexts; one among archived contexts is broken at the archived context, which is
+   listed. Each root character's `root_ctx` stays; a live context with no senpai that is not its character's
+   `root_ctx` refuses the migration, naming it.
+4. **Slots.** Each context's slots are a copy of the effective cast its next turn, its judge and its gate would
+   have used
+   under the old resolver (override, context cast, default cast and `llm_defaults` included), resolved from the
+   rows as they stand at migration, so a migrated context holds that cast's roles, not every character slot.
+   `context_window` is the model row's value, or unknown, since the live lookup is gone. `max_tokens` is what the
+   old code sent: the slot's, the model row's,
+   `llm_defaults`', or 64000 when all are unset, written into the slot. A context gets a `gate` or `distill` slot
+   only from the cast's own slot. The migration cannot read `gate.toml`, so it lists each live context with no
+   `gate` slot and each with no `distill` slot; we add them with `kj character slot set` and rotate before
+   deploy. A context the old resolver could not resolve gets no slot for its type, and the migration lists it.
+5. **Labels and handoff logs** stay where they are.
+6. Archived contexts map like live ones; an archived context that cannot be mapped is left with no context
+   character and listed. Only live contexts refuse.
 
 ## Out of scope
 
 - A verify tier for reviewers (read-only builds and tests) is a gate tier change, done separately.
 - `@<name>` drift addressing (documented in docs/character.md, not verified as implemented).
+- A verb that edits a running context's slots.
 
 ## Tests (each falsified once)
 
-- An ask in a kohai instance goes to its senpai's character; a self-held senpai climbs; a root console
-  self-confirms; a top instance held by a non-root refuses; a retired character refuses by name; a context with no
-  instance refuses.
+- An ask in a kohai goes to its senpai's character; a fork's ask climbs past its performer, including an ask a
+  person raises in the fork; a root console
+  self-confirms; a top context held by a non-root refuses; a retired character refuses by name; a context with no
+  context character refuses; an archived senpai's character still reviews.
 - Escalation climbs one step and refuses at the top.
 - The authority rule allows the senpai's character and the lineage root, and refuses a sibling and the kohai
-  itself, for each act it governs.
-- `kj senpai set` refuses a cycle, pending asks, and an inactive senpai.
-- Archiving a conversation archives no other context; the instance is inactive until `kj context promote`
-  restores the conversation; a report to an inactive instance refuses.
-- Create writes binding `seq` 1 from the character's cast and persona; a fork joins the instance on the same
-  `seq`; a rotation appends the next `seq` read fresh; a later cast or persona change moves no running context;
-  the kohai of a rotated instance stay where they are.
-- A binding with no slot for the type: create and rotate say so; a turn refuses and names the character, the cast,
-  the type and the fix. A slot with no `max_tokens` in it or in `backend_models` refuses when bound.
-- A binding copies the slot's parameters and fills unset ones from `backend_models`; a later edit to either
-  moves no running context; a turn sends no unset optional parameter.
-- A fork with distillation runs on the `distill` slot, and refuses with no `distill` slot; an instance with no
-  `gate` slot runs its gate with no council; a `[council] server` key in `gate.toml` is refused as unknown.
-- The judge shadow and the gate use the instance binding's `judge` and `gate` slots.
-- A drift along the edge runs with no ask, both ways; a drift from a conversation to its own fork runs with no
-  ask; a drift up from a fork the character made runs with no ask, and up from a fork a person made asks; a
-  drift to a sibling still asks; a `gate.toml` ask key wins.
-- Two instances of one character read and write the same handoff log; rotating the handoff context repoints
+  itself, for each act it governs; `kj senpai set` also checks the new senpai.
+- `kj senpai set` refuses a cycle, an archived senpai, a root console, a judge shadow, and a pending ask in the
+  moved context or in a fork below it whose reviewer would change; it allows pending asks when every reviewer
+  stays the same. `kj kohai create --senpai` and `kj senpai set` use the same rule over the new senpai.
+- A root console cannot be forked or archived; rotating it moves `root_ctx` at the commit; a live context with
+  no senpai that is not a `root_ctx` cannot exist.
+- Archiving a context archives no other context and moves no kohai; a report to an archived senpai refuses;
+  `kj kohai list` shows kohai of an archived senpai.
+- Create copies every character slot with unset parameters from `backend_models`; a create option replaces the
+  slot for the context's type; a later edit to the character's slots or to `backend_models` moves no context; a
+  trigger refuses a change to a context's slots or character; a turn sends no unset optional parameter.
+- A fork copies the forking context's slots and takes it as senpai; a rotation copies fresh slots and keeps the
+  predecessor's senpai.
+- Rotation moves no kohai; the successor takes them with `kj senpai set`; a director's rotate rc takes them
+  after the commit and lists the asks waiting for its character; an ask raised during the rotation waits in the
+  ledger and is in that list; a rotate rc that fails after the commit leaves the rotation standing and names the
+  kohai not taken; a rotation that fails before commit leaves the predecessor live, labeled and with its kohai, and the
+  successor archived.
+- A context with no slot for its type: create and rotate say so; a turn refuses and names the character, the
+  type and the fix. A slot with no `max_tokens` anywhere refuses at create.
+- A fork with distillation runs on the `distill` slot, and refuses with no `distill` slot; a context with no
+  `gate` slot runs its gate with no council; a `gate` slot with no `judge` slot runs the council with no judge;
+  a `judge` or `gate` slot on a backend that is not a council server refuses at write; a `[council] server` key in `gate.toml` is refused as unknown.
+- The judge shadow and the gate use the `judge` and `gate` slots.
+- A drift along the edge runs with no ask, both ways; up from a fork a person made asks; two hops away asks; a drift to a sibling
+  still asks; a `gate.toml` ask key wins.
+- Two contexts of one character read and write the same handoff log; rotating the handoff context repoints
   `characters.handoff_ctx`.
-- The prompt's `<situation>` names the instance and the senpai.
-- The migration: a rotation chain becomes one instance; a fork child joins its source's instance; a judge shadow
-  joins the instance of the context it judges; a shared cast copies into each binding; a context with an
-  override keeps its model; one resolved through `llm_defaults` keeps that model; an unresolvable one is listed;
-  a cycle refuses; dropped values are logged.
-- Each turn row names its instance and binding `seq`; the removed verbs and RPCs are gone (`kj model` and
-  `kj context set --as` are unknown).
+- The prompt's `<situation>` names the character and the senpai.
+- The migration: a character gets its default cast's slots; a context keeps its resolved model, override and
+  `llm_defaults` cases included; a judge shadow gets the character of the context it judges; an unresolvable
+  context is listed; a cycle refuses; dropped values are logged.
+- The removed verbs and RPCs are gone (`kj model`, `kj cast` and `kj context set --as` are unknown).
+
+## Open (step 5)
+
+Proposed by the lead after the kaibo review of this redesign (deepseek, 2026-10-20); each needs Amy's word:
+
+- **A `rotate` rc lifecycle verb** (`/config/rc/<type>/rotate/`), run on the successor after the commit. The
+  create rc runs before the commit, so it cannot be where a successor adopts its kohai. A new lifecycle verb
+  touches rc orchestration (`docs/kaish-integration.md`).
+- **`characters.root_ctx` comes back** as a pointer like `handoff_ctx`, moved by the rotation's commit.
+  Deriving the root console from "the live context with no senpai" gives two answers while a root console
+  rotates.
+- **Root consoles cannot be forked, moved or archived.** Each would leave a root character performing another
+  context, or with none.
+- **Drift with no ask is one hop.** The first build allowed the whole `forked_from` chain within an instance.
+
+The sections below record what each step built. Steps 1-3 built the context-edge version, and the first build
+of step 5 built character instances that spanned contexts. Where they conflict with the sections above, the
+sections above win.
 
 ## Decided (step 5, Amy, 2026-10-19)
 
@@ -352,19 +450,6 @@ answer the old code would have given.
   no new wire method. Without it the session's own character plays, and a root refuses with an error that
   names the option. Both clients ask `ActorHandle::performer_for_new_contexts`, so the refusal reads the same.
 
-## Open (step 5)
-
-- **A rotation that fails after create.** The successor's binding is appended when the successor is created,
-  because its create rc needs the instance. When the loadout check or the predecessor's archive rc then fails,
-  the predecessor stays live but the instance's newest binding names the unlabeled successor, so a retry would
-  rotate from it. Proposed: an append-only `binding_commits` table, written by `commit_rotation`; the instance's
-  conversation is the conversation of its newest committed binding.
-- **Archiving a senpai that has live kohai.** Asks to a senpai whose conversation is archived stay pending,
-  and a person finds and approves them there. To keep this rare, archiving a senpai's conversation while it has
-  live kohai should either refuse, naming them, or raise an ask. Not decided yet.
-
-The sections below record what each step built. Steps 1-3 built the context-edge version that step 5 replaces;
-where they conflict with the sections above, the sections above win.
 
 ## Open (step 1)
 

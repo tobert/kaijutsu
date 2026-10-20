@@ -141,8 +141,8 @@ a collision appears in real prose, not in advance.
 | capability | noun | An ergonomic nudge that narrows focus and removes a footgun. Never a security control, and never a statement that a player is less trusted. |
 | loadout | noun | The set of capabilities a context is given. Where mistake-prevention is routed. |
 | council context | noun | The context labeled `council-<character>` that holds a character's guidance for the council (`docs/council.md`). The set read along the reviewer chain is "the reviewer contexts". Not "voice", which names a musical voice (ABC `V:`, MIDI). |
-| character instance | noun | One run of one character: the record that holds its senpai and the model bindings its contexts run on (`docs/senpai-kohai.md`). Not "seat", which is the council's word for the context whose calls it gates. |
-| seat | noun | Only the council's: the context whose calls the council gates (`docs/council.md`). For a context a character plays, say "context"; for the character in operation, say "character instance". |
+| context character | noun | One character in one context: the record that names the character, the context's senpai and the model slots the context runs on (`docs/senpai-kohai.md`). Not "character instance", and not "seat", which is the council's word for the context whose calls it gates. |
+| seat | noun | Only the council's: the context whose calls the council gates (`docs/council.md`). For a context a character plays, say "context"; for the character in operation, say "context character". |
 | gate | noun, verb | The check that stops a statement to ask its assigned reviewer. The one place that authority lives. |
 | ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
 | continuation window | noun | Policy window for automatically resuming a model conversation after it yields. It lasts 30 minutes from the last actual provider inference request, not a yield. It expresses KV-cache and cost expectations, not a guaranteed cache lifetime or an ask expiry; see `docs/approval-identity.md`, "Continuation windows and async work". |
