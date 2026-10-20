@@ -902,7 +902,7 @@ fn the_migration_runs_once() {
 
 /// Every column and table the instance model replaced, as `(table, column)`; a
 /// column of `None` is the whole table.
-const DROPPED: [(&str, Option<&str>); 11] = [
+const DROPPED: [(&str, Option<&str>); 9] = [
     ("contexts", Some("senpai_ctx")),
     ("contexts", Some("played_by")),
     ("contexts", Some("cast_id")),
@@ -911,8 +911,6 @@ const DROPPED: [(&str, Option<&str>); 11] = [
     ("characters", Some("root_ctx")),
     ("presets", Some("cast_id")),
     ("presets", Some("system_prompt")),
-    ("turns", Some("cast_label")),
-    ("turns", Some("model_source")),
     ("llm_defaults", None),
 ];
 
@@ -949,8 +947,8 @@ fn an_open_carries_the_old_columns_into_instances_then_drops_them() {
         params![PresetId::new().as_bytes().as_slice(), blob_param(house.as_bytes()), blob_param(who.as_bytes())],
     );
     w.exec(
-        "INSERT INTO turns (turn_id, context_id, performer, cast_label, role, provider, model, model_source, started_at)
-         VALUES (?1, ?2, ?3, 'house', 'coder', 'deepseek', 'ds-flash', 'cast', 1)",
+        "INSERT INTO turns (turn_id, context_id, performer, role, provider, model, started_at)
+         VALUES (?1, ?2, ?3, 'coder', 'deepseek', 'ds-flash', 1)",
         params![TurnId::new().as_bytes().as_slice(), blob_param(seat.context_id.as_bytes()), blob_param(who.as_bytes())],
     );
     w.exec(
@@ -979,7 +977,7 @@ fn an_open_carries_the_old_columns_into_instances_then_drops_them() {
     let slot = w.db.binding_slot(instance, seq, "coder").unwrap().expect("the override's slot");
     assert_eq!((slot.backend_id, slot.model.as_str()), (w.anthropic, "claude-x"), "the override was carried into the binding");
     assert_eq!(w.db.senpai_conversation_of(overridden.context_id).unwrap(), Some(seat.context_id), "the senpai edge was carried");
-    assert_eq!(w.count("turns"), 1, "a turn survives the loss of its columns");
+    assert_eq!(w.count("turns"), 1, "a turn survives the open");
     assert_eq!(w.count("presets"), 1, "a preset survives the loss of its columns");
     assert_eq!(w.count("senpai_migration_report"), 1, "kj senpai show still reads the report");
 

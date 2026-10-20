@@ -1118,6 +1118,8 @@ CREATE TABLE IF NOT EXISTS turns (
     role               TEXT    NOT NULL,
     provider           TEXT    NOT NULL,
     model              TEXT    NOT NULL,
+    instance_id        BLOB    REFERENCES character_instances(instance_id),
+    binding_seq        INTEGER,
     started_at         INTEGER NOT NULL,
     ended_at           INTEGER,
     stop_reason        TEXT,
@@ -2634,7 +2636,8 @@ impl KernelDb {
     /// character of `target`'s instance's senpai, or the lineage root, may
     /// perform `act` on it. The inner `Err` is the refusal, naming the rule,
     /// the senpai's character and the root; the outer `Err` is a fault (a
-    /// missing row, a senpai cycle).
+    /// missing row, a senpai cycle). The instance's own character is refused
+    /// here for every act; `kj context rotate` admits it before this check.
     pub fn context_authority(
         &self,
         target: ContextId,
@@ -3016,8 +3019,6 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE contexts ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
             "ALTER TABLE contexts ADD COLUMN binding_seq INTEGER",
-            "ALTER TABLE turns ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
-            "ALTER TABLE turns ADD COLUMN binding_seq INTEGER",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -3874,19 +3875,19 @@ impl KernelDb {
 
     /// Drop what character instances replaced (`docs/senpai-kohai.md`,
     /// "Removed"), in one transaction: `contexts.{senpai_ctx, played_by,
-    /// cast_id, provider, model}`, `characters.root_ctx`,
-    /// `presets.{cast_id, system_prompt}`, `turns.{cast_label, model_source}`
-    /// and the table `llm_defaults`; and rename `characters.default_cast_id`
-    /// to `characters.cast_id`. Runs only once [`Self::migrate_instances`] has
-    /// recorded its mapping, which read them; a mapping that refused leaves
-    /// them for the next open.
+    /// cast_id, provider, model}`, `characters.root_ctx`, `presets.{cast_id,
+    /// system_prompt}` and the table `llm_defaults`; and rename
+    /// `characters.default_cast_id` to `characters.cast_id`. Runs only once
+    /// [`Self::migrate_instances`] has recorded its mapping, which read them;
+    /// a mapping that refused leaves them for the next open.
     ///
-    /// None of these columns sits under an index, trigger, view, `CHECK` or
-    /// table-level foreign key, so each is a plain `DROP COLUMN`; a
-    /// column-level `REFERENCES` goes with its column. Each step is guarded by
-    /// what is still there, so a database already on the new shape does
-    /// nothing. The preset values and the turn columns are logged before they
-    /// go; `senpai_migration_report` stays, because `kj senpai show` prints its
+    /// No schema this kernel has created puts one of these columns under an
+    /// index, trigger, view, `CHECK` or table-level foreign key, so each is a
+    /// plain `DROP COLUMN`, and SQLite refuses loudly if a hand-made one is
+    /// there; a column-level `REFERENCES` goes with its column. Each step is
+    /// guarded by what is still there, so a database already on the new shape
+    /// does nothing. The preset values are logged before they go;
+    /// `senpai_migration_report` stays, because `kj senpai show` prints its
     /// notes until the senpai is set again.
     fn drop_pre_instance_columns(conn: &Connection) -> KernelDbResult<()> {
         let mapped: bool = conn.query_row(
@@ -3908,10 +3909,6 @@ impl KernelDb {
                 info!(preset = %label, "dropping the cast and system prompt of a preset; a preset keeps only its fork filters");
             }
         }
-        if Self::has_column(&tx, "turns", "model_source")? {
-            let turns: i64 = tx.query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?;
-            info!(turns, "dropping turns.cast_label and turns.model_source; a turn keeps its binding");
-        }
         let mut dropped = Vec::new();
         for (table, column) in [
             ("contexts", "senpai_ctx"),
@@ -3922,8 +3919,6 @@ impl KernelDb {
             ("characters", "root_ctx"),
             ("presets", "cast_id"),
             ("presets", "system_prompt"),
-            ("turns", "cast_label"),
-            ("turns", "model_source"),
         ] {
             if Self::has_column(&tx, table, column)? {
                 tx.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])?;
@@ -9552,8 +9547,6 @@ fn into_pre_instance(db: &KernelDb) {
         ("contexts", "model", "TEXT"),
         ("presets", "cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
         ("presets", "system_prompt", "TEXT"),
-        ("turns", "cast_label", "TEXT"),
-        ("turns", "model_source", "TEXT NOT NULL DEFAULT 'binding'"),
     ].into_iter().chain(PRE_INSTANCE_COLUMNS) {
         if !KernelDb::has_column(c, table, column).unwrap() {
             c.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []).unwrap();

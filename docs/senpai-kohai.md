@@ -123,7 +123,8 @@ Reviewer of an ask raised in context K by actor A:
 1. Let I be K's instance. A context with no instance refuses, naming K.
 2. Let S be `senpai_instance(I)`. If S is null (I is a root console): when A is I's live root character, the ask
    is a self-confirmation; otherwise refuse, naming A and K.
-3. The reviewer is S's character when it is live and is not A.
+3. The reviewer is S's character when that character is not retired and is not A. S's conversation may be
+   archived; an inactive senpai instance still reviews.
 4. When S's character is A, climb: I := S, and repeat from 2.
 5. A retired character refuses by name. It never substitutes another character.
 
@@ -143,8 +144,10 @@ One rule: **the character of an instance's senpai, or its lineage root**, may:
 - rotate it (its own character may also rotate it, as today);
 - archive it.
 
-An rc lifecycle running in a context may also act on another context of the same instance, so the coder's
-archive rc archives its own judge shadows (`coder/archive/S10-shadows.kai`).
+A verb nested in an rc lifecycle uses a narrower rule in place of this one, with the context whose lifecycle
+runs as the actor: it may act on that context's kohai and on the other contexts of its instance, so the coder's
+archive rc archives its own judge shadows (`coder/archive/S10-shadows.kai`). The context's character lends the
+lifecycle nothing.
 
 The refusal names the rule: "only <instance>'s senpai (<character>) or its lineage root (<root>) may <act>".
 An instance's character never changes, so there is no recast act; to put another character on the work, start an
@@ -171,7 +174,8 @@ the instance has pending asks.
   instance inactive: reports to it and `kj senpai set` onto it refuse, and its forks stay live. Contexts that
   should go with it go by their type's archive rc, as the coder's judge shadows do today
   (`coder/archive/S10-shadows.kai`). `kj context promote` of the conversation makes the instance live again.
-- `kj senpai set <instance> <senpai-instance>`: moves a kohai. It needs the authority rule, refuses with pending
+- `kj senpai set <instance> <senpai-instance>`: moves a kohai. It needs the authority rule over the moved
+  instance and the same rule over the new senpai (see "Decided while building step 5"), refuses with pending
   asks, refuses a cycle, and refuses an inactive senpai instance.
 - `kj senpai show [<instance-or-ctx>]`, `kj kohai list [<instance-or-ctx>]`, `kj senpai report "<text>"` work on
   instances; given a context, they use its instance.
@@ -209,8 +213,8 @@ Steps 1-3 (context edge):
 Step 5 (instances and bindings):
 
 - Columns `contexts.senpai_ctx`, `contexts.played_by`, `contexts.cast_id`, `contexts.provider`, `contexts.model`,
-  `characters.root_ctx`, `presets.cast_id`, `presets.system_prompt`, `turns.cast_label`
-  and `turns.model_source`; table `llm_defaults`. `characters.default_cast_id` is renamed `cast_id`. The
+  `characters.root_ctx`, `presets.cast_id` and `presets.system_prompt`; table `llm_defaults`; and the
+  unreleased `turns.cast_label` and `turns.model_source`, which never reached a deployed database. `characters.default_cast_id` is renamed `cast_id`. The
   `senpai_migration_report` table stays: `kj senpai show` prints a context's notes until its senpai is set again.
 - `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj kohai create -m|--model|--cast`;
   `kj fork --model`; `kj model` (`kj context info` shows the model); `kj backend default`;
@@ -223,7 +227,8 @@ Step 5 (instances and bindings):
   explicit `model` argument that outranks it, with the wire `prompt` method's `model` parameter
   (`kaijutsu-client` `prompt(content, model, ctx)`).
 - `kj fork --distill-model`; `[council] server` and `[council] model` in `gate.toml`; every read of
-  `backend_models` or `cast_slots` outside writing a binding.
+  `backend_models` or `cast_slots` that chooses a model outside writing a binding. `kj cast slot set` reads the
+  model row only to warn about the slot it writes.
 - Every value kaijutsu supplies on its own: the 64000 `max_tokens` floor (`LlmRegistry::max_output_tokens`),
   `BuildOpts::new`'s 64000 (`BuildOpts` takes `max_tokens` from its caller), the openai-compatible client's 8192
   for a zero, and the one-shot prompts' 4096.
@@ -352,6 +357,9 @@ answer the old code would have given.
 - **Creating a context from a root's session.** A root character performs only its root console, so a root's
   TUI or MCP session names the character that plays what it creates: `--character` on `kaijutsu-tui` and
   `kaijutsu-mcp` (and `KAIJUTSU_CHARACTER` for MCP). Without it such a session refuses to create a context.
+- **An inactive senpai instance.** Routing reads only whether the senpai's character is retired, so asks still
+  go to a senpai whose conversation is archived, while `kj senpai report` and `kj senpai set` onto it refuse.
+  The alternative is to refuse the ask, naming the archived senpai, until it is promoted or the kohai is moved.
 
 The sections below record what each step built. Steps 1-3 built the context-edge version that step 5 replaces;
 where they conflict with the sections above, the sections above win.
