@@ -1,0 +1,16 @@
+# sshd for amy-dev. Runs as the host user under podman keep-id, so only that account can log in.
+# Keys only: the public keys are mounted read-only at /etc/amy-dev/authorized_keys.
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /var/lib/amy-dev/ssh/ssh_host_ed25519_key
+
+AuthorizedKeysFile /etc/amy-dev/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+UsePAM no
+X11Forwarding no
+AllowAgentForwarding no
+PrintMotd no
+Subsystem sftp internal-sftp

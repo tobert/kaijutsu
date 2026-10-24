@@ -1,0 +1,70 @@
+# amy-dev: Amy's development workspace for Kaijutsu. Arch with rustup, the audio and MIDI userspace, Claude Code,
+# and an sshd that only the host user can log into. Amy connects over SSH, starts tmux, and works here, so the
+# host carries no build state. Nothing in this image is a secret; credentials arrive as mounts (see the Quadlet).
+#
+# Built in the container, not on the host: `contrib/amy-dev/build.sh` runs `podman build` with the network on,
+# since this image is a workspace and not a hermetic release artifact (docs/container.md, "amy-dev").
+ARG BASE=docker.io/library/archlinux:base-20261011.0.609700
+FROM ${BASE}
+ARG USER_NAME
+ARG USER_UID
+ARG CLAUDE_CODE_VERSION=latest
+# The GPU userspace for this machine: none, rocm, intel, or nvidia. Each machine picks its own in machines/<host>.env.
+ARG GPU=none
+
+# Build tools for Kaijutsu (capnp schema compiler, cmake, clang for bindgen), rustup, the ALSA and PipeWire client
+# libraries and their pkg-config files for pawlsa-mcp, Node for Claude Code, and the session tools.
+# The PipeWire daemon is not installed: this container talks to the host's daemon through its socket.
+# The package cache is a build mount, not a layer: every build on this host shares it, and it stays out of the image.
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    pacman -Syu --noconfirm --needed \
+      base-devel git cmake ninja clang pkgconf capnproto \
+      rustup \
+      alsa-lib alsa-utils libpipewire \
+      nodejs npm \
+      openssh tmux \
+      ripgrep fd jq less python uv
+
+# The same user name, UID, and home as the host, so `~/src/...` paths in project docs resolve here too.
+RUN useradd --create-home --uid "${USER_UID}" --user-group --groups audio,video,render "${USER_NAME}" \
+ && install -d --mode 0755 /run/sshd \
+ && install -d --owner "${USER_NAME}" --group "${USER_NAME}" /var/lib/amy-dev
+
+# GPU userspace, one set per machine. The kernel driver is the host's, so these packages must match the host's
+# kernel; a host upgrade can require a rebuild (contrib/amy-dev/README.md, "Host upgrades"). NVIDIA's driver comes
+# into the container through CDI at run time; the image carries only the toolkit and CUDA libraries.
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    case "${GPU}" in \
+      none) ;; \
+      rocm) pacman -S --noconfirm --needed hip-runtime-amd rocm-cmake rocwmma rocminfo rocm-smi-lib ;; \
+      intel) pacman -S --noconfirm --needed intel-compute-runtime level-zero-loader intel-graphics-compiler clinfo ;; \
+      nvidia) pacman -S --noconfirm --needed cuda ;; \
+      *) echo "unknown GPU '${GPU}': use none, rocm, intel, or nvidia" >&2; exit 1 ;; \
+    esac
+
+# Claude Code, pinned at build time. Pass --build-arg CLAUDE_CODE_VERSION=<version> to pin it.
+RUN npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# sshd runs as the host user (keep-id), so only that account can log in. Host keys and the config live in the
+# state volume and are generated on first start; the image carries none.
+COPY sshd_config /etc/amy-dev/sshd_config
+COPY entrypoint.sh /usr/local/bin/amy-dev-entrypoint
+
+ENV HOME=/home/${USER_NAME} \
+    RUSTUP_HOME=/home/${USER_NAME}/.rustup \
+    CARGO_HOME=/home/${USER_NAME}/.cargo \
+    XDG_STATE_HOME=/var/lib/amy-dev/state \
+    XDG_CACHE_HOME=/var/lib/amy-dev/cache \
+    XDG_DATA_HOME=/var/lib/amy-dev/data \
+    XDG_CONFIG_HOME=/var/lib/amy-dev/config \
+    XDG_RUNTIME_DIR=/run/user/${USER_UID} \
+    PATH=/home/${USER_NAME}/.cargo/bin:/opt/rocm/bin:/opt/cuda/bin:/usr/local/bin:/usr/bin:/bin \
+    ROCM_PATH=/opt/rocm \
+    CUDA_PATH=/opt/cuda
+
+LABEL amy-dev.claude-code="${CLAUDE_CODE_VERSION}" \
+      amy-dev.gpu="${GPU}"
+USER ${USER_NAME}
+WORKDIR /home/${USER_NAME}/src
+EXPOSE 2222
+ENTRYPOINT ["/usr/local/bin/amy-dev-entrypoint"]

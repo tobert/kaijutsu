@@ -280,6 +280,25 @@ project per kernel where a parameter costs nothing.
   comments reset it.
 - Whether the broker's tool list order is stable across turns.
 
+## amy-dev: a personal development workspace
+
+`contrib/amy-dev/` is one rootless container per machine for Amy's development: Arch, rustup, the ALSA and
+PipeWire client libraries, Claude Code, tmux, and sshd. Amy connects over SSH on port 2230, starts tmux, and
+works in `~/src`. The host keeps no build state. See `contrib/amy-dev/README.md` for setup.
+
+- **One Containerfile for every machine.** The `GPU` build argument (`none`, `rocm`, `intel`, `nvidia`) selects
+  that machine's GPU userspace. `contrib/amy-dev/machines/<host>.env` sets it, and `build.sh` reads it from
+  `uname -n` or takes `--gpu`.
+- **Device passthrough lives in a per-machine drop-in**, `machines/<host>.conf`, installed as
+  `amy-dev.container.d/gpu.conf`. The image does not know its hardware.
+- **Rust toolchains and cargo live in volumes**, so a toolchain update does not rebuild the image.
+- **Upgrades are rebuilds.** The root filesystem is read-only. The GPU userspace must match the host's kernel
+  driver, so a host upgrade is followed by a rebuild and a check (`contrib/amy-dev/README.md`, "Host upgrades").
+- **Back up state, not images.** The image rebuilds from its Containerfile. The state is `~/src`,
+  `~/.local/share/amy-dev/`, and `~/.claude`, and each machine's copy is separate.
+
+Nagaya builds inside it without a GPU: its `hip` feature is off by default, so `cargo test` needs no ROCm.
+
 ## Kubernetes later
 
 For `/tank` storage pinned to zorak, use statically created `local`

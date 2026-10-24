@@ -6,6 +6,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## amy-dev: open items before its first run (2026-10-24)
+
+- tenchi (the DGX Spark) is aarch64. `contrib/amy-dev/Containerfile` takes an x86_64 Arch `BASE`, so tenchi needs an
+  aarch64 base image. Decide between Arch Linux ARM and another base.
+- The Intel host has no `contrib/amy-dev/machines/` profile. Name it by `uname -n`.
+- The `none`, `rocm`, `intel`, and `nvidia` images built on x86_64 but have not run. Their GPU and sshd entrypoints
+  are unchecked, and `zorak`'s `rocm` image is untested on zorak.
+- No `check.sh` yet: the host-upgrade check in `contrib/amy-dev/README.md` is a manual list.
+
+---
+
 ## Eight `solo_acp_stdio` turn tests exhaust their mock script (2026-10-18)
 
 On zorak at `f70bba30`, `cargo test -p kaijutsu-solo-acp --features test-mock
