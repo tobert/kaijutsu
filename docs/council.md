@@ -298,9 +298,11 @@ are no server-side context ids, and a seat is sent whole each time.
   contexts and house rules on the judge's server. The create and fork
   lifecycles of coder, default, and director run it
   (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
-  builds nothing. Root, the owner's privileged space, and mcp, the
-  debugging and admin seat, are not put under a council and do not run it. A seat with no performer or an unresolved chain builds
-  without the chain, and its first decision builds the rest. What changes
+  builds nothing. Root, the owner's privileged space, the console (the model
+  seat under it), shell (the REPL beside it), and mcp (the debugging and admin
+  seat) are not put under a council and do not run it. A seat with no
+  performer or an unresolved chain builds without the chain, and its first
+  decision builds the rest. What changes
   later, such as an edited `AGENTS.md`, a new reviewer, or a `cd`, is
   built by the next decision. The shadow itself is sent after each call,
   off the gate's path.

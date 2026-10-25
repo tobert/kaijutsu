@@ -12,6 +12,11 @@ use crate::ids::{ContextId, PrincipalId};
 /// draft runs as shell (`docs/character.md`, "Roots and rotation").
 pub const ROOT_CONTEXT_TYPE: &str = "root";
 
+/// The context type of the model console: a model context under a root,
+/// which holds the root seat's stance and its shell child. Ctrl+Z treats it
+/// as a root (`docs/character.md`, "The root console and its shell").
+pub const CONSOLE_CONTEXT_TYPE: &str = "console";
+
 /// The context type of a shell context: a REPL whose draft runs as shell
 /// whatever mode the client sent, with no model and no cast. It is the child
 /// of a root context, opened from the client (`docs/character.md`).

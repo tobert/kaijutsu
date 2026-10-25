@@ -1,7 +1,6 @@
-# root: a root character's console. The root is a model context, cast with a
-# fast model, and its stance (S00-stance) names its privileged position. Other
-# characters' seats start from here, so their lineage and their accountability
-# begin at this root (docs/character.md, "Roots and rotation").
+# root: a root character's admin console. The human root has no model and
+# composes no stance; the model console is a `console` context under it
+# (assets/defaults/rc/console). The root refuses drives.
 set -e
 kj binding allow "builtin.block"
 kj binding allow "builtin.file:read"

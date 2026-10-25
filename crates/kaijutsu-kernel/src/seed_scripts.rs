@@ -973,10 +973,11 @@ mod tests {
     /// Every seat that ships the shell guard can run `shell_write`, so the
     /// council may gate it: its create lifecycle, and its fork lifecycle
     /// when it has one, ship `S50-council-seats.kai`, which builds the
-    /// seat's council seats ahead of its first decision. Root, shell, and mcp
-    /// are the exceptions: root is the owner's privileged space, shell is the
-    /// REPL beside it, and mcp is the debugging and admin seat, and none is
-    /// put under a council. No other seat ships it.
+    /// seat's council seats ahead of its first decision. Root, console, shell,
+    /// and mcp are the exceptions: root is the owner's privileged space, the
+    /// console is the model seat under it, shell is the REPL beside it, and mcp
+    /// is the debugging and admin seat, and none is put under a council. No
+    /// other seat ships it.
     #[test]
     fn the_gated_seats_build_their_council_seats_at_create_and_fork() {
         let seeds = seed_files();
@@ -991,7 +992,7 @@ mod tests {
         types.dedup();
         let mut wrong = Vec::new();
         for ty in types {
-            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai")) && !["root", "shell", "mcp"].contains(&ty);
+            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai")) && !["root", "console", "shell", "mcp"].contains(&ty);
             let forks = seeds.iter().any(|(p, _)| p.starts_with(&format!("{RC_VFS_ROOT}/{ty}/fork/")));
             for (verb, wanted) in [("create", gated), ("fork", gated && forks)] {
                 let path = format!("{RC_VFS_ROOT}/{ty}/{verb}/S50-council-seats.kai");
@@ -1035,14 +1036,14 @@ mod tests {
                 .map(|(_, body)| body.clone())
                 .unwrap_or_else(|| panic!("{path} is not seeded"))
         };
-        let script = body("root/create/S00-stance.kai");
+        let script = body("console/create/S00-stance.kai");
         assert!(script.contains("kj block create --role system"), "{script}");
         assert!(script.contains("text/markdown"), "{script}");
         assert!(script.contains("cybernetic system"), "{script}");
         for needle in ["privileged", "Amy"] {
             assert!(script.contains(needle), "root stance must say {needle:?}: {script}");
         }
-        let stance = body("root/create/S00-stance.md");
+        let stance = body("console/create/S00-stance.md");
         assert!(stance.contains("頑張って"), "the companion closes with 頑張って: {stance}");
         assert!(stance.chars().filter(|c| !c.is_ascii()).all(|c| "頑張って".contains(c)),
             "only the closing Japanese may be non-ASCII: {stance}");

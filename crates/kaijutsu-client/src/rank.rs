@@ -17,7 +17,7 @@
 //! ring 0's seats stable at the front (where the muscle memory lives) while
 //! still surfacing what you were just working on.
 
-use kaijutsu_types::{ContextId, ROOT_CONTEXT_TYPE};
+use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, ContextId, ROOT_CONTEXT_TYPE};
 use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_ring_seats};
 
 use crate::rpc::ContextInfo;
@@ -77,12 +77,13 @@ pub fn start_candidate(saved: Option<ContextId>, contexts: &[ContextInfo]) -> Op
     {
         return Some(id);
     }
-    // The reserved `ROOT` label names the kernel's root console. Without it,
-    // a single live root is unambiguous; several are not, so no candidate.
+    // The reserved `ROOT` label names the console the human works in: the
+    // model console, or a root that has none. Without it, a single live root
+    // is unambiguous; several are not, so no candidate.
     let roots: Vec<&ContextInfo> = contexts
         .iter()
         .filter(live)
-        .filter(|c| c.context_type == ROOT_CONTEXT_TYPE)
+        .filter(|c| c.context_type == ROOT_CONTEXT_TYPE || c.context_type == CONSOLE_CONTEXT_TYPE)
         .collect();
     if let Some(reserved) = roots.iter().find(|c| c.label == "ROOT") {
         return Some(reserved.id);
@@ -207,7 +208,7 @@ mod tests {
 #[cfg(test)]
 mod start_tests {
     use super::*;
-    use kaijutsu_types::Status;
+    use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, Status};
 
     fn ctx(label: &str, context_type: &str) -> ContextInfo {
         let mut info = test_context_info(label);
@@ -282,6 +283,14 @@ mod start_tests {
         let reserved_id = reserved.id;
         let contexts = vec![other_root, reserved];
         assert_eq!(start_candidate(None, &contexts), Some(reserved_id));
+    }
+
+    #[test]
+    fn the_reserved_console_is_the_start_candidate_over_the_human_root() {
+        let human = ctx("amy", ROOT_CONTEXT_TYPE);
+        let console = ctx("ROOT", CONSOLE_CONTEXT_TYPE);
+        let console_id = console.id;
+        assert_eq!(start_candidate(None, &[human, console]), Some(console_id));
     }
 
     #[test]

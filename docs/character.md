@@ -150,16 +150,22 @@ Two things follow, and they are the ones to check a change against:
   to do something through the MCP bridge, where the model is outside the
   kernel and drives through `kj`. Autonomous operation restricts it further
   later.
-- **The root console and its shell.** Amy, 2026-10-25: the root is a model
-  context. Its cast is a fast model (Haiku on this machine, for now). Its
-  stance (`root/create/S00-stance.kai`) names its privileged position and asks
-  for care about safety. Its `kj` requests go through the regular approval
-  policy. A root-only override may come later. Ctrl-Z there opens a shell
-  context that is a child of the root (type `shell`, no model). Its output
+- **The root console and its shell.** Amy, 2026-10-25. The human root, the
+  `root` context of a root character, has no model and composes no stance. It
+  holds the operator's authority set, minus `drive`. A root character may play
+  the top of its own lineage: nobody sits above it to ask, so its own
+  confirmation is the human's act (`kj/context.rs`, `plays_own_root`). A turn
+  still refuses a performer that is its own reviewer.
+  The model console is a `console` context under the human root, labeled
+  `ROOT`. Its performer is a model character (`root`, cast with a fast model;
+  Haiku on this machine, for now). Its stance (`console/create/S00-stance`)
+  names its privileged position and asks for care. Its `kj` requests go
+  through the regular approval policy, and it refuses every `drive`. Its
+  reviewer is the human root above it. Ctrl-Z in the console, or in the human
+  root, opens a shell context under it (type `shell`, no model). Its output
   stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
-  the shell returns to the root. Setting this up on a box needs a cast with an
-  Anthropic backend and key, and a reviewer distinct from the root's performer.
-  See `docs/issues.md`, "Root console".
+  the shell returns to its parent. Incoming drifts into the console are not
+  yet gated: see `docs/issues.md`, "Root console".
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,

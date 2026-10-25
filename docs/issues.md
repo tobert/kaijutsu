@@ -8,30 +8,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Root console: model, approval, and the shell child (2026-10-25)
 
-Amy's decision, after a try at a root that was always a REPL. The always-on
-shell routing is reverted. The design is in `docs/character.md`, "The root
-console and its shell". Landed: the root may have a model, its stance ships,
-the `shell` context type routes its drafts, and the TUI's Ctrl-Z toggles root
-and shell. Work still to do:
+The design is in `docs/character.md`, "The root console and its shell".
+Landed: the human root has no model and refuses `drive`; its model console is
+a `console` context under it, labeled `ROOT`, with the stance; Ctrl-Z toggles
+root, console, and shell; the start choice prefers `ROOT`. Still open:
 
-- Set up the root's cast on the kernel: an Anthropic backend (key at
-  `~/.anthropic-key.txt`), a Haiku cast, then `kj character set --cast` for the
-  root. Its reviewer must differ from its performer. Self-review is refused.
-  The kernel is redeployed (2026-10-25) and has no Anthropic backend yet.
+- Incoming drifts into the console need approval. Nothing gates drift
+  delivery today. The plan: stage drifts into the console and release them
+  through the ledger, so Amy allows each one, or raise an ask per drift. Amy
+  said it can wait, to note it in `signoff.md`.
+- The stance names Amy as fixed text. Fresh installs for others need it
+  configurable.
 - `kaijutsu-mcp` `prepare_session_create` still records no performer for a
   root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
-- The stance names Amy as fixed text. Fresh installs for other people need it
-  made configurable.
-- The app's shell in-flight guard (`ShellToggleInFlight`) has no path that
-  leaves it stuck today. A panic in the spawned task would leave it set.
-- Ctrl-Z in the TUI's shell: the live suspend (double Ctrl-Z) is not verified
-  in a PTY.
+- `docs/character.md` says ROOT is played by a root character. The console is
+  played by a model character. The reserved-label rule needs the same edit.
+- Live checks: the Ctrl-Z toggle creating a shell child against the kernel; the
+  TUI double Ctrl-Z suspend and `fg` resume; the app's Ctrl-Z.
 - Pipe a shell snippet back to the model's draft. Later, after the above.
 - Typed shell-return rendering: `ls` looks bad in the TUI. Start with a live
   block dump to see whether `output` is missing on the wire.
-- Ctrl-Z is the same root/shell toggle in both clients. The TUI still runs
-  one-off shell lines through `:!`. The app has no `:` input surface, since
-  `docs/vi.md` decision 1 rejects one.
+- Key delivery: the Anthropic and DeepSeek keys sit in the container as
+  read-only mounts. Later, startup-only or SSH injection.
 
 ---
 

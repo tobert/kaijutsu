@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use kaijutsu_client::ContextInfo;
-use kaijutsu_types::{ContextId, ROOT_CONTEXT_TYPE};
+use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, ContextId, ROOT_CONTEXT_TYPE};
 
 use crate::app::DOUBLE_TAP;
 
@@ -46,7 +46,7 @@ pub fn shell_label(root_label: &str) -> String {
 /// From any other type: refuse.
 pub fn toggle(current: &ContextInfo, contexts: &[ContextInfo]) -> Toggle {
     match current.context_type.as_str() {
-        ROOT_CONTEXT_TYPE => {
+        ROOT_CONTEXT_TYPE | CONSOLE_CONTEXT_TYPE => {
             let children: Vec<&ContextInfo> = contexts
                 .iter()
                 .filter(|c| {
@@ -155,6 +155,19 @@ mod tests {
 
     fn shell_of(parent: &ContextInfo, label: &str) -> ContextInfo {
         ctx(label, SHELL_CONTEXT_TYPE, Some(parent.id))
+    }
+
+    /// The model console is a root for this purpose: its shell child is the
+    /// one Ctrl+Z goes to, so the console and the root toggle the same way.
+    #[test]
+    fn a_console_toggles_to_its_shell_child_and_creates_one_when_missing() {
+        let console = ctx("ROOT", CONSOLE_CONTEXT_TYPE, None);
+        let child = shell_of(&console, "ROOT-shell");
+        assert_eq!(toggle(&console, &[console.clone(), child.clone()]), Toggle::Switch(child.id));
+        assert_eq!(
+            toggle(&console, &[console.clone()]),
+            Toggle::Create { parent: console.id, label: "ROOT-shell".into() },
+        );
     }
 
     #[test]

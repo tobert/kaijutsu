@@ -9,7 +9,7 @@
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
-use kaijutsu_types::{ContextId, ROOT_CONTEXT_TYPE, SHELL_CONTEXT_TYPE};
+use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, ContextId, ROOT_CONTEXT_TYPE, SHELL_CONTEXT_TYPE};
 
 use crate::cell::{ContextSwitchRequested, DocumentCache};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
@@ -148,7 +148,7 @@ pub fn shell_label(root_label: &str) -> String {
 /// From any other type: refuse.
 pub fn toggle(current: &ContextInfo, contexts: &[ContextInfo]) -> Toggle {
     match current.context_type.as_str() {
-        ROOT_CONTEXT_TYPE => {
+        ROOT_CONTEXT_TYPE | CONSOLE_CONTEXT_TYPE => {
             let children: Vec<&ContextInfo> = contexts
                 .iter()
                 .filter(|c| {
