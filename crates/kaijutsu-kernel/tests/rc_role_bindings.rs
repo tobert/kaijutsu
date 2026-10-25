@@ -355,8 +355,9 @@ async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
     }
 }
 
-/// A root context is a human's admin console with no model: it holds the
-/// operator's whole authority set and composes no instruction blocks.
+/// A root context is a root character's admin console: it holds the
+/// operator's authority set, minus drives, and composes its stance as
+/// instruction blocks.
 ///
 /// A root context is minted at boot (`ensure_root_contexts`) or by `kj
 /// character create --root` — never by `kj context create --type root`,
@@ -365,17 +366,17 @@ async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
 /// exercises the real path via `ensure_root`, the same `ensure_root_context`
 /// internals boot runs.
 #[test]
-fn root_role_is_a_model_less_admin_console() {
+fn root_role_is_an_admin_console_with_its_stance() {
     run_on_rc_stack(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build current-thread runtime")
-            .block_on(root_role_is_a_model_less_admin_console_body());
+            .block_on(root_role_is_an_admin_console_with_its_stance_body());
     });
 }
 
-async fn root_role_is_a_model_less_admin_console_body() {
+async fn root_role_is_an_admin_console_with_its_stance_body() {
     let h = harness().await;
     let ctx = ensure_root(&h, "amy").await;
 
@@ -389,7 +390,6 @@ async fn root_role_is_a_model_less_admin_console_body() {
     for cap in [
         Capability::Operator,
         Capability::ConfigWrite,
-        Capability::Drive,
         Capability::Fork,
         Capability::Drift,
         Capability::Transport,
@@ -403,6 +403,7 @@ async fn root_role_is_a_model_less_admin_console_body() {
     ] {
         assert!(binding.allows(&cap), "root should allow {cap:?}");
     }
+    assert!(!binding.allows(&Capability::Drive), "the root refuses every drive");
     let file = InstanceId::new("builtin.file");
     assert!(binding.allows_tool(&file, "write"), "root should allow file write");
     assert!(binding.allows_tool(&InstanceId::new("builtin.block"), "block_create"));
@@ -416,11 +417,13 @@ async fn root_role_is_a_model_less_admin_console_body() {
         .into_iter()
         .filter(|block| block.role == kaijutsu_types::Role::System && block.kind == kaijutsu_types::BlockKind::Text)
         .collect();
-    assert!(
-        instructions.is_empty(),
-        "a model-less root must compose no instruction blocks, got {:?}",
+    assert_eq!(
+        instructions.len(),
+        2,
+        "the root composes its stance: the system block, then the companion; got {:?}",
         instructions.iter().map(|block| block.content.chars().take(80).collect::<String>()).collect::<Vec<_>>()
     );
+    assert!(instructions[0].content.contains("privileged position"), "{}", instructions[0].content);
 }
 
 /// `kj character create --root` runs the root bundle's create lifecycle on

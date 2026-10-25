@@ -16,9 +16,9 @@ kj binding allow "admin"
 # `kj backend`, `kj cast`, `kj alias`, `kj hook`, and `kj mcp reload`.
 kj binding allow "config-write"
 # Context and workspace lifecycle, and the verbs that move work between
-# contexts.
+# contexts. The root has no `drive`: it refuses every autonomous turn that
+# another seat would clock on it.
 kj binding allow "operator"
-kj binding allow "drive"
 kj binding allow "fork"
 kj binding allow "drift"
 kj binding allow "transport"

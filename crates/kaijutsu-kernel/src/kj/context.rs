@@ -547,7 +547,11 @@ impl KjDispatcher {
                     db.update_context_review_assignment(target_id, review.actor, review.reviewer, review.director)?;
                     let candidate_actor = review.actor.unwrap_or(review.caller_actor);
                     let candidate_reviewer = db.effective_approval_reviewer(target_id, candidate_actor)?.reviewer();
-                    if review.actor == Some(candidate_reviewer) {
+                    // A root character playing the top of its own lineage has
+                    // no one above it to ask; its confirmation is the human's act.
+                    let own_root = db.get_character(candidate_actor)?.is_some_and(|sheet| sheet.root)
+                        && db.lineage_root(target_id)? == candidate_actor;
+                    if review.actor == Some(candidate_reviewer) && !own_root {
                         return Err(crate::kernel_db::KernelDbError::Validation("the performer cannot review its own work".into()));
                     }
                     changes.push("performer/reviewer".into());
@@ -2053,10 +2057,21 @@ impl KjDispatcher {
                 })()
             };
             let assignment = match assignment { Ok(value) => value, Err(error) => return KjResult::Err(format!("kj context set: {error}")) };
-            let review = if let Some(performer) = assignment.actor {
-                self.kernel().validate_model_review_assignment(Some(target_id), performer, assignment.director, assignment.reviewer).await
-            } else {
-                self.kernel().resolve_review_assignment(Some(target_id), assignment.actor, assignment.director, assignment.reviewer).await
+            // A root playing the top of its own lineage is not a model performer:
+            // its review resolves by self-confirmation, so only other performers
+            // go through the model-assignment check.
+            let own_root = match assignment.actor {
+                Some(performer) => match self.plays_own_root(target_id, performer) {
+                    Ok(own_root) => own_root,
+                    Err(error) => return KjResult::Err(format!("kj context set: {error}")),
+                },
+                None => false,
+            };
+            let review = match assignment.actor {
+                Some(performer) if !own_root => {
+                    self.kernel().validate_model_review_assignment(Some(target_id), performer, assignment.director, assignment.reviewer).await
+                }
+                _ => self.kernel().resolve_review_assignment(Some(target_id), assignment.actor, assignment.director, assignment.reviewer).await,
             };
             if let Err(error) = review {
                 return KjResult::Err(format!("kj context set: {error}"));
@@ -2417,6 +2432,29 @@ impl KjDispatcher {
     /// lifecycle runs. Otherwise the predecessor stays live and
     /// the successor stays unlabeled for inspection. The hydration window
     /// is not copied: its marker names a block in the predecessor.
+    /// Whether `performer` is a root character playing the top of the lineage
+    /// that `context_id` belongs to: its own root, with nobody above it.
+    fn plays_own_root(&self, context_id: ContextId, performer: PrincipalId) -> Result<bool, String> {
+        let db = self.kernel_db().lock();
+        let is_root = db.get_character(performer)
+            .map_err(|e| format!("could not read the performer's sheet: {e}"))?
+            .is_some_and(|sheet| sheet.root);
+        if !is_root {
+            return Ok(false);
+        }
+        // A parentless context is the top of its own lineage; otherwise the
+        // performer must be the live lineage root. A lineage with no live root
+        // is not an error here: the model-assignment check reports it.
+        let context = db.get_context(context_id)
+            .map_err(|e| format!("could not read the context: {e}"))?
+            .ok_or_else(|| format!("context {} not found", context_id.short()))?;
+        if context.forked_from.is_none() {
+            return Ok(true);
+        }
+        let top = db.live_lineage_root(context_id).map_err(|e| format!("could not walk the lineage: {e}"))?;
+        Ok(top == Some(performer))
+    }
+
     async fn context_rotate(&self, ctx_ref: Option<&str>, caller: &KjCaller) -> KjResult {
         let predecessor = {
             let db = self.kernel_db().lock();
@@ -3698,6 +3736,28 @@ mod tests {
         let cast = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("sovereign")], &banto_caller).await;
         assert!(cast.is_ok(), "{}", cast.message());
         assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().played_by, Some(sovereign));
+    }
+
+    /// A root character may play its own root context. At the top of a
+    /// lineage there is no one above it to ask, so its own confirmation is
+    /// the human's act (`docs/approval-identity.md`).
+    #[tokio::test]
+    async fn a_root_character_may_play_its_own_root_context() {
+        let d = test_dispatcher().await;
+        let amy = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: amy, name: "owner".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        d.kernel_db().lock().update_character_root(amy, true).unwrap();
+        let context = register_context(&d, Some("owner-root"), None, amy);
+        let caller = crate::kj::KjCaller {
+            principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("owner")], &caller).await;
+        assert!(set.is_ok(), "{}", set.message());
+        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().played_by, Some(amy));
     }
 
     /// Directing is what grants `--as`, and it must name the CALLER: a
