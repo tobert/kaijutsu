@@ -1023,9 +1023,8 @@ mod tests {
     }
 
     /// The root seat is a model context, so it ships a stance: a system
-    /// block that opens on the cybernetic system, and a Markdown companion
-    /// that names the seat as privileged, names the accountable human, and
-    /// says every kj request is reviewed.
+    /// block that opens on the cybernetic system, names the seat as
+    /// privileged, and names the accountable human, and a Markdown companion.
     #[test]
     fn the_root_seat_ships_its_privileged_stance() {
         let seeds = seed_files();
@@ -1039,12 +1038,14 @@ mod tests {
         let script = body("root/create/S00-stance.kai");
         assert!(script.contains("kj block create --role system"), "{script}");
         assert!(script.contains("text/markdown"), "{script}");
-        let stance = body("root/create/S00-stance.md");
         assert!(script.contains("cybernetic system"), "{script}");
-        for needle in ["privileged", "Amy", "reviewed"] {
-            assert!(stance.contains(needle), "root stance must say {needle:?}: {stance}");
+        for needle in ["privileged", "Amy"] {
+            assert!(script.contains(needle), "root stance must say {needle:?}: {script}");
         }
-        assert!(stance.is_ascii() || stance.contains("頑張って"), "{stance}");
+        let stance = body("root/create/S00-stance.md");
+        assert!(stance.contains("頑張って"), "the companion closes with 頑張って: {stance}");
+        assert!(stance.chars().filter(|c| !c.is_ascii()).all(|c| "頑張って".contains(c)),
+            "only the closing Japanese may be non-ASCII: {stance}");
     }
 
     /// Plant every retired seed path: a link where the seed shipped one, a

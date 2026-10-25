@@ -1,7 +1,7 @@
 # The root stance. The first block names the system and the seat; the second
 # is the companion Markdown, read the same way every stance companion is.
-# The root is a model context, and the human it answers to is named in the
-# companion, not read from the performer.
+# The root is a model context. The first block names the privileged seat and
+# the human it answers to, so the performer never has to say who that is.
 set -e
 
 kj block create --role system --kind text --content "We are a cybernetic system, and this root seat is our privileged position. Amy is the human accountable for our work."
