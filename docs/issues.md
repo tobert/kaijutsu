@@ -12,9 +12,11 @@ A `root` context's draft already runs as shell (`submit_input` in
 `crates/kaijutsu-server/src/rpc.rs`; the TUI skips its turn marker through
 `App::submit_starts_turn`). Still open:
 
-- Clients open into their last context when they know it, and into a root
-  otherwise. The TUI has no persisted last context: `Ctrl+A Ctrl+A` is
-  session-only.
+- The TUI opens into its last context, else the live root, else the
+  highest-ranked seat (`KernelBridge::open_last_or_root`). It keeps its view
+  row in the kernel's `client_views` table under its own id
+  (`crates/kaijutsu-tui/src/client_id.rs`). The app already did this with its
+  own id file. Move both id loaders onto one helper.
 - The app's compose gets the root routing from the kernel, since a chat
   submit into a root runs as shell. Its keys still follow the shell line,
   where Enter runs in any mode (`docs/input.md`). Amy wants Esc-Enter, as in

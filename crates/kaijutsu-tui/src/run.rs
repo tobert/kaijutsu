@@ -269,6 +269,7 @@ pub async fn run(
     let mut feeds = Feeds::new(feed_tx, hydrated_tx, bridge.actor().clone());
     watch_context(&bridge, &mut app, start.id, &mut feeds).await?;
     app.switch_to(start.id);
+    remember_view(&bridge, start.id).await;
 
     // Before raw mode: a `--diff` that cannot run says so on a plain line
     // rather than under a viewport.
@@ -1663,6 +1664,15 @@ fn paste_text(app: &mut App, text: String) {
     }
 }
 
+/// Record the context on screen as this client's last view, so a start
+/// without `--context` reopens it. Best-effort: a failed write costs the next
+/// start its place, not this one.
+async fn remember_view(bridge: &KernelBridge, id: ContextId) {
+    if let Err(e) = bridge.remember_context(id).await {
+        tracing::warn!(context = %id.short(), error = %format!("{e:#}"), "could not record the last context");
+    }
+}
+
 /// Switch the screen to `id`: watch it, make it current, and load its draft.
 /// The draft is per context, so the compose buffer follows the switch rather
 /// than carrying the old context's text along — `load_draft` keeps the `:`
@@ -1690,6 +1700,7 @@ async fn switch_seat(
     // wire would read the draft without them, so the read queues behind them.
     let draft = app.drafts.read(id).await;
     app.switch_to(id);
+    remember_view(bridge, id).await;
     app.compose.load_draft(draft.as_deref().unwrap_or(""));
     // The switch moved both ends of the hot set — the context on screen and
     // the one `Ctrl+A Ctrl+A` goes back to — so whatever fell out of it is

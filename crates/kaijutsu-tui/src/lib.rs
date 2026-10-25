@@ -41,6 +41,7 @@
 pub mod app;
 pub mod asks;
 pub mod bridge;
+pub mod client_id;
 pub mod cmdline;
 pub mod compose;
 pub mod completion;

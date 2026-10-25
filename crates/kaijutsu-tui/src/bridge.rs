@@ -12,8 +12,9 @@ use kaijutsu_client::rpc::KjExecutionResult;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId};
+use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId, ROOT_CONTEXT_TYPE};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Per-process subscription identity.
 ///
@@ -46,6 +47,8 @@ pub struct KernelBridge {
     actor: ActorHandle,
     context_type: String,
     parent: Option<String>,
+    /// This installation's id, the key of the kernel's per-client view row.
+    client_id: Uuid,
 }
 
 impl KernelBridge {
@@ -136,6 +139,7 @@ impl KernelBridge {
             actor,
             context_type,
             parent,
+            client_id: crate::client_id::load_or_seed(),
         })
     }
 
@@ -151,7 +155,7 @@ impl KernelBridge {
     #[cfg(test)]
     pub(crate) fn never_answers_for_test() -> Self {
         let (actor, _cmds) = ActorHandle::never_answers_for_test();
-        Self { actor, context_type: "default".to_string(), parent: None }
+        Self { actor, context_type: "default".to_string(), parent: None, client_id: Uuid::nil() }
     }
 
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
@@ -199,6 +203,38 @@ impl KernelBridge {
             .into_iter()
             .find(|c| c.id == id)
             .with_context(|| format!("created context {} vanished from the listing", id.short()))
+    }
+
+    /// Open the context this client last viewed, else the live root console,
+    /// else the highest-ranked live context (see [`start_candidate`]).
+    pub async fn open_last_or_root(&self) -> Result<ContextInfo> {
+        let contexts = self.list_contexts().await?;
+        // Best-effort: an unreadable view row must not refuse the start.
+        let saved = match self.actor.get_client_view(&self.client_id.to_string()).await {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not read the last context");
+                None
+            }
+        };
+        let Some(id) = start_candidate(saved, &contexts) else {
+            return self.open_ranked().await;
+        };
+        let info = contexts
+            .into_iter()
+            .find(|c| c.id == id)
+            .context("start candidate names a context the listing does not carry")?;
+        self.actor.join_context(info.id).await?;
+        Ok(info)
+    }
+
+    /// Record `context_id` as this client's last-viewed context, so the next
+    /// start without `--context` opens it.
+    pub async fn remember_context(&self, context_id: ContextId) -> Result<()> {
+        self.actor
+            .set_last_context(&self.client_id.to_string(), context_id)
+            .await
+            .context("record the last context")
     }
 
     /// Join the highest-ranked live context, for a start with no `--context`.
@@ -340,4 +376,125 @@ fn ensure_attachable(info: &ContextInfo) -> Result<()> {
         bail!("context {} is concluded", info.id.short());
     }
     Ok(())
+}
+
+/// Which context a start with no `--context` opens: the last one this client
+/// viewed if it is still live, else the live root context. `None` leaves the
+/// choice to the ranked seats.
+pub fn start_candidate(saved: Option<ContextId>, contexts: &[ContextInfo]) -> Option<ContextId> {
+    let live = |c: &&ContextInfo| c.concluded_at.is_none() && !c.archived;
+    if let Some(id) = saved
+        && contexts.iter().filter(live).any(|c| c.id == id)
+    {
+        return Some(id);
+    }
+    // The reserved `ROOT` label names the kernel's root console. Without it,
+    // a single live root is unambiguous; several are not, so no candidate.
+    let roots: Vec<&ContextInfo> = contexts
+        .iter()
+        .filter(live)
+        .filter(|c| c.context_type == ROOT_CONTEXT_TYPE)
+        .collect();
+    if let Some(reserved) = roots.iter().find(|c| c.label == "ROOT") {
+        return Some(reserved.id);
+    }
+    match roots.as_slice() {
+        [only] => Some(only.id),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+    use kaijutsu_types::Status;
+
+    fn ctx(label: &str, context_type: &str) -> ContextInfo {
+        let mut info = test_context_info(label);
+        info.context_type = context_type.to_string();
+        info
+    }
+
+    fn test_context_info(label: &str) -> ContextInfo {
+        ContextInfo {
+            id: ContextId::new(),
+            label: label.to_string(),
+            forked_from: None,
+            provider: String::new(),
+            model: String::new(),
+            created_at: 1_000,
+            trace_id: [0u8; 16],
+            fork_kind: None,
+            context_type: "coder".to_string(),
+            archived: false,
+            concluded_at: None,
+            keywords: Vec::new(),
+            top_block_preview: None,
+            live_status: Status::Pending,
+            last_activity_at: None,
+            track_id: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            context_window: None,
+            context_used_tokens: None,
+            context_used_pct: None,
+            background_running_count: 0,
+            background_oldest_running_started_at: None,
+            background_last_finished_at: None,
+            background_last_finished_status: None,
+            background_last_exit_code: None,
+            cast_label: None,
+            origin_host: None,
+            cwd: None,
+            last_call_at: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_ttl_secs: None,
+        }
+    }
+
+    #[test]
+    fn a_live_saved_context_wins_over_the_root() {
+        let root = ctx("ROOT", ROOT_CONTEXT_TYPE);
+        let kaijutsu = ctx("kaijutsu", "coder");
+        let saved = kaijutsu.id;
+        let contexts = vec![root, kaijutsu];
+        assert_eq!(start_candidate(Some(saved), &contexts), Some(saved));
+    }
+
+    #[test]
+    fn a_saved_context_that_is_archived_or_gone_falls_back_to_the_root() {
+        let root = ctx("ROOT", ROOT_CONTEXT_TYPE);
+        let root_id = root.id;
+        let mut archived = ctx("old", "coder");
+        archived.archived = true;
+        let archived_id = archived.id;
+        let contexts = vec![root, archived];
+        assert_eq!(start_candidate(Some(archived_id), &contexts), Some(root_id));
+        assert_eq!(start_candidate(Some(ContextId::new()), &contexts), Some(root_id));
+    }
+
+    #[test]
+    fn with_no_saved_context_the_reserved_root_label_wins() {
+        let other_root = ctx("banto", ROOT_CONTEXT_TYPE);
+        let reserved = ctx("ROOT", ROOT_CONTEXT_TYPE);
+        let reserved_id = reserved.id;
+        let contexts = vec![other_root, reserved];
+        assert_eq!(start_candidate(None, &contexts), Some(reserved_id));
+    }
+
+    #[test]
+    fn with_several_roots_and_no_reserved_label_there_is_no_candidate() {
+        let contexts = vec![ctx("amy", ROOT_CONTEXT_TYPE), ctx("bob", ROOT_CONTEXT_TYPE)];
+        assert_eq!(start_candidate(None, &contexts), None);
+    }
+
+    #[test]
+    fn a_single_root_is_the_candidate_when_there_is_nothing_saved() {
+        let root = ctx("amy", ROOT_CONTEXT_TYPE);
+        let root_id = root.id;
+        let contexts = vec![ctx("kaijutsu", "coder"), root];
+        assert_eq!(start_candidate(None, &contexts), Some(root_id));
+    }
 }
