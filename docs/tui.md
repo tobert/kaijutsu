@@ -755,14 +755,25 @@ connection leaving `Connected` — with a notice saying so, because the
 stream is the only thing that clears it and a flag nothing clears would
 make `:q` refuse forever.
 
-**The `Ctrl+Z` shell surface retired in favor of `:!`.** `shell.rs`,
-`Intent::ShellToggle`, `CtrlZ::Toggled` and `app.shell` are gone — deleted,
-not deprecated (`CLAUDE.md`, "Kaijutsu is the learning space"). `:kj` and
-`:!` both always act on the context on screen, the same context the old
-shell surface always acted on too, so there is no separate "acting context"
-cursor left to show — the bar draws no context label at all. `Ctrl+Z` is a
-single-press suspend now, not a toggle: leave raw mode, raise `SIGTSTP` on
-ourselves; on `SIGCONT` re-enter raw mode and redraw the viewport. Nothing
+**The `Ctrl+Z` shell surface retired in favor of `:!`, and returned as a
+seat toggle.** `shell.rs`, `Intent::ShellToggle`, `CtrlZ::Toggled` and
+`app.shell` are gone — deleted, not deprecated (`CLAUDE.md`, "Kaijutsu is the
+learning space"). `:kj` and `:!` both always act on the context on screen, so
+the bar draws no context label at all. `Ctrl+Z` now moves the screen between a
+root context and its shell child (`crate::ctrl_z`): from a root it switches to
+the root's live child of type `shell`, labelled `<root-label>-shell`, and
+creates that child under the root the first time; from a shell it switches to
+its parent; from any other context it does nothing and says so on the status
+line. It goes through the seat switch, so the draft and the place in the
+transcript travel with the context.
+
+A double `Ctrl+Z` suspends. The first press always acts (the toggle happens
+at once, and cannot be taken back). A second press within the 500 ms window
+(`DOUBLE_TAP`, the window `Ctrl+C` and `Ctrl+A Ctrl+A` use) leaves raw mode,
+raises `SIGTSTP` on ourselves, and keeps the context the first press landed
+on. The pending first press is cleared after the suspend, so a press after
+`fg` starts a fresh tap. On `SIGCONT` the loop re-enters raw mode and redraws
+the viewport. Nothing
 else needs restoring — the inline viewport leaves the transcript in
 scrollback and the host shell's prompt appears under it; `fg` brings the
 instrument back. Over `ssh -t zorak kaijutsu-tui` that puts zorak's login
@@ -1355,8 +1366,9 @@ compose row while a prefix is pending — never the status line, whose seat digi
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
-`Ctrl+Z` is a single-press suspend (`raise SIGTSTP`; `fg` or `SIGCONT`
-brings it back), not a toggle. `:q` (warns first if a turn is known
+`Ctrl+Z` toggles a root context and its shell child (below). A second
+`Ctrl+Z` within 500 ms suspends the process (`raise SIGTSTP`; `fg` or
+`SIGCONT` brings it back). `:q` (warns first if a turn is known
 running) and `:q!` (quits regardless) are the only quits. Amy, on the
 mockup: *"the legend in the status line is awesome, that'll help me a lot, I
 tend to forget keys outside the core stuff I use."* Every overlay (picker,

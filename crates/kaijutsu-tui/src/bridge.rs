@@ -184,26 +184,42 @@ impl KernelBridge {
         }
         let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &self.list_contexts().await?)
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        let cwd = client_cwd();
-        let created = self
-            .actor
-            .create_context_in_client_cwd(parent.context_id, target, &self.context_type, None, cwd.as_deref())
-            .await
-            .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        if let Some(refused) = &created.cwd_refused {
+        let (info, cwd_refused) = self.create_child(parent.context_id, target, &self.context_type).await?;
+        if let Some(refused) = &cwd_refused {
             // Printed before the screen is taken, so it stays in scrollback.
             eprintln!(
                 "kaijutsu-tui: created {target} without this directory as its cwd, because the \
                  kernel refused it: {refused}. Set one with `kj context set . --cwd DIR`."
             );
         }
+        Ok(info)
+    }
+
+    /// Create `label` of `context_type` under `parent`, in this process's
+    /// working directory, and join it. Returns the new context and, when the
+    /// kernel refused the directory, its refusal (the context then takes the
+    /// parent's cwd). Used by `open` before the screen is taken, and by
+    /// `Ctrl+Z` mid-session, where the caller must not print.
+    pub async fn create_child(
+        &self,
+        parent: ContextId,
+        label: &str,
+        context_type: &str,
+    ) -> Result<(ContextInfo, Option<String>)> {
+        let cwd = client_cwd();
+        let created = self
+            .actor
+            .create_context_in_client_cwd(parent, label, context_type, None, cwd.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
         let id = created.id;
         self.actor.join_context(id).await?;
         let contexts = self.list_contexts().await?;
-        contexts
+        let info = contexts
             .into_iter()
             .find(|c| c.id == id)
-            .with_context(|| format!("created context {} vanished from the listing", id.short()))
+            .with_context(|| format!("created context {} vanished from the listing", id.short()))?;
+        Ok((info, created.cwd_refused))
     }
 
     /// Open the context this client last viewed, else the live root console,

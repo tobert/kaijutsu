@@ -12,6 +12,11 @@ use crate::ids::{ContextId, PrincipalId};
 /// draft runs as shell (`docs/character.md`, "Roots and rotation").
 pub const ROOT_CONTEXT_TYPE: &str = "root";
 
+/// The context type of a shell context: a REPL whose draft runs as shell
+/// whatever mode the client sent, with no model and no cast. It is the child
+/// of a root context, opened from the client (`docs/character.md`).
+pub const SHELL_CONTEXT_TYPE: &str = "shell";
+
 /// Seats per time-well ring — the canonical "10". Ring 0 renders exactly
 /// this many slots, addressed by digit hotkeys 0-9, and the kernel refuses
 /// an eleventh promotion (`ACTIVE_RING_CAPACITY` in `kernel_db.rs` derives

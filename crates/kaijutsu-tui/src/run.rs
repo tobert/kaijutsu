@@ -39,6 +39,7 @@ use kaijutsu_client::DraftEdit;
 use kaijutsu_client::draft_outbox::{self, Landed};
 use kaijutsu_client::editor_outbox;
 use crate::completion;
+use crate::ctrl_z::{self, SHELL_CONTEXT_TYPE, Toggle};
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
 use crate::picker::{self, Outcome as PickerOutcome};
@@ -609,6 +610,7 @@ async fn event_loop(
 ) -> Result<()> {
     let mut keys = Keys::new();
     let mut interrupt_ladder = interrupt::Ladder::new();
+    let mut ctrl_z_tap = ctrl_z::Tap::new();
     let mut status = bridge.actor().watch_status();
     // The open asks arrive on the actor's ledger watch, which the kernel's
     // push keeps current; nothing polls. Marked changed so the state the
@@ -686,11 +688,12 @@ async fn event_loop(
                             handle_picker_key(bridge, app, key, &mut wires.feeds).await?;
                         } else {
                             let width = terminal.size()?.width;
-                            if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &mut wires.feeds, &wires.term_lock, width)
+                            if act(bridge, app, &mut keys, &mut interrupt_ladder, &mut ctrl_z_tap, key, &mut wires.feeds, &wires.term_lock, width)
                                 .await?
                                 == Acted::Suspend
                             {
                                 suspend(terminal, &wires.term_lock)?;
+                                ctrl_z_tap.reset();
                                 presented.cursor_shape = None;
                                 presented.title = None;
                                 // `fg` put this terminal back in front of
@@ -1271,6 +1274,7 @@ async fn act(
     app: &mut App,
     keys: &mut Keys,
     interrupt_ladder: &mut interrupt::Ladder,
+    ctrl_z_tap: &mut ctrl_z::Tap,
     key: crossterm::event::KeyEvent,
     feeds: &mut Feeds,
     term_lock: &TermLock,
@@ -1378,8 +1382,13 @@ async fn act(
             TailKey::Nothing => {}
             TailKey::LeaveTail(step) => leave_tail(app, width, step),
         },
-        Intent::Suspend => {
-            return Ok(Acted::Suspend);
+        // The first press toggles now; a second inside the window suspends
+        // instead, and the toggle it lands on is kept (`docs/tui.md`, "Keys").
+        Intent::CtrlZ => {
+            if ctrl_z_tap.press(Instant::now()) {
+                return Ok(Acted::Suspend);
+            }
+            toggle_shell(bridge, app, feeds).await;
         }
         Intent::SwitchSeat(n) => match app.seat_context(n) {
             Some(id) => switch_seat(bridge, app, id, feeds).await,
@@ -1678,6 +1687,49 @@ async fn remember_view(bridge: &KernelBridge, id: ContextId) {
 /// than carrying the old context's text along — `load_draft` keeps the `:`
 /// line's own history, which is this session's, not this draft's.
 ///
+/// `Ctrl+Z`'s toggle: a root to its live shell child (created on first use),
+/// a shell back to its parent, and a notice from anywhere else
+/// (`crate::ctrl_z::toggle`).
+///
+/// The listing is asked for here rather than read from the app, so a shell
+/// child made a moment ago is found and not created twice. The switch goes
+/// through [`switch_seat`] like every other.
+async fn toggle_shell(bridge: &KernelBridge, app: &mut App, feeds: &mut Feeds) {
+    let Some(current) = app.current_info().cloned() else {
+        app.note("no context attached");
+        return;
+    };
+    let contexts = match bridge.list_contexts().await {
+        Ok(contexts) => contexts,
+        Err(e) => {
+            app.note(format!("cannot list contexts: {e:#}"));
+            return;
+        }
+    };
+    let target = match ctrl_z::toggle(&current, &contexts) {
+        Toggle::Switch(id) => id,
+        Toggle::Refuse(why) => {
+            app.note(why);
+            return;
+        }
+        Toggle::Create { parent, label } => {
+            match bridge.create_child(parent, &label, SHELL_CONTEXT_TYPE).await {
+                Ok((info, cwd_refused)) => {
+                    if let Some(refused) = cwd_refused {
+                        tracing::warn!(%refused, "the shell took the parent's cwd; the kernel refused this one");
+                    }
+                    info.id
+                }
+                Err(e) => {
+                    app.note(format!("cannot create {label}: {e:#}"));
+                    return;
+                }
+            }
+        }
+    };
+    switch_seat(bridge, app, target, feeds).await;
+}
+
 /// **Every path that changes the context on screen goes through here**: the
 /// prefix chords, `Ctrl+A Ctrl+A`, and the picker. A path that watched and
 /// switched on its own got the switch without the draft, and
@@ -1875,7 +1927,7 @@ enum OverOverlay {
 fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool) -> OverOverlay {
     match intent {
         Intent::Ignored | Intent::LegendChanged | Intent::NotYet(_) | Intent::Unbound(_)
-        | Intent::Interrupt | Intent::Suspend => OverOverlay::Keep,
+        | Intent::Interrupt => OverOverlay::Keep,
         Intent::InputKey(_) | Intent::Tab | Intent::Paste => OverOverlay::Hold,
         Intent::TogglePicker if picker => OverOverlay::Close,
         Intent::OpenLedger if ledger => OverOverlay::Close,

@@ -1,0 +1,14 @@
+# shell: a REPL beside a root. A person types a command here and the kernel
+# runs it as shell; no model performs this context, so the bundle grants no
+# cast and composes no instruction blocks. The root opens it with Ctrl-Z.
+set -e
+# The shell facades. `shell_write` is the hot shell (ExternalExec::Allow, with
+# `exec` below for host programs); `shell` is the read-only one it falls back
+# to. Submit authors the command through the facade the seat holds.
+kj binding allow "facade:shell"
+kj binding allow "facade:shell_write"
+# The person's input: compose edits and submit.
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+# Host subprocesses from the shell, as the root console has them.
+kj binding allow "exec"
