@@ -17,10 +17,10 @@ an instruction to use nonexistent features.
 | Bootstrap | `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
 | Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Performer | `kj context create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
-| Client creation | There is no create RPC. A client runs `kj context create` through `executeKj` from an existing context, which becomes the parent. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer, except a root character, which cannot be cast |
+| Performer | `kj context create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
+| Client creation | There is no create RPC. A client runs `kj context create` through `executeKj` from an existing context, which becomes the parent. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer, except a root character, which the MCP path still does not cast |
 | Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`. There is no configured default. An exhausted walk is a self-confirmation for a live root character and an error for anyone else. The lineage root, the root character at the top of a context's `forked_from` chain, controls its reviewer and director overrides; any live root grants and revokes delegation. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
-| Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
+| Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn. A root performer is admitted when its reviewer is someone else. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation whose reviewer IS its performer. See `docs/approval-identity.md` |
 | Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts that character directs. See `docs/approval-identity.md`, "Standing rules for a character" |
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired character responsible for an ancestor context refuses reviewer resolution below it, by name |
@@ -143,21 +143,23 @@ Two things follow, and they are the ones to check a change against:
   root of the forest, and `kj context create` always names a parent
   (`docs/fork-and-create.md`, "Where a created context sits"). Its
   responsible character is a root character.
-- **A root character has no model.** The sheet carries a `root` flag set at
-  create; a root has no cast and turn identity refuses it as a performer. A
-  root is a place with hands on it: Amy fools around there, and during
-  bootstrap asks a Claude Code session to do something through the MCP
-  bridge, where the model is outside the kernel and drives through `kj`.
-  Autonomous operation restricts it further later.
-- **Planned: the root has a model, and a shell beside it.** Amy, 2026-10-25:
-  the root console is a model context configured with a fast model (flash or
-  Sonnet for now), with a prompt that names its privileged position and asks
-  for care about safety. Every `kj` request it makes needs approval. Ctrl-Z
-  there opens a shell context that is a child of the root, so the shell's
-  output stays in its own log and reaches the model only by fork or drift.
-  This replaces the "no model" rule above for the root. It is not built yet:
-  the performer refusal in `kj/character.rs` and `runtime/turn_identity.rs`
-  still holds. See `docs/issues.md`, "Root console".
+- **A root character can have a model.** The sheet carries a `root` flag set
+  at create. A root may be cast as a performer, and turn identity accepts it
+  when it has a reviewer distinct from itself. A root is a place with hands on
+  it: Amy fools around there, and during bootstrap asks a Claude Code session
+  to do something through the MCP bridge, where the model is outside the
+  kernel and drives through `kj`. Autonomous operation restricts it further
+  later.
+- **The root console and its shell.** Amy, 2026-10-25: the root is a model
+  context. Its cast is a fast model (Haiku on this machine, for now). Its
+  stance (`root/create/S00-stance.kai`) names its privileged position and asks
+  for care about safety. Its `kj` requests go through the regular approval
+  policy. A root-only override may come later. Ctrl-Z there opens a shell
+  context that is a child of the root (type `shell`, no model). Its output
+  stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
+  the shell returns to the root. Setting this up on a box needs a cast with an
+  Anthropic backend and key, and a reviewer distinct from the root's performer.
+  See `docs/issues.md`, "Root console".
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,

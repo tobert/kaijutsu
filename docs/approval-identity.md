@@ -47,8 +47,9 @@ the actor alone may answer it, and the ledger records the answer as a
 self-confirmation. When the actor is not a root character, resolution
 refuses and names the actor and the context; assign a reviewer with
 `kj context set <context> --reviewer <character>`. A model turn refuses
-to start when its performer resolves as its own reviewer, and a root can
-never be a performer, so self-confirmation is a human's act. An explicit
+to start when its performer resolves as its own reviewer, so
+self-confirmation is a human's act. A root may be a performer, with a
+reviewer distinct from itself. An explicit
 override or delegation that names the actor resolves the same way, as a
 self-confirmation, since the human set it up. Escalation runs the same walk
 past the context that yielded the current reviewer, and refuses at a root,
@@ -96,8 +97,8 @@ which a fork or a create from the caller's own context records as
 `director_id` (guidance, Amy 2026-09-15, "yes banto can cast its own
 children"). Casting is what makes the cast character accountable to the
 caller in that context; no sheet relation is consulted, and a root
-character cannot be cast, by any caller, through `create --as` or
-`set --as`. `kj context create --as` is the same act at birth: it needs the
+character can be cast through `create --as` or `set --as` on the kj path. The
+MCP session path still refuses one. `kj context create --as` is the same act at birth: it needs the
 Operator capability and a live character caller, who becomes the new
 context's director. It raises no ask; a caller without that authority is
 refused. This is a second way to earn `--as` authority,

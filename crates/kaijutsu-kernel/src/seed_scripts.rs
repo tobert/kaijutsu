@@ -1022,6 +1022,31 @@ mod tests {
         assert!(reaching.is_empty(), "seeds that reach the network: {reaching:#?}");
     }
 
+    /// The root seat is a model context, so it ships a stance: a system
+    /// block that opens on the cybernetic system, and a Markdown companion
+    /// that names the seat as privileged, names the accountable human, and
+    /// says every kj request is reviewed.
+    #[test]
+    fn the_root_seat_ships_its_privileged_stance() {
+        let seeds = seed_files();
+        let body = |path: &str| {
+            seeds
+                .iter()
+                .find(|(p, _)| p == &format!("{RC_VFS_ROOT}/{path}"))
+                .map(|(_, body)| body.clone())
+                .unwrap_or_else(|| panic!("{path} is not seeded"))
+        };
+        let script = body("root/create/S00-stance.kai");
+        assert!(script.contains("kj block create --role system"), "{script}");
+        assert!(script.contains("text/markdown"), "{script}");
+        let stance = body("root/create/S00-stance.md");
+        assert!(script.contains("cybernetic system"), "{script}");
+        for needle in ["privileged", "Amy", "reviewed"] {
+            assert!(stance.contains(needle), "root stance must say {needle:?}: {stance}");
+        }
+        assert!(stance.is_ascii() || stance.contains("頑張って"), "{stance}");
+    }
+
     /// Plant every retired seed path: a link where the seed shipped one, a
     /// file otherwise.
     fn plant_retired(root: &std::path::Path) {

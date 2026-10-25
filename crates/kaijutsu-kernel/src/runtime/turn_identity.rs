@@ -35,9 +35,6 @@ pub(crate) fn resolve(
     if character.retired_at.is_some() {
         return Err(format!("The assigned performer '{}' is retired. Assign a live character before starting a model turn.", character.name));
     }
-    if character.root {
-        return Err(format!("A root character has no model, so '{}' cannot perform a turn. Cast a character a model plays with 'kj context set . --as <character>'.", character.name));
-    }
     Ok(TurnIdentity { actor, reviewer })
 }
 
@@ -71,20 +68,19 @@ mod tests {
         assert!(resolve(&db, Some(amy), amy).unwrap_err().contains("cannot review"));
     }
 
-    /// A root character has no model: turn identity refuses it as a
-    /// performer, naming the rule, before any provider call.
+    /// A root character is a model context like any other: turn identity
+    /// admits it as a performer when a distinct reviewer is assigned. The
+    /// self-review refusal still holds for the root, so a root performer
+    /// cannot review its own work.
     #[test]
-    fn a_root_character_cannot_perform_a_turn() {
+    fn a_root_character_performs_a_turn_with_a_distinct_reviewer() {
         let db = KernelDb::temporary().unwrap();
         let amy = character(&db, "amy");
         let banto = character(&db, "banto");
         db.update_character_root(amy, true).unwrap();
-        let error = resolve(&db, Some(amy), banto).unwrap_err();
-        assert!(error.contains("root character has no model"), "{error}");
-        assert!(error.contains("amy"), "{error}");
-        // The same character, no longer a root, performs normally.
-        db.update_character_root(amy, false).unwrap();
-        assert!(resolve(&db, Some(amy), banto).is_ok());
+        assert_eq!(resolve(&db, Some(amy), banto).unwrap(), TurnIdentity { actor: amy, reviewer: banto });
+        let error = resolve(&db, Some(amy), amy).unwrap_err();
+        assert!(error.contains("cannot review"), "{error}");
     }
 
     #[test]

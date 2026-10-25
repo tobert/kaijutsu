@@ -9,17 +9,22 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 ## Root console: model, approval, and the shell child (2026-10-25)
 
 Amy's decision, after a try at a root that was always a REPL. The always-on
-shell routing in `submit_input` is reverted. The planned design is in
-`docs/character.md`, "Planned: the root has a model". Work still to do:
+shell routing is reverted. The design is in `docs/character.md`, "The root
+console and its shell". Landed: the root may have a model, its stance ships,
+the `shell` context type routes its drafts, and the TUI's Ctrl-Z toggles root
+and shell. Work still to do:
 
-- Give the root character a cast and a prompt flavor that names its
-  privileged position and asks for care. The root no longer refuses a
-  performer in `kj/character.rs` and `runtime/turn_identity.rs`. Its `kj`
-  requests always need approval.
-- Ctrl-Z in a root context opens a shell context under it. Pick the context
-  type and how Ctrl-Z maps to it. The app's Ctrl-Z surface is a toggle in the
-  current context today, so this is a change for both clients.
-- The TUI retired its Ctrl-Z toggle for `:!`. It would need that toggle back.
+- Set up the root's cast on a box: an Anthropic backend and key (none on this
+  machine yet), then `kj character set --cast` for the root. Its reviewer must
+  differ from its performer. Self-review is refused.
+- `kaijutsu-mcp` `prepare_session_create` still records no performer for a
+  root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
+- The stance names Amy as fixed text. Fresh installs for other people need it
+  made configurable.
+- The app's Ctrl-Z is still a toggle of its own shell surface in the current
+  context. It should switch to the root's shell child, as the TUI does.
+- Ctrl-Z in the TUI's shell: the live suspend (double Ctrl-Z) is not verified
+  in a PTY.
 - Pipe a shell snippet back to the model's draft. Later, after the above.
 - Clients open into their last context, else the live root, else the
   highest-ranked seat. Both clients use `kaijutsu_client::start_candidate`.

@@ -388,8 +388,8 @@ pub(crate) fn insert_new_context_rows(
             };
             let default_ws = db.get_or_create_default_workspace(row.created_by)?;
             db.insert_context_with_document(row, default_ws)?;
-            // A root plays its root context but performs no model work, and
-            // confirms its own statements there.
+            // A root plays its root context and confirms its own statements
+            // there, so the self-review check skips it.
             let reviewer = db.effective_approval_reviewer(row.context_id, performer)?.reviewer();
             if !sheet.root && performer == reviewer {
                 return Err(KernelDbError::Validation("the performer cannot review its own work".into()));
@@ -1563,9 +1563,6 @@ impl KjDispatcher {
                     Ok(Some(row)) if row.retired_at.is_some() => return KjResult::Err(format!(
                         "kj context create: character '{name}' is retired; choose a live character with `kj character list`"
                     )),
-                    Ok(Some(row)) if row.root => return KjResult::Err(format!(
-                        "kj context create: '{name}' is a root character and has no model, so it cannot be cast"
-                    )),
                     Ok(Some(row)) => Some(row.principal_id),
                     Ok(None) => return KjResult::Err(format!(
                         "kj context create: no character named '{name}'; use `kj character list` or `kj character create <name>`"
@@ -2019,11 +2016,6 @@ impl KjDispatcher {
                     match db.get_character_by_name(name) {
                         Ok(Some(sheet)) if sheet.retired_at.is_some() => {
                             return KjResult::Err(format!("kj context set: character '{name}' is retired"));
-                        }
-                        Ok(Some(sheet)) if sheet.root => {
-                            return KjResult::Err(format!(
-                                "kj context set: '{name}' is a root character and has no model, so it cannot be cast"
-                            ));
                         }
                         Ok(Some(sheet)) => Some(sheet.principal_id),
                         Ok(None) => return KjResult::Err(format!("kj context set: no character named '{name}'")),
@@ -3682,10 +3674,10 @@ mod tests {
         assert_eq!(row.played_by, Some(coder));
     }
 
-    /// A root character has no model, so no caller can cast it — not even
-    /// the director of the target context.
+    /// A root character is a model context: a director can cast it as the
+    /// performer of a context it directs, and the performer is recorded.
     #[tokio::test]
-    async fn a_root_character_cannot_be_cast_as_a_performer() {
+    async fn a_root_character_can_be_cast_as_a_performer() {
         let d = test_dispatcher().await;
         let amy_id = test_reviewer_principal();
         let banto = PrincipalId::new();
@@ -3697,26 +3689,15 @@ mod tests {
         }
         d.kernel_db().lock().update_character_root(sovereign, true).unwrap();
         let context = register_context(&d, Some("banto-directed-2"), None, amy_id);
-        d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(banto)).unwrap();
+        d.kernel_db().lock().update_context_review_assignment(context, None, Some(amy_id), Some(banto)).unwrap();
         let banto_caller = crate::kj::KjCaller {
             principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("sovereign")], &banto_caller).await;
-        assert!(!refused.is_ok(), "a root has no model to cast");
-        assert!(refused.message().contains("root character"), "{}", refused.message());
-        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().played_by, None);
-
-        // A root cannot cast a root either.
-        let amy = crate::kj::KjCaller {
-            principal_id: amy_id, actor_id: amy_id, reviewer_id: None, context_id: Some(context),
-            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
-            cancel: tokio_util::sync::CancellationToken::new(),
-        };
-        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("sovereign")], &amy).await;
-        assert!(!refused.is_ok(), "{}", refused.message());
-        assert!(refused.message().contains("root character"), "{}", refused.message());
+        let cast = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("sovereign")], &banto_caller).await;
+        assert!(cast.is_ok(), "{}", cast.message());
+        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().played_by, Some(sovereign));
     }
 
     /// Directing is what grants `--as`, and it must name the CALLER: a

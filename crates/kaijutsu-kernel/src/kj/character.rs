@@ -38,9 +38,8 @@ enum CharacterCommand {
     Create {
         /// The character's kernel-owned given name.
         name: String,
-        /// Create a root character: a place with hands on it, never a seat
-        /// a model plays. A root cannot be cast as a context's performer
-        /// and cannot take a model turn.
+        /// Create a root character: a place with hands on it, and a model
+        /// context of its own. Its `kj` requests always need approval.
         #[arg(long)]
         root: bool,
     },
@@ -65,8 +64,8 @@ enum CharacterCommand {
     Set {
         /// The character to update.
         name: String,
-        /// Make this character a root: no model, and it cannot be cast as
-        /// a context's performer.
+        /// Make this character a root: a model context whose `kj` requests
+        /// always need approval.
         #[arg(long, conflicts_with = "no_root")]
         root: bool,
         /// Make this character an ordinary one that a model can play.
@@ -542,8 +541,8 @@ impl KjDispatcher {
             .map_err(|e| KjResult::Err(format!("kj character set: {e}")))
     }
 
-    /// Set or clear `root`. A root has no model: it cannot be cast as a
-    /// context's performer and turn identity refuses it
+    /// Set or clear `root`. A root is a model context like any other: a
+    /// model plays it, and its `kj` requests always need approval
     /// (`docs/character.md`, "Roots and rotation").
     async fn character_set(&self, name: &str, root: bool, no_root: bool, caller: &KjCaller) -> KjResult {
         if !root && !no_root {
