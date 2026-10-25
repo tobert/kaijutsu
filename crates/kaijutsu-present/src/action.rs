@@ -25,9 +25,6 @@ pub enum Action {
     FocusCompose,
     /// Summon input overlay in chat mode (i/Space in Navigation)
     SummonChat,
-    /// Toggle active surface between Chat and Shell within the same context.
-    /// Ctrl+Z no longer fires this: it fires [`Action::ToggleShellContext`].
-    ToggleSurface,
     /// Ctrl+Z: a root context to its live shell child (created on first
     /// use), and a shell back to its root. Other context types refuse.
     ToggleShellContext,

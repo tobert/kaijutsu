@@ -441,25 +441,6 @@ pub fn handle_focus_compose(mut actions: MessageReader<ActionFired>, mut io: Com
     }
 }
 
-/// `Ctrl+Z`: toggle between the chat and shell surfaces. Each keeps its own
-/// text; the one summoned opens as [`handle_focus_compose`] opens chat.
-pub fn handle_toggle_surface(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {
-    for ActionFired { action, .. } in actions.read() {
-        if !matches!(action, Action::ToggleSurface) {
-            continue;
-        }
-        io.surface.toggle();
-        *io.focus = FocusArea::Compose;
-        io.compose.reset_escape();
-        if io.surface.is_shell() {
-            io.compose.shell.settle_for_focus();
-        } else {
-            let ops = io.compose.chat.settle_for_focus();
-            io.send_chat_ops(&ops);
-        }
-    }
-}
-
 /// `PopLevel` while composing: back to the conversation in normal mode, and
 /// from the shell surface back to chat as the default.
 pub fn handle_pop_level(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {

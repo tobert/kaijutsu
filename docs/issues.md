@@ -21,12 +21,6 @@ and shell. Work still to do:
   root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
 - The stance names Amy as fixed text. Fresh installs for other people need it
   made configurable.
-- The app's Ctrl-Z switches to the root's shell child, as the TUI does. Its
-  old in-context shell toggle is dead code, reachable only from a user
-  bindings.toml entry naming `ToggleSurface`: `handle_toggle_surface`
-  (`crates/kaijutsu-app/src/input/compose/systems.rs`), `ActiveSurface::toggle`
-  (`input/focus.rs`), and the `Action::ToggleSurface` variant. Deleting it
-  touches the compose tests that fire it. Owner to decide.
 - The app's shell in-flight guard (`ShellToggleInFlight`) has no path that
   leaves it stuck today. A panic in the spawned task would leave it set.
 - Ctrl-Z in the TUI's shell: the live suspend (double Ctrl-Z) is not verified

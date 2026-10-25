@@ -84,7 +84,6 @@ impl Harness {
                 (
                     compose_dispatch_keys,
                     handle_focus_compose,
-                    handle_toggle_surface,
                     handle_pop_level,
                     handle_prompt_prefill,
                     handle_compose_paste,
@@ -402,6 +401,15 @@ impl Harness {
         self.app.update();
     }
 
+    /// Put the shell surface on screen with compose focused and the shell
+    /// line settled for focus, the state a summoned shell is left in.
+    fn open_shell(&mut self) {
+        *self.app.world_mut().resource_mut::<ActiveSurface>() = ActiveSurface::Shell;
+        *self.app.world_mut().resource_mut::<FocusArea>() = FocusArea::Compose;
+        self.app.world_mut().resource_mut::<ComposeState>().shell.settle_for_focus();
+        self.app.update();
+    }
+
     fn compose(&self) -> &ComposeState {
         self.app.world().resource::<ComposeState>()
     }
@@ -434,11 +442,11 @@ impl Harness {
 /// when Ctrl+Z moved to the shell meanwhile: they never type into, or run,
 /// the shell line.
 #[test]
-fn held_chat_keys_replay_into_chat_after_a_surface_toggle() {
+fn held_chat_keys_replay_into_chat_after_a_surface_change() {
     let mut h = Harness::new("draft");
     h.app.update();
     h.keys("A more<Esc><CR>");
-    h.fire(Action::ToggleSurface);
+    h.open_shell();
     assert_eq!(h.surface(), ActiveSurface::Shell);
     h.draft_read("draft");
     h.app.update();
@@ -479,16 +487,9 @@ fn an_edit_lost_before_a_failed_send_is_counted_and_shown() {
     assert!(h.errors().iter().any(|e| e.contains("writer stopped")), "{:?}", h.errors());
 }
 
-/// The double-Esc is broken by a surface change and by a bypass key.
+/// The double-Esc is broken by a bypass key.
 #[test]
-fn a_toggle_or_a_bypass_key_breaks_the_double_escape() {
-    let mut h = Harness::new("hi");
-    h.load();
-    h.keys("<Esc>");
-    h.fire(Action::ToggleSurface);
-    h.keys("<Esc>");
-    assert_eq!(h.pops(), 0, "Esc on chat, then Esc on the shell");
-
+fn a_bypass_key_breaks_the_double_escape() {
     let mut h = Harness::new("hi");
     h.load();
     h.keys("<Esc>");
@@ -508,26 +509,13 @@ fn ctrl_z_in_compose_asks_for_the_context_toggle() {
     assert_eq!(h.fired(), vec![Action::ToggleShellContext]);
 }
 
-/// Ctrl+Z opens the shell, empty and in insert mode, and back.
-#[test]
-fn toggle_surface_opens_the_other_surface() {
-    let mut h = Harness::new("held");
-    h.load();
-    h.fire(Action::ToggleSurface);
-    assert_eq!((h.surface(), h.focus()), (ActiveSurface::Shell, FocusArea::Compose));
-    assert!(h.compose().shell.inserting(), "an empty shell line opens in insert mode");
-    h.fire(Action::ToggleSurface);
-    assert_eq!(h.surface(), ActiveSurface::Chat);
-    assert!(h.compose().chat.in_normal_mode(), "a draft with text opens in normal mode");
-}
-
 /// PopLevel from the shell: back to the conversation, the shell in normal
 /// mode, and chat the surface for next time.
 #[test]
 fn pop_level_leaves_compose_in_normal_mode() {
     let mut h = Harness::new("");
     h.load();
-    h.fire(Action::ToggleSurface);
+    h.open_shell();
     h.keys("ls");
     h.fire(Action::PopLevel);
     assert_eq!((h.focus(), h.surface()), (FocusArea::Conversation, ActiveSurface::Chat));
