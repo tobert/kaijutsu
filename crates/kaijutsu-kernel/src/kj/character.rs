@@ -15,7 +15,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::kernel_db::{CharacterRow, ContextRow};
 
 /// The rc bundle a root context runs.
-pub const ROOT_CONTEXT_TYPE: &str = "root";
+pub use kaijutsu_types::ROOT_CONTEXT_TYPE;
 
 #[derive(Parser, Debug)]
 #[command(

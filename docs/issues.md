@@ -6,6 +6,36 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Root REPL: what is open after the submit routing (2026-10-25)
+
+A `root` context's draft already runs as shell (`submit_input` in
+`crates/kaijutsu-server/src/rpc.rs`; the TUI skips its turn marker through
+`App::submit_starts_turn`). Still open:
+
+- Clients open into their last context when they know it, and into a root
+  otherwise. The TUI has no persisted last context: `Ctrl+A Ctrl+A` is
+  session-only.
+- The app's compose gets the root routing from the kernel, since a chat
+  submit into a root runs as shell. Its keys still follow the shell line,
+  where Enter runs in any mode (`docs/input.md`). Amy wants Esc-Enter, as in
+  chat; not yet checked against the app's shell surface.
+- The app matches the TUI's key bindings and behavior wherever possible. The
+  TUI goes first for iteration speed; the app gets the music and image use.
+- `ls` output renders badly in the TUI now. Typed shell-return renderers fix it.
+- Shell returns render as text. Reusable renderers for kaish's typed returns
+  (`ShellEnvelope` `data` and `content_type`) do not exist yet.
+- Tab completion covers `kj` verbs only. Path completion for `vi` and `cd`
+  is not wired.
+- Kaibo's review of the root routing (openrouter cast, 2026-10-25) found no
+  bugs. It saw no integration test for kernel-side routing, but
+  `root_context_chat_submit_runs_the_draft_as_shell` in
+  `compose_draft_wire.rs` covers it.
+- `terminal_fit`'s `ctrl_a_r_rotates_the_seat_and_follows_its_successor` and
+  `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` fail on
+  a clean tree, before the root change.
+
+---
+
 ## amy-dev: open items before its first run (2026-10-24)
 
 - tenchi (the DGX Spark) is aarch64. `contrib/amy-dev/Containerfile` takes an x86_64 Arch `BASE`, so tenchi needs an

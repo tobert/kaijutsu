@@ -164,7 +164,7 @@ pub use block::{
 };
 pub use error_block::IntoErrorPayload;
 pub use summary::summarize_thinking;
-pub use context::{Context, RING_SLOTS, fork_lineage};
+pub use context::{Context, ROOT_CONTEXT_TYPE, RING_SLOTS, fork_lineage};
 pub use dag::ConversationDAG;
 pub use enums::{ContextState, DocKind, EdgeKind, ForkKind};
 pub use ids::{

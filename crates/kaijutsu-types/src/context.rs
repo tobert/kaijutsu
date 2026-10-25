@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ContextId, PrincipalId};
 
+/// The context type of a root context: a model-less admin console whose
+/// draft runs as shell (`docs/character.md`, "Roots and rotation").
+pub const ROOT_CONTEXT_TYPE: &str = "root";
+
 /// Seats per time-well ring — the canonical "10". Ring 0 renders exactly
 /// this many slots, addressed by digit hotkeys 0-9, and the kernel refuses
 /// an eleventh promotion (`ACTIVE_RING_CAPACITY` in `kernel_db.rs` derives

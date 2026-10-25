@@ -149,6 +149,12 @@ Two things follow, and they are the ones to check a change against:
   bootstrap asks a Claude Code session to do something through the MCP
   bridge, where the model is outside the kernel and drives through `kj`.
   Autonomous operation restricts it further later.
+- **A root context is a REPL.** Its model is kaish: a draft submitted in a
+  `root` context runs as a shell command whatever mode the client sent, and
+  the command block and its output are durable. The kernel decides this in
+  `submit_input`, so every client gets it. No model turn starts, so clients
+  do not mark a turn running for it. Client work still open: opening into
+  the last context, and typed shell-return rendering (`docs/issues.md`).
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,
