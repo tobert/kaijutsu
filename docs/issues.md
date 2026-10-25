@@ -14,9 +14,10 @@ console and its shell". Landed: the root may have a model, its stance ships,
 the `shell` context type routes its drafts, and the TUI's Ctrl-Z toggles root
 and shell. Work still to do:
 
-- Set up the root's cast on a box: an Anthropic backend and key (none on this
-  machine yet), then `kj character set --cast` for the root. Its reviewer must
-  differ from its performer. Self-review is refused.
+- Set up the root's cast on the kernel: an Anthropic backend (key at
+  `~/.anthropic-key.txt`), a Haiku cast, then `kj character set --cast` for the
+  root. Its reviewer must differ from its performer. Self-review is refused.
+  The kernel is redeployed (2026-10-25) and has no Anthropic backend yet.
 - `kaijutsu-mcp` `prepare_session_create` still records no performer for a
   root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
 - The stance names Amy as fixed text. Fresh installs for other people need it
@@ -26,13 +27,11 @@ and shell. Work still to do:
 - Ctrl-Z in the TUI's shell: the live suspend (double Ctrl-Z) is not verified
   in a PTY.
 - Pipe a shell snippet back to the model's draft. Later, after the above.
-- Clients open into their last context, else the live root, else the
-  highest-ranked seat. Both clients use `kaijutsu_client::start_candidate`.
 - Typed shell-return rendering: `ls` looks bad in the TUI. Start with a live
   block dump to see whether `output` is missing on the wire.
-- App parity: the app's Ctrl-Z shell surface has no TUI counterpart yet. The
-  TUI runs shell through `:!`. The app's `:` input is rejected by
-  `docs/vi.md` decision 1.
+- Ctrl-Z is the same root/shell toggle in both clients. The TUI still runs
+  one-off shell lines through `:!`. The app has no `:` input surface, since
+  `docs/vi.md` decision 1 rejects one.
 
 ---
 
