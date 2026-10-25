@@ -6,35 +6,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Root REPL: what is open after the submit routing (2026-10-25)
+## Root console: model, approval, and the shell child (2026-10-25)
 
-A `root` context's draft already runs as shell (`submit_input` in
-`crates/kaijutsu-server/src/rpc.rs`; the TUI skips its turn marker through
-`App::submit_starts_turn`). Still open:
+Amy's decision, after a try at a root that was always a REPL. The always-on
+shell routing in `submit_input` is reverted. The planned design is in
+`docs/character.md`, "Planned: the root has a model". Work still to do:
 
-- Both clients open into their last context, else the live root, else the
-  highest-ranked seat. The choice is `kaijutsu_client::start_candidate`. The
-  TUI keeps its view row under its own id (`crates/kaijutsu-tui/src/client_id.rs`).
-  The app keeps its own id file. Move both id loaders onto one helper.
-- App parity, what is left: chat Enter and Esc-Enter already match the TUI.
-  The app's Ctrl+Z shell surface (its own submit, Enter runs in any mode) has no
-  TUI counterpart: the TUI runs shell through the `:!` bar. Picking one of
-  them needs Amy's call, because `docs/vi.md` decision 1 rejects an app-side
-  `:` input surface.
-- The app's compose gets the root routing from the kernel, since a chat
-  submit into a root runs as shell.
-- `ls` output renders badly in the TUI now. Typed shell-return renderers fix it.
-- Shell returns render as text. Reusable renderers for kaish's typed returns
-  (`ShellEnvelope` `data` and `content_type`) do not exist yet.
-- Tab completion covers `kj` verbs only. Path completion for `vi` and `cd`
-  is not wired.
-- Kaibo's review of the root routing (openrouter cast, 2026-10-25) found no
-  bugs. It saw no integration test for kernel-side routing, but
-  `root_context_chat_submit_runs_the_draft_as_shell` in
-  `compose_draft_wire.rs` covers it.
-- `terminal_fit`'s `ctrl_a_r_rotates_the_seat_and_follows_its_successor` and
-  `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` fail on
-  a clean tree, before the root change.
+- Give the root character a cast and a prompt flavor that names its
+  privileged position and asks for care. The root no longer refuses a
+  performer in `kj/character.rs` and `runtime/turn_identity.rs`. Its `kj`
+  requests always need approval.
+- Ctrl-Z in a root context opens a shell context under it. Pick the context
+  type and how Ctrl-Z maps to it. The app's Ctrl-Z surface is a toggle in the
+  current context today, so this is a change for both clients.
+- The TUI retired its Ctrl-Z toggle for `:!`. It would need that toggle back.
+- Pipe a shell snippet back to the model's draft. Later, after the above.
+- Clients open into their last context, else the live root, else the
+  highest-ranked seat. Both clients use `kaijutsu_client::start_candidate`.
+- Typed shell-return rendering: `ls` looks bad in the TUI. Start with a live
+  block dump to see whether `output` is missing on the wire.
+- App parity: the app's Ctrl-Z shell surface has no TUI counterpart yet. The
+  TUI runs shell through `:!`. The app's `:` input is rejected by
+  `docs/vi.md` decision 1.
 
 ---
 

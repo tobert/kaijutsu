@@ -12,8 +12,7 @@ use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
 use kaijutsu_types::{
-    AskSummary, BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId,
-    ROOT_CONTEXT_TYPE, Role, Status,
+    AskSummary, BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role, Status,
 };
 use kaijutsu_viz::layout::Band;
 
@@ -602,14 +601,6 @@ impl App {
         self.notice = None;
     }
 
-    /// Whether a submit on `context_id` starts a model turn. A root context
-    /// is a REPL, so its draft runs as shell and starts none.
-    pub fn submit_starts_turn(&self, context_id: ContextId) -> bool {
-        !self
-            .info(context_id)
-            .is_some_and(|c| c.context_type == ROOT_CONTEXT_TYPE)
-    }
-
     /// Mark `context_id` as having a turn running. Returns whether the set
     /// changed, so a caller only redraws when it must.
     pub fn mark_turn_running(&mut self, context_id: ContextId) -> bool {
@@ -1164,22 +1155,6 @@ mod tests {
         assert!(app.mark_turn_ended(aid), "the set changed");
         assert!(!app.turn_running(aid));
         assert!(!app.any_turn_running());
-    }
-
-    /// A submit into a root context runs as shell and starts no turn. The
-    /// client must not mark one running: the kernel sends no `TurnStarted`
-    /// or `TurnCompleted` to clear it, and `:q` would warn forever.
-    #[test]
-    fn a_submit_into_a_root_context_starts_no_turn() {
-        let mut root = ctx("ROOT");
-        root.context_type = ROOT_CONTEXT_TYPE.to_string();
-        let root_id = root.id;
-        let coder = ctx("kaijutsu");
-        let coder_id = coder.id;
-        let mut app = App::new("amy");
-        app.set_contexts(vec![root, coder]);
-        assert!(!app.submit_starts_turn(root_id), "a root submit is shell, not a turn");
-        assert!(app.submit_starts_turn(coder_id), "a coder submit starts a turn");
     }
 
     /// `Ctrl+A n`/`p` walk the rank and wrap at both ends.

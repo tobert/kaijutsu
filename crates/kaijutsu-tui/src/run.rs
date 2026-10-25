@@ -1802,11 +1802,8 @@ async fn compose_key(
                 // The partial turn-liveness signal (`docs/tui.md`, "Ctrl+C
                 // reclaimed"): our own submit is one of the two ways this
                 // client learns a turn started, the other being
-                // `ServerEvent::TurnStarted` (`mark_turn_liveness`). A root
-                // submit is shell and starts none (`submit_starts_turn`).
-                if app.submit_starts_turn(ctx) {
-                    app.mark_turn_running(ctx);
-                }
+                // `ServerEvent::TurnStarted` (`mark_turn_liveness`).
+                app.mark_turn_running(ctx);
             }
             Err(e) => {
                 tracing::warn!(context = %ctx.short(), error = %format!("{e:#}"), "submit failed");

@@ -5763,13 +5763,6 @@ impl kernel::Server for KernelImpl {
 
                 let documents = kernel.documents.clone();
 
-                // A root context is a REPL: its model is kaish, so its draft
-                // runs as a shell command whatever mode the client sent.
-                let is_shell = is_shell || kernel.kernel.kernel_db().lock()
-                    .get_context(context_id)
-                    .map_err(|e| capnp::Error::failed(format!("read context type: {e}")))?
-                    .is_some_and(|row| row.context_type == kaijutsu_kernel::kj::character::ROOT_CONTEXT_TYPE);
-
                 if is_shell {
                     // A shell draft runs the shell its seat's facade chose,
                     // under the same gate as `shell_execute`.

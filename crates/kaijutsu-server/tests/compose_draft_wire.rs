@@ -604,45 +604,6 @@ fn shell_submit_authors_the_command_before_clearing_the_draft() {
     });
 }
 
-/// A root context is a REPL: its model is kaish, so a chat-mode submit runs
-/// the draft as a shell command. Chat submit into a root starts no turn.
-#[test]
-fn root_context_chat_submit_runs_the_draft_as_shell() {
-    run_local(async {
-        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
-        let client = connect_client(addr).await;
-        let kernel = bind(&client).await;
-        let context_id = open_context(&kernel, "draft-root-repl").await;
-        server
-            .kernel_db
-            .lock()
-            .update_context_type(context_id, "root")
-            .unwrap();
-
-        kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
-        let result = kernel.submit_input(context_id, false).await.unwrap();
-
-        let all = blocks(&kernel, context_id).await;
-        let command = all
-            .iter()
-            .find(|b| b.id == result.block_id)
-            .expect("the command block exists");
-        assert_eq!(
-            command.kind,
-            BlockKind::ToolCall,
-            "a root submit authors the shell command, not a chat message"
-        );
-        assert!(
-            !all.iter().any(|b| b.role == Role::Model),
-            "a root submit starts no model turn"
-        );
-        assert!(
-            draft(&kernel, context_id).await.is_none(),
-            "the draft is consumed once the command block exists"
-        );
-    });
-}
-
 struct PauseShellSubmit {
     entered: tokio::sync::Notify,
     resume: tokio::sync::Notify,

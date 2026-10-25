@@ -149,12 +149,15 @@ Two things follow, and they are the ones to check a change against:
   bootstrap asks a Claude Code session to do something through the MCP
   bridge, where the model is outside the kernel and drives through `kj`.
   Autonomous operation restricts it further later.
-- **A root context is a REPL.** Its model is kaish: a draft submitted in a
-  `root` context runs as a shell command whatever mode the client sent, and
-  the command block and its output are durable. The kernel decides this in
-  `submit_input`, so every client gets it. No model turn starts, so clients
-  do not mark a turn running for it. Client work still open: opening into
-  the last context, and typed shell-return rendering (`docs/issues.md`).
+- **Planned: the root has a model, and a shell beside it.** Amy, 2026-10-25:
+  the root console is a model context configured with a fast model (flash or
+  Sonnet for now), with a prompt that names its privileged position and asks
+  for care about safety. Every `kj` request it makes needs approval. Ctrl-Z
+  there opens a shell context that is a child of the root, so the shell's
+  output stays in its own log and reaches the model only by fork or drift.
+  This replaces the "no model" rule above for the root. It is not built yet:
+  the performer refusal in `kj/character.rs` and `runtime/turn_identity.rs`
+  still holds. See `docs/issues.md`, "Root console".
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,
