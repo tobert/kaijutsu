@@ -181,8 +181,8 @@ pub fn default_bindings() -> Vec<Binding> {
         KeyCode::KeyZ,
         Modifiers::CTRL,
         InputContext::Navigation,
-        Action::ToggleSurface,
-        "Toggle shell/chat surface",
+        Action::ToggleShellContext,
+        "Toggle root and shell context",
     ));
 
     // Activate (Enter on focused block → edit, or generic "do the thing")
@@ -981,5 +981,18 @@ mod tests {
                 assert_eq!(hit.map(|b| b.action), Some(action), "{ctx:?} {key:?} {mods:?}");
             }
         }
+    }
+
+    /// `Ctrl+Z` is the root/shell context toggle. The chat/shell surface
+    /// toggle no longer holds a key; a second binding on Ctrl+Z would fire
+    /// both, and only one is the owner's.
+    #[test]
+    fn ctrl_z_is_the_context_toggle_and_no_longer_the_surface_toggle() {
+        let on_ctrl_z: Vec<Action> = default_bindings()
+            .into_iter()
+            .filter(|b| b.source == InputSource::Key(KeyCode::KeyZ) && b.modifiers == Modifiers::CTRL)
+            .map(|b| b.action)
+            .collect();
+        assert_eq!(on_ctrl_z, vec![Action::ToggleShellContext]);
     }
 }

@@ -374,6 +374,13 @@ pub enum RpcResultMessage {
     },
     /// Context created on server — spawn an actor to join it.
     ContextCreated(ContextId),
+    /// The `Ctrl+Z` context toggle resolved on the kernel: the context to
+    /// switch to (a live shell child, a shell's root, or one just created),
+    /// or why the toggle refused or failed. Drained by
+    /// `commands::ctrl_z::handle_shell_toggle_result`.
+    ShellToggled {
+        result: Result<ContextId, String>,
+    },
     /// Restore the last-viewed context on (re)connect, read from the kernel KV
     /// (`<client-id>.current_context`). Drained into a `ContextSwitchRequested`
     /// so it travels the same join path as any switch. Closes the reattach bug

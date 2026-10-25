@@ -367,6 +367,7 @@ fn action_to_str(a: &Action) -> String {
         Action::FocusCompose => "FocusCompose".into(),
         Action::SummonChat => "SummonChat".into(),
         Action::ToggleSurface => "ToggleSurface".into(),
+        Action::ToggleShellContext => "ToggleShellContext".into(),
         Action::ToggleBlockExcluded => "ToggleBlockExcluded".into(),
         Action::PopLevel => "PopLevel".into(),
         Action::Activate => "Activate".into(),
@@ -463,6 +464,7 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "FocusCompose" => Ok(Action::FocusCompose),
         "SummonChat" => Ok(Action::SummonChat),
         "ToggleSurface" => Ok(Action::ToggleSurface),
+        "ToggleShellContext" => Ok(Action::ToggleShellContext),
         "ToggleBlockExcluded" => Ok(Action::ToggleBlockExcluded),
         "PopLevel" => Ok(Action::PopLevel),
         // Pre-rename alias (bindings.toml written before 2026-07-16).
@@ -714,6 +716,7 @@ mod tests {
         "FocusCompose",
         "SummonChat",
         "ToggleSurface",
+        "ToggleShellContext",
         "ToggleBlockExcluded",
         "PopLevel",
         "Activate",

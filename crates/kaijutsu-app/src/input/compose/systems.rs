@@ -81,7 +81,7 @@ impl ComposeIo<'_, '_> {
         if let Some(line) = action.command {
             match colon_vi_statement(&line) {
                 Some(statement) => self.run_colon_vi(statement),
-                None => self.error("compose", format!("{line}: compose runs no `:` commands; Ctrl+Z is the shell")),
+                None => self.error("compose", format!("{line}: compose runs no `:` commands; Ctrl+Z opens the shell context")),
             }
         }
         if let Some(notice) = action.notice {
@@ -346,10 +346,11 @@ pub fn compose_dispatch_keys(
         }
         let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
         // Ctrl+C, Ctrl+Z and Ctrl+V are the app's in every vi mode: the
-        // interrupt ladder, the chat/shell toggle, and the clipboard paste.
+        // interrupt ladder, the root/shell context toggle, and the clipboard
+        // paste.
         let bypass = match event.key_code {
             KeyCode::KeyC if ctrl => Some(Action::InterruptContext { immediate: false }),
-            KeyCode::KeyZ if ctrl => Some(Action::ToggleSurface),
+            KeyCode::KeyZ if ctrl => Some(Action::ToggleShellContext),
             KeyCode::KeyV if ctrl => Some(Action::Paste),
             _ => None,
         };

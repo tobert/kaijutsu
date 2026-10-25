@@ -422,6 +422,12 @@ impl Harness {
         let actions = self.app.world().resource::<Messages<ActionFired>>();
         actions.iter_current_update_messages().filter(|a| a.action == Action::PopLevel).count()
     }
+
+    /// The actions fired during the last update, in order.
+    fn fired(&self) -> Vec<Action> {
+        let actions = self.app.world().resource::<Messages<ActionFired>>();
+        actions.iter_current_update_messages().map(|a| a.action.clone()).collect()
+    }
 }
 
 /// Chat keys held while the draft loads replay into the chat draft even
@@ -432,7 +438,7 @@ fn held_chat_keys_replay_into_chat_after_a_surface_toggle() {
     let mut h = Harness::new("draft");
     h.app.update();
     h.keys("A more<Esc><CR>");
-    h.ctrl(KeyCode::KeyZ, 'z');
+    h.fire(Action::ToggleSurface);
     assert_eq!(h.surface(), ActiveSurface::Shell);
     h.draft_read("draft");
     h.app.update();
@@ -489,6 +495,17 @@ fn a_toggle_or_a_bypass_key_breaks_the_double_escape() {
     h.ctrl(KeyCode::KeyC, 'c');
     h.keys("<Esc>");
     assert_eq!(h.pops(), 0, "Esc, Ctrl+C, Esc");
+}
+
+/// Ctrl+Z in compose asks for the root/shell context toggle. The chat draft
+/// stays on screen: the surface is not what Ctrl+Z moves now.
+#[test]
+fn ctrl_z_in_compose_asks_for_the_context_toggle() {
+    let mut h = Harness::new("hi");
+    h.load();
+    h.ctrl(KeyCode::KeyZ, 'z');
+    assert_eq!(h.surface(), ActiveSurface::Chat);
+    assert_eq!(h.fired(), vec![Action::ToggleShellContext]);
 }
 
 /// Ctrl+Z opens the shell, empty and in insert mode, and back.
