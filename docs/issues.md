@@ -12,17 +12,17 @@ A `root` context's draft already runs as shell (`submit_input` in
 `crates/kaijutsu-server/src/rpc.rs`; the TUI skips its turn marker through
 `App::submit_starts_turn`). Still open:
 
-- The TUI opens into its last context, else the live root, else the
-  highest-ranked seat (`KernelBridge::open_last_or_root`). It keeps its view
-  row in the kernel's `client_views` table under its own id
-  (`crates/kaijutsu-tui/src/client_id.rs`). The app already did this with its
-  own id file. Move both id loaders onto one helper.
+- Both clients open into their last context, else the live root, else the
+  highest-ranked seat. The choice is `kaijutsu_client::start_candidate`. The
+  TUI keeps its view row under its own id (`crates/kaijutsu-tui/src/client_id.rs`).
+  The app keeps its own id file. Move both id loaders onto one helper.
+- App parity, what is left: chat Enter and Esc-Enter already match the TUI.
+  The app's Ctrl+Z shell surface (its own submit, Enter runs in any mode) has no
+  TUI counterpart: the TUI runs shell through the `:!` bar. Picking one of
+  them needs Amy's call, because `docs/vi.md` decision 1 rejects an app-side
+  `:` input surface.
 - The app's compose gets the root routing from the kernel, since a chat
-  submit into a root runs as shell. Its keys still follow the shell line,
-  where Enter runs in any mode (`docs/input.md`). Amy wants Esc-Enter, as in
-  chat; not yet checked against the app's shell surface.
-- The app matches the TUI's key bindings and behavior wherever possible. The
-  TUI goes first for iteration speed; the app gets the music and image use.
+  submit into a root runs as shell.
 - `ls` output renders badly in the TUI now. Typed shell-return renderers fix it.
 - Shell returns render as text. Reusable renderers for kaish's typed returns
   (`ShellEnvelope` `data` and `content_type`) do not exist yet.

@@ -1276,11 +1276,11 @@ fn poll_bootstrap_results(
                         }
 
                         // 3. No context specified — fetch the context list, then
-                        //    restore the last-viewed context from the kernel's
-                        //    per-client view row if it still exists (closes the
-                        //    reattach bug). The read is best-effort: any hiccup
-                        //    just falls through to the list and the normal
-                        //    first-context selection.
+                        //    open the last-viewed context if it is still live,
+                        //    else the live root console (`start_candidate`, shared
+                        //    with the tui). The read is best-effort: any hiccup
+                        //    just falls through to the list and the ranked
+                        //    first-seat selection.
                         let saved_ctx = h.get_client_view(&client_id).await.ok().flatten();
                         match h.list_contexts().await {
                             Ok(contexts) => {
@@ -1288,12 +1288,11 @@ fn poll_bootstrap_results(
                                     "Bootstrap: list_contexts returned {} contexts",
                                     contexts.len()
                                 );
-                                let restore = saved_ctx
-                                    .filter(|id| contexts.iter().any(|c| c.id == *id));
+                                let restore = kaijutsu_client::start_candidate(saved_ctx, &contexts);
                                 let _ =
                                     tx.send(RpcResultMessage::DriftContextsReceived { contexts });
                                 if let Some(id) = restore {
-                                    log::info!("Restoring last-viewed context {id}");
+                                    log::info!("Restoring start context {id}");
                                     let _ = tx.send(RpcResultMessage::RestoreContext(id));
                                 } else if let Some(id) = saved_ctx {
                                     log::info!(
