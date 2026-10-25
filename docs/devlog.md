@@ -3518,3 +3518,37 @@ contract tree, and the other two asked it for changes instead of editing
 it, after two of us wrote the same `check_ask` at the same moment. The
 servers pin gogi by git rev, so one session's work in progress no longer
 breaks another's build.
+
+## The root takes a seat (October 25)
+
+The root console started as a REPL: a root's chat draft ran as shell on every
+submit (`64870bbd`). Amy used it and found the wrong shape. The shell belongs
+behind a key, not on every submit, so the routing was reverted (`91b6ed90`).
+What she wanted was a root with a model, and a shell beside it. Ctrl-Z in a
+root opens its child shell context, type `shell`, which has no model and whose
+chat submit runs as shell. The output stays in that child's log, and reaches
+the model only by fork or drift. Ctrl-Z in the shell returns to the root.
+
+The root's model is a cast like any other seat's. Its stance names the
+privileged position and asks for care, and its `kj` requests go through the
+regular approval policy. Amy chose that over a root-only override, and noted
+that a bump may come later. Root approvals need a reviewer distinct from the
+root's performer, so the only human above the root is Amy, who answers its
+asks. Council review for the root was rejected: the root is where Amy goes
+when the council is failing.
+
+Both clients got the same behavior, and this is the part to keep. The TUI and
+app Ctrl-Z share one decision (`ctrl_z::toggle` in each client, same rules,
+same tests), and both clients open into their last context, else the live
+root (`kaijutsu_client::start_candidate`). The TUI's double Ctrl-Z suspends,
+as a shell job would. The app has no such suspend. Each change got a
+failing test first, then kaibo reviewed the staged diff before the commit.
+Kaibo found no bugs in any of them. It did find stale rows in
+`docs/character.md` and `docs/approval-identity.md` that still said roots
+could not perform, and those were fixed before landing.
+
+The old in-context chat/shell toggle was dead once Ctrl-Z moved, and it came
+out (`531fea08`). Git keeps its history. Deploying the kernel meant rebuilding
+the container image and restarting `kaijutsu.service`, which abandoned four
+pending asks from earlier MCP sessions. Those sessions retry, and the restart
+was otherwise clean.
