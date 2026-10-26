@@ -109,7 +109,12 @@ pub(crate) struct HydrationState {
 /// provider message assembly: callers that need a transcript retain their own
 /// formatting while sharing the admission rule.
 pub(crate) fn is_history_eligible(block: &BlockSnapshot) -> bool {
-    if block.ephemeral || block.status == kaijutsu_types::Status::Draft || block.excluded {
+    // An ephemeral model tool pair stays: the model already saw it, and
+    // removing it changes signed assistant content the API must get back
+    // unchanged.
+    let model_tool_pair = block.tool_use_id.is_some()
+        && matches!(block.kind, BlockKind::ToolCall | BlockKind::ToolResult);
+    if (block.ephemeral && !model_tool_pair) || block.status == kaijutsu_types::Status::Draft || block.excluded {
         return false;
     }
     if matches!(block.kind, BlockKind::File | BlockKind::Trace) {
@@ -1634,6 +1639,79 @@ mod withheld_thinking_tests {
     #[test]
     fn an_unsigned_empty_thinking_block_is_not_eligible() {
         assert!(!is_history_eligible(&thinking(1, None)));
+    }
+
+    /// An ephemeral `kj` result (such as `kj help`) marks its call and result
+    /// ephemeral. When a model made the call, the pair stays in its history:
+    /// dropping it would join the thinking on either side into one assistant
+    /// message, which the Messages API refuses as modified thinking.
+    #[test]
+    fn a_model_tool_pair_marked_ephemeral_keeps_its_place_between_thinking_blocks() {
+        use kaijutsu_types::ToolKind;
+        let ctx = ContextId::new();
+        let model = PrincipalId::new();
+        let id = |seq| BlockId::new(ctx, model, seq);
+        let signed = |seq, signature: &str| {
+            let mut block = BlockSnapshot::thinking(id(seq), None, "why");
+            block.signature = Some(signature.into());
+            block
+        };
+        let call = |seq, tool_id: &str| BlockSnapshot::tool_call(
+            id(seq), None, ToolKind::Builtin, "shell_write", serde_json::json!({}),
+            BlockRole::Model, Some(tool_id.into()),
+        );
+        let result = |seq, call_seq, tool_id: &str| BlockSnapshot::tool_result(
+            id(seq), id(call_seq), ToolKind::Builtin, "help text", false, Some(0), Some(tool_id.into()),
+        );
+        let mut help_call = call(2, "call_help");
+        let mut help_result = result(3, 2, "call_help");
+        help_call.ephemeral = true;
+        help_result.ephemeral = true;
+        let blocks = [
+            BlockSnapshot::text(id(0), None, BlockRole::User, "what types are there?"),
+            signed(1, "sig1"),
+            help_call,
+            help_result,
+            signed(4, "sig2"),
+            call(5, "call_list"),
+            result(6, 5, "call_list"),
+            model_text("twelve"),
+        ];
+        let shapes: Vec<Vec<&str>> = hydrate(&blocks).iter().map(|message| match &message.content {
+            MessageContent::Text(_) => vec!["text"],
+            MessageContent::Blocks(parts) => parts.iter().map(|part| match part {
+                ContentBlock::Reasoning { .. } => "thinking",
+                ContentBlock::ToolUse { .. } => "tool_use",
+                ContentBlock::ToolResult { .. } => "tool_result",
+                ContentBlock::Text { .. } => "text",
+                ContentBlock::Image { .. } => "image",
+            }).collect(),
+        }).collect();
+        assert_eq!(shapes, vec![
+            vec!["text"],
+            vec!["thinking", "tool_use"],
+            vec!["tool_result"],
+            vec!["thinking", "tool_use"],
+            vec!["tool_result"],
+            vec!["text"],
+        ]);
+    }
+
+    /// A human's ephemeral shell command stays out of model history.
+    #[test]
+    fn a_user_shell_pair_marked_ephemeral_stays_out_of_history() {
+        use kaijutsu_types::ToolKind;
+        let ctx = ContextId::new();
+        let amy = PrincipalId::new();
+        let id = |seq| BlockId::new(ctx, amy, seq);
+        let mut call = BlockSnapshot::tool_call(
+            id(1), None, ToolKind::Shell, "shell", serde_json::json!({"code": "kj help"}), BlockRole::User, None,
+        );
+        let mut result = BlockSnapshot::tool_result(id(2), id(1), ToolKind::Shell, "help text", false, Some(0), None);
+        call.ephemeral = true;
+        result.ephemeral = true;
+        assert!(!is_history_eligible(&call));
+        assert!(!is_history_eligible(&result));
     }
 }
 

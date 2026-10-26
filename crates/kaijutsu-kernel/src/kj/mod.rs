@@ -205,7 +205,9 @@ pub enum KjResult {
     Ok {
         message: String,
         content_type: ContentType,
-        /// When true, the output is for humans only — excluded from LLM context.
+        /// When true, a human's command and its output stay out of model
+        /// history. A model's own tool call keeps its pair, because the
+        /// model already saw it.
         ephemeral: bool,
         /// Optional structured data routed into `ExecResult.data` so that
         /// `for x in $(kj …)` iterates the value and `kaish-last` can read
@@ -276,7 +278,8 @@ impl KjResult {
         }
     }
 
-    /// Convenience: create an ephemeral Ok result (excluded from LLM hydration).
+    /// Convenience: create an ephemeral Ok result. A human's command and its
+    /// result stay out of model history; a model's own tool call keeps its pair.
     pub fn ok_ephemeral(msg: impl Into<String>, ct: ContentType) -> Self {
         KjResult::Ok {
             message: msg.into(),
@@ -317,8 +320,8 @@ impl KjResult {
 
     /// Ephemeral result with structured data attached. Used for surfaces
     /// (e.g. `kj cas ls`) where the human text is for the kj prompt only
-    /// — excluded from LLM context — but the data array remains useful
-    /// for kaish iteration.
+    /// but the data array remains useful for kaish iteration. Hydration
+    /// treats it as [`Self::ok_ephemeral`] does.
     pub fn ok_ephemeral_with_data(
         msg: impl Into<String>,
         ct: ContentType,

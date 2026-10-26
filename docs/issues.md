@@ -23,6 +23,18 @@ root, console, and shell; the start choice prefers `ROOT`. Still open:
   root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
 - `docs/character.md` says ROOT is played by a root character. The console is
   played by a model character. The reserved-label rule needs the same edit.
+- The root's shell child has only the `shell` bundle (`exec` and the shell
+  facades), so `kj cast` and `kj context create` there are denied for lack of
+  `config-write`/`operator`. Admin work runs through the TUI's `:kj` in the
+  human root. Decide whether the shell child carries the root's admin grants,
+  or the denial names `:kj`.
+- Typing in the human root fails with the self-review refusal
+  (`runtime/turn_identity.rs`), which tells the human to assign a reviewer.
+  It should say the human root runs no model turns and point to `ROOT` or
+  Ctrl-Z. The TUI also shows the whole Cap'n Proto wrapper before the message.
+- A kernel with no `console` context gives no hint to create one. Spaceghost's
+  was made by hand on 2026-10-25, with a `console` slot on `root-haiku`;
+  bootstrap should do both.
 - Live checks: the Ctrl-Z toggle creating a shell child against the kernel; the
   TUI double Ctrl-Z suspend and `fg` resume; the app's Ctrl-Z.
 - Pipe a shell snippet back to the model's draft. Later, after the above.
