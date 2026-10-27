@@ -12,7 +12,8 @@
 //! They deliberately do **not** touch a kernel: `AcpBridge` needs a live
 //! `ActorHandle`, and what is at risk here is the protocol wiring, not the
 //! kj translation (which is unit-tested in `update.rs` / `rank.rs`). The
-//! kernel half is covered by the live smoke test in docs/acp.md.
+//! kernel half is covered by `kernel_e2e.rs`, which drives this binary
+//! against a real kernel.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -3216,25 +3216,54 @@ enabled = false
         assert_eq!(c.threshold_for("program-gate").unwrap().mass_floor, -1.5);
     }
 
-    /// The benchmark's council gate parses and judges programs under its own
-    /// spec, with a threshold of its own.
+    /// A bump-only gate parses: bump-only mode over the bump spec, the
+    /// program spec reading council-code with its own `require_agree`, a
+    /// threshold for each, and the coder's deny tier still refusing.
     #[test]
-    fn the_bench_council_gate_declares_both_cases() {
-        let cfg = config(include_str!("../../../../contrib/bench/gate-council.toml"));
-        let c = cfg.council().expect("the bench file declares a council");
-        let cases: Vec<CouncilCase> = c.specs.iter().map(|s| s.case).collect();
-        assert_eq!(cases, vec![CouncilCase::Shell, CouncilCase::Program]);
-        assert!(c.threshold_for("shell-gate").is_some() && c.threshold_for("program-gate").is_some());
-        assert!(cfg.council_enabled_for(Some("coder")));
-        assert!(c.house_rules, "the bench reads the house rules, and finds none in a task container");
-    }
+    fn a_bump_only_gate_bumps_and_reads_council_code_for_programs() {
+        let cfg = config(
+            r#"
+[global]
+uncovered = "ask"
 
-    /// The benchmark's bump gate parses: bump-only mode over the bump spec,
-    /// the program spec reading council-code, a threshold for each.
-    #[test]
-    fn the_bench_bump_only_gate_bumps_and_reads_council_code_for_programs() {
-        let cfg = config(include_str!("../../../../contrib/bench/gate-bump.toml"));
-        let c = cfg.council().expect("the bench file declares a council");
+[council]
+mode = "bump-only"
+server = "http://localhost:8090"
+contexts = ["council-system"]
+pool = { method = "loglinear", weights = "mass" }
+deadline_ms = 20000
+require_agree = true
+house_rules = true
+
+[[council.spec]]
+name = "shell-bump"
+case = "shell"
+contexts = ["council-shell"]
+
+[[council.threshold]]
+spec = "shell-bump"
+allow_at = 0.8
+mass_floor = -2.5
+
+[[council.spec]]
+name = "program-gate"
+case = "program"
+contexts = ["council-code"]
+require_agree = false
+
+[[council.threshold]]
+spec = "program-gate"
+allow_at = 0.98
+mass_floor = -2.5
+
+[context_type.coder]
+deny = ["kj ledger", "kj rc", "kj binding"]
+
+[context_type.coder.council]
+enabled = true
+"#,
+        );
+        let c = cfg.council().expect("the gate declares a council");
         assert_eq!(c.mode, CouncilMode::BumpOnly);
         assert_eq!(c.bump_limit, None);
         assert_eq!(c.specs[0].name, "shell-bump");
@@ -3243,7 +3272,7 @@ enabled = false
         assert!(c.require_agree_for("shell-bump") && !c.require_agree_for("program-gate"));
         assert!(c.threshold_for("shell-bump").is_some() && c.threshold_for("program-gate").is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
-        assert!(c.house_rules, "the bench reads the house rules, and finds none in a task container");
+        assert!(c.house_rules);
         for verb in ["kj ledger show 01a1", "kj ledger list --history", "kj rc list", "kj binding list"] {
             assert!(matches!(first_verdict(verb, &cfg, Some("coder")), PolicyVerdict::Deny(_)), "{verb}");
         }

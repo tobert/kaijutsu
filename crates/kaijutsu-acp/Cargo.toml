@@ -10,6 +10,18 @@ description = "Agent Client Protocol (ACP v1) bridge exposing a kaijutsu kernel 
 name = "kaijutsu-acp"
 path = "src/main.rs"
 
+[[bin]]
+# A one-tool MCP stdio server for `tests/kernel_e2e.rs`
+# (`CARGO_BIN_EXE_mcp-fixture`). Not part of a release build.
+name = "mcp-fixture"
+path = "src/bin/mcp_fixture.rs"
+required-features = ["test-fixtures"]
+
+[features]
+# Builds `mcp-fixture`, which the client-declared MCP server test in
+# `tests/kernel_e2e.rs` launches. Without it that test is ignored and says why.
+test-fixtures = []
+
 [lints]
 workspace = true
 
@@ -45,3 +57,12 @@ shell-words = "1.1"
 # schemars' chrono04 feature; taken as a direct dep here rather than
 # hand-rolling a date formatter.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+# `tests/kernel_e2e.rs` stands up a real kernel with the server's bootstrap,
+# scripts its model with the kernel's mock backend, and drives the
+# `kaijutsu-acp` binary over stdio.
+kaijutsu-server.workspace = true
+kaijutsu-kernel = { workspace = true, features = ["test-mock"] }
+russh.workspace = true
+tempfile.workspace = true

@@ -154,7 +154,7 @@ cached system text, unlike the orientation notification. It is read at create
 and does not update when the file changes; a rotated or new context reads it
 again. The block is cut at 32000 characters and says so. No working directory,
 or no `AGENTS.md`, writes no block. Tests:
-`crates/kaijutsu-solo-acp/tests/solo_acp_stdio.rs`, the `agents_md` cases.
+`crates/kaijutsu-server/tests/house_rules_wire.rs`.
 
 ## Explicit instruction scripts
 
