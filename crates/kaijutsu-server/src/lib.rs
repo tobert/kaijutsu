@@ -4,6 +4,7 @@
 
 pub mod auth_db;
 pub mod beat;
+pub mod bootstrap;
 pub mod clock;
 pub mod config_mounts;
 pub mod constants;

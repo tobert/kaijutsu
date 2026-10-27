@@ -1,4 +1,4 @@
-# Offline administration: `kaijutsu-server kj`
+# Offline administration: `kaijutsu-server kj` and `bootstrap`
 
 Status: chosen by Amy 2026-09-22 ("Let's do option a for kj on the cli,
 seems safer over time"), and shipped.
@@ -27,6 +27,43 @@ boot, which is the lockout path (`docs/character.md`, "Bootstrap").
 `migrate-keyring` also writes `kernel.db` directly, but only ever once
 against a live root, so it is not a lockout tool — it takes the same
 `KernelLock` `kj` and the service take, and needs the service stopped.
+
+## `bootstrap`
+
+`bootstrap` sets up a kernel so its `ROOT` console can answer. A new person
+runs it once and then talks to `ROOT`; the model there helps with the rest
+of the setup. `kj` is still there for direct changes.
+
+```sh
+kaijutsu-server bootstrap
+kaijutsu-server bootstrap --as amy --key ~/.ssh/id_ed25519.pub --backend deepseek --model deepseek-v4-pro
+kaijutsu-server bootstrap --no-model
+```
+
+It writes the root character and its key directly, as `init` does. Then it
+boots the kernel the way `kj` does and runs, as that root, each verb whose
+result is missing:
+
+1. `kj backend set` for each provider whose key it finds: `ANTHROPIC_API_KEY`
+   or `~/.anthropic-key.txt`, and `DEEPSEEK_API_KEY` or `~/.deepseek-key`.
+   `--backend` names one instead. The row records both key sources, so the
+   kernel finds the key wherever it runs.
+2. `kj backend model set` with the context window of a model it knows.
+3. `kj backend default set`, when the kernel has no default, to the first
+   provider found.
+4. `kj character create root`, the model character that plays `ROOT`
+   (`--console-as` names another).
+5. `kj context create ROOT --type console --as root`, under the root context.
+
+It prints each line it ran. A second run runs nothing, and a kernel set up by
+hand is completed rather than overwritten. With no key found, it still
+creates `ROOT` and prints the two `kj backend` lines that give it a model.
+
+Run it with the service stopped: it takes the same lock as the service and
+`kj`. The defaults are `--as $USER` and `--key ~/.ssh/id_ed25519.pub`. It
+reads `--config-root`, `--mount`, and `--rw-mount` like `kj`. Tests call the
+same code, `kaijutsu_server::bootstrap::bootstrap`, on a test server's
+paths.
 
 ## `blocks repair-order`
 

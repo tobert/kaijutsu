@@ -512,8 +512,7 @@ impl SshServer {
     /// For a caller that hosts the kernel rather than merely connecting to
     /// it. A process that must settle the kernel at exit the way
     /// `spawn_signal_shutdown` does for a signal — cancel, await the runtime
-    /// worker, checkpoint — needs the handle to do it (`kaijutsu-solo-acp`
-    /// closes on client disconnect, where no signal arrives). Tests use it to
+    /// worker, checkpoint — needs the handle to do it. Tests use it to
     /// inspect the kernel behind a connected client or exercise native broker
     /// tools; `ledger_events_wire.rs` also publishes `LedgerFlow::Changed` on
     /// the kernel bus to check the `subscribeLedgerEvents` bridge
@@ -570,7 +569,7 @@ impl SshServer {
         if auth_db.is_empty().map_err(std::io::Error::other)? {
             log::warn!(
                 "Auth database is empty, so no one can connect. Stop the server and run \
-                 kaijutsu-server init --as <name> --key <pubkey-file>"
+                 kaijutsu-server bootstrap, or kaijutsu-server init --as <name> --key <pubkey-file>"
             );
         }
 

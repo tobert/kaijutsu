@@ -115,7 +115,7 @@ fn refuses_ledger_answer(argv: &[String]) -> bool {
 /// boot the same kernel the service boots (minus serving), dispatch, print,
 /// settle, and report an exit code — `docs/server-cli.md`.
 /// Why a model turn driven offline does not wait on its ask.
-const OFFLINE_HOLD_REFUSAL: &str = "This kernel is running offline for one `kj` command, and nobody can answer an ask until it serves again; nothing ran.";
+pub(crate) const OFFLINE_HOLD_REFUSAL: &str = "This kernel is running offline for one `kj` command, and nobody can answer an ask until it serves again; nothing ran.";
 
 pub async fn run_kj(args: KjRunArgs) -> ExitCode {
     let resolved_data_dir = resolve_data_dir(args.data_dir.as_deref());
@@ -183,7 +183,7 @@ pub async fn run_kj(args: KjRunArgs) -> ExitCode {
 /// Resolve `--as`/`--context` to a [`KjCaller`]: a live root character, its
 /// reviewer unset (a root confirms its own statements), joined to its root
 /// context or the one named by `--context`.
-fn resolve_caller(
+pub(crate) fn resolve_caller(
     shared: &SharedKernel,
     as_character: Option<&str>,
     context: Option<&str>,
@@ -339,7 +339,7 @@ async fn await_turns_drained(shared: &SharedKernel) {
 /// wait above. A verb that admits a model turn (`kj drive`) holds this until
 /// the turn ends — that is the offline command's whole "holds until the turn
 /// ends" promise, not just the wire admission the verb itself returns after.
-async fn settle(shared: &SharedKernel) -> Result<(), String> {
+pub(crate) async fn settle(shared: &SharedKernel) -> Result<(), String> {
     shared.shutdown.cancel();
     await_turns_drained(shared).await;
     let result = shared

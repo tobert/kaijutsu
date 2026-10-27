@@ -1663,8 +1663,9 @@ pub async fn create_shared_kernel_in(
             .any(|row| row.root);
         if !has_root {
             return Err(capnp::Error::failed(format!(
-                "no live root character in {}. Stop here and run \
-                 `kaijutsu-server init --as <name> --key <pubkey-file>`, then start again",
+                "no live root character in {}. Stop here and run `kaijutsu-server bootstrap`, \
+                 or `kaijutsu-server init --as <name> --key <pubkey-file>` for the root alone, \
+                 then start again",
                 db_path.display()
             )));
         }
