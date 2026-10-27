@@ -1783,6 +1783,41 @@ pub(crate) fn seat_route(
     })
 }
 
+/// Why the council does not decide this submission, or `None` when it does:
+/// the gate's own layers decide every statement, an earlier ask holds the
+/// submission, or the approval worker has not finished an approved run of
+/// it. Read before the council is consulted, and again after it answers,
+/// because a rule or an answer can arrive while the council reads. `Err` is
+/// a fault reading the gate's own state.
+pub(crate) fn decided_without_council(
+    db: &crate::kernel_db::KernelDb,
+    spec: &GateSpec,
+    caller: &KjCaller,
+    layers: Layers<'_>,
+) -> Result<Option<String>, String> {
+    let policy = crate::kj::gate_policy::evaluate(db, spec, crate::kj::gate_policy::RuleCaller::of(caller), layers)
+        .map_err(|e| format!("the council could not read the gate rules: {e} (fail-closed — a ledger fault, not a decision)"))?;
+    let undecided = policy
+        .per_statement
+        .iter()
+        .any(|v| matches!(v, PolicyVerdict::Uncovered | PolicyVerdict::Ask(_)));
+    if policy.verdict() != AskVerdict::Escalate || !undecided {
+        return Ok(Some("the gate's rules decide this submission".to_string()));
+    }
+    let held = crate::kj::gate::ask_holding_submission(db, spec, caller)
+        .map_err(|e| format!("the council could not check for an earlier ask: {e} (fail-closed — a ledger fault, not a decision)"))?;
+    if let Some(request_id) = held {
+        return Ok(Some(format!("an earlier ask ({request_id}) still holds this submission")));
+    }
+    let running = crate::kj::gate::approved_run_unsettled(db, spec, caller).map_err(|e| {
+        format!("the council could not read approved runs of this command: {e} (fail-closed — a ledger fault, not a decision)")
+    })?;
+    if let Some(request_id) = running {
+        return Ok(Some(format!("the approval worker has not finished running this command ({request_id})")));
+    }
+    Ok(None)
+}
+
 /// Consult the council for one gate ask, or return `None` and leave the gate
 /// as it is without one. `Err` is a fault reading the gate's own state, and
 /// the caller refuses the submission as gate unavailable.
@@ -1809,32 +1844,8 @@ pub(crate) async fn consult(
             return Ok(None);
         }
         let layers = Layers { config, context_type: context_type.as_deref() };
-        let policy = crate::kj::gate_policy::evaluate(&db, spec, crate::kj::gate_policy::RuleCaller::of(caller), layers)
-            .map_err(|e| format!("the council could not read the gate rules: {e} (fail-closed — a ledger fault, not a decision)"))?;
-        let undecided = policy
-            .per_statement
-            .iter()
-            .any(|v| matches!(v, PolicyVerdict::Uncovered | PolicyVerdict::Ask(_)));
-        if policy.verdict() != AskVerdict::Escalate || !undecided {
-            return Ok(None);
-        }
-        let held = crate::kj::gate::ask_holding_submission(&db, spec, caller)
-            .map_err(|e| format!("the council could not check for an earlier ask: {e} (fail-closed — a ledger fault, not a decision)"))?;
-        if let Some(request_id) = held {
-            tracing::info!(
-                ask.held_by = %request_id,
-                "the council is not consulted: an earlier ask still holds this submission"
-            );
-            return Ok(None);
-        }
-        let running = crate::kj::gate::approved_run_unsettled(&db, spec, caller).map_err(|e| {
-            format!("the council could not read approved runs of this command: {e} (fail-closed — a ledger fault, not a decision)")
-        })?;
-        if let Some(request_id) = running {
-            tracing::info!(
-                ask.held_by = %request_id,
-                "the council is not consulted: the approval worker has not finished running this command"
-            );
+        if let Some(why) = decided_without_council(&db, spec, caller, layers)? {
+            tracing::info!("the council is not consulted: {why}");
             return Ok(None);
         }
         let cwd = db

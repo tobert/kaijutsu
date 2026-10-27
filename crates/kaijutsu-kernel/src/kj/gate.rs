@@ -598,7 +598,10 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 /// council allows, unless an earlier ask still holds the submission
 /// ([`ask_holding_submission`]) or an approved run of it has not settled
 /// ([`approved_run_unsettled`]); both are read under the guard that applies
-/// the allow. Every verdict is recorded with its reviewer context
+/// the allow. A bump is dropped, unrecorded, when the rules decide the
+/// submission or an ask or approved run holds it by the time the council
+/// answers (`council::gate::decided_without_council`). Every other verdict
+/// is recorded with its reviewer context
 /// skips: with the ask it led to, in the transaction that creates it, or
 /// unlinked when the gate stopped before an ask existed. A record that
 /// cannot be written refuses the call as gate unavailable. A report whose
@@ -616,6 +619,27 @@ pub(crate) async fn run_gate_recorded(
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
     let mut council = council;
+    // A bump refuses before the gate runs, so the rules and asks the council
+    // was consulted under are read again first: one that arrived while the
+    // council read decides the submission, and the bump is dropped.
+    if council.as_ref().is_some_and(|c| c.submission_bump().is_some())
+        && let Ok(gate_config) = config
+    {
+        let decided = {
+            let db = kernel.kernel_db().lock();
+            let context_type = super::gate_policy::context_type_of(&db, caller.context_id);
+            let layers = super::gate_policy::Layers { config: gate_config, context_type: context_type.as_deref() };
+            crate::council::gate::decided_without_council(&db, &spec, caller, layers)
+        };
+        match decided {
+            Ok(Some(why)) => {
+                tracing::info!("{why}; the council's bump is not applied");
+                council = None;
+            }
+            Ok(None) => {}
+            Err(reason) => return GateOutcome::unavailable_without_row(reason),
+        }
+    }
     if let Some(verdict) = council.as_mut()
         && let Some(refused) = refuse_bump(kernel, caller, verdict).await
     {
