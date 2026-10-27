@@ -798,6 +798,12 @@ impl Handler for SftpSession {
                 let to = canonicalize(&ext.newpath);
                 // Best-effort overwrite: remove an existing destination first,
                 // then rename. (A future slice can make this atomic in the VFS.)
+                // The source must exist before the destination is touched, and
+                // renaming a path onto itself changes nothing.
+                self.vfs.getattr(&from).await.map_err(reply)?;
+                if from == to {
+                    return Ok(Packet::Status(ok_status(id)));
+                }
                 if self.vfs.exists(&to).await {
                     self.vfs.unlink(&to).await.map_err(reply)?;
                 }
@@ -1028,6 +1034,30 @@ mod tests {
         // the existing target); /a.txt is gone.
         assert_eq!(vfs.read_all(Path::new("/b.txt")).await.unwrap(), b"aaa");
         assert!(!vfs.exists(Path::new("/a.txt")).await);
+    }
+
+    /// posix-rename onto itself is a no-op, and one from a missing source
+    /// fails; neither removes the destination.
+    #[tokio::test]
+    async fn posix_rename_keeps_the_target_on_self_rename_or_missing_source() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/a.txt"), b"aaa").await.unwrap();
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
+        let payload = |from: &str, to: &str| -> Vec<u8> {
+            HardlinkExtension { oldpath: from.into(), newpath: to.into() }.try_into().unwrap()
+        };
+
+        Handler::extended(&mut s, 1, POSIX_RENAME.into(), payload("/a.txt", "/a.txt"))
+            .await
+            .expect("self-rename succeeds");
+        assert_eq!(vfs.read_all(Path::new("/a.txt")).await.unwrap(), b"aaa");
+
+        let err = Handler::extended(&mut s, 2, POSIX_RENAME.into(), payload("/missing.txt", "/a.txt"))
+            .await
+            .expect_err("a missing source must fail");
+        assert_eq!(err.status_code, StatusCode::NoSuchFile);
+        assert_eq!(vfs.read_all(Path::new("/a.txt")).await.unwrap(), b"aaa");
     }
 
     #[tokio::test]
