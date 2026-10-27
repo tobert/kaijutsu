@@ -37,7 +37,7 @@ pub const COLON_PROMPT: &str = ":";
 
 /// What one keystroke asked the rest of the client to do.
 ///
-/// A keystroke produces edits *or* a submit *or* an unfocus *or* a `:` line,
+/// A keystroke produces edits *or* a submit *or* a `:` line,
 /// never a mix: a submit is `Enter` in normal mode and a `:` line is `Enter`
 /// with the bar focused, which the vi engine never sees as a submit.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -46,7 +46,6 @@ pub struct ComposeAction {
     pub ops: Vec<EditOp>,
     /// `Enter` in normal mode — submit the draft as a chat turn.
     pub submit: bool,
-    /// `Esc Esc` in normal mode — compose releases the keyboard.
     /// A `:` line submitted from the bar, `:` prefix included (`":kj fork"`,
     /// `":!ls"`, `":q"`). Compose stays pure and hands the raw text back —
     /// `run.rs` (`cmdline::parse`) decides what it means and runs it

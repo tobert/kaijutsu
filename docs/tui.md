@@ -531,9 +531,8 @@ Rules the figure carries:
   and a frozen diff refuse it with a notice — none of them is wired for one. Line
   endings are normalized, since terminals differ on what a pasted newline
   is. Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
-- There is no state past normal mode. The app's `Esc Esc` hands the
-  keyboard to its block list; the tui redraws its transcript every frame
-  from the mirror rather than printing it once into scrollback, and
+- There is no state past normal mode: a second `Esc` does nothing, as in
+  the app. The tui redraws its transcript every frame from the mirror rather than printing it once into scrollback, and
   reading it from the keyboard is scrolling, which is copy mode, not a
   block cursor — the unfocused state that reserved room for one was
   deleted (Amy: *"I don't think we need the unfocused mode at all"*). Vi

@@ -140,7 +140,7 @@ list.
 **The prefilled-`kj` prompt pattern** (Amy, 2026-07-16: "pop a kj so the
 user can type and hit enter — we might use that pattern elsewhere"): summon
 the shell surface with a command line already typed up to the argument,
-cursor at end, in insert mode; Enter runs it, Esc Esc abandons it. `Ctrl+A
+cursor at end, in insert mode; Enter runs it. `Ctrl+A
 A`, `Ctrl+A '`, and `Ctrl+A r` use it; any verb that needs one free-text
 argument can ride it. A shell line whose first word is `kj` runs through
 `executeKj`, its argv split on whitespace with no shell quoting, as the
@@ -164,7 +164,7 @@ outbox, so a submit always takes exactly what was typed before it
 | Key | Does |
 |---|---|
 | `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |
-| `Esc Esc` | Leave compose, when the second Esc lands in normal mode within 500 ms |
+| `Esc` | Vi's: insert or visual mode to normal mode, closes the `/`·`?`·`:` bar. A second Esc in normal mode does nothing, so `dd` and the other vi keys after it still act on the surface |
 | `Ctrl+C` | The interrupt ladder; the third press clears the surface |
 | `Ctrl+Z` | Toggle the root context and its shell child (`docs/character.md`, "The root console and its shell"); each context keeps its own chat draft |
 | `Ctrl+V` / middle click | Paste CLIPBOARD / PRIMARY at the cursor as one edit |
@@ -195,7 +195,7 @@ exactly one action.
 |---|---|
 | Vi editor (`Screen::Editor`) | Forwarded to kernel vi, never stolen |
 | Diff viewer (`Screen::Diff`) | To the app-local `DiffCore` (visual → normal). **Never closes the screen** — that is `q`/`ZQ`/`:q` (`docs/diff.md` slice 5) |
-| Compose overlay | To the surface's `EditorCore` (mode switch, closes the `/`·`?`·`:` bar); a second Esc within 500 ms that lands in normal mode dismisses (`PopLevel`) |
+| Compose overlay | To the surface's `EditorCore` (mode switch, closes the `/`·`?`·`:` bar). **Never leaves compose**: a second Esc in normal mode does nothing. Submitting leaves it, and so does the gamepad's East button (`PopLevel`) |
 | Quick-context overlay, **held** | Releases the hold, and nothing else — the level underneath stays put |
 | Ask sheet | `AskAside` — puts the ask **aside**, still pending, and nothing else |
 | Ledger ribbon | `CloseLedger` — closes the ribbon, returning to the sheet behind it if one was raised |
@@ -274,8 +274,10 @@ The scene should be fully navigable by pad once the contexts land.
   explicit grabs + per-surface contexts.
 - Three separate 500ms double-tap machines (`interrupt.rs`,
   `vim/dismiss.rs`, the dead `nav.rs::DoubleTap`) — consolidated on one
-  helper, `input/tap.rs`. Compose's double-Esc now lives in
-  `input/compose/`.
+  helper, `input/tap.rs`.
+- Compose's double-Esc dismiss — a second Esc in normal mode within 500 ms
+  left compose, so a stray second Esc moved the keyboard to the
+  conversation, where `x` excludes a block. Esc in compose is now vi's alone.
 
 ## Seeds parked elsewhere
 

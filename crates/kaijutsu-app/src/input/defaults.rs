@@ -279,8 +279,8 @@ pub fn default_bindings() -> Vec<Binding> {
     // while it is up: `input::compose::systems::compose_dispatch_keys` hands
     // every key to the surface's `EditorCore`. Ctrl+C, Ctrl+Z and Ctrl+V
     // are taken there before the vi engine sees them. Enter submits chat
-    // from normal mode and runs the shell line in any mode; Esc Esc in
-    // normal mode dismisses.
+    // from normal mode and runs the shell line in any mode; Esc is vi's,
+    // and a second Esc in normal mode does nothing.
 
     // ====================================================================
     // Dialog (modal dialog open)

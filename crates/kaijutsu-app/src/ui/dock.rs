@@ -207,7 +207,7 @@ impl Default for DockState {
                 font_size: 13.0,
             },
             hints: DockText {
-                text: "Esc Enter: submit │ Ctrl+Z: shell │ Esc Esc: dismiss".into(),
+                text: "Esc Enter: submit │ Ctrl+Z: shell".into(),
                 color: Color::WHITE,
                 font_size: 13.0,
             },
@@ -2099,7 +2099,7 @@ pub fn update_hints(
     let hints = match screen.get() {
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => {
-                "Esc Enter: submit \u{2502} Ctrl+Z: shell \u{2502} Esc Esc: dismiss"
+                "Esc Enter: submit \u{2502} Ctrl+Z: shell"
             }
             FocusArea::Conversation => {
                 "i: chat \u{2502} Ctrl+Z: shell \u{2502} j/k: navigate \u{2502} Alt+hjkl: pane"

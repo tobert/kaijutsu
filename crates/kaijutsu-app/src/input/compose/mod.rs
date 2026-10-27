@@ -17,12 +17,6 @@ use kaijutsu_editor::{EditOp, EditorCore};
 use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, PrincipalId, Status};
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::input::tap::TapCounter;
-
-/// The window for the double-Esc dismiss, in milliseconds (`docs/input.md`,
-/// "Escape").
-const ESCAPE_WINDOW_MS: u128 = 500;
-
 /// What one keystroke asked the rest of the app to do.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComposeAction {
@@ -30,8 +24,6 @@ pub struct ComposeAction {
     pub ops: Vec<EditOp>,
     /// `Enter` outside the `/`·`?`·`:` bar: submit the surface.
     pub submit: bool,
-    /// `Esc Esc` in normal mode: leave compose.
-    pub dismiss: bool,
     /// A `:` line submitted from the bar, prefix included.
     pub command: Option<String>,
     /// Something the vi engine reported, such as `Pattern not found: x`.
@@ -258,8 +250,6 @@ pub struct ComposeState {
     /// Submits sent and not yet answered. Until one is, the feed may still
     /// show the submitted text as the draft, so no mirror is taken.
     submits: usize,
-    /// The double-Esc dismiss.
-    escape: TapCounter,
 }
 
 // SAFETY: `EditorCore` holds a modalkit `ModalMachine`, whose only
@@ -283,7 +273,6 @@ impl Default for ComposeState {
             submitted: None,
             offered: None,
             submits: 0,
-            escape: TapCounter::new(ESCAPE_WINDOW_MS, 2),
         }
     }
 }
@@ -314,12 +303,12 @@ impl ComposeState {
             self.held.push(HeldInput::Key(key));
             return None;
         }
-        Some(press_with_escape(&mut self.chat, &mut self.escape, Submit::FromNormalMode, key))
+        Some(self.chat.press(Submit::FromNormalMode, key))
     }
 
     /// One keystroke on the shell surface.
     pub fn press_shell(&mut self, key: KeyEvent) -> ComposeAction {
-        press_with_escape(&mut self.shell, &mut self.escape, Submit::FromAnyMode, key)
+        self.shell.press(Submit::FromAnyMode, key)
     }
 
     /// A paste into the chat draft. `None` while the draft is loading: the
@@ -360,12 +349,6 @@ impl ComposeState {
         self.ledger.restart();
         self.offered = None;
         LoadStarted { read: self.reads, dropped }
-    }
-
-    /// Break the double-Esc gesture: the next Esc counts from one. A
-    /// surface change and a bypass key (Ctrl+C, Ctrl+Z, Ctrl+V) each do.
-    pub fn reset_escape(&mut self) {
-        self.escape.reset();
     }
 
     /// The chat buffer has no draft to follow (no context, or no
@@ -446,24 +429,6 @@ impl ComposeState {
             .find(|b| b.status == Status::Draft && b.id.principal_id == principal && Some(b.id) != self.submitted)
             .map(|b| b.content.as_str())
     }
-}
-
-/// A keystroke, with the double-Esc dismiss on top: a second Esc within
-/// the window, landing in normal mode, leaves compose. Any other key breaks
-/// the gesture, so `Esc x Esc` does not dismiss.
-fn press_with_escape(buffer: &mut ComposeBuffer, escape: &mut TapCounter, submit: Submit, key: KeyEvent) -> ComposeAction {
-    let mut action = buffer.press(submit, key);
-    if key.code != KeyCode::Esc {
-        escape.reset();
-        return action;
-    }
-    // The count saturates at 2 and stays armed until an Esc lands in normal
-    // mode, so `Esc Esc` from visual mode dismisses on the third press.
-    if escape.press() >= 2 && buffer.in_normal_mode() {
-        escape.reset();
-        action.dismiss = true;
-    }
-    action
 }
 
 /// A shell line whose first word is `kj`, as its argv after `kj`, split on
