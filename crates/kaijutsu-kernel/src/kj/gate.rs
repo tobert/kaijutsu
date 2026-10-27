@@ -523,14 +523,14 @@ fn submission_digests(spec: &GateSpec) -> Vec<String> {
 }
 
 /// Whether `row` asked about this submission: the same executable source, or
-/// the same statements (`digests`) under the same label.
+/// the same statements (`digests`), in order and with repetition, under the
+/// same label.
 fn asks_about_submission(
     db: &KernelDb,
     spec: &GateSpec,
     digests: &[String],
     row: &approval_ledger::types::ApprovalRow,
 ) -> KernelDbResult<bool> {
-    use std::collections::BTreeSet;
     if spec.exec_source.is_some() && row.exec_source == spec.exec_source {
         return Ok(true);
     }
@@ -538,8 +538,7 @@ fn asks_about_submission(
         return Ok(false);
     }
     let held = approval_ledger::ask::load_ask_statements(db.conn_for_ledger(), &row.request_id)?;
-    let wanted: BTreeSet<&str> = digests.iter().map(String::as_str).collect();
-    Ok(held.iter().map(|s| s.statement.statement_digest.as_str()).collect::<BTreeSet<_>>() == wanted)
+    Ok(held.iter().map(|s| s.statement.statement_digest.as_str()).eq(digests.iter().map(String::as_str)))
 }
 
 /// A human-allowed ask for this submission whose run has not settled, by the
@@ -2201,6 +2200,37 @@ mod tests {
         assert!(!outcome.allowed());
         assert_eq!(outcome.verdict, GateVerdict::Pending);
         assert_eq!(outcome.ask.as_ref().unwrap().status, AskStatus::Pending);
+    }
+
+    /// An open ask holds only the submission it asked about: the same
+    /// statements in the same order, each as many times. Reordered or
+    /// repeated statements are a different submission, which a council
+    /// allow may decide on its own.
+    #[tokio::test]
+    async fn an_open_ask_holds_only_its_own_statement_sequence() {
+        let d = gate_dispatcher().await;
+        let caller = registered_caller(&d);
+        let label = "kaish-source";
+        let outcome = run_gate(
+            d.kernel(),
+            &caller,
+            two_statement_spec(label, "ls", "rm x", 2),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+
+        let asked = two_statement_spec(label, "ls", "rm x", 2);
+        let reordered = two_statement_spec(label, "rm x", "ls", 2);
+        let mut repeated = two_statement_spec(label, "ls", "rm x", 2);
+        let again = two_statement_spec(label, "ls", "rm x", 2).statements.pop().unwrap();
+        repeated.statements.push(again);
+
+        let db = d.kernel_db.lock();
+        assert!(ask_holding_submission(&db, &asked, &caller).unwrap().is_some());
+        assert_eq!(ask_holding_submission(&db, &reordered, &caller).unwrap(), None, "reordered statements");
+        assert_eq!(ask_holding_submission(&db, &repeated, &caller).unwrap(), None, "a repeated statement");
     }
 
     /// The fault/verdict split, asserted at the seam it exists to protect.
