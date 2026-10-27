@@ -5639,7 +5639,7 @@ impl KernelDb {
                     ))
                 },
             )
-            .ok();
+            .optional()?;
         let Some((all_instances, all_facades, binding_admin)) = flags else {
             return Ok(None);
         };
@@ -9585,6 +9585,15 @@ mod tests {
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
         assert!(!holds(&db, ids["default"]), "the migration must run once");
         assert!(holds(&db, ids["mcp"]), "a second run changes nothing else");
+    }
+
+    /// A database fault while reading a binding is an error, not "unbound":
+    /// callers would read it as a context that grants nothing.
+    #[test]
+    fn get_context_binding_reports_a_database_fault() {
+        let db = KernelDb::temporary().unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE context_bindings;").unwrap();
+        assert!(db.get_context_binding(ContextId::new()).is_err());
     }
 
     /// `context_usage.cache_ttl_secs` must land on a DB created before the
