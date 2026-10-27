@@ -193,10 +193,14 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
 
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    // The human root refuses `drive`, so the lane is created and driven
+    // from a director context, as a person would.
+    let boss = home.run(&["kj", "--", "context", "create", "boss", "--type", "director"]);
+    assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
+    let create = home.run(&["kj", "--context", "boss", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 
-    let drive = home.run(&["kj", "--", "drive", "lane", "--prompt", "hi"]);
+    let drive = home.run(&["kj", "--context", "boss", "--", "drive", "lane", "--prompt", "hi"]);
     assert!(drive.status.success(), "kj drive failed: {}", stderr(&drive));
 
     let list = home.run(&["kj", "--", "block", "list", "-c", "lane"]);
@@ -229,11 +233,14 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     ]).to_string()).unwrap();
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    // The human root refuses `drive`; see the test above.
+    let boss = home.run(&["kj", "--", "context", "create", "boss", "--type", "director"]);
+    assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
+    let create = home.run(&["kj", "--context", "boss", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 
     let drive = Command::new(server_bin())
-        .args(["kj", "--", "drive", "lane", "--prompt", "run it"])
+        .args(["kj", "--context", "boss", "--", "drive", "lane", "--prompt", "run it"])
         .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
         .env("KJ_MOCK_SCRIPT_DIR", &scripts)

@@ -103,7 +103,7 @@ impl Held {
         // only the model's own calls should reach a reviewer here.
         common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "cd"]);
         config.auth_db_path = Some(auth_db_path);
-        common::seed_mock_backend_with_model(config.data_dir.as_ref().unwrap(), "mock-model");
+        common::bootstrap_mock(&config, "mock-model").await;
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {
             SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();

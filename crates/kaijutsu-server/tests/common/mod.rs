@@ -157,6 +157,31 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, default_model: &
     .expect("point defaults at the mock backend");
 }
 
+/// Set up `config`'s kernel the way `kaijutsu-server bootstrap` does, with the
+/// mock backend's `model` as its default: the backend, the defaults, `ROOT`,
+/// and its performer, all through `kj` as the ephemeral root character. Call
+/// it before the server boots; it holds the kernel lock while it runs.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn bootstrap_mock(config: &SshServerConfig, model: &str) {
+    let data_dir = config.data_dir.as_ref().expect("an ephemeral config has a data dir");
+    let root = kaijutsu_kernel::kernel_db::KernelDb::open(data_dir.join("kernel.db"))
+        .expect("open kernel.db")
+        .list_characters(false)
+        .expect("read characters")
+        .into_iter()
+        .find(|row| row.root)
+        .expect("an ephemeral config has a root character")
+        .name;
+    let opts = kaijutsu_server::bootstrap::BootstrapOptions {
+        root,
+        root_key: config.root_key().public_key().clone(),
+        key_comment: None,
+        backends: vec![kaijutsu_server::bootstrap::BackendChoice::mock(model)],
+        console_performer: "root".to_string(),
+    };
+    kaijutsu_server::bootstrap::bootstrap(config, &opts).await.expect("bootstrap the test kernel");
+}
+
 /// Start a server whose ephemeral kernel DB carries a mock LLM backend.
 ///
 /// This makes `initialize_kernel_models()` register a "mock" backend so that
