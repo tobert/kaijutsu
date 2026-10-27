@@ -4608,6 +4608,36 @@ mod tests {
         assert!(store.get(ctx).is_none());
     }
 
+    /// A mutation of a deleted block is refused before it changes the
+    /// document, so the context stays usable and re-deleting journals nothing.
+    #[test]
+    fn mutating_a_deleted_block_is_refused_and_the_context_stays_usable() {
+        use crate::blocks::BlockDocumentError;
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let id = store
+            .insert_block(ctx, None, None, Role::User, BlockKind::Text, "gone", Status::Done, ContentType::Plain)
+            .unwrap();
+        store.delete_block(ctx, &id).unwrap();
+        let version = store.version(ctx).unwrap();
+
+        let refused = |name: &str, result: BlockStoreResult<()>| {
+            assert!(
+                matches!(result, Err(BlockStoreError::Block(BlockDocumentError::BlockNotFound(b))) if b == id),
+                "{name} on a deleted block must be refused, got {result:?}"
+            );
+        };
+        refused("set_excluded", store.set_excluded(ctx, &id, true));
+        refused("set_ephemeral", store.set_ephemeral(ctx, &id, true));
+        refused("set_content_type", store.set_content_type(ctx, &id, ContentType::Markdown));
+        refused("set_exit_code", store.set_exit_code(ctx, &id, Some(1)));
+        refused("delete_block", store.delete_block(ctx, &id));
+
+        assert_eq!(store.version(ctx).unwrap(), version, "a refused mutation must not bump the version");
+        assert!(store.get(ctx).is_some(), "the context must stay usable");
+    }
+
     #[test]
     fn test_list_ids_by_kind() {
         let store = BlockStore::new(test_agent());

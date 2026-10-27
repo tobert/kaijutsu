@@ -986,6 +986,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.mark_deleted();
         self.version += 1;
@@ -1156,6 +1157,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_content_type(content_type);
         self.version += 1;
@@ -1237,6 +1239,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_exit_code(exit_code);
         self.version += 1;
@@ -1248,6 +1251,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_ephemeral(ephemeral);
         self.version += 1;
@@ -1259,6 +1263,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_excluded(excluded);
         self.version += 1;
