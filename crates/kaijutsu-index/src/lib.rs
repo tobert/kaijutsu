@@ -420,13 +420,14 @@ impl SemanticIndex {
                     // a crash artifact, not a normal eviction (eviction
                     // deletes the metadata row too, via evict_oldest). Drop
                     // the row; the watcher re-indexes this context on its
-                    // next terminal event.
+                    // next terminal event. Its synthesis rows stay: a graph
+                    // that failed to load orphans every row at once.
                     tracing::warn!(
                         context = %ctx_id.short(),
                         slot = slot,
                         "rebuild: metadata row has no graph point, repairing"
                     );
-                    meta.remove(*ctx_id)?;
+                    meta.remove_entry(*ctx_id)?;
                     repaired_orphan_rows += 1;
                 }
             }
@@ -1532,6 +1533,37 @@ mod tests {
             cached.top_blocks,
             vec![("blk1".to_string(), 0.95, "preview text".to_string())]
         );
+    }
+
+    /// A graph that fails to load leaves every metadata row orphaned, and the
+    /// startup rebuild drops those rows. Synthesis results do not depend on
+    /// graph slots, so they survive.
+    #[tokio::test]
+    async fn test_synthesis_survives_a_corrupt_graph() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let ctx = ContextId::new();
+        {
+            let idx = SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            idx.index_context(ctx, &make_blocks(ctx, "alpha context")).await.unwrap();
+            let result = synthesis::SynthesisResult {
+                keywords: vec![("alpha".to_string(), 0.9)],
+                top_blocks: vec![],
+                gist: Some("kept".to_string()),
+                content_hash: "hash-kept".to_string(),
+            };
+            idx.store_synthesis(ctx, result).unwrap();
+        }
+        // A truncated data file makes the load return an error. (A garbage
+        // graph header panics inside hnsw_rs instead.)
+        let data = dir.path().join("index.hnsw.data");
+        assert!(data.exists(), "fixture: the graph was saved");
+        std::fs::write(&data, b"").unwrap();
+
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+        assert_eq!(idx.len(), 0, "fixture: the orphan row was repaired");
+        let cached = idx.synthesis_cache().get_any(ctx).expect("synthesis must survive");
+        assert_eq!(cached.gist.as_deref(), Some("kept"));
     }
 
     #[tokio::test]
