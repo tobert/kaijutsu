@@ -257,14 +257,16 @@ project per kernel where a parameter costs nothing.
 2. Raise the DeepSeek backend's request and idle timeouts on this kernel.
    The 600 s request timeout covers the whole stream, which a long
    reasoning turn can exceed.
-3. Smoke test with `fleet/contained/live/council-cleanup.toml`
-   (`docs/acp-fleet.md`, "Live scenarios").
+3. Smoke test with one live turn that cleans up a scratch directory under
+   the council gate, and check the asks and the ledger rows it leaves.
 4. Check that the request prefix is byte-stable across turns with
    `KJ_LLM_REQUEST_DUMP` (`docs/telemetry.md`).
 5. The `agent-dev` stage, a `kaijutsu-dev.container` Quadlet, and the GPU
    drop-in.
-6. A bootstrap script: `init`, `add-key` for the supervisor,
-   `kj backend set`, the characters, `gate.toml`, and `rc reseed`.
+6. A bootstrap script around `kaijutsu-server bootstrap` (`docs/server-cli.md`,
+   "bootstrap"), which writes the root character and key and sets the
+   backend; the script adds `add-key` for the supervisor, the characters,
+   `gate.toml`, and `rc reseed`.
 7. A standalone test task: a one-page spec for a small Rust crate,
    acceptance tests the seat cannot see, a kaibo review step, and a step
    that writes `rocminfo` output to `GPU.md`. The supervisor runs the

@@ -188,8 +188,10 @@ tail as the description, 124 (the body timed out) asks, and any other exit
 denies (`mcp/broker.rs`, `classify_kaish_hook_exit`). A fault running the
 body asks; a `kaish_path` body that cannot be read denies. A scoring hook that cannot reach its service
 should exit 3 rather than fail, so an outage asks a human instead of
-stopping every seat; `crates/kaijutsu-acp-fleet/fleet/hook-*.toml` pins the
-three outcomes.
+stopping every seat. The `classify_kaish_hook_exit` unit tests in
+`mcp/broker.rs` pin each exit code; through a running kernel,
+`crates/kaijutsu-server/tests/gate_scenarios_wire.rs` pins a failing hook
+(deny, no ask) and a proceeding hook (the gate's ask stands).
 
 ## The file
 
@@ -472,8 +474,9 @@ unreleased one:
 5. **First tuning pass — superseded.** Its tests ran the shipped
    classifier hook through a real `shell_write` call; the hook is removed.
    `an_allow_tier_program_skips_the_hooks` (`mcp/broker.rs`) keeps the
-   all-Allow skip, and `fleet/gate-tiers.toml` keeps the tier order around a
-   hook. `kj handoff note` sits in the global allow tier.
+   all-Allow skip, and `a_proceeding_pre_call_hook_leaves_the_gate_ask`
+   (`crates/kaijutsu-server/tests/gate_scenarios_wire.rs`) keeps the tier
+   order around a hook. `kj handoff note` sits in the global allow tier.
 6. **The uncovered tier — shipped.** `uncovered = "ask" | "allow"` on
    `[global]` and each `[context_type.<type>]` (§The uncovered tier), decided
    last and reported as its own layer in `kj ledger rules`; a

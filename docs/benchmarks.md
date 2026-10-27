@@ -1,298 +1,54 @@
-# Running kaijutsu under a benchmark
+# Benchmark runs: the record
+
+The benchmark harness was removed on 2026-10-27: `contrib/bench` (the Harbor
+adapter, the host loop, the analysis scripts, the rc variants, and the gate
+files), `kaijutsu-solo-acp`, and `kaijutsu-acp-fleet`. They live in git
+history before that date. Kaijutsu's own end-to-end tests cover the kernel
+now (`crates/kaijutsu-server/tests/`). This file keeps what the runs
+recorded. The recipes that ran them are gone, so nothing here can be rerun
+as written.
 
 Amy: "we are *NOT* chasing high benchmark numbers, mostly using it to set our
 own personal bests and really using it to see what we need to do make kaijutsu
 make sense to others."
 
-So this is a measuring instrument for kaijutsu, not a leaderboard entry. A run
-answers what a coder context does when nobody is sitting with it: where a turn
+So this was a measuring instrument for kaijutsu, not a leaderboard entry. A run
+answered what a coder context does when nobody is sitting with it: where a turn
 stops, what an ask costs, how many tokens a solved task takes, and what a
-change to the instructions does to all three. What it does not answer is
+change to the instructions does to all three. What it did not answer is
 whether kaijutsu is better than another agent — the tasks are a fixed cheap
 subset, the model is a cheap model, and every number here is one sample.
 
 The story of how this was built is `docs/devlog.md`, "The benchmark that
-measured the harness (September 18)". What is still broken is `docs/issues.md`,
+measured the harness (September 18)". What the runs exposed is `docs/issues.md`,
 "What running under a benchmark showed (2026-09-18)".
 
-## The pieces
+## How the runs were made
 
-```
-harbor run                     host: builds the task image, one trial per task
-   │  podman compose
-task container
-   │  acp_runner.py — Harbor's ACP client, started in the task's working dir
-kaijutsu-solo-acp              static x86_64 binary, uploaded by the adapter
-   │  SSH + Cap'n Proto over 127.0.0.1, the real wire
-kaijutsu kernel                inside the same process (docs/solo-acp.md)
-   ├── gate policy             gate-sandbox.toml: [global] uncovered = "allow"
-   ├── workspace mount         the launch directory, read-write
-   └── rc overlay              optional: an instruction-set variant
-```
+Harbor built each Terminal-Bench task image and ran one trial per task under
+rootless podman. Inside the task container, Harbor's ACP client drove
+`kaijutsu-solo-acp`, a static binary that held a kernel in the same process
+and spoke to it over SSH and Cap'n Proto on 127.0.0.1. The kernel mounted
+the task's working directory read-write and ran the coder context under a
+sandbox gate (`[global] uncovered = "allow"`), optionally with an rc overlay
+that replaced some of the coder's rc files.
 
-`contrib/bench/harbor/kaijutsu_solo_agent.py` is the adapter that makes the
-binary present in a container that has never heard of it, builds the ACP
-registry entry, and writes provenance. `contrib/bench/harbor/run-harbor.sh`
-wraps `harbor run` around it and scans the output for the provider key.
-
-A model can write only where the kernel mounts a directory read-write
-(`docs/mounts.md`, "What a kernel mounts today"). `kaijutsu-solo-acp` mounts
-the directory it was launched in, which is the task's own working directory, so
-no `--mount` is needed for an ordinary task.
-
-## One-time setup
-
-Linux x86_64, rootless podman, `uv`, bash 4.4 or later, Python 3.12 or later.
-
-**Harbor** installs as a uv tool under a bench-work directory, with an `env.sh`
-that keeps it there:
-
-```bash
-source /home/atobey/src/bench-work/harbor/env.sh
-uv tool install --python 3.12 'harbor==0.23.0'
-harbor --version
-```
-
-Pin 0.23.0: `kaijutsu_solo_agent.py` subclasses Harbor's `AcpAgent` and checks
-its model-name split against Harbor's own, so a newer Harbor is a deliberate
-upgrade, not a side effect of reinstalling.
-
-`env.sh` exports `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `HARBOR_HOME`,
-`XDG_CACHE_HOME`, `XDG_DATA_HOME`, `DOCKER_CONFIG`, `DOCKER_HOST`, and a `PATH`
-that reaches the uv tool bin directory. `run-harbor.sh` sources it;
-`HARBOR_ENV_SH` names it.
-
-**The compose provider.** Harbor drives podman through `podman compose` and
-passes `--project-directory`, which `podman-compose` does not accept — the
-trial's teardown fails on it. Install Docker's own `docker-compose` v2 binary,
-put it on `PATH` under that name, and point it at podman's socket:
-
-```bash
-systemctl --user enable --now podman.socket
-# in env.sh:
-# DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
-# PODMAN_COMPOSE_PROVIDER=<bench-work>/harbor/uv-tool-bin/docker-compose
-```
-
-Name the provider with `PODMAN_COMPOSE_PROVIDER`. A host that also has the
-distribution's `podman-compose` installed (moltar does, 1.6.0) otherwise
-depends on `PATH` order to pick the right one. `podman compose version` must
-print `Docker Compose version v5.x`, not `podman-compose`.
-
-Check the setup without spending tokens: the `oracle` agent runs the task's
-own solution.
-
-```bash
-harbor run --dataset "terminal-bench@2.0" -i fix-git -a oracle -e podman \
-  -o /home/atobey/src/bench-work/harbor/jobs --job-name tb2-fix-git-oracle -y
-# 26 s on moltar, reward 1.0
-```
-
-`PODMAN_COMPOSE_WARNING_LOGS=false` is exported by `run-harbor.sh`. Without it
-`podman compose` prints `>>>> Executing external compose provider … <<<<` on
-every invocation, Harbor folds a compose exec's stderr into its stdout, and
-the banner lands in the output of commands Harbor parses — the first casualty
-is `uname -s && uname -m` in `AcpAgent._detect_platform`. This hits Harbor's
-stock `acp` agent under podman too.
-
-**The provider key** lives in one file, mode 600, named by
-`KAIJUTSU_ACP_KEY_FILE` (default `~/.deepseek-key`). `run-harbor.sh` reads it
-into its own environment and gives Harbor the template
-`--ae DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}`, never the value. Harbor resolves a
-template from the host environment at run time and persists it unchanged, so
-the job's `config.json` holds the template. The script refuses to run under
-`set -x`, which would print the key twice.
-
-After the run it greps the job directory for the key. Exit 3 means the key was
-found, naming the files; exit 4 means the job directory was never created, so
-nothing was scanned; exit 5 means `grep` itself failed and the run is
-unverified. Only `grep`'s "no match" is reported as clean.
-
-The scan does not cover Harbor's console output if the caller redirects it to a
-file, the environment of a running process (the key rides `podman compose exec
--e KEY=value`, visible in that process's argv), or podman's recorded container
-environment until the container is removed.
-
-Inside the container the model can also read the key from `/proc` when the
-agent runs as root, which is usual for a task image. `kaijutsu-solo-acp` clears
-its dumpable flag, which stops a same-uid reader but not root
-(`docs/solo-acp.md`, "The key and /proc"). Use a key scoped to the benchmark
-account, not a long-lived one.
-
-## Building the binaries
-
-Build from a clean detached worktree, not the shared checkout. Other players'
-uncommitted edits would otherwise land in the binary, and `BUILD_INFO.json`
-would record it as dirty.
-
-```bash
-git worktree add --detach ~/src/wt/kj-bench-build HEAD
-WORKTREE=~/src/wt/kj-bench-build contrib/bench/build-static.sh
-```
-
-It needs rootless podman and nothing else: the worktree is mounted read-only,
-cargo runs inside the container, and every artifact lands under `WORK_ROOT`
-(default `/home/atobey/src/bench-work/dist`). `WORKTREE` names the source tree.
-`CARGO_BUILD_JOBS` (default 4) caps cargo's parallelism; a cold build took
-12.5 minutes at 4 jobs on moltar (2026-09-30).
-
-Output is `$WORK_ROOT/out/kaijutsu-solo-acp`, `kaijutsu-server`, and
-`kaijutsu-acp`, stripped, plus
-`$WORK_ROOT/kaijutsu-agent-linux-x86_64.tar.gz`.
-
-The static link flags go in
-`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS`, not `RUSTFLAGS`. A blanket
-`RUSTFLAGS` applies to host builds too, and rustc refuses to build a
-proc-macro crate as `+crt-static`. The explicit `--target` is what separates
-host artifacts from target artifacts.
-
-The script proves linkage itself: it prints `file` and `ldd` for each binary,
-then runs each one's `--help` inside `debian:bookworm-slim`, `ubuntu:24.04`,
-and `alpine:3.22`. A dynamic dependency shows up as an `ldd` line and as a
-failing smoke test.
-
-## The host loop, without containers
-
-Use this to debug the bridge, the gate, and the ask path. It is the only loop
-where asks actually fire, because it keeps the shipped gate policy instead of
-the sandbox tier.
-
-```bash
-uv venv /home/atobey/src/bench-work/acp-venv --python 3.12
-uv pip install --python /home/atobey/src/bench-work/acp-venv agent-client-protocol
-
-./contrib/bench/boot-kernel.sh --run-id ds-01 --port 22724 --model deepseek
-./contrib/bench/run-host-task.sh \
-  /home/atobey/src/bench-work/kernels/ds-01 \
-  /home/atobey/src/bench-work/tasks/py-fizz \
-  "Run 'python3 -m unittest -v' in this directory. One test fails. Fix fizz.py so every test passes, then run the tests again to confirm." \
-  ds-run-1
-./contrib/bench/stop-kernel.sh /home/atobey/src/bench-work/kernels/ds-01
-```
-
-`boot-kernel.sh` takes `--run-id`, `--port`, and `--model mock|deepseek`, and
-nothing else; it refuses port 2222. The mock model needs a server built with
-`--features kaijutsu-kernel/test-mock` and replays
-`contrib/bench/mock_scripts/`. `contrib/bench/README.md` covers the run
-directory, the gate patch, and reading `acp-events.jsonl`.
-
-There is no standalone `kj` binary. `contrib/bench/kjmcp.py` runs `kj` commands
-against a running kernel over the MCP stdio bridge.
-
-## Running a suite
-
-```bash
-# one standalone task
-./contrib/bench/harbor/run-harbor.sh --job-name kj-hello-world \
-  --task-path /home/atobey/src/harbor/examples/tasks/hello-world
-
-# one task from a dataset
-./contrib/bench/harbor/run-harbor.sh --job-name kj-fix-git \
-  --dataset "terminal-bench@2.0" --task fix-git
-
-# the pinned 20-task subset
-./contrib/bench/harbor/run-harbor.sh --job-name kj-tb2-armA \
-  --dataset "terminal-bench@2.0" \
-  --task-file contrib/bench/analysis/tb2-subset.txt
-```
-
-`--job-name` must not already exist: the key scan covers exactly that
-directory. Everything after `--` reaches `harbor run` unchanged.
-
-The subset is 20 of Terminal-Bench 2.0's 89 tasks, pinned to commit
+The 20-task subset is 20 of Terminal-Bench 2.0's 89 tasks, pinned to commit
 `69671fbaac6d67a7ef0dfec016cc38a64ef7a77c`. They were chosen to be runnable by
 a cheap model on one workstation: 12 of the dataset's 16 categories, 3 easy /
 12 medium / 5 hard, every base image `ubuntu:24.04` or a `python:3.1x-slim`
 variant, every `agent_timeout_sec` at or under 1800 seconds, and every
 candidate's Dockerfile and `setup.sh` read for a GPU, a heavy ML install, or a
 large download before it was included.
-`contrib/bench/analysis/tb2-subset.md` holds the table and the exclusions.
 
-Settings ride environment variables, each of which has a matching
-`--ak key=value`:
+The control arm was mini-swe-agent, the standard bash-only harness, on the
+same tasks and the same model, so the difference between the two rows is
+kaijutsu.
 
-| Variable | Kwarg | What it sets |
-|---|---|---|
-| `KAIJUTSU_ACP_MAX_TOKENS` | `max_tokens` | `--max-tokens N`. Unset: 65536 on DeepSeek (V4's advertised output limit), else the factory ceiling, 16384. |
-| `KAIJUTSU_ACP_WORKSPACE_MOUNTS` | `workspace_mounts` | Comma-separated directories mounted read-write and made if missing, written to the state directory's `config/mounts.toml`. Unset: `/app,/git,/srv`. Empty: none. |
-| `KAIJUTSU_ACP_RC_OVERLAY` | `rc_overlay` | A local rc variant directory, uploaded and applied before any context is created. |
-| `KAIJUTSU_ACP_EGRESS_ALLOW` | `egress_allow` | Comma-separated hosts the coder context's `curl` may reach (`docs/egress.md`). Unset: `*`, every host. Empty: none. The adapter adds `coder/create/S50-egress.kai` to the rc overlay; it runs `kj context set . --egress-allow HOST` as the root character `solo`, the context's lineage root. It refuses an overlay that already has that file, and a `--context-type` in `solo_args`. |
-| `KAIJUTSU_ACP_OTLP_ENDPOINT` | `otlp_endpoint` | OTLP gRPC endpoint the agent exports traces to, as the task container reaches it: `http://host.containers.internal:4317` on moltar. Sets `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_RESOURCE_ATTRIBUTES` (`harbor.job.name`, `harbor.trial.name`, `harbor.task.name`, `kaijutsu.commit`) in the agent's environment; the service name is `kaijutsu-solo-acp`. Unset: no export. A loopback address is refused, because inside the container it is the container's own. The collector must listen beyond loopback; run `contrib/bench/otel-collector-listen.sh` as root once. |
-| `KAIJUTSU_ACP_MODEL` | `solo_model` | The model id. Unset: `deepseek-v4-flash`. |
-| `KAIJUTSU_ACP_BACKEND` | `backend_kind` | The provider. Unset: `deepseek`. |
-| `KAIJUTSU_ACP_BASE_URL` | `base_url` | `--base-url URL`, an OpenAI-compatible endpoint. Unset: the provider's own. |
-| `KAIJUTSU_ACP_KEY_FILE`, `KAIJUTSU_ACP_KEY_ENV` | `api_key_env` (the variable name) | The key's file, and the variable it travels in. The adapter passes the name as `--api-key-env`. Default `~/.deepseek-key` in `DEEPSEEK_API_KEY`. |
-| `KAIJUTSU_ACP_RUST_LOG` | `rust_log` | Default `info`. Below `info` the run keeps no token record. |
-| `KAIJUTSU_ACP_BINARY`, `KAIJUTSU_ACP_GATE` | `binary_path`, `gate_config_path` | The uploaded binary and gate policy. |
-
-`harbor agent schema kaijutsu_solo_agent:KaijutsuSoloAcp` prints them, with
-`PYTHONPATH` on `contrib/bench/harbor`.
-
-### Qwen on Alibaba, and tenchi
-
-Both are OpenAI-compatible, so a run names the
-`openai` provider, the endpoint, and the variable the key travels in. The
-Alibaba workspace endpoint is the one crush uses; read it from there rather
-than writing it into this repository:
-
-```bash
-# Qwen 3.8 flash on Alibaba Model Studio
-KAIJUTSU_ACP_BACKEND=openai KAIJUTSU_ACP_MODEL=qwen3.8-flash \
-KAIJUTSU_ACP_BASE_URL="$(jq -r .providers.alibaba.base_url ~/.config/crush/crush.json)" \
-KAIJUTSU_ACP_KEY_FILE=~/.alibaba-inference-key.txt KAIJUTSU_ACP_KEY_ENV=ALIBABA_API_KEY \
-HARBOR_AGENT_TIMEOUT_MULTIPLIER=1 \
-  ./contrib/bench/harbor/run-harbor.sh --job-name kj-qwen-fixgit-1 \
-  --dataset "terminal-bench@2.0" --task fix-git
-```
-
-tenchi (the DGX Spark, vLLM serving `qwen3.8-27b`) takes no key and is slow:
-about 17 tokens a second, and 25 s to prefill the coder seat. Give it its
-thinking room. `KAIJUTSU_ACP_NO_KEY=1` runs with no key and no key scan, and
-the two timeouts land on the backend row:
-
-```bash
-KAIJUTSU_ACP_BACKEND=openai KAIJUTSU_ACP_MODEL=qwen3.8-27b \
-KAIJUTSU_ACP_BASE_URL=http://tenchi-inference.taila4abc.ts.net:8000/v1 \
-KAIJUTSU_ACP_NO_KEY=1 KAIJUTSU_ACP_IDLE_TIMEOUT=600 KAIJUTSU_ACP_REQUEST_TIMEOUT=1800 \
-HARBOR_AGENT_TIMEOUT_MULTIPLIER=5 \
-  ./contrib/bench/harbor/run-harbor.sh --job-name kj-tenchi-openssl-2 \
-  --dataset "terminal-bench@2.0" --task openssl-selfsigned-cert
-```
-
-Rootless task containers on moltar reach both: the tailnet name resolves
-inside the container. The kernel drops the factory `effort = high` on either
-endpoint with a warning (`effort has no sink on a non-hosted, non-DeepSeek
-OpenAI-compatible endpoint`), so these runs use each model's default
-reasoning.
-
-`HARBOR_AGENT_TIMEOUT_MULTIPLIER` (default 5) multiplies each task's own
-`agent_timeout_sec`. Raise it when a run is being cut off mid-work; set it to 1
-to hold the agent to the task's own published timeout.
-
-The wrapper pins one attempt per trial (`-k 1`) and runs `HARBOR_CONCURRENCY`
-trials at once (default 1). The job provenance records both.
-Whether `harbor run -e podman` is well behaved above one concurrent trial under
-rootless podman has not been tested here.
-
-Harbor's own `--model` is not passed through: its runner raises when a model is
-requested and the agent advertises no model-selection mechanism, and kaijutsu
-advertises none. `contrib/bench/harbor/README.md` covers what happens to a
-`--model` that is given anyway.
-
-## Reading results
-
-```bash
-python3 contrib/bench/analysis/summarize_job.py <job-dir>
-python3 contrib/bench/analysis/classify_run.py <job-dir>/<trial>/agent \
-  --kernel-log <job-dir>/<trial>/agent/acp.txt
-```
-
-`summarize_job.py` prints one row per trial plus totals; `--format jsonl` gives
-one JSON object per trial and one for the totals. `classify_run.py` reports one
-run in detail; `--format text` shortens it.
+## Reading the columns
 
 **`turn_end_class` says how the turn ended, not whether the task passed.**
-Harbor's verifier decides that, from `verifier/reward.txt` and
+Harbor's verifier decided that, from `verifier/reward.txt` and
 `verifier/ctrf.json`. A turn can end cleanly on a wrong answer, and a task can
 pass after a turn that fell over.
 
@@ -304,7 +60,7 @@ pass after a turn that fell over.
 | `yielded_on_async` | the last tool result left an operation nobody awaited |
 | `output_starved` | the last tool results spilled their output cap |
 | `token_ceiling` | `max_tokens` |
-| `iteration_cap` | ACP `max_turn_requests`; kaijutsu's agentic loop has no per-turn iteration cap today, so this class is unreachable from a kaijutsu trial |
+| `iteration_cap` | ACP `max_turn_requests`; kaijutsu's agentic loop has no per-turn iteration cap, so this class is unreachable from a kaijutsu trial |
 | `cancelled` | `session/cancel` |
 | `provider_failure` / `setup_failure` | the run errored, with or without a session |
 | `unclassified_stop_reason` | a stop reason this scheme does not name |
@@ -322,13 +78,11 @@ the refusal costs the task.
 
 The **verdict line** is the driven-worker convention: the worker's final
 message ends with `RESULT: done`, `RESULT: blocked — …`, or
-`RESULT: gave up — …`, alone on the last line
-(`contrib/bench/rc-variants/coder-driven/README.md`, "The verdict line"). Both
-tools read it. The totals compare it against Harbor's own reward:
-`verdict_done_and_solved`, `verdict_done_but_failed` (the worker claimed done
-and the verifier disagreed), `verdict_not_done_but_solved`.
+`RESULT: gave up — …`, alone on the last line. The totals compare it against
+Harbor's own reward: `verdict_done_and_solved`, `verdict_done_but_failed` (the
+worker claimed done and the verifier disagreed), `verdict_not_done_but_solved`.
 
-Totals worth watching:
+Totals:
 
 - `tokens_per_solved_task` — tokens over solved trials, divided by the solved
   trials that carried token data. The harness literature reports up to 40x
@@ -337,104 +91,31 @@ Totals worth watching:
 - `ask_count`, `stall_count`, `turns_ended_early`. A trial stalls when it
   yielded on an ask or an async operation, or orphaned an ask. It ended early
   when its class is not `completed_verified` and its reward is below 1.0.
-- `tokens_source` per row. Harbor's own token and cost columns stay empty:
-  kaijutsu sends no `PromptResponse.usage`. The kernel log riding the agent's
-  stderr into `agent/acp.txt` is the only token record, scoped to that trial's
-  session id.
-- Token columns, from the kernel log's "LLM stream completed" line. Each
-  provider's own meaning is kept:
+- Token columns come from the kernel log's "LLM stream completed" line, scoped
+  to the trial's session id; kaijutsu sends no `PromptResponse.usage`, so
+  Harbor's own token columns stayed empty. Each provider's own meaning is kept:
   - `tokens_in` is the provider's input count. Anthropic excludes prompt-cache
     reads and writes from it. DeepSeek includes its cache hits.
   - `cache_read_tokens` and `cache_write_tokens` are Anthropic's cache reads
-    and writes, logged as `cache_read=` and `cache_write=`. They are not in
-    `tokens_in`.
-  - `cache_hit_tokens` is DeepSeek's cache hit count, logged as `cache_hit=`.
-    It is already in `tokens_in`, so it is never added.
+    and writes. They are not in `tokens_in`.
+  - `cache_hit_tokens` is DeepSeek's cache hit count. It is already in
+    `tokens_in`, so it is never added.
   - `input_total` is `tokens_in + cache_read_tokens + cache_write_tokens`: all
     input sent to the model. For DeepSeek it equals `tokens_in`.
-  - A cache column is empty when no log line carried it: jobs run before these
-    fields existed, or a provider that reports no cache split. Empty means
-    unknown, not zero. `tokens_per_solved_task` still uses `tokens_in` plus
-    `tokens_out`, so it undercounts Anthropic runs; compare Anthropic runs on
-    `input_total`.
+  - An empty cache column means unknown, not zero. `tokens_per_solved_task`
+    uses `tokens_in` plus `tokens_out`, so it undercounts Anthropic runs;
+    compare Anthropic runs on `input_total`.
 
-**Provenance.** `<job>/kaijutsu-job-provenance.json` records what was asked
-for: job name, dataset or task path, task names, Harbor version, timeout
-multiplier, binary and gate paths, the key's variable name, Harbor's exit
-status. `<job>/<trial>/agent/kaijutsu-provenance.json` records what ran:
-`binary.sha256` and size, `gate.sha256`, `worktree.head` and whether it was
-dirty, backend and model, `max_tokens`, the rc overlay and its
-hash, the egress hosts and their script, the CA bundle, and the state directory.
-
-To map a binary back to a commit, match `binary.sha256` against
-`BUILD_INFO.json`, which `build-static.sh` writes beside the binaries and into
-the tarball with the commit it compiled and whether that tree was dirty.
-`worktree.head` in the trial file is the adapter's worktree at upload time; it
-identifies the adapter, the gate file and the rc variant, and it can be newer
-than the binary when the branch moved after the build.
-
-## Comparing instruction sets
-
-An rc variant replaces some of a context type's rc files and changes nothing
-else. `contrib/bench/rc-variants/coder-driven/` is the worked example: it gives
-the coder type a driven-worker contract in place of the shared collaborative
-base. Its README states what it replaces, why the loader accepts it, and the
-confounds to name in a result.
-
-Run the arms as one variable:
-
-```bash
-./contrib/bench/harbor/run-harbor.sh --job-name kj-tb2-armA-shipped \
-  --dataset "terminal-bench@2.0" --task-file contrib/bench/analysis/tb2-subset.txt
-
-KAIJUTSU_ACP_RC_OVERLAY="$PWD/contrib/bench/rc-variants/coder-driven" \
-  ./contrib/bench/harbor/run-harbor.sh --job-name kj-tb2-armB-driven \
-  --dataset "terminal-bench@2.0" --task-file contrib/bench/analysis/tb2-subset.txt
-```
-
-The overlay path resolves against the directory `harbor` runs in, so give it
-absolutely.
-
-Same tasks, same binary, same gate policy, same token
-ceiling, same timeout multiplier. Each job's provenance records all of them, and
-the overlay's sha256 ties a job to the exact variant that produced it. Compare
-with `summarize_job.py`: pass rate, tokens per solved task, `turns_ended_early`,
-and verdict agreement.
-
-## Control arm
-
-A benchmark number without a control arm measures the model, not the
-instrument. The control is mini-swe-agent — the standard bash-only harness —
-on the same tasks and the same model, so the difference between the two rows is
-kaijutsu.
-
-Run it with `contrib/bench/harbor/run-control.sh`, which takes the same
-arguments as `run-harbor.sh` and handles the key and the post-run scan the same
-way (`contrib/bench/harbor/README-control.md`):
-
-```bash
-HARBOR_CONTROL_AGENT_TIMEOUT_MULTIPLIER=1 HARBOR_CONTROL_STEP_LIMIT=100 \
-HARBOR_CONTROL_COST_LIMIT="0.25" \
-contrib/bench/harbor/run-control.sh --job-name ctl-tb2-miniswe \
-  --dataset "terminal-bench@2.0" --task-file contrib/bench/analysis/tb2-subset.txt
-```
-
-The model string is `deepseek/deepseek-v4-flash`; litellm already prices it.
-mini-swe-agent ships with no step limit, and Harbor overrides its $3 cost limit
-to unlimited. kaijutsu's agentic loop has no per-turn iteration cap either
-(`docs/issues.md`, "Per-cast turn token budget"), so `HARBOR_CONTROL_STEP_LIMIT`
-has no kaijutsu value to match; pick a limit that bounds the control run's
-cost instead. Its shell inherits the process environment: a model that
-runs `env` puts the provider key in its transcript. That happened once in the
-recorded control run; the post-run scan exits 3 and names the file to scrub.
-
-`summarize_job.py` already reads a non-ACP trial: it reports
-`turn_end_class: "n/a"` and takes tokens and cost from Harbor's own
-`agent_result`, which litellm-backed agents do populate.
+**Provenance.** Each job recorded what was asked for (task names, Harbor
+version, timeout multiplier, binary and gate paths) and each trial recorded
+what ran (`binary.sha256`, `gate.sha256`, the worktree head, backend and
+model, `max_tokens`, the rc overlay and its hash). `BUILD_INFO.json`, written
+beside the static binaries, mapped a `binary.sha256` to the commit it
+compiled; that is the `Binary → commit` column below.
 
 ## Cost
 
-A Terminal-Bench 2.0 task costs about $0.02 on `deepseek-v4-flash`. Measured by
+A Terminal-Bench 2.0 task cost about $0.02 on `deepseek-v4-flash`. Measured by
 DeepSeek account balance before and after `kj-calib-1`: three tasks, 2.65M input
 tokens, $0.05. The account is shared with kaibo's DeepSeek cast, so a balance
 delta is an upper bound on what a run spent, never an under-count.
@@ -442,11 +123,11 @@ delta is an upper bound on what a run spent, never an under-count.
 A full day of this work, about 70 task runs across four arms plus reviews,
 took the balance from $60.07 to $56.21.
 
-Per-run token counts come from `summarize_job.py`, which reads the kernel log.
-They are exact; only the dollar figure is a bound.
+Per-run token counts came from the kernel log. They are exact; only the
+dollar figure is a bound.
 
-Qwen runs on Alibaba bill against Amy's plan, and no dollar figure was taken
-for them; use the token counts. tenchi costs nothing but time.
+Qwen runs on Alibaba billed against Amy's plan, and no dollar figure was taken
+for them; use the token counts. tenchi cost nothing but time.
 
 ## Recorded baselines
 
@@ -963,7 +644,7 @@ at once for most of the run.
 
 `docs/issues.md`, "What running under a benchmark showed (2026-09-18)" holds
 what these runs exposed and what is still open, most costly first. A model's
-turn now holds on its own ask and reads the approved command's output as its
-tool result (`docs/gate-resume.md`, "The turn holds"), but no benchmark has run
-the ask path since: the sandbox gate tier allows everything, which is why every
+turn holds on its own ask and reads the approved command's output as its tool
+result (`docs/gate-resume.md`, "The turn holds"), but no recorded run took the
+ask path: the sandbox gate tier allowed everything, which is why every
 recorded run has an ask count of zero.

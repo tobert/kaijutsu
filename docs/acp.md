@@ -254,11 +254,11 @@ under their own names, qualified only on a collision, like any broker tool.
   handshake within the kernel's `mcp_connect_timeout`, 10 s by default
   (`internal_error`). A fresh context from a failed `session/new` is
   archived.
-- **Command.** `command` runs on the kernel host, which is the same machine
-  as the client for `kaijutsu-solo-acp`. A bare name is found on the
-  kernel's `PATH`; ACP asks for an absolute path, and Harbor sends both. The
-  server inherits the kernel's environment plus the declared `env`, and the
-  kernel process's working directory, not the session cwd.
+- **Command.** `command` runs on the kernel host, which may not be the
+  client's machine. A bare name is found on the kernel's `PATH`; ACP asks
+  for an absolute path. The server inherits the kernel's environment plus
+  the declared `env`, and the kernel process's working directory, not the
+  session cwd.
 
 ## Remaining work, in shippable hunks
 

@@ -1,1 +1,0 @@
-The script uses urllib.request.urlopen to fetch package metadata from pypi.org, which is routine package lookup traffic. It only reads the JSON response and prints version fields; it does not open, modify, or delete local files, and it sends no data off the host.

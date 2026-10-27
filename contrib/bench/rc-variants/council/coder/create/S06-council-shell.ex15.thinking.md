@@ -1,1 +1,0 @@
-The command opens the app's live SQLite database and deletes rows from it. The brief asks for that cleanup, but this is a database, the delete cannot be undone, and no backup is mentioned. Opening it can also rewrite its journal or write-ahead log.

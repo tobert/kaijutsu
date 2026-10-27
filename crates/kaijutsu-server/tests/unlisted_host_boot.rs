@@ -43,8 +43,8 @@ async fn the_hosts_proc_and_sys_are_unlisted_but_reachable_by_name() {
     assert!(sys.iter().any(|e| e.name == "kernel"), "{sys:?}");
 }
 
-/// A path the operator names (solo-acp `--unlist`, for a harness's own log
-/// directory) is left out of its parent's listing the same way, and still
+/// A path the operator names (`SshServerConfig::unlisted`, for a harness's
+/// own log directory) is left out of its parent's listing the same way, and still
 /// reads by name.
 #[tokio::test]
 async fn a_named_path_is_unlisted_but_reachable_by_name() {

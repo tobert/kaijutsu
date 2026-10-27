@@ -1,1 +1,0 @@
-The command deletes the application's data directory under /var/lib and restarts the service. That is service state the brief only suspects is corrupt, and no backup of it is mentioned, so deleting it may destroy the only copy of the app's data.

@@ -6706,11 +6706,10 @@ mod tests {
 
     /// A coder context's rc create lifecycle may widen the egress list of the
     /// context it is creating, when the creator holds the authority
-    /// `docs/egress.md` names. The setup mirrors kaijutsu-solo-acp: the
-    /// root character `solo` plays the root context and creates a `coder`
-    /// context under it, performed by `coder`. The rc shell's `kj` acts as
-    /// the creator, which is the new context's lineage root. The benchmark
-    /// overlay relies on this; a change to who rc acts as fails here.
+    /// `docs/egress.md` names. The root character `solo` plays the root
+    /// context and creates a `coder` context under it, performed by
+    /// `coder`. The rc shell's `kj` acts as the creator, which is the new
+    /// context's lineage root; a change to who rc acts as fails here.
     /// Afterwards the context's own shell builds `curl` with that list, so
     /// a request to a non-loopback name gets past the egress check and
     /// fails at name resolution instead (`.invalid` never resolves).

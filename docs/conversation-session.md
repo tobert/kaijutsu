@@ -142,9 +142,7 @@ calls it.
 
 A driver reads the verdict from the context: `kj wait` prints
 `done: STATUS — SUMMARY` and carries it as `done` in its data, and an ACP
-client sees the `done` call and its result. `contrib/bench/analysis/
-classify_run.py` reports it as the run's verdict (`verdict_source:
-done_tool`).
+client sees the `done` call and its result.
 
 ## Kernel instructions
 

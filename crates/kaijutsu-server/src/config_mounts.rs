@@ -165,7 +165,7 @@ impl ConfigMounts {
     }
 
     /// The kernel's read-write mounts: `[workspace].rw`, then `flags`
-    /// (`--rw-mount`, or solo-acp's `--mount`). Makes missing declared
+    /// (`--rw-mount`). Makes missing declared
     /// directories first when `create = true`. The caller validates the list.
     pub fn rw_mounts_with(&self, flags: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         self.create_workspace()?;

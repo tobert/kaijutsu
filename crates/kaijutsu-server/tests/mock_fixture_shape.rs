@@ -7,18 +7,10 @@
 //! externally tagged shape. Parsing the fixtures against that type here
 //! names the offending file in milliseconds; the alternative is discovering
 //! a shape drift through `session_scenario.rs`'s 30 s timeout.
-//!
-//! Covers both crates that load fixtures through that one mechanism: this
-//! crate's `tests/mock_scripts/*.json` and `kaijutsu-solo-acp`'s
-//! `tests/mock_scripts/{chat,file}/solo-mock.json`, which
-//! `solo_acp_stdio.rs`'s `mock_scripts()` points the variable at. Both are
-//! reached by a filesystem walk from `CARGO_MANIFEST_DIR`: this test needs
-//! nothing from `kaijutsu-solo-acp` but its checked-in fixture files.
 
 use kaijutsu_kernel::llm::stream::StreamEvent;
 
-/// Every committed mock-script fixture under `dir`, recursively (the
-/// solo-acp fixtures are one directory deeper, under `chat/` and `file/`).
+/// Every committed mock-script fixture under `dir`, recursively.
 fn collect_json_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
     for entry in entries {
@@ -32,24 +24,12 @@ fn collect_json_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) 
     }
 }
 
-/// Every fixture this test covers, across both crates.
+/// Every fixture this test covers.
 fn fixture_paths() -> Vec<std::path::PathBuf> {
-    let server_scripts =
-        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mock_scripts"));
-    let solo_scripts = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../kaijutsu-solo-acp/tests/mock_scripts"
-    ));
+    let scripts = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mock_scripts"));
     let mut paths = Vec::new();
-    for dir in [server_scripts, solo_scripts] {
-        collect_json_files(dir, &mut paths);
-    }
-    assert!(
-        !paths.is_empty(),
-        "no fixtures found under {} or {} — a path moved",
-        server_scripts.display(),
-        solo_scripts.display(),
-    );
+    collect_json_files(scripts, &mut paths);
+    assert!(!paths.is_empty(), "no fixtures found under {} — a path moved", scripts.display());
     paths
 }
 

@@ -38,9 +38,7 @@ model's paths return to."
 `--rw-mount <DIR>` adds a host directory to that set, read-write, at the same
 path inside the kernel: host `/app` is kernel `/app`. It is repeatable and
 position-independent, and it is how a model gets write access to a workspace
-outside `$HOME/src` and `/tmp`. `kaijutsu-solo-acp --mount <DIR>` is the same
-seam (`SshServerConfig::rw_mounts`), and that binary also mounts the directory
-it was launched in unless told not to (`docs/solo-acp.md`).
+outside `$HOME/src` and `/tmp`. The flag fills `SshServerConfig::rw_mounts`.
 
 Each directory is checked before the freeze (`ssh::validate_rw_mounts`), and
 one that fails refuses the boot, naming itself and the reason. It must be
@@ -125,11 +123,10 @@ own process: a builtin `grep -r PATTERN /` was killed for memory with nothing
 logged. A walk that names `/proc` can still do that; see `docs/issues.md`,
 "A builtin `grep -r PATTERN /` killed the agent process".
 
-An operator can unlist more paths at boot: `SshServerConfig::unlisted`,
-which `kaijutsu-solo-acp --unlist <path>` fills. The Harbor adapter uses it
-to keep its own log directory out of the model's walks
-(`contrib/bench/harbor/README.md`, "Reading a run"). Each must be absolute
-and not `/`, or the boot is refused.
+`SshServerConfig::unlisted` names more paths to unlist at boot. Each must be
+absolute and not `/`, or the boot is refused. No shipped binary sets it today;
+see `docs/issues.md`, "`SshServerConfig::unlisted` has no production entry
+point".
 
 The listing is the mount table's, so the FSN view and SFTP listings of `/`
 leave the same paths out. In a kaish shell, `/dev` is kaish's own device

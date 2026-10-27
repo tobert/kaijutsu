@@ -1,1 +1,0 @@
-The program imports numpy, reads /app/measurements.txt with np.loadtxt, and prints computed statistics. It does not write, delete, or open any data for modification, and it makes no network or subprocess calls.
