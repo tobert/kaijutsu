@@ -221,19 +221,28 @@ fn backdate_events(
 /// Render ABC → a flat list of `(offset-from-phrase-start, raw channel-voice
 /// MIDI bytes)`, ready to schedule relative to a start instant. Reuses the
 /// exact `abc→events` path the demolished server-side `AlsaMidiOut` used; the
-/// only sink step is tick→wall via the tune's own `Q:` tempo + the render
-/// PPQ. Meta/system events (status ≥ 0xF0) are dropped — they never went to
-/// the seq queue. Empty if the ABC parses to no tune (a producer bug
-/// upstream — logged loudly at the call site, not here).
+/// only sink step is tick→wall via the stream's Set Tempo meta event (the
+/// writer's microseconds-per-quarter, which already honors the `Q:` beat
+/// unit) + the render PPQ. Meta/system events (status ≥ 0xF0) are dropped —
+/// they never went to the seq queue. Empty if the ABC parses to no tune (a
+/// producer bug upstream — logged loudly at the call site, not here).
 fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
     let parsed = kaijutsu_abc::parse(abc);
     let Some(tune) = parsed.value.first() else {
         return Vec::new();
     };
     let params = kaijutsu_abc::MidiParams::default();
-    let bpm = tune.header.tempo.as_ref().map(|t| t.bpm).unwrap_or(120).max(1);
-    let secs_per_tick = 60.0 / bpm as f64 / params.ticks_per_beat.max(1) as f64;
-    kaijutsu_abc::midi::events(tune, &params)
+    let events = kaijutsu_abc::midi::events(tune, &params);
+    let us_per_quarter = events
+        .iter()
+        .find_map(|ev| match ev.data.as_slice() {
+            [0xFF, 0x51, 0x03, a, b, c] => Some(u32::from_be_bytes([0, *a, *b, *c])),
+            _ => None,
+        })
+        .filter(|us| *us > 0)
+        .unwrap_or(500_000);
+    let secs_per_tick = us_per_quarter as f64 / 1e6 / params.ticks_per_beat.max(1) as f64;
+    events
         .into_iter()
         .filter(|ev| matches!(ev.data.first(), Some(&status) if status < 0xF0))
         .map(|ev| {
@@ -1012,6 +1021,27 @@ mod tests {
             note_ons.windows(2).all(|w| w[0].0 < w[1].0),
             "note starts advance in time: {note_ons:?}"
         );
+    }
+
+    /// `Q:` names its beat unit: `Q:1/2=60` is 60 half notes a minute, so a
+    /// quarter lasts 500 ms, and `Q:3/8=40` is 40 dotted quarters a minute,
+    /// so a quarter lasts 1 s.
+    #[test]
+    fn the_q_beat_unit_sets_the_note_spacing() {
+        for (q, quarter) in [("1/4=120", 500), ("1/2=60", 500), ("3/8=40", 1000)] {
+            let abc = format!("X:1\nT:t\nM:4/4\nL:1/4\nQ:{q}\nK:C\nCD|\n");
+            let note_ons: Vec<Duration> = abc_to_timed_events(&abc)
+                .into_iter()
+                .filter(|(_, d)| d.len() == 3 && d[0] & 0xF0 == 0x90 && d[2] > 0)
+                .map(|(off, _)| off)
+                .collect();
+            assert_eq!(note_ons.len(), 2, "Q:{q}");
+            let spacing = note_ons[1] - note_ons[0];
+            assert!(
+                spacing.abs_diff(Duration::from_millis(quarter)) < Duration::from_millis(1),
+                "Q:{q}: a quarter note lasts {quarter} ms, got {spacing:?}"
+            );
+        }
     }
 
     #[test]
