@@ -828,13 +828,19 @@ impl DriftRouter {
         let Some(p) = &self.persistence else {
             return;
         };
-        if let Some(block_id) = self.persisted_blocks.remove(&staged_id)
-            && let Err(e) = p.blocks.set_status(p.queue_ctx, &block_id, Status::Done)
-        {
-            tracing::error!(
+        let Some(&block_id) = self.persisted_blocks.get(&staged_id) else {
+            return;
+        };
+        // On failure the record stays mapped and Pending; rehydrate keeps
+        // only the latest record per drift id.
+        match p.blocks.set_status(p.queue_ctx, &block_id, Status::Done) {
+            Ok(()) => {
+                self.persisted_blocks.remove(&staged_id);
+            }
+            Err(e) => tracing::error!(
                 drift_id = staged_id,
                 "failed to mark drift-queue block consumed: {e}"
-            );
+            ),
         }
     }
 
@@ -856,6 +862,10 @@ impl DriftRouter {
     /// moment a process starts, so recovered items always come back with
     /// `in_flight`/`cancelled` cleared even if the persisted record predates
     /// that (a crash mid-flush cannot leave a phantom in-flight item behind).
+    ///
+    /// A drift id with more than one Pending record (a superseded record
+    /// whose consumption failed) restores once, from its latest record; the
+    /// earlier records are marked consumed.
     pub fn rehydrate_from_block_log(&mut self) -> Result<(), DriftError> {
         let Some(p) = &self.persistence else {
             return Ok(());
@@ -869,6 +879,7 @@ impl DriftRouter {
         self.staging.clear();
         self.dead_letter.clear();
         self.persisted_blocks.clear();
+        let mut superseded = Vec::new();
 
         for block in &snapshots {
             if block.status != Status::Pending {
@@ -886,13 +897,22 @@ impl DriftRouter {
                 }
             };
             self.next_staged_id = self.next_staged_id.max(payload.drift.id + 1);
-            self.persisted_blocks.insert(payload.drift.id, block.id);
+            if let Some(earlier) = self.persisted_blocks.insert(payload.drift.id, block.id) {
+                superseded.push(earlier);
+                self.staging.retain(|d| d.id != payload.drift.id);
+                self.dead_letter.retain(|d| d.id != payload.drift.id);
+            }
             let mut item = payload.drift;
             item.in_flight = false;
             item.cancelled = false;
             match payload.slot {
                 QueueSlot::Staging => self.staging.push(item),
                 QueueSlot::DeadLetter => self.dead_letter.push(item),
+            }
+        }
+        for block_id in superseded {
+            if let Err(e) = p.blocks.set_status(p.queue_ctx, &block_id, Status::Done) {
+                tracing::error!(?block_id, "failed to mark a superseded drift-queue record consumed: {e}");
             }
         }
 
@@ -1192,12 +1212,17 @@ impl DriftRouter {
     /// Move a dead-letter item back into the staging queue by id (M2-B4).
     ///
     /// Resets `retry_count` to 0 so the requeued item gets a full set of
-    /// retry attempts. Returns the requeued drift on success, or `None` if
-    /// no dead-letter entry has the given id.
+    /// retry attempts, and clears `in_flight` and `cancelled` so it drains
+    /// even if a lost+found flush had checked it out; that flush's
+    /// [`ack_dead_letter`](Self::ack_dead_letter) then returns `false`.
+    /// Returns the requeued drift on success, or `None` if no dead-letter
+    /// entry has the given id.
     pub fn replay_dead_letter(&mut self, id: u64) -> Option<StagedDrift> {
         let pos = self.dead_letter.iter().position(|d| d.id == id)?;
         let mut item = self.dead_letter.remove(pos);
         item.retry_count = 0;
+        item.in_flight = false;
+        item.cancelled = false;
         // Consume the dead-letter record, write a fresh staging one.
         self.mark_consumed(item.id);
         self.persist_item(QueueSlot::Staging, &item);
@@ -2001,6 +2026,30 @@ mod tests {
 
         // Replay of a missing id is a no-op.
         assert!(router.replay_dead_letter(99_999).is_none());
+    }
+
+    /// Replaying a dead letter that a lost+found flush has checked out puts
+    /// it back in staging as a fresh, drainable item.
+    #[test]
+    fn a_replayed_checked_out_dead_letter_drains() {
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        let id = router
+            .stage(src, tgt, "fail".into(), None, DriftKind::Push, PrincipalId::new())
+            .unwrap();
+        for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+            let drained = router.drain(None);
+            router.requeue(drained);
+        }
+        assert_eq!(router.drain_dead_letter().len(), 1);
+
+        router.replay_dead_letter(id).expect("replay");
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 1, "the replayed item must be deliverable");
+        assert_eq!(drained[0].id, id);
     }
 
     #[test]
@@ -3654,6 +3703,35 @@ mod tests {
             let dl = router2.dead_letters();
             assert_eq!(dl.len(), 1, "a restored-after-failed-write dead letter must survive a restart");
             assert_eq!(dl[0].content, "write failed, restored");
+        }
+
+        /// A record whose consumption failed stays Pending beside the fresh
+        /// record for the same item. Rehydrate keeps the later record, marks
+        /// the earlier one consumed, and so restores the item once.
+        #[test]
+        fn rehydrate_keeps_one_entry_per_drift_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+            let id = router
+                .stage(src, tgt, "twice recorded".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                let drained = router.drain(None);
+                router.requeue(drained);
+            }
+            blocks.arm_accept_fault(1);
+            router.replay_dead_letter(id).expect("replay");
+            let pending = |blocks: &SharedBlockStore| {
+                blocks.block_snapshots(queue_ctx).unwrap().iter().filter(|b| b.status == Status::Pending).count()
+            };
+            assert_eq!(pending(&blocks), 2, "fixture: the dead-letter record was not consumed");
+
+            router.rehydrate_from_block_log().unwrap();
+            assert!(router.dead_letters().is_empty(), "the later staging record wins");
+            assert_eq!(router.queue().len(), 1);
+            assert_eq!(router.queue()[0].id, id);
+            assert_eq!(pending(&blocks), 1, "the superseded record is consumed");
         }
 
         #[test]
