@@ -2957,21 +2957,21 @@ impl BlockStore {
     /// one-time single-context scan and populates the cache — it does NOT
     /// default to `Pending` for an unread context. A context with no
     /// document at all (never existed, or not yet hydrated from the DB) has
-    /// no blocks to be `Running`/`Error` about, so `Pending` is correct there.
+    /// no blocks to be `Running`/`Error` about, so it reads as `Pending`,
+    /// uncached: once it loads, its blocks decide.
     pub fn live_status(&self, context_id: ContextId) -> Status {
         let entry = self.get(context_id);
         if let Some(status) = self.live_status.get(&context_id) {
             return *status;
         }
-        let computed = match entry.as_ref() {
-            Some(entry) => {
-                // Status-only, same reasoning as `journal_op`'s recompute:
-                // no need to materialize every block's text for a one-time
-                // cold-cache fill.
-                derive_context_live_status(&entry.doc.statuses_ordered())
-            }
-            None => Status::Pending,
+        // A context that is not loaded reads as Pending without caching it,
+        // so its blocks decide the status once it loads.
+        let Some(entry) = entry else {
+            return Status::Pending;
         };
+        // Status-only, same reasoning as `journal_op`'s recompute: no need to
+        // materialize every block's text for a one-time cold-cache fill.
+        let computed = derive_context_live_status(&entry.doc.statuses_ordered());
         self.live_status.insert(context_id, computed);
         computed
     }
@@ -8443,6 +8443,23 @@ mod tests {
 
         let eager = drop_and_reload(db, ws);
         assert_eq!(eager.version(ctx).unwrap(), before);
+    }
+
+    /// Asking for the live status of a context that is not loaded yet must
+    /// not pin a guess: once it loads, its blocks decide the status.
+    #[test]
+    fn live_status_of_an_unloaded_context_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+        store
+            .insert_block(ctx, None, None, Role::Model, BlockKind::Text, "failed", Status::Error, ContentType::Plain)
+            .unwrap();
+        drop(store);
+
+        let lazy = BlockStore::with_db(db, ws, PrincipalId::system());
+        assert_eq!(lazy.live_status(ctx), Status::Pending, "nothing is loaded yet");
+        assert!(lazy.load_one_from_db(ctx).unwrap());
+        assert_eq!(lazy.live_status(ctx), Status::Error);
     }
 
     /// A snapshot row that fails to decode must refuse the context loudly
