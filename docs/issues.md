@@ -13,12 +13,17 @@ Landed: the human root has no model and refuses `drive`; its model console is
 a `console` context under it, labeled `ROOT`, with the stance; Ctrl-Z toggles
 root, console, and shell; the start choice prefers `ROOT`. Still open:
 
-- Incoming drifts into the console need approval. Nothing gates drift
-  delivery today. The plan: stage drifts into the console and release them
-  through the ledger, so Amy allows each one, or raise an ask per drift. Amy
-  said it can wait, to note it in `signoff.md`.
-- The stance names Amy as fixed text. Fresh installs for others need it
-  configurable.
+- Incoming drifts into the console reach a model unreviewed. A drift starts
+  no turn (`Wake::Drift`, `runtime/turn_state.rs`), but it joins a running
+  turn at its next tool round (`offer_drift`, `kj/drift.rs`), and an idle
+  drift rides the next submit. The plan (Amy, 2026-10-27): when a drift
+  lands, the client pauses compose input, as it does for a ledger accept;
+  after reading, the human releases it with a key or excludes it
+  (`kj stage exclude`). A drift into a running console turn waits for that
+  release instead of joining at the tool round.
+- The console and council stances name Amy as fixed text, so another
+  person's `bootstrap` tells their ROOT that Amy is accountable. A small fix:
+  rc exposes the reviewer's name and the stance uses it.
 - `kaijutsu-mcp` `prepare_session_create` still records no performer for a
   root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
 - `docs/character.md` says ROOT is played by a root character. The console is

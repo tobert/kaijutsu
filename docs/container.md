@@ -49,40 +49,35 @@ The server stores its host key, auth database, config, and kernel data under
 agent-writable project mount. Mount provider credentials and other secrets
 independently and read-only; do not put them in either directory.
 
-## Add the first SSH key
+## Bootstrap the kernel
 
-The server refuses to start until `init` has created a root character and
-bound its key (`docs/character.md`, "Bootstrap: the person creates
-themself"). Run `init` before the first start; the public-key mount need not
-persist.
+The server refuses to start until a root character exists with a bound key
+(`docs/character.md`, "Bootstrap: the person creates themself").
+`bootstrap` writes them, registers a model backend, and creates the `ROOT`
+console (`docs/server-cli.md`, "bootstrap"). Run it while the server is
+stopped. The public-key mount need not persist.
+
+In the container, `~` is `/var/lib/kaijutsu`, so bootstrap finds no key file
+on its own. Mount each provider key read-only under `/run/secrets`, as the
+service does, and name it with `--backend` and `--api-key-file`. One run
+takes one backend; the first run sets the kernel default.
 
 ```bash
 podman run --rm \
   --userns=keep-id:uid=10001,gid=10001 --user kaijutsu \
   --mount type=bind,src=/tank/kaijutsu/kernel-data,dst=/var/lib/kaijutsu \
   --mount type=bind,src="$HOME/.ssh/id_ed25519.pub",dst=/keys/operator.pub,ro \
+  --mount type=bind,src="$HOME/.deepseek-key",dst=/run/secrets/deepseek-key,ro \
   --entrypoint /usr/local/bin/kaijutsu-server \
-  localhost/kaijutsu:dev init --as operator --key /keys/operator.pub
+  localhost/kaijutsu:dev bootstrap --as operator --key /keys/operator.pub \
+    --backend deepseek --api-key-file /run/secrets/deepseek-key
 ```
 
-`init` writes `kernel.db`, so run it while the server is stopped. To bind more
-keys later, `add-key <pubkey-file> --as <character>` is safe while the server
-runs: `auth.db` is WAL and never cached.
-
-## Configure a model backend
-
-A new kernel has no model backends and no default model, so a model turn
-fails with how to add one. Configure one from a client's shell after the
-first start:
-
-```bash
-kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY
-kj backend default set --backend deepseek --model deepseek-flash
-```
-
-The key reaches the kernel through the container's environment or a file
-the row names with `--api-key-file`; the row stores only the variable name or
-the path. README.md, "Quick Start" has more examples.
+The row stores only the key's environment variable name and path, so the
+service needs the same `/run/secrets` mount. To bind more keys later,
+`add-key <pubkey-file> --as <character>` is safe while the server runs:
+`auth.db` is WAL and never cached. `init` remains for the root alone, without
+a backend or `ROOT`.
 
 ## Devcontainer
 

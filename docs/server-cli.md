@@ -48,7 +48,8 @@ result is missing:
    or `~/.anthropic-key.txt`, and `DEEPSEEK_API_KEY` or `~/.deepseek-key`.
    `--backend` names one instead. The row records both key sources, so the
    kernel finds the key wherever it runs.
-2. `kj backend model set` with the context window of a model it knows.
+2. `kj backend model set` with the context window of a model it knows. For
+   a model it does not know, the report names the model and this verb.
 3. `kj backend default set`, when the kernel has no default, to the first
    provider found.
 4. `kj character create root`, the model character that plays `ROOT`

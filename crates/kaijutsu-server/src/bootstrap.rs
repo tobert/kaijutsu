@@ -140,6 +140,7 @@ const DEEPSEEK_V4: KnownModel = KnownModel { context_window: 1_000_000, max_toke
 /// A model missing here gets no model row, so its window stays unknown.
 const KNOWN_MODELS: &[(&str, &str, KnownModel)] = &[
     ("anthropic", "claude-haiku-4-5", ANTHROPIC_200K),
+    ("anthropic", "claude-haiku-5-5", ANTHROPIC_1M),
     ("anthropic", "claude-opus-4-5", ANTHROPIC_200K),
     ("anthropic", "claude-opus-4-7", ANTHROPIC_1M),
     ("anthropic", "claude-opus-4-8", ANTHROPIC_1M),
@@ -245,28 +246,34 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         } else {
             dispatch(shared, caller, backend.set_argv(), &mut report).await?;
         }
-        if let Some(known) = known_model(&backend.kind, &backend.model) {
-            let row = read(shared, |db| db.get_backend_by_name(&backend.name))?
-                .ok_or_else(|| format!("no '{}' backend row after setting it", backend.name))?;
-            let models = read(shared, |db| db.list_backend_models(row.backend_id))?;
-            if !models.iter().any(|m| m.model_id == backend.model) {
-                let mut argv = words(&[
-                    "backend",
-                    "model",
-                    "set",
-                    &backend.name,
-                    &backend.model,
-                    "--context-window",
-                    &known.context_window.to_string(),
-                ]);
-                if let Some(max_tokens) = known.max_tokens {
-                    argv.extend(words(&["--max-tokens", &max_tokens.to_string()]));
-                }
-                if let Some(effort) = known.effort {
-                    argv.extend(words(&["--effort", effort]));
-                }
-                dispatch(shared, caller, argv, &mut report).await?;
+        let row = read(shared, |db| db.get_backend_by_name(&backend.name))?
+            .ok_or_else(|| format!("no '{}' backend row after setting it", backend.name))?;
+        let models = read(shared, |db| db.list_backend_models(row.backend_id))?;
+        if !models.iter().any(|m| m.model_id == backend.model) {
+            let Some(known) = known_model(&backend.kind, &backend.model) else {
+                report.notes.push(format!(
+                    "bootstrap does not know the context window of {}/{}; `kj backend model set {} {} \
+                     --context-window <tokens>` records it",
+                    backend.name, backend.model, backend.name, backend.model
+                ));
+                continue;
+            };
+            let mut argv = words(&[
+                "backend",
+                "model",
+                "set",
+                &backend.name,
+                &backend.model,
+                "--context-window",
+                &known.context_window.to_string(),
+            ]);
+            if let Some(max_tokens) = known.max_tokens {
+                argv.extend(words(&["--max-tokens", &max_tokens.to_string()]));
             }
+            if let Some(effort) = known.effort {
+                argv.extend(words(&["--effort", effort]));
+            }
+            dispatch(shared, caller, argv, &mut report).await?;
         }
     }
 

@@ -135,6 +135,22 @@ fn without_a_backend_root_waits_for_one() {
     });
 }
 
+/// A model bootstrap has no window for gets no model row, and the report
+/// says so and names the verb that adds one.
+#[test]
+fn an_unknown_model_is_named_in_the_report() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mystery-model"))))
+            .await
+            .expect("bootstrap with an unknown model");
+        assert!(
+            report.notes.iter().any(|note| note.contains("mystery-model") && note.contains("kj backend model set")),
+            "the report names the model and the verb: {report:?}"
+        );
+    });
+}
+
 /// ROOT's performer must be someone other than the root character, who
 /// reviews it. Naming the root is refused, and nothing is made.
 #[test]
