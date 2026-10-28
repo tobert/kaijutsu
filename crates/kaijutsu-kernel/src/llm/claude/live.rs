@@ -174,12 +174,12 @@ async fn tool_round_trip(client: &Client, model: &str) {
 
 fn deepseek() -> Option<(Client, String)> {
     let key = key_from("KJ_LIVE_DEEPSEEK_KEY_FILE")?;
-    Some((Client::deepseek(key).with_request_timeout(REQUEST_TIMEOUT), model_from("KJ_LIVE_DEEPSEEK_MODEL", "deepseek-flash")))
+    Some((Client::deepseek(key).expect("a valid DeepSeek key").with_request_timeout(REQUEST_TIMEOUT), model_from("KJ_LIVE_DEEPSEEK_MODEL", "deepseek-flash")))
 }
 
 fn anthropic() -> Option<(Client, String)> {
     let key = key_from("KJ_LIVE_ANTHROPIC_KEY_FILE")?;
-    Some((Client::new(key).with_request_timeout(REQUEST_TIMEOUT), model_from("KJ_LIVE_ANTHROPIC_MODEL", "claude-haiku-5-5")))
+    Some((Client::new(key).expect("a valid Anthropic key").with_request_timeout(REQUEST_TIMEOUT), model_from("KJ_LIVE_ANTHROPIC_MODEL", "claude-haiku-5-5")))
 }
 
 #[tokio::test]

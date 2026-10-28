@@ -934,7 +934,7 @@ impl Provider {
         match config.kind {
             BackendKind::Anthropic => {
                 let api_key = resolve_key_or_placeholder(config, "Anthropic")?;
-                let mut client = claude::Client::new(api_key)
+                let mut client = claude::Client::new(api_key)?
                     .with_request_timeout(resolve_request_timeout(config))
                     .with_endpoint(endpoint()?);
                 if let Some(ref url) = config.base_url {
@@ -2064,7 +2064,7 @@ mod tests {
     #[test]
     fn test_provider_names() {
         assert_eq!(
-            Provider::Claude(claude::Client::new("fake")).name(),
+            Provider::Claude(claude::Client::new("fake").unwrap()).name(),
             "anthropic"
         );
         assert_eq!(
@@ -2109,6 +2109,24 @@ mod tests {
             err.to_string().to_lowercase().contains("key"),
             "auth error should mention key: {err}"
         );
+    }
+
+    /// An Anthropic key that cannot be an HTTP header value is an auth error
+    /// from `from_backend`, not a kernel panic, and the error does not repeat
+    /// the key. A key file with two lines is the ordinary way to get one:
+    /// trimming keeps the newline between them.
+    #[test]
+    fn from_backend_invalid_header_anthropic_key_is_an_auth_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key");
+        std::fs::write(&key_file, "sk-first\nsk-second\n").unwrap();
+        let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
+            .with_api_key_file(key_file.to_str().unwrap());
+        let err = Provider::from_backend(&config, &endpoint::Endpoints::default())
+            .err()
+            .expect("a bad key must not build a client");
+        assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
+        assert!(!err.to_string().contains("sk-"), "the error must not repeat the key: {err}");
     }
 
     #[test]
@@ -2160,7 +2178,7 @@ mod tests {
     #[test]
     fn test_registry_concrete_type() {
         let mut registry = LlmRegistry::new();
-        let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
+        let provider = Arc::new(Provider::Claude(claude::Client::new("fake").unwrap()));
         registry.register("anthropic", provider);
         registry.set_default("anthropic");
 
@@ -2171,7 +2189,7 @@ mod tests {
     #[test]
     fn test_model_alias_resolution() {
         let mut registry = LlmRegistry::new();
-        let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
+        let provider = Arc::new(Provider::Claude(claude::Client::new("fake").unwrap()));
         registry.register("anthropic", provider);
         registry.set_default("anthropic");
 
@@ -2299,7 +2317,7 @@ mod tests {
         /// `set_backends` when they need to exercise the override-wins path.
         fn registry_with_fake_claude(fake: FakeModelCapabilitySource) -> LlmRegistry {
             let mut registry = LlmRegistry::new();
-            let client = claude::Client::new("fake-key").with_capability_source(Arc::new(fake));
+            let client = claude::Client::new("fake-key").unwrap().with_capability_source(Arc::new(fake));
             registry.register("anthropic", Arc::new(Provider::Claude(client)));
             registry
         }

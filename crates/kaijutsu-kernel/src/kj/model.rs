@@ -360,7 +360,7 @@ mod tests {
     /// touching the network here.
     async fn seed_registry(d: &crate::kj::KjDispatcher) {
         let mut reg = d.kernel().llm().write().await;
-        let claude_client = claude::Client::new("fake")
+        let claude_client = claude::Client::new("fake").unwrap()
             .with_capability_source(Arc::new(FakeModelCapabilitySource::always_none()));
         reg.register("anthropic", Arc::new(Provider::Claude(claude_client)));
         reg.register("deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))));
@@ -557,7 +557,7 @@ mod tests {
             let mut reg = d.kernel().llm().write().await;
             let fake = FakeModelCapabilitySource::always_none()
                 .with_response("claude-sonnet-4-20250514", Ok(Some(200_000)));
-            let client = claude::Client::new("fake").with_capability_source(Arc::new(fake));
+            let client = claude::Client::new("fake").unwrap().with_capability_source(Arc::new(fake));
             reg.register("anthropic", Arc::new(Provider::Claude(client)));
             // Deliberately NO provider_configs entry for this model — the
             // honest-gap scenario the live fallback exists to close.

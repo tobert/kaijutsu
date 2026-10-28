@@ -3549,9 +3549,7 @@ mod tests {
         let kernel = Kernel::new_ephemeral("test").await;
 
         // Register a provider (uses fake key, won't actually call API)
-        let provider = Arc::new(Provider::Claude(crate::llm::claude::Client::new(
-            "fake-key",
-        )));
+        let provider = Arc::new(Provider::Claude(crate::llm::claude::Client::new("fake-key").unwrap()));
         kernel.register_llm("anthropic", provider).await;
         kernel.set_default_llm("anthropic").await;
 

@@ -120,22 +120,23 @@ pub struct Client {
 impl Client {
     /// Construct a client from an API key.
     ///
-    /// Panics if the key is not a valid header value (non-ASCII or control
-    /// characters), or if `reqwest::Client::builder()` fails, which on a
-    /// healthy host means a TLS backend init failure (no system roots, for
-    /// instance). Both are startup-time misconfigurations that should crash
-    /// loudly.
-    pub fn new(api_key: impl Into<String>) -> Self {
+    /// A key that is not a valid header value (a control character, such as
+    /// the newline inside a two-line key file) is an `AuthError` that does
+    /// not repeat the key. Panics if `reqwest::Client::builder()` fails,
+    /// which on a healthy host means a TLS backend init failure (no system
+    /// roots, for instance).
+    pub fn new(api_key: impl Into<String>) -> LlmResult<Self> {
         let api_key = api_key.into();
         let mut headers = reqwest::header::HeaderMap::new();
-        // HeaderValue::from_str validates; an API key with non-ASCII
-        // would fail. We accept the .expect — a malformed key is
-        // operator-side misconfiguration that should crash loudly.
-        headers.insert(
-            "x-api-key",
-            reqwest::header::HeaderValue::from_str(&api_key)
-                .expect("Anthropic API key must be ASCII"),
-        );
+        let mut key = reqwest::header::HeaderValue::from_str(&api_key).map_err(|_| {
+            LlmError::AuthError(
+                "the Anthropic API key is not a valid HTTP header value (it holds a control \
+                 character, such as a newline)"
+                    .to_string(),
+            )
+        })?;
+        key.set_sensitive(true);
+        headers.insert("x-api-key", key);
         headers.insert(
             "anthropic-version",
             reqwest::header::HeaderValue::from_static(ANTHROPIC_API_VERSION),
@@ -149,7 +150,7 @@ impl Client {
         let capability_source: Arc<dyn ModelCapabilitySource> = Arc::new(
             HttpModelCapabilitySource::new(http.clone(), base_url.clone()),
         );
-        Self {
+        Ok(Self {
             http,
             base_url,
             model_window_cache: Arc::new(AsyncRwLock::new(HashMap::new())),
@@ -157,16 +158,16 @@ impl Client {
             request_timeout: None,
             endpoint: None,
             dialect: Dialect::Anthropic,
-        }
+        })
     }
 
     /// A client for DeepSeek's Messages endpoint,
     /// `https://api.deepseek.com/anthropic`. Auth is the same `x-api-key`
     /// header; `anthropic-version` is sent and ignored.
-    pub fn deepseek(api_key: impl Into<String>) -> Self {
-        let mut client = Self::new(api_key).with_base_url(DEEPSEEK_MESSAGES_BASE_URL);
+    pub fn deepseek(api_key: impl Into<String>) -> LlmResult<Self> {
+        let mut client = Self::new(api_key)?.with_base_url(DEEPSEEK_MESSAGES_BASE_URL);
         client.dialect = Dialect::DeepSeek;
-        client
+        Ok(client)
     }
 
     /// The dialect this client speaks.
@@ -777,7 +778,7 @@ data: {\"type\":\"message_stop\"}
             String::from_utf8_lossy(&head).into_owned()
         });
 
-        let text = Client::new("fake-key")
+        let text = Client::new("fake-key").unwrap()
             .with_base_url(format!("http://127.0.0.1:{port}"))
             .prompt("claude-haiku-4-5", None, "hi")
             .await
@@ -818,7 +819,7 @@ data: {\"type\":\"message_stop\"}
             let fake = FakeModelCapabilitySource::always_none()
                 .with_response("claude-opus-4-8", Ok(Some(1_000_000)));
             let fake = Arc::new(fake);
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
+            let client = Client::new("fake-key").unwrap().with_capability_source(fake.clone());
 
             let first = client.context_window("claude-opus-4-8").await;
             assert_eq!(first, Some(1_000_000));
@@ -839,7 +840,7 @@ data: {\"type\":\"message_stop\"}
             // a real, cacheable answer, not a failure. Repeat lookups for a
             // bad id shouldn't hammer the network.
             let fake = Arc::new(FakeModelCapabilitySource::always_none());
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
+            let client = Client::new("fake-key").unwrap().with_capability_source(fake.clone());
 
             assert_eq!(client.context_window("bogus-model").await, None);
             assert_eq!(fake.call_count(), 1);
@@ -853,7 +854,7 @@ data: {\"type\":\"message_stop\"}
                 "claude-opus-4-8",
                 Err(LlmError::NetworkError("connect refused".into())),
             ));
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
+            let client = Client::new("fake-key").unwrap().with_capability_source(fake.clone());
 
             assert_eq!(
                 client.context_window("claude-opus-4-8").await,
@@ -883,7 +884,7 @@ data: {\"type\":\"message_stop\"}
                     .with_response("claude-opus-4-8", Ok(Some(1_000_000)))
                     .with_response("claude-haiku-4-5-20251001", Ok(Some(200_000))),
             );
-            let client = Client::new("fake-key").with_capability_source(fake.clone());
+            let client = Client::new("fake-key").unwrap().with_capability_source(fake.clone());
 
             assert_eq!(client.context_window("claude-opus-4-8").await, Some(1_000_000));
             assert_eq!(
@@ -909,7 +910,7 @@ data: {\"type\":\"message_stop\"}
         use kaijutsu_mk::test_server::{reply, serve};
         let (base, _) = serve(vec![reply(503, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
-        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
         let err = client.prompt("m", None, "hi").await.unwrap_err();
         assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
@@ -928,7 +929,7 @@ data: {\"type\":\"message_stop\"}
         let tmp = tempfile::tempdir().unwrap();
         let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 1, Some(tmp.path().to_path_buf()));
         let opts = BuildOpts::new("claude-sonnet-4-6").with_system("sys").with_trace(trace);
-        let _ = Client::new("k").with_base_url(&base).stream(opts, vec![Message::user("let's do a thing")]).await;
+        let _ = Client::new("k").unwrap().with_base_url(&base).stream(opts, vec![Message::user("let's do a thing")]).await;
         let files = wait_for_files(tmp.path(), 1).await;
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
@@ -945,7 +946,7 @@ data: {\"type\":\"message_stop\"}
         busy.headers.push(("retry-after", "3".into()));
         let (base, _) = serve(vec![busy]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
-        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
         let err = client.prompt("m", None, "hi").await.unwrap_err();
         assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
@@ -963,7 +964,7 @@ data: {\"type\":\"message_stop\"}
         use kaijutsu_mk::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(SIMPLE_COMPLETION)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
-        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
         let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
@@ -989,7 +990,7 @@ data: {\"type\":\"message_stop\"}
         }
         let endpoint = crate::llm::endpoint::Endpoints::default().get("hosted backend claude");
         let probe = Arc::new(InFlight(endpoint.clone(), Default::default()));
-        let client = Client::new("k").with_endpoint(endpoint.clone()).with_capability_source(probe.clone());
+        let client = Client::new("k").unwrap().with_endpoint(endpoint.clone()).with_capability_source(probe.clone());
         assert_eq!(client.context_window("claude-opus-4-8").await, Some(200_000));
         assert_eq!(*probe.1.lock().unwrap(), Some(1), "the lookup held a slot");
         assert_eq!(endpoint.status().in_flight, 0);
@@ -1005,7 +1006,7 @@ data: {\"type\":\"message_stop\"}
         let paused = SIMPLE_COMPLETION.replace("end_turn", "pause_turn");
         let (base, _) = serve(vec![sse(&paused)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
-        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
         let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
@@ -1028,11 +1029,11 @@ data: {\"type\":\"message_stop\"}
         );
         for stop in ["\"pause_turn\"", "\"model_context_window_exceeded\"", "null"] {
             let (base, _) = serve(vec![reply(200, &body(stop))]).await;
-            let err = Client::new("k").with_base_url(&base).prompt("m", None, "hi").await.unwrap_err();
+            let err = Client::new("k").unwrap().with_base_url(&base).prompt("m", None, "hi").await.unwrap_err();
             assert!(matches!(err, LlmError::CompletionError(_)), "{stop}: {err:?}");
         }
         let (base, _) = serve(vec![reply(200, &body("\"end_turn\""))]).await;
-        assert_eq!(Client::new("k").with_base_url(&base).prompt("m", None, "hi").await.unwrap(), "partial");
+        assert_eq!(Client::new("k").unwrap().with_base_url(&base).prompt("m", None, "hi").await.unwrap(), "partial");
     }
 
     /// A model that thinks on every request rejects `thinking: disabled`, so
@@ -1043,7 +1044,7 @@ data: {\"type\":\"message_stop\"}
         let (base, seen) = serve(vec![]).await;
         let mut opts = BuildOpts::new("claude-sonnet-5-5");
         opts.thinking_style = Some("off".into());
-        let err = Client::new("k").with_base_url(&base).stream(opts, vec![Message::user("hi")]).await.err().unwrap();
+        let err = Client::new("k").unwrap().with_base_url(&base).stream(opts, vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("claude-sonnet-5-5")), "{err:?}");
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
     }
@@ -1057,7 +1058,7 @@ data: {\"type\":\"message_stop\"}
         use kaijutsu_mk::test_server::{reply, serve};
         let (base, _) = serve(vec![reply(529, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_1"}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
-        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
         let err = client.prompt("m", None, "hi").await.unwrap_err();
         assert!(matches!(&err, LlmError::ApiError(m) if m.contains("overloaded_error") && m.contains("req_1")), "{err:?}");
         let (_, status) = endpoint.status().cooldown.expect("cooling down");
@@ -1097,7 +1098,7 @@ data: {\"type\":\"message_stop\"}
         );
         let (base, _) = serve(vec![sse(&failed)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
-        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
         let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
         let mut events = Vec::new();
         while let Some(ev) = stream.next_event().await {
@@ -1111,11 +1112,11 @@ data: {\"type\":\"message_stop\"}
 
     #[tokio::test]
     async fn the_deepseek_preset_points_at_the_messages_endpoint() {
-        let client = Client::deepseek("k");
+        let client = Client::deepseek("k").unwrap();
         assert_eq!(client.base_url, "https://api.deepseek.com/anthropic");
         assert_eq!(client.dialect(), Dialect::DeepSeek);
         assert_eq!(client.available_models(), vec!["deepseek-flash", "deepseek-v4-pro"]);
-        assert_eq!(Client::new("k").dialect(), Dialect::Anthropic);
+        assert_eq!(Client::new("k").unwrap().dialect(), Dialect::Anthropic);
     }
 
     /// DeepSeek's endpoint answers `GET /v1/models/{id}` with 404, so the
@@ -1126,7 +1127,7 @@ data: {\"type\":\"message_stop\"}
     async fn a_deepseek_client_makes_no_context_window_lookup() {
         use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
         let fake = Arc::new(FakeModelCapabilitySource::always_none().with_response("deepseek-flash", Ok(Some(5))));
-        let client = Client::deepseek("k").with_capability_source(fake.clone());
+        let client = Client::deepseek("k").unwrap().with_capability_source(fake.clone());
         assert_eq!(client.context_window("deepseek-flash").await, None);
         assert_eq!(fake.call_count(), 0);
     }
@@ -1138,7 +1139,7 @@ data: {\"type\":\"message_stop\"}
         use kaijutsu_mk::test_server::{reply, serve};
         let ok = r#"{"id":"m","model":"deepseek-flash","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (base, seen) = serve(vec![reply(200, ok)]).await;
-        let text = Client::deepseek("k").with_base_url(&base).prompt("deepseek-flash", None, "hi").await.unwrap();
+        let text = Client::deepseek("k").unwrap().with_base_url(&base).prompt("deepseek-flash", None, "hi").await.unwrap();
         assert_eq!(text, "ok");
         let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
         assert_eq!(wire["thinking"], serde_json::json!({"type": "disabled"}));
