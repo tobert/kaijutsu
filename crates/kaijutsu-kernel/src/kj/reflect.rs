@@ -49,7 +49,7 @@ pub struct AliasPair {
 
 /// Walk every subcommand of `kj_command()` and collect its leaves — a
 /// subcommand with no subcommands of its own. Depth is unbounded: `backend
-/// model set` and `cast slot remove` are both three deep.
+/// model set` and `character slot unset` are both three deep.
 pub fn reflect_leaves() -> Vec<ReflectedLeaf> {
     let root = super::kj_command();
     let mut out = Vec::new();
@@ -224,7 +224,7 @@ pub fn alias_pairs(leaves: &[ReflectedLeaf]) -> Vec<AliasPair> {
     let mut pairs = Vec::new();
     for leaf in leaves {
         // The alias replaces only the leaf's own name, keeping any parent
-        // path intact: "cast slot" + alias "rm" -> "cast slot rm". A
+        // path intact: "character slot" + alias "rm" -> "character slot rm". A
         // top-level leaf (no space in its path) has no parent to keep.
         let base = leaf.path.rsplit_once(' ').map(|(b, _)| b);
         for alias in &leaf.aliases {

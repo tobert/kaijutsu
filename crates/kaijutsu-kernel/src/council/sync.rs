@@ -1669,7 +1669,7 @@ mod tests {
     /// council server, so the startup build and the context plans find a
     /// council for it.
     fn coder_on_the_mock_council(r: &Rig) -> ContextId {
-        use crate::kernel_db::{BackendRow, CastRow, CastSlotRow, CharacterRow};
+        use crate::kernel_db::{BackendRow, CharacterRow, CharacterSlotRow};
         use kaijutsu_types::PrincipalId;
         let character = PrincipalId::new();
         let db = r.kernel.kernel_db().lock();
@@ -1694,16 +1694,8 @@ mod tests {
                 created_by: PrincipalId::system(),
             })
             .unwrap();
-        let cast = CastRow {
-            cast_id: kaijutsu_types::CastId::new(),
-            label: "coder-council".into(),
-            description: None,
-            created_at: 0,
-            created_by: PrincipalId::system(),
-        };
-        db.insert_cast(&cast).unwrap();
-        db.set_cast_slot(&CastSlotRow {
-            cast_id: cast.cast_id,
+        db.set_character_slot(&CharacterSlotRow {
+            principal_id: character,
             role: "gate".into(),
             backend_id: backend.backend_id,
             model: "m".into(),
@@ -1713,11 +1705,8 @@ mod tests {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            loadout: None,
-            extra: None,
         })
         .unwrap();
-        db.set_character_cast(character, Some(cast.cast_id)).unwrap();
         drop(db);
         let coder = live_context(&r.kernel, "coder-seat");
         let db = r.kernel.kernel_db().lock();

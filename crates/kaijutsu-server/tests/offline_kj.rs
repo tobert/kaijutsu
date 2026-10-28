@@ -192,8 +192,10 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
 
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
-    let cast = home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]);
-    assert!(cast.status.success(), "{}", stderr(&cast));
+    let slot = home.run(&[
+        "kj", "--", "character", "slot", "set", "bob", "coder", "--backend", "mock", "--model", "mock-model", "--max-tokens", "4096",
+    ]);
+    assert!(slot.status.success(), "{}", stderr(&slot));
 
     // The human root refuses `drive`, so the lane is created and driven
     // from a director context, as a person would.
@@ -237,8 +239,10 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     ]).to_string()).unwrap();
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
-    let cast = home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]);
-    assert!(cast.status.success(), "{}", stderr(&cast));
+    let slot = home.run(&[
+        "kj", "--", "character", "slot", "set", "bob", "coder", "--backend", "mock", "--model", "mock-model", "--max-tokens", "4096",
+    ]);
+    assert!(slot.status.success(), "{}", stderr(&slot));
     // The human root refuses `drive`; see the test above.
     let banto = home.run(&["kj", "--", "character", "create", "banto"]);
     assert!(banto.status.success(), "{}", stderr(&banto));

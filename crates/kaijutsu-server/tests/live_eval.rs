@@ -339,13 +339,13 @@ fn setup_run_dirs(suffix: &str) -> (PathBuf, PathBuf) {
     (run_root, state_dir)
 }
 
-/// Write an `anthropic` backend reading `ANTHROPIC_API_KEY` and a cast that
-/// runs Haiku for every context type the run creates, which the ephemeral
+/// Write an `anthropic` backend reading `ANTHROPIC_API_KEY` and slots that
+/// run Haiku for every context type the run creates, which the ephemeral
 /// performer plays. Model config is SQL-native, so this writes the DB before
 /// the kernel opens it.
 fn write_haiku_defaults(state_dir: &std::path::Path) {
-    use kaijutsu_kernel::kernel_db::{BackendRow, CastRow, CastSlotRow, KernelDb};
-    use kaijutsu_types::{BackendId, CastId, PrincipalId};
+    use kaijutsu_kernel::kernel_db::{BackendRow, CharacterSlotRow, KernelDb};
+    use kaijutsu_types::{BackendId, PrincipalId};
 
     fs::create_dir_all(state_dir).expect("create state dir");
     let db = KernelDb::open(state_dir.join("kernel.db")).expect("open kernel db");
@@ -365,17 +365,14 @@ fn write_haiku_defaults(state_dir: &std::path::Path) {
             created_by: PrincipalId::system(),
         })
         .expect("write the anthropic backend");
-    let cast = CastRow {
-        cast_id: CastId::new(),
-        label: "haiku".to_string(),
-        description: None,
-        created_at: 0,
-        created_by: PrincipalId::system(),
-    };
-    db.insert_cast(&cast).expect("write the haiku cast");
+    kaijutsu_server::SshServerConfig::seed_ephemeral_performer(&db);
+    let performer = db
+        .get_character_by_name(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER)
+        .expect("read the performer")
+        .expect("the performer exists");
     for role in ["default", "coder"] {
-        db.set_cast_slot(&CastSlotRow {
-            cast_id: cast.cast_id,
+        db.set_character_slot(&CharacterSlotRow {
+            principal_id: performer.principal_id,
             role: role.to_string(),
             backend_id: backend.backend_id,
             model: HAIKU_MODEL.to_string(),
@@ -385,18 +382,9 @@ fn write_haiku_defaults(state_dir: &std::path::Path) {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            loadout: None,
-            extra: None,
         })
         .expect("write a haiku slot");
     }
-    kaijutsu_server::SshServerConfig::seed_ephemeral_performer(&db);
-    let performer = db
-        .get_character_by_name(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER)
-        .expect("read the performer")
-        .expect("the performer exists");
-    db.set_character_cast(performer.principal_id, Some(cast.cast_id))
-        .expect("point the performer at the haiku cast");
 }
 
 /// Local copy of the e2e_kj_workflow `shell_exec_wait_timeout` helper.

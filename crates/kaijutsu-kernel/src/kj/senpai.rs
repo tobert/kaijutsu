@@ -562,16 +562,11 @@ mod tests {
 
     /// `kj context create` makes a new context performed by the named
     /// character. Its senpai is the caller's context, and its slots copy the
-    /// character's cast.
+    /// character's slots.
     #[tokio::test]
     async fn context_create_makes_a_context_character_under_the_callers_context() {
         let d = test_dispatcher().await;
         let h = house(&d);
-        let admin = test_caller();
-        assert!(d.dispatch(&[s("cast"), s("create"), s("band")], &admin).await.is_ok());
-        let set = d.dispatch(&[s("character"), s("set"), s("coder"), s("--cast"), s("band")], &admin).await;
-        assert!(set.is_ok(), "{}", set.message());
-
         let made = d.dispatch(&[s("context"), s("create"), s("--as"), s("coder"), s("fresh")], &caller(h.banto, h.seat)).await;
         assert!(made.is_ok(), "{}", made.message());
 
@@ -581,7 +576,7 @@ mod tests {
         assert_eq!(character.principal_id, h.coder);
         assert_eq!(fresh.created_by, h.banto, "the requester made it");
         assert_eq!(character.senpai_ctx, Some(h.seat), "its senpai is the caller's context");
-        assert!(db.list_context_slots(fresh.context_id).unwrap().is_empty(), "the cast has no slot to copy");
+        assert!(db.list_context_slots(fresh.context_id).unwrap().is_empty(), "the character has no slot to copy");
         assert_eq!(fresh.played_by, Some(h.coder));
         drop(db);
         assert_eq!(d.kernel().resolve_context_review(fresh.context_id).await.unwrap().reviewer.name, "banto");

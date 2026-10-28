@@ -914,7 +914,7 @@ mod tests {
                 principal_id: principal, name: "bound".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.seed_test_cast(principal, "deepseek", "deepseek-flash", &["default"]).unwrap();
+            db.seed_test_slots(principal, "deepseek", "deepseek-flash", &["default"]).unwrap();
         }
         let ctx = crate::kj::test_helpers::register_context(&d, Some("bound-ctx"), None, principal);
         d.kernel_db().lock().assign_stand_in_character(ctx, principal).unwrap();

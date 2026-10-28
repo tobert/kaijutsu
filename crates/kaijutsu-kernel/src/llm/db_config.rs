@@ -246,13 +246,12 @@ mod tests {
     }
 
     /// A kernel ships no backends: a new DB has no backend, model, alias or
-    /// cast row, and its registry has no provider.
+    /// character slot, and its registry has no provider.
     #[test]
     fn a_new_kernel_db_has_no_llm_configuration() {
         let db = KernelDb::temporary().unwrap();
         assert!(db.list_backends().unwrap().is_empty());
         assert!(db.list_model_aliases().unwrap().is_empty());
-        assert!(db.list_casts().unwrap().is_empty());
         let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
         assert!(registry.list().is_empty());
     }

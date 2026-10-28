@@ -2257,7 +2257,7 @@ mod tests {
                 principal_id: performer, name: "compactor".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.seed_test_cast(performer, "mock", "mock-model", &["default", "distill"]).unwrap();
+            db.seed_test_slots(performer, "mock", "mock-model", &["default", "distill"]).unwrap();
             db.assign_stand_in_character(source, performer).unwrap();
         }
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
@@ -2874,9 +2874,9 @@ mod tests {
                 principal_id: character_id, name: "binder".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.seed_test_cast(character_id, "mock", "mock-model", &["distill"]).unwrap();
+            db.seed_test_slots(character_id, "mock", "mock-model", &["distill"]).unwrap();
             db.update_played_by(source, Some(character_id)).unwrap();
-            db.seed_test_cast(character_id, "mock", "edited-model", &["distill"]).unwrap();
+            db.seed_test_slots(character_id, "mock", "edited-model", &["distill"]).unwrap();
         }
 
         for compact in [false, true] {
@@ -2955,7 +2955,7 @@ mod tests {
                 }).unwrap();
             }
             if db.context_character(source).unwrap().is_none() {
-                db.seed_test_cast(principal, "mock", "mock-model", &["distill"]).unwrap();
+                db.seed_test_slots(principal, "mock", "mock-model", &["distill"]).unwrap();
                 db.assign_stand_in_character(source, principal).unwrap();
             }
         }

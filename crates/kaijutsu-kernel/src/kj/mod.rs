@@ -8,6 +8,7 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+mod slot;
 pub mod alias;
 pub mod attach;
 pub mod audio;
@@ -18,7 +19,6 @@ pub mod ledger;
 pub mod block;
 pub mod cache;
 pub mod cas;
-pub mod cast;
 pub mod cc;
 pub mod character;
 pub mod reflect;
@@ -536,21 +536,18 @@ impl KjDispatcher {
         if cmd == "preset" {
             return self.dispatch_preset(&argv[1..], caller);
         }
-        // Model configuration is SQL-native and kernel-global — `kj backend`,
-        // `kj cast`, and `kj alias` address rows by name, never a context, so
-        // they're exempt from the active-context gate below (same rationale as
+        // Model configuration is SQL-native and kernel-global — `kj backend`
+        // and `kj alias` address rows by name, never a context, so they're
+        // exempt from the active-context gate below (same rationale as
         // `kj config`, which they replaced for this surface).
         if cmd == "backend" {
             return self.dispatch_backend(&argv[1..], caller).await;
-        }
-        if cmd == "cast" {
-            return self.dispatch_cast(&argv[1..], caller).await;
         }
         if cmd == "alias" {
             return self.dispatch_alias(&argv[1..], caller).await;
         }
         // `kj character` addresses the sheet table by name, never a
-        // context — same exemption rationale as `kj cast`/`kj backend`.
+        // context — same exemption rationale as `kj backend`.
         if cmd == "character" {
             return Box::pin(async { self.dispatch_character(&argv[1..], caller).await }).await;
         }
@@ -901,7 +898,7 @@ impl KjDispatcher {
     /// binding the context itself runs on.
     ///
     /// Used by `drift push --summarize`. A binding with no `distill` slot
-    /// refuses, naming the cast and the fix.
+    /// refuses, naming the character and the fix.
     pub(crate) async fn summarize(
         &self,
         context_id: ContextId,
@@ -1459,7 +1456,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Register a context played by `created_by` whose context character
-    /// copies a cast giving each of `roles` the model `mock-model` on the
+    /// copies the slots of a character giving each of `roles` the model `mock-model` on the
     /// `mock` backend. The character is created when absent.
     pub fn register_context_with_model(
         dispatcher: &KjDispatcher,
@@ -1489,7 +1486,7 @@ pub(crate) mod test_helpers {
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
-            db.seed_test_cast_roles(created_by, entries).unwrap();
+            db.seed_test_slot_entries(created_by, entries).unwrap();
         }
         let context = register_context(dispatcher, label, forked_from, created_by);
         dispatcher.kernel_db().lock().assign_stand_in_character(context, created_by).unwrap();
@@ -2313,7 +2310,7 @@ mod house_verb_tests {
     async fn worker_seat_is_refused_house_verbs() {
         let d = test_dispatcher().await;
         let caller = caller_bound(&d, "worker", &worker_binding());
-        for line in ["ledger list", "rc list", "binding list", "ledger --help", "cast list", "ledger help"] {
+        for line in ["ledger list", "rc list", "binding list", "ledger --help", "character list", "ledger help"] {
             let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
             assert!(matches!(result, KjResult::Err(_)), "{line}: expected a refusal, got {result:?}");
             let msg = result.message().to_string();

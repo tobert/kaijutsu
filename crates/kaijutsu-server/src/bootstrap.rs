@@ -19,11 +19,9 @@ use crate::ssh::SshServerConfig;
 
 /// The label of the model console.
 const ROOT_LABEL: &str = "ROOT";
-/// The cast bootstrap gives ROOT's performer.
-const HOUSE_CAST: &str = "house";
-/// The roles that cast fills: the console's own model and the one that
-/// distills its forks and pulls.
-const HOUSE_ROLES: &[&str] = &["console", "distill"];
+/// The slots bootstrap gives ROOT's performer: the console's own model and
+/// the one that distills its forks and pulls.
+const PERFORMER_ROLES: &[&str] = &["console", "distill"];
 /// The response budget bootstrap gives each slot.
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 
@@ -296,48 +294,35 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         Some(_) => {}
     }
 
-    // A model binds through its character's cast, one slot per role. The
-    // first backend's model fills the slots ROOT and its forks need.
+    // A context copies its character's slots when it is made. The first
+    // backend's model fills the slots ROOT and its forks need, where the
+    // performer has none for the role.
     let mut has_model = false;
     match opts.backends.first() {
         Some(backend) => {
-            if read(shared, |db| db.get_cast_by_label(HOUSE_CAST))?.is_none() {
-                dispatch(shared, caller, words(&["cast", "create", HOUSE_CAST]), &mut report).await?;
-            }
-            let house = read(shared, |db| db.get_cast_by_label(HOUSE_CAST))?
-                .ok_or_else(|| format!("no '{HOUSE_CAST}' cast row after creating it"))?;
-            for role in HOUSE_ROLES {
-                if read(shared, |db| db.get_cast_slot(house.cast_id, role))?.is_some() {
+            let played = read(shared, |db| db.get_character_by_name(performer))?
+                .ok_or_else(|| format!("no '{performer}' character row after creating it"))?;
+            for role in PERFORMER_ROLES {
+                if read(shared, |db| db.get_character_slot(played.principal_id, role))?.is_some() {
                     continue;
                 }
                 dispatch(
                     shared,
                     caller,
                     words(&[
-                        "cast", "slot", "set", HOUSE_CAST, role, "--backend", &backend.name, "--model", &backend.model,
-                        "--max-tokens", &DEFAULT_MAX_TOKENS.to_string(),
+                        "character", "slot", "set", performer, role, "--backend", &backend.name, "--model",
+                        &backend.model, "--max-tokens", &DEFAULT_MAX_TOKENS.to_string(),
                     ]),
                     &mut report,
                 )
                 .await?;
-            }
-            let played = read(shared, |db| db.get_character_by_name(performer))?
-                .ok_or_else(|| format!("no '{performer}' character row after creating it"))?;
-            match read(shared, |db| db.character_cast(played.principal_id))?.map(|row| row.cast_id) {
-                Some(cast) if cast == house.cast_id => {}
-                None => {
-                    dispatch(shared, caller, words(&["character", "set", performer, "--cast", HOUSE_CAST]), &mut report).await?;
-                }
-                Some(_) => report.notes.push(format!(
-                    "{performer} already has a cast of its own; bootstrap leaves it, and ROOT's slots come from it"
-                )),
             }
             has_model = true;
         }
         None => report.notes.push(
             "ROOT has no model yet. Give the kernel a key and run bootstrap again, or set one \
              from your root: `kj backend set anthropic --kind anthropic --api-key-file \
-             ~/.anthropic-key.txt`, then give a cast slots with `kj cast slot set`"
+             ~/.anthropic-key.txt`, then give the character slots with `kj character slot set`"
                 .to_string(),
         ),
     }
@@ -371,9 +356,9 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             ))
         }
         // A context copies its character's slots when it is written, so a
-        // ROOT made before its cast had a role takes the model on rotation.
+        // ROOT made before its character had a slot takes the model on rotation.
         Some(row) if has_model && read(shared, |db| {
-            HOUSE_ROLES.iter().try_fold(false, |lacking, role| Ok(lacking || db.context_slot(row.context_id, role)?.is_none()))
+            PERFORMER_ROLES.iter().try_fold(false, |lacking, role| Ok(lacking || db.context_slot(row.context_id, role)?.is_none()))
         })? => {
             dispatch(shared, caller, words(&["context", "rotate", ROOT_LABEL]), &mut report).await?;
         }

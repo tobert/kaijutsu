@@ -2,7 +2,7 @@
 //!
 //! A context character is one character in one context: the principal that
 //! performs it, the context it answers to (its senpai), and the persona. Its
-//! `context_slots` are a copy of the character's cast slots as they were when
+//! `context_slots` are a copy of the character's own slots as they were when
 //! the context was made, with every parameter the slot leaves unset filled
 //! from the model's `backend_models` row. Nothing but `senpai_ctx` changes
 //! after the context is made. `docs/senpai-kohai.md`, "The model" and "Where a
@@ -16,9 +16,9 @@ use tracing::{info, warn};
 use kaijutsu_types::{BackendId, CastId, ContextId, PrincipalId};
 
 use super::{
-    BackendModelRow, CAST_SLOT_COLS, CastRow, CastSlotRow, KernelDb, KernelDbError, KernelDbResult,
-    ModelTunablesRow, blob_param, now_millis, read_backend_id, read_context_id, read_opt_cast_id,
-    read_opt_context_id, read_opt_principal_id, read_principal_id, row_to_cast_slot,
+    BackendModelRow, CharacterSlotRow, KernelDb, KernelDbError, KernelDbResult, ModelTunablesRow, blob_param,
+    now_millis, read_backend_id, read_context_id, read_opt_cast_id, read_opt_context_id, read_opt_principal_id,
+    read_principal_id,
 };
 
 /// One character in one context.
@@ -77,7 +77,7 @@ fn over(own: &ModelTunablesRow, floor: &ModelTunablesRow) -> ModelTunablesRow {
     }
 }
 
-fn slot_tunables(slot: &CastSlotRow) -> ModelTunablesRow {
+fn slot_tunables(slot: &CharacterSlotRow) -> ModelTunablesRow {
     ModelTunablesRow {
         max_tokens: slot.max_tokens,
         temperature: slot.temperature,
@@ -241,13 +241,13 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Copy the slots of `cast` into `context_id`. A parameter the slot leaves
+    /// Copy the slots of `principal_id` into `context_id`. A parameter the slot leaves
     /// unset takes the model's `backend_models` value; nothing else supplies
     /// one. A slot with no `max_tokens` in either place refuses, and so does
     /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`.
-    fn copy_cast_slots(&self, context_id: ContextId, principal_id: PrincipalId, cast: &CastRow) -> KernelDbResult<()> {
+    fn copy_character_slots(&self, context_id: ContextId, principal_id: PrincipalId) -> KernelDbResult<()> {
         let who = self.name_for(principal_id);
-        for slot in self.list_cast_slots(cast.cast_id)? {
+        for slot in self.list_character_slots(principal_id)? {
             let model_row = self
                 .list_backend_models(slot.backend_id)?
                 .into_iter()
@@ -259,26 +259,26 @@ impl KernelDb {
             let max_tokens = tunables.max_tokens;
             if max_tokens.is_none() && !names_council_server(&slot.role) {
                 return Err(KernelDbError::Validation(format!(
-                    "cast {} slot {} of character {who} runs model {}, which has no max_tokens in the slot or in its \
+                    "slot {} of character {who} runs model {}, which has no max_tokens in the slot or in its \
                      backend_models row; every request carries max_tokens, so set it on one of them",
-                    cast.label, slot.role, slot.model
+                    slot.role, slot.model
                 )));
             }
             if !names_council_server(&slot.role) && tunables.thinking_style.as_deref() == Some("budget") {
                 let Some(budget) = tunables.thinking_budget else {
                     return Err(KernelDbError::Validation(format!(
-                        "cast {} slot {} of character {who} runs model {} with thinking_style=budget and no \
+                        "slot {} of character {who} runs model {} with thinking_style=budget and no \
                          thinking_budget in the slot or in its backend_models row; set one of them",
-                        cast.label, slot.role, slot.model
+                        slot.role, slot.model
                     )));
                 };
                 if let Some(max) = max_tokens
                     && budget >= max
                 {
                     return Err(KernelDbError::Validation(format!(
-                        "cast {} slot {} of character {who} runs model {} with thinking_budget ({budget}) not below \
+                        "slot {} of character {who} runs model {} with thinking_budget ({budget}) not below \
                          max_tokens ({max}); lower the budget or raise max_tokens",
-                        cast.label, slot.role, slot.model
+                        slot.role, slot.model
                     )));
                 }
             }
@@ -317,8 +317,8 @@ impl KernelDb {
     }
 
     /// Make `principal_id` the character of `context_id`, answering to
-    /// `senpai`, with slots copied fresh from the character's cast
-    /// (`characters.cast_id`; none gives a context with no slots). Refuses,
+    /// `senpai`, with slots copied fresh from the character's own slots
+    /// (none gives a context with no slots). Refuses,
     /// and writes nothing, when a slot has no `max_tokens` or the context
     /// already has a context character.
     pub fn write_context_character(
@@ -340,9 +340,7 @@ impl KernelDb {
             }
             let created_at = now_millis();
             insert_context_character(&db.conn, context_id, principal_id, senpai, persona, created_at)?;
-            if let Some(cast) = db.character_cast(principal_id)? {
-                db.copy_cast_slots(context_id, principal_id, &cast)?;
-            }
+            db.copy_character_slots(context_id, principal_id)?;
             Ok(ContextCharacterRow {
                 context_id,
                 principal_id,
@@ -621,6 +619,16 @@ struct OldLlmDefaults {
     thinking_style: Option<String>,
 }
 
+/// One slot of a cast as the migration reads it from the table that
+/// `character-slots-v1` later drops.
+struct LegacyCastSlot {
+    cast_id: CastId,
+    role: String,
+    backend_id: BackendId,
+    model: String,
+    tunables: ModelTunablesRow,
+}
+
 struct MigCharacter {
     root: bool,
     handoff_ctx: Option<ContextId>,
@@ -631,7 +639,7 @@ struct MigCharacter {
 /// The catalogs the old model resolver read, as they stand at migration.
 struct Catalog {
     casts: HashMap<CastId, String>,
-    slots: HashMap<CastId, Vec<CastSlotRow>>,
+    slots: HashMap<CastId, Vec<LegacyCastSlot>>,
     backend_by_name: HashMap<String, BackendId>,
     models: HashMap<(BackendId, String), BackendModelRow>,
     defaults: Option<OldLlmDefaults>,
@@ -644,10 +652,28 @@ impl Catalog {
             stmt.query_map([], |r| Ok((read_cast_id_col(r, 0)?, r.get::<_, String>(1)?)))?
                 .collect::<SqliteResult<HashMap<_, _>>>()?
         };
-        let mut slots: HashMap<CastId, Vec<CastSlotRow>> = HashMap::new();
+        let mut slots: HashMap<CastId, Vec<LegacyCastSlot>> = HashMap::new();
         {
-            let mut stmt = conn.prepare(&format!("SELECT {CAST_SLOT_COLS} FROM cast_slots ORDER BY cast_id, role"))?;
-            for slot in stmt.query_map([], row_to_cast_slot)? {
+            let mut stmt = conn.prepare(
+                "SELECT cast_id, role, backend_id, model, max_tokens, temperature, top_p, effort,
+                        thinking_budget, thinking_style FROM cast_slots ORDER BY cast_id, role",
+            )?;
+            for slot in stmt.query_map([], |r| {
+                Ok(LegacyCastSlot {
+                    cast_id: read_cast_id_col(r, 0)?,
+                    role: r.get(1)?,
+                    backend_id: read_backend_id(r, 2)?,
+                    model: r.get(3)?,
+                    tunables: ModelTunablesRow {
+                        max_tokens: r.get(4)?,
+                        temperature: r.get(5)?,
+                        top_p: r.get(6)?,
+                        effort: r.get(7)?,
+                        thinking_budget: r.get(8)?,
+                        thinking_style: r.get(9)?,
+                    },
+                })
+            })? {
                 let slot = slot?;
                 slots.entry(slot.cast_id).or_default().push(slot);
             }
@@ -1019,7 +1045,7 @@ impl KernelDb {
                 for slot in catalog.slots.get(&cast).into_iter().flatten() {
                     slots.insert(
                         slot.role.clone(),
-                        catalog.slot_values(&slot.role, slot.backend_id, &slot.model, &slot_tunables(slot), &mut pinned),
+                        catalog.slot_values(&slot.role, slot.backend_id, &slot.model, &slot.tunables, &mut pinned),
                     );
                 }
             }

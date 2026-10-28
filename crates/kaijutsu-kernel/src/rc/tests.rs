@@ -2499,7 +2499,7 @@ esac
                 }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), Some(caller.principal_id), None).unwrap();
-            db.seed_test_cast_roles(teller, &[("storyteller", "mock", "mock-model")]).unwrap();
+            db.seed_test_slot_entries(teller, &[("storyteller", "mock", "mock-model")]).unwrap();
         }
         let vfs = d.kernel().vfs();
         vfs.write_all(std::path::Path::new("/config/rc/storyteller/cards/kotone.md"),

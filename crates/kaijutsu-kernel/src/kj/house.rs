@@ -12,7 +12,7 @@
 
 /// Top-level verbs that need the `house` capability.
 pub(crate) const HOUSE_VERBS: &[&str] = &[
-    "alias", "attach", "audio", "backend", "binding", "cast", "cc", "character", "config", "council", "cp",
+    "alias", "attach", "audio", "backend", "binding", "cc", "character", "config", "council", "cp",
     "db", "doc", "drive", "hook", "interrupt", "ledger", "mcp", "midi", "play", "policy",
     "preset", "rc", "roster", "swap", "system", "transport",
 ];

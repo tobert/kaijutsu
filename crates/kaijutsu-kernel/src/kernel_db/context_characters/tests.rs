@@ -4,14 +4,33 @@ use kaijutsu_types::{DocKind, PresetId, TurnId, WorkspaceId};
 
 use super::*;
 use crate::kernel_db::{
-    BackendModelRow, BackendRow, CastRow, CastSlotRow, CharacterRow, ContextRow, DocumentRow, ModelTunablesRow,
+    BackendModelRow, BackendRow, CharacterRow, CharacterSlotRow, ContextRow, DocumentRow, ModelTunablesRow,
     blob_param, insert_context_with_doc, into_pre_context_character, make_context_row, now_millis,
     set_stored_played_by, setup_test_db,
 };
 use crate::kj::context::{CharacterPlacement, insert_new_context_rows};
 
+/// One slot of a fixture cast: a named set of slots a test hands a
+/// character with `default_cast`. A legacy database also stores it in the
+/// cast tables the migration reads.
+#[derive(Clone)]
+struct CastSlotRow {
+    cast_id: CastId,
+    role: String,
+    backend_id: BackendId,
+    model: String,
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    effort: Option<String>,
+    thinking_budget: Option<i64>,
+    thinking_style: Option<String>,
+}
+
 struct World {
     db: KernelDb,
+    /// The fixture casts: label and slots by id.
+    casts: std::cell::RefCell<std::collections::HashMap<CastId, (String, Vec<CastSlotRow>)>>,
     ws: WorkspaceId,
     anthropic: BackendId,
     deepseek: BackendId,
@@ -57,7 +76,7 @@ fn build_world(legacy: bool) -> World {
     };
     let anthropic = backend("anthropic", "anthropic");
     let deepseek = backend("deepseek", "deepseek");
-    World { db, ws, anthropic, deepseek, clock: std::cell::Cell::new(1_000), legacy }
+    World { db, casts: Default::default(), ws, anthropic, deepseek, clock: std::cell::Cell::new(1_000), legacy }
 }
 
 impl World {
@@ -101,36 +120,96 @@ impl World {
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            loadout: None,
-            extra: None,
         };
-        self.db.set_cast_slot(&row).unwrap();
+        self.set_cast_slot(&row);
         row
+    }
+
+    /// Record `row` in its fixture cast, and in the cast tables of a legacy
+    /// database.
+    fn set_cast_slot(&self, row: &CastSlotRow) {
+        let mut casts = self.casts.borrow_mut();
+        let (_, slots) = casts.get_mut(&row.cast_id).expect("a slot goes in a cast made with `cast`");
+        slots.retain(|slot| slot.role != row.role);
+        slots.push(row.clone());
+        if self.legacy {
+            self.db
+                .conn
+                .execute(
+                    "INSERT INTO cast_slots (cast_id, role, backend_id, model, max_tokens, temperature, top_p, effort,
+                                             thinking_budget, thinking_style)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(cast_id, role) DO UPDATE SET backend_id = excluded.backend_id, model = excluded.model,
+                         max_tokens = excluded.max_tokens, temperature = excluded.temperature, top_p = excluded.top_p,
+                         effort = excluded.effort, thinking_budget = excluded.thinking_budget,
+                         thinking_style = excluded.thinking_style",
+                    params![
+                        blob_param(row.cast_id.as_bytes()),
+                        row.role,
+                        blob_param(row.backend_id.as_bytes()),
+                        row.model,
+                        row.max_tokens,
+                        row.temperature,
+                        row.top_p,
+                        row.effort,
+                        row.thinking_budget,
+                        row.thinking_style,
+                    ],
+                )
+                .unwrap();
+        }
     }
 
     fn cast(&self, label: &str) -> CastId {
         let cast_id = CastId::new();
-        self.db
-            .insert_cast(&CastRow {
-                cast_id,
-                label: label.into(),
-                description: None,
-                created_at: 0,
-                created_by: PrincipalId::system(),
-            })
-            .unwrap();
+        self.casts.borrow_mut().insert(cast_id, (label.to_string(), Vec::new()));
+        if self.legacy {
+            self.db
+                .conn
+                .execute(
+                    "INSERT INTO casts (cast_id, label, description, created_at, created_by) VALUES (?1, ?2, NULL, 0, ?3)",
+                    params![blob_param(cast_id.as_bytes()), label, blob_param(PrincipalId::system().as_bytes())],
+                )
+                .unwrap();
+        }
         cast_id
     }
 
+    /// Give `character` the slots of `cast`. A legacy database points
+    /// `characters.default_cast_id` at the cast; the current one writes the
+    /// slots on the character, replacing any it had.
     fn default_cast(&self, character: PrincipalId, cast: CastId) {
-        let column = if self.legacy { "default_cast_id" } else { "cast_id" };
-        self.db
-            .conn
-            .execute(
-                &format!("UPDATE characters SET {column} = ?1 WHERE principal_id = ?2"),
-                params![blob_param(cast.as_bytes()), blob_param(character.as_bytes())],
-            )
-            .unwrap();
+        if self.legacy {
+            self.db
+                .conn
+                .execute(
+                    "UPDATE characters SET default_cast_id = ?1 WHERE principal_id = ?2",
+                    params![blob_param(cast.as_bytes()), blob_param(character.as_bytes())],
+                )
+                .unwrap();
+            return;
+        }
+        for existing in self.db.list_character_slots(character).unwrap() {
+            self.db.delete_character_slot(character, &existing.role).unwrap();
+        }
+        let casts = self.casts.borrow();
+        let (_, slots) = &casts[&cast];
+        for slot in slots {
+            self.db
+                .set_character_slot(&CharacterSlotRow {
+                    principal_id: character,
+                    role: slot.role.clone(),
+                    backend_id: slot.backend_id,
+                    model: slot.model.clone(),
+                    max_tokens: slot.max_tokens,
+                    temperature: slot.temperature,
+                    top_p: slot.top_p,
+                    effort: slot.effort.clone(),
+                    thinking_budget: slot.thinking_budget,
+                    thinking_style: slot.thinking_style.clone(),
+                })
+                .unwrap();
+        }
     }
 
     /// The standard cast: coder, judge and gate slots on deepseek `ds-flash`, whose
@@ -243,7 +322,7 @@ fn write_copies_the_cast_and_fills_unset_parameters_from_the_model_row() {
     let house = w.house();
     let mut coder = w.slot(house, "coder", w.deepseek, "ds-flash", None);
     coder.temperature = Some(0.2);
-    w.db.set_cast_slot(&coder).unwrap();
+    w.set_cast_slot(&coder);
     let who = w.character("coder");
     w.default_cast(who, house);
     let conv = w.ctx("conv", "coder", None, None);
@@ -277,6 +356,7 @@ fn a_cast_edit_after_create_changes_no_slots_and_a_later_context_copies_it() {
 
     w.model_row(w.anthropic, "claude-x", ModelTunablesRow { max_tokens: Some(9000), ..Default::default() }, None);
     w.slot(house, "coder", w.anthropic, "claude-x", None);
+    w.default_cast(who, house);
     w.model_row(w.deepseek, "ds-flash", ModelTunablesRow { max_tokens: Some(1), ..Default::default() }, None);
     let second = w.ctx("second", "coder", None, None);
     w.db.write_context_character(second.context_id, who, None, None).unwrap();
@@ -293,7 +373,7 @@ fn thinking_slot(w: &World, cast: CastId, role: &str, style: Option<&str>, budge
     let mut row = w.slot(cast, role, w.deepseek, "think-model", Some(4096));
     row.thinking_style = style.map(str::to_string);
     row.thinking_budget = budget;
-    w.db.set_cast_slot(&row).unwrap();
+    w.set_cast_slot(&row);
 }
 
 fn write_error(w: &World, cast: CastId) -> String {
@@ -305,12 +385,22 @@ fn write_error(w: &World, cast: CastId) -> String {
 }
 
 #[test]
-fn an_unknown_thinking_style_is_refused_on_cast_slot_and_model_row_writes() {
+fn an_unknown_thinking_style_is_refused_on_character_slot_and_model_row_writes() {
     let w = world();
-    let cast = w.cast("typo");
-    let mut row = w.slot(cast, "coder", w.deepseek, "ds-flash", Some(4096));
-    row.thinking_style = Some("budgett".into());
-    let error = w.db.set_cast_slot(&row).unwrap_err().to_string();
+    let who = w.character("typo");
+    let mut row = CharacterSlotRow {
+        principal_id: who,
+        role: "coder".into(),
+        backend_id: w.deepseek,
+        model: "ds-flash".into(),
+        max_tokens: Some(4096),
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: Some("budgett".into()),
+    };
+    let error = w.db.set_character_slot(&row).unwrap_err().to_string();
     assert!(error.contains("thinking_style") && error.contains("budgett"), "{error}");
 
     let error = w
@@ -328,19 +418,19 @@ fn an_unknown_thinking_style_is_refused_on_cast_slot_and_model_row_writes() {
 
     for style in ["off", "auto", "adaptive", "budget"] {
         row.thinking_style = Some(style.into());
-        w.db.set_cast_slot(&row).unwrap_or_else(|e| panic!("{style} must be accepted: {e}"));
+        w.db.set_character_slot(&row).unwrap_or_else(|e| panic!("{style} must be accepted: {e}"));
     }
 }
 
 #[test]
-fn a_budget_slot_with_no_thinking_budget_refuses_at_write_naming_cast_role_and_model() {
+fn a_budget_slot_with_no_thinking_budget_refuses_at_write_naming_role_and_model() {
     let w = world();
     let cast = w.cast("nobudget");
     thinking_slot(&w, cast, "coder", Some("budget"), None);
 
     let error = write_error(&w, cast);
 
-    for needle in ["nobudget", "coder", "think-model", "thinking_budget"] {
+    for needle in ["thinker-", "coder", "think-model", "thinking_budget"] {
         assert!(error.contains(needle), "{needle} missing from: {error}");
     }
     assert_eq!(w.count("context_characters"), 0, "a refused write leaves nothing");
@@ -372,7 +462,7 @@ fn a_thinking_budget_not_below_max_tokens_refuses_at_write() {
         let cast = w.cast(label);
         thinking_slot(&w, cast, "coder", Some("budget"), Some(budget));
         let error = write_error(&w, cast);
-        for needle in [label, "coder", "think-model", "thinking_budget", "max_tokens"] {
+        for needle in ["thinker-", "coder", "think-model", "thinking_budget", "max_tokens"] {
             assert!(error.contains(needle), "{needle} missing from: {error}");
         }
     }
@@ -398,7 +488,7 @@ fn a_council_server_slot_is_exempt_from_the_thinking_checks() {
 }
 
 #[test]
-fn a_slot_with_no_max_tokens_anywhere_refuses_naming_cast_role_and_model() {
+fn a_slot_with_no_max_tokens_anywhere_refuses_naming_role_and_model() {
     let w = world();
     let bare = w.cast("bare");
     w.slot(bare, "coder", w.deepseek, "no-row-model", None);
@@ -408,7 +498,7 @@ fn a_slot_with_no_max_tokens_anywhere_refuses_naming_cast_role_and_model() {
 
     let error = w.db.write_context_character(conv.context_id, who, None, None).unwrap_err().to_string();
 
-    for needle in ["bare", "coder", "no-row-model", "max_tokens"] {
+    for needle in ["coder", "no-row-model", "max_tokens"] {
         assert!(error.contains(needle), "{needle} missing from: {error}");
     }
     assert_eq!(w.count("context_characters"), 0, "a refused write leaves nothing");
@@ -420,8 +510,9 @@ fn a_slot_with_no_max_tokens_anywhere_refuses_naming_cast_role_and_model() {
     w.db.write_context_character(conv.context_id, who, None, None).unwrap();
     let next = w.ctx("next", "coder", None, None);
     w.slot(house, "coder", w.deepseek, "no-row-model", None);
+    w.default_cast(who, house);
     let error = w.db.write_context_character(next.context_id, who, None, None).unwrap_err().to_string();
-    assert!(error.contains("house") && error.contains("coder") && error.contains("no-row-model"), "{error}");
+    assert!(error.contains("coder") && error.contains("no-row-model"), "{error}");
     assert_eq!(w.count("context_characters"), 1, "a refused write leaves nothing");
     assert_eq!(w.cc(&next), None);
 }
@@ -593,7 +684,7 @@ fn a_fork_copies_the_slots_verbatim_and_takes_the_forker_as_senpai() {
 }
 
 /// A rotation's successor is the same character with slots copied fresh from
-/// the cast and the predecessor's senpai, through the placement `kj context
+/// the character and the predecessor's senpai, through the placement `kj context
 /// rotate` writes.
 #[test]
 fn a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai() {
@@ -608,6 +699,7 @@ fn a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai() {
     w.db.write_context_character(lane.context_id, who, Some(seat.context_id), None).unwrap();
     w.model_row(w.anthropic, "claude-x", ModelTunablesRow { max_tokens: Some(9000), ..Default::default() }, None);
     w.slot(house, "coder", w.anthropic, "claude-x", None);
+    w.default_cast(who, house);
 
     let mut successor = make_context_row(Some("successor"));
     successor.context_type = "coder".into();
@@ -616,7 +708,7 @@ fn a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai() {
     let copy = w.db.context_character(successor.context_id).unwrap().unwrap();
     assert_eq!((copy.principal_id, copy.senpai_ctx), (who, Some(seat.context_id)), "the same character, the predecessor's senpai");
     let slot = w.db.context_slot(successor.context_id, "coder").unwrap().unwrap();
-    assert_eq!((slot.model.as_str(), slot.backend_id), ("claude-x", w.anthropic), "slots are read fresh from the cast");
+    assert_eq!((slot.model.as_str(), slot.backend_id), ("claude-x", w.anthropic), "slots are read fresh from the character");
     let old = w.db.context_slot(lane.context_id, "coder").unwrap().unwrap();
     assert_eq!(old.model, "ds-flash", "the predecessor keeps its own");
 }
@@ -1134,7 +1226,10 @@ fn an_open_carries_the_old_columns_into_context_characters_then_drops_them() {
     }
     assert!(!KernelDb::has_column(&w.db.conn, "characters", "default_cast_id").unwrap());
     assert!(KernelDb::has_column(&w.db.conn, "characters", "root_ctx").unwrap(), "root_ctx is the console's pointer");
-    assert_eq!(w.db.character_cast(who).unwrap().map(|c| c.label), Some("house".to_string()), "characters.cast_id holds the old default cast");
+    let carried: Vec<String> = w.db.list_character_slots(who).unwrap().into_iter().map(|slot| slot.role).collect();
+    assert_eq!(carried, vec!["coder", "gate", "judge"], "the old default cast's slots moved onto the character");
+    assert!(!KernelDb::has_table(&w.db.conn, "casts").unwrap() && !KernelDb::has_table(&w.db.conn, "cast_slots").unwrap(), "the casts are dropped");
+    assert!(!KernelDb::has_column(&w.db.conn, "characters", "cast_id").unwrap());
     assert_eq!(w.db.root_console(amy).unwrap(), Some(console.context_id));
     assert_eq!(w.db.get_context(seat.context_id).unwrap().unwrap().played_by, Some(lead), "the performer was carried before the column went");
     let slot = w.db.context_slot(overridden.context_id, "coder").unwrap().expect("the override's slot");
@@ -1174,7 +1269,9 @@ fn a_new_database_has_none_of_the_dropped_columns_and_runs_neither_migration() {
     for (table, column) in [("contexts", "instance_id"), ("contexts", "binding_seq"), ("turns", "instance_id"), ("turns", "binding_seq")] {
         assert!(!KernelDb::has_column(&w.db.conn, table, column).unwrap(), "{table}.{column} is gone");
     }
-    assert!(KernelDb::has_column(&w.db.conn, "characters", "cast_id").unwrap());
+    assert!(!KernelDb::has_column(&w.db.conn, "characters", "cast_id").unwrap(), "no cast column");
+    assert!(!KernelDb::has_table(&w.db.conn, "casts").unwrap() && !KernelDb::has_table(&w.db.conn, "cast_slots").unwrap(), "no cast tables");
+    assert!(KernelDb::has_table(&w.db.conn, "character_slots").unwrap());
     assert!(KernelDb::has_column(&w.db.conn, "characters", "root_ctx").unwrap());
     assert_eq!(w.count("kernel_migrations WHERE name IN ('senpai-edges-v1', 'context-characters-v1')"), 0);
     KernelDb::apply_additive_migrations(&w.db.conn).unwrap();

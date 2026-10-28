@@ -59,8 +59,7 @@ enum CharacterCommand {
         /// The character's name.
         name: String,
     },
-    /// Update a character's sheet: whether it is a root, and its default
-    /// cast.
+    /// Update a character's sheet: whether it is a root.
     Set {
         /// The character to update.
         name: String,
@@ -71,14 +70,12 @@ enum CharacterCommand {
         /// Make this character an ordinary one that a model can play.
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
-        /// The cast each new context of this character copies. A running
-        /// context keeps its slots until `kj context rotate`.
-        #[arg(long, value_name = "CAST", conflicts_with = "no_cast")]
-        cast: Option<String>,
-        /// Clear the default cast.
-        #[arg(long = "no-cast", conflicts_with = "cast")]
-        no_cast: bool,
     },
+    /// The model each of a character's roles runs. A context copies the
+    /// slots when it is made, so a change reaches a running context at
+    /// `kj context rotate`.
+    #[command(subcommand)]
+    Slot(super::slot::CharacterSlotCommand),
     /// Retire a character and conclude and archive every live context it plays.
     /// The contexts retain their performer assignment.
     Retire {
@@ -121,8 +118,8 @@ impl KjDispatcher {
             }
         };
 
-        // Mutating verbs need the same admin-shaped gate `kj cast`'s writes
-        // use — minting, re-rooting, or retiring an identity is global,
+        // Mutating verbs need the same admin-shaped gate the model
+        // configuration writes use — minting, re-rooting, or retiring an identity is global,
         // cross-context state, not something a context should be able to do
         // to itself.
         let mutating = matches!(
@@ -130,6 +127,8 @@ impl KjDispatcher {
             CharacterCommand::Create { .. }
                 | CharacterCommand::Set { .. }
                 | CharacterCommand::Retire { .. }
+                | CharacterCommand::Slot(super::slot::CharacterSlotCommand::Set { .. })
+                | CharacterCommand::Slot(super::slot::CharacterSlotCommand::Unset { .. })
         );
         if mutating
             && let Err(denied) =
@@ -142,22 +141,13 @@ impl KjDispatcher {
             CharacterCommand::Create { name, root } => self.character_create(&name, root, caller).await,
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Set { name, root, no_root, cast, no_cast } => {
-                if !root && !no_root && cast.is_none() && !no_cast {
-                    return KjResult::Err(
-                        "kj character set: specify --root, --no-root, --cast <cast>, or --no-cast".to_string(),
-                    );
-                }
-                if (cast.is_some() || no_cast)
-                    && let Err(error) = self.character_set_cast(&name, cast.as_deref())
-                {
-                    return error;
-                }
+            CharacterCommand::Set { name, root, no_root } => {
                 if !root && !no_root {
-                    return self.character_show(&name);
+                    return KjResult::Err("kj character set: specify --root or --no-root".to_string());
                 }
                 self.character_set(&name, root, no_root, caller).await
             }
+            CharacterCommand::Slot(cmd) => self.character_slot(cmd),
             CharacterCommand::Retire { name } => self.character_retire(&name, caller).await,
         }
     }
@@ -478,10 +468,18 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.get_character_by_name(name) {
             Ok(Some(row)) => {
-                let default_cast = match db.character_cast(row.principal_id) {
-                    Ok(cast) => cast.map(|c| c.label),
+                let slots = match db.list_character_slots(row.principal_id) {
+                    Ok(slots) => slots,
                     Err(e) => return KjResult::Err(format!("kj character show: {e}")),
                 };
+                let backends: std::collections::HashMap<_, _> = match db.list_backends() {
+                    Ok(b) => b.into_iter().map(|b| (b.backend_id, b.name)).collect(),
+                    Err(e) => return KjResult::Err(format!("kj character show: {e}")),
+                };
+                let slot_names: Vec<String> = slots
+                    .iter()
+                    .map(|s| format!("{} → {}/{}", s.role, backends.get(&s.backend_id).map_or("(missing backend)", String::as_str), s.model))
+                    .collect();
                 let contexts = match db.character_live_contexts(row.principal_id) {
                     Ok(live) => live,
                     Err(e) => return KjResult::Err(format!("kj character show: {e}")),
@@ -489,11 +487,11 @@ impl KjDispatcher {
                 let context_names: Vec<String> = contexts.iter().map(|c| db.context_name(*c)).collect();
                 let mut text = format!(
                     "Character:       {}\nID:              {}\nRoot:            {}\n\
-                     Default cast:    {}\nCreated:         {}\nRetired:         {}",
+                     Slots:           {}\nCreated:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
-                    default_cast.as_deref().unwrap_or("-"),
+                    if slot_names.is_empty() { "-".to_string() } else { slot_names.join(", ") },
                     super::format::format_timestamp(row.created_at),
                     row.retired_at
                         .map(super::format::format_timestamp)
@@ -501,7 +499,10 @@ impl KjDispatcher {
                 );
                 text.push_str(&format!("\nLive contexts:   {}", if context_names.is_empty() { "-".to_string() } else { context_names.join(", ") }));
                 let mut data = character_to_json(&row);
-                data["default_cast"] = serde_json::json!(default_cast);
+                data["slots"] = match super::slot::slot_listing(&row.name, &slots, &backends) {
+                    KjResult::Ok { data: Some(slots), .. } => slots,
+                    _ => serde_json::Value::Array(Vec::new()),
+                };
                 data["contexts"] = serde_json::Value::Array(
                     contexts.iter().map(|c| serde_json::json!({
                         "id": c.to_hex(),
@@ -520,35 +521,6 @@ impl KjDispatcher {
             )),
             Err(e) => KjResult::Err(format!("kj character show: {e}")),
         }
-    }
-
-    /// Set or clear the character's default cast. `Err` carries the
-    /// refusal to return.
-    fn character_set_cast(&self, name: &str, cast: Option<&str>) -> Result<(), KjResult> {
-        let db = self.kernel_db().lock();
-        let row = match db.get_character_by_name(name) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return Err(KjResult::Err(format!(
-                    "kj character set: no character named '{name}' — `kj character list` to see who exists"
-                )));
-            }
-            Err(e) => return Err(KjResult::Err(format!("kj character set: {e}"))),
-        };
-        let cast_id = match cast {
-            None => None,
-            Some(label) => match db.get_cast_by_label(label) {
-                Ok(Some(cast)) => Some(cast.cast_id),
-                Ok(None) => {
-                    return Err(KjResult::Err(format!(
-                        "kj character set: no cast labeled '{label}' — `kj cast list` to see the casts"
-                    )));
-                }
-                Err(e) => return Err(KjResult::Err(format!("kj character set: {e}"))),
-            },
-        };
-        db.set_character_cast(row.principal_id, cast_id)
-            .map_err(|e| KjResult::Err(format!("kj character set: {e}")))
     }
 
     /// Set or clear `root`. A root is a model context like any other: a
@@ -739,6 +711,7 @@ impl Classify for CharacterCommand {
             Self::List { .. } | Self::Show { .. } => Effect::Read,
             Self::Create { .. } | Self::Set { .. } => Effect::Write,
             Self::Retire { .. } => Effect::Destroy,
+            Self::Slot(cmd) => cmd.effect(),
         }
     }
 }

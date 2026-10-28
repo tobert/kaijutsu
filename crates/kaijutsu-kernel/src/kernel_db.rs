@@ -1461,24 +1461,15 @@ CREATE TABLE IF NOT EXISTS backend_models (
     PRIMARY KEY (backend_id, model_id)
 );
 
--- ── Casts (named ensembles) ────────────────────────────────────
--- A cast is a model *team*: one slot per role, where a role is a
--- `context_type` (coder, musician, mcp, …). Free-form TEXT with no FK —
--- context types are an open set defined by the rc tree, and a cast that
--- names a role nobody has created yet is a legitimate forward declaration.
-CREATE TABLE IF NOT EXISTS casts (
-    cast_id     BLOB NOT NULL PRIMARY KEY,
-    label       TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    description TEXT,
-    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    created_by  BLOB NOT NULL
-);
-
--- One role's seat in a cast. A NULL tunable takes the model's `backend_models`
--- value when a binding copies the slot. `loadout` is a stub for a future
--- capability/loadout reference — stored, no consumer yet.
-CREATE TABLE IF NOT EXISTS cast_slots (
-    cast_id         BLOB NOT NULL REFERENCES casts(cast_id) ON DELETE CASCADE,
+-- ── Character slots ───────────────────────────────────────────
+-- The model each of a character's roles runs: one slot per role, where a
+-- role is a `context_type` (coder, musician, mcp, …) or one of the reserved
+-- roles `distill`, `gate` and `judge`. Free-form TEXT with no FK — context
+-- types are an open set defined by the rc tree. A NULL tunable takes the
+-- model's `backend_models` value when a context character copies the slot
+-- (docs/senpai-kohai.md, "The model").
+CREATE TABLE IF NOT EXISTS character_slots (
+    principal_id    BLOB NOT NULL REFERENCES characters(principal_id),
     role            TEXT NOT NULL,
     backend_id      BLOB NOT NULL REFERENCES backends(backend_id),
     model           TEXT NOT NULL CHECK (model != ''),
@@ -1488,11 +1479,9 @@ CREATE TABLE IF NOT EXISTS cast_slots (
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
-    loadout         TEXT,
-    extra           TEXT,
-    PRIMARY KEY (cast_id, role)
+    PRIMARY KEY (principal_id, role)
 );
-CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
+CREATE INDEX IF NOT EXISTS idx_character_slots_backend ON character_slots(backend_id);
 
 -- ── Characters (principal + sheet) ──────────────────────────────
 -- The persistent someone a name resolves to: a principal id plus a small,
@@ -1519,11 +1508,7 @@ CREATE TABLE IF NOT EXISTS characters (
     -- A root character's console: the one context of it with no senpai
     -- (docs/senpai-kohai.md, "The model"). A rotation of the console moves the
     -- pointer in the commit, as it moves `handoff_ctx`.
-    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    -- The cast whose slots a new context character of this character copies
-    -- (docs/senpai-kohai.md, "The model"). Read only when a context character
-    -- is written. Removing the cast clears it.
-    cast_id          BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
+    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -3094,6 +3079,7 @@ impl KernelDb {
         Self::remove_retired_classifier(conn)?;
         Self::migrate_house_capability(conn)?;
         if pre_context_character {
+            Self::ensure_legacy_cast_tables(conn)?;
             Self::ensure_pre_context_character_columns(conn)?;
             Self::migrate_senpai_edges(conn)?;
             Self::drop_old_routing(conn)?;
@@ -3104,6 +3090,122 @@ impl KernelDb {
             Self::migrate_context_characters(conn)?;
             Self::drop_pre_context_character_columns(conn)?;
         }
+        Self::migrate_character_slots(conn)?;
+        Ok(())
+    }
+
+    /// Name of the migration that moves each character's cast into its own
+    /// slots and drops the casts.
+    pub const CHARACTER_SLOTS_MIGRATION: &'static str = "character-slots-v1";
+
+    /// The pre-character-slot cast tables, created empty when a database old
+    /// enough to lack them is about to be read by the migrations that carry
+    /// casts forward. Only called on a database that still has
+    /// `contexts.provider`.
+    fn ensure_legacy_cast_tables(conn: &Connection) -> KernelDbResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS casts (
+                cast_id     BLOB NOT NULL PRIMARY KEY,
+                label       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                description TEXT,
+                created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+                created_by  BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cast_slots (
+                cast_id         BLOB NOT NULL REFERENCES casts(cast_id) ON DELETE CASCADE,
+                role            TEXT NOT NULL,
+                backend_id      BLOB NOT NULL REFERENCES backends(backend_id),
+                model           TEXT NOT NULL CHECK (model != ''),
+                max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+                temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+                top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+                effort          TEXT,
+                thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+                thinking_style  TEXT,
+                loadout         TEXT,
+                extra           TEXT,
+                PRIMARY KEY (cast_id, role)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Move each character's cast into `character_slots` and drop the casts
+    /// (`docs/senpai-kohai.md`, "Migration", step 1), in one transaction.
+    ///
+    /// A character gets a copy of the slots of the cast it names; a character
+    /// with no cast gets none. Every value that does not carry over is logged
+    /// before it goes: a cast no character names, with its slots, and a
+    /// slot's `loadout` and `extra`, which had no reader. Then
+    /// `characters.cast_id`, `cast_slots` and `casts` are dropped. A database
+    /// with no `casts` table is on the new shape and does nothing; one that
+    /// still has `characters.default_cast_id` has not been through
+    /// `context-characters-v1` and refuses, because that migration reads the
+    /// casts.
+    fn migrate_character_slots(conn: &Connection) -> KernelDbResult<()> {
+        if !Self::has_table(conn, "casts")? && !Self::has_table(conn, "cast_slots")? {
+            return Ok(());
+        }
+        if Self::has_column(conn, "characters", "default_cast_id")? || Self::has_column(conn, "contexts", "cast_id")? {
+            return Err(KernelDbError::Validation(
+                "the casts cannot move to character slots before the context character migration has read them".into(),
+            ));
+        }
+        let tx = conn.unchecked_transaction()?;
+        let has_cast_column = Self::has_column(&tx, "characters", "cast_id")?;
+        if has_cast_column && Self::has_table(&tx, "cast_slots")? {
+            tx.execute(
+                "INSERT INTO character_slots
+                     (principal_id, role, backend_id, model, max_tokens, temperature, top_p, effort,
+                      thinking_budget, thinking_style)
+                 SELECT c.principal_id, s.role, s.backend_id, s.model, s.max_tokens, s.temperature, s.top_p,
+                        s.effort, s.thinking_budget, s.thinking_style
+                 FROM characters c JOIN cast_slots s ON s.cast_id = c.cast_id
+                 WHERE true
+                 ON CONFLICT(principal_id, role) DO NOTHING",
+                [],
+            )?;
+        }
+        if Self::has_table(&tx, "casts")? {
+            let named = if has_cast_column {
+                "EXISTS (SELECT 1 FROM characters ch WHERE ch.cast_id = c.cast_id)"
+            } else {
+                "0"
+            };
+            let mut stmt = tx.prepare(&format!(
+                "SELECT c.label, (SELECT COUNT(*) FROM cast_slots s WHERE s.cast_id = c.cast_id), {named} FROM casts c ORDER BY c.label"
+            ))?;
+            let casts: Vec<(String, i64, bool)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))?
+                .collect::<SqliteResult<_>>()?;
+            for (label, slots, named) in casts {
+                if !named {
+                    warn!(cast = %label, slots, "dropping a cast no character names, with its slots");
+                }
+            }
+        }
+        if Self::has_table(&tx, "cast_slots")? {
+            let mut stmt = tx.prepare(
+                "SELECT c.label, s.role FROM cast_slots s JOIN casts c ON c.cast_id = s.cast_id
+                 WHERE s.loadout IS NOT NULL OR s.extra IS NOT NULL ORDER BY c.label, s.role",
+            )?;
+            let unread: Vec<(String, String)> =
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<SqliteResult<_>>()?;
+            for (label, role) in unread {
+                warn!(cast = %label, role = %role, "dropping a slot's loadout and extra, which nothing read");
+            }
+        }
+        if has_cast_column {
+            tx.execute("ALTER TABLE characters DROP COLUMN cast_id", [])?;
+        }
+        tx.execute("DROP TABLE IF EXISTS cast_slots", [])?;
+        tx.execute("DROP TABLE IF EXISTS casts", [])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO kernel_migrations (name) VALUES (?1)",
+            [Self::CHARACTER_SLOTS_MIGRATION],
+        )?;
+        tx.commit()?;
+        info!("moved each character's cast into its own slots and dropped the casts");
         Ok(())
     }
 
@@ -5060,49 +5162,33 @@ impl KernelDb {
     }
 
     /// Test fixture: make `character` run `model` on `backend` for each of
-    /// `roles`. See [`Self::seed_test_cast_roles`].
+    /// `roles`. See [`Self::seed_test_slot_entries`].
     #[cfg(any(test, feature = "test-util"))]
-    pub fn seed_test_cast(
+    pub fn seed_test_slots(
         &self,
         character: PrincipalId,
         backend: &str,
         model: &str,
         roles: &[&str],
-    ) -> KernelDbResult<CastId> {
+    ) -> KernelDbResult<()> {
         let entries: Vec<(&str, &str, &str)> = roles.iter().map(|role| (*role, backend, model)).collect();
-        self.seed_test_cast_roles(character, &entries)
+        self.seed_test_slot_entries(character, &entries)
     }
 
-    /// Test fixture: make `character` run, for each `(role, backend, model)`,
-    /// that model on that backend, through a cast named for its entries that
-    /// `characters.cast_id` points at. A backend row is created
-    /// (kind `mock`, no key) when absent, and each slot sets `max_tokens`. A
-    /// context character written after this copies the slots; one written
-    /// before keeps the slots it has.
+    /// Test fixture: give `character` exactly these slots, one per
+    /// `(role, backend, model)`, replacing the slots it had. A backend row is
+    /// created (kind `mock`, no key) when absent, and each slot sets
+    /// `max_tokens`. A context character written after this copies the slots;
+    /// one written before keeps the slots it has.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn seed_test_cast_roles(
+    pub fn seed_test_slot_entries(
         &self,
         character: PrincipalId,
         entries: &[(&str, &str, &str)],
-    ) -> KernelDbResult<CastId> {
-        let label = format!(
-            "test-{}",
-            entries.iter().map(|(role, backend, model)| format!("{role}-{backend}-{model}")).collect::<Vec<_>>().join("--")
-        );
-        let cast = match self.get_cast_by_label(&label)? {
-            Some(cast) => cast,
-            None => {
-                let cast = CastRow {
-                    cast_id: CastId::new(),
-                    label,
-                    description: None,
-                    created_at: 0,
-                    created_by: PrincipalId::system(),
-                };
-                self.insert_cast(&cast)?;
-                cast
-            }
-        };
+    ) -> KernelDbResult<()> {
+        for existing in self.list_character_slots(character)? {
+            self.delete_character_slot(character, &existing.role)?;
+        }
         for (role, backend, model) in entries {
             let backend_row = match self.get_backend_by_name(backend)? {
                 Some(row) => row,
@@ -5125,8 +5211,8 @@ impl KernelDb {
                     row
                 }
             };
-            self.set_cast_slot(&CastSlotRow {
-                cast_id: cast.cast_id,
+            self.set_character_slot(&CharacterSlotRow {
+                principal_id: character,
                 role: role.to_string(),
                 backend_id: backend_row.backend_id,
                 model: model.to_string(),
@@ -5136,12 +5222,9 @@ impl KernelDb {
                 effort: None,
                 thinking_budget: None,
                 thinking_style: None,
-                loadout: None,
-                extra: None,
             })?;
         }
-        self.set_character_cast(character, Some(cast.cast_id))?;
-        Ok(cast.cast_id)
+        Ok(())
     }
 
     /// Test fixture: give `id` a stand-in context character of `played_by`,
@@ -8274,16 +8357,6 @@ pub struct ModelTunablesRow {
     pub thinking_style: Option<String>,
 }
 
-/// A named ensemble.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CastRow {
-    pub cast_id: CastId,
-    pub label: String,
-    pub description: Option<String>,
-    pub created_at: i64,
-    pub created_by: PrincipalId,
-}
-
 /// A character's sheet — the persistent someone `name` resolves to. The
 /// principal is the character's key (`docs/character.md`, "Character =
 /// principal + sheet"): no distinct id type, `principal_id` is immutable,
@@ -8323,10 +8396,10 @@ impl CharacterRow {
     }
 }
 
-/// One role's seat in a cast. A NULL tunable takes the model's `backend_models` value when a binding copies the slot.
+/// One role's seat on a character. A NULL tunable takes the model's `backend_models` value when a context character copies the slot.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CastSlotRow {
-    pub cast_id: CastId,
+pub struct CharacterSlotRow {
+    pub principal_id: PrincipalId,
     pub role: String,
     pub backend_id: BackendId,
     pub model: String,
@@ -8336,9 +8409,6 @@ pub struct CastSlotRow {
     pub effort: Option<String>,
     pub thinking_budget: Option<i64>,
     pub thinking_style: Option<String>,
-    /// Stub for a future capability/loadout reference. Stored, no consumer.
-    pub loadout: Option<String>,
-    pub extra: Option<String>,
 }
 
 /// A `--model` shorthand: alias → (backend, model).
@@ -8389,19 +8459,6 @@ fn read_backend_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<BackendI
     })
 }
 
-fn read_cast_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<CastId> {
-    let bytes: Vec<u8> = row.get(idx)?;
-    CastId::try_from_slice(&bytes).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            idx,
-            rusqlite::types::Type::Blob,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cast_id blob is not 16 bytes",
-            )),
-        )
-    })
-}
 
 const BACKEND_COLS: &str = "backend_id, name, kind, base_url, api_key_env, api_key_file, \
                             key_optional, request_timeout_secs, idle_timeout_secs, created_at, \
@@ -8424,12 +8481,12 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> SqliteResult<BackendRow> {
     })
 }
 
-const CAST_SLOT_COLS: &str = "cast_id, role, backend_id, model, max_tokens, temperature, \
-                              top_p, effort, thinking_budget, thinking_style, loadout, extra";
+const CHARACTER_SLOT_COLS: &str = "principal_id, role, backend_id, model, max_tokens, temperature, \
+                                   top_p, effort, thinking_budget, thinking_style";
 
-fn row_to_cast_slot(row: &rusqlite::Row<'_>) -> SqliteResult<CastSlotRow> {
-    Ok(CastSlotRow {
-        cast_id: read_cast_id(row, 0)?,
+fn row_to_character_slot(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterSlotRow> {
+    Ok(CharacterSlotRow {
+        principal_id: read_principal_id(row, 0)?,
         role: row.get(1)?,
         backend_id: read_backend_id(row, 2)?,
         model: row.get(3)?,
@@ -8439,8 +8496,6 @@ fn row_to_cast_slot(row: &rusqlite::Row<'_>) -> SqliteResult<CastSlotRow> {
         effort: row.get(7)?,
         thinking_budget: row.get(8)?,
         thinking_style: row.get(9)?,
-        loadout: row.get(10)?,
-        extra: row.get(11)?,
     })
 }
 
@@ -8521,7 +8576,7 @@ impl KernelDb {
 
     /// Delete a backend by name.
     ///
-    /// Refuses loudly while a cast slot, a context's slot or a
+    /// Refuses loudly while a character slot, a context's slot or a
     /// model alias still points at it. The FK would reject the DELETE anyway,
     /// but a named list of the referents is the difference between "fix this"
     /// and "SQLITE_CONSTRAINT".
@@ -8532,8 +8587,8 @@ impl KernelDb {
         let id = blob_param(backend.backend_id.as_bytes());
         let slots: Vec<String> = {
             let mut stmt = self.conn.prepare(
-                "SELECT c.label || '/' || s.role FROM cast_slots s
-                 JOIN casts c ON c.cast_id = s.cast_id
+                "SELECT c.name || '/' || s.role FROM character_slots s
+                 JOIN characters c ON c.principal_id = s.principal_id
                  WHERE s.backend_id = ?1 ORDER BY 1",
             )?;
             stmt.query_map(params![id], |r| r.get::<_, String>(0))?
@@ -8666,115 +8721,10 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    // ── casts ───────────────────────────────────────────────────────────
+    // ── character slots ─────────────────────────────────────────────────
 
-    /// Create a cast. Fails loudly on a duplicate label (case-insensitive).
-    pub fn insert_cast(&self, row: &CastRow) -> KernelDbResult<()> {
-        validate_label(&row.label)?;
-        self.conn
-            .execute(
-                "INSERT INTO casts (cast_id, label, description, created_at, created_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    blob_param(row.cast_id.as_bytes()),
-                    row.label,
-                    row.description,
-                    row.created_at,
-                    blob_param(row.created_by.as_bytes()),
-                ],
-            )
-            .map_err(|e| {
-                map_unique_violation(e, format!("cast label '{}' already in use", row.label))
-            })?;
-        Ok(())
-    }
-
-    /// Fetch a cast by id — the counterpart to `get_cast_by_label` for
-    /// callers that only have a context row's `cast_id` (e.g. resolving the
-    /// label to display in `kj context info`/`list`).
-    pub fn get_cast(&self, cast_id: CastId) -> KernelDbResult<Option<CastRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT cast_id, label, description, created_at, created_by
-             FROM casts WHERE cast_id = ?1",
-        )?;
-        Ok(stmt
-            .query_row(params![blob_param(cast_id.as_bytes())], |row| {
-                Ok(CastRow {
-                    cast_id: read_cast_id(row, 0)?,
-                    label: row.get(1)?,
-                    description: row.get(2)?,
-                    created_at: row.get(3)?,
-                    created_by: read_principal_id(row, 4)?,
-                })
-            })
-            .optional()?)
-    }
-
-    /// Fetch a cast by label (case-insensitive, matching the UNIQUE collation).
-    pub fn get_cast_by_label(&self, label: &str) -> KernelDbResult<Option<CastRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT cast_id, label, description, created_at, created_by
-             FROM casts WHERE label = ?1",
-        )?;
-        Ok(stmt
-            .query_row(params![label], |row| {
-                Ok(CastRow {
-                    cast_id: read_cast_id(row, 0)?,
-                    label: row.get(1)?,
-                    description: row.get(2)?,
-                    created_at: row.get(3)?,
-                    created_by: read_principal_id(row, 4)?,
-                })
-            })
-            .optional()?)
-    }
-
-    /// Every cast, ordered by label.
-    pub fn list_casts(&self) -> KernelDbResult<Vec<CastRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT cast_id, label, description, created_at, created_by FROM casts ORDER BY label",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(CastRow {
-                cast_id: read_cast_id(row, 0)?,
-                label: row.get(1)?,
-                description: row.get(2)?,
-                created_at: row.get(3)?,
-                created_by: read_principal_id(row, 4)?,
-            })
-        })?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// Delete a cast; its slots cascade.
-    pub fn delete_cast(&self, cast_id: CastId) -> KernelDbResult<()> {
-        self.conn.execute(
-            "DELETE FROM casts WHERE cast_id = ?1",
-            params![blob_param(cast_id.as_bytes())],
-        )?;
-        Ok(())
-    }
-
-    /// Update a cast's description; `None` clears it to NULL. The empty-vs-
-    /// clear decision (an empty `--desc ""` means clear) is the `kj cast set`
-    /// caller's contract, not this method's — this just writes what it's given.
-    pub fn update_cast_description(
-        &self,
-        cast_id: CastId,
-        description: Option<&str>,
-    ) -> KernelDbResult<()> {
-        let n = self.conn.execute(
-            "UPDATE casts SET description = ?1 WHERE cast_id = ?2",
-            params![description, blob_param(cast_id.as_bytes())],
-        )?;
-        if n == 0 {
-            return Err(KernelDbError::NotFound(format!("cast {}", cast_id.short())));
-        }
-        Ok(())
-    }
-
-    /// Insert or replace one slot of a cast.
-    pub fn set_cast_slot(&self, row: &CastSlotRow) -> KernelDbResult<()> {
+    /// Insert or replace one slot of a character.
+    pub fn set_character_slot(&self, row: &CharacterSlotRow) -> KernelDbResult<()> {
         if row.role.trim().is_empty() {
             return Err(KernelDbError::Validation("role must not be empty".into()));
         }
@@ -8790,9 +8740,9 @@ impl KernelDb {
         )?;
         self.conn.execute(
             &format!(
-                "INSERT INTO cast_slots ({CAST_SLOT_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(cast_id, role) DO UPDATE SET
+                "INSERT INTO character_slots ({CHARACTER_SLOT_COLS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(principal_id, role) DO UPDATE SET
                      backend_id = excluded.backend_id,
                      model = excluded.model,
                      max_tokens = excluded.max_tokens,
@@ -8800,12 +8750,10 @@ impl KernelDb {
                      top_p = excluded.top_p,
                      effort = excluded.effort,
                      thinking_budget = excluded.thinking_budget,
-                     thinking_style = excluded.thinking_style,
-                     loadout = excluded.loadout,
-                     extra = excluded.extra"
+                     thinking_style = excluded.thinking_style"
             ),
             params![
-                blob_param(row.cast_id.as_bytes()),
+                blob_param(row.principal_id.as_bytes()),
                 row.role,
                 blob_param(row.backend_id.as_bytes()),
                 row.model,
@@ -8815,37 +8763,34 @@ impl KernelDb {
                 row.effort,
                 row.thinking_budget,
                 row.thinking_style,
-                row.loadout,
-                row.extra,
             ],
         )?;
         Ok(())
     }
 
     /// Remove one slot. Returns whether a row went.
-    pub fn delete_cast_slot(&self, cast_id: CastId, role: &str) -> KernelDbResult<bool> {
+    pub fn delete_character_slot(&self, principal_id: PrincipalId, role: &str) -> KernelDbResult<bool> {
         let n = self.conn.execute(
-            "DELETE FROM cast_slots WHERE cast_id = ?1 AND role = ?2",
-            params![blob_param(cast_id.as_bytes()), role],
+            "DELETE FROM character_slots WHERE principal_id = ?1 AND role = ?2",
+            params![blob_param(principal_id.as_bytes()), role],
         )?;
         Ok(n > 0)
     }
 
-    /// One cast's slots, ordered by role.
-    pub fn list_cast_slots(&self, cast_id: CastId) -> KernelDbResult<Vec<CastSlotRow>> {
-        let sql =
-            format!("SELECT {CAST_SLOT_COLS} FROM cast_slots WHERE cast_id = ?1 ORDER BY role");
+    /// One character's slots, ordered by role.
+    pub fn list_character_slots(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<CharacterSlotRow>> {
+        let sql = format!("SELECT {CHARACTER_SLOT_COLS} FROM character_slots WHERE principal_id = ?1 ORDER BY role");
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![blob_param(cast_id.as_bytes())], row_to_cast_slot)?;
+        let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_character_slot)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// One cast's slot for `role`, if it has one.
-    pub fn get_cast_slot(&self, cast_id: CastId, role: &str) -> KernelDbResult<Option<CastSlotRow>> {
-        let sql = format!("SELECT {CAST_SLOT_COLS} FROM cast_slots WHERE cast_id = ?1 AND role = ?2");
+    /// One character's slot for `role`, if it has one.
+    pub fn get_character_slot(&self, principal_id: PrincipalId, role: &str) -> KernelDbResult<Option<CharacterSlotRow>> {
+        let sql = format!("SELECT {CHARACTER_SLOT_COLS} FROM character_slots WHERE principal_id = ?1 AND role = ?2");
         let mut stmt = self.conn.prepare(&sql)?;
         Ok(stmt
-            .query_row(params![blob_param(cast_id.as_bytes()), role], row_to_cast_slot)
+            .query_row(params![blob_param(principal_id.as_bytes()), role], row_to_character_slot)
             .optional()?)
     }
 
@@ -8946,41 +8891,6 @@ impl KernelDb {
     /// Set or clear a character's `root` flag, which marks a model context
     /// whose kj requests always need approval (`docs/character.md`,
     /// "Roots and rotation").
-    /// Set or clear the cast whose slots a new binding of this character's
-    /// instance copies.
-    pub fn set_character_cast(&self, principal_id: PrincipalId, cast_id: Option<CastId>) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE characters SET cast_id = ?1 WHERE principal_id = ?2",
-            params![cast_id.map(|c| c.as_bytes().to_vec()), blob_param(principal_id.as_bytes())],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!("character {}", principal_id.short())));
-        }
-        Ok(())
-    }
-
-    /// The character's cast, or `None` when it has none or no sheet.
-    pub fn character_cast(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CastRow>> {
-        let cast_id: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT cast_id FROM characters WHERE principal_id = ?1",
-                params![blob_param(principal_id.as_bytes())],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        match cast_id {
-            Some(bytes) => {
-                let bytes: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
-                    KernelDbError::Validation(format!("character {} has a malformed cast id", principal_id.short()))
-                })?;
-                self.get_cast(CastId::from_bytes(bytes))
-            }
-            None => Ok(None),
-        }
-    }
-
     pub fn update_character_root(&self, principal_id: PrincipalId, root: bool) -> KernelDbResult<()> {
         let updated = self.conn.execute(
             "UPDATE characters SET root = ?1 WHERE principal_id = ?2",
@@ -9588,9 +9498,7 @@ impl KernelDb {
 #[cfg(test)]
 fn into_pre_context_character(db: &KernelDb) {
     let c = &db.conn;
-    if KernelDb::has_column(c, "characters", "cast_id").unwrap() {
-        c.execute("ALTER TABLE characters RENAME COLUMN cast_id TO default_cast_id", []).unwrap();
-    }
+    KernelDb::ensure_legacy_cast_tables(c).unwrap();
     for (table, column, definition) in [
         ("contexts", "provider", "TEXT"),
         ("contexts", "model", "TEXT"),
@@ -10587,6 +10495,89 @@ mod tests {
     /// (still carrying `provider`/`model`): the legacy columns are dropped
     /// and a preset that had a provider/model loses it; no cast column is
     /// added.
+    /// The pre-character-slot shape: the cast tables and `characters.cast_id`,
+    /// which a fresh database no longer creates.
+    fn with_cast_tables(db: &KernelDb) {
+        KernelDb::ensure_legacy_cast_tables(&db.conn).unwrap();
+        db.conn.execute("ALTER TABLE characters ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL", []).unwrap();
+    }
+
+    fn legacy_cast(db: &KernelDb, label: &str, slots: &[(&str, &str, Option<&str>)], backend: BackendId) -> Vec<u8> {
+        let cast_id = CastId::new().as_bytes().to_vec();
+        db.conn.execute(
+            "INSERT INTO casts (cast_id, label, created_by) VALUES (?1, ?2, ?3)",
+            params![cast_id, label, blob_param(PrincipalId::system().as_bytes())],
+        ).unwrap();
+        for (role, model, loadout) in slots {
+            db.conn.execute(
+                "INSERT INTO cast_slots (cast_id, role, backend_id, model, max_tokens, temperature, loadout)
+                 VALUES (?1, ?2, ?3, ?4, 4096, 0.5, ?5)",
+                params![cast_id, role, blob_param(backend.as_bytes()), model, loadout],
+            ).unwrap();
+        }
+        cast_id
+    }
+
+    /// Each character gets a copy of the slots of the cast it names; a
+    /// character with no cast gets none; the casts, the cast column and the
+    /// marker follow, and a second run changes nothing.
+    #[test]
+    fn character_slots_migration_copies_each_characters_cast_and_drops_the_casts() {
+        let db = KernelDb::temporary().unwrap();
+        with_cast_tables(&db);
+        let backend = db.upsert_backend(&BackendRow {
+            backend_id: BackendId::new(), name: "mock".into(), kind: "mock".into(), base_url: None, api_key_env: None,
+            api_key_file: None, key_optional: true, request_timeout_secs: None, idle_timeout_secs: None,
+            max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
+        }).unwrap().backend_id;
+        let [a, b, c] = seed_characters(&db, &["has-house", "no-cast", "also-house"])[..] else { unreachable!() };
+        let house = legacy_cast(&db, "house", &[("coder", "m-coder", Some("lo")), ("distill", "m-distill", None)], backend);
+        legacy_cast(&db, "orphan", &[("coder", "m-orphan", None)], backend);
+        for who in [a, c] {
+            db.conn.execute("UPDATE characters SET cast_id = ?1 WHERE principal_id = ?2", params![house, blob_param(who.as_bytes())]).unwrap();
+        }
+
+        KernelDb::migrate_character_slots(&db.conn).unwrap();
+
+        for who in [a, c] {
+            let slots = db.list_character_slots(who).unwrap();
+            let roles: Vec<(&str, &str)> = slots.iter().map(|s| (s.role.as_str(), s.model.as_str())).collect();
+            assert_eq!(roles, vec![("coder", "m-coder"), ("distill", "m-distill")]);
+            assert_eq!((slots[0].max_tokens, slots[0].temperature, slots[0].backend_id), (Some(4096), Some(0.5), backend));
+        }
+        assert!(db.list_character_slots(b).unwrap().is_empty(), "a character with no cast gets no slot");
+        assert!(!KernelDb::has_table(&db.conn, "casts").unwrap() && !KernelDb::has_table(&db.conn, "cast_slots").unwrap());
+        assert!(!KernelDb::has_column(&db.conn, "characters", "cast_id").unwrap());
+        let marked: bool = db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)", [KernelDb::CHARACTER_SLOTS_MIGRATION], |r| r.get(0),
+        ).unwrap();
+        assert!(marked, "the migration is recorded");
+
+        KernelDb::migrate_character_slots(&db.conn).unwrap();
+        assert_eq!(db.list_character_slots(a).unwrap().len(), 2, "a second run changes nothing");
+    }
+
+    /// A database that has not been through the context character migration
+    /// still has its casts to read, so the move refuses and writes nothing.
+    #[test]
+    fn character_slots_migration_refuses_before_the_context_character_migration() {
+        let db = KernelDb::temporary().unwrap();
+        with_cast_tables(&db);
+        db.conn.execute("ALTER TABLE characters ADD COLUMN default_cast_id BLOB", []).unwrap();
+        let error = KernelDb::migrate_character_slots(&db.conn).unwrap_err().to_string();
+        assert!(error.contains("context character migration"), "{error}");
+        assert!(KernelDb::has_table(&db.conn, "casts").unwrap(), "nothing was dropped");
+    }
+
+    /// A database on the new shape has no cast tables and does nothing.
+    #[test]
+    fn character_slots_migration_is_a_no_op_on_a_fresh_database() {
+        let db = KernelDb::temporary().unwrap();
+        assert!(!KernelDb::has_table(&db.conn, "casts").unwrap(), "a fresh database creates no casts");
+        KernelDb::migrate_character_slots(&db.conn).unwrap();
+        assert!(KernelDb::has_table(&db.conn, "character_slots").unwrap());
+    }
+
     #[test]
     fn preset_cast_narrowing_drops_the_legacy_columns() {
         let conn = Connection::open_in_memory().unwrap();

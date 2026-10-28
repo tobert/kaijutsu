@@ -1419,7 +1419,7 @@ mod tests {
                 }).unwrap();
             }
             for model in [rootbot, coder] {
-                db.seed_test_cast_roles(model, &[("distill", "mock", "mock-model")]).unwrap();
+                db.seed_test_slot_entries(model, &[("distill", "mock", "mock-model")]).unwrap();
             }
             for (context, performer, reviewer, context_type) in [
                 (root, amy, None, crate::kj::character::ROOT_CONTEXT_TYPE),

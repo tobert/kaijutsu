@@ -117,16 +117,16 @@ pub fn seed_mock_backend(data_dir: &std::path::Path) {
     seed_mock_backend_with_model(data_dir, "mock-model");
 }
 
-/// Like `seed_mock_backend`, but the cast's slots run a caller-chosen model.
+/// Like `seed_mock_backend`, but the performer's slots run a caller-chosen model.
 ///
 /// Needed to exercise rc scripts (like the coder stance) that branch on the
-/// bound model: the model comes from the cast the performer's instance binds,
+/// bound model: the model comes from the slots the performer holds,
 /// so it is set before any context is created, and a test can show a context
 /// ran on its binding rather than on anything stamped on its row.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
-    use kaijutsu_kernel::kernel_db::{BackendRow, CastRow, CastSlotRow, KernelDb};
-    use kaijutsu_types::{BackendId, CastId, PrincipalId};
+    use kaijutsu_kernel::kernel_db::{BackendRow, CharacterSlotRow, KernelDb};
+    use kaijutsu_types::{BackendId, PrincipalId};
 
     std::fs::create_dir_all(data_dir).expect("create data dir");
     let db = KernelDb::open(data_dir.join("kernel.db")).expect("open kernel db for mock seed");
@@ -146,36 +146,24 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
             created_by: PrincipalId::system(),
         })
         .expect("seed mock backend");
-    let cast = CastRow {
-        cast_id: CastId::new(),
-        label: "mock".to_string(),
-        description: None,
-        created_at: 0,
-        created_by: PrincipalId::system(),
-    };
-    db.insert_cast(&cast).expect("seed the mock cast");
-    for role in ["default", "coder", "musician", "director", "assistant", "mcp", "toolie"] {
-        db.set_cast_slot(&CastSlotRow {
-            cast_id: cast.cast_id,
-            role: role.to_string(),
-            backend_id: backend.backend_id,
-            model: model.to_string(),
-            max_tokens: Some(4096),
-            temperature: None,
-            top_p: None,
-            effort: None,
-            thinking_budget: None,
-            thinking_style: None,
-            loadout: None,
-            extra: None,
-        })
-        .expect("seed a mock cast slot");
-    }
     // An ephemeral kernel has its performer; an offline home does not, and a
-    // test there points its own character at the `mock` cast.
+    // test there gives its own character the slots with `kj character slot set`.
     if let Some(performer) = db.get_character_by_name(PERFORMER).expect("read the ephemeral performer") {
-        db.set_character_cast(performer.principal_id, Some(cast.cast_id))
-            .expect("point the performer at the mock cast");
+        for role in ["default", "coder", "musician", "director", "assistant", "mcp", "toolie"] {
+            db.set_character_slot(&CharacterSlotRow {
+                principal_id: performer.principal_id,
+                role: role.to_string(),
+                backend_id: backend.backend_id,
+                model: model.to_string(),
+                max_tokens: Some(4096),
+                temperature: None,
+                top_p: None,
+                effort: None,
+                thinking_budget: None,
+                thinking_style: None,
+            })
+            .expect("seed a mock slot on the performer");
+        }
     }
 }
 

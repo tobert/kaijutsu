@@ -3809,7 +3809,7 @@ mod tests {
         let seat = register_context(&d, Some("banto"), Some(root), amy);
         let db = d.kernel_db().lock();
         db.update_played_by(root, Some(amy)).unwrap();
-        db.seed_test_cast(banto, "mock", "mock-banto", &["default"]).unwrap();
+        db.seed_test_slots(banto, "mock", "mock-banto", &["default"]).unwrap();
         db.update_played_by(seat, Some(banto)).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
@@ -3838,7 +3838,7 @@ mod tests {
         let before = f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap();
         // The character's cast moves to another model after the seat was bound:
         // the running seat keeps its slots, the successor copies the new ones.
-        f.d.kernel_db().lock().seed_test_cast(f.banto, "mock", "mock-banto-next", &["default"]).unwrap();
+        f.d.kernel_db().lock().seed_test_slots(f.banto, "mock", "mock-banto-next", &["default"]).unwrap();
         let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
         assert!(rotated.is_ok(), "{}", rotated.message());
         let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
@@ -4560,7 +4560,7 @@ mod tests {
                 principal_id, name: name.into(), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
-        d.kernel_db().lock().seed_test_cast_roles(performer, &[("default", "mock", "mock-model")]).unwrap();
+        d.kernel_db().lock().seed_test_slot_entries(performer, &[("default", "mock", "mock-model")]).unwrap();
         let root = register_root_context(&d);
         let seat = register_context(&d, Some("owner-seat"), Some(root), test_reviewer_principal());
         d.kernel_db().lock().update_played_by(seat, Some(owner)).unwrap();
@@ -6372,7 +6372,7 @@ mod tests {
                     principal_id: character, name: format!("windowed-{label}"), created_at: 0,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
-                db.seed_test_cast(character, "mock", "big-model", &["default"]).unwrap();
+                db.seed_test_slots(character, "mock", "big-model", &["default"]).unwrap();
                 let backend = db.get_backend_by_name("mock").unwrap().unwrap();
                 db.set_backend_model(&crate::kernel_db::BackendModelRow {
                     backend_id: backend.backend_id,
@@ -6488,7 +6488,7 @@ mod tests {
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         let performer = d.kernel_db().lock().get_character_by_name("kohai-tester").unwrap().unwrap().principal_id;
-        d.kernel_db().lock().seed_test_cast(performer, "mock", "mock-model", &["default"]).unwrap();
+        d.kernel_db().lock().seed_test_slots(performer, "mock", "mock-model", &["default"]).unwrap();
 
         let create = d
             .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("staffed-child")], &c)

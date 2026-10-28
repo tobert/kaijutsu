@@ -523,7 +523,7 @@ fn bind_seat(
     judge: Option<&SlotSpec>,
     chat: bool,
 ) {
-    use crate::kernel_db::{BackendRow, CastRow, CastSlotRow};
+    use crate::kernel_db::{BackendRow, CharacterSlotRow};
     db.insert_character(&crate::kernel_db::CharacterRow {
         principal_id: character, name: name.into(), created_at: 0, retired_at: None,
         handoff_ctx: None, root_ctx: None, root: false,
@@ -537,14 +537,6 @@ fn bind_seat(
     if chat {
         slots.push(("default", SlotSpec { model: "mock-model", backend: "mock", kind: "mock", base: Base::None }, Some(4096)));
     }
-    let cast = CastRow {
-        cast_id: kaijutsu_types::CastId::new(),
-        label: format!("seat-{name}"),
-        description: None,
-        created_at: 0,
-        created_by: PrincipalId::system(),
-    };
-    db.insert_cast(&cast).unwrap();
     for (role, spec, max_tokens) in slots {
         let backend = db
             .upsert_backend(&BackendRow {
@@ -566,8 +558,8 @@ fn bind_seat(
                 created_by: PrincipalId::system(),
             })
             .unwrap();
-        db.set_cast_slot(&CastSlotRow {
-            cast_id: cast.cast_id,
+        db.set_character_slot(&CharacterSlotRow {
+            principal_id: character,
             role: role.into(),
             backend_id: backend.backend_id,
             model: spec.model.into(),
@@ -577,12 +569,9 @@ fn bind_seat(
             effort: None,
             thinking_budget: None,
             thinking_style: None,
-            loadout: None,
-            extra: None,
         })
         .unwrap();
     }
-    db.set_character_cast(character, Some(cast.cast_id)).unwrap();
 }
 
 async fn rig(via: Via, setup: Setup) -> Rig {
@@ -3373,15 +3362,20 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
 }
 
 /// The gate and the judge shadow read the slots the seat's context holds.
-/// Moving the character to a cast with neither slot changes nothing for the
+/// Removing the character's slots changes nothing for the
 /// running context: its decisions still go to its gate slot's server,
 /// and its judge shadow is still made.
 ///
-/// Falsified by reading the character's live cast.
+/// Falsified by reading the character's live slots.
 #[tokio::test]
-async fn a_cast_change_moves_neither_the_gate_nor_the_judge_of_a_running_instance() {
+async fn a_slot_change_moves_neither_the_gate_nor_the_judge_of_a_running_context() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
-    rig.d.kernel_db().lock().set_character_cast(rig.ctx.actor_id, None).unwrap();
+    {
+        let db = rig.d.kernel_db().lock();
+        for slot in db.list_character_slots(rig.ctx.actor_id).unwrap() {
+            db.delete_character_slot(rig.ctx.actor_id, &slot.role).unwrap();
+        }
+    }
     rig.mock.answers(&ALLOW);
     rig.submit("touch /work/still-judged").await.unwrap_or_else(|e| panic!("the bound gate slot allows: {e:?}"));
     assert_eq!(rig.mock.decisions().len(), 1, "the decision went to the bound gate slot's server");

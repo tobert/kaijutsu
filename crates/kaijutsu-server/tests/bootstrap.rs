@@ -52,8 +52,7 @@ fn a_bootstrapped_kernel_answers_in_root() {
             assert_eq!(row.context_type, "console");
             let performer = db.get_character_by_name("root").unwrap().expect("the console performer exists");
             assert_eq!(row.played_by, Some(performer.principal_id), "ROOT is played by its model character");
-            let cast = db.character_cast(performer.principal_id).unwrap().expect("the performer plays the house cast");
-            let slot = db.get_cast_slot(cast.cast_id, "console").unwrap().expect("the house cast fills the console role");
+            let slot = db.get_character_slot(performer.principal_id, "console").unwrap().expect("the performer holds a console slot");
             assert_eq!(slot.model, "mock-model");
             row.context_id
         };
@@ -119,7 +118,8 @@ fn without_a_backend_root_waits_for_one() {
         {
             let db = kernel_db(&config);
             assert!(db.find_context_by_label("ROOT").unwrap().is_some(), "ROOT exists without a model");
-            assert!(db.get_cast_by_label("house").unwrap().is_none(), "no cast without a backend");
+            let root = db.get_character_by_name("root").unwrap().expect("the console performer exists");
+            assert!(db.list_character_slots(root.principal_id).unwrap().is_empty(), "no slot without a backend");
         }
 
         let filled = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
@@ -129,13 +129,11 @@ fn without_a_backend_root_waits_for_one() {
             filled.ran,
             [
                 "kj backend set mock --kind mock --key-optional",
-                "kj cast create house",
-                "kj cast slot set house console --backend mock --model mock-model --max-tokens 16384",
-                "kj cast slot set house distill --backend mock --model mock-model --max-tokens 16384",
-                "kj character set root --cast house",
+                "kj character slot set root console --backend mock --model mock-model --max-tokens 16384",
+                "kj character slot set root distill --backend mock --model mock-model --max-tokens 16384",
                 "kj context rotate ROOT",
             ],
-            "the backend, the house cast, and a rotated ROOT that takes its slots"
+            "the backend, the performer's slots, and a rotated ROOT that takes them"
         );
     });
 }
