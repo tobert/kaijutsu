@@ -1361,10 +1361,12 @@ ignore every other Ctrl or Alt chord, so none is read as a bare letter —
 Over the full-screen editor the prefix moves between seats and nothing else
 ("Editor and diff").
 
-`q` and `d`
-are chords the prefix already claims; the notice on the status line names
-what each will do — close-and-demote, detach — until this client builds
-them. `h` is not this client's yet either and has no notice of its
+`Ctrl+A q` runs `kj context demote` on the context on screen and goes back
+to the previous one, as the app does (`docs/input.md`, "Placement keys").
+A latched step stays put, and `Ctrl+A q` on the same context within 6
+seconds confirms it. `d` is a chord the prefix already claims; the notice
+on the status line names what it will do, detach, until this client builds
+it. `h` is not this client's yet either and has no notice of its
 own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Three
 chords are this client's own, with no app equivalent yet: `Ctrl+A v` opens
 the diff viewer (the app opens it with `v` from its block list), `Ctrl+A ]`

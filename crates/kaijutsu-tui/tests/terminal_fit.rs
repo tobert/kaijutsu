@@ -1346,6 +1346,39 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
     assert!(back, "the row did not cross back: {}", session.dump("after the second verb"));
 }
 
+/// `Ctrl+A q` demotes the context on screen with `kj context demote` and
+/// lands on the previous context, whose draft comes back with it
+/// (`docs/input.md`, "The prefix table").
+#[test]
+fn ctrl_a_q_demotes_the_context_and_goes_back() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send(":kj fork --name leaveme\r");
+    session.send("izzhomezz\x1b");
+    let typed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen.rows(0, screen.size().1).any(|l| l.contains('❯') && l.contains("zzhomezz"))
+    });
+    assert!(typed, "the draft never reached the compose row: {}", session.dump("typing"));
+
+    session.send(":kj context switch leaveme\r");
+    let away = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|i| !rows[i].contains("zzhomezz"))
+    });
+    assert!(away, "the switch to the fork never landed: {}", session.dump("switch"));
+
+    session.send("\x01q");
+    let back = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|i| rows[i].contains("zzhomezz"))
+            // A fork the switch promoted unpromotes; one that was not, demotes.
+            && rows.last().is_some_and(|l| l.contains("unpromoted") || l.contains("demoted"))
+    });
+    assert!(back, "Ctrl+A q did not demote and go back: {}", session.dump("after Ctrl+A q"));
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // m. A bracketed paste is text, not keystrokes
 // ────────────────────────────────────────────────────────────────────────────

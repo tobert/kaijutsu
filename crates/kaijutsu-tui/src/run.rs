@@ -1154,6 +1154,51 @@ async fn handle_picker_key(
     Ok(())
 }
 
+/// How long a latched `Ctrl+A q` waits for the same chord to confirm it,
+/// the app's notice lifetime (`docs/input.md`, "Placement keys").
+pub(crate) const CLOSE_CONFIRM_WINDOW: Duration = Duration::from_secs(6);
+
+/// Whether this `Ctrl+A q` on `ctx` confirms the latched one in `armed`.
+fn close_confirms(armed: Option<(ContextId, Instant)>, ctx: ContextId, now: Instant) -> bool {
+    armed.is_some_and(|(id, at)| id == ctx && now.duration_since(at) < CLOSE_CONFIRM_WINDOW)
+}
+
+/// `Ctrl+A q`: run `kj context demote` on `ctx`, then go back to the
+/// previous context. A latched step moves nothing and stays on `ctx`; the
+/// same chord again within [`CLOSE_CONFIRM_WINDOW`] runs it with
+/// `--confirm`. With no previous context the view stays where it is.
+async fn close_and_demote(bridge: &KernelBridge, app: &mut App, ctx: ContextId, feeds: &mut Feeds) {
+    let now = Instant::now();
+    let mut argv = vec!["context".to_string(), "demote".to_string(), ctx.to_hex()];
+    if close_confirms(app.close_armed.take(), ctx, now) {
+        argv.push("--confirm".to_string());
+    }
+    match bridge.execute_kj(ctx, argv).await {
+        Ok(result) if result.latch.is_some() => {
+            let message = result.latch.map(|l| l.message).unwrap_or_default();
+            app.close_armed = Some((ctx, now));
+            app.note(format!("Ctrl+A q again confirms: {message}"));
+        }
+        Ok(result) if result.exit_code != 0 => {
+            let why = result.stderr.lines().next().unwrap_or("").trim().to_string();
+            app.note(format!("demote failed (exit {}): {why}", result.exit_code));
+        }
+        Ok(result) => {
+            let done = result.stdout.lines().next().unwrap_or("demoted").to_string();
+            app.roster_changed = true;
+            if let Some(previous) = app.previous.filter(|p| *p != ctx) {
+                switch_seat(bridge, app, previous, feeds).await;
+                if app.current != Some(previous) {
+                    // `switch_seat` said why it could not go back.
+                    return;
+                }
+            }
+            app.note(done);
+        }
+        Err(e) => app.note(format!("demote failed: {e}")),
+    }
+}
+
 /// One frame of the owned screen, inside one synchronized update.
 ///
 /// `?2026` brackets the frame so a terminal that supports it shows the whole
@@ -1449,6 +1494,10 @@ async fn act(
         Intent::Unbound(code) => {
             app.note(format!("Ctrl+A {} is not bound", crate::keys::key_label(code)))
         }
+        Intent::CloseAndDemote => match app.current {
+            Some(ctx) => close_and_demote(bridge, app, ctx, feeds).await,
+            None => app.note("no context attached"),
+        },
         Intent::OpenLedger => asks::request_ledger(app),
         Intent::Tab => {
             if app.compose.kj_typed().is_some() {
@@ -2923,6 +2972,19 @@ mod tests {
         ContextChange, ContextDelivery, ContextMirror, TurnCompletedStopReason, TurnOrigin, VersionedChange,
     };
     use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
+
+    /// A latched `Ctrl+A q` is confirmed only by the same chord on the same
+    /// context inside the window (`docs/input.md`, "Placement keys").
+    #[test]
+    fn ctrl_a_q_confirms_only_its_own_latch_inside_the_window() {
+        let (here, there) = (ContextId::new(), ContextId::new());
+        let at = Instant::now();
+        let armed = Some((here, at));
+        assert!(close_confirms(armed, here, at + Duration::from_secs(5)));
+        assert!(!close_confirms(armed, here, at + CLOSE_CONFIRM_WINDOW));
+        assert!(!close_confirms(armed, there, at + Duration::from_secs(1)));
+        assert!(!close_confirms(None, here, at));
+    }
 
     /// An edit the writer lost when it stopped lands as a failure the player
     /// sees, and it settles the compose count of edits in flight.

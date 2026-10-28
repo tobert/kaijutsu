@@ -96,8 +96,7 @@ and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
 and the `lineage_root` refusal wording. Still open:
 
 Behavior:
-- **4.2b** The TUI's `Ctrl+A q` is still a "not built yet" notice; the app
-  runs `kj context demote`. A root character cast as a model performer
+- **4.2b** A root character cast as a model performer
   carries the human root's placement privilege into that model's `kj`
   calls (`require_placement_authority`, `kj/context.rs`), because the
   kernel has no marker for human input.

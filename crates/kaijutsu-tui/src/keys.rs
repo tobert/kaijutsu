@@ -22,6 +22,10 @@ pub enum Intent {
     /// `Ctrl+A n` / `Ctrl+A p` — the next or previous seat on the rank,
     /// wrapping, screen's next/previous window.
     StepSeat(isize),
+    /// `Ctrl+A q` — close and demote: `kj context demote` on the context on
+    /// screen, then back to the previous context (`docs/input.md`, "The
+    /// prefix table").
+    CloseAndDemote,
     /// `Ctrl+A ]` — paste the last copy-mode yank into the draft, tmux's
     /// `paste-buffer`. The buffer is the tui's own, never the OS clipboard.
     Paste,
@@ -155,13 +159,10 @@ impl Keys {
                 KeyCode::Char('\'') => Intent::PrefillKj("kj context switch "),
                 KeyCode::Char('A') => Intent::PrefillKj("kj context rename "),
                 KeyCode::Char('r') => Intent::PrefillKj("kj context rotate "),
-                // The app already has these (`docs/input.md`, "The prefix
-                // table"); this lane has not built them, so the notice names
-                // what they will do rather than reading as a plain unbound
-                // key.
-                KeyCode::Char('q') => {
-                    Intent::NotYet("Ctrl+A q will close and demote; not built yet")
-                }
+                KeyCode::Char('q') => Intent::CloseAndDemote,
+                // The app already has this one (`docs/input.md`, "The prefix
+                // table"); this lane has not built it, so the notice names
+                // what it will do rather than reading as a plain unbound key.
                 KeyCode::Char('d') => Intent::NotYet("Ctrl+A d will detach; not built yet"),
                 KeyCode::Esc => Intent::LegendChanged,
                 _ => Intent::Unbound(key.code),
@@ -385,8 +386,8 @@ mod tests {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
         assert_eq!(
-            keys.interpret(press(KeyCode::Char('q'))),
-            Intent::NotYet("Ctrl+A q will close and demote; not built yet")
+            keys.interpret(press(KeyCode::Char('d'))),
+            Intent::NotYet("Ctrl+A d will detach; not built yet")
         );
     }
 
