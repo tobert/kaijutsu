@@ -1267,8 +1267,7 @@ CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- The rest of the sheet (rc_dir, memory_root) arrives with the slice that
--- reads it. See docs/character.md, "Character = principal + sheet".
+-- `rc_dir` arrives with the slice that reads it. See docs/character.md, "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
     principal_id     BLOB NOT NULL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,

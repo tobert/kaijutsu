@@ -46,7 +46,7 @@ set `--as banto` on the seat, or create a successor with `--as banto`, then
 Still planned: character rc composition (slice 5), which would also grant
 statically what a character rule now learns from a first ask, roster grouping and character drift addressing (slices 6–7), and
 scheduled janitor/proctor work (slice 8). The sheet still has no
-`rc_dir` or `memory_root` fields. The handoff
+`rc_dir` field. The handoff
 is a context, not a transport track. Requester and performer remain separate;
 setting `played_by` changes subsequent model invocation and output attribution;
 it never changes credentials or rewrites existing asks and block authors.
@@ -76,7 +76,7 @@ Amy's word for the shape is a D&D character sheet (guidance, 2026-09-06):
 a page of stats and pointers that is not itself the lore, but that
 references out to deeper lore. Read the design that way. The sheet is
 small and mostly foreign keys; what it names — the rc directory, the
-handoff log, the root context, the memory root — is where the depth
+handoff log, the root context — is where the depth
 lives. Adding a column is how the sheet reaches somewhere new.
 
 Two things follow, and they are the ones to check a change against:
@@ -292,7 +292,6 @@ CREATE TABLE IF NOT EXISTS characters (
     root             INTEGER NOT NULL DEFAULT 0, -- no model; see "Roots and rotation"
     default_cast_id  BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     rc_dir           TEXT,                        -- default /config/rc/character/<name>
-    memory_root      TEXT,                        -- host path; NULL = no memory of its own
     handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
     root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
@@ -992,7 +991,8 @@ Each slice is independently shippable and leaves the tree green.
    the distill-cast refusal and `--distill-model` on pull.
    `default_cast_id` shipped on its own, 2026-10-09, for the judge shadow.
 
-Deferred: saifu, availability, and `memory_root` until a reader exists.
+Deferred: saifu and availability until a reader exists. A character has no
+memory field: memory is planned as tool calls and inference-side work.
 `root_ctx` has its reader, rotation ("Roots and rotation" above), and is
 queued in `docs/issues.md`. Not doing: party, chair, seat, any reputation or trust score
 (shared trust rules it out), a `Character` Rust type.
@@ -1018,7 +1018,6 @@ it.
   and app; they did not establish every consumer. Anything that treats a
   block's principal as the authenticated requester needs a separate field
   or durable turn provenance, not a second overload of the author field.
-- **A musician's memory.** Bass-san's `memory_root` is NULL by choice.
 - **Socket-protocol liveness** for driving a Claude Code session
   (`docs/cc-peer.md`).
 - **The desk character** (受付, Uketsuke): an automode context that answers

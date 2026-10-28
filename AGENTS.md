@@ -90,7 +90,7 @@ them; the reviewer controls reassignment, and the creator makes an initial
 assignment when no reviewer is set. See `docs/approval-identity.md`.
 Composition with character rc remains planned. A sheet's default cast is
 used by contexts the character plays that have no cast of their own.
-Accountable-to, rc directory, and memory root are planned sheet fields.
+An rc directory is a planned sheet field.
 See `docs/character.md`, "Current implementation" and "Rollout, smallest
 first".
 
