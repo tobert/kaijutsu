@@ -23,6 +23,9 @@ pub enum AskOrigin {
     ShellGate,
     /// A privileged `kj` verb gated itself.
     KjVerb,
+    /// A drift into the ROOT console waits for its human. An allow lets the
+    /// console's model read it; a deny keeps it out. It never runs source.
+    Drift,
 }
 
 impl AskOrigin {
@@ -32,6 +35,7 @@ impl AskOrigin {
             AskOrigin::HookResult => "hook_result",
             AskOrigin::ShellGate => "shell_gate",
             AskOrigin::KjVerb => "kj_verb",
+            AskOrigin::Drift => "drift",
         }
     }
 }
@@ -90,6 +94,13 @@ impl AskSummary {
     pub fn answerable_by(&self, principal: PrincipalId) -> bool {
         self.status.is_open() && self.performer.is_some()
             && self.reviewer.as_ref().is_some_and(|reviewer| reviewer.id == principal)
+    }
+
+    /// Whether `principal` may answer with a standing rule: it may answer,
+    /// and the ask is not a drift. A drift ask is answered one drift at a
+    /// time, and the kernel refuses a standing rule for one.
+    pub fn can_remember(&self, principal: PrincipalId) -> bool {
+        self.answerable_by(principal) && self.origin != AskOrigin::Drift
     }
 
     /// Whether `principal` may answer with a standing rule for the

@@ -119,6 +119,8 @@ enum OriginArg {
     ShellGate,
     /// A privileged `kj` verb gated itself.
     KjVerb,
+    /// A drift into the ROOT console waits for its human.
+    Drift,
 }
 
 impl OriginArg {
@@ -128,6 +130,7 @@ impl OriginArg {
             Self::HookResult => Origin::HookResult,
             Self::ShellGate => Origin::ShellGate,
             Self::KjVerb => Origin::KjVerb,
+            Self::Drift => Origin::Drift,
         }
     }
 }
@@ -970,6 +973,22 @@ impl KjDispatcher {
                 "captured": captured, "settled": settled, "retention_error": retention_error,
             });
         }
+        if ask.origin == AskOrigin::Drift {
+            let block = match self.kernel_db.lock().approval_drift_block(request_id) {
+                Ok(block) => block,
+                Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+            };
+            let state = block.and_then(|block| {
+                let snapshot = self.block_store().block_snapshots(block.context_id).ok()?
+                    .into_iter().find(|b| b.id == block)?;
+                Some(if snapshot.is_held_drift() { "held" } else if snapshot.excluded { "dismissed" } else { "released" })
+            });
+            lines.push(format!("drift_block: {}", block.map_or_else(|| "-".to_string(), |b| b.to_key())));
+            lines.push(format!("drift:      {}", state.unwrap_or("not found")));
+            data["drift"] = serde_json::json!({
+                "block_id": block.map(|b| b.to_key()), "state": state,
+            });
+        }
         if show_signals {
             data["signals"] = serde_json::Value::Array(signal_rows.iter().map(signal_row_json).collect());
         }
@@ -1761,6 +1780,12 @@ pub fn decide_ask(
             Err(e) => return Err(refused(e)),
         };
         record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
+        if remember.is_some() && row.origin == Origin::Drift {
+            return Err(failure(AskAnswerFailureKind::Refused, format!(
+                "ask {request_id} holds a drift, and a drift is answered one at a time; no rule \
+                 was learned and the ask is still open. Answer it without --remember"
+            )));
+        }
         if remember.is_some_and(|r| r.scope == RememberScope::Session) {
             session_remember_applies(&db, request_id, &row)?;
         }

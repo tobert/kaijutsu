@@ -448,6 +448,8 @@ pub fn request_for(
     };
     Some(if !answerable {
         Err(not_yours_notice(ask))
+    } else if decision == Decision::AllowAlways && !me.is_some_and(|me| ask.can_remember(me)) {
+        Err("this ask is answered once; it cannot become a standing rule".to_string())
     } else if matches!(decision, Decision::AllowCharacter | Decision::AllowCharacterFamily)
         && !me.is_some_and(|me| ask.can_remember_for_character(me))
     {
@@ -474,6 +476,8 @@ pub fn answer_key_labels(ask: &AskSummary, me: Option<PrincipalId>, bracketed: b
     };
     if sent(Action::AskAllowOnce) {
         labels.push(once.to_string());
+    }
+    if sent(Action::AskAllowAlways) {
         labels.push(always.to_string());
     }
     if sent(Action::AskAllowCharacter) {
@@ -2022,6 +2026,16 @@ mod tests {
         assert!(matches!(request_for(&Action::AskAllowCharacter, &bare, Some(me)), Some(Err(_))));
         assert!(matches!(request_for(&Action::AskAllowCharacterFamily, &bare, Some(me)), Some(Err(_))));
         assert!(matches!(request_for(&Action::AskAllowOnce, &bare, Some(me)), Some(Ok(_))));
+
+        // A drift ask: allow once and deny go; no standing rule is offered.
+        let mut drift = keyed(me);
+        drift.origin = AskOrigin::Drift;
+        drift.has_exec_source = false;
+        assert!(matches!(request_for(&Action::AskAllowOnce, &drift, Some(me)), Some(Ok(_))));
+        assert!(matches!(request_for(&Action::AskDeny, &drift, Some(me)), Some(Ok(_))));
+        assert!(matches!(request_for(&Action::AskAllowAlways, &drift, Some(me)), Some(Err(_))));
+        let keys = answer_key_labels(&drift, Some(me), true).join("  ");
+        assert!(keys.contains("[a]llow once") && !keys.contains("[A]"), "{keys}");
 
         // Someone else's ask, and I am its lineage root: only take over goes.
         let mut theirs = keyed(other);

@@ -469,6 +469,8 @@ enum AskOrigin {
   shellGate @2;
   # A privileged `kj` verb gated itself.
   kjVerb @3;
+  # A drift into the ROOT console waits for its human; never runs source.
+  drift @4;
 }
 
 # A principal and the name its character sheet gives it now.

@@ -3589,3 +3589,17 @@ the block list (`96766b0d`). Esc in compose now belongs to vi alone, as it
 already did in the TUI. Amy's lost prompt turned out to be a slow echo: the
 submit reply waits for turn startup, so the editor keeps the text while the
 kernel has already committed it.
+
+## A drift into ROOT waits for the human (October 28)
+
+A drift into the ROOT console reached its model unreviewed. The first plan
+was a drift card of its own, with `kj drift release` and `dismiss` verbs.
+Amy asked "why not route drifts through the ledger?", and the code agreed:
+the ask card, the compose pause, the ledger view, the desktop notice and
+the answerer rules already existed. A held drift is now an ask with origin
+`drift`. The block lands `Pending` and excluded in one accepted insert, and
+the approval worker releases or dismisses it once the ask is answered,
+since no caller waits to retry. Every drift kind holds except
+`Notification`, and only in ROOT. A drift ask learns no rule: `--remember`
+is refused and the ask stays open. Amy's idea for later is to divert a
+remembered drift allow to the judge model's context, which can wait.

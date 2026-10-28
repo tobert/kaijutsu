@@ -40,16 +40,16 @@ entertainment seat, from a read of SillyTavern's prompt assembly. See
 The design is in `docs/character.md`, "The root console and its shell".
 Landed: the human root has no model and refuses `drive`; its model console is
 a `console` context under it, labeled `ROOT`, with the stance; Ctrl-Z toggles
-root, console, and shell; the start choice prefers `ROOT`. Still open:
+root, console, and shell; the start choice prefers `ROOT`; a drift into the
+console waits for the human as a ledger ask. Still open:
 
-- Incoming drifts into the console reach a model unreviewed. A drift starts
-  no turn (`Wake::Drift`, `runtime/turn_state.rs`), but it joins a running
-  turn at its next tool round (`offer_drift`, `kj/drift.rs`), and an idle
-  drift rides the next submit. The plan (Amy, 2026-10-27): when a drift
-  lands, the client pauses compose input, as it does for a ledger accept;
-  after reading, the human releases it with a key or excludes it
-  (`kj stage exclude`). A drift into a running console turn waits for that
-  release instead of joining at the tool round.
+- A drift ask takes no `--remember` (Amy, 2026-10-28). An idea for later:
+  "divert it to the judge model's context so it could pick up the ongoing
+  allow, but that's going to be tricky to tune so it can wait." Also open:
+  a held drift released while a turn runs joins that turn only when it
+  landed after the turn's write point; one that landed earlier rides the
+  next turn (`llm/mailbox.rs`, `live_tail`). The ask card shows the whole
+  drift text, so a long drift makes a tall card.
 - The console and council stances name Amy as fixed text, so another
   person's `bootstrap` tells their ROOT that Amy is accountable. A small fix:
   rc exposes the reviewer's name and the stance uses it.

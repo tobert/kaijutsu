@@ -3540,6 +3540,41 @@ impl BlockStore {
         drift_kind: kaijutsu_types::DriftKind,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
+        self.insert_drift_block_inner(context_id, parent_id, after, content.into(), source_context,
+            source_model, drift_kind, principal_id, false)
+    }
+
+    /// Insert a drift block held for review: `Pending` and excluded in the
+    /// same accepted insert, so no reader sees it included first. A held
+    /// drift reaches no model until [`Self::settle_held_drift`] releases it
+    /// (`docs/character.md`, "The root console and its shell").
+    pub fn insert_held_drift_block_as(
+        &self,
+        context_id: ContextId,
+        after: Option<&BlockId>,
+        content: impl Into<String>,
+        source_context: ContextId,
+        source_model: Option<String>,
+        drift_kind: kaijutsu_types::DriftKind,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<BlockId> {
+        self.insert_drift_block_inner(context_id, None, after, content.into(), source_context,
+            source_model, drift_kind, Some(principal_id), true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_drift_block_inner(
+        &self,
+        context_id: ContextId,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        content: String,
+        source_context: ContextId,
+        source_model: Option<String>,
+        drift_kind: kaijutsu_types::DriftKind,
+        principal_id: Option<PrincipalId>,
+        held: bool,
+    ) -> BlockStoreResult<BlockId> {
         self.accept(context_id, |entry| {
             let mut events = Vec::new();
             let after_id = after.cloned();
@@ -3554,6 +3589,10 @@ impl BlockStore {
                 source_model,
                 drift_kind,
             )?;
+            if held {
+                entry.doc.set_status(&block_id, Status::Pending)?;
+                entry.doc.set_excluded(&block_id, true)?;
+            }
             let snapshot = entry
                 .doc
                 .get_block_snapshot(&block_id)
@@ -3572,6 +3611,39 @@ impl BlockStore {
             });
 
             Ok((ops, events, block_id))
+        })
+    }
+
+    /// Answer a held drift in one accepted change: a release makes it
+    /// `Done` and included, a dismissal makes it `Done` and leaves it
+    /// excluded. The two fields change together, so no reader sees a
+    /// released drift still `Pending` or a dismissed one included. Refuses
+    /// a block that is not a held drift.
+    pub fn settle_held_drift(&self, context_id: ContextId, block_id: &BlockId, release: bool) -> BlockStoreResult<()> {
+        self.accept(context_id, |entry| {
+            let held = entry.doc.get_block_snapshot(block_id).is_some_and(|b| b.is_held_drift());
+            if !held {
+                return Err(BlockStoreError::Validation(format!("block {} is not a held drift", block_id.to_key())));
+            }
+            entry.doc.set_status(block_id, Status::Done)?;
+            if release {
+                entry.doc.set_excluded(block_id, false)?;
+            }
+            entry.touch(self.principal_id());
+            let version = entry.version();
+            let header = entry.doc.get_block_header(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            let ops = SyncPayload::from_updated_header(header);
+            let mut events = vec![BlockFlow::StatusChanged {
+                context_id, block_id: *block_id, status: Status::Done, version, source: OpSource::Local,
+            }];
+            if release {
+                events.push(BlockFlow::ExcludedChanged {
+                    context_id, block_id: *block_id, excluded: false, version, source: OpSource::Local,
+                });
+            }
+            Ok((ops, events, ()))
         })
     }
 

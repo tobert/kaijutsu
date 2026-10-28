@@ -188,6 +188,12 @@ impl ContextRow {
         self.archived_at.is_some() || self.context_state == ContextState::Archived
     }
 
+    /// Whether this is the ROOT console: the `console` context labeled
+    /// `ROOT` (`docs/character.md`, "The root console and its shell").
+    pub fn is_root_console(&self) -> bool {
+        self.context_type == kaijutsu_types::CONSOLE_CONTEXT_TYPE && self.label.as_deref() == Some("ROOT")
+    }
+
     /// Convert to the lightweight `kaijutsu_types::Context`.
     pub fn to_context(&self) -> kaijutsu_types::Context {
         kaijutsu_types::Context {
@@ -551,6 +557,14 @@ pub(crate) fn record_approval_tool_call(
     Ok(())
 }
 
+/// Record the held drift block a drift ask answers for, in the ask's
+/// transaction.
+pub(crate) fn record_approval_drift_block(conn: &Connection, request: &str, block: &BlockId) -> KernelDbResult<()> {
+    conn.execute("INSERT INTO approval_drift_blocks(request_id, block_id) VALUES (?1, ?2)",
+        rusqlite::params![request, block.to_key()])?;
+    Ok(())
+}
+
 const SCHEMA: &str = r#"
 -- ── Kernel Identity (singleton) ─────────────────────────────────
 -- One row per database. The `singleton` column + UNIQUE constraint
@@ -575,6 +589,12 @@ CREATE TABLE IF NOT EXISTS approval_pair_handoffs (
 
 -- The model's ToolCall block whose invocation raised an ask, recorded with it.
 CREATE TABLE IF NOT EXISTS approval_tool_calls (
+    request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    block_id TEXT NOT NULL
+);
+
+-- The held drift block a drift ask releases or dismisses, recorded with it.
+CREATE TABLE IF NOT EXISTS approval_drift_blocks (
     request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
     block_id TEXT NOT NULL
 );
@@ -2495,6 +2515,15 @@ impl KernelDb {
             [request], |row| row.get(0)).optional()?;
         key.map(|key| BlockId::from_key(&key)
             .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed tool call block {key}"))))
+            .transpose()
+    }
+
+    /// The held drift block recorded with a drift ask.
+    pub(crate) fn approval_drift_block(&self, request: &str) -> KernelDbResult<Option<BlockId>> {
+        let key: Option<String> = self.conn.query_row("SELECT block_id FROM approval_drift_blocks WHERE request_id=?1",
+            [request], |row| row.get(0)).optional()?;
+        key.map(|key| BlockId::from_key(&key)
+            .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed drift block {key}"))))
             .transpose()
     }
 

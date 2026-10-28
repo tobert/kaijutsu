@@ -74,8 +74,10 @@ pub enum AskDecision {
 /// the ask changes while a control is on screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Offer {
-    /// `a` `A` `d`: the viewer is the assigned reviewer.
+    /// `a` `d`: the viewer is the assigned reviewer.
     pub review: bool,
+    /// `A`: a standing rule can be learned. A drift ask has none.
+    pub always: bool,
     /// `c` `C`: a standing rule for the performer can be learned.
     pub remember: bool,
     /// `e`: the viewer may hand the ask on.
@@ -90,6 +92,7 @@ impl Offer {
         let Some(me) = me else { return Self::default() };
         Self {
             review: summary.answerable_by(me),
+            always: summary.can_remember(me),
             remember: summary.can_remember_for_character(me),
             escalate: summary.can_escalate(me),
             take_over: summary.can_take_over(me),
@@ -107,6 +110,9 @@ impl Offer {
             }
             AskDecision::AllowForCharacter | AskDecision::AllowForCharacterFamily if !self.review => {
                 Some(awaits_reviewer(request_id))
+            }
+            AskDecision::AllowAlways if !self.always => {
+                Some(format!("ask {id} is answered once; it cannot become a standing rule"))
             }
             AskDecision::AllowForCharacter | AskDecision::AllowForCharacterFamily if !self.remember => {
                 Some(format!("ask {id} carries no shell program to remember for its performer"))
@@ -232,7 +238,9 @@ fn card_key_items(card: &AskCard<'_>) -> Vec<String> {
     if offer.review {
         let who = card.asker.unwrap_or("the performer");
         items.push("[a]llow once".to_string());
-        items.push("[A]llow always (global)".to_string());
+        if offer.always {
+            items.push("[A]llow always (global)".to_string());
+        }
         if offer.remember {
             items.push(format!("[c] always for {who}"));
             items.push(format!("[C] {who}, command family"));
@@ -475,7 +483,9 @@ fn ledger_hints(selected: Option<&LedgerRow>, width: usize) -> String {
         let who = row.asker.as_deref().unwrap_or("the performer");
         if row.offer.review {
             add("a allow once", "a allow once");
-            add("A allow always (global)", "A global");
+            if row.offer.always {
+                add("A allow always (global)", "A global");
+            }
             if row.offer.remember {
                 add(&format!("c always for {who}"), &format!("c {who}"));
                 add(&format!("C {who}, command family"), &format!("C {who} family"));
@@ -1531,7 +1541,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
 
-    const REVIEWER: Offer = Offer { review: true, remember: false, escalate: false, take_over: false };
+    const REVIEWER: Offer = Offer { review: true, always: true, remember: false, escalate: false, take_over: false };
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1650,8 +1660,23 @@ mod tests {
     /// Each viewer's card shows exactly the keys they have, in the words
     /// the design gives them.
     #[test]
+    fn a_drift_ask_offers_no_standing_rule() {
+        let me = PrincipalId::new();
+        let mut summary = fixtures::summary("drift-1", ContextId::new(), "push drift from lane");
+        summary.origin = kaijutsu_types::AskOrigin::Drift;
+        summary.statements.clear();
+        summary.reviewer = Some(kaijutsu_types::PrincipalRef { id: me, name: "amy".into() });
+        summary.performer = Some(kaijutsu_types::PrincipalRef { id: PrincipalId::new(), name: "coder".into() });
+        let offer = Offer::of(&summary, Some(me));
+        assert!(offer.review && !offer.always && !offer.remember, "{offer:?}");
+        assert!(offer.refusal(AskDecision::AllowAlways, "drift-1").is_some());
+        assert!(offer.refusal(AskDecision::AllowOnce, "drift-1").is_none());
+        assert!(offer.refusal(AskDecision::Deny, "drift-1").is_none());
+    }
+
+    #[test]
     fn the_card_renders_each_viewers_keys() {
-        let all = Offer { review: true, remember: true, escalate: true, take_over: false };
+        let all = Offer { review: true, always: true, remember: true, escalate: true, take_over: false };
         assert_eq!(
             key_rows(all, 200, true),
             vec!["  [a]llow once  [A]llow always (global)  [c] always for coder  [C] coder, command family  [d]eny  [e]scalate  [v]iew ledger  Esc aside"]
@@ -1660,6 +1685,12 @@ mod tests {
         assert_eq!(
             key_rows(no_program, 200, true),
             vec!["  [a]llow once  [A]llow always (global)  [d]eny  [e]scalate  [v]iew ledger  Esc aside"]
+        );
+        let drift = Offer { always: false, remember: false, ..all };
+        assert_eq!(
+            key_rows(drift, 200, true),
+            vec!["  [a]llow once  [d]eny  [e]scalate  [v]iew ledger  Esc aside"],
+            "a drift ask offers no standing rule"
         );
         let claimed = Offer { escalate: false, ..all };
         assert!(!key_rows(claimed, 200, true)[0].contains("[e]"));
@@ -1675,7 +1706,7 @@ mod tests {
     /// card keeps the same number of rows.
     #[test]
     fn the_key_line_wraps_between_keys_and_arming_keeps_the_row_count() {
-        let all = Offer { review: true, remember: true, escalate: true, take_over: false };
+        let all = Offer { review: true, always: true, remember: true, escalate: true, take_over: false };
         let rows = key_rows(all, 50, true);
         assert!(rows.len() > 1, "{rows:?}");
         assert!(rows.iter().all(|row| row.chars().count() <= 50), "{rows:?}");
@@ -2491,7 +2522,7 @@ mod ledger_tests {
     #[test]
     fn ledger_keys_follow_the_selected_rows_offer() {
         use kaijutsu_types::{Remember, RememberScope};
-        let full = Offer { review: true, remember: true, escalate: true, take_over: false };
+        let full = Offer { review: true, always: true, remember: true, escalate: true, take_over: false };
         let mut app = ledger_of(full);
         ledger_key(&mut app, key(KeyCode::Char('C')));
         assert!(app.ledger_view.is_none());
@@ -2533,7 +2564,7 @@ mod ledger_tests {
             let rows = vec![row_with("p-1", offer)];
             line_text(render_ledger(&rows, "", 0, width, &Palette::builtin()).last().unwrap())
         };
-        let full = Offer { review: true, remember: true, escalate: true, take_over: false };
+        let full = Offer { review: true, always: true, remember: true, escalate: true, take_over: false };
         assert_eq!(
             line(full, 200),
             "a allow once  A allow always (global)  c always for coder  C coder, command family  d deny  e escalate  Enter show  j/k move  / filter  Esc back"

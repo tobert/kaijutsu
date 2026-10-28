@@ -1028,6 +1028,7 @@ pub struct UndeliveredAnswer {
     pub principal_id: Vec<u8>,
     pub status: crate::types::ApprovalStatus,
     pub description: String,
+    pub origin: crate::types::Origin,
 }
 
 /// Unredeemed human answers for the execution/resume driver, newest last.
@@ -1051,7 +1052,7 @@ pub struct UndeliveredAnswer {
 /// and gets no retry must not expect the row to disappear.
 pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> {
     let mut q = conn.prepare(
-        "SELECT request_id, context_id, principal_id, status, description FROM approvals
+        "SELECT request_id, context_id, principal_id, status, description, origin FROM approvals
          WHERE (status IN ('allowed', 'denied') OR (status = 'abandoned' AND decided_option = 'cancel'))
            AND auto_reason IS NULL
            AND origin != 'hook_result'
@@ -1073,6 +1074,7 @@ pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> 
                     _ => crate::types::ApprovalStatus::Abandoned,
                 },
                 description: row.get(4)?,
+                origin: parse_enum::<Origin>("origin", &row.get::<_, String>(5)?).map_err(sql_err)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

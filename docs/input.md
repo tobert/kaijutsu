@@ -110,6 +110,10 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
    were up. The ribbon's `Enter` opens a sheet with its keys live. The
    prefix still wins over both (it is in front of everything), so
    `Ctrl+A d` stays the detach chord and is never a deny.
+   A drift into the ROOT console is an ask too (origin `drift`), so the
+   same sheet comes up for it with `ROOT` on screen and holds typed text
+   the same way (`docs/character.md`, "A drift into ROOT waits for the
+   human").
    Neither raises on `Screen::Editor` or `Screen::Diff`: a vi surface owns
    the keys wherever it is live.
 
@@ -240,7 +244,7 @@ releases the hold instead.
 | WellZoomed | `0–9` seat of *focused* ring · `←/→/Tab` spin · `↑/↓` ring (Up at the top ring → hero pose) · `Enter` focus/commit · `p d c z a` verbs · `h` horizon dive (stub) · `?` legend · `Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
 | QuickContext (overlay held) | `Esc` release the hold — the only binding it carries; layered over whichever surface is underneath |
-| AskSheet (an ask waiting on you) | `a` allow once · `A` allow always (global) · `c`/`C` allow and remember the exact text/command family for the performer (only when the ask carries a program) · `d` deny · `e` escalate to the next reviewer · `t` take over (lineage root) · `v` ledger · `]`/`[` next/previous pending ask, across every context · `j/k` scroll the plan · `Esc` aside |
+| AskSheet (an ask waiting on you) | `a` allow once (for a drift into ROOT, release it to the model) · `A` allow always (global; not offered on a drift ask) · `c`/`C` allow and remember the exact text/command family for the performer (only when the ask carries a program) · `d` deny · `e` escalate to the next reviewer · `t` take over (lineage root) · `v` ledger · `]`/`[` next/previous pending ask, across every context · `j/k` scroll the plan · `Esc` aside |
 | LedgerRibbon (`Ctrl+A l`) | `a`/`A`/`c`/`C`/`d`/`e`/`t` answer the selected pending row (same keys as the sheet; each shows only when the ask's predicates allow it) · `j/k` (and `↑/↓`) move · `/` filter (typing edits the filter; `Enter` keeps it, `Esc` stops typing) · `Enter` open the sheet on any row, answered ones read-only · `Esc` close |
 
 `Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,

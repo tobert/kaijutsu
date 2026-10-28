@@ -2698,8 +2698,7 @@ impl KjDispatcher {
             Err(e) => return refuse(e),
         };
         let human_root = human || caller_row.as_ref().is_some_and(|c| c.context_type == ROOT_CONTEXT_TYPE);
-        let console = caller_row.as_ref()
-            .is_some_and(|c| c.context_type == CONSOLE_CONTEXT_TYPE && c.label.as_deref() == Some("ROOT"));
+        let console = caller_row.as_ref().is_some_and(|c| c.is_root_console());
         let target_is_root = row.context_type == ROOT_CONTEXT_TYPE;
         let target_is_console = row.context_type == CONSOLE_CONTEXT_TYPE;
 

@@ -166,8 +166,23 @@ Two things follow, and they are the ones to check a change against:
   reviewer is the human root above it. Ctrl-Z in the console, or in the human
   root, opens a shell context under it (type `shell`, no model). Its output
   stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
-  the shell returns to its parent. Incoming drifts into the console are not
-  yet gated: see `docs/issues.md`, "Root console".
+  the shell returns to its parent.
+- **A drift into ROOT waits for the human.** Amy, 2026-10-28. A drift into
+  the ROOT console lands held: a `Drift` block that is `Pending` and
+  excluded, so no model reads it, and no running turn is offered it. Every
+  drift kind holds except `Notification`. The drift's `rc` scripts run as
+  for any drift. An ask with origin `drift` waits in the approval ledger:
+  the sender is its performer, and its reviewer is whoever reviews the
+  console's performer, which is the human root above it. Its description
+  names the sender's context, the drift kind, and the text. The ask card,
+  the compose pause, the ledger view, and the desktop notice treat it like
+  any other ask. `kj ledger allow <id>` releases the drift: the approval
+  worker makes the block `Done` and included and offers it to a running
+  turn, so it joins at the next tool round, or else it rides the next
+  submit. `kj ledger deny <id>`, or the sender's `kj ledger cancel <id>`,
+  dismisses it: `Done`, still excluded, kept in the log. A drift ask takes
+  no `--remember`: the kernel refuses the answer and the ask stays open
+  (`kj/drift.rs`, `settle_drift_answer`; `kj/ledger.rs`, `decide_ask`).
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,

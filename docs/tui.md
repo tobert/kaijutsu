@@ -999,7 +999,8 @@ needs rather than being cropped into a fixed region.
 The key line is the viewer's own, wrapped by width between keys. The
 reviewer sees the line above; `[c]` and `[C]` appear only when the ask
 carries its shell program (`AskSummary::can_remember_for_character`), and
-`[e]` only while the ask is pending (`can_escalate`). The lineage root
+`[e]` only while the ask is pending (`can_escalate`). `[A]` appears only
+when the ask can become a rule (`can_remember`): a drift ask cannot. The lineage root
 who is not the reviewer sees `waiting for reviewer <name>  [t]ake over
 [v]iew ledger  Esc aside`; anyone else sees the same without `[t]`. The
 card and ledger ask the `AskSummary` predicates (`asks::Offer::of`) and
@@ -1026,6 +1027,21 @@ for `t`). One reassignment per card is in flight at a time: `e` or `t`
 again before it lands reports `already being reassigned`. The card stays up; the push
 shows the new reviewer on it. A key the viewer does not have posts a notice
 and changes nothing.
+
+**A drift into ROOT is an ask.** A drift sent to the ROOT console waits
+for the human as an ask with origin `drift` (`docs/character.md`, "A drift
+into ROOT waits for the human"). With `ROOT` on screen its card comes up
+like any other: the header names the `drift` tool, and the text under it
+reads `push drift from <context>:` and then the drift's text. `a` releases
+it to the console's model; `d` dismisses it. The card offers no `[A]`,
+`[c]` or `[C]`.
+
+```text
+  ⚠ ask 01a18378  drift  from ROOT (console)  asker coder  reviewer amy
+    push drift from lane (3f2a9c10):
+    please archive lane-b
+    [a]llow once  [d]eny  [e]scalate  [v]iew ledger  Esc aside
+```
 
 **A new card arms late.** It is drawn disarmed, its key line reading
 `arming… keys still go to the draft`, and every key goes where it would
