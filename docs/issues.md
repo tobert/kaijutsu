@@ -33,10 +33,8 @@ root, console, and shell; the start choice prefers `ROOT`. Still open:
   `config-write`/`operator`. Admin work runs through the TUI's `:kj` in the
   human root. Decide whether the shell child carries the root's admin grants,
   or the denial names `:kj`.
-- Typing in the human root fails with the self-review refusal
-  (`runtime/turn_identity.rs`), which tells the human to assign a reviewer.
-  It should say the human root runs no model turns and point to `ROOT` or
-  Ctrl-Z. The TUI also shows the whole Cap'n Proto wrapper before the message.
+- `submitInput` still reports reviewer-walk errors (such as "no reviewer")
+  as Cap'n Proto faults, not refusals (`runtime/turn_identity.rs`).
 - Live checks: the Ctrl-Z toggle creating a shell child against the kernel; the
   TUI double Ctrl-Z suspend and `fg` resume; the app's Ctrl-Z.
 - Pipe a shell snippet back to the model's draft. Later, after the above.
@@ -64,9 +62,6 @@ Needs Amy's decision:
   `TurnRequest.principal_id`, as fork and completion notices do; its
   prompt block now carries the performer. Moving the turn's principal
   moves approval and capability scope.
-- **6.4c** One track failure whose source context never appears blocks
-  every later failure on that track (`drain_track_failures`). Needs a
-  per-event pending set or a drop policy.
 
 Behavior:
 - **2.3** `approval_resume` runs approved commands inline in its one task,
