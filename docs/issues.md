@@ -168,6 +168,11 @@ Clarity:
   later alike: `ctrl_z_suspends_and_sigcont_resumes_a_responsive_client`
   and `the_kitty_keyboard_is_taken_with_the_screen_and_given_back`. The
   client process never stops there. Outside the sandbox is unchecked.
+- `kaijutsu-server` `gate_scenarios_wire`:
+  `an_approved_shell_write_runs_with_the_cwd_and_env_it_showed` failed once
+  in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for
+  `cd sub` (`shell_write: 1 statement(s) — cd sub`), and passed three times
+  alone. Load-dependent; cause not found.
 
 ## `SshServerConfig::unlisted` has no production entry point (2026-10-27)
 
