@@ -144,7 +144,7 @@ pub use llm::{
     // System prompt assembly
     SituationalContext,
     SenpaiFact,
-    InstanceFact,
+    CharacterFact,
     CharacterIdentity,
     build_system_prompt,
     extract_system_prompt_sections,

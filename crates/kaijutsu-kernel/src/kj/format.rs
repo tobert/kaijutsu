@@ -6,30 +6,20 @@ use kaijutsu_types::ContextId;
 
 use crate::kernel_db::ContextRow;
 
-/// What a context list shows of a context's character instance binding: the
-/// model its type runs, and the cast the binding was written from.
+/// What a context list shows of a context's slots: the model its type runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextBound {
-    /// `backend/model`, or `None` when the binding has no slot for the type.
+    /// `backend/model`, or `None` when the context has no slot for its type.
     pub model: Option<String>,
-    pub cast: Option<String>,
 }
 
-/// The `[cast:<label>]` suffix for a context whose binding has a cast.
-fn cast_tag(bound: Option<&ContextBound>) -> String {
-    bound
-        .and_then(|b| b.cast.as_deref())
-        .map(|label| format!(" [cast:{label}]"))
-        .unwrap_or_default()
-}
-
-/// The model column: the binding's model, or "(no model)".
+/// The model column: the context's model, or "(no model)".
 fn model_column(bound: Option<&ContextBound>) -> &str {
     bound.and_then(|b| b.model.as_deref()).unwrap_or("(no model)")
 }
 
 /// `[host:<name>]` tag for `format_context_table`/`format_context_tree` —
-/// same optional-suffix convention as `cast_tag`, but `origin_host` needs no
+/// an optional suffix, but `origin_host` needs no
 /// lookup (it's a plain string already on the row). Omitted entirely
 /// when unknown (old client, or a creation path with nothing to report —
 /// see `ContextRow::origin_host`'s doc comment), never rendered as "-" here:
@@ -45,10 +35,8 @@ fn origin_host_tag(origin_host: &Option<String>) -> String {
 /// Format a context list as a flat table.
 ///
 /// Marks the current context with `*` and ring-0 (promoted) contexts with a
-/// trailing `[ring0]` tag; `bound` carries each context's binding model and
-/// cast label for the model column and an additional `[cast:<label>]` tag
-/// (omitted when the binding has no cast). A
-/// `[host:<name>]` tag follows when `origin_host` is known — makes the
+/// trailing `[ring0]` tag; `bound` carries each context's model for the model
+/// column. A `[host:<name>]` tag follows when `origin_host` is known — makes the
 /// fleet board self-evident from `kj context list` alone.
 pub fn format_context_table(
     contexts: &[ContextRow],
@@ -86,11 +74,10 @@ pub fn format_context_table(
         } else {
             ""
         };
-        let cast = cast_tag(bound.get(&ctx.context_id));
         let host = origin_host_tag(&ctx.origin_host);
         let age = format_age_compact(ctx.last_activity_at.unwrap_or(ctx.created_at));
         lines.push(format!(
-            "{marker} {id_short}  {label:<label_w$} {age:>5}  {model}{ring0}{cast}{host}"
+            "{marker} {id_short}  {label:<label_w$} {age:>5}  {model}{ring0}{host}"
         ));
     }
 
@@ -130,7 +117,7 @@ pub(crate) fn format_age_compact(millis: i64) -> String {
 /// Format context DAG results as an indented tree.
 ///
 /// `dag` is a list of (ContextRow, depth) from the recursive CTE. `bound`
-/// carries each context's binding model and cast label, same convention as
+/// carries each context's model, same convention as
 /// `format_context_table` (including the `[host:<name>]` tag).
 pub fn format_context_tree(
     dag: &[(ContextRow, i64)],
@@ -153,12 +140,11 @@ pub fn format_context_tree(
         let label = ctx.label.as_deref().unwrap_or("-");
         let model = model_column(bound.get(&ctx.context_id));
         let id_short = ctx.context_id.short();
-        let cast = cast_tag(bound.get(&ctx.context_id));
         let host = origin_host_tag(&ctx.origin_host);
 
         let prefix = if *depth > 0 { "└─ " } else { "" };
         lines.push(format!(
-            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}{cast}{host}"
+            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}{host}"
         ));
     }
 
@@ -715,19 +701,16 @@ mod tests {
     }
 
     #[test]
-    fn table_shows_the_binding_model_and_tags_the_cast() {
-        let with = make_row(Some("cast-ctx"), ContextId::new());
-        let without = make_row(Some("uncast-ctx"), ContextId::new());
+    fn table_shows_the_slot_model() {
+        let with = make_row(Some("slot-ctx"), ContextId::new());
+        let without = make_row(Some("unslotted-ctx"), ContextId::new());
         let mut bound = HashMap::new();
-        bound.insert(
-            with.context_id,
-            ContextBound { model: Some("deepseek/flash".into()), cast: Some("house".into()) },
-        );
+        bound.insert(with.context_id, ContextBound { model: Some("deepseek/flash".into()) });
 
         let output = format_context_table(&[with, without], None, &bound);
         let lines: Vec<&str> = output.lines().collect();
-        assert!(lines[0].contains("deepseek/flash") && lines[0].contains("[cast:house]"), "output: {output}");
-        assert!(lines[1].contains("(no model)") && !lines[1].contains("[cast:"), "output: {output}");
+        assert!(lines[0].contains("deepseek/flash"), "output: {output}");
+        assert!(lines[1].contains("(no model)"), "output: {output}");
     }
 
     #[test]

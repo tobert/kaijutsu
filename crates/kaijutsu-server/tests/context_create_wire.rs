@@ -32,15 +32,14 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
         let row = kernel.kernel_db.lock().get_context(lane).unwrap().unwrap();
         assert_eq!(row.forked_from, Some(parent.context_id));
         assert_eq!(row.created_by, root.principal_id);
-        assert_eq!(kernel.kernel_db.lock().senpai_conversation_of(lane).unwrap(), Some(parent.context_id), "the context it was created from is its senpai");
+        assert_eq!(kernel.kernel_db.lock().senpai_of(lane).unwrap(), Some(parent.context_id), "the context it was created from is its senpai");
         assert_eq!(row.context_type, "coder");
         let performer = kernel.kernel_db.lock().get_character_by_name(PERFORMER).unwrap().unwrap();
-        assert_eq!(row.played_by, Some(performer.principal_id), "the context is the conversation of an instance of the named character");
+        assert_eq!(row.played_by, Some(performer.principal_id), "the context is performed by the named character");
         let db = kernel.kernel_db.lock();
-        let (instance, seq) = db.context_instance(lane).unwrap().expect("the new context belongs to an instance");
-        assert_eq!(seq, 1);
-        let root_instance = db.context_instance(parent.context_id).unwrap().expect("the root console is an instance");
-        assert_eq!(db.get_instance(instance).unwrap().unwrap().senpai_instance, Some(root_instance.0), "its senpai is the instance it was created from");
+        let character = db.context_character(lane).unwrap().expect("the new context has a context character");
+        assert_eq!(character.principal_id, performer.principal_id);
+        assert_eq!(character.senpai_ctx, Some(parent.context_id), "its senpai is the context it was created from");
         drop(db);
         assert_eq!(
             kernel.documents.block_snapshots(parent.context_id).unwrap().len(),

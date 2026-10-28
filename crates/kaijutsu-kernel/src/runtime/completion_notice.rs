@@ -302,7 +302,7 @@ mod tests {
         let kernel = dispatcher.kernel();
         let actor = PrincipalId::new();
         let context = register_context(&dispatcher, Some("changed-notice-recipient"), None, actor);
-        // The notice names `actor`; the context belongs to an instance of someone else.
+        // The notice names `actor`; the context is performed by someone else.
         kernel.kernel_db().lock().assign_test_review(context, Some(PrincipalId::new()), Some(PrincipalId::new())).unwrap();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());

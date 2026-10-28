@@ -41,13 +41,12 @@
 //!   seat that forked it — see the assertions below and
 //!   `docs/character.md`, "Roots and rotation".
 //! - **Each lane runs its coder's cast.** A lane is `kj kohai create <lane>
-//!   --type coder --as <coder>`, so its binding is written from the cast its
+//!   --type coder --as <coder>`, so its slots are copied from the cast its
 //!   coder character names (`kj character set <coder> --cast`), and its
 //!   `coder` slot gives it `mock-coder-a` or `mock-coder-b`.
 //! - **banto starts its own lanes.** `kj kohai create <lane> --as <coder>`
-//!   starts a character instance whose senpai is banto's instance, and a fork
-//!   stays in the forking context's instance, so the assignment happens
-//!   inside banto's own scripted turn; amy assigns nothing.
+//!   makes a context whose senpai is banto's context, so the assignment
+//!   happens inside banto's own scripted turn; amy assigns nothing.
 //! - The kernel worker reserves `KAISH_RC_THREAD_STACK` for nested kaish
 //!   (`crates/kaijutsu-kernel/src/runtime/worker.rs`), and
 //!   `kj handoff note`/`signoff` without `--for` file under the performer
@@ -342,7 +341,7 @@ fn kaijutsu_session_scenario() {
         s.kj("kj character create coder-a").await;
         s.kj("kj character create coder-b").await;
 
-        // A character's cast is bound when its instance starts: banto runs
+        // A character's cast is copied when a context is made: banto runs
         // `mock-banto`, and each coder lane runs its own coder's model.
         s.kj("kj cast create banto-cast").await;
         s.kj("kj cast slot set banto-cast director --backend mock --model mock-banto --max-tokens 4096").await;
@@ -362,8 +361,8 @@ fn kaijutsu_session_scenario() {
 
         // ------------------------------------------------------------
         // Turn 1a: amy submits a prompt in banto's seat. banto's mock script
-        // creates lane-a and lane-b, each an instance of its coder
-        // character under banto's own instance (`kj kohai create lane-x
+        // creates lane-a and lane-b, each a context of its coder
+        // character under banto's own context (`kj kohai create lane-x
         // --as coder-x`; `docs/senpai-kohai.md`, "Creating, forking,
         // rotating").
         //

@@ -1,15 +1,14 @@
-//! "What model does this context play?" Read the context's character
-//! instance binding; nothing else answers.
+//! "What model does this context play?" Read the context's own slots;
+//! nothing else answers.
 //!
-//! A model call in context K runs on the `instance_slots` row for K's context
-//! type in the binding K was made with (`contexts.instance_id` and
-//! `contexts.binding_seq`). A context with no instance, or a binding with no
-//! slot for the type, has no model. No cast, `backend_models` row or registry
-//! default stands in.
+//! A model call in context K runs on the `context_slots` row for K's context
+//! type. A context with no context character, or one with no slot for the
+//! type, has no model. No cast, `backend_models` row or registry default
+//! stands in.
 
-use kaijutsu_types::{CharacterInstanceId, ContextId};
+use kaijutsu_types::ContextId;
 
-use crate::kernel_db::{InstanceSlotRow, KernelDb, KernelDbError, KernelDbResult};
+use crate::kernel_db::{ContextSlotRow, KernelDb, KernelDbError, KernelDbResult};
 use crate::llm::SlotTunables;
 
 /// Cast slot roles that are not context types. The `gate` slot names the
@@ -28,18 +27,14 @@ pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
     }
     Err(format!(
         "'{context_type}' is a cast role, not a context type: a cast's `{context_type}` slot configures \
-         a council or distillation model for the instances that play the cast; choose another --type"
+         a council or distillation model for the contexts that characters of the cast play; choose another --type"
     ))
 }
 
-/// The model a context runs, copied from its binding.
+/// The model a context runs, copied from its slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextModel {
-    pub instance: CharacterInstanceId,
-    /// The binding `seq` the context runs on.
-    pub seq: i64,
     pub character: String,
-    pub cast: Option<String>,
     pub context_type: String,
     /// Backend NAME, the registry key.
     pub backend: String,
@@ -53,20 +48,16 @@ pub struct ContextModel {
 /// Why a context has no model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoModelReason {
-    /// The context belongs to no character instance.
-    NoInstance,
-    /// The binding was written from a character with no cast.
-    NoCast,
-    /// The binding's cast has no slot for the role.
-    NoSlot { cast: String },
+    /// The context has no context character.
+    NoContextCharacter,
+    /// The context's slots have none for the role.
+    NoSlot,
 }
 
-/// A context, or a role of its instance, that has no model.
+/// A context, or a role of it, that has no model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoModel {
     pub context: String,
-    /// The instance's name; `None` when the context has no instance.
-    pub instance: Option<String>,
     pub character: Option<String>,
     /// The role looked up: the context's type, or `gate`, `judge`, `distill`.
     pub role: String,
@@ -76,22 +67,21 @@ pub struct NoModel {
 impl NoModel {
     /// One line for `kj kohai create`, `kj context rotate` and `kj context info`.
     pub fn line(&self) -> String {
-        let instance = self.instance.as_deref().unwrap_or(&self.context);
         match &self.reason {
-            NoModelReason::NoInstance => format!("{} has no character instance, so it runs no model", self.context),
-            NoModelReason::NoCast => format!(
-                "{instance} has no model for {}: {} has no cast",
-                self.role,
-                self.character.as_deref().unwrap_or("its character")
-            ),
-            NoModelReason::NoSlot { cast } => {
-                format!("{instance} has no model for {}: cast {cast} has no {} slot", self.role, self.role)
+            NoModelReason::NoContextCharacter => {
+                format!("{} has no context character, so it runs no model", self.context)
             }
+            NoModelReason::NoSlot => format!(
+                "{} has no model for {}: {} has no {} slot",
+                self.context,
+                self.role,
+                self.character.as_deref().unwrap_or("its character"),
+                self.role
+            ),
         }
     }
 
-    /// The refusal for a model turn: the character, the cast, the role and
-    /// the fix.
+    /// The refusal for a model turn: the character, the role and the fix.
     pub fn refusal(&self) -> String {
         self.refusal_as("runs no model")
     }
@@ -103,19 +93,13 @@ impl NoModel {
     pub fn refusal_as(&self, what: &str) -> String {
         let character = self.character.as_deref().unwrap_or("(none)");
         match &self.reason {
-            NoModelReason::NoInstance => format!(
-                "{} belongs to no character instance, so it {what}. Start one: \
+            NoModelReason::NoContextCharacter => format!(
+                "{} has no context character, so it {what}. Start one: \
                  `kj kohai create <label> --as <character> --type <type>`",
                 self.context
             ),
-            NoModelReason::NoCast => format!(
-                "{} {what}: character {character} has no cast, so no {} slot. Fix: \
-                 `kj character set {character} --cast <cast>`, then `kj context rotate`",
-                self.context, self.role
-            ),
-            NoModelReason::NoSlot { cast } => format!(
-                "{} {what}: character {character}'s cast {cast} has no {} slot. Fix: \
-                 `kj cast slot set {cast} {} ...` or `kj character set {character} --cast <cast>`, \
+            NoModelReason::NoSlot => format!(
+                "{} {what}: character {character} has no {} slot. Fix: give the character a {} slot in its cast, \
                  then `kj context rotate`",
                 self.context, self.role, self.role
             ),
@@ -123,7 +107,7 @@ impl NoModel {
     }
 }
 
-/// A role's answer on a binding.
+/// A role's answer on a context.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextModelLookup {
     Model(ContextModel),
@@ -131,16 +115,6 @@ pub enum ContextModelLookup {
 }
 
 impl ContextModelLookup {
-    /// The label of the cast the binding was written from, whether or not it
-    /// has a slot for the role.
-    pub fn cast(&self) -> Option<&str> {
-        match self {
-            Self::Model(m) => m.cast.as_deref(),
-            Self::None(NoModel { reason: NoModelReason::NoSlot { cast }, .. }) => Some(cast),
-            Self::None(_) => None,
-        }
-    }
-
     /// The model, or the refusal text.
     pub fn into_model(self) -> Result<ContextModel, String> {
         match self {
@@ -154,64 +128,48 @@ fn corrupt(what: String) -> KernelDbError {
     KernelDbError::Validation(what)
 }
 
-/// The slot of `role` in the binding context `context_id` runs on, with the
-/// names around it. `role` is the context's type for a chat model, or a
-/// reserved role.
+/// The slot of `role` in context `context_id`, with the names around it.
+/// `role` is the context's type for a chat model, or a reserved role.
 pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbResult<RoleSlot> {
     let context = db.context_name(context_id);
-    let Some((instance, seq)) = db.context_instance(context_id)? else {
+    let Some(row) = db.context_character(context_id)? else {
         return Ok(RoleSlot::None(NoModel {
             context,
-            instance: None,
             character: None,
             role: role.to_string(),
-            reason: NoModelReason::NoInstance,
+            reason: NoModelReason::NoContextCharacter,
         }));
     };
-    let row = db
-        .get_instance(instance)?
-        .ok_or_else(|| corrupt(format!("context {context} names character instance {instance}, which has no row")))?;
     let character = db
         .get_character(row.principal_id)?
         .map(|c| c.name)
         .unwrap_or_else(|| row.principal_id.to_string());
-    let binding = db
-        .get_binding(instance, seq)?
-        .ok_or_else(|| corrupt(format!("context {context} runs binding {seq} of {instance}, which has no row")))?;
-    let instance_name = db.instance_name(instance);
-    let Some(slot) = db.binding_slot(instance, seq, role)? else {
-        let reason = match &binding.cast_label {
-            Some(cast) => NoModelReason::NoSlot { cast: cast.clone() },
-            None => NoModelReason::NoCast,
-        };
+    let Some(slot) = db.context_slot(context_id, role)? else {
         return Ok(RoleSlot::None(NoModel {
             context,
-            instance: Some(instance_name),
             character: Some(character),
             role: role.to_string(),
-            reason,
+            reason: NoModelReason::NoSlot,
         }));
     };
     let backend = db
         .list_backends()?
         .into_iter()
         .find(|b| b.backend_id == slot.backend_id)
-        .ok_or_else(|| corrupt(format!("binding {seq} of {instance} slot {role} names a backend that does not exist")))?
+        .ok_or_else(|| corrupt(format!("context {context} slot {role} names a backend that does not exist")))?
         .name;
-    Ok(RoleSlot::Slot(BoundSlot { instance, seq, instance_name, character, cast: binding.cast_label, backend, slot }))
+    Ok(RoleSlot::Slot(BoundSlot { context, character, backend, slot }))
 }
 
-/// A binding slot with the names a caller reports.
+/// A context slot with the names a caller reports.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSlot {
-    pub instance: CharacterInstanceId,
-    pub seq: i64,
-    pub instance_name: String,
+    /// `label (short-id)` of the context.
+    pub context: String,
     pub character: String,
-    pub cast: Option<String>,
     /// Backend NAME.
     pub backend: String,
-    pub slot: InstanceSlotRow,
+    pub slot: ContextSlotRow,
 }
 
 /// What [`role_slot`] found.
@@ -225,9 +183,9 @@ fn non_negative(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
 
-/// The model context `context_id` runs, from its binding. `Err` is a fault
-/// reading the binding, or a chat slot with no `max_tokens` (which a binding
-/// write refuses).
+/// The model context `context_id` runs, from its slot. `Err` is a fault
+/// reading the slot, or a chat slot with no `max_tokens` (which a context
+/// character write refuses).
 pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<ContextModelLookup> {
     let context_type = db
         .get_context(context_id)?
@@ -239,15 +197,12 @@ pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<Con
             let slot = &bound.slot;
             let max_tokens = non_negative(slot.max_tokens).filter(|m| *m > 0).ok_or_else(|| {
                 corrupt(format!(
-                    "binding {} of {} slot {context_type} has no max_tokens, which every request carries",
-                    bound.seq, bound.instance_name
+                    "context {} slot {context_type} has no max_tokens, which every request carries",
+                    bound.context
                 ))
             })?;
             Ok(ContextModelLookup::Model(ContextModel {
-                instance: bound.instance,
-                seq: bound.seq,
                 character: bound.character.clone(),
-                cast: bound.cast.clone(),
                 context_type,
                 backend: bound.backend.clone(),
                 model: slot.model.clone(),

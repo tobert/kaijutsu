@@ -979,7 +979,7 @@ impl KjDispatcher {
         )?;
         let system_prompt = purpose.load_system_prompt(self.kernel()).await?;
 
-        // The model comes from the `distill` slot of the caller's binding and
+        // The model comes from the `distill` slot of the caller's context and
         // nowhere else. No registry default or the source's model stands in.
         let caller = caller_context_id.unwrap_or(context_id);
         let bound = {
@@ -999,7 +999,7 @@ impl KjDispatcher {
             .ok_or_else(|| {
                 format!(
                     "the distill slot of {} has no max_tokens, which every request carries",
-                    bound.instance_name
+                    bound.context
                 )
             })?;
         let provider_name = bound.backend.clone();
@@ -1459,8 +1459,8 @@ pub(crate) mod test_helpers {
         principal_id
     }
 
-    /// Register a context played by `created_by` whose character instance
-    /// binds a cast giving each of `roles` the model `mock-model` on the
+    /// Register a context played by `created_by` whose context character
+    /// copies a cast giving each of `roles` the model `mock-model` on the
     /// `mock` backend. The character is created when absent.
     pub fn register_context_with_model(
         dispatcher: &KjDispatcher,
@@ -1493,7 +1493,7 @@ pub(crate) mod test_helpers {
             db.seed_test_cast_roles(created_by, entries).unwrap();
         }
         let context = register_context(dispatcher, label, forked_from, created_by);
-        dispatcher.kernel_db().lock().assign_stand_in_instance(context, created_by).unwrap();
+        dispatcher.kernel_db().lock().assign_stand_in_character(context, created_by).unwrap();
         context
     }
 
@@ -1515,8 +1515,8 @@ pub(crate) mod test_helpers {
     pub fn register_rooted_context(dispatcher: &KjDispatcher, label: Option<&str>, created_by: PrincipalId) -> ContextId {
         let root = register_root_context(dispatcher);
         let context = register_context(dispatcher, label, Some(root), created_by);
-        // The creator runs it, as an instance under `amy`'s console.
-        dispatcher.kernel_db().lock().assign_stand_in_instance(context, created_by).unwrap();
+        // The creator runs it, as a context character under `amy`'s console.
+        dispatcher.kernel_db().lock().assign_stand_in_character(context, created_by).unwrap();
         context
     }
 
@@ -1542,7 +1542,7 @@ pub(crate) mod test_helpers {
         let mut caller = test_caller();
         let root = register_root_context(dispatcher);
         let context = register_context(dispatcher, None, Some(root), caller.principal_id);
-        dispatcher.kernel_db().lock().assign_stand_in_instance(context, caller.principal_id).unwrap();
+        dispatcher.kernel_db().lock().assign_stand_in_character(context, caller.principal_id).unwrap();
         caller.context_id = Some(context);
         caller
     }
@@ -1569,9 +1569,9 @@ pub(crate) mod test_helpers {
     /// Give `caller`'s actor a live character sheet if it has none, so it may
     /// `kj kohai create` (`docs/senpai-kohai.md`, "Creating and moving").
     ///
-    /// A caller's registered context that belongs to no instance becomes an
-    /// instance of the actor, so the caller's `kj kohai create` has an
-    /// instance to answer to.
+    /// A caller's registered context that has no context character gets one
+    /// of the actor, so the caller's `kj kohai create` has a context to answer
+    /// to.
     pub fn give_character(dispatcher: &KjDispatcher, caller: &KjCaller) {
         let db = dispatcher.kernel_db().lock();
         if db.get_character(caller.actor_id).unwrap().is_none() {
@@ -1582,9 +1582,9 @@ pub(crate) mod test_helpers {
         }
         if let Some(context) = caller.context_id
             && db.get_context(context).unwrap().is_some()
-            && db.context_instance_row(context).unwrap().is_none()
+            && db.context_character(context).unwrap().is_none()
         {
-            db.assign_stand_in_instance(context, caller.actor_id).unwrap();
+            db.assign_stand_in_character(context, caller.actor_id).unwrap();
         }
     }
 
@@ -1607,8 +1607,8 @@ pub(crate) mod test_helpers {
             .map(|row| row.context_id)
             .collect();
         for child in children {
-            if db.context_instance_row(child).unwrap().is_none() {
-                db.assign_stand_in_instance(child, PrincipalId::new()).unwrap();
+            if db.context_character(child).unwrap().is_none() {
+                db.assign_stand_in_character(child, PrincipalId::new()).unwrap();
             }
         }
         caller

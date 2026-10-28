@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult,
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    BackendId, BlockId, CastId, CharacterInstanceId, ContextId, ContextState, DocKind, ForkKind,
+    BackendId, BlockId, CastId, ContextId, ContextState, DocKind, ForkKind,
     KernelId, PresetId, PrincipalId, TurnId, WorkspaceId,
 };
 
@@ -33,11 +33,8 @@ use crate::mcp::binding::ContextToolBinding;
 use crate::mcp::types::InstanceId;
 use crate::roster::{Availability, LivenessKind, PresenceSnapshotRow, RosterEntity, RosterRow};
 
-mod instances;
-use instances::read_opt_instance_id;
-pub use instances::{
-    CharacterInstanceRow, InstanceBindingRow, InstanceMigrationNote, InstanceSlotRow,
-};
+mod context_characters;
+pub use context_characters::{ContextCharacterMigrationNote, ContextCharacterRow, ContextSlotRow};
 
 // ============================================================================
 // Error type
@@ -103,23 +100,11 @@ pub type KernelDbResult<T> = Result<T, KernelDbError>;
 // Row types
 // ============================================================================
 
-/// SQL for the root console of the `characters` row: the newest binding's
-/// conversation of its newest instance with no senpai, `NULL` for a character
-/// that is not a root or has none.
-macro_rules! root_ctx_sql {
-    () => {
-        "(SELECT b.conversation_ctx FROM character_instances i
-           JOIN instance_bindings b ON b.instance_id = i.instance_id
-           WHERE characters.root = 1 AND i.principal_id = characters.principal_id AND i.senpai_instance IS NULL
-           ORDER BY i.started_at DESC, i.instance_id DESC, b.seq DESC LIMIT 1)"
-    };
-}
-
 /// SQL for the performer of the `contexts` row aliased `$t`: the principal of
-/// its character instance, `NULL` for a context with none.
+/// its context character, `NULL` for a context with none.
 macro_rules! performer_sql {
     ($t:literal) => {
-        concat!("(SELECT ci.principal_id FROM character_instances ci WHERE ci.instance_id = ", $t, ".instance_id)")
+        concat!("(SELECT cc.principal_id FROM context_characters cc WHERE cc.context_id = ", $t, ".context_id)")
     };
 }
 
@@ -176,8 +161,8 @@ pub struct ContextRow {
     /// `kj context list`).
     pub origin_host: Option<String>,
     /// The character whose performance this context is, or `None` for a
-    /// context with no character instance (a score context, a file document,
-    /// the handoff log). Read from the context's character instance; no
+    /// context with no context character (a score context, a file document,
+    /// the handoff log). Read from the context's context character; no
     /// column stores it, and `write_context` refuses a row that sets it. See
     /// `docs/senpai-kohai.md`, "The model".
     pub played_by: Option<PrincipalId>,
@@ -226,14 +211,14 @@ impl ContextRow {
     }
 }
 
-/// Columns a database written before character instances may lack, added so
-/// `senpai-edges-v1` and `instances-v1` can read them; the drop that follows
-/// `instances-v1` removes them. Each is `(table, column, definition)`.
-const PRE_INSTANCE_COLUMNS: [(&str, &str, &str); 5] = [
+/// Columns a database written before context characters may lack, added so
+/// `senpai-edges-v1` and `context-characters-v1` can read them; the drop that
+/// follows `context-characters-v1` removes them (`default_cast_id` is renamed
+/// to `cast_id`). Each is `(table, column, definition)`.
+const PRE_CONTEXT_CHARACTER_COLUMNS: [(&str, &str, &str); 4] = [
     ("contexts", "cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
     ("contexts", "played_by", "BLOB"),
     ("contexts", "senpai_ctx", "BLOB REFERENCES contexts(context_id)"),
-    ("characters", "root_ctx", "BLOB REFERENCES contexts(context_id) ON DELETE SET NULL"),
     ("characters", "default_cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
 ];
 
@@ -252,9 +237,9 @@ pub const ACTIVE_RING_CAPACITY: i64 = kaijutsu_types::RING_SLOTS as i64;
 pub enum ReviewFrom {
     /// An ask raised in this existing context: routing starts at its senpai.
     Context(ContextId),
-    /// A context not yet written whose instance will have this senpai instance
-    /// (a create before the insert): routing starts at that senpai.
-    Senpai(CharacterInstanceId),
+    /// A context not yet written whose senpai will be this context (a create
+    /// before the insert): routing starts at that senpai.
+    Senpai(ContextId),
 }
 
 /// An act the one authority rule governs (`docs/senpai-kohai.md`, "Authority").
@@ -318,8 +303,8 @@ impl ReviewQuery {
         Self { from: ReviewFrom::Context(context), actor, past: None, confirm_at_top: true }
     }
 
-    /// The reviewer of an ask `actor` would raise in an instance whose senpai is `senpai`.
-    pub fn under(senpai: CharacterInstanceId, actor: PrincipalId) -> Self {
+    /// The reviewer of an ask `actor` would raise in a context whose senpai is `senpai`.
+    pub fn under(senpai: ContextId, actor: PrincipalId) -> Self {
         Self { from: ReviewFrom::Senpai(senpai), actor, past: None, confirm_at_top: true }
     }
 
@@ -598,11 +583,7 @@ pub struct TurnStart {
     pub context_id: ContextId,
     /// The character that performed the turn.
     pub performer: PrincipalId,
-    /// The character instance and binding `seq` the turn ran on. `None` for
-    /// a turn recorded before turns named them.
-    pub instance: Option<CharacterInstanceId>,
-    pub binding_seq: Option<i64>,
-    /// The context type the binding slot was matched on.
+    /// The context type the context slot was matched on.
     pub role: String,
     pub provider: String,
     pub model: String,
@@ -873,12 +854,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     paused_at    INTEGER,
     -- Advisory hostname the registering client self-reported at creation
     -- (NULL = unknown). See `ContextRow::origin_host`'s doc comment.
-    origin_host  TEXT,
-    -- The character instance this context belongs to and the binding `seq` it
-    -- runs on (NULL = none: scratch, the handoff log, system contexts). Both
-    -- are set once and never changed; a trigger refuses the change.
-    instance_id  BLOB REFERENCES character_instances(instance_id),
-    binding_seq  INTEGER
+    origin_host  TEXT
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -898,39 +874,32 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
     recorded_at  INTEGER NOT NULL
 );
 
--- ── Character instances (docs/senpai-kohai.md, "The model") ────────
--- The dynamic layer: one row per run of one character, and the settings it
--- runs on. Bindings and slots are appended and never changed; a trigger
--- refuses an UPDATE or DELETE. `principal_id` is a bare id like
--- `contexts.played_by`: the kernel never reads `auth.db`.
-CREATE TABLE IF NOT EXISTS character_instances (
-    instance_id     BLOB    NOT NULL PRIMARY KEY,
-    principal_id    BLOB    NOT NULL,
-    senpai_instance BLOB    REFERENCES character_instances(instance_id),
-    started_at      INTEGER NOT NULL,
-    created_by      BLOB    NOT NULL
+-- ── Context characters (docs/senpai-kohai.md, "The model") ────────
+-- One row per context that has a character: the character in this context,
+-- the context it answers to, and the persona. A context with no row (scratch,
+-- the handoff log, system contexts) runs no turns and routes nothing.
+-- `principal_id` is a bare id like `contexts.created_by`: the kernel never
+-- reads `auth.db`. `senpai_ctx` is the one column that changes after the
+-- context is made (`kj senpai set`); triggers refuse a change to the rest.
+CREATE TABLE IF NOT EXISTS context_characters (
+    context_id   BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id),
+    principal_id BLOB    NOT NULL,
+    senpai_ctx   BLOB    REFERENCES contexts(context_id),
+    persona      TEXT,
+    created_at   INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_character_instances_principal
-    ON character_instances(principal_id);
+CREATE INDEX IF NOT EXISTS idx_context_characters_principal
+    ON context_characters(principal_id);
+CREATE INDEX IF NOT EXISTS idx_context_characters_senpai
+    ON context_characters(senpai_ctx) WHERE senpai_ctx IS NOT NULL;
 
--- One binding per `seq`: the persona and the cast a conversation runs on.
-CREATE TABLE IF NOT EXISTS instance_bindings (
-    instance_id      BLOB    NOT NULL REFERENCES character_instances(instance_id),
-    seq              INTEGER NOT NULL CHECK (seq >= 1),
-    conversation_ctx BLOB    NOT NULL REFERENCES contexts(context_id),
-    bound_at         INTEGER NOT NULL,
-    cast_label       TEXT,
-    persona          TEXT,
-    PRIMARY KEY (instance_id, seq)
-);
-
--- A copy of one cast slot, with every unset parameter filled from the model's
--- `backend_models` row. `max_tokens` is required: every provider request
--- carries it, except a `gate` or `judge` slot, which names a council server.
--- NULL optional parameters are left out of the request.
-CREATE TABLE IF NOT EXISTS instance_slots (
-    instance_id     BLOB    NOT NULL,
-    seq             INTEGER NOT NULL,
+-- A copy of one character slot, with every unset parameter filled from the
+-- model's `backend_models` row. `max_tokens` is required: every provider
+-- request carries it, except a `gate` or `judge` slot, which names a council
+-- server. NULL optional parameters are left out of the request. A trigger
+-- refuses an UPDATE or DELETE.
+CREATE TABLE IF NOT EXISTS context_slots (
+    context_id      BLOB    NOT NULL REFERENCES context_characters(context_id),
     role            TEXT    NOT NULL,
     backend_id      BLOB    NOT NULL REFERENCES backends(backend_id),
     model           TEXT    NOT NULL CHECK (model != ''),
@@ -941,17 +910,16 @@ CREATE TABLE IF NOT EXISTS instance_slots (
     effort          TEXT,
     thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
     thinking_style  TEXT,
-    PRIMARY KEY (instance_id, seq, role),
-    FOREIGN KEY (instance_id, seq) REFERENCES instance_bindings(instance_id, seq)
+    PRIMARY KEY (context_id, role)
 );
 
--- What `instances-v1` did not carry over or could not resolve, by kind:
--- dropped, unresolved, unmapped, no_gate_slot, no_distill_slot.
-CREATE TABLE IF NOT EXISTS instance_migration_report (
+-- What `context-characters-v1` did not carry over or could not resolve, by
+-- kind: dropped, unmapped, no_slot, no_gate_slot, no_distill_slot,
+-- no_character_slot.
+CREATE TABLE IF NOT EXISTS context_character_migration_report (
     report_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT    NOT NULL,
     context_id  BLOB    REFERENCES contexts(context_id) ON DELETE CASCADE,
-    instance_id BLOB    REFERENCES character_instances(instance_id),
     note        TEXT    NOT NULL,
     recorded_at INTEGER NOT NULL
 );
@@ -1103,7 +1071,7 @@ CREATE TABLE IF NOT EXISTS context_usage (
 -- is written when the turn starts and finished when it ends; `ended_at` NULL
 -- means the turn is running or the kernel stopped before it could say. It
 -- names who performed the turn, under which role, and which provider and
--- model answered; `instance_id` and `binding_seq` name the binding it ran on.
+-- model answered.
 -- The token columns
 -- are the provider's RAW counts summed over every call in the turn, so they
 -- are spend: Claude's `input_tokens` excludes the cache columns, DeepSeek's
@@ -1118,8 +1086,6 @@ CREATE TABLE IF NOT EXISTS turns (
     role               TEXT    NOT NULL,
     provider           TEXT    NOT NULL,
     model              TEXT    NOT NULL,
-    instance_id        BLOB    REFERENCES character_instances(instance_id),
-    binding_seq        INTEGER,
     started_at         INTEGER NOT NULL,
     ended_at           INTEGER,
     stop_reason        TEXT,
@@ -1521,9 +1487,13 @@ CREATE TABLE IF NOT EXISTS characters (
     -- between contexts, not a column here — see docs/character.md, "Roots
     -- and rotation".
     root             INTEGER NOT NULL DEFAULT 0,
-    -- The cast whose slots a new binding of this character's instance copies
-    -- (docs/senpai-kohai.md, "The model"). Read only when a binding is
-    -- written. Removing the cast clears it.
+    -- A root character's console: the one context of it with no senpai
+    -- (docs/senpai-kohai.md, "The model"). A rotation of the console moves the
+    -- pointer in the commit, as it moves `handoff_ctx`.
+    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
+    -- The cast whose slots a new context character of this character copies
+    -- (docs/senpai-kohai.md, "The model"). Read only when a context character
+    -- is written. Removing the cast clears it.
     cast_id          BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
 );
 
@@ -2402,11 +2372,11 @@ impl KernelDb {
         Ok(true)
     }
 
-    /// The character that answers for `context`: the character of its
-    /// instance (`docs/senpai-kohai.md`, "The model"). `None` when the context
-    /// belongs to no instance.
+    /// The character that answers for `context`: the principal of its
+    /// context character (`docs/senpai-kohai.md`, "The model"). `None` when
+    /// the context has none.
     pub fn context_holder(&self, context: ContextId) -> KernelDbResult<Option<PrincipalId>> {
-        Ok(self.context_instance_row(context)?.map(|instance| instance.principal_id))
+        Ok(self.context_character(context)?.map(|cc| cc.principal_id))
     }
 
     /// `label (short-id)`, for messages that name a context.
@@ -2417,51 +2387,19 @@ impl KernelDb {
         }
     }
 
-    /// Move `context`'s instance under the instance of `senpai`, or make it a
-    /// top with `None`. Refuses an instance that is its own senpai, a cycle, a
-    /// missing row, and a context with no instance. Who may move it, and the
-    /// pending-ask rule, belong to the caller.
-    pub fn set_context_senpai(&self, context: ContextId, senpai: Option<ContextId>) -> KernelDbResult<()> {
-        let instance = self.require_context_instance(context)?;
-        let senpai_instance = match senpai {
-            Some(senpai) => Some(self.require_context_instance(senpai)?.instance_id),
-            None => None,
-        };
-        self.set_senpai_instance(instance.instance_id, senpai_instance)?;
-        // The migration's note stands until the senpai is set again.
-        self.conn.execute(
-            "DELETE FROM senpai_migration_report WHERE context_id = ?1",
-            params![blob_param(context.as_bytes())],
-        )?;
-        Ok(())
+    /// The senpai context of `context`, or `None` for a top or a context with
+    /// no context character.
+    pub fn senpai_of(&self, context: ContextId) -> KernelDbResult<Option<ContextId>> {
+        Ok(self.context_character(context)?.and_then(|cc| cc.senpai_ctx))
     }
 
-    /// Test fixture: the conversation of the senpai instance of `context`'s
-    /// instance, or `None` for a top or a context with no instance.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn senpai_conversation_of(&self, context: ContextId) -> KernelDbResult<Option<ContextId>> {
-        let Some(instance) = self.context_instance_row(context)? else { return Ok(None) };
-        match instance.senpai_instance {
-            Some(senpai) => self.instance_conversation(senpai),
-            None => Ok(None),
-        }
-    }
-
-    /// The conversations of the live kohai of `context`'s instance: the active
-    /// instances whose senpai it is, oldest first. A context with no instance
-    /// has no kohai.
+    /// The live kohai of `context`: the contexts whose senpai it is, oldest
+    /// first. A context with no kohai (or no context character) lists none.
     pub fn list_kohai(&self, context: ContextId) -> KernelDbResult<Vec<ContextRow>> {
-        let Some(instance) = self.context_instance_row(context)? else { return Ok(Vec::new()) };
         let mut kohai = Vec::new();
-        for row in self.senpai_edge_kohai(instance.instance_id)? {
-            if !self.instance_is_active(row.instance_id)? {
-                continue;
-            }
-            let conversation = self.instance_conversation(row.instance_id)?.ok_or_else(|| {
-                KernelDbError::NotFound(format!("character instance {} has no binding", row.instance_id.short()))
-            })?;
-            kohai.push(self.get_context(conversation)?.ok_or_else(|| {
-                KernelDbError::NotFound(format!("conversation {} of character instance {}", conversation.short(), row.instance_id.short()))
+        for id in self.kohai_of(context)? {
+            kohai.push(self.get_context(id)?.ok_or_else(|| {
+                KernelDbError::NotFound(format!("kohai {} of context {}", id.short(), context.short()))
             })?);
         }
         Ok(kohai)
@@ -2470,69 +2408,69 @@ impl KernelDb {
     /// Route a review: the one resolver behind every reviewer decision
     /// (`docs/senpai-kohai.md`, "Routing").
     ///
-    /// Let I be the instance of the ask's context. The reviewer is the
-    /// character of `senpai_instance(I)` when it is live and is neither the
-    /// actor nor the reviewer `past`; a character that is, is climbed past
-    /// to its own senpai. A retired character refuses by name: the climb
-    /// never substitutes another. At an instance with no senpai (a root
-    /// console) the live root character that holds it confirms its own
-    /// statement when `confirm_at_top`; otherwise the climb refuses, naming
-    /// the actor and the context. A context with no instance refuses.
+    /// Let K be the ask's context. The reviewer is the character of K's
+    /// senpai context when it is live and is neither the actor nor the
+    /// reviewer `past`; a character that is, is climbed past to its own
+    /// senpai. A retired character refuses by name: the climb never
+    /// substitutes another. At a context with no senpai (a root console)
+    /// the live root character that holds it confirms its own statement
+    /// when `confirm_at_top`; otherwise the climb refuses, naming the actor
+    /// and the context. A context with no context character refuses.
     ///
-    /// A missing context, a missing senpai row and a senpai cycle are
-    /// corruption and are errors, never an exhausted climb.
+    /// A missing context, a senpai with no context character and a senpai
+    /// cycle are corruption and are errors, never an exhausted climb.
     pub fn route_review(&self, query: ReviewQuery) -> KernelDbResult<EffectiveReviewer> {
         let ReviewQuery { from, actor, past, confirm_at_top } = query;
         let mut passed = past.is_none();
-        let (origin, mut below, mut senpai): (Option<ContextId>, Option<CharacterInstanceRow>, Option<CharacterInstanceId>) = match from {
+        let (origin, mut below, mut senpai): (Option<ContextId>, Option<ContextCharacterRow>, Option<ContextId>) = match from {
             ReviewFrom::Context(context) => {
                 if self.get_context(context)?.is_none() {
                     return Err(KernelDbError::NotFound(format!(
                         "context {} has no row to resolve a reviewer from", context.short()
                     )));
                 }
-                let instance = self.require_context_instance(context)?;
-                let senpai = instance.senpai_instance;
-                (Some(context), Some(instance), senpai)
+                let character = self.require_context_character(context)?;
+                let senpai = character.senpai_ctx;
+                (Some(context), Some(character), senpai)
             }
-            ReviewFrom::Senpai(instance) => (None, None, Some(instance)),
+            ReviewFrom::Senpai(context) => (None, None, Some(context)),
         };
         let mut visited = HashSet::new();
         if let Some(row) = &below {
-            visited.insert(row.instance_id);
+            visited.insert(row.context_id);
         }
         loop {
             let Some(senpai_id) = senpai else {
-                let at = below.as_ref().expect("a climb with no senpai started at an instance");
+                let at = below.as_ref().expect("a climb with no senpai started at a context");
                 if !passed {
                     let who = past.map_or_else(String::new, |p| self.name_for(p));
                     return Err(KernelDbError::NoReviewerAbove(format!(
-                        "{who} holds no senpai instance on the chain above {}; it was assigned by hand, so name the next reviewer explicitly",
-                        self.instance_name(at.instance_id)
+                        "{who} holds no senpai context on the chain above {}; it was assigned by hand, so name the next reviewer explicitly",
+                        self.context_name(at.context_id)
                     )));
                 }
                 return self.at_top(at, origin, actor, confirm_at_top);
             };
             if !visited.insert(senpai_id) {
                 return Err(KernelDbError::Validation(format!(
-                    "instance {} is its own senpai ancestor; the senpai chain has a cycle",
-                    self.instance_name(senpai_id)
+                    "context {} is its own senpai ancestor; the senpai chain has a cycle",
+                    self.context_name(senpai_id)
                 )));
             }
-            let above = self.get_instance(senpai_id)?.ok_or_else(|| KernelDbError::NotFound(format!(
-                "senpai instance {} is missing, so the climb cannot continue", senpai_id.short()
+            let above = self.context_character(senpai_id)?.ok_or_else(|| KernelDbError::NotFound(format!(
+                "senpai {} has no context character, so the climb cannot continue", self.context_name(senpai_id)
             )))?;
-            let under = below.as_ref().map_or_else(|| "the new context".to_string(), |b| self.instance_name(b.instance_id));
+            let under = below.as_ref().map_or_else(|| "the new context".to_string(), |b| self.context_name(b.context_id));
             let holder = above.principal_id;
             if !passed {
-                // Still climbing to the instance the current reviewer holds.
+                // Still climbing to the context the current reviewer holds.
                 passed = Some(holder) == past;
-                senpai = above.senpai_instance;
+                senpai = above.senpai_ctx;
                 below = Some(above);
                 continue;
             }
             if holder == actor || Some(holder) == past {
-                senpai = above.senpai_instance;
+                senpai = above.senpai_ctx;
                 below = Some(above);
                 continue;
             }
@@ -2541,24 +2479,24 @@ impl KernelDb {
                 Some(sheet) => Err(KernelDbError::Validation(format!(
                     "{} is {}, the senpai of {under}, and is retired; routing does not pass over a retired character: \
                      move {under} to another senpai with `kj senpai set`",
-                    sheet.name, self.instance_name(above.instance_id)
+                    sheet.name, self.context_name(above.context_id)
                 ))),
                 None => Err(KernelDbError::Validation(format!(
                     "the character of {}, the senpai of {under}, has no character sheet",
-                    self.instance_name(above.instance_id)
+                    self.context_name(above.context_id)
                 ))),
             };
         }
     }
 
-    /// The climb reached `at`, an instance with no senpai. `origin` is the
+    /// The climb reached `at`, a context with no senpai. `origin` is the
     /// context the ask was raised in, when there is one.
-    fn at_top(&self, at: &CharacterInstanceRow, origin: Option<ContextId>, actor: PrincipalId, confirm_at_top: bool) -> KernelDbResult<EffectiveReviewer> {
-        let name = origin.map_or_else(|| self.instance_name(at.instance_id), |context| self.context_name(context));
+    fn at_top(&self, at: &ContextCharacterRow, origin: Option<ContextId>, actor: PrincipalId, confirm_at_top: bool) -> KernelDbResult<EffectiveReviewer> {
+        let name = origin.map_or_else(|| self.context_name(at.context_id), |context| self.context_name(context));
         if !confirm_at_top {
             return Err(KernelDbError::NoReviewerAbove(format!(
-                "instance {} has no senpai, so nobody is above it",
-                self.instance_name(at.instance_id)
+                "context {} has no senpai, so nobody is above it",
+                self.context_name(at.context_id)
             )));
         }
         match self.get_character(actor)? {
@@ -2568,21 +2506,21 @@ impl KernelDb {
             sheet => {
                 let who = sheet.map_or_else(|| actor.short(), |sheet| sheet.name);
                 Err(KernelDbError::Validation(format!(
-                    "nobody reviews {who} in context {name}: its instance {} has no senpai above it, and only the live \
-                     root character holding a root console confirms its own statements; give the instance a senpai \
+                    "nobody reviews {who} in context {name}: {} has no senpai above it, and only the live \
+                     root character holding a root console confirms its own statements; give the context a senpai \
                      with `kj senpai set`",
-                    self.instance_name(at.instance_id)
+                    self.context_name(at.context_id)
                 )))
             }
         }
     }
 
-    /// The root character at the top of `instance_id`'s senpai chain: the
-    /// character of the instance the chain ends at. The inner `Err` says why
+    /// The root character at the top of `context_id`'s senpai chain: the
+    /// character of the context the chain ends at. The inner `Err` says why
     /// the lineage has no live root; the outer `Err` is a fault.
-    fn lineage_root_of_instance(&self, instance_id: CharacterInstanceId) -> KernelDbResult<Result<PrincipalId, String>> {
-        let top = self.lineage_top_instance(instance_id)?;
-        let top_name = self.instance_name(top.instance_id);
+    fn lineage_root_of_context(&self, context_id: ContextId) -> KernelDbResult<Result<PrincipalId, String>> {
+        let top = self.lineage_top(context_id)?;
+        let top_name = self.context_name(top.context_id);
         Ok(match self.get_character(top.principal_id)? {
             Some(sheet) if !sheet.root => Err(format!(
                 "{} holds {top_name} at the top of this senpai chain and is not a root character",
@@ -2597,21 +2535,25 @@ impl KernelDb {
         })
     }
 
-    /// The lineage root of `context_id`'s instance, or the reason it has none.
+    /// The lineage root of `context_id`, or the reason it has none.
     fn lineage_root_or_reason(&self, context_id: ContextId) -> KernelDbResult<Result<PrincipalId, String>> {
-        match self.context_instance_row(context_id)? {
-            Some(instance) => self.lineage_root_of_instance(instance.instance_id),
+        if self.get_context(context_id)?.is_none() {
+            return Err(KernelDbError::NotFound(format!("context {}", context_id.short())));
+        }
+        match self.context_character(context_id)? {
+            Some(_) => self.lineage_root_of_context(context_id),
             None => Ok(Err(format!(
-                "context {} belongs to no character instance",
+                "context {} has no context character",
                 self.context_name(context_id)
             ))),
         }
     }
 
     /// The root character at the top of `context_id`'s senpai chain. It
-    /// holds routing authority over every instance in that lineage
+    /// holds routing authority over every context in that lineage
     /// (`docs/approval-identity.md`). A top held by a non-root or a retired
-    /// root, a context with no instance, and a broken chain all refuse.
+    /// root, a context with no context character, and a broken chain all
+    /// refuse.
     pub fn lineage_root(&self, context_id: ContextId) -> KernelDbResult<PrincipalId> {
         match self.lineage_root_or_reason(context_id)? {
             Ok(root) => Ok(root),
@@ -2620,7 +2562,7 @@ impl KernelDb {
     }
 
     /// The lineage root, or `None` when the lineage legitimately has no live
-    /// root: the context belongs to no instance, the top is not a root, is
+    /// root: the context has no context character, the top is not a root, is
     /// retired, or has no sheet, and when `context_id` itself has no row
     /// (`approvals.context_id` has no foreign key, so an ask may outlive its
     /// context). A fault (a missing ancestor, a senpai cycle, a database
@@ -2633,11 +2575,11 @@ impl KernelDb {
     }
 
     /// The one authority rule (`docs/senpai-kohai.md`, "Authority"): the
-    /// character of `target`'s instance's senpai, or the lineage root, may
-    /// perform `act` on it. The inner `Err` is the refusal, naming the rule,
-    /// the senpai's character and the root; the outer `Err` is a fault (a
-    /// missing row, a senpai cycle). The instance's own character is refused
-    /// here for every act; `kj context rotate` admits it before this check.
+    /// character of `target`'s senpai, or the lineage root, may perform `act`
+    /// on it. The inner `Err` is the refusal, naming the rule, the senpai's
+    /// character and the root; the outer `Err` is a fault (a missing row, a
+    /// senpai cycle). The context's own character is refused here for every
+    /// act; `kj context rotate` admits it before this check.
     pub fn context_authority(
         &self,
         target: ContextId,
@@ -2647,22 +2589,22 @@ impl KernelDb {
         let row = self.get_context(target)?.ok_or_else(|| KernelDbError::NotFound(format!(
             "context {} has no row to check authority over", target.short()
         )))?;
-        let Some(instance) = self.context_instance_row(target)? else {
+        let Some(character) = self.context_character(target)? else {
             return Ok(Err(format!(
-                "{} belongs to no character instance, so it has no senpai or lineage root to {}",
+                "{} has no context character, so it has no senpai or lineage root to {}",
                 Self::context_display(&row), act.as_str()
             )));
         };
-        let holder = match instance.senpai_instance {
-            Some(senpai) => Some(self.get_instance(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
-                "senpai instance {} is missing", senpai.short()
+        let holder = match character.senpai_ctx {
+            Some(senpai) => Some(self.context_character(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
+                "senpai {} has no context character", self.context_name(senpai)
             )))?.principal_id),
             None => None,
         };
         if holder == Some(actor) {
             return Ok(Ok(Authority::SenpaiHolder));
         }
-        let root = self.lineage_root_of_instance(instance.instance_id)?;
+        let root = self.lineage_root_of_context(target)?;
         if root.as_ref() == Ok(&actor) {
             return Ok(Ok(Authority::LineageRoot));
         }
@@ -2673,22 +2615,22 @@ impl KernelDb {
         };
         Ok(Err(format!(
             "only {}'s senpai ({holder_name}) or its lineage root ({root_name}) may {}",
-            self.instance_name(instance.instance_id), act.as_str()
+            self.context_name(target), act.as_str()
         )))
     }
 
-    /// Whether `actor` may place an instance under `senpai`: it is the
+    /// Whether `actor` may place a context under `senpai`: it is the
     /// character of `senpai`, or `senpai`'s lineage root
     /// (`docs/senpai-kohai.md`, "Creating, forking, rotating"). The inner
     /// `Err` is the refusal.
-    pub fn may_place_under(&self, senpai: CharacterInstanceId, actor: PrincipalId) -> KernelDbResult<Result<Authority, String>> {
-        let row = self.get_instance(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
-            "senpai instance {} has no row", senpai.short()
+    pub fn may_place_under(&self, senpai: ContextId, actor: PrincipalId) -> KernelDbResult<Result<Authority, String>> {
+        let row = self.context_character(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
+            "senpai {} has no context character", self.context_name(senpai)
         )))?;
         if row.principal_id == actor {
             return Ok(Ok(Authority::SenpaiHolder));
         }
-        let root = self.lineage_root_of_instance(senpai)?;
+        let root = self.lineage_root_of_context(senpai)?;
         if root.as_ref() == Ok(&actor) {
             return Ok(Ok(Authority::LineageRoot));
         }
@@ -2699,7 +2641,7 @@ impl KernelDb {
         };
         Ok(Err(format!(
             "only the holder of {} ({holder_name}) or its lineage root ({root_name}) may place a context under it",
-            self.instance_name(senpai)
+            self.context_name(senpai)
         )))
     }
 
@@ -3000,10 +2942,10 @@ impl KernelDb {
                      embedding_config names an embedding service (docs/synthesis.md)");
             }
         }
-        // A database written before character instances still has the columns
-        // the instance model replaced; `contexts.provider` is in every such
-        // database and in no other. Decided before anything below changes it.
-        let pre_instance = Self::has_column(conn, "contexts", "provider")?;
+        // A database written before context characters still has the columns
+        // they replaced; `contexts.provider` is in every such database and in
+        // no other. Decided before anything below changes it.
+        let pre_context_character = Self::has_column(conn, "contexts", "provider")?;
         let alters = [
             "ALTER TABLE context_continuations ADD COLUMN invalidated_through INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE approval_pair_handoffs ADD COLUMN abandoned_reason TEXT",
@@ -3017,8 +2959,6 @@ impl KernelDb {
             "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
-            "ALTER TABLE contexts ADD COLUMN instance_id BLOB REFERENCES character_instances(instance_id)",
-            "ALTER TABLE contexts ADD COLUMN binding_seq INTEGER",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -3027,6 +2967,7 @@ impl KernelDb {
                  CHECK (max_concurrent IS NULL OR max_concurrent > 0)",
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
             "ALTER TABLE backend_models ADD COLUMN temperature REAL \
                  CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
@@ -3092,25 +3033,25 @@ impl KernelDb {
         conn.execute_batch("DROP TABLE IF EXISTS approval_identity_config")?;
         Self::remove_retired_classifier(conn)?;
         Self::migrate_house_capability(conn)?;
-        if pre_instance {
-            Self::ensure_pre_instance_columns(conn)?;
+        if pre_context_character {
+            Self::ensure_pre_context_character_columns(conn)?;
             Self::migrate_senpai_edges(conn)?;
             Self::drop_old_routing(conn)?;
         }
         Self::drop_structural_edges(conn)?;
-        Self::ensure_instance_guards(conn)?;
-        if pre_instance {
-            Self::migrate_instances(conn)?;
-            Self::drop_pre_instance_columns(conn)?;
+        Self::ensure_context_character_guards(conn)?;
+        if pre_context_character {
+            Self::migrate_context_characters(conn)?;
+            Self::drop_pre_context_character_columns(conn)?;
         }
         Ok(())
     }
 
-    /// Add the pre-instance columns a very old database lacks, so the two
-    /// migrations that read them find them. Only called on a database that
-    /// still has `contexts.provider`.
-    fn ensure_pre_instance_columns(conn: &Connection) -> KernelDbResult<()> {
-        for (table, column, definition) in PRE_INSTANCE_COLUMNS {
+    /// Add the pre-context-character columns a very old database lacks, so
+    /// the two migrations that read them find them. Only called on a database
+    /// that still has `contexts.provider`.
+    fn ensure_pre_context_character_columns(conn: &Connection) -> KernelDbResult<()> {
+        for (table, column, definition) in PRE_CONTEXT_CHARACTER_COLUMNS {
             if !Self::has_column(conn, table, column)? {
                 conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
             }
@@ -3873,12 +3814,12 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Drop what character instances replaced (`docs/senpai-kohai.md`,
+    /// Drop what context characters replaced (`docs/senpai-kohai.md`,
     /// "Removed"), in one transaction: `contexts.{senpai_ctx, played_by,
-    /// cast_id, provider, model}`, `characters.root_ctx`, `presets.{cast_id,
-    /// system_prompt}` and the table `llm_defaults`; and rename
-    /// `characters.default_cast_id` to `characters.cast_id`. Runs only once
-    /// [`Self::migrate_instances`] has recorded its mapping, which read them;
+    /// cast_id, provider, model}`, `presets.{cast_id, system_prompt}` and the
+    /// table `llm_defaults`; and rename `characters.default_cast_id` to
+    /// `characters.cast_id`. Runs only once
+    /// [`Self::migrate_context_characters`] has recorded its mapping, which read them;
     /// a mapping that refused leaves them for the next open.
     ///
     /// No schema this kernel has created puts one of these columns under an
@@ -3889,14 +3830,14 @@ impl KernelDb {
     /// does nothing. The preset values are logged before they go;
     /// `senpai_migration_report` stays, because `kj senpai show` prints its
     /// notes until the senpai is set again.
-    fn drop_pre_instance_columns(conn: &Connection) -> KernelDbResult<()> {
+    fn drop_pre_context_character_columns(conn: &Connection) -> KernelDbResult<()> {
         let mapped: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
-            [Self::INSTANCES_MIGRATION], |row| row.get(0),
+            [Self::CONTEXT_CHARACTERS_MIGRATION], |row| row.get(0),
         )?;
         if !mapped {
             return Err(KernelDbError::Validation(
-                "the pre-instance columns cannot be dropped before the instance migration has mapped them".into(),
+                "the pre-context-character columns cannot be dropped before the context character migration has mapped them".into(),
             ));
         }
         let tx = conn.unchecked_transaction()?;
@@ -3916,7 +3857,6 @@ impl KernelDb {
             ("contexts", "cast_id"),
             ("contexts", "provider"),
             ("contexts", "model"),
-            ("characters", "root_ctx"),
             ("presets", "cast_id"),
             ("presets", "system_prompt"),
         ] {
@@ -3935,7 +3875,7 @@ impl KernelDb {
         }
         tx.commit()?;
         if !dropped.is_empty() {
-            info!(dropped = %dropped.join(", "), "dropped what character instances replaced");
+            info!(dropped = %dropped.join(", "), "dropped what context characters replaced");
         }
         Ok(())
     }
@@ -4838,8 +4778,8 @@ impl KernelDb {
         // the track never has to watch for forks. A non-musician parent has no
         // attachments — the copy is a clean no-op.
         Self::copy_attachments_for_fork(&tx, source, row.context_id)?;
-        // The child joins its source's instance on the same binding.
-        instances::join_source_instance(&tx, source, row.context_id)?;
+        // The child is the same character as its source, answering to it.
+        context_characters::copy_character_into(&tx, source, row.context_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -4860,7 +4800,7 @@ impl KernelDb {
         }
         if row.played_by.is_some() {
             return Err(KernelDbError::Validation(format!(
-                "context {} sets played_by, which is read from its character instance; start the instance instead",
+                "context {} sets played_by, which is read from its context character; write the context character instead",
                 row.context_id.short()
             )));
         }
@@ -4957,11 +4897,11 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Test fixture: record that `context` should answer to `senpai` once both
-    /// have instances. [`Self::update_played_by`] places an instance under the
-    /// senpai's instance when it starts, and attaches any instance already
-    /// waiting on this context, so a fixture may build a chain in either
-    /// order. The note lives in a temporary table of this connection.
+    /// Test fixture: record that `context` should answer to `senpai`.
+    /// [`Self::update_played_by`] gives the context character this senpai when
+    /// it writes it, and a context that already has one is moved at once, so a
+    /// fixture may build a chain in either order. The note lives in a
+    /// temporary table of this connection.
     #[cfg(any(test, feature = "test-util"))]
     pub fn note_senpai_intent(&self, context: ContextId, senpai: Option<ContextId>) -> KernelDbResult<()> {
         self.conn.execute_batch(
@@ -4971,6 +4911,12 @@ impl KernelDb {
             "INSERT OR REPLACE INTO test_senpai_intent (context_id, senpai_ctx) VALUES (?1, ?2)",
             params![blob_param(context.as_bytes()), senpai.as_ref().map(|id| id.as_bytes().to_vec())],
         )?;
+        if self.context_character(context)?.is_some() {
+            self.conn.execute(
+                "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+                params![senpai.as_ref().map(|id| id.as_bytes().to_vec()), blob_param(context.as_bytes())],
+            )?;
+        }
         Ok(())
     }
 
@@ -4997,11 +4943,11 @@ impl KernelDb {
             .flatten())
     }
 
-    /// Test fixture: give `context` a character instance of `played_by`, the
-    /// way creation does. The instance is placed under the instance of the
-    /// context [`Self::note_senpai_intent`] named, when that has one. A
-    /// context that already has this character's instance is left alone;
-    /// `None` and a different character refuse.
+    /// Test fixture: give `context` a context character of `played_by`, the
+    /// way creation does, under the senpai [`Self::note_senpai_intent`] named.
+    /// A context that already has this character's context character is left
+    /// alone; a different character rewrites it (see
+    /// [`Self::recast_test_character`]) and `None` refuses.
     #[cfg(any(test, feature = "test-util"))]
     pub fn update_played_by(
         &self,
@@ -5010,30 +4956,34 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         let Some(played_by) = played_by else {
             return Err(KernelDbError::Validation(
-                "a character instance never changes its character, so a fixture cannot clear a performer".into(),
+                "a context character never changes its character, so a fixture cannot clear a performer".into(),
             ));
         };
-        self.assign_instance(id, played_by)?;
+        self.assign_context_character(id, played_by)?;
         Ok(())
     }
 
-    /// Test fixture: rewrite the character of `id`'s instance to `played_by`.
-    /// No kernel path does this: an instance's character never changes. For
-    /// wire tests that make a context through `kj kohai create` and then need
-    /// another character to perform it.
+    /// Test fixture: rewrite the character of `id`'s context character to
+    /// `played_by`. No kernel path does this: a context's character never
+    /// changes. For wire tests that make a context through `kj kohai create`
+    /// and then need another character to perform it. The trigger that fixes
+    /// the principal is dropped for the update and put back.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn recast_test_instance(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<()> {
-        let instance = self.context_instance_row(id)?
-            .ok_or_else(|| KernelDbError::Validation(format!("context {} belongs to no instance to recast", id.short())))?;
-        self.conn.execute(
-            "UPDATE character_instances SET principal_id = ?1 WHERE instance_id = ?2",
-            params![blob_param(played_by.as_bytes()), blob_param(instance.instance_id.as_bytes())],
-        )?;
+    pub fn recast_test_character(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<()> {
+        self.context_character(id)?
+            .ok_or_else(|| KernelDbError::Validation(format!("context {} has no context character to recast", id.short())))?;
+        self.conn.execute_batch("DROP TRIGGER IF EXISTS context_characters_fixed")?;
+        let updated = self.conn.execute(
+            "UPDATE context_characters SET principal_id = ?1 WHERE context_id = ?2",
+            params![blob_param(played_by.as_bytes()), blob_param(id.as_bytes())],
+        );
+        Self::ensure_context_character_guards(&self.conn)?;
+        updated?;
         Ok(())
     }
 
-    /// [`Self::assign_test_review`] after recasting an instance of another
-    /// character to `played_by` (see [`Self::recast_test_instance`]).
+    /// [`Self::assign_test_review`] after recasting a context character of
+    /// another character to `played_by` (see [`Self::recast_test_character`]).
     #[cfg(any(test, feature = "test-util"))]
     pub fn assign_test_review_recasting(
         &self,
@@ -5041,10 +4991,10 @@ impl KernelDb {
         played_by: Option<PrincipalId>,
         reviewer: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
-        if let (Some(played_by), Some(instance)) = (played_by, self.context_instance_row(context)?)
-            && instance.principal_id != played_by
+        if let (Some(played_by), Some(character)) = (played_by, self.context_character(context)?)
+            && character.principal_id != played_by
         {
-            self.recast_test_instance(context, played_by)?;
+            self.recast_test_character(context, played_by)?;
         }
         self.assign_test_review(context, played_by, reviewer)
     }
@@ -5066,9 +5016,9 @@ impl KernelDb {
     /// Test fixture: make `character` run, for each `(role, backend, model)`,
     /// that model on that backend, through a cast named for its entries that
     /// `characters.cast_id` points at. A backend row is created
-    /// (kind `mock`, no key) when absent, and each slot sets `max_tokens`. An
-    /// instance started after this binds the slots; one started before keeps
-    /// the binding it has.
+    /// (kind `mock`, no key) when absent, and each slot sets `max_tokens`. A
+    /// context character written after this copies the slots; one written
+    /// before keeps the slots it has.
     #[cfg(any(test, feature = "test-util"))]
     pub fn seed_test_cast_roles(
         &self,
@@ -5134,83 +5084,85 @@ impl KernelDb {
         Ok(cast.cast_id)
     }
 
-    /// Test fixture: give `id` a stand-in instance of `played_by`, which a
-    /// later [`Self::update_played_by`] or [`Self::assign_test_review`] naming
-    /// another character replaces. For helpers that register a context before
-    /// a test says who runs it.
+    /// Test fixture: give `id` a stand-in context character of `played_by`,
+    /// which a later [`Self::update_played_by`] or [`Self::assign_test_review`]
+    /// naming another character replaces. For helpers that register a context
+    /// before a test says who runs it.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn assign_stand_in_instance(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<()> {
-        self.assign_instance_as(id, played_by, PrincipalId::system())?;
+    pub fn assign_stand_in_character(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<()> {
+        let existed = self.context_character(id)?.is_some();
+        self.assign_context_character(id, played_by)?;
+        if !existed {
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS test_stand_in_character (context_id BLOB NOT NULL PRIMARY KEY)",
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO test_stand_in_character (context_id) VALUES (?1)",
+                params![blob_param(id.as_bytes())],
+            )?;
+        }
         Ok(())
     }
 
+    /// Whether `id`'s context character is a stand-in a fixture may replace.
     #[cfg(any(test, feature = "test-util"))]
-    fn assign_instance(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<CharacterInstanceId> {
-        self.assign_instance_as(id, played_by, played_by)
+    fn is_stand_in_character(&self, id: ContextId) -> KernelDbResult<bool> {
+        let table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = 'test_stand_in_character')",
+            [], |r| r.get(0),
+        )?;
+        if !table {
+            return Ok(false);
+        }
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM test_stand_in_character WHERE context_id = ?1)",
+            params![blob_param(id.as_bytes())],
+            |r| r.get(0),
+        )?)
     }
 
-    /// A stand-in instance is started with `created_by` the system principal;
-    /// a fixture may rewrite its character, which no kernel path does.
+    /// Write `id`'s context character as creation does. A root character's
+    /// first context with no senpai becomes its console. An existing context
+    /// character of another character is rewritten.
     #[cfg(any(test, feature = "test-util"))]
-    fn assign_instance_as(&self, id: ContextId, played_by: PrincipalId, created_by: PrincipalId) -> KernelDbResult<CharacterInstanceId> {
+    fn assign_context_character(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<ContextCharacterRow> {
         self.get_context(id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
-        if let Some(existing) = self.context_instance_row(id)? {
+        if let Some(existing) = self.context_character(id)? {
             if existing.principal_id == played_by {
-                return Ok(existing.instance_id);
+                return Ok(existing);
             }
-            if existing.created_by == PrincipalId::system() && created_by != PrincipalId::system() {
-                self.conn.execute(
-                    "UPDATE character_instances SET principal_id = ?1, created_by = ?1 WHERE instance_id = ?2",
-                    params![blob_param(played_by.as_bytes()), blob_param(existing.instance_id.as_bytes())],
-                )?;
-                return Ok(existing.instance_id);
+            if !self.is_stand_in_character(id)? {
+                return Err(KernelDbError::Validation(format!(
+                    "context {} already has a context character of another character, which never changes",
+                    id.short()
+                )));
             }
-            return Err(KernelDbError::Validation(format!(
-                "context {} already belongs to an instance of another character, which never changes",
-                id.short()
-            )));
-        }
-        let senpai = match self.senpai_intent(id)? {
-            Some(senpai_ctx) => self.context_instance_row(senpai_ctx)?.map(|i| i.instance_id),
-            None => None,
-        };
-        let instance = self.start_character_instance(played_by, senpai, id, created_by)?;
-        // Instances whose conversation named this context as its senpai
-        // before it had one.
-        let waiting: Vec<CharacterInstanceId> = if self.has_senpai_intent_table()? {
-            let mut stmt = self.conn.prepare(
-                "SELECT i.instance_id FROM character_instances i
-                 JOIN contexts c ON c.instance_id = i.instance_id
-                 JOIN temp.test_senpai_intent n ON n.context_id = c.context_id
-                 WHERE i.senpai_instance IS NULL AND n.senpai_ctx = ?1 AND c.context_id != ?1
-                   AND i.instance_id != ?2",
+            self.recast_test_character(id, played_by)?;
+            self.conn.execute(
+                "DELETE FROM test_stand_in_character WHERE context_id = ?1",
+                params![blob_param(id.as_bytes())],
             )?;
-            let rows = stmt.query_map(
-                params![blob_param(id.as_bytes()), blob_param(instance.instance_id.as_bytes())],
-                |r| {
-                    let bytes: Vec<u8> = r.get(0)?;
-                    CharacterInstanceId::try_from_slice(&bytes).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, "invalid CharacterInstanceId bytes".into())
-                    })
-                },
-            )?;
-            rows.collect::<SqliteResult<_>>()?
-        } else {
-            Vec::new()
-        };
-        for waiting in waiting {
-            self.set_senpai_instance(waiting, Some(instance.instance_id))?;
+            return Ok(self.require_context_character(id)?);
         }
-        Ok(instance.instance_id)
+        let senpai = self.senpai_intent(id)?;
+        let row = self.write_context_character(id, played_by, senpai, None)?;
+        if senpai.is_none()
+            && let Some(sheet) = self.get_character(played_by)?
+            && sheet.root
+            && sheet.root_ctx.is_none()
+        {
+            self.set_character_root_ctx(played_by, Some(id))?;
+        }
+        Ok(row)
     }
 
     /// Test fixture: make `context` performed by `played_by` and reviewed by
     /// `reviewer`: the reviewer holds a seat context (created on first use)
-    /// with its own instance, and the context's instance is placed under the
-    /// seat's, so routing follows the senpai edge like production. With no
+    /// with its own context character, and the context is placed under the
+    /// seat, so routing follows the senpai edge like production. With no
     /// reviewer only the performer is set; with no performer a stand-in
-    /// character runs a context that has no instance yet.
+    /// character runs a context that has no context character yet.
     #[cfg(any(test, feature = "test-util"))]
     pub fn assign_test_review(
         &self,
@@ -5218,11 +5170,11 @@ impl KernelDb {
         played_by: Option<PrincipalId>,
         reviewer: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
-        // A context routes through its instance, so one with no named
-        // performer is run by a stand-in character.
-        match (played_by, self.context_instance_row(context)?) {
-            (Some(played_by), _) => { self.assign_instance(context, played_by)?; }
-            (None, None) => { self.assign_instance(context, PrincipalId::new())?; }
+        // A context routes through its context character, so one with no
+        // named performer is run by a stand-in character.
+        match (played_by, self.context_character(context)?) {
+            (Some(played_by), _) => { self.assign_context_character(context, played_by)?; }
+            (None, None) => { self.assign_context_character(context, PrincipalId::new())?; }
             (None, Some(_)) => {}
         }
         let Some(reviewer) = reviewer else { return Ok(()) };
@@ -5242,9 +5194,9 @@ impl KernelDb {
                 };
                 // The reviewer's own senpai is where the context answered
                 // before, so the climb continues where the old walk did.
-                let previous = self.senpai_conversation_of(context)?;
+                let previous = self.senpai_of(context)?;
                 self.insert_context_with_document(&row, ws)?;
-                self.assign_instance(seat, reviewer)?;
+                self.assign_context_character(seat, reviewer)?;
                 if let Some(previous) = previous {
                     self.set_context_senpai(seat, Some(previous))?;
                 }
@@ -5372,8 +5324,8 @@ impl KernelDb {
     /// `successor` its label and ring placement, and point a character's
     /// `handoff_ctx` at the successor when it named the predecessor. Returns
     /// how many handoff pointers moved. A predecessor that is missing or
-    /// already archived refuses. The instance's kohai and senpai point at
-    /// the instance, so they do not move.
+    /// already archived refuses. Moves a character's `root_ctx` the same way.
+    /// The kernel moves no kohai.
     pub fn commit_rotation(&self, predecessor: ContextId, successor: ContextId) -> KernelDbResult<usize> {
         self.in_transaction(|db| {
             let row = db.get_context(predecessor)?.ok_or_else(|| {
@@ -5391,6 +5343,10 @@ impl KernelDb {
             )?;
             let moved = db.conn.execute(
                 "UPDATE characters SET handoff_ctx = ?1 WHERE handoff_ctx = ?2",
+                params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
+            )?;
+            db.conn.execute(
+                "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
             Ok(moved)
@@ -6314,8 +6270,8 @@ impl KernelDb {
         self.conn.execute(
             "INSERT INTO turns (
                 turn_id, context_id, performer, role,
-                provider, model, started_at, instance_id, binding_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                provider, model, started_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 blob_param(turn.turn_id.as_bytes()),
                 blob_param(turn.context_id.as_bytes()),
@@ -6324,8 +6280,6 @@ impl KernelDb {
                 turn.provider,
                 turn.model,
                 turn.started_at,
-                turn.instance.as_ref().map(|i| i.as_bytes().to_vec()),
-                turn.binding_seq,
             ],
         )?;
         Ok(())
@@ -6374,7 +6328,7 @@ impl KernelDb {
 
     const TURN_COLUMNS: &'static str = "turn_id, context_id, performer, role, provider, model,
         started_at, ended_at, stop_reason, llm_calls, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, reasoning_tokens, instance_id, binding_seq";
+        cache_read_tokens, cache_write_tokens, reasoning_tokens";
 
     fn read_turn_row(row: &rusqlite::Row<'_>) -> SqliteResult<TurnRow> {
         let turn_bytes: Vec<u8> = row.get(0)?;
@@ -6390,8 +6344,6 @@ impl KernelDb {
                 role: row.get(3)?,
                 provider: row.get(4)?,
                 model: row.get(5)?,
-                instance: read_opt_instance_id(row, 15)?,
-                binding_seq: row.get(16)?,
                 started_at: row.get(6)?,
             },
             ended_at: row.get(7)?,
@@ -8488,7 +8440,7 @@ impl KernelDb {
 
     /// Delete a backend by name.
     ///
-    /// Refuses loudly while a cast slot, a character instance's binding or a
+    /// Refuses loudly while a cast slot, a context's slot or a
     /// model alias still points at it. The FK would reject the DELETE anyway,
     /// but a named list of the referents is the difference between "fix this"
     /// and "SQLITE_CONSTRAINT".
@@ -8508,10 +8460,11 @@ impl KernelDb {
         };
         let bindings: Vec<String> = {
             let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT lower(hex(instance_id)) || '#' || seq FROM instance_slots
-                 WHERE backend_id = ?1 ORDER BY 1",
+                "SELECT DISTINCT cc.context_id FROM context_slots cs
+                 JOIN context_characters cc ON cc.context_id = cs.context_id
+                 WHERE cs.backend_id = ?1 ORDER BY 1",
             )?;
-            stmt.query_map(params![id], |r| r.get::<_, String>(0))?
+            stmt.query_map(params![id], |r| Ok(read_context_id(r, 0)?.short()))?
                 .collect::<SqliteResult<Vec<_>>>()?
         };
         let aliases: Vec<String> = {
@@ -8527,7 +8480,7 @@ impl KernelDb {
                 parts.push(format!("cast slots [{}]", slots.join(", ")));
             }
             if !bindings.is_empty() {
-                parts.push(format!("character instance bindings [{}]", bindings.join(", ")));
+                parts.push(format!("context slots of [{}]", bindings.join(", ")));
             }
             if !aliases.is_empty() {
                 parts.push(format!("aliases [{}]", aliases.join(", ")));
@@ -8825,8 +8778,8 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
@@ -8834,6 +8787,7 @@ impl KernelDb {
                     row.retired_at,
                     row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                     row.root,
+                    row.root_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -8845,8 +8799,8 @@ impl KernelDb {
     /// Fetch a character by its kernel-owned name.
     pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, ", root_ctx_sql!(), " AS root_ctx
-             FROM characters WHERE name = ?1"),
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx
+             FROM characters WHERE name = ?1",
         )?;
         Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
     }
@@ -8856,8 +8810,8 @@ impl KernelDb {
     /// `played_by` (e.g. resolving the name to display in `kj context info`).
     pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, ", root_ctx_sql!(), " AS root_ctx
-             FROM characters WHERE principal_id = ?1"),
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx
+             FROM characters WHERE principal_id = ?1",
         )?;
         Ok(stmt
             .query_row(params![blob_param(principal_id.as_bytes())], row_to_character_row)
@@ -8869,11 +8823,11 @@ impl KernelDb {
     /// ones by default.
     pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
         let sql = if include_retired {
-            concat!("SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, ", root_ctx_sql!(), " AS root_ctx \
-             FROM characters ORDER BY name")
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx \
+             FROM characters ORDER BY name"
         } else {
-            concat!("SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, ", root_ctx_sql!(), " AS root_ctx \
-             FROM characters WHERE retired_at IS NULL ORDER BY name")
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx \
+             FROM characters WHERE retired_at IS NULL ORDER BY name"
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], row_to_character_row)?;
@@ -8996,8 +8950,8 @@ impl KernelDb {
         }
     }
 
-    /// Every live (non-archived) context belonging to an instance of
-    /// `principal_id` — the set `kj character retire` archives.
+    /// Every live (non-archived) context `principal_id` performs — the set
+    /// `kj character retire` archives.
     pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             concat!("SELECT context_id, label,
@@ -9007,7 +8961,7 @@ impl KernelDb {
                     last_activity_at, promoted_at, demoted_at, paused_at,
              origin_host, ", performer_sql!("contexts"), " AS played_by
              FROM contexts
-             WHERE instance_id IN (SELECT instance_id FROM character_instances WHERE principal_id = ?1)
+             WHERE context_id IN (SELECT context_id FROM context_characters WHERE principal_id = ?1)
                AND archived_at IS NULL"),
         )?;
         let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_context_row)?;
@@ -9546,12 +9500,12 @@ impl KernelDb {
 // Test helpers
 // ============================================================================
 
-/// Give a fresh database the schema one written before character instances
-/// had: the columns and table `drop_pre_instance_columns` removes. Idempotent.
-/// Rows in those columns are written with raw SQL, since no `KernelDb` method
-/// writes them.
+/// Give a fresh database the schema one written before context characters
+/// had: the columns and table `drop_pre_context_character_columns` removes.
+/// Idempotent. Rows in those columns are written with raw SQL, since no
+/// `KernelDb` method writes them.
 #[cfg(test)]
-fn into_pre_instance(db: &KernelDb) {
+fn into_pre_context_character(db: &KernelDb) {
     let c = &db.conn;
     if KernelDb::has_column(c, "characters", "cast_id").unwrap() {
         c.execute("ALTER TABLE characters RENAME COLUMN cast_id TO default_cast_id", []).unwrap();
@@ -9561,7 +9515,7 @@ fn into_pre_instance(db: &KernelDb) {
         ("contexts", "model", "TEXT"),
         ("presets", "cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
         ("presets", "system_prompt", "TEXT"),
-    ].into_iter().chain(PRE_INSTANCE_COLUMNS) {
+    ].into_iter().chain(PRE_CONTEXT_CHARACTER_COLUMNS) {
         if !KernelDb::has_column(c, table, column).unwrap() {
             c.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []).unwrap();
         }
@@ -9581,7 +9535,7 @@ fn into_pre_instance(db: &KernelDb) {
     ).unwrap();
 }
 
-/// Write the stored `characters.root_ctx` of a character that predates instances.
+/// Write the stored `characters.root_ctx` of a character.
 #[cfg(test)]
 fn set_stored_root_ctx(db: &KernelDb, character: PrincipalId, ctx: ContextId) {
     db.conn.execute(
@@ -9590,7 +9544,7 @@ fn set_stored_root_ctx(db: &KernelDb, character: PrincipalId, ctx: ContextId) {
     ).unwrap();
 }
 
-/// Write the stored `contexts.played_by` of a context that predates instances.
+/// Write the stored `contexts.played_by` of a context that predates context characters.
 #[cfg(test)]
 fn set_stored_played_by(db: &KernelDb, ctx: ContextId, played_by: Option<PrincipalId>) {
     db.conn.execute(
@@ -10240,13 +10194,19 @@ mod tests {
     fn a_reviewer_from_before_the_director_column_is_not_an_override() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
-        let [coder, banto, judge] = seed_characters(&db, &["coder", "banto", "judge"])[..] else { unreachable!() };
-        into_pre_instance(&db);
+        let [coder, banto, judge, amy] = seed_characters(&db, &["coder", "banto", "judge", "amy"])[..] else { unreachable!() };
+        into_pre_context_character(&db);
         db.conn.execute("ALTER TABLE contexts ADD COLUMN reviewer_id BLOB", []).unwrap();
-        let seat = make_context_row(Some("seat"));
+        let root = make_context_row(Some("amy"));
+        insert_context_with_doc(&db, &root, ws_id);
+        set_stored_played_by(&db, root.context_id, Some(amy));
+        set_stored_root_ctx(&db, amy, root.context_id);
+        let mut seat = make_context_row(Some("seat"));
+        seat.forked_from = Some(root.context_id);
         insert_context_with_doc(&db, &seat, ws_id);
         set_stored_played_by(&db, seat.context_id, Some(banto));
-        let judge_seat = make_context_row(Some("judge-seat"));
+        let mut judge_seat = make_context_row(Some("judge-seat"));
+        judge_seat.forked_from = Some(root.context_id);
         insert_context_with_doc(&db, &judge_seat, ws_id);
         set_stored_played_by(&db, judge_seat.context_id, Some(judge));
         let mut lane = make_context_row(Some("lane"));
@@ -10261,7 +10221,7 @@ mod tests {
 
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
 
-        assert_eq!(db.senpai_conversation_of(lane.context_id).unwrap(), Some(seat.context_id));
+        assert_eq!(db.senpai_of(lane.context_id).unwrap(), Some(seat.context_id));
         assert!(db.senpai_migration_report().unwrap().is_empty());
         let has_reviewer: bool = db.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'reviewer_id')", [], |r| r.get(0),
@@ -11749,17 +11709,16 @@ mod tests {
         assert_eq!(ctx.forked_from, Some(parent_id));
         assert_eq!(ctx.created_by, creator);
 
-        // A fixture's performer is the principal of the context's character
-        // instance, and a context's character never changes.
+        // A fixture's performer is the principal of the context's context
+        // character.
         let character = PrincipalId::new();
         db.update_played_by(child_id, Some(character)).unwrap();
         let played = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(played.played_by, Some(character));
-        let instance = db.context_instance_row(child_id).unwrap().expect("a performed context has an instance");
-        assert_eq!(instance.principal_id, character);
+        let context_character = db.context_character(child_id).unwrap().expect("a performed context has a context character");
+        assert_eq!(context_character.principal_id, character);
         db.update_played_by(child_id, Some(character)).unwrap();
-        assert_eq!(db.context_instance_row(child_id).unwrap().unwrap().instance_id, instance.instance_id, "the same character keeps its instance");
-        assert!(db.update_played_by(child_id, Some(PrincipalId::new())).is_err(), "another character cannot take the instance over");
+        assert_eq!(db.context_character(child_id).unwrap().unwrap(), context_character, "the same character changes nothing");
         assert!(db.update_played_by(child_id, None).is_err(), "a performer cannot be cleared");
         assert_eq!(db.get_context(child_id).unwrap().unwrap().played_by, Some(character));
     }
@@ -11992,14 +11951,10 @@ mod tests {
         row
     }
 
-    fn instance_of(db: &KernelDb, ctx: &ContextRow) -> CharacterInstanceId {
-        db.context_instance_row(ctx.context_id).unwrap().expect("the fixture gave the context an instance").instance_id
-    }
-
-    /// Run `instances-v1` over the rows a test wrote with the old columns.
-    fn run_instance_migration(db: &KernelDb) -> KernelDbResult<()> {
-        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::INSTANCES_MIGRATION]).unwrap();
-        KernelDb::migrate_instances(&db.conn)
+    /// Run `context-characters-v1` over the rows a test wrote with the old columns.
+    fn run_context_character_migration(db: &KernelDb) -> KernelDbResult<()> {
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::CONTEXT_CHARACTERS_MIGRATION]).unwrap();
+        KernelDb::migrate_context_characters(&db.conn)
     }
 
     /// amy's root console (played by amy, a root) → banto's seat → a lane
@@ -12147,22 +12102,21 @@ mod tests {
         assert!(!error.contains("amy"), "never substitutes the next holder up: {error}");
     }
 
-    /// A context with no character instance routes nothing: it refuses,
-    /// naming the context; an instance with no senpai edge has nobody above
-    /// it.
+    /// A context with no context character routes nothing: it refuses,
+    /// naming the context; a context with no senpai has nobody above it.
     #[test]
-    fn route_review_refuses_a_context_with_no_instance() {
+    fn route_review_refuses_a_context_with_no_context_character() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let [coder] = seed_characters(&db, &["coder"])[..] else { unreachable!() };
-        let bare = senpai_ctx_row(&db, ws_id, "no-instance", None, None);
+        let bare = senpai_ctx_row(&db, ws_id, "no-context-character", None, None);
         let error = db.route_review(ReviewQuery::ask(bare.context_id, coder)).unwrap_err();
         assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
         let text = error.to_string();
-        assert!(text.contains("no-instance") && text.contains("no character instance"), "{text}");
+        assert!(text.contains("no-context-character") && text.contains("no context character"), "{text}");
         let lane = senpai_ctx_row(&db, ws_id, "under-bare", None, Some(coder));
         let text = db.route_review(ReviewQuery::ask(lane.context_id, coder)).unwrap_err().to_string();
-        assert!(text.contains("has no senpai above it") || text.contains("nobody reviews"), "an instance with no senpai edge has nobody above it: {text}");
+        assert!(text.contains("has no senpai above it") || text.contains("nobody reviews"), "a context with no senpai has nobody above it: {text}");
     }
 
     /// An archived senpai is climbed through (it still answers for what was
@@ -12181,11 +12135,11 @@ mod tests {
             "an archived senpai is still the one who answers for what was done under it",
         );
 
-        let orphan_senpai = CharacterInstanceId::new();
+        let orphan_senpai = ContextId::new();
         db.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
         db.conn.execute(
-            "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
-            params![blob_param(orphan_senpai.as_bytes()), blob_param(instance_of(&db, &lane).as_bytes())],
+            "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+            params![blob_param(orphan_senpai.as_bytes()), blob_param(lane.context_id.as_bytes())],
         ).unwrap();
         db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
         let error = db.route_review(ReviewQuery::ask(lane.context_id, coder)).unwrap_err();
@@ -12205,8 +12159,8 @@ mod tests {
         let a = senpai_ctx_row(&db, ws_id, "cycle-a", None, Some(coder));
         let b = senpai_ctx_row(&db, ws_id, "cycle-b", Some(&a), Some(coder));
         db.conn.execute(
-            "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
-            params![blob_param(instance_of(&db, &b).as_bytes()), blob_param(instance_of(&db, &a).as_bytes())],
+            "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+            params![blob_param(b.context_id.as_bytes()), blob_param(a.context_id.as_bytes())],
         ).unwrap();
         let error = db.route_review(ReviewQuery::ask(a.context_id, coder)).unwrap_err();
         assert!(error.to_string().contains("cycle"), "{error}");
@@ -12237,8 +12191,8 @@ mod tests {
         );
     }
 
-    /// A create routes before its instance exists: `ReviewFrom::Senpai`
-    /// starts at the senpai instance the new instance will name.
+    /// A create routes before its context exists: `ReviewFrom::Senpai`
+    /// starts at the senpai the new context will name.
     #[test]
     fn route_review_can_start_at_the_senpai_of_a_context_not_yet_written() {
         let db = KernelDb::temporary().unwrap();
@@ -12248,11 +12202,11 @@ mod tests {
         let root = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
         let seat = senpai_ctx_row(&db, ws_id, "banto", Some(&root), Some(banto));
 
-        assert_eq!(db.route_review(ReviewQuery::under(instance_of(&db, &seat), coder)).unwrap(), EffectiveReviewer::Assigned(banto));
-        assert_eq!(db.route_review(ReviewQuery::under(instance_of(&db, &seat), banto)).unwrap(), EffectiveReviewer::Assigned(amy));
-        assert_eq!(db.route_review(ReviewQuery::under(instance_of(&db, &root), amy)).unwrap(), EffectiveReviewer::SelfConfirmation(amy));
+        assert_eq!(db.route_review(ReviewQuery::under(seat.context_id, coder)).unwrap(), EffectiveReviewer::Assigned(banto));
+        assert_eq!(db.route_review(ReviewQuery::under(seat.context_id, banto)).unwrap(), EffectiveReviewer::Assigned(amy));
+        assert_eq!(db.route_review(ReviewQuery::under(root.context_id, amy)).unwrap(), EffectiveReviewer::SelfConfirmation(amy));
         assert!(matches!(
-            db.route_review(ReviewQuery::under(CharacterInstanceId::new(), coder)).unwrap_err(),
+            db.route_review(ReviewQuery::under(ContextId::new(), coder)).unwrap_err(),
             KernelDbError::NotFound(_)
         ));
     }
@@ -12300,7 +12254,7 @@ mod tests {
         assert!(error.to_string().contains("not a root"), "{error}");
 
         let bare = senpai_ctx_row(&db, ws_id, "nobody-top", None, None);
-        assert!(db.lineage_root(bare.context_id).unwrap_err().to_string().contains("no character instance"));
+        assert!(db.lineage_root(bare.context_id).unwrap_err().to_string().contains("no context character"));
 
         db.update_character_root(amy, true).unwrap();
         let root = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
@@ -12328,15 +12282,14 @@ mod tests {
         db.set_context_senpai(lane.context_id, Some(bob_root.context_id)).unwrap();
 
         assert_eq!(db.lineage_root(lane.context_id).unwrap(), bob);
-        let top = db.lineage_top_instance(instance_of(&db, &lane)).unwrap();
-        assert_eq!(db.instance_conversation(top.instance_id).unwrap(), Some(bob_root.context_id));
+        assert_eq!(db.lineage_top(lane.context_id).unwrap().context_id, bob_root.context_id);
         assert_eq!(db.lineage_root(seat.context_id).unwrap(), amy);
     }
 
-    /// `lineage_top_instance` names the top instance itself and asks nothing
-    /// of its character: a top held by a non-root still names a top.
+    /// `lineage_top` names the top context itself and asks nothing of its
+    /// character: a top held by a non-root still names a top.
     #[test]
-    fn lineage_top_instance_names_the_top_regardless_of_its_character() {
+    fn lineage_top_names_the_top_regardless_of_its_character() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let [banto, coder] = seed_characters(&db, &["banto", "coder"])[..] else { unreachable!() };
@@ -12344,9 +12297,9 @@ mod tests {
         let seat = senpai_ctx_row(&db, ws_id, "unrooted-seat", None, Some(banto));
         let lane = senpai_ctx_row(&db, ws_id, "unrooted-lane", Some(&seat), Some(coder));
         assert!(db.lineage_root(lane.context_id).is_err());
-        assert_eq!(db.lineage_top_instance(instance_of(&db, &lane)).unwrap().instance_id, instance_of(&db, &seat));
-        assert_eq!(db.lineage_top_instance(instance_of(&db, &seat)).unwrap().instance_id, instance_of(&db, &seat), "a top names itself");
-        assert!(matches!(db.lineage_top_instance(CharacterInstanceId::new()).unwrap_err(), KernelDbError::NotFound(_)));
+        assert_eq!(db.lineage_top(lane.context_id).unwrap().context_id, seat.context_id);
+        assert_eq!(db.lineage_top(seat.context_id).unwrap().context_id, seat.context_id, "a top names itself");
+        assert!(matches!(db.lineage_top(ContextId::new()).unwrap_err(), KernelDbError::Validation(_)));
     }
 
     /// A senpai cycle is corruption; the lineage walk stops with a named
@@ -12359,11 +12312,11 @@ mod tests {
         let a = senpai_ctx_row(&db, ws_id, "cycle-a", None, Some(filler));
         let b = senpai_ctx_row(&db, ws_id, "cycle-b", Some(&a), Some(filler));
         db.conn.execute(
-            "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
-            params![blob_param(instance_of(&db, &b).as_bytes()), blob_param(instance_of(&db, &a).as_bytes())],
+            "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+            params![blob_param(b.context_id.as_bytes()), blob_param(a.context_id.as_bytes())],
         ).unwrap();
         for error in [
-            db.lineage_top_instance(instance_of(&db, &a)).unwrap_err(),
+            db.lineage_top(a.context_id).unwrap_err(),
             db.live_lineage_root(a.context_id).unwrap_err(),
         ] {
             assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
@@ -12394,25 +12347,24 @@ mod tests {
     /// A senpai pointer to a row that is not there is corruption, not a
     /// reason to stop climbing.
     #[test]
-    fn lineage_top_instance_refuses_a_dangling_senpai() {
+    fn lineage_top_refuses_a_dangling_senpai() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let [filler] = seed_characters(&db, &["filler"])[..] else { unreachable!() };
         let lane = senpai_ctx_row(&db, ws_id, "dangling-lane", None, Some(filler));
         db.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
         db.conn.execute(
-            "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
-            params![blob_param(CharacterInstanceId::new().as_bytes()), blob_param(instance_of(&db, &lane).as_bytes())],
+            "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+            params![blob_param(ContextId::new().as_bytes()), blob_param(lane.context_id.as_bytes())],
         ).unwrap();
         db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
-        let error = db.lineage_top_instance(instance_of(&db, &lane)).unwrap_err();
+        let error = db.lineage_top(lane.context_id).unwrap_err();
         assert!(matches!(error, KernelDbError::NotFound(_)), "{error}");
     }
 
-    /// Moving a context's instance under a new senpai refuses a self edge, a
-    /// cycle, a missing senpai and a context with no instance; `None` makes
-    /// it a top. The edge is the instance's, so it moves every context of
-    /// the instance.
+    /// Moving a context under a new senpai refuses a self edge, a cycle, a
+    /// missing senpai and a context with no context character; `None` makes
+    /// it a top.
     #[test]
     fn set_context_senpai_moves_a_kohai_and_refuses_cycles_and_missing_rows() {
         let db = KernelDb::temporary().unwrap();
@@ -12422,11 +12374,11 @@ mod tests {
         let b = senpai_ctx_row(&db, ws_id, "mv-b", Some(&a), Some(filler));
         let c = senpai_ctx_row(&db, ws_id, "mv-c", Some(&b), Some(filler));
         let d = senpai_ctx_row(&db, ws_id, "mv-d", None, Some(filler));
-        let edge = |ctx: &ContextRow| db.get_instance(instance_of(&db, ctx)).unwrap().unwrap().senpai_instance;
+        let edge = |ctx: &ContextRow| db.senpai_of(ctx.context_id).unwrap();
 
         db.set_context_senpai(c.context_id, Some(d.context_id)).unwrap();
-        assert_eq!(edge(&c), Some(instance_of(&db, &d)));
-        assert_eq!(db.senpai_conversation_of(c.context_id).unwrap(), Some(d.context_id));
+        assert_eq!(edge(&c), Some(d.context_id));
+        assert_eq!(db.senpai_of(c.context_id).unwrap(), Some(d.context_id));
         db.set_context_senpai(c.context_id, None).unwrap();
         assert_eq!(edge(&c), None);
         db.set_context_senpai(c.context_id, Some(b.context_id)).unwrap();
@@ -12442,12 +12394,12 @@ mod tests {
         assert!(matches!(no_row, KernelDbError::NotFound(_)), "{no_row}");
         let bare = senpai_ctx_row(&db, ws_id, "mv-bare", None, None);
         let bare_error = db.set_context_senpai(bare.context_id, Some(a.context_id)).unwrap_err();
-        assert!(bare_error.to_string().contains("no character instance"), "{bare_error}");
+        assert!(bare_error.to_string().contains("no context character"), "{bare_error}");
     }
 
-    /// A rotation leaves the kohai where they are: they point at the
-    /// instance, not at a conversation. It repoints a handoff log's pointer,
-    /// and only that character's.
+    /// A rotation moves no kohai: they keep pointing at the archived
+    /// predecessor. It repoints a handoff log's pointer, and only that
+    /// character's.
     #[test]
     fn commit_rotation_leaves_the_kohai_and_repoints_a_handoff_log() {
         let db = KernelDb::temporary().unwrap();
@@ -12457,15 +12409,15 @@ mod tests {
         let old = senpai_ctx_row(&db, ws_id, "rot-old", Some(&top), Some(other));
         let kohai = senpai_ctx_row(&db, ws_id, "rot-kohai", Some(&old), Some(kohai_character));
         let new = senpai_ctx_row(&db, ws_id, "rot-new", None, None);
-        db.append_binding(instance_of(&db, &old), None, None, new.context_id).unwrap();
+        db.write_context_character(new.context_id, other, Some(top.context_id), None).unwrap();
 
         let handoff = senpai_ctx_row(&db, ws_id, "rot-handoff", None, None);
         let handoff_next = senpai_ctx_row(&db, ws_id, "rot-handoff-next", None, None);
         db.set_character_handoff_ctx(owner, Some(handoff.context_id)).unwrap();
 
         assert_eq!(db.commit_rotation(old.context_id, new.context_id).unwrap(), 0, "no handoff log pointed at it");
-        assert_eq!(db.get_instance(instance_of(&db, &kohai)).unwrap().unwrap().senpai_instance, Some(instance_of(&db, &old)));
-        assert_eq!(db.list_kohai(new.context_id).unwrap().into_iter().map(|r| r.context_id).collect::<Vec<_>>(), vec![kohai.context_id], "the kohai answer to the successor, through the instance");
+        assert_eq!(db.senpai_of(kohai.context_id).unwrap(), Some(old.context_id), "the kohai still answer to the predecessor");
+        assert!(db.list_kohai(new.context_id).unwrap().is_empty(), "the successor has none until it takes them");
         assert!(db.get_context(old.context_id).unwrap().unwrap().is_archived());
 
         assert_eq!(db.commit_rotation(handoff.context_id, handoff_next.context_id).unwrap(), 1);
@@ -12529,7 +12481,7 @@ mod tests {
     /// `contexts.reviewer_id`, `contexts.director_id` and the delegation
     /// tables. Idempotent.
     fn ensure_old_routing_schema(db: &KernelDb) {
-        into_pre_instance(db);
+        into_pre_context_character(db);
         for sql in ["ALTER TABLE contexts ADD COLUMN reviewer_id BLOB", "ALTER TABLE contexts ADD COLUMN director_id BLOB"] {
             match db.conn.execute(sql, []) {
                 Ok(_) => {}
@@ -12657,6 +12609,7 @@ mod tests {
         db.update_character_root(amy, true).unwrap();
 
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
         let lane = old_context(&db, ws_id, "lane", Some(&seat), Some(coder), 3);
         let self_fork = old_context(&db, ws_id, "banto-fork", Some(&seat), Some(banto), 4);
@@ -12670,7 +12623,7 @@ mod tests {
         assert!(db.retire_character(gone, 1).unwrap());
 
         run_senpai_migration(&db).unwrap();
-        run_instance_migration(&db).unwrap();
+        run_context_character_migration(&db).unwrap();
 
         assert_eq!(senpai_of(&db, &root), None, "a root console is a top");
         assert_eq!(senpai_of(&db, &seat), Some(root.context_id));
@@ -12684,9 +12637,13 @@ mod tests {
         let error = db.route_review(ReviewQuery::ask(under_retired.context_id, coder)).unwrap_err().to_string();
         assert!(error.contains("gone") && error.contains("retired"), "the new resolver refuses the same way: {error}");
         assert_eq!(report_of(&db), vec![], "every one of these was the nearest-ancestor case");
-        for ctx in [&root, &seat, &lane, &self_fork, &under_holderless, &client, &retired_seat] {
+        for ctx in [&root, &seat, &lane, &self_fork, &under_holderless, &retired_seat] {
             assert_eq!(db.lineage_root(ctx.context_id).unwrap(), amy);
         }
+        assert_eq!(db.context_character(client.context_id).unwrap(), None, "a context nobody performs gets no context character");
+        let listed: Vec<ContextId> = db.context_character_migration_report().unwrap().into_iter()
+            .filter(|n| n.kind == "unmapped").filter_map(|n| n.context_id).collect();
+        assert!(listed.contains(&client.context_id), "and is listed because it had a senpai_ctx: {listed:?}");
     }
 
     /// The migration routes every context to the reviewer the old resolver
@@ -12698,6 +12655,7 @@ mod tests {
         let [coder, banto, judge, amy] = seed_characters(&db, &["coder", "banto", "judge", "amy"])[..] else { unreachable!() };
         db.update_character_root(amy, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
         let lane = old_context(&db, ws_id, "lane", Some(&seat), Some(coder), 3);
         let judged = old_context(&db, ws_id, "judged", Some(&seat), Some(coder), 4);
@@ -12706,7 +12664,7 @@ mod tests {
         let _ = judge_seat;
 
         run_senpai_migration(&db).unwrap();
-        run_instance_migration(&db).unwrap();
+        run_context_character_migration(&db).unwrap();
 
         for (ctx, performer, reviewer) in [(&lane, coder, banto), (&seat, banto, amy), (&judged, coder, amy)] {
             assert_eq!(db.route_review(ReviewQuery::ask(ctx.context_id, performer)).unwrap().reviewer(), reviewer, "{:?}", ctx.label);
@@ -12726,6 +12684,7 @@ mod tests {
         db.update_character_root(amy, true).unwrap();
         db.update_character_root(bob, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let bob_console = old_context(&db, ws_id, "bob", None, Some(bob), 2);
         set_stored_root_ctx(&db, bob, bob_console.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 3);
@@ -12794,6 +12753,7 @@ mod tests {
         let [coder, banto, judge, amy] = seed_characters(&db, &["coder", "banto", "judge", "amy"])[..] else { unreachable!() };
         db.update_character_root(amy, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
         let lane = old_context(&db, ws_id, "lane", Some(&seat), Some(coder), 3);
         let judge_seat = old_context(&db, ws_id, "judge-seat", Some(&root), Some(judge), 4);
@@ -12805,7 +12765,7 @@ mod tests {
         db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::SENPAI_MIGRATION]).unwrap();
 
         senpai_open_steps(&db.conn).unwrap();
-        run_instance_migration(&db).unwrap();
+        run_context_character_migration(&db).unwrap();
 
         assert_eq!(senpai_of(&db, &lane), Some(seat.context_id));
         assert_eq!(senpai_of(&db, &overridden), Some(judge_seat.context_id), "the override named judge: its live context");
@@ -12840,6 +12800,7 @@ mod tests {
         let [coder, banto, nobody, amy] = seed_characters(&db, &["coder", "banto", "nobody", "amy"])[..] else { unreachable!() };
         db.update_character_root(amy, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
         let bad = old_context(&db, ws_id, "bad", Some(&seat), Some(coder), 3);
         set_old_routing(&db, &bad, Some(banto), Some(nobody));
@@ -12868,6 +12829,7 @@ mod tests {
         let [coder, banto, nobody, gone, amy] = seed_characters(&db, &["coder", "banto", "nobody", "gone", "amy"])[..] else { unreachable!() };
         db.update_character_root(amy, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
         let fine = old_context(&db, ws_id, "fine", Some(&seat), Some(coder), 3);
         // An override naming a character with no console and no live context.
@@ -12905,6 +12867,7 @@ mod tests {
         let [coder, banto, nobody, amy] = seed_characters(&db, &["coder", "banto", "nobody", "amy"])[..] else { unreachable!() };
         db.update_character_root(amy, true).unwrap();
         let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
         let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
         let archived = old_context(&db, ws_id, "archived-bad", Some(&seat), Some(coder), 3);
         set_old_routing(&db, &archived, Some(banto), Some(nobody));
@@ -12932,6 +12895,7 @@ mod tests {
             let [coder, banto, amy] = seed_characters(&db, &["coder", "banto", "amy"])[..] else { unreachable!() };
             db.update_character_root(amy, true).unwrap();
             let root = old_context(&db, ws_id, "amy", None, Some(amy), 1);
+        set_stored_root_ctx(&db, amy, root.context_id);
             let seat = old_context(&db, ws_id, "banto", Some(&root), Some(banto), 2);
             let lane = old_context(&db, ws_id, "lane", Some(&seat), Some(coder), 3);
             db.conn.execute_batch(
@@ -12941,8 +12905,8 @@ mod tests {
             (lane, seat, root, amy)
         };
         let db = KernelDb::open(&path).unwrap();
-        assert_eq!(db.senpai_conversation_of(lane.context_id).unwrap(), Some(seat.context_id));
-        assert_eq!(db.senpai_conversation_of(seat.context_id).unwrap(), Some(root.context_id));
+        assert_eq!(db.senpai_of(lane.context_id).unwrap(), Some(seat.context_id));
+        assert_eq!(db.senpai_of(seat.context_id).unwrap(), Some(root.context_id));
         assert_eq!(db.lineage_root(lane.context_id).unwrap(), amy);
     }
 
@@ -13114,8 +13078,6 @@ mod tests {
             role: "coder".into(),
             provider: "anthropic".into(),
             model: "claude-haiku-5-5".into(),
-            instance: None,
-            binding_seq: None,
             started_at: 1_000,
         }
     }
@@ -17684,7 +17646,7 @@ mod label_index_tests {
         assert!(!db.admit_inference_request(row.context_id, origin.epoch + 1, 1_100).unwrap());
     }
 
-    /// A context's character is fixed by its instance, so a second
+    /// A context's character is fixed by its context character, so a second
     /// assignment of the same character keeps the continuation and another
     /// character is refused without touching it.
     #[test]

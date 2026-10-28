@@ -55,7 +55,7 @@ pub use stream::{
     InlineToolResult, RetryDisposition, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
-pub use system_prompt::{CharacterIdentity, InstanceFact, SenpaiFact, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
+pub use system_prompt::{CharacterIdentity, CharacterFact, SenpaiFact, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
 pub(crate) use system_prompt::is_system_prompt_section;
 
 use serde::{Deserialize, Serialize};
@@ -1374,7 +1374,7 @@ impl LlmRegistry {
     /// or `None` when unconfigured.
     ///
     /// A catalog read, for discovery (`kj models`, `kj backend show`): a
-    /// turn's window comes from its binding slot, copied from this row when
+    /// turn's window comes from its context slot, copied from this row when
     /// the binding was written. Callers pass an already-resolved provider +
     /// model, not an alias name. `None` must be rendered as an explicit
     /// "unknown" by every caller — never a fabricated default.

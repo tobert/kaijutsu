@@ -816,12 +816,12 @@ fn test_coder_stance_is_the_same_for_every_model() {
     });
 }
 
-/// A context made through the wire runs the model its character instance's
-/// binding gives its type, and nothing is stamped on its row.
+/// A context made through the wire runs the model its context character's
+/// slot gives its type, and nothing is stamped on its row.
 ///
 /// Falsified by reading any model from the row or a registry default.
 #[test]
-fn test_rpc_created_context_runs_its_bindings_model() {
+fn test_rpc_created_context_runs_its_slots_model() {
     run_local(async {
         let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
         let client = connect_client(addr).await;
@@ -841,7 +841,7 @@ fn test_rpc_created_context_runs_its_bindings_model() {
 
         assert_eq!(data["resolved_model"].as_str(), Some("claude-haiku-4-5"), "{data}");
         assert_eq!(data["resolved_backend"].as_str(), Some("mock"), "{data}");
-        assert_eq!(data["cast_label"].as_str(), Some("mock"), "{data}");
+        assert!(data.get("cast_label").is_none(), "no cast label is stored: {data}");
         assert!(data.get("resolved_source").is_none(), "no resolver tier remains: {data}");
     });
 }

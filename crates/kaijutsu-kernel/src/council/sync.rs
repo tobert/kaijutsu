@@ -809,10 +809,10 @@ impl SeatBuild {
 /// What the gate's decisions for `context` read on the seats that depend
 /// on it: under each of its council's shell and program specs, the labels
 /// along the reviewer chain of its performer and the house rules of its
-/// workspace, routed to the server its binding's `gate` slot names; each
+/// workspace, routed to the server its context's `gate` slot names; each
 /// observing reviewer context alone under `direction-check`; and, when its
 /// binding has an `mk` judge, the judge read's labels and house rules on the
-/// judge's server. Empty when its type has no council or its binding has no
+/// judge's server. Empty when its type has no council or its context has no
 /// `gate` slot. Waits on no server.
 ///
 /// The second value says why the reviewer chain is left out: a context
@@ -1722,7 +1722,7 @@ mod tests {
         let coder = live_context(&r.kernel, "coder-seat");
         let db = r.kernel.kernel_db().lock();
         db.update_context_type(coder, "coder").unwrap();
-        db.assign_stand_in_instance(coder, character).unwrap();
+        db.assign_stand_in_character(coder, character).unwrap();
         coder
     }
 

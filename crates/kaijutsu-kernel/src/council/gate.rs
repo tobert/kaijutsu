@@ -1711,9 +1711,9 @@ pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
     council.specs.iter().find(|s| s.case == CouncilCase::Shell)
 }
 
-/// The backend and model of the `role` slot in the binding `seat` runs on.
-/// `None` when the seat belongs to no character instance or its binding has
-/// no `role` slot: the cast the binding was written from is not read again.
+/// The backend and model of the `role` slot of `seat`. `None` when the seat
+/// has no context character or no `role` slot: the cast the slots were
+/// copied from is not read again.
 pub(crate) fn seat_slot_backend(
     db: &crate::kernel_db::KernelDb,
     seat: ContextId,
@@ -1724,8 +1724,8 @@ pub(crate) fn seat_slot_backend(
     };
     let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == bound.slot.backend_id).ok_or_else(|| {
         crate::kernel_db::KernelDbError::Validation(format!(
-            "binding {} of {} slot {role} names a backend that does not exist",
-            bound.seq, bound.instance_name
+            "context {} slot {role} names a backend that does not exist",
+            bound.context
         ))
     })?;
     Ok(Some((backend, bound.slot.model)))
@@ -1752,7 +1752,7 @@ pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow, model: &st
 }
 
 /// The council server and served model for `seat`'s gate decisions when
-/// its binding has a [`GATE`] slot. `None` when it has no such slot, so the
+/// its context has a [`GATE`] slot. `None` when it has no such slot, so the
 /// seat has no council. `Some(Err)` is a miss cause: the slot's backend is
 /// not a council server, and no other server stands in.
 fn bound_council_server(

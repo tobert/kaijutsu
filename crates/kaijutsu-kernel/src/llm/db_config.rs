@@ -94,7 +94,7 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
 /// Registers one client per backend row, keyed by backend NAME. A backend that
 /// fails to construct (no resolvable key, say) is warned about and skipped; a
 /// turn bound to it refuses, naming the backend. Nothing here chooses a
-/// model: a character instance's binding does.
+/// model: a context character's slots do.
 ///
 /// Each client takes its slots from `endpoints`, the kernel's one set, whose
 /// limits this rebuild sets from the backends that built. A skipped backend

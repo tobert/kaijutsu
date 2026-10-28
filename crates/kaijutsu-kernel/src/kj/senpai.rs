@@ -1,12 +1,11 @@
 //! `kj senpai show|set|report` and `kj kohai create|list`: the senpai edge
-//! (`docs/senpai-kohai.md`). A character instance's senpai is the instance
-//! it answers to; its kohai are the live instances that answer to it. A verb
-//! that takes an instance accepts any context of it.
+//! (`docs/senpai-kohai.md`). A context's senpai is the context it answers to;
+//! its kohai are the live contexts that answer to it.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId};
 
-use crate::kernel_db::{CharacterInstanceRow, ContextRow, GovernedAct, KernelDb};
+use crate::kernel_db::{ContextCharacterRow, ContextRow, GovernedAct, KernelDb};
 
 use super::context::ContextConfigArgs;
 use super::effect::{Classify, Effect};
@@ -15,7 +14,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "senpai",
-    about = "Show or move the instance a character instance answers to",
+    about = "Show or move the context a context answers to",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -26,31 +25,29 @@ pub(crate) struct SenpaiArgs {
 
 #[derive(Subcommand, Debug)]
 enum SenpaiCommand {
-    /// Show an instance's senpai, the lineage root, and who reviews an ask
-    /// its character raises (default: the current context's instance).
+    /// Show a context's senpai, the lineage root, and who reviews an ask its
+    /// character raises (default: the current context).
     Show {
-        /// An instance, named by any of its contexts. Defaults to the
-        /// current context. Ids and labels come from `kj context list`.
-        instance: Option<String>,
+        /// A context. Defaults to the current context. Ids and labels come
+        /// from `kj context list`.
+        context: Option<String>,
     },
-    /// Move an instance under another senpai instance. The character of its
-    /// senpai, or its lineage root, may move it; the caller must also be the
-    /// new senpai's character or its lineage root. Refuses while the
-    /// instance has pending asks, a move that would close a cycle, an
-    /// archived senpai instance, and a senpai whose character is retired.
+    /// Move a context under another senpai. The character of its senpai, or
+    /// its lineage root, may move it; the caller must also be the new
+    /// senpai's character or its lineage root. Refuses while the context has
+    /// pending asks, a move that would close a cycle, an archived senpai, and
+    /// a senpai whose character is retired.
     Set {
-        /// The instance to move, named by any of its contexts. Ids and
-        /// labels come from `kj context list`.
-        instance: String,
-        /// The senpai instance it answers to from now on, named by any of
-        /// its contexts.
+        /// The context to move. Ids and labels come from `kj context list`.
+        context: String,
+        /// The context it answers to from now on.
         senpai: String,
     },
-    /// Report to this instance's senpai: the text lands in the senpai
-    /// instance's conversation as a drift block from the current context,
-    /// as `kj drift push` would put it there, with no context id to type.
-    /// A drift along the senpai edge needs no ask. Refuses an instance with
-    /// no senpai, an archived senpai instance, and empty text.
+    /// Report to this context's senpai: the text lands in the senpai context
+    /// as a drift block from the current context, as `kj drift push` would
+    /// put it there, with no context id to type. A drift along the senpai
+    /// edge needs no ask. Refuses a context with no senpai, an archived
+    /// senpai, and empty text.
     Report {
         /// The report (joined with spaces).
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -61,7 +58,7 @@ enum SenpaiCommand {
 #[derive(Parser, Debug)]
 #[command(
     name = "kohai",
-    about = "Start and list the character instances that answer to an instance",
+    about = "Start and list the contexts that answer to a context",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -72,12 +69,11 @@ pub(crate) struct KohaiArgs {
 
 #[derive(Subcommand, Debug)]
 enum KohaiCommand {
-    /// Start an instance of a character, with a new context as its
-    /// conversation, that answers to this context's instance. Label is
-    /// positional or `--name`. The new context runs the model in the
-    /// character's cast slot for its type, bound now; the output says when
-    /// the cast has none. Needs the operator capability and a live character
-    /// caller.
+    /// Make a new context performed by a character, that answers to this
+    /// context. Label is positional or `--name`. The new context runs the
+    /// model in the character's cast slot for its type, copied now; the
+    /// output says when the cast has none. Needs the operator capability and
+    /// a live character caller.
     #[command(alias = "new")]
     Create {
         /// Label (positional form; or use --name)
@@ -89,26 +85,24 @@ enum KohaiCommand {
         /// Defaults to the current context
         #[arg(long, short = 'p')]
         parent: Option<String>,
-        /// A context of the instance the new one answers to. Defaults to the
-        /// current context; another instance needs the caller to be its
-        /// character or its lineage root
+        /// The context the new one answers to. Defaults to the current
+        /// context; another context needs the caller to be its character or
+        /// its lineage root
         #[arg(long)]
         senpai: Option<String>,
-        /// The live, non-root character the new instance runs. Its senpai's
-        /// character reviews its asks
+        /// The live, non-root character that performs the new context. Its
+        /// senpai's character reviews its asks
         #[arg(long = "as", value_name = "CHARACTER", required = true)]
         character: String,
         #[command(flatten)]
         config: Box<ContextConfigArgs>,
     },
-    /// List the live kohai instances of an instance, each by its
-    /// conversation, with its character and the conversation's type
-    /// (default: the current context's instance).
+    /// List the live kohai of a context, each with its character and type
+    /// (default: the current context).
     #[command(alias = "ls")]
     List {
-        /// An instance, named by any of its contexts. Defaults to the
-        /// current context.
-        instance: Option<String>,
+        /// A context. Defaults to the current context.
+        context: Option<String>,
     },
 }
 
@@ -147,34 +141,31 @@ fn parse<A: Parser + clap::CommandFactory>(argv: &[String], verb: &str) -> Resul
     })
 }
 
-/// The instance a verb argument names: the instance of the context it
-/// resolves to, with that context.
-fn resolve_instance_arg(
+/// The context a verb argument names, with its context character.
+fn resolve_character_arg(
     arg: Option<&str>,
     caller: &KjCaller,
     db: &KernelDb,
-) -> Result<(ContextId, CharacterInstanceRow), String> {
+) -> Result<(ContextId, ContextCharacterRow), String> {
     let context = super::refs::resolve_context_arg(arg, caller, db)?;
-    let instance = db.context_instance_row(context).map_err(|e| e.to_string())?.ok_or_else(|| {
-        format!("{} belongs to no character instance, so it has no senpai and no kohai", db.context_name(context))
+    let character = db.context_character(context).map_err(|e| e.to_string())?.ok_or_else(|| {
+        format!("{} has no context character, so it has no senpai and no kohai", db.context_name(context))
     })?;
-    Ok((context, instance))
+    Ok((context, character))
 }
 
-/// `label (short-id)` of the instance's conversation, and its character.
-fn instance_line(db: &KernelDb, instance: &CharacterInstanceRow) -> String {
-    format!("{}, {}", db.instance_name(instance.instance_id), db.name_for(instance.principal_id))
+/// `label (short-id)` of the context, and its character.
+fn context_line(db: &KernelDb, character: &ContextCharacterRow) -> String {
+    format!("{}, {}", db.context_name(character.context_id), db.name_for(character.principal_id))
 }
 
-fn instance_json(db: &KernelDb, instance: &CharacterInstanceRow) -> serde_json::Value {
-    let conversation = db.instance_conversation(instance.instance_id).ok().flatten();
-    let label = conversation.and_then(|c| db.get_context(c).ok().flatten()).and_then(|row| row.label);
+fn context_json(db: &KernelDb, character: &ContextCharacterRow) -> serde_json::Value {
+    let label = db.get_context(character.context_id).ok().flatten().and_then(|row| row.label);
     serde_json::json!({
-        "id": instance.instance_id.to_hex(),
+        "context": character.context_id.to_hex(),
         "label": label,
-        "conversation": conversation.map(|c| c.to_hex()),
-        "character": db.name_for(instance.principal_id),
-        "character_id": instance.principal_id.to_hex(),
+        "character": db.name_for(character.principal_id),
+        "character_id": character.principal_id.to_hex(),
     })
 }
 
@@ -185,12 +176,12 @@ impl KjDispatcher {
             Err(result) => return result,
         };
         match parsed.command {
-            SenpaiCommand::Show { instance } => self.senpai_show(instance.as_deref(), caller).await,
-            SenpaiCommand::Set { instance, senpai } => {
+            SenpaiCommand::Show { context } => self.senpai_show(context.as_deref(), caller).await,
+            SenpaiCommand::Set { context, senpai } => {
                 if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "senpai set") {
                     return denied;
                 }
-                self.senpai_set(&instance, &senpai, caller)
+                self.senpai_set(&context, &senpai, caller)
             }
             SenpaiCommand::Report { text } => {
                 if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drift, "senpai report") {
@@ -221,26 +212,27 @@ impl KjDispatcher {
                 ))
                 .await
             }
-            KohaiCommand::List { instance } => self.kohai_list(instance.as_deref(), caller),
+            KohaiCommand::List { context } => self.kohai_list(context.as_deref(), caller),
         }
     }
 
-    /// `kj senpai show [<instance-or-ctx>]`.
-    async fn senpai_show(&self, instance: Option<&str>, caller: &KjCaller) -> KjResult {
+    /// `kj senpai show [<ctx>]`.
+    async fn senpai_show(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         let (context, row, senpai, root, note) = {
             let db = self.kernel_db().lock();
             let shown = (|| -> Result<_, String> {
-                let (context, row) = resolve_instance_arg(instance, caller, &db)?;
-                let senpai = match row.senpai_instance {
-                    Some(id) => Some(db.get_instance(id).map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("senpai instance {} has no row", id.short()))?),
+                let (context, row) = resolve_character_arg(context, caller, &db)?;
+                let senpai = match row.senpai_ctx {
+                    Some(id) => Some(db.context_character(id).map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("senpai {} has no context character", db.context_name(id)))?),
                     None => None,
                 };
                 let root = db.lineage_root(context).map_err(|e| e.to_string());
-                let mut notes = db.senpai_migration_report().map_err(|e| e.to_string())?;
-                let mine = db.instance_contexts(row.instance_id).map_err(|e| e.to_string())?;
-                notes.retain(|(c, _, _)| mine.contains(c));
-                Ok((context, row, senpai, root, notes.into_iter().next().map(|(_, _, note)| note)))
+                let note = db.senpai_migration_report().map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|(c, _, _)| *c == context)
+                    .map(|(_, _, note)| note);
+                Ok((context, row, senpai, root, note))
             })();
             match shown {
                 Ok(shown) => shown,
@@ -248,10 +240,10 @@ impl KjDispatcher {
             }
         };
         let name = |principal| self.kernel_db().lock().name_for(principal);
-        let mut lines = vec![format!("instance: {}", instance_line(&self.kernel_db().lock(), &row))];
+        let mut lines = vec![format!("context: {}", context_line(&self.kernel_db().lock(), &row))];
         lines.push(match &senpai {
-            Some(senpai) => format!("senpai: {}", instance_line(&self.kernel_db().lock(), senpai)),
-            None => "senpai: none (nothing above this instance)".to_string(),
+            Some(senpai) => format!("senpai: {}", context_line(&self.kernel_db().lock(), senpai)),
+            None => "senpai: none (nothing above this context)".to_string(),
         });
         lines.push(match &root {
             Ok(root) => format!("lineage root: {}", name(*root)),
@@ -266,12 +258,12 @@ impl KjDispatcher {
         if let Some(note) = &note {
             lines.push(format!("note: {note}"));
         }
-        let (instance_data, senpai_data) = {
+        let (context_data, senpai_data) = {
             let db = self.kernel_db().lock();
-            (instance_json(&db, &row), senpai.as_ref().map(|s| instance_json(&db, s)))
+            (context_json(&db, &row), senpai.as_ref().map(|s| context_json(&db, s)))
         };
         let data = serde_json::json!({
-            "instance": instance_data,
+            "context": context_data,
             "senpai": senpai_data,
             "lineage_root": root.as_ref().ok().map(|r| serde_json::json!({ "id": r.to_hex(), "name": name(*r) })),
             "lineage_root_error": root.as_ref().err(),
@@ -284,64 +276,64 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    /// `kj senpai set <instance-or-ctx> <senpai-instance-or-ctx>`: every
-    /// check and the write run under one lock and one transaction.
-    fn senpai_set(&self, instance: &str, senpai: &str, caller: &KjCaller) -> KjResult {
+    /// `kj senpai set <ctx> <senpai-ctx>`: every check and the write run under
+    /// one lock and one transaction.
+    fn senpai_set(&self, context: &str, senpai: &str, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let moved = (|| -> Result<(CharacterInstanceRow, CharacterInstanceRow), String> {
-            let (target, _) = resolve_instance_arg(Some(instance), caller, &db)?;
-            let (senpai, _) = resolve_instance_arg(Some(senpai), caller, &db)?;
+        let moved = (|| -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
+            let (target, _) = resolve_character_arg(Some(context), caller, &db)?;
+            let (senpai, _) = resolve_character_arg(Some(senpai), caller, &db)?;
             db.in_transaction(|db| Ok(move_kohai(db, target, senpai, caller)))
                 .map_err(|e| e.to_string())?
         })();
         match moved {
             Ok((row, senpai)) => KjResult::ok_with_data(
-                format!("{} now answers to {}", instance_line(&db, &row), instance_line(&db, &senpai)),
-                serde_json::json!({ "instance": instance_json(&db, &row), "senpai": instance_json(&db, &senpai) }),
+                format!("{} now answers to {}", context_line(&db, &row), context_line(&db, &senpai)),
+                serde_json::json!({ "context": context_json(&db, &row), "senpai": context_json(&db, &senpai) }),
             ),
             Err(e) => KjResult::Err(format!("kj senpai set: {e}")),
         }
     }
 
-    /// `kj senpai report <text>...`: `kj drift push` to the conversation of
-    /// the caller's senpai instance, by id, so the report can only reach the
-    /// instance this one answers to.
+    /// `kj senpai report <text>...`: `kj drift push` to the caller's senpai,
+    /// by id, so the report can only reach the context this one answers to.
     async fn senpai_report(&self, text: &[String], caller: &KjCaller) -> KjResult {
         let here = match caller.require_context() {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let (senpai, conversation) = {
+        let senpai = {
             let db = self.kernel_db().lock();
-            let found = (|| -> Result<(CharacterInstanceRow, ContextId), String> {
-                let (_, row) = resolve_instance_arg(Some(&here.to_hex()), caller, &db)?;
-                let senpai_id = row.senpai_instance.ok_or_else(|| {
-                    format!("{} has no senpai, so there is nobody to report to", db.instance_name(row.instance_id))
+            let found = (|| -> Result<ContextCharacterRow, String> {
+                let (_, row) = resolve_character_arg(Some(&here.to_hex()), caller, &db)?;
+                let senpai_id = row.senpai_ctx.ok_or_else(|| {
+                    format!("{} has no senpai, so there is nobody to report to", db.context_name(row.context_id))
                 })?;
-                let senpai = db.get_instance(senpai_id).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("senpai instance {} has no row", senpai_id.short()))?;
-                if !db.instance_is_active(senpai_id).map_err(|e| e.to_string())? {
+                let senpai = db.context_character(senpai_id).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai {} has no context character", db.context_name(senpai_id)))?;
+                let archived = db.get_context(senpai_id).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai {} has no row", senpai_id.short()))?
+                    .is_archived();
+                if archived {
                     return Err(format!(
-                        "{} is archived; `kj context promote` its conversation to reach it again",
-                        db.instance_name(senpai_id)
+                        "{} is archived; `kj context promote` it to reach it again, or move this context with `kj senpai set`",
+                        db.context_name(senpai_id)
                     ));
                 }
-                let conversation = db.instance_conversation(senpai_id).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("senpai instance {} has no binding", senpai_id.short()))?;
-                Ok((senpai, conversation))
+                Ok(senpai)
             })();
             match found {
                 Ok(found) => found,
                 Err(e) => return KjResult::Err(format!("kj senpai report: {e}")),
             }
         };
-        let pushed = self.drift_push(&conversation.to_hex(), false, false, text, caller).await;
+        let pushed = self.drift_push(&senpai.context_id.to_hex(), false, false, text, caller).await;
         match pushed {
             KjResult::Ok { .. } => {
                 let db = self.kernel_db().lock();
                 KjResult::ok_with_data(
-                    format!("reported → {}", instance_line(&db, &senpai)),
-                    serde_json::json!({ "senpai": instance_json(&db, &senpai) }),
+                    format!("reported → {}", context_line(&db, &senpai)),
+                    serde_json::json!({ "senpai": context_json(&db, &senpai) }),
                 )
             }
             KjResult::Err(e) => KjResult::Err(e.replacen("kj drift push", "kj senpai report", 1)),
@@ -349,11 +341,11 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj kohai list [<instance-or-ctx>]`.
-    fn kohai_list(&self, instance: Option<&str>, caller: &KjCaller) -> KjResult {
+    /// `kj kohai list [<ctx>]`.
+    fn kohai_list(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let listed = (|| -> Result<(CharacterInstanceRow, Vec<ContextRow>), String> {
-            let (context, row) = resolve_instance_arg(instance, caller, &db)?;
+        let listed = (|| -> Result<(ContextCharacterRow, Vec<ContextRow>), String> {
+            let (context, row) = resolve_character_arg(context, caller, &db)?;
             Ok((row, db.list_kohai(context).map_err(|e| e.to_string())?))
         })();
         let (row, kohai) = match listed {
@@ -363,7 +355,7 @@ impl KjDispatcher {
         let character = |k: &ContextRow| k.played_by.map(|p| db.name_for(p));
         let mut lines = Vec::with_capacity(kohai.len() + 1);
         if kohai.is_empty() {
-            lines.push(format!("{} has no live kohai", db.instance_name(row.instance_id)));
+            lines.push(format!("{} has no live kohai", db.context_name(row.context_id)));
         }
         for k in &kohai {
             lines.push(format!(
@@ -372,9 +364,9 @@ impl KjDispatcher {
             ));
         }
         let data = serde_json::json!({
-            "instance": instance_json(&db, &row),
+            "context": context_json(&db, &row),
             "kohai": kohai.iter().map(|k| serde_json::json!({
-                "conversation": k.context_id.to_hex(), "label": k.label, "context_type": k.context_type,
+                "context": k.context_id.to_hex(), "label": k.label, "context_type": k.context_type,
                 "character": character(k),
             })).collect::<Vec<_>>(),
         });
@@ -383,49 +375,58 @@ impl KjDispatcher {
 }
 
 /// The checks and the write behind `kj senpai set`, inside the caller's
-/// transaction. `target` and `senpai` are contexts of the two instances. The
-/// inner `Err` is the refusal.
+/// transaction. The inner `Err` is the refusal.
 fn move_kohai(
     db: &KernelDb,
     target: ContextId,
     senpai: ContextId,
     caller: &KjCaller,
-) -> Result<(CharacterInstanceRow, CharacterInstanceRow), String> {
-    let row = db.context_instance_row(target).map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{} belongs to no character instance", db.context_name(target)))?;
-    let senpai_instance = db.context_instance_row(senpai).map_err(|e| e.to_string())?.ok_or_else(|| {
+) -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
+    let row = db.context_character(target).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} has no context character", db.context_name(target)))?;
+    let senpai_row = db.context_character(senpai).map_err(|e| e.to_string())?.ok_or_else(|| {
         format!(
-            "{} belongs to no character instance, so nobody would answer for {}",
-            db.context_name(senpai), db.instance_name(row.instance_id)
+            "{} has no context character, so nobody would answer for {}",
+            db.context_name(senpai), db.context_name(target)
         )
     })?;
-    let name = |instance: &CharacterInstanceRow| db.instance_name(instance.instance_id);
     db.context_authority(target, caller.actor_id, GovernedAct::Move).map_err(|e| e.to_string())??;
-    db.may_place_under(senpai_instance.instance_id, caller.actor_id).map_err(|e| e.to_string())??;
-    if !db.instance_is_active(senpai_instance.instance_id).map_err(|e| e.to_string())? {
+    db.may_place_under(senpai, caller.actor_id).map_err(|e| e.to_string())??;
+    let archived = db.get_context(senpai).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("senpai {} has no row", senpai.short()))?
+        .is_archived();
+    if archived {
         return Err(format!(
-            "{} is archived; an instance answers to a live senpai instance, or `kj context promote` its conversation first",
-            name(&senpai_instance)
+            "{} is archived; a context answers to a live senpai, or `kj context promote` it first",
+            db.context_name(senpai)
         ));
     }
-    let live = db.get_character(senpai_instance.principal_id).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none());
+    let live = db.get_character(senpai_row.principal_id).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none());
     if !live {
         return Err(format!(
             "{} has no live holder: its character is retired, so nobody would answer for {}",
-            name(&senpai_instance), name(&row)
+            db.context_name(senpai), db.context_name(target)
         ));
     }
-    let pending = db.list_pending_asks().map_err(|e| e.to_string())?;
-    let mine = db.instance_contexts(row.instance_id).map_err(|e| e.to_string())?;
-    if pending.iter().any(|ask| mine.iter().any(|c| ask.context_id.as_slice() == c.as_bytes())) {
-        return Err(format!("settle or cancel the pending asks of {} before moving it", name(&row)));
+    // An ask raised in the moved context, or in a context below it, may
+    // climb through it, so it blocks the move.
+    let mut below = vec![target];
+    let mut next = 0;
+    while next < below.len() {
+        for kohai in db.kohai_of(below[next]).map_err(|e| e.to_string())? {
+            if !below.contains(&kohai) {
+                below.push(kohai);
+            }
+        }
+        next += 1;
     }
-    let conversation = |instance: &CharacterInstanceRow| -> Result<ContextId, String> {
-        db.instance_conversation(instance.instance_id).map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("character instance {} has no binding", instance.instance_id.short()))
-    };
-    db.set_context_senpai(conversation(&row)?, Some(conversation(&senpai_instance)?)).map_err(|e| e.to_string())?;
-    Ok((row, senpai_instance))
+    let pending = db.list_pending_asks().map_err(|e| e.to_string())?;
+    if pending.iter().any(|ask| below.iter().any(|c| ask.context_id.as_slice() == c.as_bytes())) {
+        return Err(format!("settle or cancel the pending asks of {} before moving it", db.context_name(target)));
+    }
+    db.set_context_senpai(target, Some(senpai)).map_err(|e| e.to_string())?;
+    let moved = db.context_character(target).map_err(|e| e.to_string())?.unwrap_or(row);
+    Ok((moved, senpai_row))
 }
 
 #[cfg(test)]
@@ -491,15 +492,15 @@ mod tests {
         let shown = d.dispatch(&[s("senpai"), s("show")], &caller(h.coder, h.lane)).await;
         assert!(shown.is_ok(), "{}", shown.message());
         let text = shown.message();
-        assert!(text.contains(&format!("instance: lane ({}), coder", h.lane.short())), "{text}");
+        assert!(text.contains(&format!("context: lane ({}), coder", h.lane.short())), "{text}");
         assert!(text.contains(&format!("senpai: banto-seat ({}), banto", h.seat.short())), "{text}");
         assert!(text.contains("lineage root: amy"), "{text}");
         assert!(text.contains("an ask by coder goes to: banto (senpai)"), "{text}");
         let data = data(&shown);
-        assert_eq!(data["senpai"]["conversation"], h.seat.to_hex());
+        assert_eq!(data["senpai"]["context"], h.seat.to_hex());
         assert_eq!(data["senpai"]["label"], "banto-seat");
         assert_eq!(data["senpai"]["character"], "banto");
-        assert_eq!(data["instance"]["character"], "coder");
+        assert_eq!(data["context"]["character"], "coder");
         assert_eq!(data["reviewer"]["name"], "banto");
 
         let top = d.dispatch(&[s("senpai"), s("show"), h.root.to_hex()], &caller(h.amy, h.root)).await;
@@ -523,13 +524,8 @@ mod tests {
         )), "{}", refused.message());
         let moved = d.dispatch(&[s("senpai"), s("set"), lane.clone(), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
         assert!(moved.is_ok(), "{}", moved.message());
-        assert_eq!(d.kernel_db().lock().senpai_conversation_of(h.lane).unwrap(), Some(h.judge_seat));
+        assert_eq!(d.kernel_db().lock().senpai_of(h.lane).unwrap(), Some(h.judge_seat));
         assert_eq!(d.kernel().resolve_context_review(h.lane).await.unwrap().reviewer.name, "judge");
-        {
-            let db = d.kernel_db().lock();
-            let judge_instance = db.context_instance(h.judge_seat).unwrap().unwrap().0;
-            assert_eq!(db.context_instance_row(h.lane).unwrap().unwrap().senpai_instance, Some(judge_instance));
-        }
         let back = d.dispatch(&[s("senpai"), s("set"), h.other.to_hex(), h.seat.to_hex()], &caller(h.banto, h.seat)).await;
         assert!(back.is_ok(), "banto holds other-lane's senpai and the target seat: {}", back.message());
     }
@@ -551,15 +547,15 @@ mod tests {
         let cycle = d.dispatch(&set(h.seat, h.lane), &caller(h.amy, h.root)).await;
         assert!(!cycle.is_ok() && cycle.message().contains("cycle"), "{}", cycle.message());
 
-        // A context with no instance has nobody to answer for the kohai.
+        // A context with no context character has nobody to answer for the kohai.
         let empty = register_context(&d, Some("nobody-holds"), Some(h.root), h.amy);
         d.kernel_db().lock().conn_for_ledger().execute(
-            "UPDATE contexts SET instance_id = NULL, binding_seq = NULL WHERE context_id = ?1",
+            "DELETE FROM context_characters WHERE context_id = ?1",
             rusqlite::params![empty.as_bytes().as_slice()],
         ).unwrap();
         let holderless = d.dispatch(&set(h.lane, empty), &caller(h.amy, h.root)).await;
         assert!(
-            !holderless.is_ok() && holderless.message().contains("belongs to no character instance"),
+            !holderless.is_ok() && holderless.message().contains("has no context character"),
             "{}", holderless.message()
         );
 
@@ -569,7 +565,7 @@ mod tests {
         assert!(outcome.ask.is_some());
         let pending = d.dispatch(&set(h.lane, h.judge_seat), &caller(h.amy, h.root)).await;
         assert!(!pending.is_ok() && pending.message().contains("pending asks"), "{}", pending.message());
-        assert_eq!(d.kernel_db().lock().senpai_conversation_of(h.lane).unwrap(), Some(h.seat), "every refusal changed nothing");
+        assert_eq!(d.kernel_db().lock().senpai_of(h.lane).unwrap(), Some(h.seat), "every refusal changed nothing");
     }
 
     /// Setting the senpai again clears the migration's note, which `kj
@@ -610,11 +606,11 @@ mod tests {
         assert!(none.message().contains("has no live kohai"), "{}", none.message());
     }
 
-    /// `kj kohai create` starts an instance of the named character whose
-    /// conversation is the new context. Its senpai is the caller's instance,
-    /// and binding `seq` 1 copies the character's cast.
+    /// `kj kohai create` makes a new context performed by the named
+    /// character. Its senpai is the caller's context, and its slots copy the
+    /// character's cast.
     #[tokio::test]
-    async fn kohai_create_starts_an_instance_under_the_callers_instance_on_binding_one() {
+    async fn kohai_create_makes_a_context_character_under_the_callers_context() {
         let d = test_dispatcher().await;
         let h = house(&d);
         let admin = test_caller();
@@ -627,25 +623,18 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let fresh = db.find_context_by_label("fresh").unwrap().unwrap();
-        let (instance_id, seq) = db.context_instance(fresh.context_id).unwrap().expect("the new context is in an instance");
-        assert_eq!(seq, 1);
-        let instance = db.get_instance(instance_id).unwrap().unwrap();
-        assert_eq!(instance.principal_id, h.coder);
-        assert_eq!(instance.created_by, h.banto, "the requester started it");
-        let seat_instance = db.context_instance(h.seat).unwrap().unwrap().0;
-        assert_eq!(instance.senpai_instance, Some(seat_instance), "its senpai is the caller's instance");
-        let bindings = db.list_instance_bindings(instance_id).unwrap();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!((bindings[0].seq, bindings[0].conversation_ctx, bindings[0].cast_label.as_deref()), (1, fresh.context_id, Some("band")));
+        let character = db.context_character(fresh.context_id).unwrap().expect("the new context has a context character");
+        assert_eq!(character.principal_id, h.coder);
+        assert_eq!(fresh.created_by, h.banto, "the requester made it");
+        assert_eq!(character.senpai_ctx, Some(h.seat), "its senpai is the caller's context");
+        assert!(db.list_context_slots(fresh.context_id).unwrap().is_empty(), "the cast has no slot to copy");
         assert_eq!(fresh.played_by, Some(h.coder));
-        assert_eq!(db.senpai_conversation_of(fresh.context_id).unwrap(), Some(h.seat), "its senpai's conversation is the caller's");
         drop(db);
         assert_eq!(d.kernel().resolve_context_review(fresh.context_id).await.unwrap().reviewer.name, "banto");
     }
 
-    /// `--senpai` names the instance of any context it is given, and only
-    /// when the caller's character is that instance's character or its
-    /// lineage root; `--parent` is provenance only and may differ.
+    /// `--senpai` names any context it is given, and only when the caller's
+    /// character is that context's character or its lineage root; `--parent` is provenance only and may differ.
     #[tokio::test]
     async fn kohai_create_senpai_needs_the_caller_to_hold_it_or_be_its_root() {
         let d = test_dispatcher().await;
@@ -666,16 +655,14 @@ mod tests {
         assert_eq!(row.forked_from, Some(h.lane), "--parent records provenance");
         {
             let db = d.kernel_db().lock();
-            assert_eq!(db.senpai_conversation_of(row.context_id).unwrap(), Some(h.judge_seat), "--senpai routes");
-            let judge_instance = db.context_instance(h.judge_seat).unwrap().unwrap().0;
-            assert_eq!(db.context_instance_row(row.context_id).unwrap().unwrap().senpai_instance, Some(judge_instance));
+            assert_eq!(db.senpai_of(row.context_id).unwrap(), Some(h.judge_seat), "--senpai routes");
         }
 
         let own = d.dispatch(&create("by-holder", &["--senpai", "banto-seat"]), &caller(h.banto, h.lane)).await;
         assert!(own.is_ok(), "banto holds banto-seat: {}", own.message());
         let row = d.kernel_db().lock().find_context_by_label("by-holder").unwrap().unwrap();
         assert_eq!(row.forked_from, Some(h.lane));
-        assert_eq!(d.kernel_db().lock().senpai_conversation_of(row.context_id).unwrap(), Some(h.seat));
+        assert_eq!(d.kernel_db().lock().senpai_of(row.context_id).unwrap(), Some(h.seat));
     }
 
     /// `kj senpai report` lands the text in the senpai's log as a drift
@@ -731,11 +718,10 @@ mod tests {
         assert!(d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none());
     }
 
-    /// A verb that takes an instance accepts any of its contexts, and the
-    /// edge it reads is the instance's: moving the instance's senpai changes
-    /// where `show`, `report` and `list` look.
+    /// A fork is a kohai of the context it forked from: the verbs read the
+    /// edge of the context they name, and moving a fork moves that fork only.
     #[tokio::test]
-    async fn the_senpai_verbs_name_an_instance_by_any_context_and_read_the_instance_edge() {
+    async fn the_senpai_verbs_read_the_edge_of_the_context_they_name() {
         let d = test_dispatcher().await;
         let h = house(&d);
         for ctx in [h.root, h.seat, h.judge_seat, h.lane] {
@@ -743,55 +729,37 @@ mod tests {
         }
         let fork = register_context(&d, Some("lane-fork"), Some(h.lane), h.amy);
         d.block_store().create_document(fork, crate::DocumentKind::Conversation, None).unwrap();
-        let (lane_instance, root_instance) = {
-            let db = d.kernel_db().lock();
-            let (instance, seq) = db.context_instance(h.lane).unwrap().unwrap();
-            db.join_instance(fork, instance, seq).unwrap();
-            (instance, db.context_instance(h.root).unwrap().unwrap().0)
-        };
+        d.kernel_db().lock().copy_context_character(h.lane, fork).unwrap().expect("the lane has a context character");
         let drifts = |ctx: ContextId| -> usize {
             d.block_store().block_snapshots(ctx).unwrap().into_iter()
                 .filter(|b| b.kind == kaijutsu_types::BlockKind::Drift).count()
         };
 
         let shown = d.dispatch(&[s("senpai"), s("show"), s("lane-fork")], &caller(h.coder, h.lane)).await;
-        assert!(shown.message().contains(&format!("instance: lane ({}), coder", h.lane.short())), "{}", shown.message());
-        let listed = d.dispatch(&[s("kohai"), s("list"), s("lane-fork")], &caller(h.coder, h.lane)).await;
-        assert!(listed.message().contains("has no live kohai"), "{}", listed.message());
+        assert!(shown.message().contains(&format!("context: lane-fork ({}), coder", fork.short())), "{}", shown.message());
+        assert!(shown.message().contains(&format!("senpai: lane ({}), coder", h.lane.short())), "{}", shown.message());
+        let listed = d.dispatch(&[s("kohai"), s("list"), s("lane")], &caller(h.coder, h.lane)).await;
+        assert!(listed.message().contains(&format!("lane-fork ({})  coder", fork.short())), "{}", listed.message());
+        let none = d.dispatch(&[s("kohai"), s("list"), s("lane-fork")], &caller(h.coder, h.lane)).await;
+        assert!(none.message().contains("has no live kohai"), "{}", none.message());
 
         let reported = d.dispatch(&[s("senpai"), s("report"), s("from the fork")], &caller(h.coder, fork)).await;
         assert!(reported.is_ok(), "{}", reported.message());
-        assert_eq!((drifts(h.seat), drifts(h.root)), (1, 0), "a fork reports to its instance's senpai");
+        assert_eq!((drifts(h.lane), drifts(h.seat)), (1, 0), "a fork reports to the context it forked from");
 
-        // The instance edge moves.
-        d.kernel_db().lock().set_senpai_instance(lane_instance, Some(root_instance)).unwrap();
-        assert_eq!(d.kernel_db().lock().senpai_conversation_of(h.lane).unwrap(), Some(h.root));
-        let shown = d.dispatch(&[s("senpai"), s("show"), s("lane")], &caller(h.amy, h.root)).await;
-        assert!(shown.message().contains(&format!("senpai: amy ({}), amy", h.root.short())), "{}", shown.message());
-        let reported = d.dispatch(&[s("senpai"), s("report"), s("after the move")], &caller(h.coder, fork)).await;
-        assert!(reported.is_ok(), "{}", reported.message());
-        assert_eq!((drifts(h.seat), drifts(h.root)), (1, 1), "the report follows the instance edge");
-        let seat_kohai = d.dispatch(&[s("kohai"), s("list"), s("banto-seat")], &caller(h.banto, h.seat)).await;
-        assert!(!seat_kohai.message().lines().any(|l| l.starts_with("lane (")), "{}", seat_kohai.message());
-        assert!(seat_kohai.message().contains("other-lane"), "{}", seat_kohai.message());
-        let root_kohai = d.dispatch(&[s("kohai"), s("list"), s("lane-fork")], &caller(h.coder, fork)).await;
-        assert!(root_kohai.message().contains("has no live kohai"), "{}", root_kohai.message());
-        let amy_kohai = d.dispatch(&[s("kohai"), s("list")], &caller(h.amy, h.root)).await;
-        assert!(amy_kohai.message().contains(&format!("lane ({})  coder", h.lane.short())), "{}", amy_kohai.message());
-
-        // `set` takes a fork for the instance to move.
+        // `set` moves the fork alone.
         let moved = d.dispatch(&[s("senpai"), s("set"), s("lane-fork"), s("judge-seat")], &caller(h.amy, h.root)).await;
         assert!(moved.is_ok(), "{}", moved.message());
         let db = d.kernel_db().lock();
-        let judge_instance = db.context_instance(h.judge_seat).unwrap().unwrap().0;
-        assert_eq!(db.get_instance(lane_instance).unwrap().unwrap().senpai_instance, Some(judge_instance));
+        assert_eq!(db.senpai_of(fork).unwrap(), Some(h.judge_seat));
+        assert_eq!(db.senpai_of(h.lane).unwrap(), Some(h.seat), "the lane stays where it was");
     }
 
-    /// Archiving a conversation archives that context only. Its instance is
-    /// inactive: a report to it and a `kj senpai set` onto it refuse, and its
-    /// kohai stay live. Promoting the conversation revives the instance.
+    /// Archiving a context archives that context only. A report to it and a
+    /// `kj senpai set` onto it refuse, and its kohai stay live. Promoting it
+    /// makes both work again.
     #[tokio::test]
-    async fn an_archived_conversation_makes_its_instance_inactive_until_promoted() {
+    async fn an_archived_senpai_refuses_reports_and_moves_until_promoted() {
         let d = test_dispatcher().await;
         let h = house(&d);
         for ctx in [h.root, h.seat, h.lane, h.other] {
@@ -810,8 +778,6 @@ mod tests {
             for kohai in [h.lane, h.other, h.root] {
                 assert!(!db.get_context(kohai).unwrap().unwrap().is_archived(), "archive named only the seat");
             }
-            let seat_instance = db.context_instance(h.seat).unwrap().unwrap().0;
-            assert!(!db.instance_is_active(seat_instance).unwrap());
         }
 
         let report = d.dispatch(&[s("senpai"), s("report"), s("anyone there?")], &caller(h.coder, h.lane)).await;
@@ -831,9 +797,9 @@ mod tests {
         assert!(onto.is_ok(), "{}", onto.message());
     }
 
-    /// The emitted help names instances, never the old context edge.
+    /// The emitted help speaks of contexts, never of instances.
     #[tokio::test]
-    async fn senpai_and_kohai_help_speak_of_instances() {
+    async fn senpai_and_kohai_help_speak_of_contexts() {
         let d = test_dispatcher().await;
         for argv in [
             vec![s("senpai"), s("--help")],
@@ -847,23 +813,19 @@ mod tests {
             let help = d.dispatch(&argv, &test_caller()).await;
             assert!(help.is_ok(), "{argv:?}: {}", help.message());
             println!("== {argv:?}\n{}", help.message());
-            assert!(help.message().to_lowercase().contains("instance"), "{argv:?}: {}", help.message());
+            assert!(!help.message().to_lowercase().contains("instance"), "{argv:?}: {}", help.message());
             assert!(!help.message().contains("holder"), "{argv:?}: {}", help.message());
         }
     }
 
-    /// A pending ask raised in any context of the instance, a fork included,
-    /// blocks moving the instance.
+    /// A pending ask raised in a context below the moved one, a fork
+    /// included, blocks the move.
     #[tokio::test]
-    async fn senpai_set_refuses_while_a_fork_of_the_instance_has_a_pending_ask() {
+    async fn senpai_set_refuses_while_a_fork_of_the_context_has_a_pending_ask() {
         let d = test_dispatcher().await;
         let h = house(&d);
         let fork = register_context(&d, Some("lane-fork"), Some(h.lane), h.amy);
-        {
-            let db = d.kernel_db().lock();
-            let (instance, seq) = db.context_instance(h.lane).unwrap().unwrap();
-            db.join_instance(fork, instance, seq).unwrap();
-        }
+        d.kernel_db().lock().copy_context_character(h.lane, fork).unwrap().expect("the lane has a context character");
         let gate_caller = KjCaller { reviewer_id: Some(h.banto), ..caller(h.coder, fork) };
         let spec = crate::kj::gate::GateSpec { publishes_pair: false, tool_call: None, origin: approval_ledger::types::Origin::Hook, instance: "test".into(), tool: "test".into(), hook_id: None, description: "pending".into(), authorized_label: "pending".into(), statements: vec![crate::kj::gate::GatedStatement { rendered: "pending".into(), statement_kind: "test".into(), vars: vec![], source_index: None }], exec_source: None, exec_stdin: None, planned: vec![] };
         let outcome = crate::kj::gate::run_gate(d.kernel(), &gate_caller, spec, d.kernel().ledger_flows(), &crate::kj::gate_policy::no_config()).await;

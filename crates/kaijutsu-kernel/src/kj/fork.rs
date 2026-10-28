@@ -47,8 +47,8 @@ pub(crate) struct ForkArgs {
     /// Move the session to the child after forking
     #[arg(long)]
     switch: bool,
-    /// Summarize earlier work on the instance's `distill` slot (refuses when
-    /// the binding has none); retain chosen instructions and the latest
+    /// Summarize earlier work on the forking context's `distill` slot (refuses
+    /// when it has none); retain chosen instructions and the latest
     /// complete turn.
     /// Word guidance and input limit come from the source context's environment.
     #[arg(long, conflicts_with_all = ["preset", "include", "exclude"])]
@@ -530,9 +530,9 @@ impl KjDispatcher {
         let admission = {
             let mut db = self.kernel_db().lock();
 
-            // Inherit the workspace from the source. The child joins the
-            // source's character instance and binding, so it runs on the
-            // source's model slots.
+            // Inherit the workspace from the source. The child copies the
+            // source's context character, so it runs on the source's model
+            // slots and answers to the source.
             let source_row = db.get_context(source_id).ok().flatten();
             let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
 
@@ -789,7 +789,7 @@ impl KjDispatcher {
         };
 
         // Keep the native working state and the summary tied to one source version.
-        // The summary runs on the `distill` slot of the forking instance.
+        // The summary runs on the `distill` slot of the forking context.
         let summary = match self.summarize_for_continuation(source_id).await {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
@@ -2134,18 +2134,18 @@ mod tests {
         assert_eq!(row.created_by, c.principal_id, "created_by names the requester, not the performer");
     }
 
-    /// A fork continues its source's performance: it joins the source's
-    /// instance and binding, so it answers to the same senpai.
+    /// A fork continues its source's performance: it copies the source's
+    /// context character and answers to the source.
     #[tokio::test]
-    async fn fork_joins_the_source_instance() {
+    async fn fork_copies_the_source_context_character_and_answers_to_it() {
         let d = test_dispatcher().await;
         let requester = PrincipalId::new();
         let top = register_context(&d, Some("senpai-fork-top"), None, requester);
         let source = register_context(&d, Some("senpai-fork-src"), Some(top), requester);
         {
             let db = d.kernel_db().lock();
-            db.assign_stand_in_instance(top, PrincipalId::new()).unwrap();
-            db.assign_stand_in_instance(source, PrincipalId::new()).unwrap();
+            db.assign_stand_in_character(top, PrincipalId::new()).unwrap();
+            db.assign_stand_in_character(source, PrincipalId::new()).unwrap();
             db.set_context_senpai(source, Some(top)).unwrap();
         }
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
@@ -2156,12 +2156,17 @@ mod tests {
         let child = child_id(&d, "senpai-fork-child");
         let db = d.kernel_db().lock();
         assert_eq!(db.get_context(child).unwrap().unwrap().forked_from, Some(source));
-        assert_eq!(db.context_instance(child).unwrap(), db.context_instance(source).unwrap(), "the fork runs on its source's instance and binding");
-        assert_eq!(db.senpai_conversation_of(child).unwrap(), Some(top), "so it answers to its source's senpai");
+        assert_eq!(
+            db.context_character(child).unwrap().unwrap().principal_id,
+            db.context_character(source).unwrap().unwrap().principal_id,
+            "the fork is performed by its source's character"
+        );
+        assert_eq!(db.senpai_of(child).unwrap(), Some(source), "and answers to the context it forked from");
+        assert_eq!(db.senpai_of(source).unwrap(), Some(top), "the source keeps its own senpai");
     }
 
     #[tokio::test]
-    async fn compact_fork_joins_the_source_instance() {
+    async fn compact_fork_copies_the_source_context_character() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("senpai-compact-src"), None, principal);
@@ -2173,7 +2178,7 @@ mod tests {
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.seed_test_cast(performer, "mock", "mock-model", &["default", "distill"]).unwrap();
-            db.assign_stand_in_instance(source, performer).unwrap();
+            db.assign_stand_in_character(source, performer).unwrap();
         }
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         setup_compact_source(&d, source, principal).await;
@@ -2181,7 +2186,9 @@ mod tests {
         assert!(result.is_ok(), "{}", result.message());
         let child = child_id(&d, "senpai-compact-child");
         let db = d.kernel_db().lock();
-        assert_eq!(db.context_instance(child).unwrap(), db.context_instance(source).unwrap());
+        let (child_row, source_row) = (db.context_character(child).unwrap().unwrap(), db.context_character(source).unwrap().unwrap());
+        assert_eq!(child_row.principal_id, source_row.principal_id);
+        assert_eq!(child_row.senpai_ctx, Some(source));
     }
 
     #[tokio::test]
@@ -2747,13 +2754,12 @@ mod tests {
 
     // ── Track D: cast inherits/assigns across fork ───────────────────────
 
-    // ── A fork joins its source's character instance ──────────────────────
+    // ── A fork copies its source's context character ─────────────────────
 
-    /// A fork is the same performance's continuation: the child joins the
-    /// source's instance, on the same binding `seq`, so it is performed by
-    /// the same character.
+    /// A fork is the same performance's continuation: the child is performed
+    /// by the source's character and answers to the source.
     #[tokio::test]
-    async fn fork_joins_the_instance_and_binding_of_its_source() {
+    async fn fork_is_performed_by_the_character_of_its_source() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let character_id = PrincipalId::new();
@@ -2770,51 +2776,58 @@ mod tests {
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
         assert_eq!(child.played_by, Some(character_id));
-        let source_instance = db.context_instance(source).unwrap().expect("the source has an instance");
-        assert_eq!(db.context_instance(child.context_id).unwrap(), Some(source_instance), "same instance, same binding seq");
-        assert_eq!(db.list_instance_bindings(source_instance.0).unwrap().len(), 1, "a fork writes no binding");
+        assert_eq!(db.senpai_of(child.context_id).unwrap(), Some(source), "a fork answers to the context it forked from");
     }
 
-    /// A fork of a rotated conversation joins the binding that conversation
-    /// runs on, not the instance's first.
+    /// A fork copies the slots its source has, not the character's current
+    /// cast: a cast edited after the source was made reaches no fork.
     #[tokio::test]
-    async fn fork_joins_the_binding_its_source_runs_on() {
+    async fn fork_copies_the_slots_of_its_source_not_the_characters_current_cast() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let character_id = PrincipalId::new();
-        let first = register_context(&d, Some("first"), None, principal);
-        let second = register_context(&d, Some("second"), None, principal);
-        d.block_store().create_document(second, crate::DocumentKind::Conversation, None).unwrap();
-        let instance = {
+        let source = register_context(&d, Some("first"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        {
             let db = d.kernel_db().lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: character_id, name: "binder".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            let cast = db.seed_test_cast(character_id, "mock", "mock-model", &["distill"]).unwrap();
-            db.update_played_by(first, Some(character_id)).unwrap();
-            let (instance, _) = db.context_instance(first).unwrap().unwrap();
-            db.append_binding(instance, Some(cast), None, second).unwrap();
-            instance
-        };
+            db.seed_test_cast(character_id, "mock", "mock-model", &["distill"]).unwrap();
+            db.update_played_by(source, Some(character_id)).unwrap();
+            db.seed_test_cast(character_id, "mock", "edited-model", &["distill"]).unwrap();
+        }
 
         for compact in [false, true] {
             let name = if compact { "compact-child" } else { "full-child" };
             let mut argv = vec![s("fork")];
             if compact {
                 argv.push(s("--compact"));
-                setup_compact_source(&d, second, principal).await;
+                setup_compact_source(&d, source, principal).await;
             }
             argv.extend([s("--name"), s(name)]);
-            let result = d.dispatch(&argv, &caller_with_context(second)).await;
+            let result = d.dispatch(&argv, &caller_with_context(source)).await;
             assert!(result.is_ok(), "{name}: {}", result.message());
             let child = child_id(&d, name);
-            assert_eq!(d.kernel_db().lock().context_instance(child).unwrap(), Some((instance, 2)), "{name}");
+            let db = d.kernel_db().lock();
+            let slots = |ctx| db.list_context_slots(ctx).unwrap().into_iter()
+                .map(|slot| ContextSlotCopy { role: slot.role, model: slot.model, max_tokens: slot.max_tokens })
+                .collect::<Vec<_>>();
+            assert_eq!(slots(child), slots(source), "{name}: the slots are copied verbatim");
+            assert_eq!(slots(child).iter().map(|s| s.model.as_str()).collect::<Vec<_>>(), ["mock-model"], "{name}");
         }
     }
 
-    /// A source with no instance forks a child with none: no performer is
-    /// invented.
+    #[derive(Debug, PartialEq)]
+    struct ContextSlotCopy {
+        role: String,
+        model: String,
+        max_tokens: Option<i64>,
+    }
+
+    /// A source with no context character forks a child with none: no
+    /// performer is invented.
     #[tokio::test]
     async fn fork_of_unplayed_source_leaves_child_unplayed() {
         let d = test_dispatcher().await;
@@ -2831,7 +2844,7 @@ mod tests {
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
         assert_eq!(child.played_by, None);
-        assert_eq!(db.context_instance(child.context_id).unwrap(), None);
+        assert_eq!(db.context_character(child.context_id).unwrap(), None);
     }
 
     // ====================================================================
@@ -2840,11 +2853,11 @@ mod tests {
     // tests above (fork_with_prompt_requests_turn / _without_ / _switch_).
     // ====================================================================
 
-    /// Register a mock LLM provider, give `source`'s character instance a
+    /// Register a mock LLM provider, give `source`'s context character a
     /// `distill` slot on it, and seed `source` with a block so compact's
     /// distillation step (an LLM call over non-empty content) can run in tests.
-    /// A `source` that has an instance keeps it, and must give it a `distill`
-    /// slot itself.
+    /// A `source` that has a context character keeps it, and must give it a
+    /// `distill` slot itself.
     async fn setup_compact_source(
         d: &super::super::KjDispatcher,
         source: kaijutsu_types::ContextId,
@@ -2861,9 +2874,9 @@ mod tests {
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
-            if db.context_instance_row(source).unwrap().is_none() {
+            if db.context_character(source).unwrap().is_none() {
                 db.seed_test_cast(principal, "mock", "mock-model", &["distill"]).unwrap();
-                db.assign_stand_in_instance(source, principal).unwrap();
+                db.assign_stand_in_character(source, principal).unwrap();
             }
         }
         // compact summarizes the source's included blocks; without content it
@@ -3213,11 +3226,11 @@ mod tests {
     // identities can differ and must not be conflated.
 
     /// A compact fork's summary runs on the `distill` slot of the forking
-    /// instance's binding, not the slot of the context's own type.
+    /// context's slots, not the slot of the context's own type.
     ///
     /// Falsified by distilling on the chat slot.
     #[tokio::test]
-    async fn fork_compact_distills_on_the_forking_instances_distill_slot() {
+    async fn fork_compact_distills_on_the_forking_contexts_distill_slot() {
         use crate::llm::{MockClient, Provider};
         use std::sync::Arc;
 
@@ -3244,12 +3257,12 @@ mod tests {
         assert!(!seed.iter().any(|c| c.contains("CHAT-ANSWER")), "{seed:?}");
     }
 
-    /// A fork that asks for distillation from an instance with no `distill`
+    /// A fork that asks for distillation from a context with no `distill`
     /// slot refuses, naming the cast and the fix, before it creates anything.
     ///
     /// Falsified by a compact fork that falls back to the chat model.
     #[tokio::test]
-    async fn fork_compact_without_a_distill_slot_refuses_naming_the_cast_and_the_fix() {
+    async fn fork_compact_without_a_distill_slot_refuses_naming_the_character_and_the_fix() {
         use crate::llm::{MockClient, Provider};
         use std::sync::Arc;
 
@@ -3266,13 +3279,12 @@ mod tests {
         assert!(!result.is_ok(), "a compact fork with no distill slot must refuse");
         let msg = result.message();
         assert!(msg.contains("cannot distill"), "{msg}");
-        assert!(msg.contains("test-default-mock-mock-model"), "names the cast: {msg}");
-        assert!(msg.contains("has no distill slot") && msg.contains("kj cast slot set"), "names the fix: {msg}");
+        assert!(msg.contains("has no distill slot") && msg.contains("kj context rotate"), "names the character and the fix: {msg}");
         assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "no child was created");
     }
 
     /// `--model` and `--distill-model` are gone from `kj fork`: a child runs
-    /// on its instance's binding.
+    /// on its own slots.
     #[tokio::test]
     async fn fork_takes_no_model_flags() {
         let d = test_dispatcher().await;

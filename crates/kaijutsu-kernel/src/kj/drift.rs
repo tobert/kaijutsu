@@ -2755,7 +2755,7 @@ mod tests {
     ///
     /// Falsified by a pull that falls back to the source's or a default model.
     #[tokio::test]
-    async fn drift_pull_without_a_distill_slot_refuses_naming_the_cast_and_the_fix() {
+    async fn drift_pull_without_a_distill_slot_refuses_naming_the_character_and_the_fix() {
         use crate::llm::{MockClient, Provider};
         use std::sync::Arc;
 
@@ -2780,8 +2780,7 @@ mod tests {
         assert!(!result.is_ok(), "a pull with no distill slot must refuse");
         let msg = result.message();
         assert!(msg.contains("cannot distill"), "{msg}");
-        assert!(msg.contains("test-default-mock-mock-model"), "names the cast: {msg}");
-        assert!(msg.contains("has no distill slot") && msg.contains("kj cast slot set"), "names the fix: {msg}");
+        assert!(msg.contains("has no distill slot") && msg.contains("kj context rotate"), "names the character and the fix: {msg}");
         let blocks = d.block_store().block_snapshots(dest).unwrap();
         assert!(
             !blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift),

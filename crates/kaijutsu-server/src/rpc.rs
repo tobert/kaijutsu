@@ -2360,7 +2360,6 @@ fn write_context_row_to_handle_info(
         info.set_provider(&m.backend);
         info.set_model(&m.model);
     }
-    info.set_cast_label(bound.cast().unwrap_or(""));
     info.set_created_at(row.created_at as u64);
     info.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
     info.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
@@ -3608,7 +3607,6 @@ impl kernel::Server for KernelImpl {
                         c.set_provider(&m.backend);
                         c.set_model(&m.model);
                     }
-                    c.set_cast_label(bound_by_ctx.get(&ctx.id).and_then(|b| b.cast()).unwrap_or(""));
                     c.set_created_at(ctx.created_at);
                     c.set_trace_id(&ctx.trace_id);
 
@@ -3771,10 +3769,9 @@ impl kernel::Server for KernelImpl {
                         })?,
                         None => kaijutsu_kernel::ContextModelLookup::None(kaijutsu_kernel::NoModel {
                             context: label.clone(),
-                            instance: None,
                             character: None,
                             role: String::new(),
-                            reason: kaijutsu_kernel::model_resolution::NoModelReason::NoInstance,
+                            reason: kaijutsu_kernel::model_resolution::NoModelReason::NoContextCharacter,
                         }),
                     };
                     (row, cwd, bound)

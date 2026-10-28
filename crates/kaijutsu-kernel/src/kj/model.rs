@@ -6,7 +6,7 @@
 //! The structured `.data` is an array of those specs (alias names +
 //! fully-qualified `provider/model`) so `for m in $(kj models)` iterates usable
 //! handles, per the kj list-data convention. A context's model is not here:
-//! `kj context info` shows the model its binding gives it.
+//! `kj context info` shows the model its slot gives it.
 //!
 //! The dispatch reads the LLM registry behind its async `RwLock`, so it is
 //! async.

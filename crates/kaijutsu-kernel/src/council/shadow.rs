@@ -4,7 +4,7 @@
 //! The gate is the shadow's only writer. [`record_call`] runs before the
 //! gate decides and appends the call as a user turn; [`record_outcome`] runs
 //! after and appends what the gate did as the model turn after it. A seat
-//! has a judge shadow when its binding has a [`JUDGE`] slot; the shadow is
+//! has a judge shadow when its context has a [`JUDGE`] slot; the shadow is
 //! created on the first call the gate evaluates for that seat.
 //!
 //! A new shadow runs the `judge` type's `create` rc lifecycle, whose stance
@@ -466,15 +466,16 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
             judge.shadow = existing.context_id;
             return Ok(Some((judge, false)));
         }
-        // A shadow belongs to its seat's instance, on the seat's binding.
-        let Some((instance, seq)) = db.context_instance(seat)? else {
+        // A shadow is a fork of its seat: the seat's character, slots copied
+        // verbatim, answering to the seat.
+        if db.context_character(seat)?.is_none() {
             return Err(KernelDbError::Validation(format!(
-                "seat context {seat} belongs to no character instance, so its judge shadow has none to join"
+                "seat context {seat} has no context character, so its judge shadow has none to copy"
             )));
-        };
+        }
         let row = shadow_row(&seat_row);
         db.in_transaction(|db| {
-            crate::kj::context::insert_new_context_rows(db, &row, crate::kj::context::InstancePlacement::Join { instance, seq })
+            crate::kj::context::insert_new_context_rows(db, &row, crate::kj::context::CharacterPlacement::Fork { source: seat })
         })?;
         judge.shadow = row.context_id;
         if judge.server.is_none() {
@@ -486,7 +487,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
                 Err(e) => format!("unread: {e}"),
             };
             tracing::warn!(
-                %seat, shadow = %judge.shadow, instance = %instance, binding = seq, %backend,
+                %seat, shadow = %judge.shadow, %backend,
                 "shadow: the judge slot is not on an mk backend, so this judge shadow is created but its judge is never read"
             );
         }

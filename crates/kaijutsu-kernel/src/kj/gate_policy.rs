@@ -108,9 +108,8 @@ pub(crate) enum Layer {
     /// The council's allow for a statement no other layer covered, naming
     /// the spec it read the submission under (`docs/council.md`).
     Council(String),
-    /// A drift along the caller's senpai edge — to its senpai instance's
-    /// conversation, to a kohai instance's, or inside its own instance — that
-    /// no key decided (`docs/senpai-kohai.md`, "Reports and drift").
+    /// A drift along the caller's senpai edge — to its senpai or to one of its
+    /// kohai — that no key decided (`docs/senpai-kohai.md`, "Reports and drift").
     SenpaiEdge,
 }
 
@@ -444,8 +443,8 @@ pub(crate) struct CouncilThreshold {
 /// The `[council]` section with its specs and thresholds.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CouncilConfig {
-    /// The council server decisions go to: the address of the backend of an
-    /// instance's `gate` (or `judge`) slot. gate.toml names none, so a config
+    /// The council server decisions go to: the address of the backend of a
+    /// context's `gate` (or `judge`) slot. gate.toml names none, so a config
     /// it loads holds an empty address until the gate routes it to a slot
     /// ([`crate::council::gate::seat_route`]); a config never reaches a
     /// server unrouted.
@@ -1534,47 +1533,28 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
         CharacterTarget::Context(target) => {
             super::refs::resolve_context_arg_from(target.as_deref(), caller.context_id, db)
                 .ok()
-                .and_then(|id| db.context_instance_row(id).ok().flatten())
-                .and_then(|instance| instance.senpai_instance)
-                .and_then(|senpai| db.get_instance(senpai).ok().flatten())
-                .is_some_and(|senpai| senpai.principal_id == caller.actor_id)
+                .and_then(|id| db.context_character(id).ok().flatten())
+                .and_then(|character| character.senpai_ctx)
+                .and_then(|senpai| db.context_holder(senpai).ok().flatten())
+                .is_some_and(|holder| holder == caller.actor_id)
         }
     }
-}
-
-/// Whether `ancestor` is `context` or one of the contexts it was forked
-/// from, following `forked_from`. A broken chain or a loop ends the walk.
-fn forked_from_chain_reaches(db: &KernelDb, context: ContextId, ancestor: ContextId) -> bool {
-    let mut visited = std::collections::HashSet::new();
-    let mut current = Some(context);
-    while let Some(id) = current {
-        if id == ancestor {
-            return true;
-        }
-        if !visited.insert(id) {
-            return false;
-        }
-        current = db.get_context(id).ok().flatten().and_then(|row| row.forked_from);
-    }
-    false
 }
 
 /// Whether `cmd` drifts along an edge that needs no ask
 /// (`docs/senpai-kohai.md`, "Reports and drift"):
 ///
-/// - `kj drift push` from a context of an instance to its senpai instance's
-///   conversation, or from a context of a senpai instance to a kohai
-///   instance's conversation;
-/// - within one instance, from its conversation down to a context forked
-///   from it, and from such a fork up to the conversation when the fork's
-///   `created_by` is the instance's own character;
-/// - `kj senpai report` from a context whose instance has a senpai.
+/// - `kj drift push` from a context to its senpai, or from a context to one
+///   of its kohai, with one exception: a push up from a fork (a context of
+///   the same character as its senpai) whose `created_by` is not that
+///   character keeps the gate;
+/// - `kj senpai report` from a context that has a senpai.
 ///
-/// The edge is the character instance's, read from the instance tables.
-/// Every argument must be a literal word, and the command plain (no
-/// redirect, background flag or heredoc), since the decision reads the
-/// target out of the arguments. `None` for anything else; the verb itself
-/// still refuses a target that is not live.
+/// The edge is the context character's `senpai_ctx`. Every argument must be a
+/// literal word, and the command plain (no redirect, background flag or
+/// heredoc), since the decision reads the target out of the arguments. `None`
+/// for anything else; the verb itself still refuses a target that is not
+/// live.
 fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
     if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
         return None;
@@ -1588,8 +1568,7 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
     }
     super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
     let matches = super::effect::cached_kj_args_command().try_get_matches_from(&args).ok()?;
-    let (here_instance, _) = db.context_instance(here).ok()??;
-    let here_row = db.get_instance(here_instance).ok()??;
+    let here_row = db.context_character(here).ok()??;
     let label = |id: ContextId| {
         db.get_context(id)
             .ok()
@@ -1606,25 +1585,16 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
                 if target == here {
                     return None;
                 }
-                let (target_instance, _) = db.context_instance(target).ok()??;
-                let target_conversation = db.instance_conversation(target_instance).ok()??;
-                if target_instance == here_instance {
-                    if target_conversation == here {
-                        // The conversation down to one of its forks.
-                        return forked_from_chain_reaches(db, target, here)
-                            .then(|| Decision { layer: Layer::SenpaiEdge, key: format!("kj drift push to {}, its fork", label(target)) });
-                    }
-                    // A fork up to the conversation, when the instance's own character made it.
+                let target_row = db.context_character(target).ok()??;
+                if here_row.senpai_ctx == Some(target) {
+                    // A fork made by someone other than its character keeps the gate.
+                    let fork = target_row.principal_id == here_row.principal_id;
                     let own = db.get_context(here).ok()??.created_by == here_row.principal_id;
-                    return (target == target_conversation && own && forked_from_chain_reaches(db, here, target))
-                        .then(|| Decision { layer: Layer::SenpaiEdge, key: format!("kj drift push to {}, the conversation it forked from", label(target)) });
-                }
-                if target != target_conversation {
-                    return None;
-                }
-                if here_row.senpai_instance == Some(target_instance) {
+                    if fork && !own {
+                        return None;
+                    }
                     edge(format!("kj drift push to {}, its senpai", label(target)))
-                } else if db.get_instance(target_instance).ok()??.senpai_instance == Some(here_instance) {
+                } else if target_row.senpai_ctx == Some(here) {
                     edge(format!("kj drift push to {}, its kohai", label(target)))
                 } else {
                     None
@@ -1634,9 +1604,8 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
         },
         ("senpai", m) => match m.subcommand()? {
             ("report", _) => {
-                let senpai = here_row.senpai_instance?;
-                let conversation = db.instance_conversation(senpai).ok()??;
-                edge(format!("kj senpai report to {}", label(conversation)))
+                let senpai = here_row.senpai_ctx?;
+                edge(format!("kj senpai report to {}", label(senpai)))
             }
             _ => None,
         },
@@ -3032,7 +3001,7 @@ enabled = false
         assert_eq!(c.thresholds[0].mass_floor, -0.05);
     }
 
-    /// The council server and model come from an instance's `gate` slot, so
+    /// The council server and model come from a context's `gate` slot, so
     /// gate.toml refuses both keys as unknown.
     ///
     /// Falsified by adding `server` back to `CouncilToml`.

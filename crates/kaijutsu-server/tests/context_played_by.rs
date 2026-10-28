@@ -60,7 +60,7 @@ fn create_context_records_the_requester_and_the_named_performer() {
             "the performer is the character the create names, not the requester"
         );
         assert_ne!(row.played_by, Some(root.principal_id));
-        let senpai = kernel.kernel_db.lock().senpai_conversation_of(context_id).unwrap();
+        let senpai = kernel.kernel_db.lock().senpai_of(context_id).unwrap();
         assert!(senpai.is_some(), "ordinary context creation records a senpai");
         assert_eq!(
             senpai, row.forked_from,

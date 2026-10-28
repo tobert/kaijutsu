@@ -2655,11 +2655,10 @@ mod tests {
         {
             // The root context now answers to its own descendant.
             let db = d.kernel_db().lock();
-            let instance = db.context_instance_row(ctx).unwrap().expect("the caller's context belongs to an instance");
-            let root = instance.senpai_instance.expect("the caller's instance has a senpai");
+            let root = db.senpai_of(ctx).unwrap().expect("the caller's context has a senpai");
             db.conn_for_ledger().execute(
-                "UPDATE character_instances SET senpai_instance = ?1 WHERE instance_id = ?2",
-                rusqlite::params![instance.instance_id.as_bytes().as_slice(), root.as_bytes().as_slice()],
+                "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+                rusqlite::params![ctx.as_bytes().as_slice(), root.as_bytes().as_slice()],
             ).unwrap();
             let error = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap_err();
             assert!(error.contains("cycle") && error.contains(&ask.request_id), "{error}");
@@ -3382,7 +3381,7 @@ mod tests {
         let kei = character("kei");
         // Each context's senpai is its parent here (`register_context`).
         // A lane with no named performer is run by a stand-in worker: every
-        // context that routes needs an instance.
+        // context that routes needs a context character.
         let worker = character("worker");
         let context = |label: &str, parent, played_by: Option<PrincipalId>| {
             let id = register_context(d, Some(label), Some(parent), amy);
@@ -3555,51 +3554,43 @@ mod tests {
         assert_eq!(asked.verdict, Pending, "{}", asked.reason);
     }
 
-    /// Inside one instance a drift runs with no ask from the conversation
-    /// down to its forks, and from a fork up to the conversation when the
-    /// instance's own character made the fork; a fork a person made keeps
-    /// the gate on the way up, and so does a fork-to-fork drift. A `gate.toml`
-    /// ask key on `kj drift push` still wins (`docs/senpai-kohai.md`,
-    /// "Reports and drift").
+    /// A fork is a kohai of the context it forked from, so a drift between a
+    /// context and its fork runs with no ask, one hop at a time: down to the
+    /// fork, and up from it when the fork's own character made it. A fork a
+    /// person made keeps the gate on the way up; a fork-to-fork drift and a
+    /// drift two hops away keep it too. A `gate.toml` ask key on `kj drift
+    /// push` still wins (`docs/senpai-kohai.md`, "Reports and drift").
     #[tokio::test]
-    async fn a_drift_inside_one_instance_asks_only_up_from_a_fork_a_person_made() {
+    async fn a_drift_to_a_fork_asks_only_up_from_a_fork_a_person_made_or_two_hops_away() {
         use crate::kj::gate::GateVerdict::{Allowed, Pending};
         let d = test_dispatcher().await;
         let house = character_house(&d);
         let seat = house.banto.context_id.unwrap();
         let banto = house.banto.actor_id;
         let amy = house.banto.principal_id;
-        let (instance, seq) = d.kernel_db().lock().context_instance(seat).unwrap().unwrap();
         let fork = |label: &str, parent: kaijutsu_types::ContextId, made_by: PrincipalId| {
             let id = crate::kj::test_helpers::register_context(&d, Some(label), Some(parent), made_by);
-            d.kernel_db().lock().join_instance(id, instance, seq).unwrap();
+            d.kernel_db().lock().copy_context_character(parent, id).unwrap().expect("the parent has a context character");
             id
         };
         let own = fork("own-fork", seat, banto);
         let person = fork("person-fork", seat, amy);
         let grandchild = fork("own-grandchild", own, banto);
-        // In the instance but not forked from its conversation.
-        let stray = fork("stray", house.root, banto);
-        // A fork inside a kohai's instance: the edge reaches a conversation only.
-        {
-            let id = crate::kj::test_helpers::register_context(&d, Some("lane-fork"), Some(house.lane_a), banto);
-            let (lane_instance, lane_seq) = d.kernel_db().lock().context_instance(house.lane_a).unwrap().unwrap();
-            d.kernel_db().lock().join_instance(id, lane_instance, lane_seq).unwrap();
-        }
+        // A fork of a kohai is two hops from the seat.
+        fork("lane-fork", house.lane_a, banto);
         let from = |context| crate::kj::KjCaller { context_id: Some(context), ..house.banto.clone() };
         let cases: &[(kaijutsu_types::ContextId, &str, crate::kj::gate::GateVerdict)] = &[
             (seat, "kj drift push own-fork 'take this branch'", Allowed),
             (seat, "kj drift push person-fork 'take this branch'", Allowed),
-            (seat, "kj drift push own-grandchild 'deeper'", Allowed),
+            (seat, "kj drift push own-grandchild 'deeper'", Pending),
             (own, "kj drift push banto-seat 'branch done'", Allowed),
-            (grandchild, "kj drift push banto-seat 'deep branch done'", Allowed),
+            (own, "kj drift push own-grandchild 'down from a fork'", Allowed),
+            (grandchild, "kj drift push own-fork 'deep branch done'", Allowed),
+            (grandchild, "kj drift push banto-seat 'two hops up'", Pending),
             (person, "kj drift push banto-seat 'a person made me'", Pending),
             (own, "kj drift push person-fork 'sideways'", Pending),
-            (own, "kj drift push own-grandchild 'down from a fork'", Pending),
-            (seat, "kj drift push stray 'not one of my forks'", Pending),
-            (stray, "kj drift push banto-seat 'not forked from it'", Pending),
             (seat, "kj drift push lane-fork 'a fork of a kohai'", Pending),
-            (seat, "kj drift push lane-a 'the kohai conversation'", Allowed),
+            (seat, "kj drift push lane-a 'the kohai'", Allowed),
         ];
         for (context, source, expected) in cases {
             let outcome = gate_once(&d, &from(*context), planned_shell_spec(source)).await;

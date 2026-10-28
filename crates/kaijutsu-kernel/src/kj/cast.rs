@@ -4,8 +4,8 @@
 //! `context_type` (coder, musician, mcp, …), or `gate`, `judge` or `distill`.
 //! A slot names a backend + model and may set any request parameter. A
 //! parameter the slot leaves unset is read from the model's `backend_models`
-//! row when a character instance's binding is written; after that nothing
-//! reads the cast, so a cast change reaches an instance when it is rotated.
+//! row when a context character's slots are written; after that nothing
+//! reads the cast, so a cast change reaches a context when it is rotated.
 //!
 //! The `gate` and `judge` roles are not context types: they name the council
 //! server for gate decisions and for the judge shadow
@@ -98,8 +98,8 @@ enum CastSlotCommand {
         #[arg(long)]
         model: String,
         /// Maximum RESPONSE tokens. Omit to read it from the model's
-        /// `kj backend model set` row when an instance is bound; a binding
-        /// refuses a model request role with neither
+        /// `kj backend model set` row when a context's slots are copied; a context
+        /// character write refuses a model request role with neither
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -256,7 +256,7 @@ impl KjDispatcher {
                 knobs.push(format!("thinking_style={v}"));
             }
             // Only the slot's own values are shown; the rest are read from
-            // the model's row when an instance is bound, and printing them
+            // the model's row when a context's slots are copied, and printing them
             // here would read as a per-slot decision nobody made.
             let knob_str = if knobs.is_empty() {
                 " (no parameters set)".to_string()
@@ -423,7 +423,7 @@ impl KjDispatcher {
                         match effective_max_tokens {
                             None if !matches!(role.as_str(), "gate" | "judge") => msg.push_str(&format!(
                                 " — WARN: no max_tokens in the slot or in the model's row, and every \
-                                 request carries max_tokens; binding an instance to this cast will \
+                                 request carries max_tokens; making a context for a character of this cast will \
                                  refuse until one is set (`--max-tokens` here, or `kj backend model \
                                  set {backend} {model} --max-tokens N`)"
                             )),
@@ -525,7 +525,7 @@ mod tests {
     }
 
     /// A slot write lands in the cast and invents no value: a parameter the
-    /// slot leaves unset stays unset until an instance is bound.
+    /// slot leaves unset stays unset until a context's slots are copied.
     ///
     /// Falsified by a slot write that fills `max_tokens` itself.
     #[tokio::test]

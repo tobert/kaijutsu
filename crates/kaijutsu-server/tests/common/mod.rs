@@ -235,10 +235,10 @@ pub fn seed_turn_identity(
         handoff_ctx: None, root_ctx: None, root: false,
     };
     let db = kernel.kernel_db.lock();
-    // A context made by `create_context` is already an instance of a
-    // character; that character is its performer.
-    if let Some(instance) = db.context_instance_row(context).expect("read the context's instance") {
-        return instance.principal_id;
+    // A context made by `create_context` already has a context character;
+    // that character is its performer.
+    if let Some(character) = db.context_character(context).expect("read the context's context character") {
+        return character.principal_id;
     }
     let performer = sheet("mock-performer");
     db.insert_character(&performer)
@@ -247,7 +247,7 @@ pub fn seed_turn_identity(
         .expect("assign the performer");
     // A context answers to its senpai's holder. One made from a context
     // nobody performs has no reviewer, so home it under a root console.
-    let routable = db.senpai_conversation_of(context).ok().flatten()
+    let routable = db.senpai_of(context).ok().flatten()
         .is_some_and(|senpai| db.context_holder(senpai).ok().flatten().is_some());
     if !routable {
         let console = db.list_characters(false).expect("list characters").into_iter()

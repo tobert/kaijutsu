@@ -262,7 +262,7 @@ pub(super) mod fixtures {
             played_by: None,
         };
         edit(&mut row);
-        // The performer is not a column: it becomes the context's instance.
+        // The performer is not a column: it becomes the context's character.
         let performer = row.played_by.take();
         {
             let db = kernel.kernel_db().lock();
@@ -270,15 +270,15 @@ pub(super) mod fixtures {
                 .get_or_create_default_workspace(PrincipalId::system())
                 .expect("default workspace");
             db.insert_context_with_document(&row, ws).expect("insert context");
-            // A performer is the character of the context's instance. A
-            // context made under a parent whose instance exists answers to it,
-            // as a create would.
+            // A performer is the character of the context's context character.
+            // A context made under a parent that has one answers to it, as a
+            // create would.
             if let Some(performer) = performer {
-                db.update_played_by(id, Some(performer)).expect("give the context its instance");
+                db.update_played_by(id, Some(performer)).expect("give the context its context character");
                 if let Some(parent) = row.forked_from
-                    && db.context_instance_row(parent).expect("read the parent's instance").is_some()
+                    && db.context_character(parent).expect("read the parent's context character").is_some()
                 {
-                    db.set_context_senpai(id, Some(parent)).expect("place the instance under its parent's");
+                    db.set_context_senpai(id, Some(parent)).expect("place the context under its parent");
                 }
             }
         }

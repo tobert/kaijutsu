@@ -92,8 +92,8 @@ enum BackendCommand {
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
     },
-    /// Remove a backend. Refused while a cast slot, a character instance's
-    /// binding, or an alias still names it.
+    /// Remove a backend. Refused while a cast slot, a context's slot, or an
+    /// alias still names it.
     #[command(alias = "rm")]
     Remove {
         /// Backend name
@@ -108,8 +108,8 @@ enum BackendCommand {
 enum BackendModelCommand {
     /// Pin one model's metadata and tunables on a backend. Only the flags you
     /// pass change. A cast slot's own value wins; a tunable the slot leaves
-    /// unset is read from here when a character instance's binding is
-    /// written, so a change reaches instances after `kj context rotate`.
+    /// unset is read from here when a context character's slots are
+    /// written, so a change reaches contexts after `kj context rotate`.
     Set {
         /// Backend name
         backend: String,
@@ -898,13 +898,13 @@ mod tests {
         }
     }
 
-    /// A character instance's binding names a backend for as long as the
-    /// binding exists, and bindings are never changed, so the backend cannot
-    /// be removed: the refusal says which bindings hold it.
+    /// A context's slot names a backend for as long as the context exists,
+    /// and slots are never changed, so the backend cannot be removed: the
+    /// refusal says which contexts hold it.
     ///
-    /// Falsified by a removal that ignores `instance_slots`.
+    /// Falsified by a removal that ignores `context_slots`.
     #[tokio::test]
-    async fn remove_is_refused_while_an_instance_binding_names_the_backend() {
+    async fn remove_is_refused_while_a_context_slot_names_the_backend() {
         let d = seeded().await;
         let c = test_caller();
         let principal = kaijutsu_types::PrincipalId::new();
@@ -917,10 +917,10 @@ mod tests {
             db.seed_test_cast(principal, "deepseek", "deepseek-flash", &["default"]).unwrap();
         }
         let ctx = crate::kj::test_helpers::register_context(&d, Some("bound-ctx"), None, principal);
-        d.kernel_db().lock().assign_stand_in_instance(ctx, principal).unwrap();
+        d.kernel_db().lock().assign_stand_in_character(ctx, principal).unwrap();
         let r = d.dispatch(&argv(&["backend", "rm", "deepseek"]), &c).await;
         assert!(!r.is_ok(), "a bound backend must not be removed: {}", r.message());
-        assert!(r.message().contains("character instance bindings"), "{}", r.message());
+        assert!(r.message().contains("context slots of"), "{}", r.message());
         assert!(d.kernel_db().lock().get_backend_by_name("deepseek").unwrap().is_some());
     }
     #[tokio::test]

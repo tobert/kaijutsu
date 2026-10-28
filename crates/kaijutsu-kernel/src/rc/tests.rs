@@ -978,7 +978,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         assert_eq!(child.created_by, caller.principal_id, "Amy requested the work");
         assert_eq!(child.played_by, Some(coder));
         let lead_work = lookup_context_id(&d, "lead-work");
-        let senpai = d.kernel_db().lock().senpai_conversation_of(child_id).unwrap();
+        let senpai = d.kernel_db().lock().senpai_of(child_id).unwrap();
         assert_eq!(senpai, Some(lead_work), "the lead's context is its coder's senpai");
         assert_eq!(
             d.kernel().resolve_context_review(child_id).await.unwrap().reviewer.principal_id,
@@ -3475,7 +3475,7 @@ esac
         assert!(db.get_context(stranger).unwrap().unwrap().archived_at.is_none(), "the seat does not hold stranger's senpai");
         drop(db);
         let contents = block_contents_in(&d, seat).join("\n");
-        assert!(contents.contains("stranger is neither"), "the refusal is recorded in the seat: {contents}");
+        assert!(contents.contains("only its own kohai") && contents.contains("stranger is not one"), "the refusal is recorded in the seat: {contents}");
     }
 
     /// A nested archive passes only for a kohai of the seat itself. The

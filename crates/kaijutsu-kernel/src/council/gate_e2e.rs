@@ -1832,7 +1832,7 @@ async fn one_deadline_bounds_prepare_and_the_decision_together() {
     }
 }
 
-/// A model seat on a tool rig: the performer's cast gives its binding a
+/// A model seat on a tool rig: the performer's cast gives its context a
 /// `default` slot on the mock model, which records each request,
 /// and `/scratch` is a host directory the commands leave markers in.
 struct Seat {
@@ -3163,8 +3163,15 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     assert_eq!(shadow.label.as_deref(), Some("judge-council-seat"));
     {
         let db = rig.d.kernel_db().lock();
-        let seat = db.context_instance(rig.ctx.context_id).unwrap().expect("the seat belongs to an instance");
-        assert_eq!(db.context_instance(shadow.context_id).unwrap(), Some(seat), "a shadow joins its seat's instance, on the seat's binding");
+        let seat = db.context_character(rig.ctx.context_id).unwrap().expect("the seat has a context character");
+        let copy = db.context_character(shadow.context_id).unwrap().expect("the shadow has a context character");
+        assert_eq!(copy.principal_id, seat.principal_id, "a shadow is the seat's character");
+        assert_eq!(copy.senpai_ctx, Some(rig.ctx.context_id), "a shadow answers to its seat");
+        assert_eq!(
+            db.list_context_slots(shadow.context_id).unwrap().into_iter().map(|s| (s.role, s.model)).collect::<Vec<_>>(),
+            db.list_context_slots(rig.ctx.context_id).unwrap().into_iter().map(|s| (s.role, s.model)).collect::<Vec<_>>(),
+            "a shadow copies its seat's slots verbatim"
+        );
     }
 
     let turns = dialogue(&rig, shadow.context_id);
@@ -3283,9 +3290,9 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     rig.finish().await;
 }
 
-/// The gate and the judge shadow read the binding the seat's instance runs
-/// on. Moving the character to a cast with neither slot changes nothing for
-/// the running instance: its decisions still go to its gate slot's server,
+/// The gate and the judge shadow read the slots the seat's context holds.
+/// Moving the character to a cast with neither slot changes nothing for the
+/// running context: its decisions still go to its gate slot's server,
 /// and its judge shadow is still made.
 ///
 /// Falsified by reading the character's live cast.
@@ -3357,7 +3364,7 @@ async fn a_seat_whose_gate_slot_names_a_council_server_decides_there() {
     }
 }
 
-/// An instance with no `gate` slot has no council: its gate decides without
+/// A context with no `gate` slot has no council: its gate decides without
 /// one, so no server is asked and no council decision is recorded, whatever
 /// gate.toml enables.
 ///
