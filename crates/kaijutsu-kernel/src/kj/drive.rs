@@ -145,10 +145,11 @@ impl KjDispatcher {
         };
 
         // A prompt becomes a durable User/Text block authored by the caller's
-        // performer, who wrote it; the turn request below keeps the
-        // requester. Without a prompt, anchor at the existing tail. The model
-        // reads the log; event content is an observation, not another copy
-        // to insert.
+        // performer, who wrote it. That performer is also the driven turn's
+        // requester (`docs/approval-identity.md`, "Three identities"); the
+        // target's own performer and reviewer still play and review it.
+        // Without a prompt, anchor at the existing tail. The model reads the
+        // log; event content is an observation, not another copy to insert.
         let seed: String = parsed.prompt.clone().unwrap_or_default();
         let after = match parsed.prompt.as_deref() {
             Some(prompt) => {
@@ -177,7 +178,7 @@ impl KjDispatcher {
         let (turn_id, work_id) = match self.kernel().request_turn_admitted(crate::runtime::turn_request::TurnRequest {
             score,
             context_id: target, after_block_id: after, content: seed,
-            principal_id: caller.principal_id, model: None, continuation_epoch: None,
+            principal_id: caller.actor_id, model: None, continuation_epoch: None,
         }, slot, admission) {
             Ok(crate::runtime::turn_request::TurnAdmission::Accepted { turn_id, work_id }) => (turn_id, work_id),
             Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),
@@ -462,8 +463,8 @@ mod tests {
 
     /// A model that drives another context with a prompt wrote that prompt,
     /// so the seed block carries the performer, as a drift block does
-    /// (`docs/approval-identity.md`, "Three identities"). The turn request
-    /// keeps the requester, which scopes the driven turn's capabilities.
+    /// (`docs/approval-identity.md`, "Three identities"). The performer is
+    /// also the driven turn's requester.
     #[tokio::test]
     async fn drive_seed_block_carries_the_performer_not_the_requester() {
         let d = test_dispatcher().await;
@@ -483,10 +484,94 @@ mod tests {
         assert_eq!(seed.id.principal_id, banto, "the performer wrote the prompt");
         match sub.try_recv().expect("drive --prompt should publish").payload {
             crate::flows::TurnFlow::Requested { principal_id, .. } => {
-                assert_eq!(principal_id, c.principal_id, "the turn keeps its requester");
+                assert_eq!(principal_id, banto, "the driving performer requests the turn");
             }
             other => panic!("expected Requested, got {other:?}"),
         }
+    }
+
+    /// A tool that records the identity each call carries.
+    struct IdentityProbe {
+        id: crate::mcp::InstanceId,
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<crate::mcp::CallContext>>>,
+        notif_tx: tokio::sync::broadcast::Sender<crate::mcp::server_like::ServerNotification>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::server_like::McpServerLike for IdentityProbe {
+        fn instance_id(&self) -> &crate::mcp::InstanceId { &self.id }
+        async fn list_tools(&self, _ctx: &crate::mcp::CallContext) -> crate::mcp::McpResult<Vec<crate::mcp::KernelTool>> {
+            Ok(vec![crate::mcp::KernelTool { instance: self.id.clone(), name: "probe".into(), description: None,
+                input_schema: serde_json::json!({"type": "object"}) }])
+        }
+        async fn call_tool(&self, _params: crate::mcp::KernelCallParams, ctx: &crate::mcp::CallContext,
+            _cancel: tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<crate::mcp::KernelToolResult>
+        {
+            self.seen.lock().push(ctx.clone());
+            Ok(crate::mcp::KernelToolResult::text("seen"))
+        }
+        fn notifications(&self) -> tokio::sync::broadcast::Receiver<crate::mcp::server_like::ServerNotification> {
+            self.notif_tx.subscribe()
+        }
+    }
+
+    /// banto, performing a turn amy requested, drives coder's lane. The
+    /// lane's tool calls carry banto as requester, coder as performer, and
+    /// the lane's own reviewer, so the drive does not make banto review
+    /// coder's work or amy request it.
+    #[tokio::test]
+    async fn a_driven_turn_s_tools_run_with_the_driving_performer_as_requester() {
+        use crate::llm::{MockClient, Provider, StreamEvent};
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let [amy, banto, coder, judge] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
+        let lane = register_context(&d, Some("lane"), None, amy);
+        seed_with_block(&d, lane, amy);
+        {
+            let mut db = d.kernel_db().lock();
+            for (principal_id, name) in [(amy, "drive-amy"), (banto, "drive-banto"), (coder, "drive-coder"), (judge, "drive-judge")] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            db.update_context_review(lane, Some(coder), Some(judge)).unwrap();
+        }
+        let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
+        let mock = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: s("probe-1"), name: s("probe"), input: serde_json::json!({}) }, done("tool_use")],
+            vec![StreamEvent::TextStart, StreamEvent::TextDelta(s("seen it")), StreamEvent::TextEnd, done("end_turn")],
+        ]);
+        {
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+            assert!(registry.set_default("mock"));
+            registry.set_default_model("mock-model");
+        }
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (notif_tx, _) = tokio::sync::broadcast::channel(1);
+        d.kernel().broker().register(
+            std::sync::Arc::new(IdentityProbe { id: crate::mcp::InstanceId::new("drive.probe"), seen: seen.clone(), notif_tx }),
+            crate::mcp::InstancePolicy::for_kernel(d.kernel()),
+        ).await.unwrap();
+        d.kernel().broker().set_binding(lane,
+            crate::mcp::ContextToolBinding::with_instances(vec![crate::mcp::InstanceId::new("drive.probe")])).await.unwrap();
+
+        let mut caller = caller_with_context(lane).with_actor(banto, Some(amy));
+        caller.principal_id = amy;
+        let result = d.dispatch(&[s("drive"), s("lane"), s("--prompt"), s("look")], &caller).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while seen.lock().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the driven turn never called the probe: {:#?}",
+                d.block_store().block_snapshots(lane).unwrap().iter().map(|b| (b.role, b.kind, b.content.clone())).collect::<Vec<_>>());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let call = seen.lock()[0].clone();
+        assert_eq!(call.principal_id, banto, "the driving performer is the driven turn's requester");
+        assert_eq!(call.actor_id, coder, "the lane's performer performs its turn");
+        assert_eq!(call.reviewer_id, Some(judge), "the lane's own reviewer reviews it");
     }
 
     #[tokio::test]

@@ -584,14 +584,16 @@ inheritance from a calling model context remains a design question.
 
 **Two identities ride every turn, and neither replaces the other.** The
 **requester** is who caused the turn: the principal on the `KjCaller`, on the
-user's prompt or `kj drive` seed (`kj/drive.rs:135–172`), on a gate's ask,
-and on `TurnFlow` events. The **effective actor** is the character whose
+user's prompt, on a gate's ask, and on `TurnFlow` events. `kj drive` makes
+the caller's performer the driven turn's requester, and its seed carries
+that performer. The **effective actor** is the character whose
 performance this is, resolved once at turn start from `played_by`. Who gets
 stamped where:
 
 | Block or record | Principal |
 |---|---|
-| capability checks, drive origin, user prompt and seed, approval ask, `TurnFlow` | requester, unchanged |
+| capability checks, drive origin, user prompt, approval ask, `TurnFlow` | requester, unchanged |
+| `kj drive` seed, and the requester of the driven turn | the driving caller's performer |
 | provider-emitted thinking, model text, model tool call | effective actor (today `system`) |
 | tool result, structured tool error, kernel warning, error and interrupt markers | `system`, unchanged |
 | rc output | the context's `created_by`, unchanged (`rc/mod.rs`) |
@@ -611,8 +613,7 @@ the human who drove the turn; the matrix above says tool output is kernel
 output and should stamp `system`, and those servers should follow it. And
 the gate-resume seed passes no principal (`rpc.rs:1316`), falling through
 to the store default `system` (`rpc.rs:2431`), where `kj drive`'s seed stamps
-the caller (`kj/drive.rs:158`); the resume seed is a requester act and should
-say so.
+the caller's performer; the resume seed is a requester act and should say so.
 
 Two invariants to pin with tests, because both are already load-bearing:
 
