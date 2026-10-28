@@ -8297,13 +8297,6 @@ mod lifetime_tests {
             crate::runtime::prompt::PromptSource::Text { content: "landed".into(), model: None }).await
             .expect("the input landed, so the submit succeeded");
 
-        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
-        assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
-        let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
-        assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
-        assert!(errors[0].contains("No LLM backend is configured"), "{errors:?}");
-        assert!(errors[0].contains("`kj backend set`") && errors[0].contains("`kj backend default set`"),
-            "the error's summary says how to configure a backend: {errors:?}");
         let failed = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let TurnFlow::Failed { .. } = flows.recv().await.unwrap().payload {
@@ -8312,6 +8305,13 @@ mod lifetime_tests {
             }
         }).await;
         assert!(failed.is_ok(), "observers learn the turn failed");
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
+        let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
+        assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
+        assert!(errors[0].contains("No LLM backend is configured"), "{errors:?}");
+        assert!(errors[0].contains("`kj backend set`") && errors[0].contains("`kj backend default set`"),
+            "the error's summary says how to configure a backend: {errors:?}");
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
     }
@@ -9226,13 +9226,16 @@ mod lifetime_tests {
             }
             let mock = MockClient::new("").with_scripted_stream(vec![events]);
             let mock = if ending == "cancel" { mock.hangs_when_exhausted() } else { mock };
+            let (mock, sent) = mock.recording_sent_messages();
             let (kernel, context, _after, call) = fixture(Some(mock)).await;
             let mut completed = kernel.turn_flows().subscribe("turn.completed");
             let mut failed = kernel.turn_flows().subscribe("turn.failed");
             submit_text(&kernel, context, call.principal_id, "go").await;
             if ending == "cancel" {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while !kernel.turn_in_flight(context)
+                    // The submit replies before startup, so the interrupt
+                    // waits for the model call the notice is about.
+                    while sent.lock().is_empty()
                         || (partial && !kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.content == "half an answer"))
                     {
                         tokio::task::yield_now().await;

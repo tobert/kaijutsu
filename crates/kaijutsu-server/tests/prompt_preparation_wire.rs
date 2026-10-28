@@ -26,6 +26,59 @@ fn chat_submit_preparation_survives_the_submitting_ssh_client_disconnect() {
 }
 
 #[test]
+fn chat_submit_replies_once_the_input_commits() {
+    replies_before_preparation(InputPath::ChatSubmit);
+}
+
+#[test]
+fn prompt_replies_once_the_input_commits() {
+    replies_before_preparation(InputPath::Prompt);
+}
+
+/// The submit replies when its input commits, not when its turn starts: with
+/// preparation parked, the reply arrives and its block is already a `Done`
+/// block the client can read. The turn then runs to completion.
+fn replies_before_preparation(path: InputPath) {
+    run_local(async move {
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "reply-on-commit").await.unwrap();
+        seed_turn_identity(&server, context);
+        kj.join_context(context, "submitter").await.unwrap();
+        if matches!(path, InputPath::ChatSubmit) {
+            kj.edit_input(context, 0, "reply on commit", 0).await.unwrap();
+        }
+        let (turn_callback, mut turns) = turn_events_channel(32);
+        kj.subscribe_turn_events(turn_callback).await.unwrap();
+
+        // Provider selection takes the matching read guard in
+        // `spawn_admitted_turn`, so holding the writer parks preparation.
+        let registry = server.kernel.llm().write().await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            match path {
+                InputPath::Prompt => kj.prompt("reply on commit", None, context).await.map(|_| None),
+                InputPath::ChatSubmit => kj.submit_input(context, false).await.map(|r| Some(r.block_id)),
+            }
+        }).await.expect("the submit must reply while its turn preparation is parked").unwrap();
+        assert!(server.kernel.turn_in_flight(context), "the accepted turn is still preparing");
+
+        let blocks = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        let input = blocks.iter().find(|block| block.role == Role::User && block.content == "reply on commit")
+            .expect("the committed input is visible to the client");
+        assert_eq!(input.status, Status::Done);
+        assert!(!input.ephemeral);
+        if let Some(block_id) = reply {
+            assert_eq!(input.id, block_id, "the reply names the promoted draft");
+        }
+
+        drop(registry);
+        assert!(matches!(recv_terminal(&mut turns, context).await, ServerEvent::TurnCompleted { .. }));
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+#[test]
 fn shutdown_joins_submit_lifecycle_before_finishing_the_turn() {
     run_local(async {
         use kaijutsu_kernel::vfs::VfsOps;
@@ -116,8 +169,10 @@ fn disconnect_during_preparation(path: InputPath) {
             "admitted preparation must retain turn liveness before provider selection"
         );
 
+        // The reply may already have arrived, since it does not wait for
+        // preparation; either way the client goes away mid-preparation.
         request.abort();
-        assert!(request.await.is_err(), "the submitting RPC must be cancelled before disconnect");
+        let _ = request.await;
         drop(submitting);
         drop(submitting_client);
         drop(registry);

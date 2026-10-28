@@ -4,7 +4,7 @@ use std::sync::Arc;
 use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, InputEdge, PrincipalId, Role, SessionId, Status};
 use crate::{ExecContext, Kernel, KjCaller};
 use super::admission::ContextAdmission;
-use super::turn_request::{StartupRequest, TurnRequest, queue_startup};
+use super::turn_request::{StartupRequest, TurnRequest, queue_startup, report_failure, watch_startup};
 
 pub enum PromptSource {
     Text { content: String, model: Option<String> },
@@ -14,8 +14,9 @@ pub enum PromptSource {
 /// Persist input before preparation. Accepted work owns its turn before the
 /// first await and survives caller disconnect. An error means the input did
 /// not commit: a context with no performer or reviewer is refused first.
-/// Once the input commits the reply is its block, and a turn that then fails
-/// to start is reported in the transcript and on `TurnFlow::Failed`.
+/// Once the input commits the reply is its block, sent without waiting for
+/// turn startup or the submit lifecycle; a turn that then fails to start is
+/// reported in the transcript and on `TurnFlow::Failed`.
 ///
 /// Reserves a worker-pool slot before minting the `ContextAdmission`, before
 /// the user block is inserted, and before a draft is consumed
@@ -65,24 +66,25 @@ pub async fn submit(
             (block, None, None, Some((info, caller)))
         }
     };
-    let startup = queue_startup(kernel, StartupRequest {
-        admission, lease, request: TurnRequest {
-            context_id: context, after_block_id, content: String::new(),
-            principal_id: principal, model, continuation_epoch: None, score: None,
-        },
-        origin: crate::flows::TurnOrigin::Interactive, tool_ctx, session, submit,
+    // The input has committed, so the submit has happened and the reply is
+    // its block. Startup runs on without the reply: a turn that fails to
+    // start says so in the transcript and on `TurnFlow::Failed`.
+    let turn_id = lease.id();
+    let origin = crate::flows::TurnOrigin::Interactive;
+    let request = TurnRequest {
+        context_id: context, after_block_id, content: String::new(),
+        principal_id: principal, model, continuation_epoch: None, score: None,
+    };
+    match queue_startup(kernel, StartupRequest {
+        admission, lease, request: request.clone(), origin, tool_ctx, session, submit,
         joins_live_turn: true,
-    }, None, slot)?;
-    match startup.await {
-        Ok(Ok(())) => {}
-        // The input has committed, so the submit happened. A turn that then
-        // fails to start says so in the transcript and on `TurnFlow::Failed`
-        // (`turn_request::report_failure`), not by failing the submit.
-        Ok(Err(error)) => {
-            tracing::warn!(context.id = %context, block.id = %after_block_id, %error,
-                "input committed; its turn did not start");
+    }, None, slot) {
+        Ok(startup) => watch_startup(kernel, turn_id, request, origin, startup),
+        Err(error) => {
+            tracing::error!(context.id = %context, block.id = %after_block_id, %error,
+                "input committed; its turn could not be queued");
+            report_failure(kernel, turn_id, &request, origin, error);
         }
-        Err(_) => return Err("turn preparation stopped before replying".to_string()),
     }
     Ok(after_block_id)
 }
@@ -97,14 +99,16 @@ pub(crate) fn follow_up(
         let db = kernel.kernel_db().lock();
         (ContextAdmission::acquire(&db, context)?, kernel.turns().begin(context))
     };
-    // The startup result reports only preparation; the turn reports its own end.
-    let _startup = queue_startup(kernel, StartupRequest {
-        admission, lease, request: TurnRequest {
-            context_id: context, after_block_id: block, content: String::new(),
-            principal_id: principal, model: None, continuation_epoch: None, score: None,
-        },
-        origin: crate::flows::TurnOrigin::Interactive, tool_ctx: None, session,
+    let turn_id = lease.id();
+    let origin = crate::flows::TurnOrigin::Interactive;
+    let request = TurnRequest {
+        context_id: context, after_block_id: block, content: String::new(),
+        principal_id: principal, model: None, continuation_epoch: None, score: None,
+    };
+    let startup = queue_startup(kernel, StartupRequest {
+        admission, lease, request: request.clone(), origin, tool_ctx: None, session,
         submit: None, joins_live_turn: false,
     }, None, slot)?;
+    watch_startup(kernel, turn_id, request, origin, startup);
     Ok(())
 }

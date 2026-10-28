@@ -443,6 +443,10 @@ harmless: compose always holds the keyboard. On a submit the
 tui sends the newest block the transcript showed as the player's edge, with
 its character count as rendered (`ContextView::edge`, `docs/prompts.md`,
 "The submit verb"). A context that has shown nothing at all sends no edge.
+The kernel replies once the draft commits, before the turn starts, so
+compose clears at once and the promoted block reaches the transcript through
+the change feed. A refused submit leaves the draft as typed and shows the
+kernel's reason on the status line.
 
 Rules the figure carries:
 

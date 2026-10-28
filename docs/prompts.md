@@ -456,14 +456,17 @@ and `--preset`; use a filtered fork for those selections.
 
 `submit` fires after the server promotes a player's chat submission to a
 durable user block, the way `drift` fires after a drift block lands
-(`rc/mod.rs`, `rc::run`). It runs awaited inline, so
-anything a script writes is durable before `submitInput` returns.
+(`rc/mod.rs`, `rc::run`). It runs in turn startup, before the turn reads the
+input, so anything a script writes is durable before the model sees the
+input. `submitInput` does not wait for it.
 
-A submit either commits or fails with nothing changed (`prompt::submit`).
-A context with no performer or no reviewer is refused before the draft
-commits, so the draft stays as typed. Once the input commits, `submitInput`
-returns its block; a turn that then fails to start is recorded once in the
-transcript and published as a turn failure, not returned as a submit error.
+A submit either commits or is refused with nothing changed
+(`prompt::submit`). A context with no performer or no reviewer is refused
+before the draft commits, so the draft stays as typed. Once the input
+commits, `submitInput` returns its block at once, and the `submit` scripts
+and turn startup run after the reply. A turn that then fails to start is
+recorded once in the transcript and published as a turn failure, not
+returned as a submit error.
 
 Its scripts read the submit facts as `KJ_*` variables. Every name is always
 set, empty rather than absent when the fact does not apply:

@@ -47,6 +47,43 @@ async fn draft(kernel: &KernelHandle, context_id: ContextId) -> Option<BlockSnap
         .find(|b| b.status == Status::Draft)
 }
 
+/// Every block once `done` holds of them. A submit replies when its input
+/// commits; its `submit` scripts and its turn run after the reply.
+async fn blocks_once(
+    kernel: &KernelHandle,
+    context_id: ContextId,
+    done: impl Fn(&[BlockSnapshot]) -> bool,
+) -> Vec<BlockSnapshot> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let all = blocks(kernel, context_id).await;
+            if done(&all) {
+                return all;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the blocks never settled")
+}
+
+/// Every block once the submitted turn has ended, so its `submit` scripts
+/// have run.
+async fn blocks_after_turn(
+    live_kernel: &kaijutsu_server::SharedKernel,
+    kernel: &KernelHandle,
+    context_id: ContextId,
+) -> Vec<BlockSnapshot> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while live_kernel.kernel.turn_in_flight(context_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the submitted turn never ended");
+    blocks(kernel, context_id).await
+}
+
 async fn open_context(kernel: &KernelHandle, label: &str) -> ContextId {
     let context_id = create_context(&kernel, label).await.unwrap();
     kernel.join_context(context_id, "draft-test").await.unwrap();
@@ -232,9 +269,8 @@ fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
             .unwrap()
             .block_id;
 
-        // Read synchronously after the call returns: the script's block must
-        // already be durable, and it must sit after the user block.
-        let all = blocks(&kernel, context_id).await;
+        // The script's block sits after the user block.
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let expected = format!(
             "input={} edge={} shown=3 tail={} live=",
             third.to_key(),
@@ -312,7 +348,11 @@ fn chat_submit_reports_a_live_turn() {
         kernel.edit_input(context_id, 0, "while you work", 0).await.unwrap();
         let input = kernel.submit_input(context_id, false).await.unwrap().block_id;
 
-        let all = blocks(&kernel, context_id).await;
+        let prefix = format!("input={} ", input.to_key());
+        let all = blocks_once(&kernel, context_id, |all| {
+            all.iter().any(|b| b.kind == BlockKind::Notification && b.content.starts_with(&prefix))
+        })
+        .await;
         let facts = facts_for(&all, input);
         assert!(facts.ends_with("live=true"), "facts: {facts}");
     });
@@ -376,7 +416,7 @@ fn chat_submit_log_tail_counts_ephemeral_blocks_but_not_drafts() {
             .unwrap()
             .block_id;
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let facts = facts_for(&all, input);
         assert!(
             facts.contains(&format!(" tail={} ", marker.to_key())),
@@ -415,7 +455,7 @@ fn chat_submit_survives_a_failing_submit_script() {
             .expect("a script failure never refuses the submit")
             .block_id;
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let sent = all.iter().find(|b| b.id == input).expect("the message is durable");
         assert_eq!(sent.status, Status::Done);
         assert!(
@@ -475,7 +515,7 @@ fn chat_submit_example_script_renders_the_edge_excerpt() {
             .await
             .unwrap();
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let rendered = all
             .iter()
             .filter(|b| b.kind == BlockKind::Notification)
@@ -534,7 +574,7 @@ fn chat_submit_example_script_is_silent_at_the_tail() {
             .await
             .unwrap();
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         assert!(
             !all.iter().any(|b| b.content.starts_with("The player wrote the message above")),
             "an edge at the tail renders nothing"
@@ -897,6 +937,13 @@ fn a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge() {
 
         kernel.submit_input_with_edge(context_id, false, Some(InputEdge { block: earlier, shown: None }))
             .await.unwrap();
+        // The submit replies before its scripts run and the running turn
+        // takes the input; the note's own lease ends once the turn has it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_kernel.kernel.turns().active_count(context_id) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the running turn takes the note");
         hold.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(10), async {

@@ -743,8 +743,15 @@ fn performer_reassignment_rejects_a_queued_inference_over_the_wire() {
         let session = server.kernel.turns().conversations().get_or_create(context);
         let held = session.lock().await;
         kj.prompt("queued for the first performer", None, context).await.unwrap();
-        let epoch = server.kernel_db.lock().continuation_epoch(context).unwrap()
-            .expect("accepted prompt opens its continuation before returning");
+        // The prompt replies on commit; startup opens the continuation after.
+        let epoch = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(epoch) = server.kernel_db.lock().continuation_epoch(context).unwrap() {
+                    return epoch;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("accepted prompt opens its continuation during startup");
         let result = kj.execute_kj_quiet(context, &[
             "context".into(), "set".into(), ".".into(), "--as".into(), "next-performer".into(),
         ]).await.unwrap();
