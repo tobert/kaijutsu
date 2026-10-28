@@ -94,10 +94,11 @@ pub(crate) struct HydrationState {
     /// Matched to ToolResults via `tool_call_id` for correct pairing
     /// even when blocks interleave with model tool calls.
     user_shell_pending: HashMap<BlockId, String>,
-    /// Image messages that arrived while a tool call was unanswered. A tool
-    /// that attaches an image appends it before its own result lands, so the
-    /// image waits and follows the results to keep the call and result adjacent.
-    pending_images: Vec<Message>,
+    /// Messages that arrived while a model's tool batch was open: images a
+    /// tool attaches before its own result lands, and user shell results.
+    /// They wait and follow the batch's results, which keeps each call
+    /// adjacent to its result.
+    deferred: Vec<Message>,
     /// How kernel instructions and drift arrivals render.
     form: InstructionForm,
 }
@@ -304,7 +305,7 @@ impl HydrationState {
             tool_uses: Vec::new(),
             tool_results: Vec::new(),
             user_shell_pending: HashMap::new(),
-            pending_images: Vec::new(),
+            deferred: Vec::new(),
             form,
         }
     }
@@ -323,7 +324,7 @@ impl HydrationState {
         }
         let entry = system_message_entry(block);
         let idle = self.assistant_text.is_none() && self.tool_uses.is_empty()
-            && self.tool_results.is_empty() && self.pending_images.is_empty();
+            && self.tool_results.is_empty() && self.deferred.is_empty();
         if idle && join_system_messages(&mut self.messages, std::slice::from_ref(&entry)) {
             return;
         }
@@ -365,8 +366,9 @@ impl HydrationState {
             }
             (BlockRole::User, BlockKind::ToolCall) => {
                 // User-initiated shell command — extract the code and wait for
-                // the paired ToolResult to emit a single user message.
-                self.flush_all();
+                // the paired ToolResult to emit a single user message. Nothing
+                // is flushed here: a model batch still waiting for results
+                // stays open.
                 let code = block
                     .tool_input
                     .as_ref()
@@ -459,12 +461,7 @@ impl HydrationState {
                             data_base64: None,
                         }]),
                     };
-                    if self.tool_uses.is_empty() && self.tool_results.is_empty() {
-                        self.flush_all();
-                        self.messages.push(message);
-                    } else {
-                        self.pending_images.push(message);
-                    }
+                    self.push_after_open_batch(message);
                 }
                 // Other Asset content types stay skipped (no current producer).
             }
@@ -514,16 +511,15 @@ impl HydrationState {
                     .tool_call_id
                     .and_then(|id| self.user_shell_pending.remove(&id));
                 if let Some(code) = user_code {
-                    // User-initiated shell result → emit as a single user message
-                    self.flush_all();
+                    // User-initiated shell result → one user message, after
+                    // any model batch that is still open.
                     let output = stdout.trim();
-                    if output.is_empty() {
-                        self.messages
-                            .push(Message::user(format!("[User ran `{}`]", code)));
+                    let message = if output.is_empty() {
+                        Message::user(format!("[User ran `{}`]", code))
                     } else {
-                        self.messages
-                            .push(Message::user(format!("[User ran `{}`]\n{}", code, output)));
-                    }
+                        Message::user(format!("[User ran `{}`]\n{}", code, output))
+                    };
+                    self.push_after_open_batch(message);
                 } else {
                     // Agent-initiated tool result — existing logic
                     self.flush_assistant();
@@ -779,7 +775,18 @@ impl HydrationState {
             let results = std::mem::take(&mut self.tool_results);
             self.messages.push(Message::tool_results(results));
         }
-        self.messages.append(&mut self.pending_images);
+        self.messages.append(&mut self.deferred);
+    }
+
+    /// Push `message` now, or defer it while a model's tool batch is open
+    /// (calls or results not yet flushed), so it follows the batch's results.
+    fn push_after_open_batch(&mut self, message: Message) {
+        if self.tool_uses.is_empty() && self.tool_results.is_empty() {
+            self.flush_all();
+            self.messages.push(message);
+        } else {
+            self.deferred.push(message);
+        }
     }
 
     /// Flush everything pending (assistant then tool results).

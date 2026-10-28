@@ -3223,6 +3223,58 @@ mod tests {
             assert!(msgs[2].as_text().unwrap().contains("done sleeping"));
         }
 
+        /// A user shell command that runs while a model's tool batch is
+        /// open waits for the batch: both model results stay adjacent to
+        /// their calls, and the shell message follows them.
+        #[test]
+        fn user_shell_result_inside_a_model_batch_keeps_every_model_result() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+            let model_call = |seq, id: &str| {
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, seq), None, ToolKind::Mcp, "read_file",
+                    serde_json::json!({}), BlockRole::Model, Some(id.to_string()),
+                )
+            };
+            let model_result = |seq, call_seq, id: &str| {
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, seq), BlockId::new(c, m, call_seq), ToolKind::Mcp,
+                    &format!("{id} output"), false, Some(0), Some(id.to_string()),
+                )
+            };
+            let user_call_id = BlockId::new(c, u, 0);
+            let user_tc = BlockSnapshot::tool_call(
+                user_call_id, None, ToolKind::Shell, "shell",
+                serde_json::json!({"code": "ls"}), BlockRole::User, None,
+            );
+            let user_tr = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 1), user_call_id, ToolKind::Shell, "src", false, Some(0), None,
+            );
+
+            for order in [
+                vec![model_call(0, "t1"), model_call(1, "t2"), user_tc.clone(), model_result(0, 0, "t1"),
+                     user_tr.clone(), model_result(2, 1, "t2")],
+                vec![model_call(0, "t1"), model_call(1, "t2"), model_result(0, 0, "t1"), user_tc.clone(),
+                     user_tr.clone(), model_result(2, 1, "t2")],
+                vec![model_call(0, "t1"), model_call(1, "t2"), user_tc.clone(), user_tr.clone(),
+                     model_result(0, 0, "t1"), model_result(2, 1, "t2")],
+            ] {
+                let msgs = hydrate_from_blocks(&order);
+                let roles: Vec<_> = msgs.iter().map(|m| &m.role).collect();
+                assert_eq!(msgs.len(), 3, "got: {roles:?}");
+                assert_eq!(msgs[0].role, Role::Assistant);
+                let MessageContent::Blocks(results) = &msgs[1].content else { panic!("expected results: {:?}", msgs[1]) };
+                let contents: Vec<_> = results.iter().map(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, content, .. } => (tool_use_id.as_str(), content.as_str()),
+                    other => panic!("expected only tool results: {other:?}"),
+                }).collect();
+                assert_eq!(contents, [("t1", "t1 output"), ("t2", "t2 output")]);
+                assert!(msgs[2].as_text().unwrap().contains("[User ran `ls`]"), "{:?}", msgs[2]);
+            }
+        }
+
         #[test]
         fn mid_conversation_orphaned_tool_use_gets_synthetic_result() {
             // Simulates a forked context: model requested a tool, no result came,
