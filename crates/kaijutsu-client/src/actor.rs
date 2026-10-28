@@ -372,14 +372,6 @@ enum RpcCommand {
         label: String,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
-    PromoteContext {
-        context_id: ContextId,
-        reply: oneshot::Sender<Result<(), CallError>>,
-    },
-    DemoteContext {
-        context_id: ContextId,
-        reply: oneshot::Sender<Result<(), CallError>>,
-    },
     SetContextPaused {
         context_id: ContextId,
         paused: bool,
@@ -810,8 +802,6 @@ impl RpcCommand {
             Self::SubscribeVfsActivity { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::RenameContext { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::PromoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextPaused { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextOriginHost { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::AuthorBlock { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1146,23 +1136,6 @@ impl ActorHandle {
     pub async fn rename_context(&self, context_id: ContextId, label: &str) -> Result<(), CallError> {
         let label = label.to_string();
         self.send(|reply| RpcCommand::RenameContext { context_id, label, reply }).await
-    }
-
-    /// Promote a context into the time-well's ring 0 ("active"). First-write-
-    /// wins server-side — re-promoting an already-promoted context is a no-op
-    /// success. Fails loud when the active ring is full (10 seats,
-    /// `ACTIVE_RING_CAPACITY` kernel-side) — the caller surfaces that error.
-    #[tracing::instrument(skip(self))]
-    pub async fn promote_context(&self, context_id: ContextId) -> Result<(), CallError> {
-        self.send(|reply| RpcCommand::PromoteContext { context_id, reply }).await
-    }
-
-    /// Push a context outward one step on the kernel-owned demote ladder:
-    /// promoted → automatic placement; automatic → demoted; already demoted →
-    /// archived (single context, no subtree, no latch).
-    #[tracing::instrument(skip(self))]
-    pub async fn demote_context(&self, context_id: ContextId) -> Result<(), CallError> {
-        self.send(|reply| RpcCommand::DemoteContext { context_id, reply }).await
     }
 
     /// Set or clear a context's "suspend activity" flag (`pausedAt`).
@@ -3701,12 +3674,6 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::RenameContext { context_id, label, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.rename_context(context_id, &label));
-        }
-        RpcCommand::PromoteContext { context_id, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.promote_context(context_id));
-        }
-        RpcCommand::DemoteContext { context_id, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.demote_context(context_id));
         }
         RpcCommand::SetContextPaused { context_id, paused, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_paused(context_id, paused));

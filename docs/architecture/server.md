@@ -61,7 +61,7 @@ Connection count is capped (default 100).
 `subscribe_blocks[_filtered]`, `get_blocks`, `move_block`, `set_block_excluded`,
 `cherry_pick_block`), **LLM** (`prompt`, `configure_llm`, `drift_queue`/
 `drift_cancel`), **context ops** (`create_context`/`join_context`/
-`rename_context`/`promote_context`/`demote_context`/`archive_context`/
+`rename_context`/`archive_context`/
 `compact_context`/`interrupt_context` — there is no `fork`/`drift` RPC method;
 those stay `kj` verbs per the "administration is a `kj` verb, chatty paths stay
 on RPC" rule), MCP, peers, kaish (`shell_execute`, cwd/vars), **per-client view

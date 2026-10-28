@@ -315,8 +315,10 @@ The verbs (keys provisional; the in-well legend — the transient `?` toggle,
   resurrects; visits never do.
 - **`d` demote** — one step outward per press, kernel-owned ladder:
   promoted → automatic placement; automatic → demoted; already demoted →
-  **archived** (single context, no subtree, no latch on the key;
-  `kj context demote` latches that last step behind `--confirm`). The kernel's ladder is
+  **archived** (single context, no subtree). `p` and `d` run `kj context
+  promote|demote`, which latches that last step behind `--confirm`: the
+  hints line says so and `d` again confirms (`docs/input.md`, "Placement
+  keys"). The kernel's ladder is
   unchanged by the ring collapse; what changed is that its middle rung now
   *renders* as the horizon rather than as a ring of its own.
 - **`a` archive** — straight past the horizon from anywhere (same unlatched
@@ -340,8 +342,9 @@ running-forces-hot override, conclude-demotes-one-band, the
 
 Kernel/wire state (all additive): `contexts.promoted_at/demoted_at/paused_at`;
 `ContextHandleInfo` `promotedAt @17` / `demotedAt @18` / `pausedAt @19`;
-`promoteContext @83` / `demoteContext @84` / `setContextPaused @85` /
-`archiveContext @86`; `kj context promote|demote|pause|resume`;
+`setContextPaused @85` / `archiveContext @86`; `kj context
+promote|demote|pause|resume` (promote and demote have no RPC of their own;
+`@83` and `@84` are retired);
 `ACTIVE_RING_CAPACITY = 10` enforced kernel-side (`RING_SLOTS = 10` is the
 app-side seat count — keep them in agreement).
 

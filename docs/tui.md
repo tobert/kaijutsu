@@ -954,6 +954,11 @@ Rules the figure carries:
 - `j`/`k` move, `Tab` hops sections, `Enter` switches, `p d z a c` are the
   placement verbs unchanged, `/` filters, `h` opens the horizon as a filtered
   list. Digits address the ACTIVE seats, as in the well.
+- Each placement verb runs `kj context <verb> <id>` through `executeKj`.
+  A press that comes back latched (`a`, and the `d` step that archives)
+  waits: the same verb on the same row confirms it with `--confirm`, and
+  any other key clears it. A press that ran arms nothing, so `d` after a
+  demote step that ran is another plain step.
 - A switch through the picker keeps each context's own scrolled place, like
   every switch (`docs/tui.md`, "The buffer").
 - The live tail is the context's own last line (`live.rs` tail buffers,
@@ -965,7 +970,7 @@ Rules the figure carries:
   `:kj` line that ran (`App::roster_changed`) starts a refresh round now
   instead of on the next tick, and every round
   rebuilds an open picker over the new roster (`PickerModel::refreshed`):
-  the filter, the open horizon and the archive confirm latch stay, and the
+  the filter, the open horizon and a pending confirm stay, and the
   cursor follows the context it was on — after `p` it sits on the same row
   in ACTIVE. A row that left the roster clamps the cursor into what remains.
 

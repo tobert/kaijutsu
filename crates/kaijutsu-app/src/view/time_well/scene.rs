@@ -208,13 +208,14 @@ pub struct TimeWellState {
     /// now it's label-only — see `card::card_from`). Empty when the kernel has
     /// no semantic index.
     pub cluster_of: HashMap<ContextId, super::card::ClusterAssignment>,
-    /// Contexts with a placement verb (`p`/`d`/`z`/`a`) in flight — fired over
-    /// RPC but not yet reflected by a `DriftState` poll. Further placement
-    /// verbs on a pending context are ignored (info-logged) until the next
-    /// poll clears the set ([`super::sync::sync_time_well`]): without this,
-    /// a double-`d` inside one poll interval walks the ladder two rungs
-    /// sight-unseen (auto → demoted → ARCHIVED). Digits/Enter/`c` stay
-    /// unguarded — navigation and conclude aren't ladder steps.
+    /// Contexts with a placement verb (`p`/`d`/`z`/`a`) in flight — sent but
+    /// not yet reflected by a `DriftState` poll. Further placement verbs on a
+    /// pending context are ignored (info-logged) until the next poll clears
+    /// the set ([`super::sync::sync_time_well`]), or until a `p`/`d` result
+    /// that moved nothing lands (`commands::placement::land_placements`):
+    /// without this, a double-`d` inside one poll interval walks the ladder
+    /// two rungs sight-unseen. Digits/Enter/`c` stay unguarded — navigation
+    /// and conclude aren't ladder steps.
     pub placement_pending: HashSet<ContextId>,
     /// Whether the camera is parked in the **hero pose** — Up at the mouth
     /// ring (already the shallowest; nowhere further inward to focus) rises
@@ -994,7 +995,7 @@ pub fn handle_go_to_well(
 ///   and the camera retargets to it.
 /// - `Activate` (**Enter**, South) focuses then commits; `Conclude` (`c`),
 ///   `Promote` (`p`), `Demote` (`d`), `PauseToggle` (`z`), `Archive` (`a`) —
-///   see the verb arms below (fire-and-forget RPC).
+///   see the verb arms below.
 /// - `ActivateHorizon` (`h`) — dive into the event horizon. A stub in v1:
 ///   logs, does nothing (see its arm below).
 ///
@@ -1012,6 +1013,7 @@ pub fn well_keyboard(
     actor: Option<Res<crate::connection::RpcActor>>,
     drift: Res<crate::connection::drift::DriftState>,
     mut room: ResMut<crate::view::room::RoomState>,
+    mut placements: MessageWriter<crate::commands::placement::PlacementRequested>,
 ) {
     use crate::input::Action;
 
@@ -1148,63 +1150,31 @@ pub fn well_keyboard(
                 }
             }
 
-            // `p` / `d` / `z` / `a`: promote / demote / toggle-pause /
-            // archive the selection — fire-and-forget over RPC, same pattern
-            // as `c` above. The kernel owns the demote ladder and the
-            // active-ring cap; a failure logs a visible warning with the
-            // context short id. Promote's ring-full refusal ("active ring
-            // full (10 seats) — demote something first") surfaces through
-            // that same warn — seats never appear or vanish silently.
+            // `p` / `d`: `kj context promote|demote` on the selection
+            // (`commands::placement`). The verb owns the demote ladder, the
+            // active-ring cap, and the `--confirm` latch on the step that
+            // archives; the hints line says what happened, and a latched `d`
+            // waits for `d` again. `z` / `a`: toggle-pause / archive over
+            // RPC, fire-and-forget like `c` above, with a failure logged as
+            // a warning.
             //
             // Each verb passes the `begin_placement` in-flight guard first: a
             // second placement verb on the same context before the next poll
             // refreshes is ignored, so a double-`d` can't walk the ladder two
-            // rungs sight-unseen (auto → demoted → ARCHIVED inside one poll
-            // interval).
-            Action::Promote => {
-                if let Some(id) = state.selected
-                    && let Some(actor) = actor.as_ref()
-                {
-                    if !state.begin_placement(id) {
-                        info!(
-                            "well: promote {} ignored — placement already in flight",
-                            id.short()
-                        );
-                        continue;
-                    }
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.promote_context(id).await {
-                                log::warn!("well: promote {} failed: {e}", id.short());
-                            }
-                        })
-                        .detach();
-                    info!("well: promote {}", id.short());
+            // rungs sight-unseen. A step that moved nothing frees the guard
+            // when its result lands.
+            Action::Promote | Action::Demote => {
+                let Some(id) = state.selected else { continue };
+                let (verb, key) = match action {
+                    Action::Promote => ("promote", crate::commands::placement::PlacementKey::Promote),
+                    _ => ("demote", crate::commands::placement::PlacementKey::Demote),
+                };
+                if !state.begin_placement(id) {
+                    info!("well: {verb} {} ignored — placement already in flight", id.short());
+                    continue;
                 }
-            }
-
-            Action::Demote => {
-                if let Some(id) = state.selected
-                    && let Some(actor) = actor.as_ref()
-                {
-                    if !state.begin_placement(id) {
-                        info!(
-                            "well: demote {} ignored — placement already in flight",
-                            id.short()
-                        );
-                        continue;
-                    }
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.demote_context(id).await {
-                                log::warn!("well: demote {} failed: {e}", id.short());
-                            }
-                        })
-                        .detach();
-                    info!("well: demote {}", id.short());
-                }
+                placements.write(crate::commands::placement::PlacementRequested { context_id: id, key });
+                info!("well: {verb} {}", id.short());
             }
 
             // `z` toggles `paused_at`: the RPC takes the new absolute value,

@@ -1132,9 +1132,17 @@ async fn handle_picker_key(
             switch_seat(bridge, app, id, feeds).await;
         }
         PickerOutcome::Placement { context_id, argv } => match bridge.execute_kj(context_id, argv).await {
+            // A latch exits 2; its message is the command that confirms it.
             Ok(result) if result.latch.is_some() => {
                 let message = result.latch.map(|l| l.message).unwrap_or_default();
-                app.note(message);
+                if let Some(picker) = app.picker.as_mut() {
+                    picker.latched();
+                }
+                app.note(format!("the same key again confirms: {message}"));
+            }
+            Ok(result) if result.exit_code != 0 => {
+                let why = result.stderr.lines().next().unwrap_or("").trim().to_string();
+                app.note(format!("placement failed (exit {}): {why}", result.exit_code));
             }
             Ok(result) => {
                 app.note(result.stdout.lines().next().unwrap_or("done").to_string());

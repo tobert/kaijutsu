@@ -397,6 +397,13 @@ pub enum RpcResultMessage {
         from: ContextId,
         result: kaijutsu_client::rpc::KjExecutionResult,
     },
+    /// A placement key's `kj context promote|demote` ran on `context_id`
+    /// (`commands::placement`).
+    PlacementFinished {
+        context_id: ContextId,
+        key: crate::commands::placement::PlacementKey,
+        result: Result<kaijutsu_client::rpc::KjExecutionResult, String>,
+    },
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
     /// A followed context's change feed ended and does not resume

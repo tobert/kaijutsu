@@ -5,6 +5,7 @@
 
 mod conversation;
 pub mod ctrl_z;
+pub mod placement;
 
 use bevy::prelude::*;
 
@@ -13,11 +14,18 @@ pub struct CommandsPlugin;
 
 impl Plugin for CommandsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            conversation::handle_prefix_context_verbs
-                .after(crate::input::InputPhase::Dispatch),
-        )
+        app.add_message::<placement::PlacementRequested>()
+            .init_resource::<placement::PlacementLatch>()
+            .add_systems(
+                Update,
+                (
+                    conversation::handle_prefix_context_verbs,
+                    placement::run_placements,
+                    placement::land_placements,
+                )
+                    .chain()
+                    .after(crate::input::InputPhase::Dispatch),
+            )
         .init_resource::<ctrl_z::ShellToggleInFlight>()
         .add_systems(
             Update,

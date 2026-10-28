@@ -84,8 +84,8 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, TaskStatus};
 #[cfg(test)]
 use kaijutsu_kernel::block_store::derive_context_live_status;
 use kaijutsu_kernel::kernel_db::{
-    context_used_pct, ContextRow, ContextShellRow, ContextUsageRow, DemoteOutcome, KernelDb,
-    KernelDbError, PromoteOutcome, WellKnownRole,
+    context_used_pct, ContextRow, ContextShellRow, ContextUsageRow, KernelDb,
+    KernelDbError, WellKnownRole,
 };
 use kaijutsu_kernel::{
     // FlowBus
@@ -6535,100 +6535,6 @@ impl kernel::Server for KernelImpl {
         }
 
         log::info!("rename_context: context={} label={label}", context_id.short());
-        Promise::ok(())
-    }
-
-    fn promote_context(
-        self: Rc<Self>,
-        params: kernel::PromoteContextParams,
-        mut results: kernel::PromoteContextResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "promote_context").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        // No drift-router existence pre-check: the DB is authoritative (it
-        // errors NotFound for unknown ids), and an archived context must be
-        // promotable — resurrection — whether or not the router remembers it.
-        let outcome = {
-            let db = self.kernel.kernel_db.lock();
-            match db.promote_context(context_id) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(e.to_string());
-                    return Promise::ok(());
-                }
-            }
-        };
-
-        // Resurrection reverses archive's DriftRouter sync: without this the
-        // router still holds Archived and sessions can't touch the context.
-        // Conclusion is orthogonal to placement — a resurrected concluded
-        // context comes back Concluded, not Live.
-        if let PromoteOutcome::Resurrected { concluded } = outcome {
-            let state = if concluded {
-                kaijutsu_types::ContextState::Concluded
-            } else {
-                kaijutsu_types::ContextState::Live
-            };
-            if let Err(e) = self.kernel.kernel.drift().write().set_state(context_id, state) {
-                log::error!("promote_context: drift set_state failed: {e}");
-            }
-        }
-
-        log::info!(
-            "promote_context: context={} outcome={:?}",
-            context_id.short(),
-            outcome
-        );
-        results.get().set_success(true);
-        Promise::ok(())
-    }
-
-    fn demote_context(
-        self: Rc<Self>,
-        params: kernel::DemoteContextParams,
-        mut results: kernel::DemoteContextResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "demote_context").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        let outcome = {
-            let db = self.kernel.kernel_db.lock();
-            match db.demote_context(context_id) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(e.to_string());
-                    return Promise::ok(());
-                }
-            }
-        };
-
-        // Only the ladder's terminal step (archive) touches lifecycle state
-        // the drift router tracks; unpromote/demote are ring placement only.
-        if outcome == DemoteOutcome::Archived
-            && let Err(e) = self.kernel.kernel.drift().write().set_state(context_id, kaijutsu_types::ContextState::Archived)
-        {
-            log::error!("demote_context: drift set_state failed: {e}");
-        }
-
-        log::info!(
-            "demote_context: context={} outcome={:?}",
-            context_id.short(),
-            outcome
-        );
-        results.get().set_success(true);
         Promise::ok(())
     }
 
