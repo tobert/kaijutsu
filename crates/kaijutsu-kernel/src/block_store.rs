@@ -2099,6 +2099,15 @@ impl BlockStore {
     ) -> BlockStoreResult<()> {
         self.accept(context_id, |entry| {
             let mut events = Vec::new();
+            // A held drift is included only by its ask's allow
+            // (`settle_held_drift`); including it here would let a model
+            // read it unanswered.
+            if !excluded && entry.doc.get_block_snapshot(block_id).is_some_and(|b| b.is_held_drift()) {
+                return Err(BlockStoreError::Validation(format!(
+                    "block {} is a drift held for ROOT's human; `kj ledger allow` on its ask releases it",
+                    block_id.to_key()
+                )));
+            }
             entry.doc.set_excluded(block_id, excluded)?;
             entry.touch(self.principal_id());
             let version = entry.version();

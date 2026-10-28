@@ -286,7 +286,10 @@ pub fn abandon(conn: &Connection, request_id: &str, reason: Option<&str>) -> Res
 pub fn abandon_unresolved_on_restart(conn: &Connection, reason: &str) -> Result<usize> {
     let unresolved = crate::ask::list_unresolved(conn)?;
     let mut swept = 0usize;
-    for row in unresolved {
+    // A drift ask survives a restart: it authorizes no program and no
+    // caller waits on it. Its held drift block waits for the answer, and
+    // the approval worker settles that answer whenever it comes.
+    for row in unresolved.into_iter().filter(|row| row.origin != crate::types::Origin::Drift) {
         match abandon(conn, &row.request_id, Some(reason)) {
             Ok(_) => swept += 1,
             Err(LedgerError::AlreadyDecided { .. }) => {}

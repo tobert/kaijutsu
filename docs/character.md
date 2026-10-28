@@ -183,6 +183,16 @@ Two things follow, and they are the ones to check a change against:
   dismisses it: `Done`, still excluded, kept in the log. A drift ask takes
   no `--remember`: the kernel refuses the answer and the ask stays open
   (`kj/drift.rs`, `settle_drift_answer`; `kj/ledger.rs`, `decide_ask`).
+  - Only a human answers it. A drift is refused, before anything is
+    written, when ROOT's reviewer is not a live root character.
+  - A drift ask survives a restart; every other unresolved ask is retired.
+    At start, a held drift with no open or unsettled ask is dismissed
+    (`reconcile_root_held_drifts`).
+  - ROOT is not archived, or rotated, while a drift ask is open or its
+    answer is unsettled: the archive is refused, naming the asks.
+  - `kj stage include` and `setBlockExcluded` refuse a held drift; only the
+    ask's allow includes it. A held `pull` or `merge` tells its caller the
+    ask id and shows no preview.
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,

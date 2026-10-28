@@ -1010,10 +1010,11 @@ async fn run_delivery(
             // it here, and wake nobody.
             if row.origin == approval_ledger::types::Origin::Drift {
                 let allowed = answer.status == crate::ApprovalStatus::Allowed;
-                if let Err(error) = crate::kj::drift::settle_drift_answer(kernel, &answer.request_id, allowed) {
-                    tracing::error!(ask = %answer.request_id, %error, "gate-resume: could not settle a drift answer");
+                // A failed settle stays unwoken, so the next scan retries it.
+                match crate::kj::drift::settle_drift_answer(kernel, &answer.request_id, allowed) {
+                    Ok(()) => { woken.insert(answer.request_id.clone()); }
+                    Err(error) => tracing::error!(ask = %answer.request_id, %error, "gate-resume: could not settle a drift answer; retrying"),
                 }
-                woken.insert(answer.request_id.clone());
                 delivered_this_scan += 1;
                 continue;
             }

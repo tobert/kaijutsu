@@ -2055,6 +2055,13 @@ pub async fn create_shared_kernel_in(
     if abandoned > 0 {
         log::info!("retired {abandoned} unresolved approval ask(s) after restart; source will not be retried");
     }
+    // A drift into ROOT that lost its ask, or whose ask closed unanswered,
+    // would stay held forever; it is dismissed and kept in the log.
+    let dismissed = kaijutsu_kernel::kj::drift::reconcile_root_held_drifts(&kernel_arc)
+        .map_err(|error| capnp::Error::failed(format!("Cannot reconcile ROOT's held drifts: {error}")))?;
+    if dismissed > 0 {
+        log::info!("dismissed {dismissed} held drift(s) in ROOT with no ask that can release them");
+    }
     let swept_blocks = documents.abandon_running_blocks_on_restart(
         "the kernel restarted while this was still in progress; nothing is being retried",
     ).map_err(|error| capnp::Error::failed(format!("Cannot recover interrupted blocks: {error}")))?;

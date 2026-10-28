@@ -2518,6 +2518,12 @@ impl KernelDb {
             .transpose()
     }
 
+    /// The drift ask recorded with a held drift block.
+    pub(crate) fn approval_for_drift_block(&self, block: &BlockId) -> KernelDbResult<Option<String>> {
+        Ok(self.conn.query_row("SELECT request_id FROM approval_drift_blocks WHERE block_id=?1",
+            [block.to_key()], |row| row.get(0)).optional()?)
+    }
+
     /// The held drift block recorded with a drift ask.
     pub(crate) fn approval_drift_block(&self, request: &str) -> KernelDbResult<Option<BlockId>> {
         let key: Option<String> = self.conn.query_row("SELECT block_id FROM approval_drift_blocks WHERE request_id=?1",
@@ -4453,6 +4459,18 @@ impl KernelDb {
     }
 
     fn archive_context_writes(&self, id: ContextId) -> KernelDbResult<bool> {
+        // A held drift is settled by its ask, and an archived context
+        // answers nothing, so archiving here would leave the drift held
+        // with no ask that can release it. Refuse until it is answered.
+        let held = approval_ledger::ask::list_unsettled_drift_asks(&self.conn, id.as_bytes())?;
+        if !held.is_empty() {
+            let asks = held.iter().map(|id| id.split('-').next().unwrap_or(id)).collect::<Vec<_>>().join(", ");
+            return Err(KernelDbError::Validation(format!(
+                "context {} holds {} drift(s) waiting for its human (ask {asks}); answer each with \
+                 `kj ledger allow <id>` or `kj ledger deny <id>`, then archive it",
+                id.short(), held.len()
+            )));
+        }
         let now = now_millis();
         let updated = self.conn.execute(
             "UPDATE contexts
