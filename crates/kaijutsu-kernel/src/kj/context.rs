@@ -322,7 +322,7 @@ fn insert_new_context_checked(db: &KernelDb, row: &ContextRow, placement: Charac
 /// The body of [`insert_new_context_checked`], for a caller that already
 /// holds a transaction and writes more rows in it. A context that starts or
 /// continues a character must be reviewed by someone other than that
-/// character, unless it is a root.
+/// character, except when a root rotates its own console.
 pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement: CharacterPlacement) -> KernelDbResult<()> {
     let default_ws = db.get_or_create_default_workspace(row.created_by)?;
     let live_character = |performer: kaijutsu_types::PrincipalId| -> KernelDbResult<()> {
@@ -363,9 +363,14 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
         }
     }
     if let Some(performer) = performer {
-        let root = db.get_character(performer)?.is_some_and(|sheet| sheet.root);
+        // Only the rotation of a root console has its root confirm itself:
+        // the successor is a top held by the root, as its predecessor was.
+        let rotates_root_console = match placement {
+            CharacterPlacement::Rotate { predecessor } => db.is_root_console(predecessor)?,
+            _ => false,
+        };
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(row.context_id, performer))?.reviewer();
-        if !root && performer == reviewer {
+        if !rotates_root_console && performer == reviewer {
             return Err(KernelDbError::Validation("the performer cannot review its own work".into()));
         }
     }
@@ -4470,6 +4475,30 @@ mod tests {
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("root console"), "{error}");
         assert!(d.kernel_db().lock().get_context(context_id).unwrap().is_none(), "nothing was inserted");
+    }
+
+    /// A root performer is exempt from the self-review check only when it
+    /// rotates its own root console. Starting a kohai of the root under its
+    /// own console would make it review itself.
+    #[tokio::test]
+    async fn a_root_may_rotate_its_console_but_not_perform_a_kohai_under_it() {
+        let d = test_dispatcher().await;
+        let root = register_root_context(&d);
+        let amy = d.kernel_db().lock().context_character(root).unwrap().unwrap().principal_id;
+        let row = |label: &str| crate::kernel_db::ContextRow {
+            context_id: ContextId::new(), label: Some(label.to_string()), system_prompt: None, context_state: ContextState::Live,
+            context_type: s("default"), created_at: 1, created_by: amy, forked_from: None, fork_kind: None, archived_at: None,
+            workspace_id: None, preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+            demoted_at: None, paused_at: None, origin_host: None, played_by: None,
+        };
+        let kohai = row("root-kohai");
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &kohai, CharacterPlacement::Start { performer: amy, senpai: Some(root) }).unwrap_err();
+        assert!(error.to_string().contains("cannot review its own work"), "{error}");
+        assert!(d.kernel_db().lock().get_context(kohai.context_id).unwrap().is_none(), "nothing was inserted");
+
+        let successor = row("root-successor");
+        insert_new_context_checked(&d.kernel_db().lock(), &successor, CharacterPlacement::Rotate { predecessor: root })
+            .expect("a root rotates its own console");
     }
 
     /// The default senpai, the caller's own context, follows the placing

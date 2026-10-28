@@ -280,7 +280,7 @@ impl KjDispatcher {
             .map_err(|e| format!("could not read the target context: {e}"))?
             .is_some_and(|row| row.is_root_console());
         // Resolved before anything is written, so a refusal leaves no trace.
-        let reviewer = if held { Some(self.drift_reviewer(target_ctx, author)?) } else { None };
+        let reviewer = if held { Some(self.drift_reviewer(target_ctx)?) } else { None };
         let after = self.block_store().last_block_id(target_ctx);
         // The drift block is the one block in the target that legitimately
         // belongs to an outsider, so it carries the SENDER: the caller's
@@ -377,13 +377,22 @@ impl KjDispatcher {
     /// the console's model, which plays the console. Refuses when that is
     /// not a live root character, since a model would then decide what
     /// ROOT's model reads.
-    fn drift_reviewer(&self, target_ctx: ContextId, sender: PrincipalId) -> Result<PrincipalId, String> {
+    fn drift_reviewer(&self, target_ctx: ContextId) -> Result<PrincipalId, String> {
         let db = self.kernel_db().lock();
         let performer = db.context_character(target_ctx)
             .map_err(|e| format!("could not read the console's character: {e}"))?
-            .map_or(sender, |row| row.principal_id);
+            .ok_or_else(|| format!(
+                "ROOT has no context character, so nobody answers for it and a drift into it has no reviewer; \
+                 `kj kohai create ROOT --type console --as <character>` makes one"
+            ))?
+            .principal_id;
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(target_ctx, performer))
-            .map_err(|e| format!("could not resolve a reviewer for ROOT: {e}"))?
+            .map_err(|e| match e {
+                crate::kernel_db::KernelDbError::Validation(why) | crate::kernel_db::KernelDbError::NoReviewerAbove(why) => {
+                    format!("ROOT has no reviewer to release a drift: {why}")
+                }
+                other => format!("could not resolve a reviewer for ROOT: {other}"),
+            })?
             .reviewer();
         let human = db.get_character(reviewer)
             .map_err(|e| format!("could not read the reviewer's sheet: {e}"))?
@@ -1723,6 +1732,20 @@ mod tests {
         assert!(error.contains("not a live root character"), "{error}");
         assert!(h.d.block_store().block_snapshots(h.console).unwrap().iter().all(|b| b.kind != kaijutsu_types::BlockKind::Drift));
         assert!(approval_ledger::ask::list_pending(h.d.kernel_db().lock().conn_for_ledger()).unwrap().is_empty());
+    }
+
+    /// A console with no context character has no one to answer for it, so
+    /// a drift into it is refused with that reason, not by a fallback to the
+    /// sender.
+    #[tokio::test]
+    async fn a_drift_into_a_root_console_with_no_character_is_refused() {
+        let h = root_house().await;
+        let bare = register_context(&h.d, Some("ROOT-bare"), Some(h.console), h.amy);
+        h.d.kernel_db().lock().update_context_type(bare, kaijutsu_types::CONSOLE_CONTEXT_TYPE).unwrap();
+        let outcome = h.d.drift_reviewer(bare);
+        let error = outcome.expect_err("a console with no character has no reviewer");
+        assert!(error.contains("no context character") && error.contains("kj kohai create"), "names the repair: {error}");
+        assert!(!error.contains("validation error"), "not a flattened routing error: {error}");
     }
 
     /// Settling refuses a block that is not a held drift.

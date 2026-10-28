@@ -88,6 +88,18 @@ mod tests {
         assert!(error.contains("cannot review"), "{error}");
     }
 
+    /// A routing error the senpai's holder can repair refuses; corruption and
+    /// every other failure is a fault.
+    #[test]
+    fn routing_errors_split_into_refusals_and_faults() {
+        use crate::kernel_db::KernelDbError;
+        let refused = |e| matches!(identity_error_from(e), IdentityError::Refused(_));
+        assert!(refused(KernelDbError::Validation("nobody reviews".into())));
+        assert!(refused(KernelDbError::NoReviewerAbove("nobody above".into())));
+        assert!(!refused(KernelDbError::Corrupt("a senpai cycle".into())));
+        assert!(!refused(KernelDbError::NotFound("a senpai with no context character".into())));
+    }
+
     #[test]
     fn unknown_and_retired_characters_cannot_perform_or_review() {
         let db = KernelDb::temporary().unwrap();
@@ -118,6 +130,17 @@ impl From<IdentityError> for String {
     }
 }
 
+/// A routing error that the senpai's holder can repair (nobody above the
+/// performer, a retired holder) refuses; stored state that contradicts an
+/// invariant, and every other failure, is a fault.
+fn identity_error_from(error: crate::kernel_db::KernelDbError) -> IdentityError {
+    use crate::kernel_db::KernelDbError;
+    match error {
+        KernelDbError::Validation(why) | KernelDbError::NoReviewerAbove(why) => IdentityError::Refused(why),
+        other => IdentityError::Failed(other.to_string()),
+    }
+}
+
 /// Resolve the identity a model turn in `context_id` needs: its performer
 /// and the reviewer chained above it. `prompt::submit` runs this before the
 /// input commits and turn startup runs it again, so a refusal can come
@@ -134,13 +157,17 @@ pub(crate) async fn resolve_for_context(
     }
     let actor = row.played_by;
     let performer = require_performer(actor).map_err(IdentityError::Refused)?;
-    // A chain with nobody to review the performer is an assignment the
-    // senpai's holder repairs, so it refuses; any other failure is a fault.
-    let routed = kernel.kernel_db().lock().route_review(crate::kernel_db::ReviewQuery::ask(context_id, performer));
-    if let Err(crate::kernel_db::KernelDbError::Validation(why)) = routed {
-        return Err(IdentityError::Refused(why));
+    let sheet = kernel.kernel_db().lock().get_character(performer)
+        .map_err(|e| IdentityError::Failed(format!("Could not resolve performer: {e}")))?;
+    if sheet.is_none() {
+        return Err(IdentityError::Failed(format!(
+            "The assigned performer {performer} has no character sheet, which stored state requires."
+        )));
     }
-    let review = kernel.resolve_context_review(context_id).await.map_err(IdentityError::Failed)?;
+    let routed = kernel.kernel_db().lock()
+        .route_review(crate::kernel_db::ReviewQuery::ask(context_id, performer))
+        .map_err(identity_error_from)?;
+    let review = kernel.review_from_routed(routed).map_err(IdentityError::Failed)?;
     let db = kernel.kernel_db().lock();
     resolve(&db, actor, review.reviewer.principal_id)
         .map(|identity| (identity, review))

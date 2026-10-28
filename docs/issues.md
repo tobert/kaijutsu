@@ -25,20 +25,9 @@ TUI entries below). Open:
   (a reassigned context drops a queued turn) has no test.
 - A kaibo review of the landed branch (2026-10-28, `deepseek` cast, read of
   the files, no test run) found guards that `docs/senpai-kohai.md` promises
-  and the code lacked. The root-console, no-senpai and default-senpai guards
-  have shipped. Still open, each needing a test that fails first:
-  - The root exemption in `insert_new_context_rows` is load-bearing for
-    rotating a root console, so narrow it to "the performer's `root_ctx`"
-    rather than removing it, and delete the design line that calls the check
-    dead.
-  - `resolve_for_context` types a `Validation` error from `route_review` as a
-    refusal, but that variant also covers a senpai cycle and a missing
-    character sheet, which are corruption. `KernelDbError` has no variant to
-    tell them apart. The second call maps everything to a fault.
-  - `resolve_review` labels every `Assigned` reviewer `ReviewSource::Senpai`,
-    so `kj context info` prints `(senpai)` for a root holding a top context.
-  - `drift_reviewer` falls back to the sender when the console has no
-    context character, and flattens refusal and corruption into one message.
+  and the code lacked. The root-console, no-senpai and default-senpai guards,
+  the narrowed root exemption, corruption-versus-refusal typing, the reviewer
+  source label and the drift reviewer have shipped. Still open:
   - `docs/approval-identity.md` still says "instance" outside its routing
     sections, and `docs/senpai-kohai.md` describes `--model`/`--max-tokens`
     create options and a no-casts hard cut that the code does not have.

@@ -14,6 +14,9 @@ pub enum ReviewSource {
     /// The climb reached a context with no senpai and the actor is a live
     /// root character: it confirms its own statement.
     SelfConfirmation,
+    /// A non-root actor acts in a root context, and the live root that holds
+    /// it reviews.
+    TopHolder,
 }
 
 impl ReviewSource {
@@ -21,6 +24,7 @@ impl ReviewSource {
         match self {
             Self::Senpai => "senpai",
             Self::SelfConfirmation => "self_confirmation",
+            Self::TopHolder => "top_holder",
         }
     }
 }
@@ -83,9 +87,16 @@ impl Kernel {
     fn resolve_review(&self, from: ReviewFrom, actor: PrincipalId) -> Result<ResolvedContextReview, String> {
         let routed = self.kernel_db().lock().route_review(ReviewQuery { from, actor, past: None, confirm_at_top: true })
             .map_err(|error| error.to_string())?;
+        self.review_from_routed(routed)
+    }
+
+    /// The reviewer a routing answer names, as a live character, with where
+    /// the answer came from.
+    pub(crate) fn review_from_routed(&self, routed: crate::kernel_db::EffectiveReviewer) -> Result<ResolvedContextReview, String> {
         let source = match routed {
             crate::kernel_db::EffectiveReviewer::Assigned(_) => ReviewSource::Senpai,
             crate::kernel_db::EffectiveReviewer::SelfConfirmation(_) => ReviewSource::SelfConfirmation,
+            crate::kernel_db::EffectiveReviewer::TopHolder(_) => ReviewSource::TopHolder,
         };
         let reviewer = self.live_character(routed.reviewer(), "reviewer")?;
         Ok(ResolvedContextReview { reviewer, source })
@@ -205,6 +216,10 @@ mod tests {
         // The performer is the holder of its own senpai: the climb goes past it.
         let review = kernel.validate_model_review_assignment(ReviewFrom::Senpai(seat), *lead).await.unwrap();
         assert_eq!(review.reviewer.principal_id, *amy);
+        // A model acting in a root's console is reviewed by that root, and the
+        // source says so.
+        let review = kernel.resolve_context_review_for(root, *coder).await.unwrap();
+        assert_eq!((review.reviewer.principal_id, review.source), (*amy, ReviewSource::TopHolder));
         // A root confirms its own direct statements, but is never a model performer.
         assert!(kernel.resolve_context_review_for(root, *amy).await.is_ok());
         let error = kernel.validate_model_review_assignment(ReviewFrom::Context(root), *amy).await.unwrap_err();

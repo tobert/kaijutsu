@@ -64,6 +64,12 @@ pub enum KernelDbError {
     #[error("{0}")]
     NoReviewerAbove(String),
 
+    /// Stored state contradicts an invariant, such as a senpai cycle or a
+    /// character with no sheet. A fault to report, never a refusal the caller
+    /// can repair by changing its request.
+    #[error("{0}")]
+    Corrupt(String),
+
     /// Label already in use for this kernel.
     #[error("label conflict: {0}")]
     LabelConflict(String),
@@ -337,6 +343,10 @@ pub enum EffectiveReviewer {
     /// raised with the actor as reviewer and only the actor may answer it
     /// (`docs/approval-identity.md`).
     SelfConfirmation(PrincipalId),
+    /// A non-root actor acts in a root context the live root holds, and that
+    /// root reviews it. The context has no senpai: the holder is the root
+    /// itself.
+    TopHolder(PrincipalId),
 }
 
 impl EffectiveReviewer {
@@ -344,7 +354,7 @@ impl EffectiveReviewer {
     /// names the actor.
     pub fn reviewer(self) -> PrincipalId {
         match self {
-            Self::Assigned(reviewer) => reviewer,
+            Self::Assigned(reviewer) | Self::TopHolder(reviewer) => reviewer,
             Self::SelfConfirmation(actor) => actor,
         }
     }
@@ -2474,7 +2484,7 @@ impl KernelDb {
                 return self.at_top(at, origin, actor, confirm_at_top);
             };
             if !visited.insert(senpai_id) {
-                return Err(KernelDbError::Validation(format!(
+                return Err(KernelDbError::Corrupt(format!(
                     "context {} is its own senpai ancestor; the senpai chain has a cycle",
                     self.context_name(senpai_id)
                 )));
@@ -2503,7 +2513,7 @@ impl KernelDb {
                      move {under} to another senpai with `kj senpai set`",
                     sheet.name, self.context_name(above.context_id)
                 ))),
-                None => Err(KernelDbError::Validation(format!(
+                None => Err(KernelDbError::Corrupt(format!(
                     "the character of {}, the senpai of {under}, has no character sheet",
                     self.context_name(above.context_id)
                 ))),
@@ -2528,7 +2538,7 @@ impl KernelDb {
             Some(sheet) if !sheet.root
                 && self.get_character(at.principal_id)?.is_some_and(|holder| holder.root && holder.retired_at.is_none()) =>
             {
-                Ok(EffectiveReviewer::Assigned(at.principal_id))
+                Ok(EffectiveReviewer::TopHolder(at.principal_id))
             }
             sheet => {
                 let who = sheet.map_or_else(|| actor.short(), |sheet| sheet.name);
@@ -12170,7 +12180,7 @@ mod tests {
         let root = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
         assert_eq!(
             db.route_review(ReviewQuery::ask(root.context_id, claude)).unwrap(),
-            EffectiveReviewer::Assigned(amy),
+            EffectiveReviewer::TopHolder(amy),
             "amy holds the top context, so she reviews what claude does in it",
         );
         let orphan = senpai_ctx_row(&db, ws_id, "orphan-top", None, Some(bob));
@@ -12260,6 +12270,7 @@ mod tests {
             params![blob_param(b.context_id.as_bytes()), blob_param(a.context_id.as_bytes())],
         ).unwrap();
         let error = db.route_review(ReviewQuery::ask(a.context_id, coder)).unwrap_err();
+        assert!(matches!(error, KernelDbError::Corrupt(_)), "a cycle is corruption, not a refusal: {error}");
         assert!(error.to_string().contains("cycle"), "{error}");
     }
 
