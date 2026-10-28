@@ -19,7 +19,7 @@ TUI entries below). Open:
   root-performed context through this path.
 - `kj context set --as` and the `played_by` column are gone, so `main`'s tests
   for director casting went with them. Re-express "a director may cast a
-  root" on `kj kohai create`.
+  root" on `kj context create`.
 - The "performer reassignment rejects a queued inference" wire test
   (`turn_events_wire`) was deleted with the performer column. Its behavior
   (a reassigned context drops a queued turn) has no test.
@@ -620,7 +620,7 @@ the model under observation has tried."
 ## A banto's own kj work asks its reviewer for each verb (2026-10-10)
 
 Partly superseded by docs/senpai-kohai.md (branch feat/senpai-kohai): a drift along the
-senpai edge needs no ask, and the verb is now `kj kohai create`. The rest stays open.
+senpai edge needs no ask, and the verb is now `kj context create`. The rest stays open.
 
 A `director` seat played by banto on moltar (`banto-shadow`) raised about
 17 asks to Amy in two small tasks: `kj context create ... --as coder`,
@@ -1519,7 +1519,7 @@ The walk and the open question at the end of this entry are superseded by docs/s
 resolution climbs `senpai_ctx`, so a human's command in a model's lane is reviewed by the
 lane's senpai holder. What stays open is item 1 below: a context with no senpai.
 
-Every path that mints a context decides who reviews. Fork and `kj kohai create` from inside a
+Every path that mints a context decides who reviews. Fork and `kj context create` from inside a
 context set the senpai; nothing re-parents a context except `kj senpai set`. This is not covered:
 
 1. **Handoff logs are parentless.** `kj handoff note` mints the
@@ -2406,7 +2406,7 @@ app is refused for the same reason (self-approval is barred by the
 2026-09-12 approval-identity work). The ask is then stuck pending until it
 expires. So the app's own shell cannot run any gated command today. The fix
 is an identity decision, not app UI: the app should attach as a distinct
-performer character (`kj kohai create --as`, or a dedicated app
+performer character (`kj context create --as`, or a dedicated app
 character) with Amy as the reviewer, or a non-Amy reviewer must be
 configured for the app's context. Coordinate with the approval-identity
 work (commits dcb5fc8b, fd27b822). Probe ask `01a096d2-358d-…` was left
@@ -2627,7 +2627,7 @@ joined in-process. Found by kaibo (DeepSeek) reviewing 730a9ed8, 2026-09-22.
 
 ## Parentless contexts outside the root consoles
 
-`kj kohai create` and `kj fork` always set a senpai (fe187fe5 made them name a parent), but
+`kj context create` and `kj fork` always set a senpai (fe187fe5 made them name a parent), but
 these paths still insert `forked_from: None` rows with a null `senpai_ctx`: `kj context scratch`
 (`kj/context.rs`, `context_scratch`), the handoff log (`kj/handoff.rs`,
 already filed under "Handoff logs are parentless"), the beat's score
@@ -2642,7 +2642,7 @@ Found by kaibo (DeepSeek) reviewing fe187fe5, 2026-09-22.
 
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
 
-Written before the hard cut: the verb is now `kj kohai create`; the symptom is not known to be fixed.
+Written before the hard cut: the verb is now `kj context create`; the symptom is not known to be fixed.
 
 From an `mcp` seat with `[context_type.mcp] allow = ["kj context create"]`
 live, `kj context create x --type director` auto-allowed and
@@ -2989,7 +2989,7 @@ still missing:
   does not say "this turn is waiting on an ask", only the hints line's `!n`
   and the sheet do.
 - **Context creation and senpai assignment have no app UI.** Use
-  `kj kohai create --as` so the performer exists before rc. The new context's
+  `kj context create --as` so the performer exists before rc. The new context's
   senpai is the caller's context; there is no reviewer assignment to make.
 - **The PLAN block renders a flat statement list**, which is all
   the ledger's `AskSummary` carries. A plan tree and per-statement verdicts would

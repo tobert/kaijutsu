@@ -141,7 +141,7 @@ ledger          list, show, allow, deny, rules, forget, runs — answer pending
                 generalize the decision into a standing rule (refused for
                 `allow` when a statement has a free variable; `character`
                 covers the performer anywhere, and its kj drive, interrupt,
-                context archive and kohai create only on contexts whose
+                context archive and context create only on contexts whose
                 senpai it holds),
                 `--remember … --family`
                 to remember the command family (`kj handoff note`, `git

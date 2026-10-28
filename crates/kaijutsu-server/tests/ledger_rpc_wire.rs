@@ -58,7 +58,7 @@ impl Rig {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
-        common::allow_in_shipped_gate(&config, &["kj kohai create", "kj drift push"]);
+        common::allow_in_shipped_gate(&config, &["kj context create", "kj drift push"]);
         let db_path = config.data_dir.as_ref().unwrap().join("kernel.db");
         let amy = kaijutsu_kernel::KernelDb::open(&db_path)
             .unwrap().get_character_by_name("amy").unwrap().expect("amy is root").principal_id;

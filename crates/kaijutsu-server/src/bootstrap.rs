@@ -354,7 +354,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                 .ok_or_else(|| format!("'{}' has no root context for ROOT to answer to", opts.root))?
                 .to_string();
             let argv = words(&[
-                "kohai", "create", ROOT_LABEL, "--type", "console", "--as", performer,
+                "context", "create", ROOT_LABEL, "--type", "console", "--as", performer,
                 "--parent", &human_root, "--senpai", &human_root,
             ]);
             dispatch(shared, caller, argv, &mut report).await?;

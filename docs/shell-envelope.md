@@ -188,7 +188,7 @@ instead (Amy, 2026-10-02):
 | `shell_write`, `kj shell` | `warning` set after settlement, from the cwd the call left |
 | read-only `shell` | `warning` set from the cwd it started in, since its `cd` is discarded |
 | kaijutsu-mcp `shell` | `warning` set from the context's stored cwd, read once the command completed |
-| `kj kohai create --cwd /`, `kj context set --cwd /`, `kj fork --pwd /`, an inherited `/` | an output line, `` warning: context ID has cwd /, which is almost always a mistake; set its work tree with `kj context set ID --cwd DIR` `` |
+| `kj context create --cwd /`, `kj context set --cwd /`, `kj fork --pwd /`, an inherited `/` | an output line, `` warning: context ID has cwd /, which is almost always a mistake; set its work tree with `kj context set ID --cwd DIR` `` |
 | ACP `session/new`, `session/load`, `session/resume` at `/` | an agent message to the client, and a kernel log line on `setContextCwd` |
 | coder create orientation | a notification in place of the orientation |
 

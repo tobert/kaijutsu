@@ -5025,7 +5025,7 @@ impl KernelDb {
 
     /// Test fixture: rewrite the character of `id`'s context character to
     /// `played_by`. No kernel path does this: a context's character never
-    /// changes. For wire tests that make a context through `kj kohai create`
+    /// changes. For wire tests that make a context through `kj context create`
     /// and then need another character to perform it. The trigger that fixes
     /// the principal is dropped for the update and put back.
     #[cfg(any(test, feature = "test-util"))]

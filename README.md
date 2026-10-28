@@ -114,7 +114,7 @@ kj backend model set deepseek deepseek-flash --context-window 1000000 --max-toke
 kj cast create house
 kj cast slot set house coder --backend deepseek --model deepseek-flash
 kj character set <character> --cast house
-kj kohai create <label> --as <character> --type coder
+kj context create <label> --as <character> --type coder
 
 # Anthropic
 kj backend set anthropic --kind anthropic --api-key-env ANTHROPIC_API_KEY --api-key-file ~/.anthropic-key.txt

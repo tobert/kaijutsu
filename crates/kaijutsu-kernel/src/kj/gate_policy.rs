@@ -1427,10 +1427,10 @@ enum CharacterTarget {
     /// current context, which the verb resolves the same way. Covered when
     /// the actor holds that context's senpai.
     Context(Option<String>),
-    /// `kj kohai create --senpai <ctx>`: the new context answers to this
+    /// `kj context create --senpai <ctx>`: the new context answers to this
     /// one. Covered when the actor holds it.
     NewUnder(String),
-    /// `kj kohai create` under the caller's current context: the new
+    /// `kj context create` under the caller's current context: the new
     /// context's senpai is the caller's own.
     NewChild,
     /// A verb the condition does not read, or a form of one that acts on
@@ -1465,9 +1465,6 @@ fn character_target(args: &[String]) -> CharacterTarget {
                 Ok(true) => Ok(Unread),
                 Err(e) => Err(e),
             },
-            _ => Ok(Unread),
-        },
-        Some(("kohai", m)) => match m.subcommand() {
             Some(("create", m)) => value(m, "senpai").map(|p| p.map_or(NewChild, NewUnder)),
             _ => Ok(Unread),
         },
@@ -1505,8 +1502,8 @@ fn wraps_kj(cmd: &PlannedCommand) -> bool {
 /// not the `kj` builtin passes: the gate reads no context target in it. A `kj` call the builtin layer allows passes, since it only reads.
 /// `kj drive`, `kj interrupt` and `kj context archive` pass only when the
 /// actor holds the target's senpai, resolved as the verb resolves it;
-/// `kj kohai create --senpai <ctx>` passes only when the actor holds that
-/// context, and a bare `kj kohai create` passes, since its new context
+/// `kj context create --senpai <ctx>` passes only when the actor holds that
+/// context, and a bare `kj context create` passes, since its new context
 /// answers to the caller's own (`docs/senpai-kohai.md`, "Decided after the
 /// docs pass"). Every other `kj` call fails, as does one with an argument
 /// that is not a literal word (an expansion could name another target, or a
@@ -1641,7 +1638,7 @@ pub(crate) fn character_rule_refusal(statements: &[PlannedStatement]) -> Option<
     Some(format!(
         "`{}` is not a kj call a character rule can cover; a character allow covers kj drive, \
          kj interrupt and kj context archive (without --children) on contexts whose senpai the \
-         character holds, and kj kohai create under a context it holds, with literal arguments, \
+         character holds, and kj context create under a context it holds, with literal arguments, \
          and commands other than kj",
         command_clause(unread)
     ))
@@ -1942,7 +1939,7 @@ mod tests {
     }
 
     /// A context env argument (`--env KEY=VALUE`) is plain text and must
-    /// not drop a tier-allowed `kj kohai create` to Uncovered.
+    /// not drop a tier-allowed `kj context create` to Uncovered.
     /// The verbs a character allow can cover each name their target by a
     /// clap field id. A renamed field must read as `Unread`, never as the
     /// current context, so this pins every id the table reads.
@@ -1959,9 +1956,9 @@ mod tests {
         assert_eq!(target("context archive lane"), Context(Some("lane".into())));
         assert_eq!(target("--confirm context archive"), Context(None));
         assert_eq!(target("context archive --children lane"), Unread);
-        assert_eq!(target("kohai create child --type coder --as coder"), NewChild);
-        assert_eq!(target("kohai create child --as coder --parent lane"), NewChild, "--parent is provenance only");
-        assert_eq!(target("kohai create child --as coder --senpai lane"), NewUnder("lane".into()));
+        assert_eq!(target("context create child --type coder --as coder"), NewChild);
+        assert_eq!(target("context create child --as coder --parent lane"), NewChild, "--parent is provenance only");
+        assert_eq!(target("context create child --as coder --senpai lane"), NewUnder("lane".into()));
         assert_eq!(target("context create child"), Unread, "kj context create is gone");
         assert_eq!(target("context set lane --model m"), Unread);
         assert_eq!(target("fork"), Unread);
@@ -1976,7 +1973,7 @@ mod tests {
     fn a_character_allow_is_refused_where_the_target_cannot_be_read() {
         let refusal = |source: &str| character_rule_refusal(&plan(source));
         assert_eq!(refusal("kj drive lane --prompt go && git log"), None);
-        assert_eq!(refusal("kj kohai create child --type coder --as coder"), None);
+        assert_eq!(refusal("kj context create child --type coder --as coder"), None);
         assert!(refusal("for x in lane-a; do kj drive $x; done").is_some(), "a loop variable is not a literal target");
         assert!(refusal("kj drive ${LANE}").is_some());
         assert!(refusal("./kj drive amy-lane").is_some());
@@ -2006,15 +2003,15 @@ mod tests {
 
     #[test]
     fn env_argument_keeps_the_context_type_allow() {
-        let cfg = config("[context_type.mcp]\nallow = [\"kj kohai create\"]\n");
+        let cfg = config("[context_type.mcp]\nallow = [\"kj context create\"]\n");
         let v = first_verdict(
-            "kj kohai create banto-probe --as banto --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
+            "kj context create banto-probe --as banto --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
             &cfg,
             Some("mcp"),
         );
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::ContextTypeConfig("mcp".to_string()), "kj kohai create".to_string())],
+            vec![(Layer::ContextTypeConfig("mcp".to_string()), "kj context create".to_string())],
             "got {v:?}"
         );
     }
@@ -2077,23 +2074,23 @@ mod tests {
     }
 
     /// A config allow that cannot cover a command leaves the builtin layer
-    /// to decide it: allowing `kj kohai create` must not make
-    /// `kj kohai create --help` ask when no config names it. A config ask or
+    /// to decide it: allowing `kj context create` must not make
+    /// `kj context create --help` ask when no config names it. A config ask or
     /// deny still decides first.
     ///
     /// Falsified by returning uncovered from a config allow that fails
     /// the structural check, skipping the builtin layer.
     #[test]
     fn a_config_allow_does_not_take_help_away() {
-        let cfg = config("[global]\nallow = [\"kj kohai create\"]\n[context_type.director]\nallow = [\"kj kohai create\"]\n");
+        let cfg = config("[global]\nallow = [\"kj context create\"]\n[context_type.director]\nallow = [\"kj context create\"]\n");
         for context_type in [None, Some("director")] {
-            assert_eq!(builtin_key_of(&first_verdict("kj kohai create --help", &cfg, context_type)), "kj kohai --help",
+            assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, context_type)), "kj context --help",
                 "{context_type:?}");
         }
-        assert_eq!(first_verdict("kj kohai create x --as coder > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
+        assert_eq!(first_verdict("kj context create x --as coder > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
             "a redirect still keeps the allow from covering, and no builtin covers it");
-        let asks = config("[global]\nask = [\"kj kohai create\"]\n");
-        assert!(matches!(first_verdict("kj kohai create --help", &asks, None), PolicyVerdict::Ask(_)),
+        let asks = config("[global]\nask = [\"kj context create\"]\n");
+        assert!(matches!(first_verdict("kj context create --help", &asks, None), PolicyVerdict::Ask(_)),
             "an ask is firm");
     }
 
@@ -2284,7 +2281,7 @@ ask = ["kj rc add", "git push"]
 deny = ["dd"]
 
 [context_type.explorer]
-deny = ["kj kohai create"]
+deny = ["kj context create"]
 "#;
 
     #[test]
@@ -2410,20 +2407,20 @@ deny = ["kj kohai create"]
     #[test]
     fn the_context_type_layer_outranks_global_and_a_specific_key_outranks_a_general_one() {
         let cfg = config(
-            "[global]\nallow = [\"kj context\"]\ndeny = [\"kj kohai create\"]\n\
-             [context_type.explorer]\nallow = [\"kj kohai create\"]\n",
+            "[global]\nallow = [\"kj context\"]\ndeny = [\"kj context create\"]\n\
+             [context_type.explorer]\nallow = [\"kj context create\"]\n",
         );
         // Within global: the specific deny beats the general allow.
-        assert!(matches!(first_verdict("kj kohai create x --as coder", &cfg, None), PolicyVerdict::Deny(_)));
+        assert!(matches!(first_verdict("kj context create x --as coder", &cfg, None), PolicyVerdict::Deny(_)));
         assert!(matches!(first_verdict("kj context list", &cfg, None), PolicyVerdict::Allow(_)));
         // The context_type layer sits above global.
-        let v = first_verdict("kj kohai create x --as coder", &cfg, Some("explorer"));
+        let v = first_verdict("kj context create x --as coder", &cfg, Some("explorer"));
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::ContextTypeConfig("explorer".into()), "kj kohai create".to_string())]
+            vec![(Layer::ContextTypeConfig("explorer".into()), "kj context create".to_string())]
         );
         assert!(matches!(
-            first_verdict("kj kohai create x --as coder", &cfg, Some("coder")),
+            first_verdict("kj context create x --as coder", &cfg, Some("coder")),
             PolicyVerdict::Deny(_)
         ));
     }
@@ -2603,7 +2600,7 @@ uncovered = "allow"
     fn the_shipped_default_lets_a_director_create_and_drive_a_lane() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         for source in [
-            "kj kohai create count-kj-rs --type coder --as coder",
+            "kj context create count-kj-rs --type coder --as coder",
             "kj fork --name lane --prompt \"count the files\"",
             "kj drive count-kj-rs --prompt \"count the files\"",
         ] {

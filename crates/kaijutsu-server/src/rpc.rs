@@ -2386,7 +2386,7 @@ fn write_context_row_to_handle_info(
 /// the durable KernelDb row if the in-memory registry has lost it. Returns
 /// the context's trace id (zeroed if truly unknown) on success.
 ///
-/// The registry is populated by `kj kohai create` and fork, AND
+/// The registry is populated by `kj context create` and fork, AND
 /// `create_shared_kernel`'s boot-time recovery step already re-registers
 /// every context `KernelDb::list_active_contexts` returns (`WHERE
 /// archived_at IS NULL`) on every kernel start — so a live or concluded
@@ -2416,7 +2416,7 @@ async fn ensure_context_joinable(
     // Context must already exist — no auto-creation.
     if !kernel.documents.contains(context_id) {
         return Err(capnp::Error::failed(format!(
-            "context {} does not exist; create it with `kj kohai create`",
+            "context {} does not exist; create it with `kj context create`",
             context_id
         )));
     }
@@ -2436,7 +2436,7 @@ async fn ensure_context_joinable(
         let row = row.ok_or_else(|| {
             capnp::Error::failed(format!(
                 "context {context_id} not registered in drift router and has \
-                 no KernelDb row; create it with `kj kohai create`",
+                 no KernelDb row; create it with `kj context create`",
             ))
         })?;
         log::warn!(
@@ -3802,7 +3802,7 @@ impl kernel::Server for KernelImpl {
 
     /// Join an existing context, returning its context_id.
     ///
-    /// The context must already exist (created by `kj kohai create`). Returns an
+    /// The context must already exist (created by `kj context create`). Returns an
     /// error if the context doesn't exist — no auto-creation.
     fn join_context(
         self: Rc<Self>,

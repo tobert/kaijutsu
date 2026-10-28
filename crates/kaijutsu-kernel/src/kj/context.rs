@@ -57,6 +57,39 @@ impl From<ContextConfigArgs> for ContextConfig {
 
 #[derive(Subcommand, Debug)]
 enum ContextCommand {
+    /// Make a new context performed by a character, that answers to this
+    /// context. Label is positional or `--name`. The new context runs the
+    /// model in the character's cast slot for its type, copied now; the
+    /// output says when the cast has none. Needs the operator capability and
+    /// a live character caller.
+    #[command(alias = "new")]
+    Create {
+        /// Label (positional form; or use --name)
+        label: Option<String>,
+        /// Label (flag form; takes precedence over the positional label)
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// Context the new one is created from, for provenance only.
+        /// Defaults to the current context
+        #[arg(long, short = 'p')]
+        parent: Option<String>,
+        /// The context the new one answers to. Defaults to the current
+        /// context; another context needs the caller to be its character or
+        /// its lineage root
+        #[arg(long)]
+        senpai: Option<String>,
+        /// The live character that performs the new context. Its senpai's
+        /// character reviews its asks
+        #[arg(long = "as", value_name = "CHARACTER", required = true)]
+        character: String,
+        /// With --cwd: if the kernel cannot use that directory when the
+        /// create runs, create as if --cwd were not given and say why. A
+        /// create held for approval checks when it runs
+        #[arg(long = "cwd-optional", requires = "cwd")]
+        cwd_optional: bool,
+        #[command(flatten)]
+        config: Box<ContextConfigArgs>,
+    },
     /// List active contexts (or the fork DAG with --tree).
     #[command(alias = "ls")]
     List {
@@ -535,7 +568,7 @@ impl KjDispatcher {
         // Mutating or destroying an *existing* context is operator authority.
         // `scratch` is deliberately ungated: it is the bootstrap entry point,
         // needing no parent, so a fresh, unjoined session can still make its
-        // first context. Creating any other context is `kj kohai create`.
+        // first context. Creating any other context is `kj context create`.
         // Read/navigation verbs (list/info/current/switch/log) stay ungated
         // too.
         //
@@ -555,7 +588,8 @@ impl KjDispatcher {
         // context (`docs/character.md`, "ROOT places contexts").
         if matches!(
             parsed.command,
-            ContextCommand::Set { .. }
+            ContextCommand::Create { .. }
+                | ContextCommand::Set { .. }
                 | ContextCommand::Unset { .. }
                 | ContextCommand::Rename { .. }
                 | ContextCommand::Archive { .. }
@@ -606,6 +640,18 @@ impl KjDispatcher {
             },
             ContextCommand::Archive { context, children: true, context_type } => {
                 Box::pin(self.context_archive_children(context.as_deref(), context_type.as_deref(), caller)).await
+            }
+            ContextCommand::Create { label, name, parent, senpai, character, cwd_optional, config } => {
+                Box::pin(self.context_create(
+                    name.or(label).as_deref(),
+                    parent.as_deref(),
+                    senpai.as_deref(),
+                    &character,
+                    cwd_optional,
+                    *config,
+                    caller,
+                ))
+                .await
             }
             ContextCommand::Rotate { context } => self.context_rotate(context.as_deref(), caller).await,
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
@@ -1285,14 +1331,14 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj kohai create` (`docs/senpai-kohai.md`, "Creating, forking,
+    /// `kj context create` (`docs/senpai-kohai.md`, "Creating, forking,
     /// rotating"): makes a new context performed by `character`. Its senpai
     /// is the caller's context, or the context `senpai` names when the
     /// caller's character is that context's character or its lineage root.
     /// `parent` is provenance only
     /// and defaults to the caller's context. The caller must be a live
     /// character.
-    pub(crate) async fn kohai_create(
+    pub(crate) async fn context_create(
         &self,
         label: Option<&str>,
         parent: Option<&str>,
@@ -1309,7 +1355,7 @@ impl KjDispatcher {
             Some(l) => l,
             None => {
                 return KjResult::Err(
-                    "kj kohai create: requires a label (positional or --name)".to_string(),
+                    "kj context create: requires a label (positional or --name)".to_string(),
                 );
             }
         };
@@ -1319,14 +1365,14 @@ impl KjDispatcher {
         match self.kernel_db().lock().get_character(caller.actor_id) {
             Ok(Some(sheet)) if sheet.retired_at.is_none() => {}
             Ok(Some(sheet)) => return KjResult::Err(format!(
-                "kj kohai create: {} is retired and cannot create a context", sheet.name
+                "kj context create: {} is retired and cannot create a context", sheet.name
             )),
             Ok(None) => return KjResult::Err(
-                "kj kohai create: the caller has no character sheet; a new context answers to its creator, \
+                "kj context create: the caller has no character sheet; a new context answers to its creator, \
                  so only a live character may create one"
                     .to_string(),
             ),
-            Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+            Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         }
 
         // `--parent` names the provenance explicitly, or it defaults to the
@@ -1340,12 +1386,12 @@ impl KjDispatcher {
                 Ok(id) => Some(id),
                 Err(_) if parent.is_none() => {
                     return KjResult::Err(
-                        "kj kohai create: no current context and no --parent given; \
+                        "kj context create: no current context and no --parent given; \
                          name one with --parent <context>"
                             .to_string(),
                     );
                 }
-                Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             }
         };
 
@@ -1358,12 +1404,12 @@ impl KjDispatcher {
             let (context, via_flag) = match senpai {
                 Some(senpai) => match super::refs::resolve_context_arg(Some(senpai), caller, &db) {
                     Ok(id) => (id, true),
-                    Err(e) => return KjResult::Err(format!("kj kohai create: --senpai: {e}")),
+                    Err(e) => return KjResult::Err(format!("kj context create: --senpai: {e}")),
                 },
                 None => match caller.context_id {
                     Some(id) => (id, false),
                     None => return KjResult::Err(
-                        "kj kohai create: the new context's senpai is the context it is created from, \
+                        "kj context create: the new context's senpai is the context it is created from, \
                          and the caller has no current context; run this from the context that should \
                          supervise it, or name one with --senpai"
                             .to_string(),
@@ -1373,11 +1419,11 @@ impl KjDispatcher {
             match db.context_character(context) {
                 Ok(Some(_)) => {}
                 Ok(None) => return KjResult::Err(format!(
-                    "kj kohai create: context {} has no context character, so nothing can answer to it; \
+                    "kj context create: context {} has no context character, so nothing can answer to it; \
                      name a context that has one with --senpai",
                     db.context_name(context)
                 )),
-                Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             }
             // By default, anyone may start a kohai in a root's own console
             // (the gate's ask to the root is the control there), and a
@@ -1387,13 +1433,13 @@ impl KjDispatcher {
             let in_rc_lifecycle = caller.privileged && caller.rc_depth > 0;
             let exempt = !via_flag && (in_rc_lifecycle || match db.is_root_console(context) {
                 Ok(root_console) => root_console,
-                Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             });
             if !exempt {
                 match db.may_place_under(context, caller.actor_id) {
                     Ok(Ok(_)) => {}
-                    Ok(Err(refusal)) => return KjResult::Err(format!("kj kohai create: {refusal}")),
-                    Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+                    Ok(Err(refusal)) => return KjResult::Err(format!("kj context create: {refusal}")),
+                    Err(e) => return KjResult::Err(format!("kj context create: {e}")),
                 }
             }
             context
@@ -1410,7 +1456,7 @@ impl KjDispatcher {
         // Refuse an unlisted type before any mutation — a typo'd --type must
         // not silently create a context with no rc bucket to run.
         if let Err(e) = super::rc::check_context_type(self.kernel().vfs(), &context_type).await {
-            return KjResult::Err(format!("kj kohai create: {e}"));
+            return KjResult::Err(format!("kj context create: {e}"));
         }
 
         // Refuse a type whose `create` bucket is missing or holds no
@@ -1424,7 +1470,7 @@ impl KjDispatcher {
             Ok(true) => {}
             Ok(false) => {
                 return KjResult::Err(format!(
-                    "kj kohai create: context type '{context_type}' has no rc create \
+                    "kj context create: context type '{context_type}' has no rc create \
                      scripts at {}; a context of this type would be committed inert \
                      (deny-by-default, no loadout) with no create lifecycle to bind one. \
                      Add a script there, or run `kaijutsu-server rc reseed` to restore the \
@@ -1434,7 +1480,7 @@ impl KjDispatcher {
             }
             Err(e) => {
                 return KjResult::Err(format!(
-                    "kj kohai create: could not check the '{context_type}' create bucket \
+                    "kj context create: could not check the '{context_type}' create bucket \
                      for scripts: {e}"
                 ));
             }
@@ -1466,13 +1512,13 @@ impl KjDispatcher {
         {
             let inherited = match crate::runtime::shell_state::read_context_cwd(&self.kernel_db().lock(), current) {
                 Ok(cwd) => cwd,
-                Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             };
             if let Some(cwd) = inherited {
                 let cwd = cwd.to_string_lossy().into_owned();
                 if let Err(e) = self.check_cwd(caller, current, &cwd).await {
                     return KjResult::Err(format!(
-                        "kj kohai create: the current context's cwd {e}; name the new \
+                        "kj context create: the current context's cwd {e}; name the new \
                          context's directory with --cwd DIR"
                     ));
                 }
@@ -1483,10 +1529,10 @@ impl KjDispatcher {
         // Validate the rest before any mutation so a typo'd --env or --cwd
         // can't leave an orphan context behind.
         let Some(cwd_check_context) = parent_id.or(caller.context_id) else {
-            return KjResult::Err("kj kohai create: no parent context".into());
+            return KjResult::Err("kj context create: no parent context".into());
         };
         if let Err(e) = self.resolve_context_config(&cfg, caller, cwd_check_context).await {
-            return KjResult::Err(format!("kj kohai create: {e}"));
+            return KjResult::Err(format!("kj context create: {e}"));
         }
         let new_id = ContextId::new();
 
@@ -1500,19 +1546,19 @@ impl KjDispatcher {
                 let db = self.kernel_db().lock();
                 match db.get_character_by_name(character) {
                     Ok(Some(row)) if row.retired_at.is_some() => return KjResult::Err(format!(
-                        "kj kohai create: character '{character}' is retired; choose a live character with `kj character list`"
+                        "kj context create: character '{character}' is retired; choose a live character with `kj character list`"
                     )),
                     Ok(Some(row)) => row.principal_id,
                     Ok(None) => return KjResult::Err(format!(
-                        "kj kohai create: no character named '{character}'; use `kj character list` or `kj character create <name>`"
+                        "kj context create: no character named '{character}'; use `kj character list` or `kj character create <name>`"
                     )),
-                    Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+                    Err(e) => return KjResult::Err(format!("kj context create: {e}")),
                 }
             };
             // The context does not exist yet, so routing starts at the senpai
             // it will name.
             if let Err(error) = self.kernel().validate_model_review_assignment(crate::kernel_db::ReviewFrom::Senpai(senpai_ctx), performer).await {
-                return KjResult::Err(format!("kj kohai create: {error}"));
+                return KjResult::Err(format!("kj context create: {error}"));
             }
             let row = ContextRow {
                 context_id: new_id,
@@ -1537,7 +1583,7 @@ impl KjDispatcher {
             };
             let db = self.kernel_db().lock();
             if let Err(e) = insert_new_context_checked(&db, &row, CharacterPlacement::Start { performer, senpai: Some(senpai_ctx) }) {
-                return KjResult::Err(format!("kj kohai create: {e}"));
+                return KjResult::Err(format!("kj context create: {e}"));
             }
             crate::runtime::admission::ContextAdmission::for_inserted(&row)
         };
@@ -1546,7 +1592,7 @@ impl KjDispatcher {
         {
             let mut drift = self.drift_router().write();
             if let Err(e) = drift.register(new_id, Some(label), parent_id, caller.principal_id) {
-                return KjResult::Err(format!("kj kohai create: {e}"));
+                return KjResult::Err(format!("kj context create: {e}"));
             }
         }
 
@@ -1555,7 +1601,7 @@ impl KjDispatcher {
         // here.
         let config_changes = match self.apply_context_config(new_id, &cfg).await {
             Ok(changes) => changes,
-            Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+            Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         };
 
         // Run rc create-lifecycle scripts after committing the context. Script
@@ -1574,7 +1620,7 @@ impl KjDispatcher {
 
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
-                "kj kohai create: context '{}' ({}) was committed, but its rc \
+                "kj context create: context '{}' ({}) was committed, but its rc \
                  create lifecycle was cancelled",
                 label,
                 new_id.short()
@@ -1582,7 +1628,7 @@ impl KjDispatcher {
         }
         if let Err(e) = lifecycle {
             return KjResult::Err(format!(
-                "kj kohai create: context '{}' ({}) was committed, but its rc create lifecycle could not settle: {e}",
+                "kj context create: context '{}' ({}) was committed, but its rc create lifecycle could not settle: {e}",
                 label, new_id.short()
             ));
         }
@@ -2874,7 +2920,8 @@ impl Classify for ContextCommand {
             | Self::Prompt { .. }
             | Self::Current
             | Self::Log { .. } => Effect::Read,
-            Self::Switch { .. }
+            Self::Create { .. }
+            | Self::Switch { .. }
             | Self::Scratch
             | Self::Rebind { .. }
             | Self::Rotate { .. }
@@ -3346,7 +3393,7 @@ mod tests {
 
         crate::kj::test_helpers::give_character(&d, &c);
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("child-ctx")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("child-ctx")], &c)
             .await;
         assert!(result.is_ok());
         assert!(
@@ -3384,7 +3431,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&d, &c);
 
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("default-child")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("default-child")], &c)
             .await;
         assert!(result.is_ok(), "{}", result.message());
 
@@ -3396,10 +3443,10 @@ mod tests {
     /// `--top` is gone (spec answer 2): `--senpai <ctx>` names any other
     /// senpai the caller has authority over.
     #[tokio::test]
-    async fn kohai_create_has_no_top_flag() {
+    async fn context_create_has_no_top_flag() {
         let d = test_dispatcher().await;
         let parent = register_context(&d, Some("no-top-parent"), None, PrincipalId::new());
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("top-child"), s("--top")], &caller_with_context(parent)).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("top-child"), s("--top")], &caller_with_context(parent)).await;
         assert!(!result.is_ok());
         assert!(result.message().contains("unexpected argument '--top'"), "{}", result.message());
         assert!(d.kernel_db().lock().find_context_by_label("top-child").unwrap().is_none());
@@ -3416,9 +3463,9 @@ mod tests {
         let c = caller_with_context(caller_ctx);
         crate::kj::test_helpers::give_character(&d, &c);
 
-        let default = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kohai-default")], &c).await;
+        let default = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("kohai-default")], &c).await;
         assert!(default.is_ok(), "{}", default.message());
-        let named = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kohai-parented"), s("--parent"), s("senpai-elsewhere")], &c).await;
+        let named = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("kohai-parented"), s("--parent"), s("senpai-elsewhere")], &c).await;
         assert!(named.is_ok(), "{}", named.message());
 
         let db = d.kernel_db().lock();
@@ -3438,7 +3485,7 @@ mod tests {
         register_context(&d, Some("only-parent"), None, principal);
         let caller = crate::kj::KjCaller { context_id: None, ..test_caller() };
         crate::kj::test_helpers::give_character(&d, &caller);
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("stray"), s("--parent"), s("only-parent")], &caller).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("stray"), s("--parent"), s("only-parent")], &caller).await;
         assert!(!result.is_ok(), "{}", result.message());
         assert!(result.message().contains("senpai"), "{}", result.message());
         assert!(d.kernel_db().lock().find_context_by_label("stray").unwrap().is_none());
@@ -3457,7 +3504,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&d, &caller);
 
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller)
             .await;
         assert!(!result.is_ok(), "a parentless create must refuse");
         assert!(
@@ -3484,7 +3531,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("empty-parent"), s("--parent"), s("")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("empty-parent"), s("--parent"), s("")],
                 &caller,
             )
             .await;
@@ -3505,7 +3552,7 @@ mod tests {
         c.cancel.cancel();
 
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("cancelled-create-child")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("cancelled-create-child")], &c)
             .await;
 
         assert!(!result.is_ok(), "cancelled create must report partial completion");
@@ -3535,7 +3582,7 @@ mod tests {
         }
 
         let result = d.dispatch(
-            &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("rc-admission-fault-child")], &c,
+            &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("rc-admission-fault-child")], &c,
         ).await;
         d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
@@ -3611,7 +3658,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let refused = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("sovereign"), s("sovereign-lane")], &banto_caller).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("--as"), s("sovereign"), s("sovereign-lane")], &banto_caller).await;
         assert!(refused.is_ok(), "a root can be cast: {}", refused.message());
         let lane = d.kernel_db().lock().find_context_by_label("sovereign-lane").unwrap()
             .expect("the kohai exists");
@@ -3641,16 +3688,16 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let refused = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("owner"), s("owner-lane")], &caller).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("--as"), s("owner"), s("owner-lane")], &caller).await;
         assert!(!refused.is_ok(), "a root would review its own work");
         assert!(refused.message().contains("cannot review its own work"), "{}", refused.message());
         assert!(d.kernel_db().lock().find_context_by_label("owner-lane").unwrap().is_none(), "nothing was written");
     }
 
     #[tokio::test]
-    async fn kohai_create_help_describes_performer_and_senpai_selection() {
+    async fn context_create_help_describes_performer_and_senpai_selection() {
         let d = test_dispatcher().await;
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--help")], &test_caller()).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--help")], &test_caller()).await;
         assert!(result.is_ok(), "{}", result.message());
         let help = result.message();
         println!("{help}");
@@ -4154,7 +4201,7 @@ mod tests {
             std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
         ).await.unwrap();
         let result = shell.execute_with_options(
-            "kj kohai create operator --type director --as banto --env 'KJ_CHARACTER=obsolete-name'",
+            "kj context create operator --type director --as banto --env 'KJ_CHARACTER=obsolete-name'",
             kaish_kernel::ExecuteOptions::default(),
         ).await.unwrap();
         assert!(result.ok(), "{result:?}");
@@ -4225,7 +4272,7 @@ mod tests {
             let note = d.dispatch(&[s("handoff"), s("note"), s("--for"), s(name), s("name-specific-history")], &caller).await;
             assert!(note.is_ok(), "{}", note.message());
             let label = format!("named-{index}");
-            let create = d.dispatch(&[s("kohai"), s("create"), s(&label), s("--type"), s("director"), s("--as"), s(name)], &caller).await;
+            let create = d.dispatch(&[s("context"), s("create"), s(&label), s("--type"), s("director"), s("--as"), s(name)], &caller).await;
             assert!(create.is_ok(), "{}", create.message());
             let id = d.kernel_db().lock().resolve_context(&label).unwrap();
             let blocks = d.block_store().block_snapshots(id).unwrap();
@@ -4257,7 +4304,7 @@ mod tests {
     /// `create --as` needs the Operator capability, as other changes to
     /// an existing context do.
     #[tokio::test]
-    async fn kohai_create_requires_operator_with_or_without_as() {
+    async fn context_create_requires_operator_with_or_without_as() {
         let d = test_dispatcher().await;
         let amy = test_reviewer_principal();
         let coder = PrincipalId::new();
@@ -4279,11 +4326,11 @@ mod tests {
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
-        let refused = d.dispatch(&[s("kohai"), s("create"), s("cast-lane"), s("--parent"), s("cast-parent"), s("--as"), s("coder")], &caller).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("cast-lane"), s("--parent"), s("cast-parent"), s("--as"), s("coder")], &caller).await;
         assert!(!refused.is_ok(), "{}", refused.message());
         assert!(refused.message().contains("operator"), "{}", refused.message());
         assert!(d.kernel_db().lock().resolve_context("cast-lane").is_err(), "a refusal creates nothing");
-        let plain = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("plain-lane"), s("--parent"), s("cast-parent")], &caller).await;
+        let plain = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("plain-lane"), s("--parent"), s("cast-parent")], &caller).await;
         assert!(!plain.is_ok(), "creating needs operator with no performer too (`docs/senpai-kohai.md`)");
         assert!(plain.message().contains("operator"), "{}", plain.message());
         assert!(d.kernel_db().lock().resolve_context("plain-lane").is_err());
@@ -4305,18 +4352,18 @@ mod tests {
         d.kernel_db().lock().update_played_by(parent, Some(amy)).unwrap();
         let mut caller = test_caller();
         caller.context_id = Some(parent);
-        let characterless = d.dispatch(&[s("kohai"), s("create"), s("ghost-lane"), s("--as"), s("coder")], &caller).await;
+        let characterless = d.dispatch(&[s("context"), s("create"), s("ghost-lane"), s("--as"), s("coder")], &caller).await;
         assert!(!characterless.is_ok(), "{}", characterless.message());
         assert!(characterless.message().contains("character sheet"), "{}", characterless.message());
 
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: ghost, name: s("ghost"), created_at: 1, retired_at: Some(2), handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        let retired = d.dispatch(&[s("kohai"), s("create"), s("ghost-lane"), s("--as"), s("coder")], &caller.clone().with_actor(ghost, None)).await;
+        let retired = d.dispatch(&[s("context"), s("create"), s("ghost-lane"), s("--as"), s("coder")], &caller.clone().with_actor(ghost, None)).await;
         assert!(!retired.is_ok() && retired.message().contains("retired"), "{}", retired.message());
         assert!(d.kernel_db().lock().resolve_context("ghost-lane").is_err(), "a refusal creates nothing");
 
-        let cast = d.dispatch(&[s("kohai"), s("create"), s("amy-lane"), s("--as"), s("coder")], &caller.with_actor(amy, None)).await;
+        let cast = d.dispatch(&[s("context"), s("create"), s("amy-lane"), s("--as"), s("coder")], &caller.with_actor(amy, None)).await;
         assert!(cast.is_ok(), "a live character directs what it casts: {}", cast.message());
     }
 
@@ -4334,7 +4381,7 @@ mod tests {
         let before = d.kernel_db().lock().list_documents().unwrap().len();
         for (name, expected) in [("missing", "no character named"), ("retired", "is retired")] {
             let result = d.dispatch(
-                &[s("kohai"), s("create"), s("refused"), s("--as"), s(name)], &caller,
+                &[s("context"), s("create"), s("refused"), s("--as"), s(name)], &caller,
             ).await;
             assert!(!result.is_ok());
             assert!(result.message().contains(expected), "{}", result.message());
@@ -4505,7 +4552,7 @@ mod tests {
     /// rule as `--senpai` does: a character that neither plays that context,
     /// holds its senpai, nor is its lineage root cannot start a kohai under it.
     #[tokio::test]
-    async fn kohai_create_under_a_context_the_caller_cannot_place_under_is_refused() {
+    async fn context_create_under_a_context_the_caller_cannot_place_under_is_refused() {
         let d = test_dispatcher().await;
         let [owner, visitor, performer] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
         for (principal_id, name) in [(owner, "owner-x"), (visitor, "visitor-x"), (performer, "performer-x")] {
@@ -4519,7 +4566,7 @@ mod tests {
         d.kernel_db().lock().update_played_by(seat, Some(owner)).unwrap();
         d.kernel_db().lock().set_context_senpai(seat, Some(root)).unwrap();
         let visiting = crate::kj::KjCaller { principal_id: visitor, actor_id: visitor, context_id: Some(seat), privileged: true, ..test_caller() };
-        let refused = d.dispatch(&[s("kohai"), s("create"), s("visited"), s("--as"), s("performer-x")], &visiting).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("visited"), s("--as"), s("performer-x")], &visiting).await;
         assert!(!refused.is_ok(), "a visitor placed a kohai under the owner's context");
         assert!(d.kernel_db().lock().find_context_by_label("visited").unwrap().is_none(), "nothing was written");
     }
@@ -4527,7 +4574,7 @@ mod tests {
     /// A context's character is the instance's character, so `--as` is
     /// required: clap refuses its absence before the kernel looks at anything.
     #[tokio::test]
-    async fn kohai_create_without_as_is_refused_by_clap() {
+    async fn context_create_without_as_is_refused_by_clap() {
         let d = test_dispatcher().await;
         let mut caller = test_caller();
         let parent = register_context(&d, Some("unset-performer-parent"), None, caller.principal_id);
@@ -4536,7 +4583,7 @@ mod tests {
             principal_id: caller.principal_id, name: s("requester"), created_at: 1,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        let result = d.dispatch(&[s("kohai"), s("create"), s("unassigned")], &caller).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("unassigned")], &caller).await;
         let KjResult::Err(message) = result else { panic!("expected a refusal, got {result:?}") };
         assert!(message.contains("--as") && message.contains("required"), "{message}");
         assert!(d.kernel_db().lock().find_context_by_label("unassigned").unwrap().is_none(), "nothing was created");
@@ -4556,7 +4603,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&d, &c);
         let result = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("--type"), s("codr"), s("x")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("--type"), s("codr"), s("x")],
                 &c,
             )
             .await;
@@ -4590,7 +4637,7 @@ mod tests {
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
 
-        let created = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("--type"), s("gate"), s("g")], &c).await;
+        let created = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("--type"), s("gate"), s("g")], &c).await;
         assert!(!created.is_ok(), "expected error, got: {}", created.message());
         assert!(created.message().contains("is a cast role, not a context type"), "{}", created.message());
         assert!(
@@ -4615,11 +4662,11 @@ mod tests {
 
         crate::kj::test_helpers::give_character(&d, &c);
         // First create succeeds
-        let r1 = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("dup")], &c).await;
+        let r1 = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("dup")], &c).await;
         assert!(r1.is_ok());
 
         // Second create with same label should fail
-        let r2 = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("dup")], &c).await;
+        let r2 = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("dup")], &c).await;
         assert!(!r2.is_ok(), "expected error, got: {}", r2.message());
     }
 
@@ -4991,7 +5038,7 @@ mod tests {
 
         crate::kj::test_helpers::give_character(&d, &c);
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("ROOT-old")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("ROOT-old")], &c)
             .await;
         assert!(result.is_ok(), "create over an archived label failed: {}", result.message());
 
@@ -5682,12 +5729,12 @@ mod tests {
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("lost"), s("--cwd"), s("/scratch/missing")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("lost"), s("--cwd"), s("/scratch/missing")], &c).await;
         assert!(!result.is_ok(), "create --cwd on a missing directory must refuse: {}", result.message());
-        assert!(result.message().contains("kj kohai create: --cwd '/scratch/missing'"), "clients match this refusal: {}", result.message());
+        assert!(result.message().contains("kj context create: --cwd '/scratch/missing'"), "clients match this refusal: {}", result.message());
         assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "no context is created");
 
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("found"), s("--cwd"), s("/scratch/work")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("found"), s("--cwd"), s("/scratch/work")], &c).await;
         assert!(result.is_ok(), "create --cwd on a directory succeeds: {}", result.message());
     }
 
@@ -5707,7 +5754,7 @@ mod tests {
             let d = d.clone();
             let c = c.clone();
             async move {
-                d.dispatch(&[s("kohai"), s("create"), s(label), s("--as"), s(crate::kj::test_helpers::TEST_PERFORMER), s("--cwd"), s(cwd), s("--cwd-optional")], &c).await
+                d.dispatch(&[s("context"), s("create"), s(label), s("--as"), s(crate::kj::test_helpers::TEST_PERFORMER), s("--cwd"), s(cwd), s("--cwd-optional")], &c).await
             }
         };
 
@@ -5727,7 +5774,7 @@ mod tests {
         let found = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
         assert_eq!(cwd_of(found).as_deref(), Some("/scratch/work"));
 
-        let result = d.dispatch(&[s("kohai"), s("create"), s("bare"), s("--as"), s(crate::kj::test_helpers::TEST_PERFORMER), s("--cwd-optional")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("bare"), s("--as"), s(crate::kj::test_helpers::TEST_PERFORMER), s("--cwd-optional")], &c).await;
         assert!(!result.is_ok(), "--cwd-optional needs --cwd: {}", result.message());
     }
 
@@ -5750,8 +5797,8 @@ mod tests {
         assert!(result.is_ok() && !result.message().contains("warning"), "set --cwd DIR: {}", result.message());
 
         for (label, argv) in [
-            ("explicit", vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("explicit"), s("--cwd"), s("/")]),
-            ("inherited", vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("inherited")]),
+            ("explicit", vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s("explicit"), s("--cwd"), s("/")]),
+            ("inherited", vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s("inherited")]),
         ] {
             if label == "inherited" {
                 d.dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/")], &c).await;
@@ -5762,7 +5809,7 @@ mod tests {
             assert!(warns(result.message(), child), "{label}: {}", result.message());
             assert_eq!(d.kernel_db().lock().get_context_shell(child).unwrap().unwrap().cwd.as_deref(), Some("/"));
         }
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("worked"), s("--cwd"), s("/scratch/work")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("worked"), s("--cwd"), s("/scratch/work")], &c).await;
         assert!(result.is_ok() && !result.message().contains("warning"), "create --cwd DIR: {}", result.message());
     }
 
@@ -6267,7 +6314,7 @@ mod tests {
     }
 
     /// A context with no slot for its type reports no model, and says why:
-    /// the same line `kj kohai create` and `kj context rotate` print. A
+    /// the same line `kj context create` and `kj context rotate` print. A
     /// context with no context character says so.
     ///
     /// Falsified by an info that names any other model.
@@ -6428,13 +6475,13 @@ mod tests {
         assert!(list.message().contains("mock/mock-model"), "list: {}", list.message());
         assert!(!list.message().contains("[cast:"), "no cast label is stored: {}", list.message());
     }
-    /// `kj kohai create --as <character>` copies the character's cast slots:
+    /// `kj context create --as <character>` copies the character's cast slots:
     /// the new context's info reports the model, and a character whose cast
     /// has no slot for the type is told so at create.
     ///
     /// Falsified by a create that prints nothing when the context has no slot.
     #[tokio::test]
-    async fn kohai_create_copies_the_cast_and_reports_a_missing_slot() {
+    async fn context_create_copies_the_cast_and_reports_a_missing_slot() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("staffing-parent"), None, principal);
@@ -6444,7 +6491,7 @@ mod tests {
         d.kernel_db().lock().seed_test_cast(performer, "mock", "mock-model", &["default"]).unwrap();
 
         let create = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("staffed-child")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("staffed-child")], &c)
             .await;
         assert!(create.is_ok(), "create failed: {}", create.message());
         assert!(!create.message().contains("has no model"), "a slot exists, so nothing is reported: {}", create.message());
@@ -6457,7 +6504,7 @@ mod tests {
 
         // Another type has no slot in that cast.
         let slotless = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("slotless-child"), s("--type"), s("coder")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("slotless-child"), s("--type"), s("coder")], &c)
             .await;
         assert!(slotless.is_ok(), "create failed: {}", slotless.message());
         assert!(
@@ -6468,13 +6515,13 @@ mod tests {
 
     /// A character with no cast says so at create.
     #[tokio::test]
-    async fn kohai_create_says_when_the_character_has_no_cast() {
+    async fn context_create_says_when_the_character_has_no_cast() {
         let d = test_dispatcher().await;
         let parent = register_context(&d, Some("castless-parent"), None, PrincipalId::new());
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         let create = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("castless-child")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("castless-child")], &c)
             .await;
         assert!(create.is_ok(), "create failed: {}", create.message());
         assert!(
@@ -6483,7 +6530,7 @@ mod tests {
         );
     }
 
-    /// `--model`, `-m` and `--cast` are gone from `kj kohai create`, and
+    /// `--model`, `-m` and `--cast` are gone from `kj context create`, and
     /// `--model`, `--cast` from `kj context set` and `unset`: a model comes
     /// from the character's cast, copied when its context character is written.
     #[tokio::test]
@@ -6493,9 +6540,9 @@ mod tests {
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         for argv in [
-            vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("--model"), s("x")],
-            vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("-m"), s("x")],
-            vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("--cast"), s("x")],
+            vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("--model"), s("x")],
+            vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("-m"), s("x")],
+            vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s("a"), s("--cast"), s("x")],
             vec![s("context"), s("set"), s("--model"), s("x")],
             vec![s("context"), s("set"), s("--cast"), s("x")],
             vec![s("context"), s("unset"), s("--model")],
@@ -6519,7 +6566,7 @@ mod tests {
 
         crate::kj::test_helpers::give_character(&d, &c);
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("--name"), s("aliased")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("--name"), s("aliased")], &c)
             .await;
         assert!(result.is_ok(), "create --name failed: {}", result.message());
 
@@ -6543,7 +6590,7 @@ mod tests {
         let result = d
             .dispatch(
                 &[
-                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
+                    s("context"), s("create"), s("--as"), s("kohai-tester"),
                     s("kid"),
                     s("--cwd"),
                     s("/scratch/work"),
@@ -6595,16 +6642,16 @@ mod tests {
         let c = caller_with_context(caller);
         crate::kj::test_helpers::give_character(&d, &c);
 
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &c).await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         assert_eq!(cwd_of(&d, "kid").as_deref(), Some("/scratch/work"));
         assert!(result.message().contains("cwd=/scratch/work"), "the result names the cwd: {}", result.message());
 
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("placed"), s("--parent"), s("elsewhere")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("placed"), s("--parent"), s("elsewhere")], &c).await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         assert_eq!(cwd_of(&d, "placed").as_deref(), Some("/scratch/work"), "the caller's cwd, not the parent's");
 
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("named"), s("--cwd"), s("/scratch")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("named"), s("--cwd"), s("/scratch")], &c).await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         assert_eq!(cwd_of(&d, "named").as_deref(), Some("/scratch"));
     }
@@ -6621,7 +6668,7 @@ mod tests {
         let result = d.dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/v/docs")], &c).await;
         assert!(result.is_ok(), "set --cwd /v/docs: {}", result.message());
         assert_eq!(cwd_of(&d, "caller").as_deref(), Some("/v/docs"));
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &c).await;
         assert!(result.is_ok(), "create from a /v/docs cwd: {}", result.message());
         assert_eq!(cwd_of(&d, "kid").as_deref(), Some("/v/docs"));
     }
@@ -6632,7 +6679,7 @@ mod tests {
         let caller = register_context(&d, Some("caller"), None, PrincipalId::new());
         let creator = caller_with_context(caller);
         crate::kj::test_helpers::give_character(&d, &creator);
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &creator).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &creator).await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         assert_eq!(cwd_of(&d, "kid"), None);
     }
@@ -6648,15 +6695,15 @@ mod tests {
         let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
         let creator = caller_with_context(caller);
         crate::kj::test_helpers::give_character(&d, &creator);
-        let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &creator).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("kid")], &creator).await;
         assert!(!result.is_ok(), "an unavailable inherited cwd must refuse: {}", result.message());
         assert!(result.message().contains("current context's cwd '/scratch/gone'") && result.message().contains("--cwd DIR"), "msg: {}", result.message());
         assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "no context is created");
     }
 
-    /// `kj kohai create` has no `--egress-allow`/`--egress-deny` of its
+    /// `kj context create` has no `--egress-allow`/`--egress-deny` of its
     /// own — a freshly created context's egress list starts empty
-    /// (`docs/egress.md`, "Who changes the list": "`kj kohai create`
+    /// (`docs/egress.md`, "Who changes the list": "`kj context create`
     /// starts with an empty list").
     #[tokio::test]
     async fn context_create_starts_with_an_empty_egress_list() {
@@ -6668,7 +6715,7 @@ mod tests {
 
         crate::kj::test_helpers::give_character(&d, &c);
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("egress-create-kid")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("egress-create-kid")], &c)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -6718,7 +6765,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
         let created = d
-            .dispatch(&[s("kohai"), s("create"), s("bench"), s("--type"), s("coder"), s("--as"), s("coder")], &solo_call)
+            .dispatch(&[s("context"), s("create"), s("bench"), s("--type"), s("coder"), s("--as"), s("coder")], &solo_call)
             .await;
         assert!(created.is_ok(), "{}", created.message());
         let kid = d.kernel_db().lock().resolve_context("bench").expect("the coder context exists");
@@ -6818,7 +6865,7 @@ mod tests {
 
         // Default type: no beat command.
         let r = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("plain")], &c)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("plain")], &c)
             .await;
         assert!(r.is_ok(), "default create failed: {}", r.message());
         assert!(
@@ -6829,7 +6876,7 @@ mod tests {
         // Musician type: arms, with a track derived from the label.
         let r = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("bassline"), s("--type"), s("musician")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("bassline"), s("--type"), s("musician")],
                 &c,
             )
             .await;
@@ -6913,7 +6960,7 @@ mod tests {
         }
         d.kernel_db().lock().update_played_by(parent, Some(create_caller.actor_id)).unwrap();
         let create = d
-            .dispatch(&[s("kohai"), s("create"), s("banto-seat"), s("--type"), s("director"), s("--as"), s("banto")], &create_caller)
+            .dispatch(&[s("context"), s("create"), s("banto-seat"), s("--type"), s("director"), s("--as"), s("banto")], &create_caller)
             .await;
         assert!(create.is_ok(), "create failed: {}", create.message());
         let ctx = d.kernel_db().lock().resolve_context("banto-seat").expect("banto-seat exists");
@@ -6973,7 +7020,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("c1"), s("--type"), s("coder")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("c1"), s("--type"), s("coder")],
                 &create_caller,
             )
             .await;
@@ -7020,7 +7067,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("m1"), s("--type"), s("musician")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("m1"), s("--type"), s("musician")],
                 &create_caller,
             )
             .await;
@@ -7065,7 +7112,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("before"), s("--type"), s("coder")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("before"), s("--type"), s("coder")],
                 &caller,
             )
             .await;
@@ -7107,7 +7154,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("after"), s("--type"), s("coder")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("after"), s("--type"), s("coder")],
                 &caller,
             )
             .await;
@@ -7533,7 +7580,7 @@ mod rebind_tests {
         crate::kj::test_helpers::give_character(&d, &caller);
         // No rc scripts are installed here, so nothing binds the new context.
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("fresh")], &caller)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("fresh")], &caller)
             .await;
         assert!(result.is_ok(), "create still succeeds: {}", result.message());
         let msg = result.message();

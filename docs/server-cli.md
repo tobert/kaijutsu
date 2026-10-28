@@ -9,7 +9,7 @@ The server binary runs any `kj` verb against a stopped kernel:
 systemctl --user stop kaijutsu-server
 kaijutsu-server kj -- character create bob --root
 kaijutsu-server kj -- backend set deepseek --api-key-file ~/.deepseek-key
-kaijutsu-server kj --as amy -- kohai create banto --type director --as banto
+kaijutsu-server kj --as amy -- context create banto --type director --as banto
 systemctl --user start kaijutsu-server
 ```
 
@@ -55,7 +55,7 @@ result is missing:
 4. `kj cast create house`, with a `console` and a `distill` slot on the first
    provider's model, and `kj character set root --cast house` when the
    character has no cast. A cast the character already has is left alone.
-5. `kj kohai create ROOT --type console --as root`, a kohai of the root
+5. `kj context create ROOT --type console --as root`, a kohai of the root
    character's own context. When ROOT exists but lacks a slot its cast now
    fills, bootstrap runs `kj context rotate ROOT`. When ROOT is played by
    another character than `--console-as` names, the report says so and

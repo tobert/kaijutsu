@@ -832,7 +832,7 @@ kind `mk` and a `base_url`; any other backend makes every decision on the submis
 backend, and no other server is asked in its place. The slot's `--model` names the served model; the served
 model's identity is recorded with each decision. The role is `gate`, not `council`, because `council` is a
 context type: a council context playing a cast with a `council` slot would take that slot as its chat model.
-`gate`, `judge` and `distill` are reserved roles: no context resolves its chat model from one, and `kj kohai
+`gate`, `judge` and `distill` are reserved roles: no context resolves its chat model from one, and `kj context
 create` and `kj context set` refuse `--type gate` as a cast role, not a context type. The binding chooses only
 the server and its served model; whether a type gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program decisions included, and the

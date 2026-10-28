@@ -65,7 +65,7 @@ pub struct NoModel {
 }
 
 impl NoModel {
-    /// One line for `kj kohai create`, `kj context rotate` and `kj context info`.
+    /// One line for `kj context create`, `kj context rotate` and `kj context info`.
     pub fn line(&self) -> String {
         match &self.reason {
             NoModelReason::NoContextCharacter => {
@@ -95,7 +95,7 @@ impl NoModel {
         match &self.reason {
             NoModelReason::NoContextCharacter => format!(
                 "{} has no context character, so it {what}. Start one: \
-                 `kj kohai create <label> --as <character> --type <type>`",
+                 `kj context create <label> --as <character> --type <type>`",
                 self.context
             ),
             NoModelReason::NoSlot => format!(

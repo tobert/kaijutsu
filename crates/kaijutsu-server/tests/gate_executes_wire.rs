@@ -133,7 +133,7 @@ async fn seats() -> Seats {
     // These tests are about the hooks and reviews after that, so the
     // commands they run are covered; a redirect still keeps a command
     // uncovered, which the PreCall cases use to reach the hook chain.
-    common::allow_in_shipped_gate(&config, &["kj kohai create", "echo", "seq", "tee", "ls", "false"]);
+    common::allow_in_shipped_gate(&config, &["kj context create", "echo", "seq", "tee", "ls", "false"]);
     config.auth_db_path = Some(auth_db_path);
     let db_path = config.data_dir.as_ref().unwrap().join("kernel.db");
     let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();

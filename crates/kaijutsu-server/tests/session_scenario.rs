@@ -40,11 +40,11 @@
 //!   lane's ask resolves to `banto` as the character responsible for the
 //!   seat that forked it — see the assertions below and
 //!   `docs/character.md`, "Roots and rotation".
-//! - **Each lane runs its coder's cast.** A lane is `kj kohai create <lane>
+//! - **Each lane runs its coder's cast.** A lane is `kj context create <lane>
 //!   --type coder --as <coder>`, so its slots are copied from the cast its
 //!   coder character names (`kj character set <coder> --cast`), and its
 //!   `coder` slot gives it `mock-coder-a` or `mock-coder-b`.
-//! - **banto starts its own lanes.** `kj kohai create <lane> --as <coder>`
+//! - **banto starts its own lanes.** `kj context create <lane> --as <coder>`
 //!   makes a context whose senpai is banto's context, so the assignment
 //!   happens inside banto's own scripted turn; amy assigns nothing.
 //! - The kernel worker reserves `KAISH_RC_THREAD_STACK` for nested kaish
@@ -351,7 +351,7 @@ fn kaijutsu_session_scenario() {
         s.kj("kj character set coder-a --cast cast-a").await;
         s.kj("kj character set coder-b --cast cast-b").await;
 
-        s.kj("kj kohai create banto --type director --as banto").await;
+        s.kj("kj context create banto --type director --as banto").await;
         let banto_ctx = s.context_by_label("banto");
         let banto_principal = s.character_principal("banto");
         let coder_a_principal = s.character_principal("coder-a");
@@ -360,7 +360,7 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Turn 1a: amy submits a prompt in banto's seat. banto's mock script
         // creates lane-a and lane-b, each a context of its coder
-        // character under banto's own context (`kj kohai create lane-x
+        // character under banto's own context (`kj context create lane-x
         // --as coder-x`; `docs/senpai-kohai.md`, "Creating, forking,
         // rotating").
         //

@@ -42,7 +42,7 @@ Decided by Amy on 2026-10-20, after step 5 was first built on character instance
   conversation has an instance." The name: "context_characters ... is a better name than 'character instance'
   anyways since it's the fusion of a character with a context."
 - Casts melt into characters: "melt them, it's too complex having both layers."
-- Point-in-time settings are what `kj kohai create` options set. A context character could be updated at
+- Point-in-time settings are what `kj context create` options set. A context character could be updated at
   runtime, "since they'd be isolated. If freezing simplifies things, we can freeze it."
 - Rotation does not move kohai in the kernel: "A rotating senpai knows who its kohai are so we should figure out
   a handoff rather than trying to embed to much of this in kaijutsu." The successor adopts them ("successor
@@ -122,7 +122,7 @@ slot for K's context type. A context with no context character runs no model.
   `context_window` comes from the slot's model row in `backend_models`, or is unknown. An unset optional parameter
   (temperature, top_p, effort, thinking) is left out of the request. A context window none holds shows as
   unknown.
-- A context with no slot for its type has no model. `kj kohai create` and `kj context rotate` say so in their
+- A context with no slot for its type has no model. `kj context create` and `kj context rotate` say so in their
   output ("<context> has no model for <type>: <character> has no <type> slot"), and `kj context info` shows the
   same line. A model turn in K refuses before any provider work, naming the character, the type and the fix
   (`kj character slot set`, then `kj context rotate`).
@@ -176,7 +176,7 @@ One rule: **the character of a context's senpai, or its lineage root**, may:
 - archive it;
 - change its egress (`kj context set --egress-allow|--egress-deny`).
 
-**Placing under a senpai.** `kj kohai create --senpai <ctx>` and `kj senpai set` share one rule over the new
+**Placing under a senpai.** `kj context create --senpai <ctx>` and `kj senpai set` share one rule over the new
 senpai: the actor plays it, holds its senpai, or is its lineage root. A new edge refuses an archived senpai. A
 copied edge (fork, rotate) keeps the senpai it copies, archived or not.
 
@@ -200,7 +200,7 @@ its own work; a model turn refuses to start when its performer would review itse
 
 ## Creating, forking, rotating
 
-- `kj kohai create <label> --as <character> --type <t> [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
+- `kj context create <label> --as <character> --type <t> [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
   [--env K=V]... [--model <backend>/<model>] [--max-tokens N] [--effort E]` makes a context and its context
   character. `--as` is required. The senpai is the caller's context, or `--senpai <ctx>` under "Placing under a
   senpai". `--parent` sets `forked_from` only. The slots
@@ -227,8 +227,8 @@ its own work; a model turn refuses to start when its performer would review itse
   while a pending ask would change reviewer: it re-resolves every pending ask raised in the moved context and in
   the contexts below it whose climb passes through it, and refuses, naming the asks, when any reviewer would
   differ.
-- `kj senpai show [<ctx>]`, `kj kohai list [<ctx>]`, `kj senpai report "<text>"` default to the caller's context.
-  `kj kohai list` shows kohai whose senpai is archived, so they are easy to find.
+- `kj senpai show [<ctx>]`, `kj senpai kohai [<ctx>]`, `kj senpai report "<text>"` default to the caller's context.
+  `kj senpai kohai` shows kohai whose senpai is archived, so they are easy to find.
 - `kj ledger list --reviewer <character>` lists only the asks whose reviewer is that character.
 - `kj context info` shows the context's character, its senpai, and the model for its type (or why it has none).
   `kj character show` lists the character's live contexts.
@@ -251,7 +251,7 @@ The kernel does not move kohai on rotation. The rotating character knows its koh
 A rotation that fails before the commit leaves the predecessor live and labeled, with its kohai, and the
 successor unlabeled; the error names the successor, and rotate archives it before returning. A rotate rc that
 fails after the commit undoes nothing: the rotation stands, the error names the kohai not yet taken, and
-`kj kohai list` of the predecessor shows them.
+`kj senpai kohai` of the predecessor shows them.
 
 ## Reports and drift
 
@@ -276,7 +276,7 @@ Steps 1-3 (context edge):
 
 - Columns `contexts.reviewer_id` and `contexts.director_id`; tables `approval_reviewer_delegations` and its events.
 - `kj context set --reviewer`, `--clear-reviewer` and `--director`; `kj ledger delegation grant|revoke|list`;
-  `kj context create` (now `kj kohai create`).
+  `kj context create` (now `kj context create`).
 - The `forked_from` review walk, `responsible_character_above`, and the duplicate resolver.
 
 Step 5 (context characters):
@@ -289,7 +289,7 @@ Step 5 (context characters):
   `senpai_migration_report` table stays: `kj senpai show` prints a context's notes until its senpai is set again.
 - `kj cast` (every subcommand; `kj character slot set|unset|list` replaces `kj cast slot`) and
   `kj character set --cast`.
-- `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj kohai create --cast`;
+- `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj context create --cast`;
   `kj fork --model`; `kj model` (`kj context info` shows the model); `kj backend default`;
   `kj preset save --cast|--system-prompt`. `kj models` (discovery) stays.
 - RPC `configureLlm`, `setDefaultProvider`, `setDefaultModel` and `getLlmConfig`; the client's
@@ -369,11 +369,11 @@ the old row did not have; the new model requires it, and it is the character of 
   itself, for each act it governs; `kj senpai set` also checks the new senpai.
 - `kj senpai set` refuses a cycle, an archived senpai, a root console, a judge shadow, and a pending ask in the
   moved context or in a fork below it whose reviewer would change; it allows pending asks when every reviewer
-  stays the same. `kj kohai create --senpai` and `kj senpai set` use the same rule over the new senpai.
+  stays the same. `kj context create --senpai` and `kj senpai set` use the same rule over the new senpai.
 - A root console cannot be forked or archived; rotating it moves `root_ctx` at the commit; a live context with
   no senpai that is not a `root_ctx` cannot exist.
 - Archiving a context archives no other context and moves no kohai; a report to an archived senpai refuses;
-  `kj kohai list` shows kohai of an archived senpai.
+  `kj senpai kohai` shows kohai of an archived senpai.
 - Create copies every character slot with unset parameters from `backend_models`; a create option replaces the
   slot for the context's type; a later edit to the character's slots or to `backend_models` moves no context; a
   trigger refuses a change to a context's slots or character; a turn sends no unset optional parameter.
@@ -443,7 +443,7 @@ sections above win.
   no output budget.
 - **Creating a context from a root's session.** A root character performs only its root console, so a root's
   `kaijutsu-tui` or `kaijutsu-mcp` session names the character that plays what it creates: `--character <name>`
-  on both, and `KAIJUTSU_CHARACTER` for MCP (the flag wins). The name goes to `kj kohai create --as`; there is
+  on both, and `KAIJUTSU_CHARACTER` for MCP (the flag wins). The name goes to `kj context create --as`; there is
   no new wire method. Without it the session's own character plays, and a root refuses with an error that
   names the option. Both clients ask `ActorHandle::performer_for_new_contexts`, so the refusal reads the same.
 
@@ -472,7 +472,7 @@ Choices made conservatively where the design was silent. None is a new rule; eac
 
 The docs rewrite (`4a5c8be3`..`ff20a31c`) found these gaps in the spec. Steps 2 and 3 build to these answers:
 
-1. Character standing rules on `kj drive`, `interrupt`, `archive` and `kohai create` that tested
+1. Character standing rules on `kj drive`, `interrupt`, `archive` and `context create` that tested
    `director_id == actor` now test "the actor holds the target's senpai" (the first half of the authority rule).
 2. `--top` goes. Only root consoles and the listed system contexts have no senpai; `--senpai <ctx>` covers the rest.
 3. `--parent` (provenance) and `--senpai` (routing) both default to the caller's context and may differ.
@@ -520,22 +520,22 @@ Choices made where the design was silent, the smaller shape each time.
 - **Archiving a holderless top**: a parentless system context with no holder has no senpai and no lineage root, so
   `kj context archive` refuses it for everyone. Nothing in the shipped rc or bootstrap archives one.
 - **The old columns** are on `contexts` (`contexts.reviewer_id`, `contexts.director_id`), not on `characters`.
-- **`kj kohai create` flags**: it keeps `kj context create`'s whole flag set (`--name`, `-m/--model`,
+- **`kj context create` flags**: it keeps `kj context create`'s whole flag set (`--name`, `-m/--model`,
   `--system-prompt`, an optional `--type` defaulting to `default`) minus `--top`, plus `--senpai`. The spec's
   synopsis lists fewer; step 5 removes the per-context model.
 - **`kj senpai set`** also needs the caller to hold the new senpai or be its lineage root, the same rule as
   `--senpai` at create, and the operator capability, as other changes to an existing context do. It refuses an
   archived senpai. A successful set clears the migration report row, so `kj senpai show` stops printing the note.
-- **Character standing rules on `kj kohai create`**: a bare create is covered; `--senpai <ctx>` is covered only when
+- **Character standing rules on `kj context create`**: a bare create is covered; `--senpai <ctx>` is covered only when
   the actor holds `<ctx>` itself; `--parent` is provenance and does not narrow the rule.
 - **A characterless creator refuses**: a key in `auth.db` whose principal has no character sheet can no longer
   create a context (the server wire test now expects the refusal).
 - **`kj context info`** shows `Senpai:` and its record has `senpai_ctx` in place of `reviewer_override_id` and
   `director_id`. `llm.turn` no longer records `director.id`.
 - **Kept**: the dead self-review guard in `insert_new_context_rows` (step 1 note) stays.
-- **contrib/agent-dev/bootstrap.sh** moved to `kj kohai create` in this step: the coder is created with
+- **contrib/agent-dev/bootstrap.sh** moved to `kj context create` in this step: the coder is created with
   `--senpai "$project-banto"` instead of `kj context set --reviewer banto`, and the root's gate allow names
-  `kj kohai create`. The council seed scripts, `headless-app.sh` and the demo storyboard moved too.
+  `kj context create`. The council seed scripts, `headless-app.sh` and the demo storyboard moved too.
 - **Left for step 3**: `contrib/bench/rc-variants/council/coder/create/S04..S06` still run `kj context create --top`.
   They run inside a coder's create lifecycle, where `--top` has no equivalent until we choose which context the
   council contexts answer to.
@@ -570,7 +570,7 @@ Choices made where the design was silent, the smaller shape each time.
   holder nor whoever started the lifecycle lends it anything (Amy, 2026-10-19). The shipped coder archive
   bucket needs no more, since the coder context is its judge shadows' senpai.
 - **The council bench contexts** (`contrib/bench/rc-variants/council/coder/create/S04..S06`, step 2 follow-up 2)
-  are made with `kj kohai create` inside the first coder's create lifecycle, so they answer to that coder context.
+  are made with `kj context create` inside the first coder's create lifecycle, so they answer to that coder context.
   They raise no asks, so the edge routes nothing for them today.
 - **bootstrap.sh** cannot put banto under senpai's context: that context is made later, when senpai's MCP session
   registers. banto starts under Amy's root console, and the script prints the `kj senpai set` Amy runs once

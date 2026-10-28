@@ -152,7 +152,7 @@ overlay.
   banto's asks go to senpai, and a drift between banto and senpai (`kj senpai report`) needs no ask. banto starts
   coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.
 - **Gate.** Coders run with `uncovered = "allow"`. The `mcp` type does too, so the supervisor's `kj` verbs do not
-  wait on Amy. `root` allows `kj kohai create`, which MCP registration runs under Amy's root.
+  wait on Amy. `root` allows `kj context create`, which MCP registration runs under Amy's root.
 - **CPU.** `--cpuset-cpus=4-31 --cpu-shares=512`, so cores 0-3 stay free for the host. Pinning needs the `cpuset`
   controller, which systemd does not delegate to a user session by default. On zorak,
   `/etc/systemd/system/user@.service.d/delegate.conf` sets `Delegate=cpu cpuset io memory pids`; it took effect
@@ -207,7 +207,7 @@ overlay.
 - Characters: a `<project>-coder` performer on the `deepseek-flash` model,
   and `banto`. Each coder context is a kohai of banto's seat, so its asks reach
   banto, which is driving the loop; banto's seat is a kohai of the supervising
-  Claude session's context. The bootstrap creates both with `kj kohai create`.
+  Claude session's context. The bootstrap creates both with `kj context create`.
   In the first runs the supervising Claude session outside the container can
   hold the banto seat itself and drive the coder seats over MCP. Later a model
   banto in the kernel's `director` seat drives them the same way.

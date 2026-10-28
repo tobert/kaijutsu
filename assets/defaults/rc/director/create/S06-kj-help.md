@@ -41,10 +41,10 @@ See the context types this kernel has and their lifecycle scripts.
 kj character list
 Find the character who will perform a new piece of work. The `coder` character plays coder contexts; if it is missing, we ask the human.
 
-kj kohai create fix-login --type coder --as coder
+kj context create fix-login --type coder --as coder
 Start one piece of work as a new context for a character. It answers to us, so its asks come to us. Pick the type that fits the work; coder is one type.
 
-kj kohai list
+kj senpai kohai
 See the contexts that answer to us, each with its character and type.
 
 kj drive fix-login --prompt "<the work, what it may touch, what done looks like, and how to check it>"

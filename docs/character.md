@@ -18,13 +18,13 @@ an instruction to use nonexistent features.
 | Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give `ROOT` a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
 | Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Character instance | One run of one character (`docs/senpai-kohai.md`). `kj kohai create <label> --as <character> --type <t>` needs the Operator capability and a live character caller, requires `--as`, refuses an unknown, retired or root character and one that would review itself, and preserves the requester's `created_by`. It writes binding `seq` 1 from the character's cast. A fork joins its source's instance and binding; a rotation appends the next binding. The performer of a context is its instance's character, which never changes; to put another character on the work, start an instance of it |
-| Client creation | There is no create RPC. A client runs `kj kohai create --as <character>` through `executeKj` from an existing context, whose instance becomes the new instance's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses |
+| Character instance | One run of one character (`docs/senpai-kohai.md`). `kj context create <label> --as <character> --type <t>` needs the Operator capability and a live character caller, requires `--as`, refuses an unknown, retired or root character and one that would review itself, and preserves the requester's `created_by`. It writes binding `seq` 1 from the character's cast. A fork joins its source's instance and binding; a rotation appends the next binding. The performer of a context is its instance's character, which never changes; to put another character on the work, start an instance of it |
+| Client creation | There is no create RPC. A client runs `kj context create --as <character>` through `executeKj` from an existing context, whose instance becomes the new instance's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses |
 | Senpai edge | Every working instance answers to one senpai instance (`character_instances.senpai_instance`); the senpai's character reviews the instance's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
 | Model | Every model call reads the instance's binding for its context's type: `instance_slots` copies the cast slot and fills unset parameters from `backend_models` when the binding is written. No default stands in; a binding with no slot for the type gives no model, and a turn refuses naming the fix. The judge, the gate and distillation use the binding's `judge`, `gate` and `distill` slots |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation at a root context. See `docs/approval-identity.md` |
-| Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj kohai create` only on contexts whose senpai that character holds. See `docs/approval-identity.md`, "Standing rules for a character" |
+| Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts whose senpai that character holds. See `docs/approval-identity.md`, "Standing rules for a character" |
 | Retirement | Concludes and archives the live contexts of the character's instances, judge shadows included; existing block authors stay unchanged. A retired senpai character refuses reviewer resolution below it, by name |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer and the senpai from context metadata |
@@ -39,7 +39,7 @@ Sources: `kernel_db.rs::CharacterRow`, `kernel_db/instances.rs`, `model_resoluti
 
 Banto is a character that plays the `director` context type. It does not need a new
 type to have its own identity and handoff. Its instance is created with
-`kj kohai create <label> --type director --as banto`; director instructions read
+`kj context create <label> --type director --as banto`; director instructions read
 the performer from context metadata.
 
 Still planned: character rc composition (slice 5), which would also grant
@@ -260,11 +260,11 @@ Two things follow, and they are the ones to check a change against:
   default and no override. See `docs/approval-identity.md`, "Routing".
 - **A character instance's character never changes.** The senpai's
   character, or the lineage root, starts another instance of the character that
-  should do the work (`kj kohai create --as`). Roots cannot be cast, since
+  should do the work (`kj context create --as`). Roots cannot be cast, since
   they have no model.
 - **A model rotates itself with `kj context rotate`.** Amy, 2026-09-17:
   the performer may rotate its own conversation, so no ask is needed.
-  `kj kohai create --as` follows the same shape: Operator and a live
+  `kj context create --as` follows the same shape: Operator and a live
   character caller, with no ask.
 
 ### A session, inside kaijutsu
@@ -276,7 +276,7 @@ prompts, banto supervises lanes, and the lanes are contexts.
    hand. She attaches the tui to `banto` and types; the draft is hers, submit
    authors a user block as amy, and the turn runs with banto as actor and amy
    as reviewer.
-2. banto creates lanes with `kj kohai create --type coder --as coder`,
+2. banto creates lanes with `kj context create --type coder --as coder`,
    each with a label, a territory, and a worktree under `~/src/wt/`.
 3. Lanes run as driven turns. banto drives and waits. A lane's gated
    statement goes to banto, its senpai's character; banto's own, such as a
@@ -629,7 +629,7 @@ So the server CLI is four verbs: `init`, `add-key --as`, `list-keys`, and
 ALTER TABLE contexts ADD COLUMN played_by BLOB;  -- principal_id; NULL = nobody (score ctx, file doc)
 ```
 
-Set explicitly with `kj kohai create --as <character>`; omitting it leaves
+Set explicitly with `kj context create --as <character>`; omitting it leaves
 `played_by` unset on the kj path. Fork copies it. Server client creation
 defaults to the creating principal's character, when present. Automatic
 inheritance from a calling model context remains a design question.

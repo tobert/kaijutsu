@@ -294,7 +294,7 @@ impl SshServerConfig {
 
     /// The name of the live, non-root character `ephemeral()` also creates. A
     /// root performs only its root console, so a test that makes a context
-    /// with `kj kohai create --as` names this one.
+    /// with `kj context create --as` names this one.
     pub const EPHEMERAL_PERFORMER: &'static str = "performer";
 
     /// Create [`Self::EPHEMERAL_PERFORMER`] in `kernel_db` unless it exists.

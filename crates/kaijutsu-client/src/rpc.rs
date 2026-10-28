@@ -1805,7 +1805,7 @@ impl KernelHandle {
     /// registering client's own hostname. Called once, right after context
     /// creation, by a client that knows its own host (e.g.
     /// `register_session` on the kaijutsu-mcp side); every other creation
-    /// path (fork, root context bootstrap, `kj kohai create`) is
+    /// path (fork, root context bootstrap, `kj context create`) is
     /// unaffected and simply never calls this. Shared-trust model: advisory
     /// metadata, not auth.
     #[tracing::instrument(skip(self), name = "rpc_client.set_context_origin_host")]

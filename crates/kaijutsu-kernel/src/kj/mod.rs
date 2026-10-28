@@ -158,7 +158,7 @@ pub struct KjCaller {
     pub confirmed: bool,
     /// Recursion depth from rc lifecycle dispatch. The rc runner increments
     /// this before invoking nested kj from a script, so an rc-driven
-    /// `kj kohai create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
+    /// `kj context create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
     /// prevent runaway recursion (see `rc/mod.rs`).
     pub rc_depth: u8,
     /// True when this caller originates from the rc lifecycle's privileged
@@ -469,7 +469,7 @@ impl KjDispatcher {
             return KjResult::Err(self.help_for(caller));
         }
 
-        // Footgun guard: a trailing bare `help` (e.g. `kj kohai create help`)
+        // Footgun guard: a trailing bare `help` (e.g. `kj context create help`)
         // would otherwise bind as a positional and silently mint a context named
         // "help". Rewrite it to `--help` so clap renders the leaf's help. Flag
         // values (`--name help`) and non-trailing positionals are left intact.
@@ -525,14 +525,10 @@ impl KjDispatcher {
         if cmd == "context" || cmd == "ctx" {
             return Box::pin(async { self.dispatch_context(&argv[1..], caller).await }).await;
         }
-        // `kj senpai` and `kj kohai` take an optional context and default to
-        // the current one, like `kj context`; `create` needs a context of
-        // its own to answer to and says so.
+        // `kj senpai` takes an optional context and defaults to the current
+        // one, like `kj context`.
         if cmd == "senpai" {
             return Box::pin(async { self.dispatch_senpai(&argv[1..], caller).await }).await;
-        }
-        if cmd == "kohai" {
-            return Box::pin(async { self.dispatch_kohai(&argv[1..], caller).await }).await;
         }
         if cmd == "workspace" || cmd == "ws" {
             return self.dispatch_workspace(&argv[1..], caller);
@@ -871,7 +867,7 @@ impl KjDispatcher {
     }
 
     /// "Did this context end up with a usable loadout?" — the outcome question
-    /// `kj kohai create` reports on and `kj context rebind` gates on.
+    /// `kj context create` reports on and `kj context rebind` gates on.
     ///
     /// A missing binding row and a row that grants nothing answer the same: no.
     /// That is deliberate. Keying on *which rc script failed* instead would
@@ -1446,7 +1442,7 @@ pub(crate) mod test_helpers {
         *REVIEWER.get_or_init(PrincipalId::new)
     }
 
-    /// The live, non-root character `kj kohai create --as` casts in tests.
+    /// The live, non-root character `kj context create --as` casts in tests.
     pub const TEST_PERFORMER: &str = "kohai-tester";
 
     /// Insert [`TEST_PERFORMER`] unless it exists.
@@ -1570,10 +1566,10 @@ pub(crate) mod test_helpers {
     }
 
     /// Give `caller`'s actor a live character sheet if it has none, so it may
-    /// `kj kohai create` (`docs/senpai-kohai.md`, "Creating and moving").
+    /// `kj context create` (`docs/senpai-kohai.md`, "Creating and moving").
     ///
     /// A caller's registered context that has no context character gets one
-    /// of the actor, so the caller's `kj kohai create` has a context to answer
+    /// of the actor, so the caller's `kj context create` has a context to answer
     /// to.
     pub fn give_character(dispatcher: &KjDispatcher, caller: &KjCaller) {
         let db = dispatcher.kernel_db().lock();
@@ -1824,7 +1820,7 @@ mod help_footgun_tests {
         let caller = test_caller();
 
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("help")], &caller)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("help")], &caller)
             .await;
 
         // It rendered help (ephemeral Ok), not a creation/switch result.
@@ -1851,7 +1847,7 @@ mod help_footgun_tests {
             .expect("db query ok");
         assert!(
             created.is_none(),
-            "`kj kohai create help` must not mint a context labelled 'help'"
+            "`kj context create help` must not mint a context labelled 'help'"
         );
     }
 
@@ -1875,7 +1871,7 @@ mod help_footgun_tests {
         let caller = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &caller);
         let result = d
-            .dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("--name"), s("help")], &caller)
+            .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("--name"), s("help")], &caller)
             .await;
         assert!(
             !matches!(&result, KjResult::Ok { message, .. } if message.to_lowercase().contains("usage")),
@@ -1888,7 +1884,7 @@ mod help_footgun_tests {
             .expect("db query ok");
         assert!(
             created.is_some(),
-            "`kj kohai create --name help` should mint a context labelled 'help'"
+            "`kj context create --name help` should mint a context labelled 'help'"
         );
     }
 }

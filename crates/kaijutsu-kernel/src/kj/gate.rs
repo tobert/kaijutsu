@@ -2964,10 +2964,10 @@ mod tests {
         d.kernel_db.lock().update_context_type(context_id, "explorer").unwrap();
         let caller = crate::kj::test_helpers::caller_with_context(context_id);
         let config = gate_config(
-            "[global]\nallow = [\"kj kohai create\"]\n[context_type.explorer]\ndeny = [\"kj kohai create\"]\n",
+            "[global]\nallow = [\"kj context create\"]\n[context_type.explorer]\ndeny = [\"kj context create\"]\n",
         );
 
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj kohai create x --as coder").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x --as coder").unwrap();
         let outcome =
             run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
@@ -2975,7 +2975,7 @@ mod tests {
 
         // Another context of no particular type gets the global allow.
         let other = registered_caller(&d);
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj kohai create x --as coder").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x --as coder").unwrap();
         let outcome =
             run_gate(d.kernel(), &other, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);

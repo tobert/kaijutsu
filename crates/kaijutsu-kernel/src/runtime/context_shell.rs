@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(d.kernel().editor_list().len(), 1, "refused vi must not allocate sessions");
         let mut failed_reads = Vec::new();
         for command in ["kj context list", "kj block list", "kj vi open --help", "cat /config/kernel/readonly-editor.txt",
-            "kj help", "kj kohai create help", "kj synth status", "kj synth help", "kj synth --help"] {
+            "kj help", "kj context create help", "kj synth status", "kj synth help", "kj synth --help"] {
             let result = d.kernel().broker().call_tool(KernelCallParams {
                 instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE), tool: "shell".into(),
                 arguments: serde_json::json!({"command": command, "run_in_background": false}),

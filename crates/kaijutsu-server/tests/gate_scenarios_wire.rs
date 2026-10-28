@@ -88,7 +88,7 @@ fn result_of(sent: &[Vec<Message>], id: &str) -> (String, bool) {
 /// A `gate.toml` whose global allow tier holds the setup verbs and `allow`,
 /// followed by `rest` in the same section.
 fn gate(allow: &[&str], rest: &str) -> String {
-    let keys: Vec<String> = ["kj kohai create", "kj drive", "cd"].iter().chain(allow).map(|k| format!("{k:?}")).collect();
+    let keys: Vec<String> = ["kj context create", "kj drive", "cd"].iter().chain(allow).map(|k| format!("{k:?}")).collect();
     format!("[global]\nallow = [{}]\n{rest}\n", keys.join(", "))
 }
 

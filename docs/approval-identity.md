@@ -8,11 +8,11 @@ reviewer, no per-context override, and no grant that moves review from one chara
 
 ```sh
 kj character create coder
-kj kohai create repair --type coder --as coder
+kj context create repair --type coder --as coder
 kj senpai show repair
 ```
 
-`kj kohai create` starts an instance of coder, with `repair` as its conversation, as a kohai of the caller's
+`kj context create` starts an instance of coder, with `repair` as its conversation, as a kohai of the caller's
 instance. Run from Amy's root console, Amy's console is its senpai and Amy reviews coder. Run from banto's
 conversation, banto's instance is its senpai and banto reviews coder. Creating a context does not grant review
 authority to anyone beyond what the senpai edge gives.
@@ -28,7 +28,7 @@ rotation writes the successor with the predecessor's character and senpai, so th
 - The chain never has a cycle. Setting an edge that would close one is refused.
 
 `kj senpai show [<ctx>]` prints the instance, its senpai (label and character), the lineage root, and who would
-review an ask by its character. `kj kohai list [<ctx>]` lists the live kohai with character and type. Each takes
+review an ask by its character. `kj senpai kohai [<ctx>]` lists the live kohai with character and type. Each takes
 any context of an instance and uses that context's instance.
 
 ## Routing
@@ -79,7 +79,7 @@ judge shadows.
 A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root (<root>) may <act>". Also true:
 
 - A root character never performs an instance other than its root console.
-- `kj kohai create --as` needs the Operator capability and a live character caller, and raises no ask. The new
+- `kj context create --as` needs the Operator capability and a live character caller, and raises no ask. The new
   instance's senpai is the caller's instance, or the `--senpai <ctx>` instance the caller has authority over.
 - A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own
   senpai (`docs/egress.md`).
@@ -246,7 +246,7 @@ character holds the target's senpai. It covers these verbs:
 | `kj drive [<target>]` | the target, default the current context | |
 | `kj interrupt <target>` | the target | |
 | `kj context archive [<context>]` | the context, default the current context | `--children` |
-| `kj kohai create [--senpai <c>]` | `--senpai`; without it, the new context is the caller's own kohai | |
+| `kj context create [--senpai <c>]` | `--senpai`; without it, the new context is the caller's own kohai | |
 
 The gate resolves the target the way the verb does (label, id, `.`,
 `.parent`). Every argument must be a literal word, because an expanded

@@ -389,7 +389,7 @@ impl KernelDb {
         self.context_character(context_id)?.ok_or_else(|| {
             KernelDbError::Validation(format!(
                 "context {} has no context character, so it has no senpai and routes nothing; \
-                 a context gets one from `kj kohai create --as <character>`, or by forking one that has it",
+                 a context gets one from `kj context create --as <character>`, or by forking one that has it",
                 self.context_name(context_id)
             ))
         })

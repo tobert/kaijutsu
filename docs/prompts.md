@@ -128,7 +128,7 @@ The executable filename controls order. Default handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a
 spine branch that interprets.
 
-`kj kohai create --type <type>` refuses before committing a row when
+`kj context create --type <type>` refuses before committing a row when
 `<type>`'s `create` bucket (`/config/rc/<type>/create`) is missing or holds no
 runnable `.kai` script — naming the type, the expected bucket path, and `rc
 reseed` as the fix. A missing or empty bucket for any other verb (`fork`,
@@ -200,7 +200,7 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 
-`kj kohai create banto --type director --as banto` starts a character
+`kj context create banto --type director --as banto` starts a character
 instance of banto, while `created_by` remains the requester. `--as` is
 required; the character must exist and be live, and unknown or retired names
 fail before creating a context. The caller's instance becomes its senpai, and
@@ -284,7 +284,7 @@ characters and says so. Measured on this repository it is about 2000
 characters; a two-file directory is about 350.
 
 Every client that knows its working directory must create the context with
-`kj kohai create --cwd`, so the create lifecycle runs there. ACP
+`kj context create --cwd`, so the create lifecycle runs there. ACP
 `session/new` does, and refuses a directory the kernel cannot see. The tui
 (`--context` naming a new label) and kaijutsu-mcp (`register_session`) pass
 their own directory through `ActorHandle::create_context_in_client_cwd`: the
@@ -516,7 +516,7 @@ player was looking at an older point in the conversation than the log tail. See 
 ## Migration and comparison
 
 Deploy the `--as` implementation and metadata-reading director/handoff scripts
-together, and the `kj kohai` verbs with the rc and contrib scripts that call them. A kernel that lacks the flag cannot create the intended performer
+together, and the `kj context create` verbs with the rc and contrib scripts that call them. A kernel that lacks the flag cannot create the intended performer
 relationship. Replace contexts using the old `KJ_CHARACTER` bridge with verified
 successors as described above; changing the seed does not rewrite their stored
 instructions or assign their performer retroactively.

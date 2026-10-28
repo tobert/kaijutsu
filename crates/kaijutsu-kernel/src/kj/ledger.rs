@@ -71,7 +71,7 @@ enum RememberScopeArg {
     Always,
     /// The character that performed the ask, in any context it performs
     /// in. An allow covers kj drive, kj interrupt and kj context archive
-    /// only on contexts whose senpai that character holds, and kj kohai
+    /// only on contexts whose senpai that character holds, and kj context
     /// create only under a context it holds.
     Character,
 }
@@ -1753,7 +1753,7 @@ pub fn decide_ask(
                         result.note.push_str(&if allow {
                             format!(" for {name}, in any context it performs in; kj drive, kj interrupt \
                                      and kj context archive are covered only on contexts whose senpai \
-                                     {name} holds, and kj kohai create only under a context {name} holds")
+                                     {name} holds, and kj context create only under a context {name} holds")
                         } else {
                             format!(" for {name}, in any context it performs in")
                         });
@@ -3496,7 +3496,7 @@ mod tests {
         assert_eq!(after.verdict, Pending, "a forgotten rule covers nothing: {}", after.reason);
     }
 
-    /// A character family rule for `kj kohai create` covers a bare create
+    /// A character family rule for `kj context create` covers a bare create
     /// (the new context answers to the caller's own), `--senpai` naming a
     /// context the character holds, and any `--parent` (provenance only),
     /// and still asks for `--senpai` naming a context it does not hold.
@@ -3505,7 +3505,7 @@ mod tests {
         use crate::kj::gate::GateVerdict::{Allowed, Pending};
         let d = test_dispatcher().await;
         let house = character_house(&d);
-        let first = gate_once(&d, &house.banto, planned_shell_spec("kj kohai create c1 --type coder --as coder")).await;
+        let first = gate_once(&d, &house.banto, planned_shell_spec("kj context create c1 --type coder --as coder")).await;
         assert_eq!(first.verdict, Pending, "{}", first.reason);
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
         let learned = d
@@ -3514,15 +3514,15 @@ mod tests {
                 &answering_seat(),
             )
             .await;
-        assert!(learned.message().contains("character family rule for kj kohai create"), "{}", learned.message());
+        assert!(learned.message().contains("character family rule for kj context create"), "{}", learned.message());
         assert!(d.kernel_db().lock().redeem_ask(&request_id).unwrap());
 
         for (source, expected) in [
-            ("kj kohai create c2 --type coder --as coder", Allowed),
-            ("kj kohai create c3 --as coder --senpai banto-seat", Allowed),
-            ("kj kohai create c4 --as coder --parent amy-lane", Allowed),
-            ("kj kohai create c5 --as coder --senpai amy-lane", Pending),
-            ("kj kohai create c6 --as coder --senpai lane-b", Pending),
+            ("kj context create c2 --type coder --as coder", Allowed),
+            ("kj context create c3 --as coder --senpai banto-seat", Allowed),
+            ("kj context create c4 --as coder --parent amy-lane", Allowed),
+            ("kj context create c5 --as coder --senpai amy-lane", Pending),
+            ("kj context create c6 --as coder --senpai lane-b", Pending),
         ] {
             let outcome = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
             assert_eq!(outcome.verdict, expected, "{source}: {}", outcome.reason);
@@ -4431,15 +4431,15 @@ mod tests {
 
     /// A privileged caller joined to a fresh parentless "console" context,
     /// registered directly in the db (`register_context`) the way boot's
-    /// `ensure_root_contexts` does — not something `kj kohai create`
+    /// `ensure_root_contexts` does — not something `kj context create`
     /// itself can mint, since a create needs a parent. Boot is not the only
     /// path that mints a parentless context: `kj context scratch`, handoff
     /// logs, the score context, the drift queue, and lost+found do too.
-    /// `kj kohai create` from here lands as this context's child. Mirrors
+    /// `kj context create` from here lands as this context's child. Mirrors
     /// `rc::tests::console_caller`.
     fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = kaijutsu_types::PrincipalId::new();
-        // A person at a console is a live character, which `kj kohai create` needs.
+        // A person at a console is a live character, which `kj context create` needs.
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
@@ -4487,7 +4487,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
                 &c,
             )
             .await;
@@ -4520,7 +4520,7 @@ mod tests {
         let created = d
             .dispatch(
                 &[
-                    s("kohai"), s("create"), s("--as"), s("kohai-tester"),
+                    s("context"), s("create"), s("--as"), s("kohai-tester"),
                     s("ledger-run-show-ctx"),
                     s("--type"),
                     s("ledgertest2"),
@@ -4566,7 +4566,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
+                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
                 &c,
             )
             .await;

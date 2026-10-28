@@ -59,7 +59,7 @@ set the list when the creator holds that authority. Kaijutsu ships no such
 script.
 
 `kj fork` copies the parent's rows to the child, so a child starts with what
-its parent had and no more. `kj kohai create` starts with an empty list.
+its parent had and no more. `kj context create` starts with an empty list.
 
 The shell reads the rows when it is built, and a context shell is built for
 each use, so a change applies to the next command. A running `curl` keeps the

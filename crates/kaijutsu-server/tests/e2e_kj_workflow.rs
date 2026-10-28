@@ -674,7 +674,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
 
 // ============================================================================
 // rc create-lifecycle runs on the RPC creation path (app / MCP), not just
-// `kj kohai create`. Regression guard for the divergent-creation-path bug:
+// `kj context create`. Regression guard for the divergent-creation-path bug:
 // register_session / the GUI create dialog go through the kernel RPC
 // `create_context`, which used to skip rc entirely.
 // ============================================================================

@@ -78,7 +78,7 @@ own character names. `kj character` manages sheets, and `kj handoff
 note|tail` accesses their logs. Retirement archives the contexts of the
 character's instances.
 
-A **character instance** is one run of one character: `kj kohai create
+A **character instance** is one run of one character: `kj context create
 <label> --as <character> --type <t>` starts it with its conversation, and
 its character never changes. A **binding** copies the character's cast slots
 into the instance when it is written; every model call reads the binding for

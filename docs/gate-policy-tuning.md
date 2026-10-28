@@ -232,17 +232,17 @@ deny = [
 
 [context_type.toolie]
 deny = [
-  "kj kohai create",     # a toolie uses tools; lifecycle belongs to its senpai
+  "kj context create",     # a toolie uses tools; lifecycle belongs to its senpai
 ]
 [context_type.mcp]
 allow = [
-  "kj kohai create",     # an mcp seat spins up coders; recoverable: archive it
+  "kj context create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
 
 [context_type.director]
 allow = [
-  "kj kohai create",     # a director creates its kohai lanes, `--type coder --as coder`
+  "kj context create",     # a director creates its kohai lanes, `--type coder --as coder`
   "kj fork",             # a fork copies this seat's own performer and type
   "kj drive",            # runs a turn on a lane this seat directs
 ]
@@ -255,7 +255,7 @@ not ship.
 
 **A `[context_type.<name>]` section must name a live context type**, one
 with an rc bucket under `/config/rc` (`kj::rc::known_context_types`, the
-list `kj kohai create --type` validates against). A section naming no live
+list `kj context create --type` validates against). A section naming no live
 type applies to nobody, so a typo'd `ask` tier leaves its type on whatever
 `[global]` said — fail-open for exactly the role the operator meant to
 protect. The refusal names the section and lists the known types, and it
@@ -590,8 +590,8 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   there, and a remembered deny refuses with nobody asked.
 - **A config allow that cannot cover a command decides nothing.** When a
   redirect or an argv that does not classify keeps an allow from covering,
-  the builtin layer still decides, so `kj kohai create --help` stays help
-  under an allow for `kj kohai create`.
+  the builtin layer still decides, so `kj context create --help` stays help
+  under an allow for `kj context create`.
 
 ## Open questions
 - **shell-guard's interpreter lists.** They are opacity rules, not risk
@@ -627,7 +627,7 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   To be decided in step 7: the config shape (a key in `gate.toml` or a separate cast), and whether one gate
   cast serves every seat or one is chosen per `[context_type.<type>]`.
 - **The director tier** (`[context_type.director]` above) is keyed by the context type, which step 6 reworks
-  or replaces. The tier's contents (allow `kj kohai create`, `kj fork`, `kj drive`) do not change.
+  or replaces. The tier's contents (allow `kj context create`, `kj fork`, `kj drive`) do not change.
   To be decided in step 6: the new type name; the section is renamed with it, and a section naming no live
   type is refused loudly as it is today.
 

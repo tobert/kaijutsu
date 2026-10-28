@@ -34,7 +34,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
         kaijutsu-server list-characters\n    \
         kaijutsu-server rc reseed                                    install anything missing\n    \
         kaijutsu-server kj -- character create bob --root\n    \
-        kaijutsu-server kj --as amy -- kohai create banto --type director --as banto\n\n\
+        kaijutsu-server kj --as amy -- context create banto --type director --as banto\n\n\
         DATABASES:\n    \
         Keys live in <data-home>/kaijutsu/auth.db\n    \
         Characters live in <data-home>/kaijutsu/kernel/kernel.db\n    \

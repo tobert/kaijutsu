@@ -1,4 +1,4 @@
-//! `kj senpai show|set|report` and `kj kohai create|list`: the senpai edge
+//! `kj senpai show|set|report` and `kj context create|list`: the senpai edge
 //! (`docs/senpai-kohai.md`). A context's senpai is the context it answers to;
 //! its kohai are the live contexts that answer to it.
 
@@ -7,7 +7,6 @@ use kaijutsu_types::{ContentType, ContextId};
 
 use crate::kernel_db::{ContextCharacterRow, ContextRow, GovernedAct, KernelDb};
 
-use super::context::ContextConfigArgs;
 use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -43,6 +42,12 @@ enum SenpaiCommand {
         /// The context it answers to from now on.
         senpai: String,
     },
+    /// List the live kohai of a context, each with its character and type
+    /// (default: the current context).
+    Kohai {
+        /// A context. Defaults to the current context.
+        context: Option<String>,
+    },
     /// Report to this context's senpai: the text lands in the senpai context
     /// as a drift block from the current context, as `kj drift push` would
     /// put it there, with no context id to type. A drift along the senpai
@@ -55,81 +60,16 @@ enum SenpaiCommand {
     },
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "kohai",
-    about = "Start and list the contexts that answer to a context",
-    disable_help_subcommand = true,
-    no_binary_name = true
-)]
-pub(crate) struct KohaiArgs {
-    #[command(subcommand)]
-    command: KohaiCommand,
-}
-
-#[derive(Subcommand, Debug)]
-enum KohaiCommand {
-    /// Make a new context performed by a character, that answers to this
-    /// context. Label is positional or `--name`. The new context runs the
-    /// model in the character's cast slot for its type, copied now; the
-    /// output says when the cast has none. Needs the operator capability and
-    /// a live character caller.
-    #[command(alias = "new")]
-    Create {
-        /// Label (positional form; or use --name)
-        label: Option<String>,
-        /// Label (flag form; takes precedence over the positional label)
-        #[arg(long, short = 'n')]
-        name: Option<String>,
-        /// Context the new one is created from, for provenance only.
-        /// Defaults to the current context
-        #[arg(long, short = 'p')]
-        parent: Option<String>,
-        /// The context the new one answers to. Defaults to the current
-        /// context; another context needs the caller to be its character or
-        /// its lineage root
-        #[arg(long)]
-        senpai: Option<String>,
-        /// The live character that performs the new context. Its senpai's
-        /// character reviews its asks
-        #[arg(long = "as", value_name = "CHARACTER", required = true)]
-        character: String,
-        /// With --cwd: if the kernel cannot use that directory when the
-        /// create runs, create as if --cwd were not given and say why. A
-        /// create held for approval checks when it runs
-        #[arg(long = "cwd-optional", requires = "cwd")]
-        cwd_optional: bool,
-        #[command(flatten)]
-        config: Box<ContextConfigArgs>,
-    },
-    /// List the live kohai of a context, each with its character and type
-    /// (default: the current context).
-    #[command(alias = "ls")]
-    List {
-        /// A context. Defaults to the current context.
-        context: Option<String>,
-    },
-}
-
 impl Classify for SenpaiArgs {
     fn effect(&self) -> Effect {
         match self.command {
-            SenpaiCommand::Show { .. } => Effect::Read,
+            SenpaiCommand::Show { .. } | SenpaiCommand::Kohai { .. } => Effect::Read,
             SenpaiCommand::Set { .. } | SenpaiCommand::Report { .. } => Effect::Write,
         }
     }
 }
 
-impl Classify for KohaiArgs {
-    fn effect(&self) -> Effect {
-        match self.command {
-            KohaiCommand::Create { .. } => Effect::Write,
-            KohaiCommand::List { .. } => Effect::Read,
-        }
-    }
-}
-
-/// Parse `argv` for one of the two verbs, rendering help as help.
+/// Parse `argv` for the verb, rendering help as help.
 fn parse<A: Parser + clap::CommandFactory>(argv: &[String], verb: &str) -> Result<A, KjResult> {
     if argv.is_empty() {
         return Err(clap_help_for::<A>());
@@ -182,6 +122,7 @@ impl KjDispatcher {
         };
         match parsed.command {
             SenpaiCommand::Show { context } => self.senpai_show(context.as_deref(), caller).await,
+            SenpaiCommand::Kohai { context } => self.kohai_list(context.as_deref(), caller),
             SenpaiCommand::Set { context, senpai } => {
                 if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "senpai set") {
                     return denied;
@@ -194,31 +135,6 @@ impl KjDispatcher {
                 }
                 self.senpai_report(&text, caller).await
             }
-        }
-    }
-
-    pub(crate) async fn dispatch_kohai(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let parsed = match parse::<KohaiArgs>(argv, "kohai") {
-            Ok(parsed) => parsed,
-            Err(result) => return result,
-        };
-        match parsed.command {
-            KohaiCommand::Create { label, name, parent, senpai, character, cwd_optional, config } => {
-                if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "kohai create") {
-                    return denied;
-                }
-                Box::pin(self.kohai_create(
-                    name.or(label).as_deref(),
-                    parent.as_deref(),
-                    senpai.as_deref(),
-                    &character,
-                    cwd_optional,
-                    *config,
-                    caller,
-                ))
-                .await
-            }
-            KohaiCommand::List { context } => self.kohai_list(context.as_deref(), caller),
         }
     }
 
@@ -347,7 +263,7 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj kohai list [<ctx>]`.
+    /// `kj senpai kohai [<ctx>]`.
     fn kohai_list(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
         let listed = (|| -> Result<(ContextCharacterRow, Vec<ContextRow>), String> {
@@ -356,7 +272,7 @@ impl KjDispatcher {
         })();
         let (row, kohai) = match listed {
             Ok(listed) => listed,
-            Err(e) => return KjResult::Err(format!("kj kohai list: {e}")),
+            Err(e) => return KjResult::Err(format!("kj senpai kohai: {e}")),
         };
         let character = |k: &ContextRow| k.played_by.map(|p| db.name_for(p));
         let mut lines = Vec::with_capacity(kohai.len() + 1);
@@ -631,7 +547,7 @@ mod tests {
         d.kernel_db().lock().update_context_type(h.other, "coder").unwrap();
         let gone = register_context(&d, Some("gone-lane"), Some(h.seat), h.amy);
         d.kernel_db().lock().archive_context(gone).unwrap();
-        let listed = d.dispatch(&[s("kohai"), s("list")], &caller(h.banto, h.seat)).await;
+        let listed = d.dispatch(&[s("senpai"), s("kohai")], &caller(h.banto, h.seat)).await;
         assert!(listed.is_ok(), "{}", listed.message());
         let text = listed.message();
         assert!(text.contains(&format!("lane ({})  coder  default", h.lane.short())), "{text}");
@@ -640,15 +556,15 @@ mod tests {
         let data = data(&listed);
         assert_eq!(data["kohai"].as_array().unwrap().len(), 2);
         assert_eq!(data["kohai"][0]["character"], "coder");
-        let none = d.dispatch(&[s("kohai"), s("list"), h.lane.to_hex()], &caller(h.banto, h.seat)).await;
+        let none = d.dispatch(&[s("senpai"), s("kohai"), h.lane.to_hex()], &caller(h.banto, h.seat)).await;
         assert!(none.message().contains("has no live kohai"), "{}", none.message());
     }
 
-    /// `kj kohai create` makes a new context performed by the named
+    /// `kj context create` makes a new context performed by the named
     /// character. Its senpai is the caller's context, and its slots copy the
     /// character's cast.
     #[tokio::test]
-    async fn kohai_create_makes_a_context_character_under_the_callers_context() {
+    async fn context_create_makes_a_context_character_under_the_callers_context() {
         let d = test_dispatcher().await;
         let h = house(&d);
         let admin = test_caller();
@@ -656,7 +572,7 @@ mod tests {
         let set = d.dispatch(&[s("character"), s("set"), s("coder"), s("--cast"), s("band")], &admin).await;
         assert!(set.is_ok(), "{}", set.message());
 
-        let made = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("coder"), s("fresh")], &caller(h.banto, h.seat)).await;
+        let made = d.dispatch(&[s("context"), s("create"), s("--as"), s("coder"), s("fresh")], &caller(h.banto, h.seat)).await;
         assert!(made.is_ok(), "{}", made.message());
 
         let db = d.kernel_db().lock();
@@ -674,11 +590,11 @@ mod tests {
     /// `--senpai` names any context it is given, and only when the caller's
     /// character is that context's character or its lineage root; `--parent` is provenance only and may differ.
     #[tokio::test]
-    async fn kohai_create_senpai_needs_the_caller_to_hold_it_or_be_its_root() {
+    async fn context_create_senpai_needs_the_caller_to_hold_it_or_be_its_root() {
         let d = test_dispatcher().await;
         let h = house(&d);
         let create = |label: &str, extra: &[&str]| {
-            let mut argv = vec![s("kohai"), s("create"), s("--as"), s("kohai-tester"), s(label)];
+            let mut argv = vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s(label)];
             argv.extend(extra.iter().map(|a| s(a)));
             argv
         };
@@ -744,14 +660,14 @@ mod tests {
     /// A new context answers to its creator, so a caller with no character
     /// sheet, or a retired one, cannot create one.
     #[tokio::test]
-    async fn kohai_create_needs_a_live_character_caller() {
+    async fn context_create_needs_a_live_character_caller() {
         let d = test_dispatcher().await;
         let h = house(&d);
-        let nobody = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(PrincipalId::new(), h.root)).await;
+        let nobody = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(PrincipalId::new(), h.root)).await;
         assert!(!nobody.is_ok());
         assert!(nobody.message().contains("no character sheet"), "{}", nobody.message());
         d.kernel_db().lock().retire_character(h.sibling, 1).unwrap();
-        let retired = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(h.sibling, h.other)).await;
+        let retired = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(h.sibling, h.other)).await;
         assert!(!retired.is_ok() && retired.message().contains("is retired"), "{}", retired.message());
         assert!(d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none());
     }
@@ -776,9 +692,9 @@ mod tests {
         let shown = d.dispatch(&[s("senpai"), s("show"), s("lane-fork")], &caller(h.coder, h.lane)).await;
         assert!(shown.message().contains(&format!("context: lane-fork ({}), coder", fork.short())), "{}", shown.message());
         assert!(shown.message().contains(&format!("senpai: lane ({}), coder", h.lane.short())), "{}", shown.message());
-        let listed = d.dispatch(&[s("kohai"), s("list"), s("lane")], &caller(h.coder, h.lane)).await;
+        let listed = d.dispatch(&[s("senpai"), s("kohai"), s("lane")], &caller(h.coder, h.lane)).await;
         assert!(listed.message().contains(&format!("lane-fork ({})  coder", fork.short())), "{}", listed.message());
-        let none = d.dispatch(&[s("kohai"), s("list"), s("lane-fork")], &caller(h.coder, h.lane)).await;
+        let none = d.dispatch(&[s("senpai"), s("kohai"), s("lane-fork")], &caller(h.coder, h.lane)).await;
         assert!(none.message().contains("has no live kohai"), "{}", none.message());
 
         let reported = d.dispatch(&[s("senpai"), s("report"), s("from the fork")], &caller(h.coder, fork)).await;
@@ -823,7 +739,7 @@ mod tests {
         assert_eq!(drifts(h.seat), 0, "a refused report lands nothing");
         let onto = d.dispatch(&[s("senpai"), s("set"), s("other-lane"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
         assert!(!onto.is_ok() && onto.message().contains("is archived"), "{}", onto.message());
-        let kohai = d.dispatch(&[s("kohai"), s("list"), s("lane")], &caller(h.coder, h.lane)).await;
+        let kohai = d.dispatch(&[s("senpai"), s("kohai"), s("lane")], &caller(h.coder, h.lane)).await;
         assert!(kohai.is_ok(), "the kohai's own verbs still work: {}", kohai.message());
 
         let promoted = d.dispatch(&[s("context"), s("promote"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
@@ -844,9 +760,8 @@ mod tests {
             vec![s("senpai"), s("show"), s("--help")],
             vec![s("senpai"), s("set"), s("--help")],
             vec![s("senpai"), s("report"), s("--help")],
-            vec![s("kohai"), s("--help")],
-            vec![s("kohai"), s("list"), s("--help")],
-            vec![s("kohai"), s("create"), s("--help")],
+            vec![s("senpai"), s("kohai"), s("--help")],
+            vec![s("context"), s("create"), s("--help")],
         ] {
             let help = d.dispatch(&argv, &test_caller()).await;
             assert!(help.is_ok(), "{argv:?}: {}", help.message());

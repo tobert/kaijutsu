@@ -189,7 +189,7 @@ pub fn cast_a_performer(server: &EphemeralServer) {
 }
 
 /// Grant the `operator` capability to the context labelled `label`, from the
-/// root seat. `kj kohai create` needs it, and a coder seat holds none.
+/// root seat. `kj context create` needs it, and a coder seat holds none.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
 pub fn grant_operator(server: &EphemeralServer, label: &str) {
     with_kernel(server, async |kernel| {
@@ -211,7 +211,7 @@ pub fn drift_into_a_root_console(server: &EphemeralServer, text: &str) {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
         for argv in [
-            vec!["kohai", "create", "ROOT", "--type", "console", "--as", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER],
+            vec!["context", "create", "ROOT", "--type", "console", "--as", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER],
             vec!["drift", "push", "ROOT", text],
         ] {
             let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();

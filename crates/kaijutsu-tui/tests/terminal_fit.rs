@@ -721,7 +721,7 @@ fn the_window_title_follows_the_context_and_is_given_back() {
     // A second context with a label of its own, then a switch to its seat.
     // The probe is a coder seat, which holds no `operator`; creating needs it.
     support::grant_operator(&_server, "probe");
-    colon_line(&session, ":kj kohai create second --as performer");
+    colon_line(&session, ":kj context create second --as performer");
     clear_status_notice(&session);
     let digit = seat_of(&session, "second");
     session.send(&format!("\x01{digit}")); // Ctrl+A <digit>

@@ -97,7 +97,7 @@ async fn run(cli: Cli) -> Result<u8> {
     let context = actor.resolve_context_label(&cli.context).await
         .with_context(|| format!("resolve context {:?} on {}:{}", cli.context, cli.host, cli.port))?
         .ok_or_else(|| anyhow!("no context labeled {:?} on {}:{}; create one with \
-            `kj kohai create {}`", cli.context, cli.host, cli.port, cli.context))?
+            `kj context create {}`", cli.context, cli.host, cli.port, cli.context))?
         .id;
     match cli.command {
         Command::Kj { argv } => run_kj(&actor, context, argv).await,

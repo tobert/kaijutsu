@@ -383,7 +383,7 @@ impl KjDispatcher {
             .map_err(|e| format!("could not read the console's character: {e}"))?
             .ok_or_else(|| format!(
                 "ROOT has no context character, so nobody answers for it and a drift into it has no reviewer; \
-                 `kj kohai create ROOT --type console --as <character>` makes one"
+                 `kj context create ROOT --type console --as <character>` makes one"
             ))?
             .principal_id;
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(target_ctx, performer))
@@ -1744,7 +1744,7 @@ mod tests {
         h.d.kernel_db().lock().update_context_type(bare, kaijutsu_types::CONSOLE_CONTEXT_TYPE).unwrap();
         let outcome = h.d.drift_reviewer(bare);
         let error = outcome.expect_err("a console with no character has no reviewer");
-        assert!(error.contains("no context character") && error.contains("kj kohai create"), "names the repair: {error}");
+        assert!(error.contains("no context character") && error.contains("kj context create"), "names the repair: {error}");
         assert!(!error.contains("validation error"), "not a flattened routing error: {error}");
     }
 

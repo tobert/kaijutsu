@@ -43,7 +43,7 @@ fn bootstrap_finds_the_key_and_the_provider_in_home() {
         "ran: kj cast create house",
         "ran: kj cast slot set house console --backend deepseek --model deepseek-flash --max-tokens 16384",
         "ran: kj character set root --cast house",
-        "ran: kj kohai create ROOT --type console --as root",
+        "ran: kj context create ROOT --type console --as root",
     ] {
         assert!(first.contains(line), "missing {line:?} in:\n{first}");
     }

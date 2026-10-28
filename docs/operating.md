@@ -114,7 +114,7 @@ shell-escape guard. The performing character cannot approve its own ask. Its ass
 can answer from the same context; external model leads need a credential bound
 to their own character. See `docs/approval-identity.md`.
 
-`kj kohai create --type <t>` is how to probe a type's rc. A reseed seeds
+`kj context create --type <t>` is how to probe a type's rc. A reseed seeds
 from the **binary**, so build first.
 
 ## Builds beside a live kernel
