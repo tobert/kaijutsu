@@ -47,6 +47,75 @@ root, console, and shell; the start choice prefers `ROOT`. Still open:
 
 ---
 
+## Renovation review, 2026-10-14 — what is still open
+
+Review at `040f9b21`, kept in git at `d54a4fed`
+(`docs/audits/2026-10-14-codebase-renovation-review.md`); the IDs are its
+section numbers. Triaged against main on 2026-10-27, and its S-sized
+data-integrity, approval, hydration, kj, beat and media fixes landed the
+same day. Findings already tracked elsewhere stay there: 6.1 (Anticipation
+and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
+and the `lineage_root` refusal wording. Still open:
+
+Needs Amy's decision:
+- **4.2** `kj context demote`, `promote` and `conclude` have no capability
+  check. A test pins this as intended.
+- **4.4** `kj drive` keeps the requester as the driven turn's
+  `TurnRequest.principal_id`, as fork and completion notices do; its
+  prompt block now carries the performer. Moving the turn's principal
+  moves approval and capability scope.
+- **6.4c** One track failure whose source context never appears blocks
+  every later failure on that track (`drain_track_failures`). Needs a
+  per-event pending set or a drop policy.
+
+Behavior:
+- **2.3** `approval_resume` runs approved commands inline in its one task,
+  so a long command stalls ask delivery for every context. M.
+- **2.6** The submit-rc race, `interrupt.hard()` on a persistence failure,
+  and a turn that runs without an admission permit. M.
+- **4.6** Block and task tools edit any context a caller's `BlockId` names,
+  and `block_list` lists every document. Not a security boundary, but it
+  breaks focus. M.
+- **4.7b** Notification, Resource, Task, Error and Drift blocks inside an
+  open model batch still flush it during hydration and can split its
+  results, as a user shell result did (`llm/hydrate.rs`).
+- **2.2** Clean cached files keep serving after a delete or rename;
+  `MountBackend` never invalidates the cache. M.
+- **5.1** The client refuses subscribe while connecting, a failed
+  resubscribe freezes the view, and `BlockEventsForwarder::closed` latches.
+- **5.2** `run_context_feed` wakes on every context's events;
+  `spawn_editor_reconciler` holds an `Arc` cycle, so the kernel never drops.
+- **5.3c** `cherry_pick_block` drops metadata. A correct copy needs a
+  block-store API that mints a target id and decides what a copy keeps.
+- **3.1** The council shadow's `CREATE` lock is dropped before
+  `run_create_lifecycle`, and the shadow is primed twice per call.
+- **6.3** CAS-backed ABC cues do not play: `dispatch_midi_cue` has no
+  prefetch path. M.
+- **7.2** The app spawns a new `RpcActor` on every cache-miss context switch
+  and loses collapse state (`view/sync.rs`). M.
+- **7.3** App input and scroll handlers fire on every screen; split panes
+  all draw the main cell; the shell dock never tracks cursor kind or
+  selection. M.
+- **8.1** A garbage graph header panics inside `hnsw_rs` 0.3.4
+  (`HnswIo::init`) instead of returning an error, and the `HnswIo` leaked
+  on a successful load is not reclaimed when rebuild replaces the index.
+- **5.4** SFTP posix-rename does not detect two names for one file, and the
+  replace is not atomic. Share `getattr` follows symlinks (`share.rs`).
+- **2.4** Unverified: a late denial may leave a background hold waiting.
+- **6.2** Unverified: a phase slew may put the next master beat a fraction
+  of a period after `scheduled`, firing one beat twice.
+
+Clarity:
+- **1.7** Two hydration loaders; `promote_context` returns a raw SQLite
+  error on a label conflict; `publish_batch` takes one lock per message.
+- **3.3** `council_programs(program_decision_id)` has no index, and
+  `list_bump_flavors` lacks the program filter.
+- **3.5** `approval_identity` locks the DB up to four times per call;
+  `approval_ledger::claim` has only test callers while help describes it;
+  `rules::revoke` is not transactional.
+- **8.2** The index watcher treats a closed stream like a timeout, and
+  corrupt `context_id` blobs are skipped silently.
+
 ## amy-dev: open items before its first run (2026-10-24)
 
 - tenchi (the DGX Spark) is aarch64. `contrib/amy-dev/Containerfile` takes an x86_64 Arch `BASE`, so tenchi needs an
@@ -270,9 +339,6 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   is the tool label, shared by many asks, so each check reads every
   collected allow with a stored command under that label in the context.
   The cost grows with approval history; unmeasured.
-- **No kernel test for the same-statements match.** `asks_about_submission`'s
-  digest-set-under-one-label branch is tested only through the ledger query,
-  not as `approved_run_unsettled` uses it (e.g. `touch  x` against `touch x`).
 - **A prepare miss records empty identity fields.** `council_decisions`
   makes `server_*` and `spec_id` NOT NULL, but a miss inside `prepare` has
   neither, so the gate writes empty strings and the cause explains. Make
@@ -891,7 +957,8 @@ sent to the server is meant.
 ## Architecture cleanup plan
 
 Source review at `f7e46f8e`, September 16:
-[evidence and proposed tests](audits/2026-09-16-architecture-debt.md).
+evidence and proposed tests in `docs/audits/2026-09-16-architecture-debt.md`,
+kept in git before `4ed9406d`.
 This is the live plan; the audit records the review. Planning added source
 markers and corrected misleading comments, without changing behavior.
 
@@ -3023,7 +3090,8 @@ problem.
 
 ## Tech-debt audits, 2026-08-20 — what is still open
 
-Full reports: `docs/audits/`. Re-verified against the current tree:
+Full reports were in `docs/audits/`, kept in git before `4ed9406d`.
+Re-verified against the current tree:
 
 - **`dirty_file_buffers.context_id` is loaded and never used.**
   `get_dirty_file_buffer` and `list_dirty_file_buffers` select it, and
