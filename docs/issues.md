@@ -6,6 +6,35 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Storyteller: what the prototype leaves open (2026-10-28)
+
+The `storyteller` type (`assets/defaults/rc/storyteller/`) is a first
+entertainment seat, from a read of SillyTavern's prompt assembly. See
+`docs/prompts.md`, "Context types choose their instructions".
+
+- Cards live at `/config/rc/storyteller/cards/<performer>.md`, a stand-in for
+  character rc (`docs/character.md`, slice 5). When `rc_dir` lands, a card
+  moves into the character's directory and `S05-card.kai` goes.
+- The model has no tools, so it cannot write its own handoff note. The handoff
+  and predecessor notifications still name `kj` commands it cannot run.
+- Submit reminders accumulate, one per submit. A rotation for long stories
+  could filter reminders and other droppable blocks from the successor; that
+  filter has no design yet. `kj fork --compact` and handoffs are what carries a
+  story past its context limit today.
+- No greeting or example dialogue. SillyTavern's `first_mes` and `mes_example`
+  set a voice better than description does on small models; a card could
+  carry them as a model-role block at create.
+- No keyword lore (SillyTavern's World Info). A durable notification on match,
+  or a lore tool for larger models, are the two shapes that fit the log.
+- Interjecting while a model thinks: live input reaches a turn only after a
+  tool round or the final inference (`docs/conversation-session.md`, "Input
+  during a turn"). A mid-thinking path for council API clients is an idea,
+  not a design.
+- Untested paths: the type's default reminder (no card) and the refusal of a
+  performer name that could leave the cards directory.
+
+---
+
 ## Root console: model, approval, and the shell child (2026-10-25)
 
 The design is in `docs/character.md`, "The root console and its shell".
@@ -2565,10 +2594,10 @@ classification needs its own fixtures.
 
 ## A delegated coder inherits the lead's morning window (2026-09-10)
 
-`coder/create/S15-recall.kai` and `S16-handoff.kai` inject the fleet memory
-index and the calling character's last twelve handoff notes into every
-coder. A coder driven on a two-file fixture read the lead's note "no ask
-expected" and reported the gate asks it met as a possible
+`S16-handoff.kai` injects the calling character's last twelve handoff notes
+into every coder. The fleet memory index was injected too, until
+`S15-recall.kai` was removed. A coder driven on a two-file fixture read the
+lead's note "no ask expected" and reported the gate asks it met as a possible
 regression — a concern the note caused, not the task. The broad loadout
 also lists 96 tools in `<situation>`, 45 of them `bevy_brp`. Both are
 per-turn cost on a delegated lane that needs neither; whether a delegated

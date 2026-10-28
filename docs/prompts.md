@@ -106,6 +106,15 @@ lifecycle, and sends it to a council server; no model turn runs in it. Its
 stance frames the seat's command history for the council, after the
 council framing every council context opens with; see `docs/council.md`, "Shadow context".
 
+The storyteller type is a seat for telling stories with the person, for
+enjoyment. Its model has no tools. `S05-card.kai` reads the performer's card
+from `/config/rc/storyteller/cards/<performer>.md` as instruction text after
+the stance; no card ships. After each submit, `submit/S10-reminder.kai` writes
+a `(System, Notification)` reminder behind the input: the card's
+`<performer>.reminder.md`, or the type's `S10-reminder.md`. Reminders
+accumulate; rotation sheds them. Open work is in `docs/issues.md`,
+"Storyteller: what the prototype leaves open".
+
 The executable filename controls order. Default handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a
 spine branch that interprets.
@@ -488,11 +497,11 @@ A running turn is offered the input only after its `submit` scripts finish,
 so it delivers their blocks together with the input
 (`docs/conversation-session.md`, "Input during a turn").
 
-No context type links a `submit` script by default; a type opts in by
-symlink, the way any rc verb does. `assets/defaults/rc/lib/submit/S10-edge.kai`
-is the shipped example: it emits a `(System, Notification)` excerpt of the
-edge block, but only when the player was looking at an older point in the
-conversation than the log tail. See `docs/prompts.md`, "The submit verb" for the design this verb implements.
+The storyteller ships its own `submit/S10-reminder.kai`. Other types run no
+`submit` script; a type opts in by symlink, the way any rc verb does.
+`assets/defaults/rc/lib/submit/S10-edge.kai` is the shipped shared script: it
+emits a `(System, Notification)` excerpt of the edge block, but only when the
+player was looking at an older point in the conversation than the log tail. See `docs/prompts.md`, "The submit verb" for the design this verb implements.
 
 ## Migration and comparison
 

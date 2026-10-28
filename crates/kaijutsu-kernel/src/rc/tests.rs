@@ -2462,6 +2462,77 @@ esac
         }
     }
 
+    /// A storyteller seat composes its performer's card at create and adds
+    /// that card's reminder after every submit. The card is cached system
+    /// text; each reminder is a notification behind the input it follows,
+    /// and reminders accumulate rather than replace one another.
+    #[test]
+    fn storyteller_composes_its_card_and_reminds_after_each_submit() {
+        crate::on_rc_thread(storyteller_composes_its_card_and_reminds_after_each_submit_body);
+    }
+
+    async fn storyteller_composes_its_card_and_reminds_after_each_submit_body() {
+        use crate::vfs::VfsOps;
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let caller = console_caller(&d);
+        let teller = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            for (id, name) in [(caller.principal_id, "amy"), (teller, "kotone")] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: id, name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            db.update_played_by(caller.context_id.unwrap(), Some(caller.principal_id)).unwrap();
+        }
+        let vfs = d.kernel().vfs();
+        vfs.write_all(std::path::Path::new("/config/rc/storyteller/cards/kotone.md"),
+            b"Kotone keeps a tea house at the edge of the marsh.").await.unwrap();
+        vfs.write_all(std::path::Path::new("/config/rc/storyteller/cards/kotone.reminder.md"),
+            b"Kotone speaks softly and never hurries.").await.unwrap();
+
+        let r = d.dispatch(&argv(&["context", "create", "tale", "--type", "storyteller", "--as", "kotone"]), &caller).await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+        let ctx = lookup_context_id(&d, "tale");
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
+        assert!(sections.contains("accountable"), "the type stance names who is accountable: {sections}");
+        assert!(sections.contains("tea house at the edge of the marsh"), "the card is instruction text: {sections}");
+        assert!(!blocks.iter().any(|b| b.kind == BlockKind::Error), "{:?}", block_contents_in(&d, ctx));
+        d.kernel_db().lock().update_context_review_assignment(ctx, Some(teller), Some(caller.principal_id), None).unwrap();
+
+        // No provider is configured, so each turn fails after its submit
+        // lifecycle has run; the lifecycle's blocks are what is under test.
+        let mut failed = d.kernel().turn_flows().subscribe("turn.failed");
+        for line in ["We open the door.", "We sit by the window."] {
+            d.block_store().edit_draft(ctx, caller.principal_id, 0, line, 0).unwrap();
+            crate::runtime::prompt::submit(
+                d.kernel(), ctx, caller.principal_id, kaijutsu_types::SessionId::new(),
+                crate::runtime::prompt::PromptSource::Draft { edge: None },
+            ).await.expect("the submit commits");
+            tokio::time::timeout(std::time::Duration::from_secs(5), failed.recv())
+                .await.expect("the submitted turn reports its failed startup");
+        }
+
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let after_inputs: Vec<(Role, BlockKind, String)> = blocks.iter()
+            .skip_while(|b| b.role != Role::User)
+            .filter(|b| !matches!(b.kind, BlockKind::Error | BlockKind::Trace))
+            .map(|b| (b.role, b.kind, b.content.clone()))
+            .collect();
+        let reminder = "Kotone speaks softly and never hurries.";
+        assert!(matches!(after_inputs.as_slice(), [
+            (Role::User, _, a), (Role::System, BlockKind::Notification, ra),
+            (Role::User, _, b), (Role::System, BlockKind::Notification, rb),
+        ] if a == "We open the door." && b == "We sit by the window."
+            && ra.contains(reminder) && rb.contains(reminder)), "{after_inputs:#?}");
+        let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
+        assert!(!sections.contains(reminder), "a reminder must stay out of the cached system text");
+    }
+
     /// Fork re-seeds: the child gets its own fresh datetime note on top of
     /// whatever it inherited from the parent (the parent's create-time note
     /// copies over too — fork copies the whole log — so the count grows by

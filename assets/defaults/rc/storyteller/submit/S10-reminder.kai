@@ -1,0 +1,22 @@
+# A reminder after each submit, so the model reads the character's voice
+# next to the person's newest turn instead of only at the top of a long
+# scene. The performer's /config/rc/storyteller/cards/<performer>.reminder.md
+# wins; otherwise this script's companion Markdown is the reminder.
+#
+# NOTIFICATION, never (Role::System, BlockKind::Text): it lands behind the
+# input it follows and stays out of the cached system prompt. Reminders
+# accumulate in the log; rotation is how a long story sheds them.
+set -e
+who="$(kj context info --json | jq -r '.played_by_name // empty')"
+reminder="$(dirname "$0")/$(basename "$0" .kai).md"
+case "$who" in
+  ""|*/*|.*) ;;
+  *)
+    card="$(dirname "$0")/../cards/$who.reminder.md"
+    if test -f "$card"; then
+      reminder="$card"
+    fi
+    ;;
+esac
+kj block create --role system --kind notification < "$reminder"
+echo "reminder: $reminder"
