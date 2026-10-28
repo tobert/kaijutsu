@@ -52,10 +52,14 @@ const ASK_EVERYTHING_GATE: &str = "[global]\n";
 // The kernel
 // ---------------------------------------------------------------------------
 
+/// The kernel's durable state, which a test reads and seeds directly.
+type Db = Arc<parking_lot::Mutex<kaijutsu_kernel::kernel_db::KernelDb>>;
+
 /// A bootstrapped kernel serving on a loopback port, on a thread of its own.
 /// Dropping it stops the kernel and removes its state.
 struct Kernel {
     port: u16,
+    db: Db,
     /// Holds the root key file and the bridge's `HOME`.
     dir: tempfile::TempDir,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -68,7 +72,7 @@ impl Kernel {
     fn start(script: Vec<Vec<StreamEvent>>) -> Self {
         let dir = tempfile::tempdir().expect("create the test directory");
         let key_path = dir.path().join("root_key");
-        let (ready_tx, ready_rx) = channel::<u16>();
+        let (ready_tx, ready_rx) = channel::<(u16, Db)>();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -79,10 +83,10 @@ impl Kernel {
             let local = tokio::task::LocalSet::new();
             runtime.block_on(local.run_until(serve_kernel(script, key_path, ready_tx, stop_rx)));
         });
-        let port = ready_rx
+        let (port, db) = ready_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the kernel never reported its port");
-        Self { port, dir, stop: Some(stop_tx), thread: Some(thread) }
+        Self { port, db, dir, stop: Some(stop_tx), thread: Some(thread) }
     }
 
     fn key_path(&self) -> PathBuf {
@@ -136,7 +140,7 @@ impl Drop for Kernel {
 async fn serve_kernel(
     script: Vec<Vec<StreamEvent>>,
     key_path: PathBuf,
-    ready: std::sync::mpsc::Sender<u16>,
+    ready: std::sync::mpsc::Sender<(u16, Db)>,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -190,7 +194,7 @@ async fn serve_kernel(
     let mock = MockClient::new("").with_scripted_stream(script);
     shared.kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));
 
-    ready.send(port).expect("report the port");
+    ready.send((port, shared.kernel_db.clone())).expect("report the port");
     let _ = stop.await;
     let _ = shared.kernel.shutdown_runtime_worker().await;
 }
@@ -593,6 +597,56 @@ fn a_session_at_the_root_opens_with_a_warning() {
         client.agent_text(),
         client.stderr()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Session delete
+// ---------------------------------------------------------------------------
+
+/// `session/delete` archives the session's context through `kj context
+/// archive`, so the context type's archive rc lifecycle runs: a coder's
+/// judge shadow is archived with its seat. A retried delete succeeds.
+#[test]
+fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
+    let kernel = Kernel::start(Vec::new());
+    let mut client = kernel.connect();
+    let cwd = workspace();
+    let session = client.open(cwd.path());
+    let seat = kaijutsu_types::ContextId::parse(&session).expect("a session id is a context id");
+
+    let shadow = kaijutsu_types::ContextId::new();
+    {
+        let db = kernel.db.lock();
+        let mut row = db.get_context(seat).expect("read the seat").expect("the seat exists");
+        assert_eq!(row.context_type, "coder", "the bridge creates coder seats");
+        row.context_id = shadow;
+        row.label = Some("judge-shadow".into());
+        row.context_type = "judge".into();
+        let workspace = db.get_or_create_default_workspace(row.created_by).expect("default workspace");
+        db.insert_context_with_document(&row, workspace).expect("insert the shadow");
+        db.insert_edge(&kaijutsu_kernel::kernel_db::ContextEdgeRow {
+            edge_id: uuid::Uuid::now_v7(),
+            source_id: seat,
+            target_id: shadow,
+            kind: kaijutsu_types::EdgeKind::Structural,
+            metadata: None,
+            created_at: kaijutsu_types::now_millis() as i64,
+        })
+        .expect("seat the shadow under the session");
+    }
+
+    client
+        .request("session/delete", json!({"sessionId": session}))
+        .unwrap_or_else(|e| panic!("session/delete: {e}\n--- bridge stderr ---\n{}", client.stderr()));
+
+    client
+        .request("session/delete", json!({"sessionId": session}))
+        .unwrap_or_else(|e| panic!("a retried session/delete succeeds: {e}"));
+
+    let db = kernel.db.lock();
+    let archived = |id| db.get_context(id).expect("read").expect("rows are retained").archived_at.is_some();
+    assert!(archived(seat), "session/delete archives the session's context");
+    assert!(archived(shadow), "the coder's archive rc lifecycle archived its judge shadow");
 }
 
 // ---------------------------------------------------------------------------

@@ -101,8 +101,7 @@ fn set_context_origin_host_with_empty_string_clears_it() {
 
 /// `setContextOriginHost` against an id that names no context must fail
 /// loudly over the wire (`success: false` + a message), not silently
-/// succeed — the same contract `setContextPaused`/`archiveContext` already
-/// give a caller for an unknown id.
+/// succeed.
 #[test]
 fn set_context_origin_host_on_unknown_context_fails() {
     run_local(async {

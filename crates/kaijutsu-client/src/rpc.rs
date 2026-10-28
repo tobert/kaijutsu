@@ -1842,62 +1842,6 @@ impl KernelHandle {
         Ok(())
     }
 
-    /// Conclude a context — the explicit "this work is done" act. Sets the
-    /// context to the `concluded` lifecycle state and stamps `concludedAt`
-    /// server-side. Idempotent (re-concluding succeeds without restamping).
-    /// Returns a [`RpcError::ServerError`] with the server's message when the
-    /// context can't be concluded (unknown / archived).
-    #[tracing::instrument(skip(self), name = "rpc_client.conclude")]
-    pub async fn conclude(&self, context_id: ContextId) -> Result<(), RpcError> {
-        let mut request = self.kernel.conclude_request();
-        request.get().set_context_id(context_id.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let reader = response.get()?;
-        if reader.get_success() {
-            Ok(())
-        } else {
-            let msg = reader.get_error()?.to_str().unwrap_or("conclude failed");
-            Err(RpcError::ServerError(msg.to_string()))
-        }
-    }
-
-    /// Set or clear a context's "suspend activity" flag. Design-only for now
-    /// — persisted and exposed on the wire, but not yet wired to any
-    /// behavioral gating.
-    #[tracing::instrument(skip(self), name = "rpc_client.set_context_paused")]
-    pub async fn set_context_paused(
-        &self,
-        context_id: ContextId,
-        paused: bool,
-    ) -> Result<(), RpcError> {
-        let mut request = self.kernel.set_context_paused_request();
-        request.get().set_context_id(context_id.as_bytes());
-        request.get().set_paused(paused);
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let reader = response.get()?;
-        if reader.get_success() {
-            Ok(())
-        } else {
-            let msg = reader
-                .get_error()?
-                .to_str()
-                .unwrap_or("set_context_paused failed");
-            Err(RpcError::ServerError(msg.to_string()))
-        }
-    }
-
     /// Set (or clear, on `""`) a context's advisory `origin_host` — the
     /// registering client's own hostname. Called once, right after context
     /// creation, by a client that knows its own host (e.g.
@@ -2030,34 +1974,6 @@ impl KernelHandle {
             Ok(())
         } else {
             let msg = reader.get_error()?.to_str().unwrap_or("complete_block failed");
-            Err(RpcError::ServerError(msg.to_string()))
-        }
-    }
-
-    /// Archive a single context — the well's single-keystroke archive
-    /// action. Unlike the `kj context archive` builtin (latched, recurses
-    /// into structural children), this is single-context, not latched, no
-    /// subtree recursion. Idempotent: archiving an already-archived context
-    /// succeeds.
-    #[tracing::instrument(skip(self), name = "rpc_client.archive_context")]
-    pub async fn archive_context(&self, context_id: ContextId) -> Result<(), RpcError> {
-        let mut request = self.kernel.archive_context_request();
-        request.get().set_context_id(context_id.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let reader = response.get()?;
-        if reader.get_success() {
-            Ok(())
-        } else {
-            let msg = reader
-                .get_error()?
-                .to_str()
-                .unwrap_or("archive_context failed");
             Err(RpcError::ServerError(msg.to_string()))
         }
     }

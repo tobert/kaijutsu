@@ -1291,9 +1291,9 @@ fn test_client_view_is_namespaced_per_client() {
 // Time-well ring placement (docs/timewell.md)
 // ============================================================================
 
-/// `kj context promote|demote` over `executeKj` — the path the app's and
-/// the tui's placement keys take — and `setContextPaused` round-trip over the
-/// real wire, and `listContexts` reflects the ladder as it steps: promoted →
+/// `kj context promote|demote|pause|resume` over `executeKj` — the path the
+/// app's and the tui's placement keys take — round-trip over the real wire,
+/// and `listContexts` reflects the ladder as it steps: promoted →
 /// unpromoted → demoted → latched → archived once confirmed, with
 /// pause/resume independent of ring placement.
 #[test]
@@ -1375,32 +1375,51 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
 
         // Pause/resume are independent of ring placement.
         let ctx2 = create_context(&kernel, "napper").await.unwrap();
-        kernel.set_context_paused(ctx2, true).await.unwrap();
+        let paused = kernel.execute_kj(ctx2, &["context".to_string(), "pause".to_string(), ctx2.to_hex()]).await.unwrap();
+        assert_eq!(paused.exit_code, 0, "{}", paused.stderr);
         let contexts = kernel.list_contexts().await.unwrap();
         assert!(find(&contexts, ctx2).unwrap().paused_at.is_some());
-        kernel.set_context_paused(ctx2, false).await.unwrap();
+        let resumed = kernel.execute_kj(ctx2, &["context".to_string(), "resume".to_string(), ctx2.to_hex()]).await.unwrap();
+        assert_eq!(resumed.exit_code, 0, "{}", resumed.stderr);
         let contexts = kernel.list_contexts().await.unwrap();
         assert!(find(&contexts, ctx2).unwrap().paused_at.is_none());
     });
 }
 
-/// The well's single-keystroke archive action: `archiveContext` archives one
-/// context — no latch, no subtree recursion — and is idempotent on replay.
+/// The well's `a`: `kj context archive` over `executeKj` latches, the
+/// confirmed run archives, and a retried confirmed run still succeeds.
 #[test]
-fn test_archive_context_rpc_is_single_context_and_idempotent() {
+fn test_kj_context_archive_latches_then_archives_over_rpc() {
     run_local(async {
         let addr = start_server().await;
         let (_client, kernel) = setup_execute_context(addr).await;
 
         let ctx = create_context(&kernel, "solo-archive").await.unwrap();
-        kernel.archive_context(ctx).await.unwrap();
+        let steward = create_context(&kernel, "archive-steward").await.unwrap();
+        let archive = |confirm: bool| {
+            let mut argv = vec!["context".to_string(), "archive".to_string(), ctx.to_hex()];
+            if confirm {
+                argv.push("--confirm".to_string());
+            }
+            argv
+        };
 
+        let latched = kernel.execute_kj(ctx, &archive(false)).await.unwrap();
+        let latch = latched.latch.expect("an unconfirmed archive latches");
+        assert_eq!(latch.message, format!("kj context archive {} --confirm", ctx.to_hex()));
         let contexts = kernel.list_contexts().await.unwrap();
-        let row = contexts.iter().find(|c| c.id == ctx).unwrap();
-        assert!(row.archived);
+        assert!(!contexts.iter().find(|c| c.id == ctx).unwrap().archived, "a latch archives nothing");
 
-        // Idempotent: archiving again still succeeds.
-        kernel.archive_context(ctx).await.unwrap();
+        let archived = kernel.execute_kj(ctx, &archive(true)).await.unwrap();
+        assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
+        let contexts = kernel.list_contexts().await.unwrap();
+        assert!(contexts.iter().find(|c| c.id == ctx).unwrap().archived);
+
+        // An archived context runs no new work, so the retry runs from
+        // another context.
+        let again = kernel.execute_kj(steward, &archive(true)).await.unwrap();
+        assert_eq!(again.exit_code, 0, "{}", again.stderr);
+        assert!(again.stdout.contains("already archived"), "{}", again.stdout);
     });
 }
 
@@ -1439,7 +1458,9 @@ fn test_set_last_context_auto_promotes_a_fresh_context_but_not_a_demoted_one() {
         // Archived is sticky too: visits never resurrect — only an explicit
         // promote opens the resurrection door.
         let buried = create_context(&kernel, "stay-buried").await.unwrap();
-        kernel.archive_context(buried).await.unwrap();
+        let argv = ["context".to_string(), "archive".to_string(), buried.to_hex(), "--confirm".to_string()];
+        let archived = kernel.execute_kj(buried, &argv).await.unwrap();
+        assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
         kernel.set_last_context(&client_id, buried).await.unwrap();
         let contexts = kernel.list_contexts().await.unwrap();
         let row = contexts.iter().find(|c| c.id == buried).unwrap();

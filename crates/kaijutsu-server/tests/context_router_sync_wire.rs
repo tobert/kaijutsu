@@ -50,7 +50,7 @@ fn conclude_updates_the_router_while_another_thread_reads_it() {
         let context = create_context(&kj, "router-sync-conclude").await.unwrap();
 
         let holder = hold_router_read(&server);
-        kj.conclude(context).await.unwrap();
+        context_verb(&kj, "conclude", context, &[]).await;
         holder.join().unwrap();
 
         let state = server.kernel.drift().read().get(context).map(|h| h.state);

@@ -1,15 +1,15 @@
-//! The placement keys: the well's `p` and `d`, and `Ctrl+A q`
-//! (`docs/input.md`, "The prefix table" and "Placement keys").
+//! The placement keys: the well's `p`, `d`, `c`, `z` and `a`, and
+//! `Ctrl+A q` (`docs/input.md`, "The prefix table" and "Placement keys").
 //!
-//! Each key runs `kj context promote|demote <id>` through `executeKj`
-//! against the context it moves, as the tui's picker does. The verb checks
-//! placement authority, latches the demote step that archives behind
-//! `--confirm`, and runs the archive rc lifecycle, so a key gets the same
-//! checks as a typed line.
+//! Each key runs its `kj context promote|demote|conclude|pause|resume|archive
+//! <id>` through `executeKj` against the context it moves, as the tui's
+//! picker does. The verb checks authority, latches each step that archives
+//! behind `--confirm`, and runs the archive rc lifecycle, so a key gets the
+//! same checks as a typed line.
 //!
-//! A latched demote moves nothing. The hints line says that the next step
-//! archives, and the same key on the same context, while that notice shows,
-//! runs the step again with `--confirm`. One press never archives.
+//! A latched step moves nothing. The hints line says what the step does, and
+//! the same key on the same context, while that notice shows, runs the step
+//! again with `--confirm`. One press never archives.
 
 use bevy::prelude::*;
 use kaijutsu_client::rpc::KjExecutionResult;
@@ -29,13 +29,25 @@ pub enum PlacementKey {
     /// `Ctrl+A q`: `kj context demote` on the context on screen, then land
     /// on the previous context once the demote has run.
     CloseAndDemote,
+    /// The well's `c`: `kj context conclude`.
+    Conclude,
+    /// The well's `z` on a running context: `kj context pause`.
+    Pause,
+    /// The well's `z` on a paused context: `kj context resume`.
+    Resume,
+    /// The well's `a`: `kj context archive`.
+    Archive,
 }
 
 impl PlacementKey {
-    fn verb(self) -> &'static str {
+    pub fn verb(self) -> &'static str {
         match self {
             PlacementKey::Promote => "promote",
             PlacementKey::Demote | PlacementKey::CloseAndDemote => "demote",
+            PlacementKey::Conclude => "conclude",
+            PlacementKey::Pause => "pause",
+            PlacementKey::Resume => "resume",
+            PlacementKey::Archive => "archive",
         }
     }
 
@@ -45,6 +57,9 @@ impl PlacementKey {
             PlacementKey::Promote => "p",
             PlacementKey::Demote => "d",
             PlacementKey::CloseAndDemote => "Ctrl+A q",
+            PlacementKey::Conclude => "c",
+            PlacementKey::Pause | PlacementKey::Resume => "z",
+            PlacementKey::Archive => "a",
         }
     }
 }
@@ -138,10 +153,10 @@ fn landed(context_id: ContextId, key: PlacementKey, result: &Result<KjExecutionR
     let verb = key.verb();
     match result {
         Err(e) => Landed::Failed(format!("{verb} {short} failed: {e}")),
-        Ok(result) if result.latch.is_some() => Landed::Latched(format!(
-            "{short} is already demoted, so the next demote archives it; {} again confirms",
-            key.name()
-        )),
+        Ok(result) if result.latch.is_some() => Landed::Latched(match key {
+            PlacementKey::Archive => format!("archive {short}? {} again confirms", key.name()),
+            _ => format!("{short} is already demoted, so the next demote archives it; {} again confirms", key.name()),
+        }),
         Ok(result) if result.exit_code != 0 => {
             let why = result.stderr.lines().next().unwrap_or("").trim();
             Landed::Failed(format!("{verb} {short} failed (exit {}): {why}", result.exit_code))
@@ -238,6 +253,19 @@ mod tests {
     }
 
     #[test]
+    fn the_wells_other_keys_run_their_kj_verbs() {
+        let id = ContextId::new();
+        assert_eq!(placement_argv(PlacementKey::Conclude, id, false), vec!["context", "conclude", &id.to_hex()]);
+        assert_eq!(placement_argv(PlacementKey::Pause, id, false), vec!["context", "pause", &id.to_hex()]);
+        assert_eq!(placement_argv(PlacementKey::Resume, id, false), vec!["context", "resume", &id.to_hex()]);
+        assert_eq!(placement_argv(PlacementKey::Archive, id, false), vec!["context", "archive", &id.to_hex()]);
+        assert_eq!(
+            placement_argv(PlacementKey::Archive, id, true),
+            vec!["context", "archive", &id.to_hex(), "--confirm"]
+        );
+    }
+
+    #[test]
     fn only_the_same_key_on_the_same_context_confirms_while_its_notice_shows() {
         let (a, b) = (ContextId::new(), ContextId::new());
         let mut latch = PlacementLatch::default();
@@ -266,6 +294,21 @@ mod tests {
         assert!(matches!(&failed, Landed::Failed(said) if said.contains("lacks the 'operator' capability")), "{failed:?}");
         let moved = landed(id, PlacementKey::Demote, &Ok(executed(0, "demoted 01a1\n", "", false)));
         assert_eq!(moved, Landed::Moved("demoted 01a1".into()));
+    }
+
+    /// A latched archive asks before it archives and names `a` as the key
+    /// that confirms; a refused conclude says the kernel's reason.
+    #[test]
+    fn a_latched_archive_names_a_and_a_refused_conclude_says_why() {
+        let id = ContextId::new();
+        let latched = landed(id, PlacementKey::Archive, &Ok(executed(2, "", "confirmation required", true)));
+        assert_eq!(latched, Landed::Latched(format!("archive {}? a again confirms", id.short())));
+        let refused = landed(
+            id,
+            PlacementKey::Conclude,
+            &Ok(executed(1, "", "kj context conclude: only the performer may conclude it\n", false)),
+        );
+        assert!(matches!(&refused, Landed::Failed(said) if said.contains("only the performer may conclude it")), "{refused:?}");
     }
 
     fn prefix_app(active: ContextId, previous: ContextId) -> App {
@@ -308,9 +351,10 @@ mod tests {
         assert!(switches(&app).is_empty(), "the view moves only once the demote has run");
     }
 
-    /// The well's `p` and `d` ask for the kj verb on the selected card.
+    /// The well's `p`, `d`, `c`, `z` and `a` ask for their kj verb on the
+    /// selection. `z` pauses a running context and resumes a paused one.
     #[test]
-    fn the_wells_p_and_d_ask_for_the_kj_verb_on_the_selection() {
+    fn the_wells_keys_ask_for_their_kj_verb_on_the_selection() {
         let card = ContextId::new();
         let mut app = App::new();
         app.add_plugins(bevy::state::app::StatesPlugin)
@@ -323,15 +367,28 @@ mod tests {
             .init_resource::<crate::view::time_well::scene::TimeWellState>()
             .add_systems(Update, crate::view::time_well::scene::well_keyboard);
         app.world_mut().resource_mut::<crate::view::time_well::scene::TimeWellState>().selected = Some(card);
-        for (action, key) in [(Action::Promote, PlacementKey::Promote), (Action::Demote, PlacementKey::Demote)] {
-            app.world_mut().write_message(ActionFired { action, context: InputContext::WellZoomed });
+        let press = |app: &mut App, action: Action, key: PlacementKey| {
+            app.world_mut().write_message(ActionFired { action: action.clone(), context: InputContext::WellZoomed });
             app.update();
-            assert_eq!(requests(&app), vec![PlacementRequested { context_id: card, key }]);
+            assert_eq!(requests(app), vec![PlacementRequested { context_id: card, key }], "{action:?}");
             app.world_mut()
                 .resource_mut::<crate::view::time_well::scene::TimeWellState>()
                 .placement_pending
                 .clear();
+        };
+        for (action, key) in [
+            (Action::Promote, PlacementKey::Promote),
+            (Action::Demote, PlacementKey::Demote),
+            (Action::Conclude, PlacementKey::Conclude),
+            (Action::Archive, PlacementKey::Archive),
+            (Action::PauseToggle, PlacementKey::Pause),
+        ] {
+            press(&mut app, action, key);
         }
+        let mut paused = crate::view::time_well::scene::tests::minimal_ctx(card);
+        paused.paused_at = Some(1);
+        app.world_mut().resource_mut::<crate::connection::drift::DriftState>().contexts = vec![paused];
+        press(&mut app, Action::PauseToggle, PlacementKey::Resume);
     }
 
     fn landing_app(active: ContextId, previous: ContextId) -> App {

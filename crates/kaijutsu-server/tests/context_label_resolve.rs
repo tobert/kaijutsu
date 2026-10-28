@@ -58,7 +58,7 @@ fn resolve_context_label_reports_concluded_state() {
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let context_id = create_context(&kernel, "resolve-label-concluded").await.unwrap();
-        kernel.conclude(context_id).await.unwrap();
+        context_verb(&kernel, "conclude", context_id, &[]).await;
 
         let row = kernel
             .resolve_context_label("resolve-label-concluded")
@@ -147,7 +147,7 @@ fn join_context_heals_registry_for_an_archived_context_after_restart() {
                 .join_context(context_id, "pre-restart-instance")
                 .await
                 .unwrap();
-            kernel.archive_context(context_id).await.unwrap();
+            context_verb(&kernel, "archive", context_id, &["--confirm"]).await;
             (context_id, label)
         };
 
@@ -221,7 +221,7 @@ fn join_context_heals_an_archived_context_whose_label_a_live_context_holds() {
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let archived_id = create_context(&kernel, &label).await.unwrap();
-            kernel.archive_context(archived_id).await.unwrap();
+            context_verb(&kernel, "archive", archived_id, &["--confirm"]).await;
             // The label is free again; a second context takes it while the
             // first is still archived.
             let live_id = create_context(&kernel, &label).await.unwrap();

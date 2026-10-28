@@ -269,7 +269,10 @@ a Toad flight before the next one needs to start.
 1. **Addressed cwd + resume — shipped.** Context-addressed cwd RPCs persist new
    session cwd, reset it on load/resume, and report it per context;
    stable-v1 `session/resume` is advertised and attaches without replay.
-2. **Archive through `session/delete` — shipped.** Kernel archive is
+2. **Archive through `session/delete` — shipped.** The bridge runs `kj
+   context archive <id> --confirm` from the context the session was created
+   from, so the context type's archive rc lifecycle runs; a coder seat lacks
+   the `operator` capability that archive needs. Kernel archive is
    idempotent for client retries; a successful request unbinds the session
    registry entry and stops its event pump, while context data remains
    recoverable in kj.

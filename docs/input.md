@@ -151,17 +151,18 @@ and the hints line shows the latch message or the first stdout line. Any
 other line runs in the shell and returns no data; a context switch there
 follows the kernel's `ContextSwitched` push instead.
 
-**Placement keys.** The well's `p` and `d` and `Ctrl+A q` run `kj context
-promote <id>` or `kj context demote <id>` through `executeKj`, against the
-context they move, as the tui's picker does. There is no placement RPC: the
-verb checks placement authority, latches the demote step that archives
-behind `--confirm`, and runs the archive rc lifecycle. The hints line shows
-the first stdout line, or why the verb failed. A latched demote moves
-nothing; the hints line says that the next demote archives the context and
-which key confirms it. The same key on the same context, while that notice
-shows (6 seconds), runs the step again with `--confirm`. Any other placement
-press disarms it, so one press never archives. The well's `z` and `a` still
-call `setContextPaused` and `archiveContext`.
+**Placement keys.** The well's `p`, `d`, `c`, `z` and `a` and `Ctrl+A q`
+run a `kj context` verb on the context they move, through `executeKj` and
+against that context, as the tui's picker does: `p` promote, `d` and
+`Ctrl+A q` demote, `c` conclude, `z` pause (or resume, when the context is
+paused), and `a` archive. There is no placement RPC: the verb checks
+authority, latches each step that archives behind `--confirm`, and runs the
+archive rc lifecycle. The hints line shows the first stdout line, or why the
+verb failed. A latched step moves nothing; the hints line says what the step
+does and which key confirms it. The same key on the same context, while that
+notice shows (6 seconds), runs the step again with `--confirm`. Any other
+placement press disarms it, so one press never archives. `kj context
+archive` always latches, so `a` archives on its second press.
 
 ## Compose keys
 
