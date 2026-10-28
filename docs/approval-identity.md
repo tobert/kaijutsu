@@ -90,6 +90,15 @@ Create sets the edge, and nothing else moves it but `kj senpai set`: `kj fork` j
 instance, and `kj context rotate` starts a new conversation in the same instance, so neither touches the senpai or
 the kohai. Every client creation names its performer with `--as`.
 
+Ring placement and conclusion do not follow the lineage. `kj context
+promote`, `demote`, and `conclude` need the operator capability, except
+for a live root character: it acts as a human root from any context. ROOT,
+a human root or the ROOT console, may act on any context. Another seat, such
+as a director, may act on any context except a human root, a console, or
+its own; for its own, it asks ROOT. Only a human root demotes or concludes
+a human root or a console, and nobody concludes a human root. See
+`docs/character.md`, "ROOT places contexts".
+
 ## Three identities
 
 | Field | Meaning |

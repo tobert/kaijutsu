@@ -45,7 +45,7 @@ the performer from context metadata.
 Still planned: character rc composition (slice 5), which would also grant
 statically what a character rule now learns from a first ask, roster grouping and character drift addressing (slices 6–7), and
 scheduled janitor/proctor work (slice 8). The sheet still has no
-`rc_dir` or `memory_root` fields. The handoff
+`rc_dir` field. The handoff
 is a context, not a transport track. Requester and performer remain separate;
 a performer never changes credentials or rewrites existing asks and block authors.
 
@@ -90,7 +90,7 @@ Amy's word for the shape is a D&D character sheet (guidance, 2026-09-06):
 a page of stats and pointers that is not itself the lore, but that
 references out to deeper lore. Read the design that way. The sheet is
 small and mostly foreign keys; what it names — the rc directory, the
-handoff log, the root context, the memory root — is where the depth
+handoff log, the root context — is where the depth
 lives. Adding a column is how the sheet reaches somewhere new.
 
 Two things follow, and they are the ones to check a change against:
@@ -176,12 +176,70 @@ Two things follow, and they are the ones to check a change against:
   reviewer is the human root above it. Ctrl-Z in the console, or in the human
   root, opens a shell context under it (type `shell`, no model). Its output
   stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
-  the shell returns to its parent. Incoming drifts into the console are not
-  yet gated: see `docs/issues.md`, "Root console".
+  the shell returns to its parent.
+- **A drift into ROOT waits for the human.** Amy, 2026-10-28. A drift into
+  the ROOT console lands held: a `Drift` block that is `Pending` and
+  excluded, so no model reads it, and no running turn is offered it. Every
+  drift kind holds except `Notification`. The drift's `rc` scripts run as
+  for any drift. An ask with origin `drift` waits in the approval ledger:
+  the sender is its performer, and its reviewer is whoever reviews the
+  console's performer, which is the human root above it. Its description
+  names the sender's context, the drift kind, and the text. The ask card,
+  the compose pause, the ledger view, and the desktop notice treat it like
+  any other ask. `kj ledger allow <id>` releases the drift: the approval
+  worker makes the block `Done` and included and offers it to a running
+  turn, so it joins at the next tool round, or else it rides the next
+  submit. `kj ledger deny <id>`, or the sender's `kj ledger cancel <id>`,
+  dismisses it: `Done`, still excluded, kept in the log. A drift ask takes
+  no `--remember`: the kernel refuses the answer and the ask stays open
+  (`kj/drift.rs`, `settle_drift_answer`; `kj/ledger.rs`, `decide_ask`).
+  - Only a human answers it. A drift is refused, before anything is
+    written, when ROOT's reviewer is not a live root character.
+  - A drift ask survives a restart; every other unresolved ask is retired.
+    At start, a held drift with no open or unsettled ask is dismissed
+    (`reconcile_root_held_drifts`).
+  - ROOT is not archived, rotated, or demoted past the rim while a drift
+    ask is open or its answer is unsettled. Each verb refuses before it
+    runs anything, naming the asks.
+  - `kj stage include` and `setBlockExcluded` refuse a held drift; only the
+    ask's allow includes it. A held `pull` or `merge` tells its caller the
+    ask id and shows no preview.
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,
   and the factory preset labels.
+- **ROOT places contexts.** Amy, 2026-10-28: "I think we are simplifying
+  on having ROOT be the privileged context for getting stuff moving. A
+  banto/director should have privileges to drive other contexts, and fall
+  back to the ROOT when it needs to do something on itself. This gives me
+  one place for things to bubble down to me." `kj context promote`,
+  `demote`, and `conclude` follow this rule (`kj/context.rs`,
+  `require_placement_authority`). Asked where a person's own authority
+  comes from, Amy chose "It follows the human": a live root character (a
+  sheet with `root` set, not retired) is a human root wherever it acts, so
+  its keys work in any client on any card, and it needs no capability. A
+  model seat is ROOT only in the ROOT console (the `console` context
+  labeled `ROOT`), and needs the operator capability there. A call that
+  runs in a `root` context is a human root too.
+  - ROOT may act on any context, including itself and directors.
+  - Only a human root demotes or concludes a human root or a console.
+    Nobody concludes a human root: conclusion has no undo, and a concluded
+    context refuses drifts, which is how work reaches the human. A human
+    root that wants fresh history rotates.
+  - Any other seat with Operator, such as a director, may act on any other
+    context in the house, in any lineage. It may not act on a human root,
+    a console, or its own context. Its own context is the one the call
+    runs in, or any context its character plays. The refusal says to ask
+    ROOT, for example with `kj drift push ROOT`.
+  - A seat without Operator acts on nothing. The refusal names the
+    capability and says to go through its director or ROOT. A `shell`
+    context holds no Operator, so it places nothing.
+
+  `kj context archive` follows the same principle: it needs Operator, or a
+  live root character acting from any context, and it always latches.
+  `kj drive` and `kj context rotate` keep their own rules: `drive` needs
+  the drive capability on any target, including the caller's own context,
+  and the performer or lineage root rotates.
 - **Rotation replaces a conversation, not a character.** Amy, 2026-09-17,
   and step 5 of `docs/senpai-kohai.md`: the successor is a new conversation
   in the same instance, on the instance's next binding, read fresh from the
@@ -288,7 +346,6 @@ CREATE TABLE IF NOT EXISTS characters (
     root             INTEGER NOT NULL DEFAULT 0, -- no model; see "Roots and rotation"
     cast_id          BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     rc_dir           TEXT,                        -- default /config/rc/character/<name>
-    memory_root      TEXT,                        -- host path; NULL = no memory of its own
     handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
 ```
@@ -911,7 +968,8 @@ Each slice is independently shippable and leaves the tree green.
    the distill-cast refusal and `--distill-model` on pull.
    `default_cast_id` shipped on its own, 2026-10-09, for the judge shadow.
 
-Deferred: saifu, availability, and `memory_root` until a reader exists.
+Deferred: saifu and availability until a reader exists. A character has no
+memory field: memory is planned as tool calls and inference-side work.
 `root_ctx` has its reader, rotation ("Roots and rotation" above), and is
 queued in `docs/issues.md`. Not doing: party, chair, seat, any reputation or trust score
 (shared trust rules it out), a `Character` Rust type.
@@ -937,7 +995,6 @@ it.
   and app; they did not establish every consumer. Anything that treats a
   block's principal as the authenticated requester needs a separate field
   or durable turn provenance, not a second overload of the author field.
-- **A musician's memory.** Bass-san's `memory_root` is NULL by choice.
 - **Socket-protocol liveness** for driving a Claude Code session
   (`docs/cc-peer.md`).
 - **The desk character** (受付, Uketsuke): an automode context that answers

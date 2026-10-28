@@ -1936,6 +1936,13 @@ impl BlockSnapshot {
         self.id.principal_id
     }
 
+    /// Whether this is a drift held for its human's review: a `Drift`
+    /// block still `Pending`. It is excluded until an answer to its ask
+    /// releases it (`docs/character.md`, "The root console and its shell").
+    pub fn is_held_drift(&self) -> bool {
+        self.kind == BlockKind::Drift && self.status == Status::Pending
+    }
+
     /// Extract the scalar metadata fields carried by `MetadataChanged`.
     pub fn metadata(&self) -> BlockMetadata {
         BlockMetadata {

@@ -241,11 +241,15 @@ impl KernelBridge {
             .with_context(|| format!("set context cwd to {cwd}"))
     }
 
+    /// Archive one context with `kj context archive <id> --confirm`, run
+    /// from the context it was created from, so its archive rc lifecycle
+    /// runs. The caller has already decided, so it confirms. A refusal is an
+    /// error carrying the kernel's message.
     pub async fn archive_context(&self, context_id: ContextId) -> Result<()> {
         self.actor
-            .archive_context(context_id)
+            .archive_context_from_parent(context_id)
             .await
-            .context("archive context")
+            .map_err(|e| anyhow::anyhow!("kj context archive {}: {e}", context_id.short()))
     }
 
     /// Replace this connection's MCP servers for one context; an empty list

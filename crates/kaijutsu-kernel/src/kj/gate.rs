@@ -262,6 +262,7 @@ pub(crate) fn statement_digest(origin: Origin, rendered: &str) -> String {
         Origin::ShellGate => format!("shell-stmt:v1:{rendered}"),
         Origin::Hook => format!("hook:v1:{rendered}"),
         Origin::HookResult => format!("hook-result:v1:{rendered}"),
+        Origin::Drift => format!("drift:v1:{rendered}"),
     }
 }
 

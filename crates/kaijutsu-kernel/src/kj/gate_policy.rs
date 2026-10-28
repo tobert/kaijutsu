@@ -1307,7 +1307,7 @@ fn planned_groups(spec: &GateSpec) -> Option<Vec<&[PlannedStatement]>> {
             Some(spec.planned.iter().map(std::slice::from_ref).collect())
         }
         Origin::Hook if n == 1 && !spec.planned.is_empty() => Some(vec![spec.planned.as_slice()]),
-        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => None,
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb | Origin::Drift => None,
     }
 }
 
@@ -1665,7 +1665,7 @@ fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>, edge: &
             let program = spec.planned.iter().map(|s| statement_verdict(s, layers, edge)).collect();
             vec![fold_verdicts(program)]
         }
-        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => {
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb | Origin::Drift => {
             vec![PolicyVerdict::Uncovered; n]
         }
     }

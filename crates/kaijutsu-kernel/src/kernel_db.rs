@@ -199,6 +199,12 @@ impl ContextRow {
         self.archived_at.is_some() || self.context_state == ContextState::Archived
     }
 
+    /// Whether this is the ROOT console: the `console` context labeled
+    /// `ROOT` (`docs/character.md`, "The root console and its shell").
+    pub fn is_root_console(&self) -> bool {
+        self.context_type == kaijutsu_types::CONSOLE_CONTEXT_TYPE && self.label.as_deref() == Some("ROOT")
+    }
+
     /// Convert to the lightweight `kaijutsu_types::Context`.
     pub fn to_context(&self) -> kaijutsu_types::Context {
         kaijutsu_types::Context {
@@ -711,6 +717,14 @@ pub(crate) fn record_approval_tool_call(
     Ok(())
 }
 
+/// Record the held drift block a drift ask answers for, in the ask's
+/// transaction.
+pub(crate) fn record_approval_drift_block(conn: &Connection, request: &str, block: &BlockId) -> KernelDbResult<()> {
+    conn.execute("INSERT INTO approval_drift_blocks(request_id, block_id) VALUES (?1, ?2)",
+        rusqlite::params![request, block.to_key()])?;
+    Ok(())
+}
+
 const SCHEMA: &str = r#"
 -- ── Kernel Identity (singleton) ─────────────────────────────────
 -- One row per database. The `singleton` column + UNIQUE constraint
@@ -735,6 +749,12 @@ CREATE TABLE IF NOT EXISTS approval_pair_handoffs (
 
 -- The model's ToolCall block whose invocation raised an ask, recorded with it.
 CREATE TABLE IF NOT EXISTS approval_tool_calls (
+    request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    block_id TEXT NOT NULL
+);
+
+-- The held drift block a drift ask releases or dismisses, recorded with it.
+CREATE TABLE IF NOT EXISTS approval_drift_blocks (
     request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
     block_id TEXT NOT NULL
 );
@@ -1468,8 +1488,7 @@ CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- The rest of the sheet (rc_dir, memory_root) arrives with the slice that
--- reads it. See docs/character.md, "Character = principal + sheet".
+-- `rc_dir` arrives with the slice that reads it. See docs/character.md, "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
     principal_id     BLOB NOT NULL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -2693,6 +2712,21 @@ impl KernelDb {
             [request], |row| row.get(0)).optional()?;
         key.map(|key| BlockId::from_key(&key)
             .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed tool call block {key}"))))
+            .transpose()
+    }
+
+    /// The drift ask recorded with a held drift block.
+    pub(crate) fn approval_for_drift_block(&self, block: &BlockId) -> KernelDbResult<Option<String>> {
+        Ok(self.conn.query_row("SELECT request_id FROM approval_drift_blocks WHERE block_id=?1",
+            [block.to_key()], |row| row.get(0)).optional()?)
+    }
+
+    /// The held drift block recorded with a drift ask.
+    pub(crate) fn approval_drift_block(&self, request: &str) -> KernelDbResult<Option<BlockId>> {
+        let key: Option<String> = self.conn.query_row("SELECT block_id FROM approval_drift_blocks WHERE request_id=?1",
+            [request], |row| row.get(0)).optional()?;
+        key.map(|key| BlockId::from_key(&key)
+            .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed drift block {key}"))))
             .transpose()
     }
 
@@ -5300,7 +5334,29 @@ impl KernelDb {
         }
     }
 
+    /// Why `id` may not be archived yet: it holds drifts whose asks are
+    /// unanswered or unsettled. A held drift is settled by its ask, and an
+    /// archived context answers nothing, so archiving would leave the drift
+    /// held with no ask that can release it. Verbs that archive check this
+    /// before they run anything; [`Self::archive_context_writes`] checks it
+    /// again inside the write.
+    pub(crate) fn held_drift_refusal(&self, id: ContextId) -> KernelDbResult<Option<String>> {
+        let held = approval_ledger::ask::list_unsettled_drift_asks(&self.conn, id.as_bytes())?;
+        if held.is_empty() {
+            return Ok(None);
+        }
+        let asks = held.iter().map(|id| id.split('-').next().unwrap_or(id)).collect::<Vec<_>>().join(", ");
+        Ok(Some(format!(
+            "context {} holds {} drift(s) waiting for its human (ask {asks}); answer each with \
+             `kj ledger allow <id>` or `kj ledger deny <id>`, then archive it",
+            id.short(), held.len()
+        )))
+    }
+
     fn archive_context_writes(&self, id: ContextId) -> KernelDbResult<bool> {
+        if let Some(why) = self.held_drift_refusal(id)? {
+            return Err(KernelDbError::Validation(why));
+        }
         let now = now_millis();
         let updated = self.conn.execute(
             "UPDATE contexts

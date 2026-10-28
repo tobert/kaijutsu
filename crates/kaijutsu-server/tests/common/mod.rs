@@ -588,3 +588,15 @@ pub async fn create_context_typed_as(
     let result = kernel.execute_kj_quiet(parent.context_id, &argv).await.map_err(|e| e.to_string())?;
     kaijutsu_client::context_id_from_create_result(&result)
 }
+
+/// Run `kj context <verb> <context> [args]` from the kernel's only root
+/// context, and panic on a nonzero exit.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn context_verb(kernel: &KernelHandle, verb: &str, context: kaijutsu_types::ContextId, args: &[&str]) {
+    let contexts = kernel.list_contexts().await.expect("list contexts");
+    let root = kaijutsu_client::choose_parent(None, &contexts).expect("the kernel's only root context");
+    let mut argv = vec!["context".to_string(), verb.to_string(), context.to_hex()];
+    argv.extend(args.iter().map(|arg| arg.to_string()));
+    let result = kernel.execute_kj_quiet(root.context_id, &argv).await.expect("executeKj");
+    assert_eq!(result.exit_code, 0, "kj {}: {}", argv.join(" "), result.stderr);
+}

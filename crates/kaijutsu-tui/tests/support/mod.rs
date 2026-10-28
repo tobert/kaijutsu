@@ -202,6 +202,25 @@ pub fn grant_operator(server: &EphemeralServer, label: &str) {
     })
 }
 
+/// Make a `ROOT` console played by the ephemeral kernel's performer, then
+/// push `text` into it from the root seat. The drift lands held, with an
+/// ask for the root principal the client under test also uses.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
+pub fn drift_into_a_root_console(server: &EphemeralServer, text: &str) {
+    with_kernel(server, async |kernel| {
+        let contexts = kernel.list_contexts().await.expect("list contexts");
+        let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
+        for argv in [
+            vec!["kohai", "create", "ROOT", "--type", "console", "--as", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER],
+            vec!["drift", "push", "ROOT", text],
+        ] {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            let result = kernel.execute_kj_quiet(root, &argv).await.expect("run kj");
+            assert_eq!(result.exit_code, 0, "kj {argv:?}: {}", result.stderr);
+        }
+    })
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // The pty session
 // ────────────────────────────────────────────────────────────────────────────

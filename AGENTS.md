@@ -96,8 +96,8 @@ cast slot. Model turns require a live performer and a distinct reviewer.
 Provider output and tools carry the performer; the connection keeps its own
 identity. `forked_from` is provenance only. See `docs/senpai-kohai.md` and
 `docs/approval-identity.md`.
-Composition with character rc remains planned. Rc directory and memory root
-are planned sheet fields. Persona text moves onto the character in the
+Composition with character rc remains planned. An rc directory is a planned
+sheet field. Persona text moves onto the character in the
 senpai/kohai stack (step 6); see `docs/character.md`, "Current implementation"
 and "Rollout, smallest first".
 

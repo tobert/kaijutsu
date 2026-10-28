@@ -397,7 +397,7 @@ pub enum RpcResultMessage {
         from: ContextId,
         result: kaijutsu_client::rpc::KjExecutionResult,
     },
-    /// A placement key's `kj context promote|demote` ran on `context_id`
+    /// A placement key's `kj context` verb ran on `context_id`
     /// (`commands::placement`).
     PlacementFinished {
         context_id: ContextId,

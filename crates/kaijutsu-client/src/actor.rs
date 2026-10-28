@@ -363,18 +363,9 @@ enum RpcCommand {
         interval_ms: u32,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
-    Conclude {
-        context_id: ContextId,
-        reply: oneshot::Sender<Result<(), CallError>>,
-    },
     RenameContext {
         context_id: ContextId,
         label: String,
-        reply: oneshot::Sender<Result<(), CallError>>,
-    },
-    SetContextPaused {
-        context_id: ContextId,
-        paused: bool,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
     SetContextOriginHost {
@@ -397,10 +388,6 @@ enum RpcCommand {
         status: Status,
         is_error: bool,
         exit_code: Option<i32>,
-        reply: oneshot::Sender<Result<(), CallError>>,
-    },
-    ArchiveContext {
-        context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
     SearchSimilar {
@@ -781,13 +768,10 @@ impl RpcCommand {
             Self::ListTracks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::VfsSnapshot { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubscribeVfsActivity { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::RenameContext { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::SetContextPaused { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextOriginHost { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::AuthorBlock { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompleteBlock { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ArchiveContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetClusters { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1101,29 +1085,11 @@ impl ActorHandle {
             .await
     }
 
-    /// Conclude a context — the explicit "done" act (sets `concluded`/stamps
-    /// `concludedAt` server-side). Idempotent.
-    #[tracing::instrument(skip(self))]
-    pub async fn conclude(&self, context_id: ContextId) -> Result<(), CallError> {
-        self.send(|reply| RpcCommand::Conclude { context_id, reply }).await
-    }
-
     /// Rename a context's human-friendly label.
     #[tracing::instrument(skip(self))]
     pub async fn rename_context(&self, context_id: ContextId, label: &str) -> Result<(), CallError> {
         let label = label.to_string();
         self.send(|reply| RpcCommand::RenameContext { context_id, label, reply }).await
-    }
-
-    /// Set or clear a context's "suspend activity" flag (`pausedAt`).
-    /// Design-only for now — persisted and on the wire, no behavioral gating.
-    #[tracing::instrument(skip(self))]
-    pub async fn set_context_paused(
-        &self,
-        context_id: ContextId,
-        paused: bool,
-    ) -> Result<(), CallError> {
-        self.send(|reply| RpcCommand::SetContextPaused { context_id, paused, reply }).await
     }
 
     /// Set (or clear, on `""`) a context's advisory `origin_host` — the
@@ -1175,14 +1141,6 @@ impl ActorHandle {
             reply,
         })
         .await
-    }
-
-    /// Archive a single context — the well's single-keystroke archive act.
-    /// Unlike the `kj context archive` builtin (latched, recurses into
-    /// structural children), this is single-context, unlatched, idempotent.
-    #[tracing::instrument(skip(self))]
-    pub async fn archive_context(&self, context_id: ContextId) -> Result<(), CallError> {
-        self.send(|reply| RpcCommand::ArchiveContext { context_id, reply }).await
     }
 
     /// Semantic search: contexts similar to a free-text query (top `k`).
@@ -3604,14 +3562,8 @@ async fn dispatch_kernel_command(
         RpcCommand::VfsSnapshot { path, depth, max_entries, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.vfs_snapshot(&path, depth, max_entries));
         }
-        RpcCommand::Conclude { context_id, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));
-        }
         RpcCommand::RenameContext { context_id, label, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.rename_context(context_id, &label));
-        }
-        RpcCommand::SetContextPaused { context_id, paused, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.set_context_paused(context_id, paused));
         }
         RpcCommand::AuthorBlock { req, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.author_block(&req));
@@ -3633,9 +3585,6 @@ async fn dispatch_kernel_command(
                 k,
                 k.set_context_origin_host(context_id, &origin_host)
             );
-        }
-        RpcCommand::ArchiveContext { context_id, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.archive_context(context_id));
         }
         RpcCommand::SearchSimilar { query, k: topk, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.search_similar(&query, topk));

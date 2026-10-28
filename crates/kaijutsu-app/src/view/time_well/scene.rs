@@ -211,7 +211,7 @@ pub struct TimeWellState {
     /// Contexts with a placement verb (`p`/`d`/`z`/`a`) in flight — sent but
     /// not yet reflected by a `DriftState` poll. Further placement verbs on a
     /// pending context are ignored (info-logged) until the next poll clears
-    /// the set ([`super::sync::sync_time_well`]), or until a `p`/`d` result
+    /// the set ([`super::sync::sync_time_well`]), or until a result
     /// that moved nothing lands (`commands::placement::land_placements`):
     /// without this, a double-`d` inside one poll interval walks the ladder
     /// two rungs sight-unseen. Digits/Enter/`c` stay unguarded — navigation
@@ -1010,7 +1010,6 @@ pub fn well_keyboard(
     mut state: ResMut<TimeWellState>,
     mut switch: MessageWriter<crate::view::components::ContextSwitchRequested>,
     mut next: ResMut<NextState<Screen>>,
-    actor: Option<Res<crate::connection::RpcActor>>,
     drift: Res<crate::connection::drift::DriftState>,
     mut room: ResMut<crate::view::room::RoomState>,
     mut placements: MessageWriter<crate::commands::placement::PlacementRequested>,
@@ -1131,110 +1130,43 @@ pub fn well_keyboard(
                 }
             }
 
-    // `c`: conclude the selected context (fire-and-forget over RPC; the
-            // next DriftState poll sends it past the horizon — concluded work
-            // never competes for a ring seat, see `assign_placement`).
-            Action::Conclude => {
-                if let Some(id) = state.selected
-                    && let Some(actor) = actor.as_ref()
-                {
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.conclude(id).await {
-                                log::warn!("well: conclude {} failed: {e}", id.short());
-                            }
-                        })
-                        .detach();
-                    info!("well: conclude {}", id.short());
-                }
-            }
-
-            // `p` / `d`: `kj context promote|demote` on the selection
-            // (`commands::placement`). The verb owns the demote ladder, the
-            // active-ring cap, and the `--confirm` latch on the step that
-            // archives; the hints line says what happened, and a latched `d`
-            // waits for `d` again. `z` / `a`: toggle-pause / archive over
-            // RPC, fire-and-forget like `c` above, with a failure logged as
-            // a warning.
+            // `p` / `d` / `c` / `z` / `a`: `kj context
+            // promote|demote|conclude|pause|resume|archive` on the selection
+            // (`commands::placement`). The verbs own the demote ladder, the
+            // active-ring cap, authority, and the `--confirm` latch on each
+            // step that archives; the hints line says what happened, and a
+            // latched `d` or `a` waits for the same key again. Concluded work
+            // goes past the horizon on the next `DriftState` poll; it never
+            // competes for a ring seat (see `assign_placement`).
             //
-            // Each verb passes the `begin_placement` in-flight guard first: a
-            // second placement verb on the same context before the next poll
-            // refreshes is ignored, so a double-`d` can't walk the ladder two
-            // rungs sight-unseen. A step that moved nothing frees the guard
-            // when its result lands.
-            Action::Promote | Action::Demote => {
+            // `p`/`d`/`z`/`a` pass the `begin_placement` in-flight guard
+            // first: a second placement verb on the same context before the
+            // next poll refreshes is ignored, so a double-`d` can't walk the
+            // ladder two rungs sight-unseen, and a double-`z` can't send the
+            // same pause twice off a stale flag. A step that moved nothing
+            // frees the guard when its result lands. `c` is unguarded:
+            // concluding twice is a no-op.
+            //
+            // `z` reads the selection's current flag off the same poll
+            // `sync.rs` reads (`DriftState`'s ContextInfo): a paused context
+            // resumes, any other pauses.
+            Action::Promote | Action::Demote | Action::Conclude | Action::PauseToggle | Action::Archive => {
+                use crate::commands::placement::PlacementKey;
                 let Some(id) = state.selected else { continue };
-                let (verb, key) = match action {
-                    Action::Promote => ("promote", crate::commands::placement::PlacementKey::Promote),
-                    _ => ("demote", crate::commands::placement::PlacementKey::Demote),
+                let key = match action {
+                    Action::Promote => PlacementKey::Promote,
+                    Action::Demote => PlacementKey::Demote,
+                    Action::Conclude => PlacementKey::Conclude,
+                    Action::Archive => PlacementKey::Archive,
+                    _ if drift.contexts.iter().any(|c| c.id == id && c.paused_at.is_some()) => PlacementKey::Resume,
+                    _ => PlacementKey::Pause,
                 };
-                if !state.begin_placement(id) {
-                    info!("well: {verb} {} ignored — placement already in flight", id.short());
+                if key != PlacementKey::Conclude && !state.begin_placement(id) {
+                    info!("well: {} {} ignored — placement already in flight", key.verb(), id.short());
                     continue;
                 }
                 placements.write(crate::commands::placement::PlacementRequested { context_id: id, key });
-                info!("well: {verb} {}", id.short());
-            }
-
-            // `z` toggles `paused_at`: the RPC takes the new absolute value,
-            // so read the selection's current flag off the same poll
-            // `sync.rs` reads (`DriftState`'s ContextInfo) and send its
-            // negation. The in-flight guard matters here too — the flag read
-            // is stale until the poll lands, so an unguarded double-`z` would
-            // send the same value twice instead of toggling back.
-            Action::PauseToggle => {
-                if let Some(id) = state.selected
-                    && let Some(actor) = actor.as_ref()
-                {
-                    if !state.begin_placement(id) {
-                        info!(
-                            "well: pause-toggle {} ignored — placement already in flight",
-                            id.short()
-                        );
-                        continue;
-                    }
-                    let currently_paused = drift
-                        .contexts
-                        .iter()
-                        .any(|c| c.id == id && c.paused_at.is_some());
-                    let next_paused = !currently_paused;
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.set_context_paused(id, next_paused).await {
-                                log::warn!(
-                                    "well: pause {} -> {next_paused} failed: {e}",
-                                    id.short()
-                                );
-                            }
-                        })
-                        .detach();
-                    info!("well: pause {} -> {next_paused}", id.short());
-                }
-            }
-
-            Action::Archive => {
-                if let Some(id) = state.selected
-                    && let Some(actor) = actor.as_ref()
-                {
-                    if !state.begin_placement(id) {
-                        info!(
-                            "well: archive {} ignored — placement already in flight",
-                            id.short()
-                        );
-                        continue;
-                    }
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.archive_context(id).await {
-                                log::warn!("well: archive {} failed: {e}", id.short());
-                            }
-                        })
-                        .detach();
-                    info!("well: archive {}", id.short());
-                }
+                info!("well: {} {}", key.verb(), id.short());
             }
 
             // `h`: dive into the event horizon. The horizon is a count today
@@ -1253,7 +1185,7 @@ pub fn well_keyboard(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Helper: the card mesh's positions, before worrying about which face.
@@ -1585,7 +1517,7 @@ mod tests {
 
     /// A minimal `ContextInfo` sufficient to seat a join entry — the rest of
     /// the fields don't matter for these reset-semantics tests.
-    fn minimal_ctx(id: ContextId) -> kaijutsu_client::ContextInfo {
+    pub(crate) fn minimal_ctx(id: ContextId) -> kaijutsu_client::ContextInfo {
         kaijutsu_client::ContextInfo {
             id,
             label: "x".into(),

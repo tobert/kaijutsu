@@ -302,8 +302,10 @@ impl ConversationMailbox {
 
 /// Record a folded block. A draft folds as nothing, and submitting it
 /// promotes the same block id, so a draft stays unseen until it is sent.
+/// A held drift is the same: it folds as nothing until its release
+/// includes the same block id.
 fn mark_seen(seen: &mut HashSet<BlockId>, block: &BlockSnapshot) {
-    if block.status != kaijutsu_types::Status::Draft {
+    if block.status != kaijutsu_types::Status::Draft && !block.is_held_drift() {
         seen.insert(block.id);
     }
 }
@@ -430,6 +432,31 @@ mod tests {
             MessageContent::Text(text) => Some(text.as_str()),
             _ => None,
         }), Some("a note"));
+    }
+
+    /// A held drift folds as nothing and stays unseen, so its release, which
+    /// includes the same block id, reaches the next turn and a live one. A
+    /// dismissed drift stays out.
+    #[test]
+    fn a_held_drift_folds_once_released_and_never_once_dismissed() {
+        use kaijutsu_types::Status;
+        let go = user_text("go");
+        let drift = |status: Status, excluded: bool, id: BlockId| {
+            BlockSnapshotBuilder::new(id, BlockKind::Drift).role(BlockRole::System)
+                .content("from a seat").status(status).excluded(excluded).build()
+        };
+        let next_id = || BlockId::new(TEST_CTX.with(|v| *v), TEST_PRINCIPAL.with(|v| *v), next_seq());
+        let (released_id, dismissed_id) = (next_id(), next_id());
+        let mut mailbox = ConversationMailbox::new();
+        mailbox.catch_up(&[go.clone(), drift(Status::Pending, true, released_id), drift(Status::Pending, true, dismissed_id)]);
+        assert!(!mailbox.has_seen(&released_id) && !mailbox.has_seen(&dismissed_id), "a held drift is not part of the conversation yet");
+        let before = mailbox.snapshot().len();
+
+        let log = [go.clone(), drift(Status::Done, false, released_id), drift(Status::Done, true, dismissed_id)];
+        assert_eq!(mailbox.live_tail(&log, &go.id).unwrap().delivered, vec![released_id]);
+        mailbox.catch_up(&log);
+        assert!(mailbox.has_seen(&released_id) && mailbox.has_seen(&dismissed_id));
+        assert_eq!(mailbox.snapshot().len(), before + 1, "only the released drift joins the conversation");
     }
 
     // ── hydration_keep_set: the order-free `window` runs ──────────────────

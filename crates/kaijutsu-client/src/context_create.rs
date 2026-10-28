@@ -5,6 +5,10 @@
 //! so every context has a root above it (`docs/character.md`, "Bootstrap:
 //! the person creates themself"). The kernel never chooses that parent; a
 //! client that has no context yet chooses one with [`choose_parent`].
+//!
+//! A client that has decided to archive a context it created runs `kj
+//! context archive <id> --confirm` from that same parent
+//! ([`ActorHandle::archive_context_from_parent`]).
 
 use kaijutsu_types::ContextId;
 
@@ -90,6 +94,23 @@ pub fn context_create_argv(label: &str, context_type: &str, performer: &str, cwd
         argv.push(cwd.to_string());
     }
     argv
+}
+
+/// The `kj` argv that archives `context_id` for a caller that has already
+/// decided, so it confirms.
+pub fn context_archive_argv(context_id: ContextId) -> Vec<String> {
+    vec!["context".to_string(), "archive".to_string(), context_id.to_hex(), "--confirm".to_string()]
+}
+
+/// The context that runs the archive of `context_id`: its parent, the
+/// context it was created from, which holds the `operator` capability a
+/// seat such as a coder lacks. A context with no parent runs it itself.
+pub fn archive_runs_from(context_id: ContextId, contexts: &[ContextInfo]) -> Result<ContextId, String> {
+    let context = contexts
+        .iter()
+        .find(|context| context.id == context_id)
+        .ok_or_else(|| format!("no such context: {}", context_id.short()))?;
+    Ok(context.forked_from.unwrap_or(context_id))
 }
 
 /// The new context's id from a `kj kohai create` result. A nonzero exit
@@ -260,11 +281,40 @@ impl ActorHandle {
             .map(str::to_owned);
         Ok(CreatedContext { id, cwd_refused })
     }
+
+    /// Archive `context_id` with `kj context archive <id> --confirm`, run
+    /// from [`archive_runs_from`] and authoring no blocks there. Its archive
+    /// rc lifecycle runs. A refusal is an error carrying the kernel's
+    /// message.
+    pub async fn archive_context_from_parent(&self, context_id: ContextId) -> Result<(), String> {
+        let contexts = self.list_contexts().await.map_err(|e| format!("could not list contexts: {e}"))?;
+        let from = archive_runs_from(context_id, &contexts)?;
+        let result = self
+            .execute_kj_quiet(from, context_archive_argv(context_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        if result.exit_code != 0 {
+            let detail = if result.stderr.trim().is_empty() { &result.stdout } else { &result.stderr };
+            return Err(detail.trim().to_string());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_archive_runs_from_the_parent_and_confirms() {
+        let root = ctx("amy", "root", None);
+        let seat = ctx("seat", "coder", Some(root.id));
+        let contexts = vec![root.clone(), seat.clone()];
+        assert_eq!(archive_runs_from(seat.id, &contexts), Ok(root.id));
+        assert_eq!(archive_runs_from(root.id, &contexts), Ok(root.id), "a root runs its own archive");
+        assert!(archive_runs_from(ContextId::new(), &contexts).is_err());
+        assert_eq!(context_archive_argv(seat.id), vec!["context", "archive", &seat.id.to_hex(), "--confirm"]);
+    }
 
     fn ctx(label: &str, context_type: &str, parent: Option<ContextId>) -> ContextInfo {
         ContextInfo {

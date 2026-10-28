@@ -75,6 +75,9 @@ pub enum Origin {
     ShellGate,
     /// A privileged `kj` verb (e.g. `context archive`) gated itself.
     KjVerb,
+    /// A drift into the ROOT console waits for its human; approval releases
+    /// the held drift block and never executes source.
+    Drift,
 }
 
 impl Origin {
@@ -84,6 +87,7 @@ impl Origin {
             Self::HookResult => "hook_result",
             Self::ShellGate => "shell_gate",
             Self::KjVerb => "kj_verb",
+            Self::Drift => "drift",
         }
     }
 }
@@ -832,7 +836,7 @@ mod tests {
         for v in [PairOwner::Turn, PairOwner::Session] {
             assert_eq!(PairOwner::from_str(v.as_str()).unwrap(), v);
         }
-        for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb] {
+        for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb, Origin::Drift] {
             assert_eq!(Origin::from_str(v.as_str()).unwrap(), v);
         }
         for v in [

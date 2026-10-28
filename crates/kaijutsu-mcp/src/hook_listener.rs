@@ -47,7 +47,7 @@ const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Maximum size of a block's content created from hook events.
 const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
 
-/// Bound on the archive RPC [`HookListener::archive_if_session_ended`] issues
+/// Bound on the `kj context archive` [`HookListener::archive_if_session_ended`] runs
 /// at process shutdown. Not on the hook critical path — the hosting process
 /// is already exiting — but still bounded so a wedged kernel connection
 /// cannot hang that exit indefinitely. [`tiers::REQUEST`]: "a single call
@@ -1067,7 +1067,9 @@ impl HookListener {
 
     /// Archive this listener's joined context if a `session.end` was
     /// recorded ([`should_record_session_end`]) and no later hook event
-    /// cleared it (see the top of [`Self::process_event`]).
+    /// cleared it (see the top of [`Self::process_event`]). The archive is
+    /// `kj context archive <id> --confirm`, run from the context it was
+    /// created from, so its archive rc lifecycle runs.
     ///
     /// Call exactly once, from the stdio server's own shutdown path (the
     /// hosting process's stdin/stdout actually closing) — never from the
@@ -1081,8 +1083,7 @@ impl HookListener {
     ///
     /// Bounded by [`ARCHIVE_ON_SHUTDOWN_TIMEOUT`] so a wedged kernel
     /// connection cannot hang process exit; a failure or timeout is logged
-    /// loudly rather than swallowed, matching the old inline archive's
-    /// failure handling.
+    /// loudly rather than swallowed.
     pub async fn archive_if_session_ended(&self) {
         let recorded = std::mem::take(
             &mut *self
@@ -1097,7 +1098,7 @@ impl HookListener {
         let Some(ctx_id) = self.context_id() else { return };
         match tokio::time::timeout(
             ARCHIVE_ON_SHUTDOWN_TIMEOUT,
-            remote.actor.archive_context(ctx_id),
+            remote.actor.archive_context_from_parent(ctx_id),
         )
         .await
         {

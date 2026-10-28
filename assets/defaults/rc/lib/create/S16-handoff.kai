@@ -6,11 +6,10 @@
 # Without a performer, read the caller's own log. Requester and performer
 # can differ when a person creates a model context with `--as`.
 #
-# S15-recall injects what the fleet knows; this injects what the last
-# session left. Together they are the morning window: who I am, what I was
-# doing, what is waiting.
+# This injects what the last session left: what I was doing and what is
+# waiting.
 #
-# Constraints this script exists to satisfy, same family as S15-recall:
+# Constraints this script exists to satisfy:
 #
 #  - NEVER exit nonzero. A nonzero exit inserts a non-ephemeral
 #    BlockKind::Error the model sees on EVERY context create

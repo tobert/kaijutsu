@@ -215,6 +215,15 @@ impl KjDispatcher {
             0 => KjResult::Err(format!("kj stage: no block matching '{block_key}'")),
             1 => {
                 let block_id = matching[0].id;
+                if !excluded && matching[0].is_held_drift() {
+                    let ask = self.kernel_db().lock().approval_for_drift_block(&block_id).ok().flatten()
+                        .unwrap_or_else(|| "<id>".to_string());
+                    return KjResult::Err(format!(
+                        "kj stage include: block {} is a drift held for ROOT's human; release it with \
+                         `kj ledger allow {ask}`, or dismiss it with `kj ledger deny {ask}`",
+                        block_id.to_key()
+                    ));
+                }
                 if let Err(e) = self.block_store().set_excluded(context_id, &block_id, excluded) {
                     return KjResult::Err(format!("kj stage: {e}"));
                 }

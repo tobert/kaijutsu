@@ -469,6 +469,8 @@ enum AskOrigin {
   shellGate @2;
   # A privileged `kj` verb gated itself.
   kjVerb @3;
+  # A drift into the ROOT console waits for its human; never runs source.
+  drift @4;
 }
 
 # A principal and the name its character sheet gives it now.
@@ -1256,7 +1258,7 @@ struct ContextHandleInfo {
   trackId @16 :Text;              # Track this context is attached to (empty = unattached; TrackIds are never empty)
   promotedAt @17 :UInt64;         # 0 = not promoted, else Unix millis of the explicit ring-0 promote (append-ordered, never restamped)
   demotedAt @18 :UInt64;          # 0 = not demoted, else Unix millis of the explicit push to the demoted ring
-  pausedAt @19 :UInt64;           # 0 = not paused, else Unix millis of the explicit pause; gating deferred (see setContextPaused)
+  pausedAt @19 :UInt64;           # 0 = not paused, else Unix millis of the explicit pause; gating deferred (`kj context pause`)
 
   # Context-window usage — the bottom-dock gauge's wire spine. Resolved
   # kernel-side from the SAME KernelDb::get_context_usage + the binding
@@ -2170,15 +2172,9 @@ interface Kernel {
   # Set lifecycle state for a context (e.g., Staging → Live).
   setContextState @30 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
-  # Conclude a context: the explicit "this work is done" act (the kaijutsu
-  # equivalent of exit-ing a mux window). Sets contextState = "concluded" and
-  # stamps `concludedAt`. Distinct from a transient detach (contextLeave, which
-  # must NOT demote) and from archive (which hides the context). Reversible by
-  # forking/recovering from the concluded set — deliberately not first-class, so
-  # there is no dedicated un-conclude verb. Idempotent: re-concluding a concluded
-  # context succeeds without restamping. `success = false` with `error` set when
-  # the context can't be concluded (unknown / already archived).
-  conclude @31 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
+  # Concluding a context is `kj context conclude`, run through `executeKj`:
+  # the verb checks placement authority.
+  retired31 @31 ();
 
   # Drop this session's binding to a context. Used by the constellation
   # archive flow so the drift router can mark the context Archived
@@ -2223,27 +2219,14 @@ interface Kernel {
 
   # ── Time-well ring placement (docs/timewell.md) ──
 
-  # Promotion and demotion are `kj context promote|demote`, run through
-  # `executeKj`: the verb checks placement authority, latches the demote
-  # step that archives behind `--confirm`, and runs the archive rc
-  # lifecycle.
+  # Promotion, demotion, pause, resume, and archive are `kj context
+  # promote|demote|pause|resume|archive`, run through `executeKj`: the verbs
+  # check authority, latch each step that archives behind `--confirm`, and
+  # run the archive rc lifecycle.
   retired83 @83 ();
   retired84 @84 ();
-
-  # Set or clear a context's `pausedAt` — DESIGN-ONLY for now: persisted and
-  # exposed on the wire, but not yet wired to any behavioral gating (no
-  # scheduler/turn-start changes). A paused context will eventually receive
-  # no beat/OODA wakeups and reject turn-starts loudly; that gating is
-  # deferred.
-  setContextPaused @85 (contextId :Data, paused :Bool, trace :TraceContext) -> (success :Bool, error :Text);
-
-  # Archive a single context — the well's single-keystroke archive action.
-  # Unlike the `kj context archive` builtin (latched, recurses into
-  # structural children), this is a single context, not latched, no subtree
-  # recursion. Idempotent: archiving an already-archived context succeeds
-  # without restamping (the underlying `archived_at IS NULL` guard is
-  # already a no-op).
-  archiveContext @86 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
+  retired85 @85 ();
+  retired86 @86 ();
 
   # ── Per-client durable view state (docs/shared-state.md "Retiring KV") ──
   # The kernel-managed replacement for the app's one production KV use:

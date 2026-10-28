@@ -18,9 +18,88 @@ use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 enum DriftDeliveryOutcome {
-    Complete,
+    /// Delivered. `Some` names the ask that holds it for review.
+    Complete(Option<String>),
     LifecycleCancelled(String),
     LifecycleFault(String),
+}
+
+/// Act on an answered drift ask: an allow releases its held block, which
+/// becomes `Done` and included and is offered to a running turn, so it
+/// joins at the next tool round or rides the next submit. A denial or a
+/// cancellation dismisses it: `Done`, still excluded, kept in the log. Then
+/// the answer is spent. A block already settled (a retry after a crash
+/// between the two steps) is left as it is. The approval worker calls this
+/// once per answer (`runtime/approval_resume.rs`).
+pub(crate) fn settle_drift_answer(
+    kernel: &crate::Kernel,
+    request_id: &str,
+    allowed: bool,
+) -> Result<(), String> {
+    let block = kernel.kernel_db().lock().approval_drift_block(request_id)
+        .map_err(|e| format!("could not read the drift ask's block: {e}"))?
+        .ok_or_else(|| format!("drift ask {request_id} records no block"))?;
+    let context = block.context_id;
+    let blocks = kernel.blocks();
+    if !blocks.contains(context) {
+        blocks.load_one_from_db(context).map_err(|e| format!("could not load context {}: {e}", context.short()))?;
+    }
+    let held = blocks.get_block_snapshot(context, &block)
+        .map_err(|e| format!("could not read the drift block: {e}"))?
+        .is_some_and(|b| b.is_held_drift());
+    if held {
+        kernel.blocks().settle_held_drift(context, &block, allowed)
+            .map_err(|e| format!("could not settle the held drift: {e}"))?;
+        if allowed {
+            kernel.turns().offer_input(context, crate::runtime::turn_state::LiveInput {
+                block, wake: crate::runtime::turn_state::Wake::Drift,
+            });
+        }
+    }
+    kernel.kernel_db().lock().redeem_ask(request_id)
+        .map_err(|e| format!("could not spend the drift ask's answer: {e}"))?;
+    crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
+    Ok(())
+}
+
+/// At kernel start, dismiss every held drift in the ROOT console whose ask
+/// cannot settle it: none was recorded (the kernel stopped between the
+/// block's insert and its ask), or the ask closed without an answer the
+/// approval worker acts on. A held drift whose ask is open, or answered and
+/// not yet settled, is left for that answer. Returns how many it dismissed.
+pub fn reconcile_root_held_drifts(kernel: &crate::Kernel) -> Result<usize, String> {
+    let (console, live) = {
+        let db = kernel.kernel_db().lock();
+        let Some(console) = db.list_active_contexts().map_err(|e| format!("could not list contexts: {e}"))?
+            .into_iter().find(|row| row.is_root_console()) else { return Ok(0) };
+        let live = approval_ledger::ask::list_unsettled_drift_asks(db.conn_for_ledger(), console.context_id.as_bytes())
+            .map_err(|e| format!("could not read ROOT's drift asks: {e}"))?;
+        (console.context_id, live)
+    };
+    let blocks = kernel.blocks();
+    if !blocks.contains(console) {
+        blocks.load_one_from_db(console).map_err(|e| format!("could not load ROOT: {e}"))?;
+    }
+    let held: Vec<_> = blocks.block_snapshots(console).map_err(|e| format!("could not read ROOT: {e}"))?
+        .into_iter().filter(|b| b.is_held_drift()).map(|b| b.id).collect();
+    let mut dismissed = 0;
+    for block in held {
+        let ask = kernel.kernel_db().lock().approval_for_drift_block(&block)
+            .map_err(|e| format!("could not read the ask for drift {}: {e}", block.to_key()))?;
+        if ask.is_some_and(|ask| live.contains(&ask)) {
+            continue;
+        }
+        blocks.settle_held_drift(console, &block, false)
+            .map_err(|e| format!("could not dismiss drift {}: {e}", block.to_key()))?;
+        dismissed += 1;
+    }
+    Ok(dismissed)
+}
+
+/// What the caller reads about a drift held for ROOT's human: never its
+/// content.
+fn held_message(target: &str, ask: &str) -> String {
+    format!("drifted → {target}, held for its human to read first (ask {ask}); the model there reads it only after an allow")
 }
 
 #[derive(Parser, Debug)]
@@ -39,7 +118,9 @@ pub(crate) struct DriftArgs {
 enum DriftCommand {
     /// Send content to a target context now: it lands in the target's log,
     /// and a turn running there reads it after its next tool round. It
-    /// never starts or extends a turn. With
+    /// never starts or extends a turn. A drift into the ROOT console waits
+    /// for its human instead: it reaches ROOT's model only after
+    /// `kj ledger allow <id>`. With
     /// --summarize, distill the caller's whole context (on the instance's
     /// `distill` slot) instead of
     /// sending literal content. With --stage, queue it for a later
@@ -171,6 +252,12 @@ impl KjDispatcher {
     /// (`push`, `pull`, `merge`, `flush`) goes through here, so the turn
     /// wakes with the rc output already in the log.
     ///
+    /// A drift into the ROOT console, of any kind but `Notification`, is
+    /// held instead: the block lands `Pending` and excluded, nothing is
+    /// offered, and an ask with origin `Drift` waits for the console's
+    /// reviewer. The approval worker releases or dismisses the block once
+    /// it is answered ([`settle_drift_answer`]).
+    ///
     /// A failed admission or *insert* is returned to the caller so it can
     /// decide what to do with the content (immediate `push` stages it,
     /// `flush` requeues it). A failed edge write is logged; an rc fault or
@@ -189,6 +276,11 @@ impl KjDispatcher {
         caller: &KjCaller,
     ) -> Result<DriftDeliveryOutcome, String> {
         let admission = self.kernel().admit_context(target_ctx)?;
+        let held = drift_kind != DriftKind::Notification && self.kernel_db().lock().get_context(target_ctx)
+            .map_err(|e| format!("could not read the target context: {e}"))?
+            .is_some_and(|row| row.is_root_console());
+        // Resolved before anything is written, so a refusal leaves no trace.
+        let reviewer = if held { Some(self.drift_reviewer(target_ctx, author)?) } else { None };
         let after = self.block_store().last_block_id(target_ctx);
         // The drift block is the one block in the target that legitimately
         // belongs to an outsider, so it carries the SENDER: the caller's
@@ -197,8 +289,12 @@ impl KjDispatcher {
         // identities"). Everything the arrival then triggers (the target's
         // `drift` rc scripts) belongs to the context owner instead — see
         // `rc::run`.
-        let block = self.block_store()
-            .insert_drift_block_as(
+        let block = if held {
+            self.block_store().insert_held_drift_block_as(
+                target_ctx, after.as_ref(), content, source_ctx, source_model.clone(), drift_kind, author,
+            )
+        } else {
+            self.block_store().insert_drift_block_as(
                 target_ctx,
                 None,
                 after.as_ref(),
@@ -208,7 +304,24 @@ impl KjDispatcher {
                 drift_kind,
                 Some(author),
             )
-            .map_err(|e| format!("failed to insert drift block: {e}"))?;
+        }
+        .map_err(|e| format!("failed to insert drift block: {e}"))?;
+        let held_by = if let Some(reviewer) = reviewer {
+            match self.open_drift_ask(source_ctx, target_ctx, block, content, drift_kind, author, reviewer) {
+                Ok(ask) => Some(ask),
+                Err(e) => {
+                    // A held block with no ask would wait for an answer
+                    // nobody can give. Dismiss it, keep it in the log, and
+                    // refuse the delivery.
+                    if let Err(dismiss) = self.block_store().settle_held_drift(target_ctx, &block, false) {
+                        tracing::error!(block = %block.to_key(), "could not dismiss a held drift with no ask: {dismiss}");
+                    }
+                    return Err(format!("could not hold the drift for review: {e}"));
+                }
+            }
+        } else {
+            None
+        };
 
         {
             let db = self.kernel_db().lock();
@@ -243,7 +356,10 @@ impl KjDispatcher {
         )
             .await;
         // Offered after the drift rc output has landed, so it rides along.
-        self.offer_drift(target_ctx, block);
+        // A held drift is offered when its ask is allowed.
+        if held_by.is_none() {
+            self.offer_drift(target_ctx, block);
+        }
         if caller.cancel.is_cancelled() {
             return Ok(DriftDeliveryOutcome::LifecycleCancelled(
                 lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into()),
@@ -253,7 +369,89 @@ impl KjDispatcher {
             return Ok(DriftDeliveryOutcome::LifecycleFault(error));
         }
 
-        Ok(DriftDeliveryOutcome::Complete)
+        Ok(DriftDeliveryOutcome::Complete(held_by))
+    }
+
+    /// The human who answers a drift into the ROOT console: whoever reviews
+    /// the console's performer. Resolving for the sender instead would find
+    /// the console's model, which plays the console. Refuses when that is
+    /// not a live root character, since a model would then decide what
+    /// ROOT's model reads.
+    fn drift_reviewer(&self, target_ctx: ContextId, sender: PrincipalId) -> Result<PrincipalId, String> {
+        let db = self.kernel_db().lock();
+        let performer = db.context_character(target_ctx)
+            .map_err(|e| format!("could not read the console's character: {e}"))?
+            .map_or(sender, |row| row.principal_id);
+        let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(target_ctx, performer))
+            .map_err(|e| format!("could not resolve a reviewer for ROOT: {e}"))?
+            .reviewer();
+        let human = db.get_character(reviewer)
+            .map_err(|e| format!("could not read the reviewer's sheet: {e}"))?
+            .is_some_and(|sheet| sheet.root && sheet.retired_at.is_none());
+        if !human {
+            return Err(format!(
+                "ROOT's reviewer resolves to {}, which is not a live root character, and only a human \
+                 releases a drift into ROOT; set one with `kj senpai set ROOT <root context>`",
+                db.name_for(reviewer)
+            ));
+        }
+        Ok(reviewer)
+    }
+
+    /// Open the ask that holds a drift into the ROOT console: origin
+    /// `Drift`, raised by the sender in the console, and reviewed by
+    /// `reviewer` ([`Self::drift_reviewer`]). It carries no statement
+    /// and no source, so no rule decides it and an allow runs nothing. The
+    /// held block is recorded with the ask in the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn open_drift_ask(
+        &self,
+        source_ctx: ContextId,
+        target_ctx: ContextId,
+        block: kaijutsu_types::BlockId,
+        content: &str,
+        drift_kind: DriftKind,
+        sender: PrincipalId,
+        reviewer: PrincipalId,
+    ) -> Result<String, String> {
+        use approval_ledger::types::{NewAsk, NewOption, Origin};
+        let request_id = {
+            let db = self.kernel_db().lock();
+            let source = db.get_context(source_ctx).ok().flatten()
+                .and_then(|row| row.label)
+                .map_or_else(|| source_ctx.short(), |label| format!("{label} ({})", source_ctx.short()));
+            let ask = NewAsk {
+                context_id: target_ctx.as_bytes().to_vec(),
+                actor_id: sender.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(),
+                principal_id: sender.as_bytes().to_vec(),
+                origin: Origin::Drift,
+                instance: Some("builtin.kj".into()),
+                tool: Some("drift".into()),
+                hook_id: None,
+                description: format!("{drift_kind} drift from {source}:\n{content}"),
+                statements: vec![],
+                authorized_label: None,
+                rc_run_id: None,
+                expires_at: None,
+                options: vec![
+                    NewOption { option_id: "allow_once".into(), label: "Release to the model".into(), kind: "allow_once".into() },
+                    NewOption { option_id: "deny".into(), label: "Dismiss".into(), kind: "deny".into() },
+                ],
+                signals: vec![],
+                cwd: None,
+                exec_source: None,
+                exec_stdin: None,
+                continuation_epoch: None,
+                env: vec![],
+            };
+            db.create_approval_ask_recorded(&ask, false, |conn, request| {
+                crate::kernel_db::record_approval_drift_block(conn, request, &block)
+            })
+            .map_err(|e| format!("could not record the ask: {e}"))?
+        };
+        crate::kj::gate::announce_ledger_change(self.kernel_db(), self.kernel().ledger_flows());
+        Ok(request_id)
     }
 
     /// Offer a landed drift block to its context's running turn, which
@@ -419,7 +617,8 @@ impl KjDispatcher {
                 )
                 .await
             {
-                Ok(DriftDeliveryOutcome::Complete) => KjResult::ok(format!("drifted → {}", dst_query)),
+                Ok(DriftDeliveryOutcome::Complete(None)) => KjResult::ok(format!("drifted → {}", dst_query)),
+                Ok(DriftDeliveryOutcome::Complete(Some(ask))) => KjResult::ok(held_message(dst_query, &ask)),
                 Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => KjResult::Err(format!(
                     "kj drift push: delivered to {dst_query}, but its rc lifecycle was cancelled: {error}"
                 )),
@@ -512,7 +711,10 @@ impl KjDispatcher {
             .deliver_drift(source_id, context_id, &summary, source_model, DriftKind::Pull, "pull".into(), caller.actor_id, caller)
             .await
         {
-            Ok(DriftDeliveryOutcome::Complete) => {}
+            // A held pull lands in ROOT, whose model would read a preview
+            // here before its human does; it gets the ask instead.
+            Ok(DriftDeliveryOutcome::Complete(Some(ask))) => return KjResult::ok(held_message(src_query, &ask)),
+            Ok(DriftDeliveryOutcome::Complete(None)) => {}
             Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => {
                 return KjResult::Err(format!(
                     "kj drift pull: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
@@ -601,7 +803,11 @@ impl KjDispatcher {
             .deliver_drift(context_id, target_id, &summary, source_model, DriftKind::Merge, "merge".into(), caller.actor_id, caller)
             .await
         {
-            Ok(DriftDeliveryOutcome::Complete) => {}
+            Ok(DriftDeliveryOutcome::Complete(Some(ask))) => {
+                let target = target_arg.unwrap_or("the parent");
+                return KjResult::ok(held_message(target, &ask));
+            }
+            Ok(DriftDeliveryOutcome::Complete(None)) => {}
             Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => {
                 return KjResult::Err(format!(
                     "kj drift merge: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
@@ -737,7 +943,7 @@ impl KjDispatcher {
                     // instead of silently doing nothing.
                     self.drift_router().write().complete(drift.id);
                     match outcome {
-                        DriftDeliveryOutcome::Complete => {}
+                        DriftDeliveryOutcome::Complete(_) => {}
                         DriftDeliveryOutcome::LifecycleCancelled(_) => {
                             released.extend(staged);
                             lifecycle_cancelled = true;
@@ -1074,7 +1280,8 @@ impl Classify for EdgeCommand {
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_types::{DriftKind, PrincipalId};
+    use super::{reconcile_root_held_drifts, settle_drift_answer};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -1175,6 +1382,358 @@ mod tests {
         assert_eq!(pending, vec![crate::runtime::turn_state::LiveInput {
             block: drift.id, wake: crate::runtime::turn_state::Wake::Drift,
         }]);
+    }
+
+    /// The house a drift into ROOT meets: amy (a root) plays her human root
+    /// `amy`; the `ROOT` console under it is played by the model
+    /// `rootbot`; `lane`, a worker under amy, is played by `coder`.
+    struct RootHouse {
+        d: crate::kj::KjDispatcher,
+        amy: PrincipalId,
+        rootbot: PrincipalId,
+        coder: PrincipalId,
+        console: kaijutsu_types::ContextId,
+        lane: kaijutsu_types::ContextId,
+    }
+
+    async fn root_house() -> RootHouse {
+        let d = test_dispatcher().await;
+        let [amy, rootbot, coder] = std::array::from_fn(|_| PrincipalId::new());
+        let root = register_context(&d, Some("amy"), None, amy);
+        let console = register_context(&d, Some("ROOT"), Some(root), amy);
+        let lane = register_context(&d, Some("lane"), Some(root), amy);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name, root) in [(amy, "house-amy", true), (rootbot, "house-rootbot", false), (coder, "house-coder", false)] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
+                }).unwrap();
+            }
+            for model in [rootbot, coder] {
+                db.seed_test_cast_roles(model, &[("distill", "mock", "mock-model")]).unwrap();
+            }
+            for (context, performer, reviewer, context_type) in [
+                (root, amy, None, crate::kj::character::ROOT_CONTEXT_TYPE),
+                (console, rootbot, Some(amy), kaijutsu_types::CONSOLE_CONTEXT_TYPE),
+                (lane, coder, Some(amy), "coder"),
+            ] {
+                db.assign_test_review(context, Some(performer), reviewer).unwrap();
+                db.update_context_type(context, context_type).unwrap();
+            }
+        }
+        for context in [console, lane] {
+            d.block_store().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        }
+        RootHouse { d, amy, rootbot, coder, console, lane }
+    }
+
+    fn seat(context: kaijutsu_types::ContextId, actor: PrincipalId) -> crate::kj::KjCaller {
+        crate::kj::KjCaller { actor_id: actor, ..caller_with_context(context) }
+    }
+
+    fn drift_in(d: &crate::kj::KjDispatcher, context: kaijutsu_types::ContextId) -> kaijutsu_types::BlockSnapshot {
+        d.block_store().block_snapshots(context).unwrap().into_iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift).expect("drift block")
+    }
+
+    fn drift_ask(d: &crate::kj::KjDispatcher) -> approval_ledger::types::ApprovalRow {
+        let db = d.kernel_db().lock();
+        let mut asks = approval_ledger::ask::list_pending(db.conn_for_ledger()).unwrap();
+        assert_eq!(asks.len(), 1, "one ask holds the drift: {asks:?}");
+        asks.remove(0)
+    }
+
+    async fn settled(d: &crate::kj::KjDispatcher, context: kaijutsu_types::ContextId) -> kaijutsu_types::BlockSnapshot {
+        for _ in 0..300 {
+            let block = drift_in(d, context);
+            if !block.is_held_drift() { return block; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the approval worker never settled the held drift");
+    }
+
+    /// A push into the ROOT console lands held: pending, excluded, not
+    /// offered to the console's running turn, and an ask with origin
+    /// `Drift` waits for the console's reviewer, the human, not the model.
+    #[tokio::test]
+    async fn a_push_into_the_root_console_waits_for_its_human() {
+        let h = root_house().await;
+        let turns = h.d.kernel().turns();
+        let lease = turns.begin(h.console);
+        turns.open_ingress(h.console, lease.id(), lease.interrupt());
+
+        let result = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("please archive lane-b")], &seat(h.lane, h.coder)).await;
+        assert!(result.is_ok(), "push failed: {}", result.message());
+        assert!(result.message().contains("held"), "the sender learns it is held: {}", result.message());
+
+        let drift = drift_in(&h.d, h.console);
+        assert!(drift.is_held_drift() && drift.excluded, "{drift:?}");
+        assert!(turns.close_ingress(h.console, lease.id()).is_empty(), "a held drift is not offered");
+        let ask = drift_ask(&h.d);
+        assert_eq!(ask.origin, approval_ledger::types::Origin::Drift);
+        assert_eq!(ask.context_id, h.console.as_bytes().to_vec());
+        assert_eq!(ask.actor_id.as_deref(), Some(h.coder.as_bytes().as_slice()));
+        assert_eq!(ask.reviewer_id.as_deref(), Some(h.amy.as_bytes().as_slice()));
+        assert!(ask.description.contains("lane") && ask.description.contains("please archive lane-b"), "{}", ask.description);
+        assert_eq!(h.d.kernel_db().lock().approval_drift_block(&ask.request_id).unwrap(), Some(drift.id));
+    }
+
+    /// A notification into ROOT passes through as before, and a push into
+    /// any other context is not held.
+    #[tokio::test]
+    async fn only_a_non_notification_drift_into_the_root_console_holds() {
+        let h = root_house().await;
+        let outcome = h.d.deliver_drift(h.lane, h.console, "a resource changed", None, kaijutsu_types::DriftKind::Notification,
+            "notification".into(), h.coder, &seat(h.lane, h.coder)).await.unwrap();
+        assert!(matches!(outcome, super::DriftDeliveryOutcome::Complete(None)));
+        let drift = drift_in(&h.d, h.console);
+        assert!(!drift.is_held_drift() && !drift.excluded, "{drift:?}");
+
+        let result = h.d.dispatch(&[s("drift"), s("push"), s("lane"), s("for the lane")], &seat(h.console, h.rootbot)).await;
+        assert!(result.is_ok(), "push failed: {}", result.message());
+        let drift = drift_in(&h.d, h.lane);
+        assert!(!drift.is_held_drift() && !drift.excluded, "{drift:?}");
+        assert!(approval_ledger::ask::list_pending(h.d.kernel_db().lock().conn_for_ledger()).unwrap().is_empty());
+    }
+
+    /// The human's allow releases the drift: `Done`, included, and offered
+    /// to the console's running turn. A deny dismisses one: `Done`, still
+    /// excluded, not offered. Both answers are spent.
+    #[tokio::test]
+    async fn an_allow_releases_a_held_drift_and_a_deny_dismisses_it() {
+        for (verb, released) in [("allow", true), ("deny", false)] {
+            let h = root_house().await;
+            h.d.kernel().start_approval_delivery().unwrap();
+            let turns = h.d.kernel().turns();
+            let lease = turns.begin(h.console);
+            turns.open_ingress(h.console, lease.id(), lease.interrupt());
+            let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s(verb)], &seat(h.lane, h.coder)).await;
+            assert!(pushed.is_ok(), "{}", pushed.message());
+            let ask = drift_ask(&h.d);
+            let answered = h.d.dispatch(&[s("ledger"), s(verb), ask.request_id.clone()], &seat(h.console, h.amy)).await;
+            assert!(answered.is_ok(), "amy may {verb}: {}", answered.message());
+
+            let drift = settled(&h.d, h.console).await;
+            assert_eq!(drift.status, kaijutsu_types::Status::Done);
+            assert_eq!(drift.excluded, !released, "{verb}: {drift:?}");
+            let offered = turns.close_ingress(h.console, lease.id());
+            assert_eq!(offered.iter().any(|input| input.block == drift.id), released, "{verb}: {offered:?}");
+            assert!(approval_ledger::ask::redeemed_at(h.d.kernel_db().lock().conn_for_ledger(), &ask.request_id).unwrap().is_some(),
+                "{verb}: the answer is spent");
+        }
+    }
+
+    /// An answer given while no worker runs (a restart between the answer
+    /// and its settling) is settled when the worker starts: a held drift
+    /// has no caller to retry, so the backlog does not skip it.
+    #[tokio::test]
+    async fn an_answer_from_before_a_restart_still_releases_its_drift() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("early")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let ask = drift_ask(&h.d);
+        let answered = h.d.dispatch(&[s("ledger"), s("allow"), ask.request_id.clone()], &seat(h.console, h.amy)).await;
+        assert!(answered.is_ok(), "{}", answered.message());
+        assert!(drift_in(&h.d, h.console).is_held_drift(), "nothing settles it without the worker");
+        h.d.kernel().start_approval_delivery().unwrap();
+        let drift = settled(&h.d, h.console).await;
+        assert!(!drift.excluded, "{drift:?}");
+    }
+
+    /// Only the console's reviewer answers. ROOT's own model is refused, and
+    /// so is the sender; the drift stays held. A standing rule is refused
+    /// loudly, and the ask stays open.
+    #[tokio::test]
+    async fn only_the_human_answers_a_drift_and_never_with_a_rule() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("hello")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let ask = drift_ask(&h.d);
+        for (who, context) in [(h.rootbot, h.console), (h.coder, h.lane)] {
+            let refused = h.d.dispatch(&[s("ledger"), s("allow"), ask.request_id.clone()], &seat(context, who)).await;
+            assert!(!refused.is_ok(), "only the human answers: {}", refused.message());
+        }
+        let remembered = h.d.dispatch(&[s("ledger"), s("allow"), ask.request_id.clone(), s("--remember"), s("always")],
+            &seat(h.console, h.amy)).await;
+        assert!(!remembered.is_ok() && remembered.message().contains("--remember"), "{}", remembered.message());
+        assert_eq!(drift_ask(&h.d).request_id, ask.request_id, "the ask is still open");
+        assert!(drift_in(&h.d, h.console).is_held_drift());
+
+        let shown = h.d.dispatch(&[s("ledger"), s("show"), ask.request_id.clone()], &seat(h.console, h.amy)).await;
+        assert!(shown.is_ok() && shown.message().contains("drift:      held") && shown.message().contains("hello"),
+            "{}", shown.message());
+    }
+
+    /// A fresh kernel over the same database, as a cold start builds one:
+    /// nothing is resident in its block store.
+    async fn restarted(d: &crate::kj::KjDispatcher, dir: &std::path::Path) -> std::sync::Arc<crate::Kernel> {
+        let db = d.kernel_db().clone();
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+        std::sync::Arc::new(crate::Kernel::new("drift-restarted", dir, blocks, db).await)
+    }
+
+    async fn settled_in(kernel: &crate::Kernel, context: kaijutsu_types::ContextId, block: kaijutsu_types::BlockId) -> kaijutsu_types::BlockSnapshot {
+        for _ in 0..300 {
+            if kernel.blocks().contains(context)
+                && let Some(snapshot) = kernel.blocks().get_block_snapshot(context, &block).unwrap()
+                && !snapshot.is_held_drift()
+            {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the restarted kernel never settled the held drift");
+    }
+
+    /// A pending drift ask survives a cold start, which retires every other
+    /// unresolved ask. The restarted kernel has not loaded ROOT, and its
+    /// approval worker still releases the drift when the human allows it.
+    #[tokio::test]
+    async fn a_held_drift_survives_a_restart_and_its_allow_still_releases_it() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("across a restart")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let ask = drift_ask(&h.d);
+        let block = drift_in(&h.d, h.console).id;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = restarted(&h.d, dir.path()).await;
+        assert_eq!(kernel.kernel_db().lock().abandon_unresolved_asks_on_restart("restart").unwrap(), 0,
+            "a drift ask is not retired by a restart");
+        assert_eq!(reconcile_root_held_drifts(&kernel).unwrap(), 0, "its drift still has a live ask");
+        assert!(!kernel.blocks().contains(h.console) || kernel.blocks().get_block_snapshot(h.console, &block).unwrap().unwrap().is_held_drift());
+
+        crate::kj::ledger::decide_ask(&kernel, h.amy, Some(h.console), &ask.request_id, kaijutsu_types::AskVerdict::Allow, None)
+            .expect("amy releases it after the restart");
+        // Unload ROOT again: the worker must load it itself.
+        let fresh = restarted(&h.d, dir.path()).await;
+        fresh.start_approval_delivery().unwrap();
+        let drift = settled_in(&fresh, h.console, block).await;
+        assert!(!drift.excluded, "{drift:?}");
+    }
+
+    /// A held drift with no ask (the kernel stopped between the block's
+    /// insert and its ask), or whose ask closed unanswered, is dismissed at
+    /// start; one with an open ask is left held.
+    #[tokio::test]
+    async fn a_held_drift_with_no_live_ask_is_dismissed_at_start() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("kept")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let kept = drift_in(&h.d, h.console).id;
+        let orphan = h.d.block_store().insert_held_drift_block_as(h.console, None, "orphan", h.lane, None,
+            DriftKind::Push, h.coder).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = restarted(&h.d, dir.path()).await;
+        assert_eq!(reconcile_root_held_drifts(&kernel).unwrap(), 1);
+        let orphan = kernel.blocks().get_block_snapshot(h.console, &orphan).unwrap().unwrap();
+        assert!(!orphan.is_held_drift() && orphan.excluded, "dismissed and kept: {orphan:?}");
+        assert!(kernel.blocks().get_block_snapshot(h.console, &kept).unwrap().unwrap().is_held_drift());
+    }
+
+    /// ROOT is not archived while it holds a drift: the archived context
+    /// would answer nothing, and the drift would stay held with no ask to
+    /// release it. Once the drift is answered and settled, it archives.
+    #[tokio::test]
+    async fn root_is_not_archived_while_it_holds_a_drift() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("hold")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let ask = drift_ask(&h.d);
+        let refused = h.d.kernel_db().lock().archive_context(h.console).unwrap_err();
+        assert!(refused.to_string().contains("drift") && refused.to_string().contains("kj ledger"), "{refused}");
+        assert!(!h.d.kernel_db().lock().get_context(h.console).unwrap().unwrap().is_archived());
+
+        let denied = h.d.dispatch(&[s("ledger"), s("deny"), ask.request_id.clone()], &seat(h.console, h.amy)).await;
+        assert!(denied.is_ok(), "{}", denied.message());
+        assert!(h.d.kernel_db().lock().archive_context(h.console).is_err(), "an answer the worker has not settled still holds it");
+        settle_drift_answer(h.d.kernel(), &ask.request_id, false).unwrap();
+        assert!(h.d.kernel_db().lock().archive_context(h.console).unwrap());
+    }
+
+    /// Rotating, archiving, or demoting ROOT past the rim while it holds a
+    /// drift is refused before anything runs: no successor is made and no
+    /// archive lifecycle starts.
+    #[tokio::test]
+    async fn root_is_not_rotated_or_archived_by_kj_while_it_holds_a_drift() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("hold")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let before = h.d.kernel_db().lock().list_all_contexts().unwrap().len();
+        let mut amy = seat(h.console, h.amy);
+        amy.confirmed = true;
+        for argv in [vec![s("context"), s("rotate"), s("ROOT")], vec![s("context"), s("archive"), s("ROOT")]] {
+            let refused = h.d.dispatch(&argv, &amy).await;
+            assert!(!refused.is_ok(), "{argv:?} ran: {}", refused.message());
+            assert!(refused.message().contains("kj ledger"), "{argv:?}: {}", refused.message());
+        }
+        assert_eq!(h.d.kernel_db().lock().list_all_contexts().unwrap().len(), before, "a successor was made");
+        assert!(!h.d.kernel_db().lock().get_context(h.console).unwrap().unwrap().is_archived());
+    }
+
+    /// A pull and a merge into ROOT tell their caller the drift is held,
+    /// with no preview of its content: a pull runs in ROOT, so its model
+    /// would read the preview before its human does.
+    #[tokio::test]
+    async fn a_held_pull_or_merge_shows_no_preview() {
+        let h = root_house().await;
+        let child = register_context_with_model(&h.d, Some("child"), Some(h.console), h.coder, &["distill"]);
+        h.d.block_store().create_document(child, crate::DocumentKind::Conversation, None).unwrap();
+        for context in [h.lane, child, h.console] {
+            h.d.block_store().insert_block(context, None, None, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text,
+                "material", kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain).unwrap();
+        }
+        mock_distiller(&h.d, "SECRET-SUMMARY").await;
+        let pulled = h.d.dispatch(&[s("drift"), s("pull"), s("lane")], &seat(h.console, h.rootbot)).await;
+        let merged = h.d.dispatch(&[s("drift"), s("merge")], &seat(child, h.coder)).await;
+        for (verb, result) in [("pull", pulled), ("merge", merged)] {
+            assert!(result.is_ok(), "{verb}: {}", result.message());
+            assert!(result.message().contains("held") && !result.message().contains("SECRET-SUMMARY"),
+                "{verb}: {}", result.message());
+        }
+    }
+
+    /// `kj stage include` cannot release a held drift; the refusal names
+    /// the ask that can. The block store refuses it for every caller.
+    #[tokio::test]
+    async fn stage_include_refuses_a_held_drift() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("stay held")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let ask = drift_ask(&h.d);
+        let block = drift_in(&h.d, h.console).id;
+        let included = h.d.dispatch(&[s("stage"), s("include"), block.to_key()], &seat(h.console, h.amy)).await;
+        assert!(!included.is_ok() && included.message().contains(&format!("kj ledger allow {}", ask.request_id)),
+            "{}", included.message());
+        assert!(h.d.block_store().set_excluded(h.console, &block, false).is_err());
+        assert!(drift_in(&h.d, h.console).is_held_drift() && drift_in(&h.d, h.console).excluded);
+    }
+
+    /// A drift into ROOT is refused, before anything is written, when ROOT's
+    /// reviewer is not a human: a model would decide what ROOT's model reads.
+    #[tokio::test]
+    async fn a_drift_into_root_with_no_human_reviewer_is_refused() {
+        let h = root_house().await;
+        h.d.kernel_db().lock().assign_test_review(h.console, Some(h.rootbot), Some(h.coder)).unwrap();
+        let outcome = h.d.deliver_drift(h.lane, h.console, "for a model", None, DriftKind::Push,
+            "push".into(), h.coder, &seat(h.lane, h.coder)).await;
+        let Err(error) = outcome else { panic!("a drift reviewed by a model must be refused") };
+        assert!(error.contains("not a live root character"), "{error}");
+        assert!(h.d.block_store().block_snapshots(h.console).unwrap().iter().all(|b| b.kind != kaijutsu_types::BlockKind::Drift));
+        assert!(approval_ledger::ask::list_pending(h.d.kernel_db().lock().conn_for_ledger()).unwrap().is_empty());
+    }
+
+    /// Settling refuses a block that is not a held drift.
+    #[tokio::test]
+    async fn settling_refuses_a_block_that_is_not_held() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("lane"), s("plain")], &seat(h.console, h.rootbot)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let drift = drift_in(&h.d, h.lane);
+        let error = h.d.block_store().settle_held_drift(h.lane, &drift.id, true).unwrap_err();
+        assert!(error.to_string().contains("not a held drift"), "{error}");
     }
 
     /// The identity smear, drift half: the drift block is the ONE block in the

@@ -445,8 +445,8 @@ fn concluded_context_gets_fresh_suffixed_label_not_resurrected() {
         assert!(reg1.get("success").and_then(|v| v.as_bool()).unwrap_or(false));
         let original_context_id = reg1["context_id"].as_str().unwrap().to_string();
 
-        // Conclude it — the explicit "this work is done" act — via the
-        // actor directly (no MCP tool wraps `conclude` today).
+        // Conclude it — the explicit "this work is done" act — with `kj
+        // context conclude` run in the context itself.
         let Backend::Remote(remote1) = mcp1.backend() else {
             panic!("expected Remote backend");
         };
@@ -454,11 +454,12 @@ fn concluded_context_gets_fresh_suffixed_label_not_resurrected() {
             let guard = remote1.joined.read().await;
             guard.as_ref().expect("must be joined").context_id
         };
-        remote1
+        let concluded = remote1
             .actor
-            .conclude(ctx_id)
+            .execute_kj(ctx_id, vec!["context".into(), "conclude".into(), ctx_id.to_hex()])
             .await
-            .expect("conclude must succeed");
+            .expect("kj context conclude runs");
+        assert_eq!(concluded.exit_code, 0, "conclude must succeed: {}", concluded.stderr);
         drop(mcp1);
 
         // Reconnect with the SAME label.
@@ -531,9 +532,9 @@ fn a_bound_context_archived_out_from_under_the_session_gets_rebound() {
         assert!(reg1.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg1}");
         let original_context_id = reg1["context_id"].as_str().unwrap().to_string();
 
-        // Archive the bound context directly through the kernel — standing
-        // in for another player's `kj context archive`, or this process's
-        // own deferred session-end archive. `mcp`'s `remote.joined` still
+        // Archive the bound context from its parent — the path this
+        // process's own deferred session-end archive takes, standing in too
+        // for another player's `kj context archive`. `mcp`'s `remote.joined` still
         // names this context; nothing on the MCP side has heard about the
         // archive yet.
         let Backend::Remote(remote) = mcp.backend() else {
@@ -545,9 +546,9 @@ fn a_bound_context_archived_out_from_under_the_session_gets_rebound() {
         };
         remote
             .actor
-            .archive_context(ctx_id)
+            .archive_context_from_parent(ctx_id)
             .await
-            .expect("archive_context must succeed");
+            .expect("kj context archive must succeed");
 
         // Same MCP session, same label: the naive `already_registered` fast
         // path would answer with the now-archived `original_context_id`.

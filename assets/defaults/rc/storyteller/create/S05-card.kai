@@ -1,0 +1,26 @@
+# The performer's card: who this storyteller plays. A card is local prose at
+# /config/rc/storyteller/cards/<performer>.md, written by the person; no card
+# ships. It becomes cached instruction text after the type stance. A seat
+# without a performer or without a card plays the stance's narrator.
+#
+# Character names are not validated, so a name that could leave the cards
+# directory is refused before it reaches a path.
+set -e
+who="$(kj context info --json | jq -r '.played_by_name // empty')"
+case "$who" in
+  "")
+    echo "card: no performer"
+    exit 0
+    ;;
+  */*|.*)
+    echo "card: refusing performer name '$who' as a path"
+    exit 1
+    ;;
+esac
+card="$(dirname "$0")/../cards/$who.md"
+if test -f "$card"; then
+  kj block create --role system --kind text --content-type text/markdown < "$card"
+  echo "card: $card"
+else
+  echo "card: none at $card"
+fi

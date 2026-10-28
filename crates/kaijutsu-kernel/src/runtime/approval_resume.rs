@@ -844,9 +844,12 @@ pub(crate) fn start(kernel: &Arc<Kernel>) -> Result<(), String> {
     let sub = kernel.ledger_flows().subscribe("ledger.changed");
     // Answers already outstanding belong to callers from the previous lifetime.
     // Never wake that backlog because an unrelated new answer arrives.
+    // A drift answer has no caller to wake; its held block waits for it, so
+    // it is settled whenever it was given.
     let woken = kernel.kernel_db().lock().undelivered_answers()
         .map_err(|error| format!("could not read approval backlog: {error}"))?
-        .into_iter().map(|answer| answer.request_id).collect();
+        .into_iter().filter(|answer| answer.origin != approval_ledger::types::Origin::Drift)
+        .map(|answer| answer.request_id).collect();
     let owner = Arc::downgrade(kernel);
     kernel.spawn_runtime_task(move |stop| run_delivery(owner, sub, woken, stop))
 }
@@ -1002,6 +1005,19 @@ async fn run_delivery(
                     continue;
                 }
             };
+
+            // A drift ask holds a block, not a caller: release or dismiss
+            // it here, and wake nobody.
+            if row.origin == approval_ledger::types::Origin::Drift {
+                let allowed = answer.status == crate::ApprovalStatus::Allowed;
+                // A failed settle stays unwoken, so the next scan retries it.
+                match crate::kj::drift::settle_drift_answer(kernel, &answer.request_id, allowed) {
+                    Ok(()) => { woken.insert(answer.request_id.clone()); }
+                    Err(error) => tracing::error!(ask = %answer.request_id, %error, "gate-resume: could not settle a drift answer; retrying"),
+                }
+                delivered_this_scan += 1;
+                continue;
+            }
 
             match kernel.kernel_db().lock().approval_pair_ready(&answer.request_id) {
                 Ok(true) => {}

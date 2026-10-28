@@ -25,7 +25,7 @@ mod support;
 use std::time::Duration;
 
 use support::{
-    EphemeralServer, TuiSession, marked_rows, reader_rows, serial, write_ephemeral_key,
+    EphemeralServer, TuiSession, drift_into_a_root_console, marked_rows, reader_rows, serial, write_ephemeral_key,
 };
 
 /// How long to wait for the client to connect and render its first frame.
@@ -1346,6 +1346,86 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
         screen_contains_str(screen, "ACTIVE") && in_active(&rows, "seatme") == Some(started_active)
     });
     assert!(back, "the row did not cross back: {}", session.dump("after the second verb"));
+}
+
+/// `Ctrl+A q` demotes the context on screen with `kj context demote` and
+/// lands on the previous context, whose draft comes back with it
+/// (`docs/input.md`, "The prefix table").
+#[test]
+fn ctrl_a_q_demotes_the_context_and_goes_back() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send(":kj fork --name leaveme\r");
+    session.send("izzhomezz\x1b");
+    let typed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen.rows(0, screen.size().1).any(|l| l.contains('❯') && l.contains("zzhomezz"))
+    });
+    assert!(typed, "the draft never reached the compose row: {}", session.dump("typing"));
+
+    session.send(":kj context switch leaveme\r");
+    let away = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|i| !rows[i].contains("zzhomezz"))
+    });
+    assert!(away, "the switch to the fork never landed: {}", session.dump("switch"));
+
+    session.send("\x01q");
+    let back = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|i| rows[i].contains("zzhomezz"))
+            // A fork the switch promoted unpromotes; one that was not, demotes.
+            && rows.last().is_some_and(|l| l.contains("unpromoted") || l.contains("demoted"))
+    });
+    assert!(back, "Ctrl+A q did not demote and go back: {}", session.dump("after Ctrl+A q"));
+}
+
+/// A drift into the ROOT console waits for the human as an ask: with
+/// `ROOT` on screen the ask card comes up naming where the drift came
+/// from and what it says, typed text does not reach the draft while the
+/// card is up, and `a` releases it (`docs/tui.md`, "Asks").
+#[test]
+fn a_drift_into_root_comes_up_as_an_ask_card_and_a_releases_it() {
+    let _serial = serial();
+    let (server, _key_dir, session) = spawn_session(30, 120);
+    wait_for_attach(&session);
+
+    drift_into_a_root_console(&server, "zzdriftbody");
+    colon_line(&session, ":kj context switch ROOT");
+    let carded = session.wait_until(Duration::from_secs(20), |screen| {
+        screen_contains_str(screen, "zzdriftbody") && screen_contains_str(screen, "Esc aside")
+    });
+    assert!(carded, "the held drift never came up as an ask card: {}", session.dump("drift card"));
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "push drift from")),
+        "the card names where the drift came from: {}",
+        session.dump("drift card")
+    );
+    assert!(
+        !session.wait_until(Duration::from_secs(1), |screen| screen_contains_str(screen, "[A]llow always")),
+        "a drift ask offers no standing rule: {}",
+        session.dump("drift card")
+    );
+
+    session.send("iqq");
+    std::thread::sleep(Duration::from_millis(500));
+    let rows = session.screen_text();
+    assert!(
+        compose_row(&rows).is_some_and(|i| !rows[i].contains("qq")),
+        "typing reached the draft under the card: {}",
+        session.dump("held keys")
+    );
+
+    session.send("a");
+    let released = session.wait_until(Duration::from_secs(20), |screen| !screen_contains_str(screen, "Esc aside"));
+    assert!(released, "a did not answer the drift ask: {}", session.dump("after a"));
+    colon_line(&session, ":kj ledger list --history");
+    assert!(
+        session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "allowed")),
+        "the drift ask was not allowed: {}",
+        session.dump("history")
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

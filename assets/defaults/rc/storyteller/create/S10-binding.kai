@@ -1,0 +1,8 @@
+# The storyteller's model has no tools: the person's input facades and the
+# editor, as the council seat has. A small model tells a story better with
+# nothing else on the request.
+set -e
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"
+kj binding allow "editor"

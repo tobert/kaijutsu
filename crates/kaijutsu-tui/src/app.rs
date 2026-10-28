@@ -131,6 +131,9 @@ pub struct App {
     pub current: Option<ContextId>,
     /// Where `Ctrl+A Ctrl+A` goes.
     pub previous: Option<ContextId>,
+    /// The context whose `Ctrl+A q` came back latched, and when: the same
+    /// chord on it within `run::CLOSE_CONFIRM_WINDOW` confirms the step.
+    pub close_armed: Option<(ContextId, std::time::Instant)>,
     pub views: HashMap<ContextId, ContextView>,
     pub connection: Option<ConnectionStatus>,
     /// The compose surface — a modalkit `VimMachine` over the context's
@@ -263,6 +266,7 @@ impl App {
             seats: Vec::new(),
             current: None,
             previous: None,
+            close_armed: None,
             views: HashMap::new(),
             connection: None,
             compose: Compose::new(),

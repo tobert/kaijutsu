@@ -45,21 +45,50 @@ the test for it.
 
 ---
 
+## Storyteller: what the prototype leaves open (2026-10-28)
+
+The `storyteller` type (`assets/defaults/rc/storyteller/`) is a first
+entertainment seat, from a read of SillyTavern's prompt assembly. See
+`docs/prompts.md`, "Context types choose their instructions".
+
+- Cards live at `/config/rc/storyteller/cards/<performer>.md`, a stand-in for
+  character rc (`docs/character.md`, slice 5). When `rc_dir` lands, a card
+  moves into the character's directory and `S05-card.kai` goes.
+- The model has no tools, so it cannot write its own handoff note. The handoff
+  and predecessor notifications still name `kj` commands it cannot run.
+- Submit reminders accumulate, one per submit. A rotation for long stories
+  could filter reminders and other droppable blocks from the successor; that
+  filter has no design yet. `kj fork --compact` and handoffs are what carries a
+  story past its context limit today.
+- No greeting or example dialogue. SillyTavern's `first_mes` and `mes_example`
+  set a voice better than description does on small models; a card could
+  carry them as a model-role block at create.
+- No keyword lore (SillyTavern's World Info). A durable notification on match,
+  or a lore tool for larger models, are the two shapes that fit the log.
+- Interjecting while a model thinks: live input reaches a turn only after a
+  tool round or the final inference (`docs/conversation-session.md`, "Input
+  during a turn"). A mid-thinking path for council API clients is an idea,
+  not a design.
+- Untested paths: the type's default reminder (no card) and the refusal of a
+  performer name that could leave the cards directory.
+
+---
+
 ## Root console: model, approval, and the shell child (2026-10-25)
 
 The design is in `docs/character.md`, "The root console and its shell".
 Landed: the human root has no model and refuses `drive`; its model console is
 a `console` context under it, labeled `ROOT`, with the stance; Ctrl-Z toggles
-root, console, and shell; the start choice prefers `ROOT`. Still open:
+root, console, and shell; the start choice prefers `ROOT`; a drift into the
+console waits for the human as a ledger ask. Still open:
 
-- Incoming drifts into the console reach a model unreviewed. A drift starts
-  no turn (`Wake::Drift`, `runtime/turn_state.rs`), but it joins a running
-  turn at its next tool round (`offer_drift`, `kj/drift.rs`), and an idle
-  drift rides the next submit. The plan (Amy, 2026-10-27): when a drift
-  lands, the client pauses compose input, as it does for a ledger accept;
-  after reading, the human releases it with a key or excludes it
-  (`kj stage exclude`). A drift into a running console turn waits for that
-  release instead of joining at the tool round.
+- A drift ask takes no `--remember` (Amy, 2026-10-28). An idea for later:
+  "divert it to the judge model's context so it could pick up the ongoing
+  allow, but that's going to be tricky to tune so it can wait." Also open:
+  a held drift released while a turn runs joins that turn only when it
+  landed after the turn's write point; one that landed earlier rides the
+  next turn (`llm/mailbox.rs`, `live_tail`). The ask card shows the whole
+  drift text, so a long drift makes a tall card.
 - The console and council stances name Amy as fixed text, so another
   person's `bootstrap` tells their ROOT that Amy is accountable. A small fix:
   rc exposes the reviewer's name and the stance uses it.
@@ -106,12 +135,10 @@ and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
 and the `lineage_root` refusal wording. Still open:
 
 Behavior:
-- **4.2b** Three RPCs still skip their `kj` verb: `archiveContext` (the
-  app well's `a`, and kaijutsu-acp; no latch, no archive rc, no authority
-  check, documented as deliberately unlatched), `conclude` (the well's `c`;
-  skips the lineage authority check), and `setContextPaused` (the well's
-  `z`). `demoteContext` and `promoteContext` are gone (Amy: "drop that rpc
-  for demote"). The TUI's `Ctrl+A q` is still a "not built yet" notice.
+- **4.2b** A root character cast as a model performer
+  carries the human root's placement privilege into that model's `kj`
+  calls (`require_placement_authority`, `kj/context.rs`), because the
+  kernel has no marker for human input.
 - **2.3** `approval_resume` runs approved commands inline in its one task,
   so a long command stalls ask delivery for every context. M.
 - **2.6** The submit-rc race, `interrupt.hard()` on a persistence failure,
@@ -176,6 +203,15 @@ Clarity:
   (the `operator` capability gate refuses `kj context rotate`) and
   `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` (a vi
   document-cache miss).
+- Two more fail only inside the Claude Code sandbox, at `f29dd492` and
+  later alike: `ctrl_z_suspends_and_sigcont_resumes_a_responsive_client`
+  and `the_kitty_keyboard_is_taken_with_the_screen_and_given_back`. The
+  client process never stops there. Outside the sandbox is unchecked.
+- `kaijutsu-server` `gate_scenarios_wire`:
+  `an_approved_shell_write_runs_with_the_cwd_and_env_it_showed` failed once
+  in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for
+  `cd sub` (`shell_write: 1 statement(s) — cd sub`), and passed three times
+  alone. Load-dependent; cause not found.
 
 ## `SshServerConfig::unlisted` has no production entry point (2026-10-27)
 
@@ -2605,10 +2641,10 @@ classification needs its own fixtures.
 
 ## A delegated coder inherits the lead's morning window (2026-09-10)
 
-`coder/create/S15-recall.kai` and `S16-handoff.kai` inject the fleet memory
-index and the calling character's last twelve handoff notes into every
-coder. A coder driven on a two-file fixture read the lead's note "no ask
-expected" and reported the gate asks it met as a possible
+`S16-handoff.kai` injects the calling character's last twelve handoff notes
+into every coder. The fleet memory index was injected too, until
+`S15-recall.kai` was removed. A coder driven on a two-file fixture read the
+lead's note "no ask expected" and reported the gate asks it met as a possible
 regression — a concern the note caused, not the task. The broad loadout
 also lists 96 tools in `<situation>`, 45 of them `bevy_brp`. Both are
 per-turn cost on a delegated lane that needs neither; whether a delegated

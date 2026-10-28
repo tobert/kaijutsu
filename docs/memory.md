@@ -217,7 +217,9 @@ fix wants building; see `issues.md`.
 
 ### Slice 1 — the recall block. Zero Rust.
 
-**Shipped** as `assets/defaults/rc/coder/create/S15-recall.kai`.
+Shipped as `assets/defaults/rc/coder/create/S15-recall.kai`, then removed in
+`64d8b208`. No rc script injects memory today; memory is planned as tool
+calls and inference-side work instead.
 
 Both memory trees are **already reachable from inside the running kernel**
 through the existing catch-all `LocalBackend::read_only("/")` mount

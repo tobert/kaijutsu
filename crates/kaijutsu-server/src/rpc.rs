@@ -2039,6 +2039,13 @@ pub async fn create_shared_kernel_in(
     if abandoned > 0 {
         log::info!("retired {abandoned} unresolved approval ask(s) after restart; source will not be retried");
     }
+    // A drift into ROOT that lost its ask, or whose ask closed unanswered,
+    // would stay held forever; it is dismissed and kept in the log.
+    let dismissed = kaijutsu_kernel::kj::drift::reconcile_root_held_drifts(&kernel_arc)
+        .map_err(|error| capnp::Error::failed(format!("Cannot reconcile ROOT's held drifts: {error}")))?;
+    if dismissed > 0 {
+        log::info!("dismissed {dismissed} held drift(s) in ROOT with no ask that can release them");
+    }
     let swept_blocks = documents.abandon_running_blocks_on_restart(
         "the kernel restarted while this was still in progress; nothing is being retried",
     ).map_err(|error| capnp::Error::failed(format!("Cannot recover interrupted blocks: {error}")))?;
@@ -6096,80 +6103,6 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn conclude(
-        self: Rc<Self>,
-        params: kernel::ConcludeParams,
-        mut results: kernel::ConcludeResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "conclude").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        let drift_router = self.kernel.kernel.drift().clone();
-
-        // Inspect current state for idempotency + guards.
-        {
-            let drift = drift_router.read();
-            use kaijutsu_types::ContextState::*;
-            match drift.context_state(context_id) {
-                None => {
-                    results.get().set_success(false);
-                    results.get().set_error("context not found");
-                    return Promise::ok(());
-                }
-                // Idempotent: re-concluding a concluded context succeeds without
-                // restamping `concluded_at`.
-                Some(Concluded) => {
-                    results.get().set_success(true);
-                    return Promise::ok(());
-                }
-                Some(Archived) => {
-                    results.get().set_success(false);
-                    results
-                        .get()
-                        .set_error("cannot conclude an archived context");
-                    return Promise::ok(());
-                }
-                Some(Live) | Some(Staging) => {}
-            }
-        }
-
-        // Persist first — KernelDb holds the authoritative `concluded_at` stamp.
-        {
-            let db = self.kernel.kernel_db.lock();
-            match db.conclude_context(context_id) {
-                Ok(true) => {}
-                Ok(false) => {
-                    results.get().set_success(false);
-                    results.get().set_error(
-                        "context could not be concluded (already concluded, archived, or unknown)",
-                    );
-                    return Promise::ok(());
-                }
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(e.to_string());
-                    return Promise::ok(());
-                }
-            }
-        }
-
-        // Reflect in the DriftRouter so `listContexts` shows the new state
-        // immediately. A router guard is held only briefly, so waiting for one
-        // keeps the router in step with the DB.
-        if let Err(e) = drift_router.write().set_state(context_id, kaijutsu_types::ContextState::Concluded) {
-            log::error!("conclude: drift set_state failed: {e}");
-        }
-
-        log::info!("conclude: context={}", context_id.short());
-        results.get().set_success(true);
-        Promise::ok(())
-    }
-
     fn rename_context(
         self: Rc<Self>,
         params: kernel::RenameContextParams,
@@ -6199,38 +6132,6 @@ impl kernel::Server for KernelImpl {
         }
 
         log::info!("rename_context: context={} label={label}", context_id.short());
-        Promise::ok(())
-    }
-
-    fn set_context_paused(
-        self: Rc<Self>,
-        params: kernel::SetContextPausedParams,
-        mut results: kernel::SetContextPausedResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "set_context_paused").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-        let paused = p.get_paused();
-
-        let db = self.kernel.kernel_db.lock();
-        match db.set_context_paused(context_id, paused) {
-            Ok(()) => {
-                log::info!(
-                    "set_context_paused: context={} paused={}",
-                    context_id.short(),
-                    paused
-                );
-                results.get().set_success(true);
-            }
-            Err(e) => {
-                results.get().set_success(false);
-                results.get().set_error(e.to_string());
-            }
-        }
         Promise::ok(())
     }
 
@@ -6466,64 +6367,6 @@ impl kernel::Server for KernelImpl {
                 results.get().set_error(e.to_string());
             }
         }
-        Promise::ok(())
-    }
-
-    /// Archive a single context — the well's single-keystroke archive
-    /// action. Same one-row semantics as the `kj context archive` builtin,
-    /// minus the latch. Idempotent: archiving an already-archived context
-    /// succeeds (the DB write's `archived_at IS NULL` guard is already a
-    /// no-op).
-    fn archive_context(
-        self: Rc<Self>,
-        params: kernel::ArchiveContextParams,
-        mut results: kernel::ArchiveContextResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "archive_context").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        // No drift-router existence pre-check (same stance as
-        // promote_context): the DB is authoritative. Its WHERE guard makes
-        // re-archiving a no-op `Ok(false)` — distinguish that idempotent
-        // success from an unknown id, which must still fail loud.
-        {
-            let db = self.kernel.kernel_db.lock();
-            match db.archive_context(context_id) {
-                Ok(true) => {}
-                Ok(false) => match db.get_context(context_id) {
-                    Ok(Some(_)) => {} // already archived — idempotent success
-                    Ok(None) => {
-                        results.get().set_success(false);
-                        results.get().set_error("context not found");
-                        return Promise::ok(());
-                    }
-                    Err(e) => {
-                        results.get().set_success(false);
-                        results.get().set_error(e.to_string());
-                        return Promise::ok(());
-                    }
-                },
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(e.to_string());
-                    return Promise::ok(());
-                }
-            }
-        }
-
-        // Sync the in-memory drift router (M2-B3 pattern): without this an
-        // active session could still resurrect the context with the next op.
-        if let Err(e) = self.kernel.kernel.drift().write().set_state(context_id, kaijutsu_types::ContextState::Archived) {
-            log::error!("archive_context: drift set_state failed: {e}");
-        }
-
-        log::info!("archive_context: context={}", context_id.short());
-        results.get().set_success(true);
         Promise::ok(())
     }
 
