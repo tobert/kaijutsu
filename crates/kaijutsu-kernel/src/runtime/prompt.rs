@@ -11,9 +11,48 @@ pub enum PromptSource {
     Draft { edge: Option<InputEdge> },
 }
 
+/// Why a submit did not commit. Either way nothing landed and a draft stays
+/// as typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The context's performer and reviewer assignment allows no model
+    /// turn here. A verdict about the caller's standing, carried as a
+    /// result (`docs/error-chain.md`).
+    Refused(kaijutsu_types::Refusal),
+    /// Anything else: no runtime slot, an archived context, an empty
+    /// draft, a storage error.
+    Failed(String),
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Refused(refusal) => write!(f, "{refusal}"),
+            SubmitError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for SubmitError {
+    fn from(message: String) -> Self { SubmitError::Failed(message) }
+}
+
+impl From<super::turn_identity::IdentityError> for SubmitError {
+    fn from(error: super::turn_identity::IdentityError) -> Self {
+        match error {
+            super::turn_identity::IdentityError::Refused(reason) => SubmitError::Refused(kaijutsu_types::Refusal {
+                kind: kaijutsu_types::RefusalKind::Denied, reason,
+                subject: String::new(), ask: None, remedy: None,
+            }),
+            super::turn_identity::IdentityError::Failed(message) => SubmitError::Failed(message),
+        }
+    }
+}
+
 /// Persist input before preparation. Accepted work owns its turn before the
 /// first await and survives caller disconnect. An error means the input did
-/// not commit: a context with no performer or reviewer is refused first.
+/// not commit: a context whose assignment allows no model turn is refused
+/// first, with [`SubmitError::Refused`].
 /// Once the input commits the reply is its block, sent without waiting for
 /// turn startup or the submit lifecycle; a turn that then fails to start is
 /// reported in the transcript and on `TurnFlow::Failed`.
@@ -25,7 +64,7 @@ pub enum PromptSource {
 pub async fn submit(
     kernel: &Arc<Kernel>, context: ContextId, principal: PrincipalId,
     session: SessionId, source: PromptSource,
-) -> Result<BlockId, String> {
+) -> Result<BlockId, SubmitError> {
     let slot = kernel.reserve_runtime_slot()?;
     let (admission, lease, turn_live) = {
         let db = kernel.kernel_db().lock();
@@ -44,7 +83,7 @@ pub async fn submit(
                 None => ExecContext::new_without_cwd(principal, context, session, kernel.id()),
             };
             if documents.get(context).is_none() {
-                return Err(format!("context {context} not found — call join_context first"));
+                return Err(format!("context {context} not found — call join_context first").into());
             }
             let block = documents.insert_block_as(context, None, documents.last_block_id(context).as_ref(),
                 Role::User, BlockKind::Text, &content, Status::Done, ContentType::Plain, Some(principal))

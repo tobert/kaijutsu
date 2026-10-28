@@ -11,6 +11,11 @@ pub(crate) struct TurnIdentity {
     pub reviewer: PrincipalId,
 }
 
+/// The human root (`docs/character.md`, "The root console and its shell")
+/// has no model, so it is refused before its performer, who is its own
+/// reviewer, meets the self-review refusal.
+pub(crate) const HUMAN_ROOT_REFUSAL: &str = "The human root runs no model turns. Talk to a model in the ROOT console, or press Ctrl+Z for this root's shell.";
+
 /// The performer is checked before the reviewer resolves: the reviewer walk
 /// starts above the performer, so with none set it fails with a message
 /// about the reviewer, which is not the repair the caller needs.
@@ -94,6 +99,25 @@ mod tests {
     }
 }
 
+/// Why a model turn has no identity to run under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityError {
+    /// The context's assignment does not allow a model turn: the human
+    /// root, no performer, a self-reviewing, retired, or unknown performer.
+    /// Changing the assignment, or the context, is the remedy.
+    Refused(String),
+    /// The assignment could not be read or the reviewer walk failed.
+    Failed(String),
+}
+
+impl From<IdentityError> for String {
+    fn from(error: IdentityError) -> String {
+        match error {
+            IdentityError::Refused(message) | IdentityError::Failed(message) => message,
+        }
+    }
+}
+
 /// Resolve the identity a model turn in `context_id` needs: its performer
 /// and the reviewer chained above it. `prompt::submit` runs this before the
 /// input commits and turn startup runs it again, so a refusal can come
@@ -101,13 +125,18 @@ mod tests {
 pub(crate) async fn resolve_for_context(
     kernel: &Kernel,
     context_id: ContextId,
-) -> Result<(TurnIdentity, ResolvedContextReview), String> {
-    let actor = kernel.kernel_db().lock().get_context(context_id)
-        .map_err(|e| format!("Could not read performer assignment: {e}"))?
-        .ok_or_else(|| format!("No such context: {context_id}"))?
-        .played_by;
-    require_performer(actor)?;
-    let review = kernel.resolve_context_review(context_id).await?;
+) -> Result<(TurnIdentity, ResolvedContextReview), IdentityError> {
+    let row = kernel.kernel_db().lock().get_context(context_id)
+        .map_err(|e| IdentityError::Failed(format!("Could not read performer assignment: {e}")))?
+        .ok_or_else(|| IdentityError::Failed(format!("No such context: {context_id}")))?;
+    if row.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE {
+        return Err(IdentityError::Refused(HUMAN_ROOT_REFUSAL.to_string()));
+    }
+    let actor = row.played_by;
+    require_performer(actor).map_err(IdentityError::Refused)?;
+    let review = kernel.resolve_context_review(context_id).await.map_err(IdentityError::Failed)?;
     let db = kernel.kernel_db().lock();
-    resolve(&db, actor, review.reviewer.principal_id).map(|identity| (identity, review))
+    resolve(&db, actor, review.reviewer.principal_id)
+        .map(|identity| (identity, review))
+        .map_err(IdentityError::Refused)
 }

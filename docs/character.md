@@ -155,7 +155,9 @@ Two things follow, and they are the ones to check a change against:
   holds the operator's authority set, minus `drive`. A root character may play
   the top of its own lineage: nobody sits above it to ask, so its own
   confirmation is the human's act (`kj/context.rs`, `plays_own_root`). A turn
-  still refuses a performer that is its own reviewer.
+  still refuses a performer that is its own reviewer. A chat submit in the
+  human root is refused before the self-review check, with a reason that
+  points to `ROOT` and `Ctrl+Z` (`runtime/turn_identity.rs`).
   The model console is a `console` context under the human root, labeled
   `ROOT`. Its performer is a model character (`root`, cast with a fast model;
   Haiku on this machine, for now). Its stance (`console/create/S00-stance`)

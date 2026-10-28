@@ -462,7 +462,10 @@ input. `submitInput` does not wait for it.
 
 A submit either commits or is refused with nothing changed
 (`prompt::submit`). A context with no performer or no reviewer is refused
-before the draft commits, so the draft stays as typed. Once the input
+before the draft commits, so the draft stays as typed. The human root runs
+no model turns, so a chat submit there is refused with a reason that points
+to the `ROOT` console and `Ctrl+Z`. Turn identity refusals reach the client
+as `submitInput`'s refused outcome, not as an RPC failure. Once the input
 commits, `submitInput` returns its block at once, and the `submit` scripts
 and turn startup run after the reply. A turn that then fails to start is
 recorded once in the transcript and published as a turn failure, not

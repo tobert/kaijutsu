@@ -33,6 +33,15 @@ pub struct DraftEdit {
     pub delete: u64,
 }
 
+/// The text a failed submit shows. A refusal is the kernel's whole answer,
+/// so it is shown as is; a fault names the call it broke.
+fn submit_failure(error: crate::actor::CallError) -> String {
+    match error {
+        crate::actor::CallError::Refused(refusal) => refusal.to_string(),
+        error => format!("submit input: {error}"),
+    }
+}
+
 /// Where the writer sends calls: the kernel, or a test's stand-in. Each
 /// failure is the text the caller shows.
 pub trait DraftSink: 'static {
@@ -66,7 +75,7 @@ impl DraftSink for ActorHandle {
                 .submit_input_with_edge(context_id, false, edge)
                 .await
                 .map(|result| result.block_id)
-                .map_err(|e| format!("submit input: {e}"))
+                .map_err(submit_failure)
         }
     }
 
@@ -241,6 +250,20 @@ impl DraftOutbox {
 
 #[cfg(test)]
 mod tests {
+    /// A refused submit shows the kernel's reason alone; a fault keeps the
+    /// name of the call.
+    #[test]
+    fn a_refused_submit_shows_only_the_kernels_reason() {
+        let refusal = kaijutsu_types::Refusal {
+            kind: kaijutsu_types::RefusalKind::Denied,
+            reason: "The human root runs no model turns.".into(),
+            subject: String::new(), ask: None, remedy: None,
+        };
+        assert_eq!(super::submit_failure(crate::actor::CallError::Refused(refusal)),
+            "The human root runs no model turns.");
+        assert_eq!(super::submit_failure(crate::actor::CallError::Shutdown), "submit input: actor shut down");
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;

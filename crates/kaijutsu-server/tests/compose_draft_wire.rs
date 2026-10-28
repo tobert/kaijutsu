@@ -792,6 +792,60 @@ fn refused_shell_submit_keeps_its_draft() {
     });
 }
 
+/// Typing in the human root is refused as a refusal, not a fault: the human
+/// root runs no model turns, and the reason points to `ROOT` and `Ctrl+Z`
+/// instead of asking for a reviewer. The draft stays as typed.
+#[test]
+fn a_chat_submit_in_the_human_root_says_it_runs_no_model_turns() {
+    run_local(async {
+        let (addr, _live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let root = kernel.list_contexts().await.unwrap().into_iter()
+            .find(|c| c.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE)
+            .expect("the kernel has a human root")
+            .id;
+        kernel.join_context(root, "draft-test").await.unwrap();
+        kernel.edit_input(root, 0, "hello root", 0).await.unwrap();
+        let before = draft(&kernel, root).await.unwrap();
+
+        let error = kernel.submit_input(root, false).await.unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else {
+            panic!("expected a refusal, not a fault: {error:?}");
+        };
+        assert!(refusal.reason.contains("human root runs no model turns"), "{refusal:?}");
+        assert!(refusal.reason.contains("ROOT") && refusal.reason.contains("Ctrl+Z"), "{refusal:?}");
+        assert!(!refusal.reason.contains("review"), "{refusal:?}");
+        let after = draft(&kernel, root).await.expect("refusal preserves the draft");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.content, "hello root");
+    });
+}
+
+/// Outside the human root, a performer assigned as its own reviewer is
+/// still refused with the self-review reason, as a refusal.
+#[test]
+fn a_chat_submit_that_would_review_itself_is_refused() {
+    run_local(async {
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-self-review").await;
+        let performer = seed_turn_identity(&live_kernel, context_id);
+        live_kernel.kernel_db.lock()
+            .update_context_review(context_id, Some(performer), Some(performer))
+            .unwrap();
+        kernel.edit_input(context_id, 0, "review yourself", 0).await.unwrap();
+
+        let error = kernel.submit_input(context_id, false).await.unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else {
+            panic!("expected a refusal, not a fault: {error:?}");
+        };
+        assert!(refusal.reason.contains("cannot review its own work"), "{refusal:?}");
+        assert!(draft(&kernel, context_id).await.is_some(), "refusal preserves the draft");
+    });
+}
+
 /// `clearInput` discards the caller's draft.
 #[test]
 fn clearing_removes_the_draft_block() {

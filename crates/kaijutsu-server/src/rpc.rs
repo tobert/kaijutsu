@@ -3527,7 +3527,7 @@ impl kernel::Server for KernelImpl {
                 kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel, context_id,
                     user_principal_id, session_id,
                     kaijutsu_kernel::runtime::prompt::PromptSource::Text { content, model })
-                    .await.map_err(capnp::Error::failed)?;
+                    .await.map_err(|error| capnp::Error::failed(error.to_string()))?;
                 results.get().set_prompt_id(&uuid::Uuid::new_v4().to_string());
                 Ok(())
             }
@@ -5815,13 +5815,22 @@ impl kernel::Server for KernelImpl {
                     }
                 } else {
                     let session_id = connection.borrow().session_id;
-                    let user_block_id = kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel,
+                    use kaijutsu_kernel::runtime::prompt::SubmitError;
+                    match kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel,
                         context_id, user_principal_id, session_id,
-                        kaijutsu_kernel::runtime::prompt::PromptSource::Draft { edge })
-                        .await.map_err(capnp::Error::failed)?;
-
-                    let mut b = results.get().init_outcome().init_ok();
-                    set_block_id_builder(&mut b, &user_block_id);
+                        kaijutsu_kernel::runtime::prompt::PromptSource::Draft { edge }).await
+                    {
+                        Ok(user_block_id) => {
+                            let mut b = results.get().init_outcome().init_ok();
+                            set_block_id_builder(&mut b, &user_block_id);
+                        }
+                        // A refused draft stays as typed.
+                        Err(SubmitError::Refused(refusal)) => {
+                            let mut b = results.get().init_outcome().init_refused();
+                            set_refusal(&mut b, &refusal);
+                        }
+                        Err(SubmitError::Failed(message)) => return Err(capnp::Error::failed(message)),
+                    }
                 }
 
                 Ok(())

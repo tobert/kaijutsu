@@ -8272,14 +8272,14 @@ mod lifetime_tests {
         let landed = kernel.blocks().non_draft_snapshots(context).unwrap().len();
 
         let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Draft { edge: None }).await.unwrap_err();
+            crate::runtime::prompt::PromptSource::Draft { edge: None }).await.unwrap_err().to_string();
         assert!(error.contains("No performer assigned"), "{error}");
         let draft = kernel.blocks().draft_block(context, player).unwrap().expect("the draft survives");
         assert_eq!(draft.content, "keep me");
         assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
 
         let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Text { content: "typed".into(), model: None }).await.unwrap_err();
+            crate::runtime::prompt::PromptSource::Text { content: "typed".into(), model: None }).await.unwrap_err().to_string();
         assert!(error.contains("No performer assigned"), "{error}");
         assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
         assert!(!kernel.turn_in_flight(context));
