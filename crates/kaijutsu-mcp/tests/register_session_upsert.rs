@@ -234,6 +234,82 @@ fn a_manual_register_racing_startup_registration_joins_once() {
     });
 }
 
+/// A model's session created in Amy's root context waits for her approval.
+/// The reply says the session is not joined and how to join, and once Amy
+/// allows the create, registering again with the same label joins the
+/// context the approved create made.
+#[test]
+fn a_held_create_says_how_to_join_and_joins_after_approval() {
+    run_local(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
+        let gate = config.config_mounts.host_dir(kaijutsu_types::paths::CONFIG_ROOT).join("gate.toml");
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/defaults/gate.toml"), &gate).unwrap();
+        let amy_key = KeySource::InMemory(config.root_key());
+        let claude_key = KeySource::ephemeral();
+        let KeySource::InMemory(claude_private) = &claude_key else { unreachable!("an ephemeral key is in memory") };
+        let claude = kaijutsu_types::PrincipalId::new();
+        kaijutsu_server::AuthDb::open(config.auth_db_path.as_ref().unwrap())
+            .unwrap()
+            .add_key(claude, claude_private.public_key(), Some("claude"))
+            .unwrap();
+        let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_local(async move {
+            SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
+        });
+        let kernel = kernel_rx.await.unwrap();
+        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            principal_id: claude, name: "claude".into(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let connect = |name: &str, key_source: KeySource| {
+            KaijutsuMcp::connect_with_config(
+                SshConfig { host: addr.ip().to_string(), port: addr.port(), username: name.into(), key_source, insecure: true },
+                "e2e-test",
+                Some("e2e-session"),
+            )
+        };
+
+        let mcp = connect("claude", claude_key.clone());
+        wait_connected(&mcp).await;
+        let held = mcp
+            .register_session(Parameters(RegisterSessionRequest { label: Some("held-seat".into()), context_type: None }))
+            .await;
+        let ask = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().expect("the create waits for Amy");
+        assert!(held.contains(&ask.request_id), "the reply names the ask: {held}");
+        assert!(held.contains("not joined") && held.contains("register_session again"), "the reply says how to join: {held}");
+
+        let amy = connect("amy", amy_key);
+        wait_connected(&amy).await;
+        let Backend::Remote(amy_remote) = amy.backend() else { unreachable!("connect is remote") };
+        let root = kaijutsu_client::choose_parent(None, &amy_remote.actor.list_contexts().await.unwrap()).unwrap();
+        let allowed = amy_remote
+            .actor
+            .execute_kj(root.context_id, vec!["ledger".into(), "allow".into(), ask.request_id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(allowed.exit_code, 0, "kj ledger allow: {} {}", allowed.stdout, allowed.stderr);
+
+        let Backend::Remote(remote) = mcp.backend() else { unreachable!("connect is remote") };
+        let created = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if let Some(context) = remote.actor.resolve_context_label("held-seat").await.unwrap() {
+                    break context;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the approved create lands");
+        let joined = register_with_retry(&mcp, "held-seat").await;
+        assert_eq!(joined["success"].as_bool(), Some(true), "{joined}");
+        assert_eq!(joined["resumed"].as_bool(), Some(true), "{joined}");
+        assert_eq!(joined["context_id"].as_str(), Some(created.id.to_hex().as_str()), "{joined}");
+    });
+}
+
 /// The core regression guard: a second MCP session (a fresh actor — the
 /// reconnect-after-a-dropped-session shape) registering with the SAME label
 /// as a still-live context must attach to it, not hard-fail on the

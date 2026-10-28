@@ -123,6 +123,11 @@ enum ContextCommand {
         /// delegated
         #[arg(long = "as", value_name = "CHARACTER")]
         character: Option<String>,
+        /// With --cwd: if the kernel cannot use that directory when the
+        /// create runs, create as if --cwd were not given and say why. A
+        /// create held for approval checks when it runs
+        #[arg(long = "cwd-optional", requires = "cwd")]
+        cwd_optional: bool,
         #[command(flatten)]
         config: ContextConfigArgs,
     },
@@ -732,6 +737,7 @@ impl KjDispatcher {
                 parent,
                 top,
                 character,
+                cwd_optional,
                 config,
             } => {
                 self.context_create(
@@ -739,6 +745,7 @@ impl KjDispatcher {
                     parent.as_deref(),
                     top,
                     character.as_deref(),
+                    cwd_optional,
                     config.into(),
                     caller,
                 )
@@ -1401,6 +1408,7 @@ impl KjDispatcher {
         parent: Option<&str>,
         top: bool,
         character: Option<&str>,
+        cwd_optional: bool,
         mut cfg: ContextConfig,
         caller: &KjCaller,
     ) -> KjResult {
@@ -1522,6 +1530,18 @@ impl KjDispatcher {
         // — no `context_type == "musician"` branch, and new beat-bearing roles
         // (funkMusician, …) need no kernel edit. `docs/chameleon.md`,
         // "context_type is an rc bundle of features".
+
+        // `--cwd-optional` drops a `--cwd` the kernel cannot use, and the
+        // create continues as if it had not been given.
+        let mut cwd_refused = None;
+        if cwd_optional
+            && let Some(cwd) = cfg.cwd_spec.clone()
+            && let Some(check_in) = parent_id.or(caller.context_id)
+            && let Err(e) = self.check_cwd(caller, check_in, &cwd).await
+        {
+            cwd_refused = Some(format!("--cwd {e}"));
+            cfg.cwd_spec = None;
+        }
 
         // Without `--cwd`, the new context starts in the caller's cwd, as
         // `kj fork` does. A cwd that no longer resolves refuses the create.
@@ -1693,6 +1713,9 @@ impl KjDispatcher {
             msg.push('\n');
             msg.push_str(&line);
         }
+        if let Some(refused) = &cwd_refused {
+            msg.push_str(&format!("\n{refused}; created without it"));
+        }
         // Report whether the retained context received a usable loadout.
         match self.has_usable_loadout(new_id) {
             Ok(true) => {}
@@ -1708,6 +1731,7 @@ impl KjDispatcher {
         }
         KjResult::ok_with_data(msg, serde_json::json!({
             "context_id": new_id.to_hex(),
+            "cwd_refused": cwd_refused,
         }))
     }
 
@@ -5573,6 +5597,44 @@ mod tests {
 
         let result = d.dispatch(&[s("context"), s("create"), s("found"), s("--cwd"), s("/scratch/work")], &c).await;
         assert!(result.is_ok(), "create --cwd on a directory succeeds: {}", result.message());
+    }
+
+    /// `--cwd-optional` decides when the create runs: a directory the kernel
+    /// cannot use is dropped, the context takes the caller's cwd, and the
+    /// result says why in its message and its `cwd_refused` data.
+    #[tokio::test]
+    async fn context_create_cwd_optional_drops_a_directory_the_kernel_cannot_use() {
+        let d = wired_dispatcher().await;
+        let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
+        mount_scratch_work(&d).await;
+        let c = caller_with_context(parent);
+        let cwd_of = |id: ContextId| d.kernel_db().lock().get_context_shell(id).unwrap().and_then(|shell| shell.cwd);
+        let create = |label: &'static str, cwd: &'static str| {
+            let d = d.clone();
+            let c = c.clone();
+            async move {
+                d.dispatch(&[s("context"), s("create"), s(label), s("--cwd"), s(cwd), s("--cwd-optional")], &c).await
+            }
+        };
+
+        let result = create("lost", "/scratch/missing").await;
+        let KjResult::Ok { message, data: Some(data), .. } = &result else {
+            panic!("--cwd-optional creates without a missing directory: {}", result.message());
+        };
+        let refused = data["cwd_refused"].as_str().expect("the result carries the refusal");
+        assert!(refused.contains("'/scratch/missing'"), "the refusal names the directory: {refused}");
+        assert!(message.contains(refused), "the message says why too: {message}");
+        let lost = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        assert_eq!(cwd_of(lost), None, "the parent has no cwd to inherit");
+
+        let result = create("found", "/scratch/work").await;
+        let KjResult::Ok { data: Some(data), .. } = &result else { panic!("{}", result.message()) };
+        assert!(data["cwd_refused"].is_null(), "a usable directory is not refused: {data}");
+        let found = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        assert_eq!(cwd_of(found).as_deref(), Some("/scratch/work"));
+
+        let result = d.dispatch(&[s("context"), s("create"), s("bare"), s("--cwd-optional")], &c).await;
+        assert!(!result.is_ok(), "--cwd-optional needs --cwd: {}", result.message());
     }
 
     /// `/` is accepted as a cwd, and every command that leaves a context

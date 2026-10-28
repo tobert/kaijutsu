@@ -272,8 +272,10 @@ Every client that knows its working directory must create the context with
 (`--context` naming a new label) and kaijutsu-mcp (`register_session`) pass
 their own directory through `ActorHandle::create_context_in_client_cwd`: the
 kernel may run on another host, so a refused directory creates the context
-without it and the client shows the refusal. A later `kj context set --cwd`
-does not rerun create.
+without it and the client shows the refusal. They pass `--cwd-optional`, so
+the kernel decides when the create runs: a create a gate holds runs after
+approval with the arguments it was given, and the directory may differ by
+then. A later `kj context set --cwd` does not rerun create.
 A create without `--cwd` takes the current context's cwd, so a context
 created from a model's shell starts where that model works. `kj fork` gives
 the child the source's cwd, or `--pwd DIR`. Create and fork check an
