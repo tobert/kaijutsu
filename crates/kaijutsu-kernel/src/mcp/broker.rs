@@ -11113,7 +11113,7 @@ mod tests {
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ctx = ContextId::new();
         {
-            let mut db = kernel_db.lock();
+            let db = kernel_db.lock();
             let creator = PrincipalId::system();
             let ws_id = db.get_or_create_default_workspace(creator).unwrap();
             db.insert_document(&DocumentRow {

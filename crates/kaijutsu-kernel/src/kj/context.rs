@@ -3569,7 +3569,6 @@ mod tests {
     #[tokio::test]
     async fn a_root_character_can_be_cast_as_a_performer() {
         let d = test_dispatcher().await;
-        let amy_id = test_reviewer_principal();
         let banto = PrincipalId::new();
         let sovereign = PrincipalId::new();
         for (principal_id, name) in [(banto, "banto"), (sovereign, "sovereign")] {

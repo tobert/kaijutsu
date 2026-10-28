@@ -1035,7 +1035,7 @@ mod tests {
             seeds
                 .iter()
                 .find(|(p, _)| p == &format!("{RC_VFS_ROOT}/{path}"))
-                .map(|(_, body)| body.clone())
+                .map(|(_, body)| *body)
                 .unwrap_or_else(|| panic!("{path} is not seeded"))
         };
         let script = body("console/create/S00-stance.kai");
