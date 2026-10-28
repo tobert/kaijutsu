@@ -1822,63 +1822,6 @@ impl KernelHandle {
         }
     }
 
-    /// Promote a context into ring 0 ("active"). First-write-wins server-side
-    /// — re-promoting an already-promoted context is a no-op success.
-    /// Promoting an ARCHIVED context resurrects it (unarchives + seats it;
-    /// promote is the resurrection door). Returns a
-    /// [`RpcError::ServerError`] when the active ring is full (10
-    /// seats) — ring 0 is a hand-curated row, so seats never appear or
-    /// vanish without an explicit act.
-    #[tracing::instrument(skip(self), name = "rpc_client.promote_context")]
-    pub async fn promote_context(&self, context_id: ContextId) -> Result<(), RpcError> {
-        let mut request = self.kernel.promote_context_request();
-        request.get().set_context_id(context_id.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let reader = response.get()?;
-        if reader.get_success() {
-            Ok(())
-        } else {
-            let msg = reader
-                .get_error()?
-                .to_str()
-                .unwrap_or("promote_context failed");
-            Err(RpcError::ServerError(msg.to_string()))
-        }
-    }
-
-    /// Push a context outward one step on the demote ladder (kernel-owned
-    /// policy): promoted → unpromoted (automatic placement); neither
-    /// promoted nor demoted → demoted; already demoted → archived (single
-    /// context, no subtree recursion, no latch).
-    #[tracing::instrument(skip(self), name = "rpc_client.demote_context")]
-    pub async fn demote_context(&self, context_id: ContextId) -> Result<(), RpcError> {
-        let mut request = self.kernel.demote_context_request();
-        request.get().set_context_id(context_id.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let reader = response.get()?;
-        if reader.get_success() {
-            Ok(())
-        } else {
-            let msg = reader
-                .get_error()?
-                .to_str()
-                .unwrap_or("demote_context failed");
-            Err(RpcError::ServerError(msg.to_string()))
-        }
-    }
-
     /// Set or clear a context's "suspend activity" flag. Design-only for now
     /// — persisted and exposed on the wire, but not yet wired to any
     /// behavioral gating.

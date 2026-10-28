@@ -58,7 +58,7 @@ pub use kernel_clock::{KernelClockHandle, local_epoch_ns};
 pub use key_select::{KeySelectError, resolve_key_source};
 #[cfg(feature = "cli")]
 pub use key_select::KeyArgs;
-pub use rank::{RankedSeat, ranked_context_ids, ranked_seats};
+pub use rank::{RankedSeat, ranked_context_ids, ranked_seats, start_candidate};
 pub use sftp::{CasFetch, CasResolver, ResolveSource, SftpClient, SftpError, default_cache_dir};
 pub use share_server::{
     ShareArg, ShareHandler, ShareServerConfig, parse_share_arg, validate_unique_names,

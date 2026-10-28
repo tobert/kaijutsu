@@ -90,10 +90,15 @@ enum KohaiCommand {
         /// its lineage root
         #[arg(long)]
         senpai: Option<String>,
-        /// The live, non-root character that performs the new context. Its
-        /// senpai's character reviews its asks
+        /// The live character that performs the new context. Its senpai's
+        /// character reviews its asks
         #[arg(long = "as", value_name = "CHARACTER", required = true)]
         character: String,
+        /// With --cwd: if the kernel cannot use that directory when the
+        /// create runs, create as if --cwd were not given and say why. A
+        /// create held for approval checks when it runs
+        #[arg(long = "cwd-optional", requires = "cwd")]
+        cwd_optional: bool,
         #[command(flatten)]
         config: Box<ContextConfigArgs>,
     },
@@ -198,7 +203,7 @@ impl KjDispatcher {
             Err(result) => return result,
         };
         match parsed.command {
-            KohaiCommand::Create { label, name, parent, senpai, character, config } => {
+            KohaiCommand::Create { label, name, parent, senpai, character, cwd_optional, config } => {
                 if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "kohai create") {
                     return denied;
                 }
@@ -207,6 +212,7 @@ impl KjDispatcher {
                     parent.as_deref(),
                     senpai.as_deref(),
                     &character,
+                    cwd_optional,
                     *config,
                     caller,
                 ))

@@ -125,7 +125,7 @@ list.
 | `Ctrl+A 0–9` | Switch to ring-0 seat *n*, from anywhere | window n |
 | `Ctrl+A Ctrl+A` | Toggle to previous context | other window |
 | `Ctrl+A a` | Send literal Ctrl+A to the focused vi surface | meta |
-| `Ctrl+A q` | Close-and-demote: demote the current context one step on the ring ladder (kernel `demote_context`), then switch to the MRU-previous context; nowhere to land → demote and stay | (repurposed) |
+| `Ctrl+A q` | Close-and-demote: `kj context demote` on the current context (see "Placement keys" below), then switch to the MRU-previous context once the demote has run; nowhere to land → demote and stay. The step that archives latches, so the view stays and `Ctrl+A q` again confirms | (repurposed) |
 | `Ctrl+A "` | Open the well (zoomed) — the interactive picker | windowlist |
 | `Ctrl+A w` | Synonym for `"` — the well | — |
 | `Ctrl+A '` | Switch-by-prompt: prefilled-`kj` prompt, `kj context switch ` (see pattern below) | select |
@@ -151,6 +151,18 @@ and the hints line shows the latch message or the first stdout line. Any
 other line runs in the shell and returns no data; a context switch there
 follows the kernel's `ContextSwitched` push instead.
 
+**Placement keys.** The well's `p` and `d` and `Ctrl+A q` run `kj context
+promote <id>` or `kj context demote <id>` through `executeKj`, against the
+context they move, as the tui's picker does. There is no placement RPC: the
+verb checks placement authority, latches the demote step that archives
+behind `--confirm`, and runs the archive rc lifecycle. The hints line shows
+the first stdout line, or why the verb failed. A latched demote moves
+nothing; the hints line says that the next demote archives the context and
+which key confirms it. The same key on the same context, while that notice
+shows (6 seconds), runs the step again with `--confirm`. Any other placement
+press disarms it, so one press never archives. The well's `z` and `a` still
+call `setContextPaused` and `archiveContext`.
+
 ## Compose keys
 
 Compose's chat and shell surfaces each run a local `EditorCore`, the vi
@@ -166,7 +178,7 @@ outbox, so a submit always takes exactly what was typed before it
 | `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |
 | `Esc Esc` | Leave compose, when the second Esc lands in normal mode within 500 ms |
 | `Ctrl+C` | The interrupt ladder; the third press clears the surface |
-| `Ctrl+Z` | Toggle chat and shell; each keeps its own text |
+| `Ctrl+Z` | Toggle the root context and its shell child (`docs/character.md`, "The root console and its shell"); each context keeps its own chat draft |
 | `Ctrl+V` / middle click | Paste CLIPBOARD / PRIMARY at the cursor as one edit |
 | `Ctrl+A a` | A literal `Ctrl+A` for the vi engine |
 
@@ -242,7 +254,7 @@ folds · `V` visual-line · `y` yank to clipboard · `R` reload a stale view ·
 | `Ctrl+Shift+V` | Paste CLIPBOARD into the vi editor through `editor_insert` | editor; refused with a notice while the `:` line is open |
 | middle-click | Paste PRIMARY | in the editor through `editor_insert`, refused while the `:` line is open |
 | selection | Auto-copies to PRIMARY (mouse or vi visual) | |
-| `Ctrl+Z` | Chat↔shell toggle; in the editor: suspend to shell | unix suspend metaphor |
+| `Ctrl+Z` | Root↔shell context toggle; in the editor: suspend to shell | unix suspend metaphor |
 | `Ctrl+D/U` | Half-page scroll | unchanged |
 | `Ctrl+6` | Previous-pane toggle | unchanged |
 | `Alt+hjkl/v/s/q/[/]` | Tiling | unchanged |

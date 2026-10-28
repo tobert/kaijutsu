@@ -2223,22 +2223,12 @@ interface Kernel {
 
   # ── Time-well ring placement (docs/timewell.md) ──
 
-  # Promote a context into the hand-picked ring 0 ("active"). Sets
-  # `promotedAt` (first time only — never restamped on re-promote, so ring-0
-  # order stays append-stable) and clears `demotedAt`. Promoting an ARCHIVED
-  # context resurrects it: `archivedAt` cleared, a FRESH `promotedAt` stamped
-  # (the old seat was surrendered at archive time), `concludedAt` untouched —
-  # promote is the resurrection door; the archive is memory to drift back
-  # from, not trash. Works from any state, not latched, not capability-gated
-  # (same as `conclude`).
-  promoteContext @83 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
-
-  # Push a context outward one step on the demote ladder (kernel-owned
-  # policy): promoted → clears `promotedAt` (back to automatic placement);
-  # neither promoted nor demoted → sets `demotedAt`; already demoted →
-  # archives it (single context, no subtree recursion, no latch). Not
-  # capability-gated.
-  demoteContext @84 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
+  # Promotion and demotion are `kj context promote|demote`, run through
+  # `executeKj`: the verb checks placement authority, latches the demote
+  # step that archives behind `--confirm`, and runs the archive rc
+  # lifecycle.
+  retired83 @83 ();
+  retired84 @84 ();
 
   # Set or clear a context's `pausedAt` — DESIGN-ONLY for now: persisted and
   # exposed on the wire, but not yet wired to any behavioral gating (no

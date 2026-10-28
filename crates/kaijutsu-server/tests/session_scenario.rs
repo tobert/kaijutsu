@@ -58,7 +58,7 @@ use common::{create_context_typed};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{run_local, seed_mock_backend_with_model, shell_exec_wait};
+use common::{bootstrap_mock, run_local, shell_exec_wait};
 use kaijutsu_client::{
     KernelHandle, KeySource, RpcClient, ServerEvent, SshClient, SshConfig, turn_events_channel,
 };
@@ -214,9 +214,7 @@ async fn boot() -> Scenario {
         .expect("read amy's sheet")
         .expect("init created amy")
         .principal_id;
-    if let Some(ref data_dir) = config.data_dir {
-        seed_mock_backend_with_model(data_dir, "mock-model");
-    }
+    bootstrap_mock(&config, "mock-model").await;
 
     // `gate.toml`'s shipped default (`assets/defaults/gate.toml`) allow-lists
     // "kj handoff note" globally and gives `[context_type.director]` create,

@@ -155,7 +155,7 @@ mod tests {
     /// the discovery verb has something to report.
     async fn seed_registry(d: &crate::kj::KjDispatcher) {
         let mut reg = d.kernel().llm().write().await;
-        reg.register("anthropic", Arc::new(Provider::Claude(claude::Client::new("fake"))));
+        reg.register("anthropic", Arc::new(Provider::Claude(claude::Client::new("fake").unwrap())));
         reg.register("deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))));
         reg.set_backends(vec![{
             let mut c = BackendConfig::new("anthropic", BackendKind::Anthropic);

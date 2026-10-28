@@ -6696,29 +6696,20 @@ dependencies = [
  "chrono",
  "clap",
  "kaijutsu-client",
+ "kaijutsu-kernel",
+ "kaijutsu-server",
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "parking_lot",
+ "russh",
  "serde_json",
  "shell-words",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "whoami",
-]
-
-[[package]]
-name = "kaijutsu-acp-fleet"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "gogi-proto",
- "rustix 0.38.44",
- "serde",
- "serde_json",
- "toml 0.8.23",
 ]
 
 [[package]]
@@ -7148,32 +7139,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "kaijutsu-solo-acp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "kaijutsu-acp",
- "kaijutsu-acp-fleet",
- "kaijutsu-client",
- "kaijutsu-kernel",
- "kaijutsu-server",
- "kaijutsu-telemetry",
- "kaijutsu-types",
- "kaish-kernel",
- "libc",
- "parking_lot",
- "rand 0.10.1",
- "russh",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "whoami",
 ]
 
 [[package]]

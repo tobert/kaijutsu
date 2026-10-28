@@ -111,6 +111,16 @@ Provider text, reasoning, and tool calls are authored
 by the performer. User prompts keep their requester; kernel-produced tool
 results keep kernel authorship.
 
+`kj drive` runs the driven turn with the caller's performer as its
+requester, and writes the `--prompt` seed as that performer. When banto,
+performing a turn Amy requested, drives a lane, the lane's turn, its tool
+calls, and its asks carry banto as `principal_id`. The lane's own performer
+and reviewer still play and review that turn. The self-approval check
+compares the reviewer with the performer, not the requester, so a driver
+that is also the lane's reviewer still answers the lane's asks. As the
+asks' requester, the driver may also cancel them, and a `session` rule
+learned on one covers the lane and the driver as its requester.
+
 An app, TUI, ACP client, or MCP bridge acts as the character bound to its
 credential. Navigating into a coder context does not turn Amy into coder.
 External lead models need their own character-bound credential; two processes

@@ -33,10 +33,10 @@ pub enum Intent {
     /// `crossterm::event::KeyEvent`) and because what `Enter` or `Esc` means
     /// depends on the vi mode, which this module deliberately does not know.
     InputKey(KeyEvent),
-    /// `Ctrl+Z` — suspend the process the way a shell job does (`docs/tui.md`,
-    /// "The `:` line": the `Ctrl+Z` shell surface retired in favor of `:!`,
-    /// so this is now a single-press suspend, not a toggle).
-    Suspend,
+    /// `Ctrl+Z` — toggle between a root context and its shell child. The
+    /// caller's double tap makes the second press within the window suspend
+    /// the process instead (`crate::ctrl_z`, `docs/tui.md`, "Keys").
+    CtrlZ,
     /// `Ctrl+A r` / `A` / `'` — open the `:` bar typed up to the verb's
     /// argument, cursor at the end (`docs/input.md`, "The prefilled-`kj`
     /// prompt pattern"). The text is the bar's body, no `:` prefix. `Enter`
@@ -174,7 +174,7 @@ impl Keys {
                 Intent::LegendChanged
             }
             KeyCode::Char('c') if ctrl => Intent::Interrupt,
-            KeyCode::Char('z') if ctrl => Intent::Suspend,
+            KeyCode::Char('z') if ctrl => Intent::CtrlZ,
             // Everything else belongs to the input region. Control chords go
             // too: `<C-w>` and `<C-r>` are vi keys, and the two this client
             // reserves are already claimed above.
@@ -268,11 +268,14 @@ mod tests {
     }
 
 
-    /// `Ctrl+Z` is never compose text — it suspends, one press, no toggle.
+    /// `Ctrl+Z` is never compose text. It is the root and shell toggle, and
+    /// the caller's double tap turns the second press into a suspend
+    /// (`crate::ctrl_z`).
     #[test]
-    fn ctrl_z_is_a_suspend_intent() {
+    fn ctrl_z_is_the_toggle_intent() {
         let mut keys = Keys::new();
-        assert_eq!(keys.interpret(ctrl('z')), Intent::Suspend);
+        assert_eq!(keys.interpret(ctrl('z')), Intent::CtrlZ);
+        assert!(!keys.armed());
     }
 
     #[test]

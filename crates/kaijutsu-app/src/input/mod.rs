@@ -246,7 +246,6 @@ impl Plugin for InputPlugin {
                 // Focus management (global)
                 systems::handle_focus_cycle,
                 compose::systems::handle_focus_compose,
-                compose::systems::handle_toggle_surface,
                 compose::systems::handle_pop_level,
                 systems::handle_detach,
                 compose::systems::handle_prompt_prefill,

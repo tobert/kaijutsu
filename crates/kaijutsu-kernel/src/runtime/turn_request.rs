@@ -205,7 +205,30 @@ pub(crate) fn queue_startup(
     Ok(result)
 }
 
-fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, origin: TurnOrigin, error: String) {
+/// Watch a startup nobody waits on. Startup reports its own failures; a
+/// startup the runtime dropped before it answered is reported here, in the
+/// transcript and on `TurnFlow::Failed`, the way startup reports one.
+pub(crate) fn watch_startup(
+    kernel: &Arc<Kernel>, turn_id: TurnId, request: TurnRequest, origin: TurnOrigin,
+    startup: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) {
+    let kernel = kernel.clone();
+    tokio::spawn(async move {
+        match startup.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(context.id = %request.context_id,
+                block.id = %request.after_block_id, %error, "input committed; its turn did not start"),
+            Err(_) => {
+                let error = "turn preparation stopped before replying".to_string();
+                tracing::error!(context.id = %request.context_id, block.id = %request.after_block_id,
+                    "input committed; {error}");
+                report_failure(&kernel, turn_id, &request, origin, error);
+            }
+        }
+    });
+}
+
+pub(super) fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, origin: TurnOrigin, error: String) {
     let payload = kaijutsu_types::ErrorPayload {
         category: kaijutsu_types::ErrorCategory::Stream,
         severity: kaijutsu_types::ErrorSeverity::Error,
@@ -282,6 +305,39 @@ mod tests {
         }
         assert!(!dispatcher.kernel().turn_in_flight(context));
         dispatcher.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A startup dropped before it answered still reports the failure once,
+    /// in the transcript and on `TurnFlow::Failed`, though nobody waits on it.
+    #[tokio::test]
+    async fn a_startup_dropped_before_it_answered_reports_the_failure() {
+        let dispatcher = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("dropped-startup"), None, principal);
+        let blocks = dispatcher.block_store();
+        blocks.create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let input = blocks.insert_block_as(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "submitted", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain, Some(principal)).unwrap();
+        let mut failures = dispatcher.kernel().turn_flows().subscribe("turn.failed");
+        let (reply, startup) = tokio::sync::oneshot::channel();
+        drop(reply);
+        watch_startup(dispatcher.kernel(), TurnId::new(), TurnRequest {
+            score: None, context_id: context, after_block_id: input, content: String::new(),
+            principal_id: principal, continuation_epoch: None,
+        }, TurnOrigin::Interactive, startup);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv())
+            .await.unwrap().unwrap();
+        match event.payload {
+            TurnFlow::Failed { error, origin, .. } => {
+                assert!(error.contains("stopped before replying"), "{error}");
+                assert_eq!(origin, TurnOrigin::Interactive);
+            }
+            other => panic!("expected failed startup, got {other:?}"),
+        }
+        let errors: Vec<_> = blocks.block_snapshots(context).unwrap().into_iter()
+            .filter(|block| block.status == kaijutsu_types::Status::Error).collect();
+        assert_eq!(errors.len(), 1, "one record of the dropped startup: {errors:?}");
     }
 
     #[tokio::test]

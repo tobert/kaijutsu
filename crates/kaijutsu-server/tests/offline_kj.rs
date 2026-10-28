@@ -195,10 +195,16 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     let cast = home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]);
     assert!(cast.status.success(), "{}", stderr(&cast));
 
-    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
+    // The human root refuses `drive`, so the lane is created and driven
+    // from a director context, as a person would.
+    let banto = home.run(&["kj", "--", "character", "create", "banto"]);
+    assert!(banto.status.success(), "{}", stderr(&banto));
+    let boss = home.run(&["kj", "--", "kohai", "create", "boss", "--type", "director", "--as", "banto"]);
+    assert!(boss.status.success(), "kj kohai create boss failed: {}", stderr(&boss));
+    let create = home.run(&["kj", "--context", "boss", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
     assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
-    let drive = home.run(&["kj", "--", "drive", "lane", "--prompt", "hi"]);
+    let drive = home.run(&["kj", "--context", "boss", "--", "drive", "lane", "--prompt", "hi"]);
     assert!(drive.status.success(), "kj drive failed: {}", stderr(&drive));
 
     let list = home.run(&["kj", "--", "block", "list", "-c", "lane"]);
@@ -231,12 +237,18 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     ]).to_string()).unwrap();
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
-    assert!(home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]).status.success());
-    let create = home.run(&["kj", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
+    let cast = home.run(&["kj", "--", "character", "set", "bob", "--cast", "mock"]);
+    assert!(cast.status.success(), "{}", stderr(&cast));
+    // The human root refuses `drive`; see the test above.
+    let banto = home.run(&["kj", "--", "character", "create", "banto"]);
+    assert!(banto.status.success(), "{}", stderr(&banto));
+    let boss = home.run(&["kj", "--", "kohai", "create", "boss", "--type", "director", "--as", "banto"]);
+    assert!(boss.status.success(), "kj kohai create boss failed: {}", stderr(&boss));
+    let create = home.run(&["kj", "--context", "boss", "--", "kohai", "create", "lane", "--type", "coder", "--as", "bob"]);
     assert!(create.status.success(), "kj kohai create failed: {}", stderr(&create));
 
     let drive = Command::new(server_bin())
-        .args(["kj", "--", "drive", "lane", "--prompt", "run it"])
+        .args(["kj", "--context", "boss", "--", "drive", "lane", "--prompt", "run it"])
         .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
         .env("KJ_MOCK_SCRIPT_DIR", &scripts)

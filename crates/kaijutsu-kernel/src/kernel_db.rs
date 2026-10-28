@@ -1482,8 +1482,8 @@ CREATE TABLE IF NOT EXISTS characters (
     -- archived context is retained work, not a reason to disown the sheet
     -- row that points at it.
     handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    -- A root character has no model: turn identity refuses it as a
-    -- performer and it cannot be cast. Accountability itself is a relation
+    -- A root character is a model context like any other, and its kj
+    -- requests always need approval. Accountability itself is a relation
     -- between contexts, not a column here — see docs/character.md, "Roots
     -- and rotation".
     root             INTEGER NOT NULL DEFAULT 0,
@@ -6548,7 +6548,7 @@ impl KernelDb {
                     ))
                 },
             )
-            .ok();
+            .optional()?;
         let Some((all_instances, all_facades, binding_admin)) = flags else {
             return Ok(None);
         };
@@ -8227,10 +8227,9 @@ pub struct CharacterRow {
     /// ordinary character, and briefly for a root whose context the kernel
     /// has not created yet (`docs/character.md`, "Roots and rotation").
     pub root_ctx: Option<ContextId>,
-    /// A root character has no model. It cannot be cast as a context's
-    /// performer and turn identity refuses it, so a root is a place with
-    /// hands on it rather than a seat a model plays
-    /// (`docs/character.md`, "Roots and rotation").
+    /// A root character is a model context: a model can play it, and its
+    /// kj requests always need approval (`docs/character.md`, "Roots and
+    /// rotation").
     pub root: bool,
 }
 
@@ -8862,9 +8861,9 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Set or clear a character's `root` flag. A root has no model: it
-    /// cannot be cast as a context's performer and turn identity refuses
-    /// it (`docs/character.md`, "Roots and rotation").
+    /// Set or clear a character's `root` flag, which marks a model context
+    /// whose kj requests always need approval (`docs/character.md`,
+    /// "Roots and rotation").
     /// Set or clear the cast whose slots a new binding of this character's
     /// instance copies.
     pub fn set_character_cast(&self, principal_id: PrincipalId, cast_id: Option<CastId>) -> KernelDbResult<()> {
@@ -10422,6 +10421,15 @@ mod tests {
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
         assert!(!holds(&db, ids["default"]), "the migration must run once");
         assert!(holds(&db, ids["mcp"]), "a second run changes nothing else");
+    }
+
+    /// A database fault while reading a binding is an error, not "unbound":
+    /// callers would read it as a context that grants nothing.
+    #[test]
+    fn get_context_binding_reports_a_database_fault() {
+        let db = KernelDb::temporary().unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE context_bindings;").unwrap();
+        assert!(db.get_context_binding(ContextId::new()).is_err());
     }
 
     /// `context_usage.cache_ttl_secs` must land on a DB created before the

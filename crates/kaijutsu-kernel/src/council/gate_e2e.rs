@@ -2625,6 +2625,88 @@ async fn a_bump_refuses_with_guidance_and_opens_no_ask() {
     }
 }
 
+/// Learn a standing allow rule for the one-statement submission of
+/// `command` as `via` presents it to the gate, the way an `allow_always`
+/// answer does.
+fn learn_allow_rule(db: &parking_lot::Mutex<crate::kernel_db::KernelDb>, via: Via, command: &str) {
+    use approval_ledger::types::{NewAsk, NewPlanCommand, NewPlanStatement, Origin, RuleScope};
+    let tool = format!("{}.{}", ShellServer::INSTANCE_WRITE, ShellServer::TOOL_WRITE);
+    let (origin, rendered, label) = match via {
+        Via::Rpc => (Origin::Hook, format!("{tool} {}", serde_json::json!({ "command": command })), tool),
+        Via::Tool => (Origin::ShellGate, command.to_string(), command.to_string()),
+    };
+    let seed = NewAsk {
+        context_id: vec![],
+        actor_id: vec![9, 9, 9],
+        reviewer_id: vec![1, 2, 3],
+        principal_id: vec![],
+        origin,
+        instance: Some(ShellServer::INSTANCE_WRITE.into()),
+        tool: Some(ShellServer::TOOL_WRITE.into()),
+        hook_id: None,
+        description: "test fixture: learn an allow rule".into(),
+        statements: vec![NewPlanStatement {
+            statement_digest: crate::kj::gate::statement_digest(origin, &rendered),
+            rendered,
+            statement_kind: "command".into(),
+            commands: vec![NewPlanCommand { name: "seed".into(), args: vec![], redirects: vec![], backgrounded: false }],
+            vars: vec![],
+        }],
+        authorized_label: Some(label),
+        rc_run_id: None,
+        expires_at: None,
+        options: vec![],
+        signals: vec![],
+        cwd: None,
+        exec_source: None,
+        exec_stdin: None,
+        continuation_epoch: None,
+        env: vec![],
+    };
+    let db = db.lock();
+    let conn = db.conn_for_ledger();
+    let request_id = approval_ledger::ask::create_ask(conn, &seed).unwrap();
+    approval_ledger::decide::decide(
+        conn,
+        &request_id,
+        approval_ledger::decide::DecideInput {
+            allow: true,
+            decided_by: Some(approval_ledger::decide::Answerer { principal: &[1, 2, 3], context: Some(&[4, 5, 6]) }),
+            decided_option: Some("allow_always"),
+            remember_scope: None,
+            auto_reason: None,
+        },
+    )
+    .unwrap();
+    approval_ledger::rules::learn_from_approval(conn, &request_id, 0, RuleScope::Always, true, Some(&[1, 2, 3]))
+        .unwrap();
+}
+
+/// A rule learned while the council reads a submission decides it: the
+/// bump is not applied, the rule allows, and the command runs. The gate
+/// checks the rules again after the council answers, before it refuses
+/// anything.
+///
+/// Falsified by refusing the bump before that check: the submission is
+/// bumped although a rule allows it.
+#[tokio::test]
+async fn a_rule_learned_during_the_council_read_wins_over_its_bump() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        let db = rig.d.kernel_db().clone();
+        rig.mock.set(move |req| {
+            learn_allow_rule(&db, via, "touch /work/marker");
+            Reply::ok(bump_answer(req, TRY_HARDER))
+        });
+        rig.submit("touch /work/marker")
+            .await
+            .unwrap_or_else(|e| panic!("{via:?}: the rule allows the submission: {e:?}"));
+        assert!(rig.asks().iter().all(|a| a.status != ApprovalStatus::Pending), "{via:?}");
+        assert!(bump_flavors(&rig, &digest_of("touch /work/marker")).is_empty(), "{via:?}: no bump was refused");
+        rig.finish().await;
+    }
+}
+
 const UNDO_OPTIONS: [&str; 3] = ["reversible", "normal", "irreversible"];
 const IRREVERSIBLE: [f64; 3] = [-5.0, -3.0, -0.06];
 

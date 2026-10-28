@@ -22,8 +22,8 @@ below.
 `KvDocument`/`Kv`, the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`),
 and `kj kv` are gone — no callers anywhere in the tree, and their old ordinals
 (79–83) are reassigned to unrelated methods (`subscribeEditor`,
-`setLastContext`, `getClientView`, `listTracks`, `promoteContext`), not left
-as `retiredNN` stubs. The one real production use — the app's
+`setLastContext`, `getClientView`, `listTracks`, and 83, which is now
+`retired83`), not left as `retiredNN` stubs. The one real production use — the app's
 `<client-id>.current_context` restore-on-reconnect — split in two: the *live*
 acting context stays in the already-ephemeral `SessionContextMap` (no KV
 needed), and the *durable* restore is a small typed per-client store

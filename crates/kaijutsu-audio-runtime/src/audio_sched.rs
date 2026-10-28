@@ -439,6 +439,34 @@ pub(crate) fn test_handle() -> (AudioSchedulerHandle, Receiver<SchedulerCmd>) {
     (AudioSchedulerHandle { tx, failed: Arc::new(AtomicBool::new(false)) }, rx)
 }
 
+/// A real, decodable WAV for tests: 100 ms of a 440 Hz sine, mono 16-bit PCM
+/// at 8 kHz, built in memory so the tests run the same on every host.
+#[cfg(test)]
+pub(crate) fn test_wav_bytes() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 8_000;
+    const NUM_SAMPLES: u32 = SAMPLE_RATE / 10;
+    let data_size = NUM_SAMPLES * 2;
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    for n in 0..NUM_SAMPLES {
+        let phase = 2.0 * std::f64::consts::PI * 440.0 * n as f64 / SAMPLE_RATE as f64;
+        wav.extend_from_slice(&((phase.sin() * 8_000.0) as i16).to_le_bytes());
+    }
+    wav
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,18 +693,9 @@ mod tests {
 
     // ── build_source: decode + trim + gain, no device involved ────────────
 
-    const TEST_WAV: &str = "/home/atobey/src/pawlsa-mcp/pawlsa-test.wav";
-
-    fn test_wav_bytes() -> Option<Vec<u8>> {
-        std::fs::read(TEST_WAV).ok()
-    }
-
     #[test]
     fn build_source_decodes_real_wav_bytes_with_no_trim_or_gain() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let source = build_source(bytes, None, None, 0.0).expect("real WAV decodes");
         // `channels()` returns `NonZero<u16>` as of rodio 0.21+ (was plain
         // `u16` under 0.20) — `.get()` to compare against a bare literal.
@@ -685,10 +704,7 @@ mod tests {
 
     #[test]
     fn build_source_applies_offset_and_length_trim_without_erroring() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let trimmed = build_source(
             bytes,
             Some(Duration::from_millis(10)),
@@ -717,10 +733,7 @@ mod tests {
 
     #[test]
     fn play_now_with_no_device_decodes_but_plays_nothing() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let mut pending = BinaryHeap::new();
         let mut live = Vec::new();
         let mut seq = 0u64;
@@ -740,10 +753,7 @@ mod tests {
 
     #[test]
     fn play_at_with_a_future_deadline_enqueues_rather_than_firing() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let mut pending = BinaryHeap::new();
         let mut live = Vec::new();
         let mut seq = 0u64;
@@ -770,10 +780,7 @@ mod tests {
 
     #[test]
     fn play_at_with_a_past_deadline_fires_immediately_instead_of_enqueuing() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let mut pending = BinaryHeap::new();
         let mut live = Vec::new();
         let mut seq = 0u64;
@@ -799,10 +806,7 @@ mod tests {
 
     #[test]
     fn flush_clears_pending_and_stops_every_live_sink() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let mut pending = BinaryHeap::new();
         let mut live = Vec::new();
         let mut seq = 0u64;
@@ -861,10 +865,7 @@ mod tests {
     #[test]
     #[ignore = "needs a real audio output device; run manually (e.g. on the zorak runner)"]
     fn live_scheduler_thread_plays_and_flushes_without_panicking() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let (handle, join) = spawn(None, 0).unwrap();
         handle.play_now(bytes.clone());
         handle.play_at(

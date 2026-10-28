@@ -235,8 +235,8 @@ pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
 /// events (tempo `0xFF 0x51`, etc.) are included for the consumer to honour or
 /// skip — an ALSA seq target plays only the channel-voice (`0x80`/`0x90`/…)
 /// messages. M1 renders the single-track (format-0) merge: a multi-voice tune
-/// collapses onto one channel here (per-voice channel split is a later milestone,
-/// matching `generate`'s own format-0 path).
+/// collapses onto one channel here, every voice starting at tick 0 (per-voice
+/// channel split is a later milestone, matching `generate`'s own format-0 path).
 pub fn events(tune: &Tune, params: &MidiParams) -> Vec<MidiEvent> {
     let mut writer = build_single_track_writer(tune, params);
     writer.events.sort_by_key(|e| e.tick);
@@ -269,8 +269,10 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
     let unit_length = tune.header.unit_length.unwrap_or_default();
     let unit_ticks = compute_unit_ticks(&unit_length, params.ticks_per_beat);
 
-    // Process all voices (merge into single track for format 0)
+    // Process all voices (merge into single track for format 0). Every voice
+    // starts at tick 0 so the voices sound together.
     for voice in &tune.voices {
+        writer.current_tick = 0;
         // Get pitch offset from voice properties (transpose, octave)
         let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
             + key_pitch_offset(&tune.header.key)
@@ -1165,6 +1167,23 @@ mod tests {
             .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
             .unwrap();
         assert_eq!(first2.data[1], 72, "C up one octave = 72");
+    }
+
+    #[test]
+    fn events_sound_every_voice_from_the_start_of_the_tune() {
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\nV:1\nC4|\nV:2\nE4|\n";
+        let tune = &crate::parse(abc).value[0];
+        assert_eq!(tune.voices.len(), 2);
+        let note_ons: Vec<(u32, u8)> = events(tune, &MidiParams::default())
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| (e.tick, e.data[1]))
+            .collect();
+        assert_eq!(note_ons.len(), 2);
+        assert!(
+            note_ons.iter().all(|(tick, _)| *tick == 0),
+            "voices sound together, not one after another: {note_ons:?}"
+        );
     }
 
     #[test]

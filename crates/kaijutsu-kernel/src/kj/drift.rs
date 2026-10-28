@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::DriftKind;
-use kaijutsu_types::{ContentType, ContextId};
+use kaijutsu_types::{ContentType, ContextId, PrincipalId};
 
 use super::effect::{Classify, Effect};
 use super::format::format_drift_queue;
@@ -165,19 +165,18 @@ impl KjDispatcher {
         }
     }
 
-    /// Insert a drift block into `target_ctx`, record the `context_edges`
-    /// row, and run the target's `drift` rc lifecycle.
+    /// Insert a drift block authored by `author` into `target_ctx`, record
+    /// the `context_edges` row, run the target's `drift` rc lifecycle, and
+    /// then offer the block to the target's running turn. Every delivery
+    /// (`push`, `pull`, `merge`, `flush`) goes through here, so the turn
+    /// wakes with the rc output already in the log.
     ///
-    /// This is the shared shape that `push` (immediate), `pull`, `merge`
-    /// and `flush` each used to inline. Only the immediate-`push` path is
-    /// routed through it so far; the others are unchanged and can migrate
-    /// when they are next touched.
-    ///
-    /// A failed *insert* is returned to the caller so it can decide what to
-    /// do with the content (immediate `push` stages it rather than losing
-    /// it). A failed edge write or rc script is logged and does not fail
-    /// the delivery — the block is already durable, and refusing to
-    /// acknowledge a delivered block would be the worse lie.
+    /// A failed admission or *insert* is returned to the caller so it can
+    /// decide what to do with the content (immediate `push` stages it,
+    /// `flush` requeues it). A failed edge write is logged; an rc fault or
+    /// cancellation is reported as an outcome. Neither fails the delivery:
+    /// the block is already durable, and refusing to acknowledge a
+    /// delivered block would be the worse lie.
     async fn deliver_drift(
         &self,
         source_ctx: ContextId,
@@ -186,16 +185,18 @@ impl KjDispatcher {
         source_model: Option<String>,
         drift_kind: DriftKind,
         edge_metadata: String,
+        author: PrincipalId,
         caller: &KjCaller,
     ) -> Result<DriftDeliveryOutcome, String> {
         let admission = self.kernel().admit_context(target_ctx)?;
         let after = self.block_store().last_block_id(target_ctx);
         // The drift block is the one block in the target that legitimately
-        // belongs to an outsider, so it carries the SENDER — the performer,
-        // not the requester that opened the connection
-        // (`docs/approval-identity.md`, "Three identities"). Everything the
-        // arrival then triggers (the target's `drift` rc scripts) belongs to
-        // the context owner instead — see `rc::run`.
+        // belongs to an outsider, so it carries the SENDER: the caller's
+        // performer, or whoever staged a flushed item — never the requester
+        // that opened the connection (`docs/approval-identity.md`, "Three
+        // identities"). Everything the arrival then triggers (the target's
+        // `drift` rc scripts) belongs to the context owner instead — see
+        // `rc::run`.
         let block = self.block_store()
             .insert_drift_block_as(
                 target_ctx,
@@ -205,9 +206,9 @@ impl KjDispatcher {
                 source_ctx,
                 source_model.clone(),
                 drift_kind,
-                Some(caller.actor_id),
+                Some(author),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("failed to insert drift block: {e}"))?;
 
         {
             let db = self.kernel_db().lock();
@@ -413,6 +414,7 @@ impl KjDispatcher {
                     source_model.clone(),
                     drift_kind,
                     drift_kind.to_string(),
+                    caller.actor_id,
                     caller,
                 )
                 .await
@@ -502,69 +504,26 @@ impl KjDispatcher {
 
         // Insert drift block in caller's context
         let source_model = self.bound_model_name(source_id);
-        let admission = match self.kernel().admit_context(context_id) {
-            Ok(admission) => admission,
-            Err(error) => return KjResult::Err(format!("kj drift pull: {error}")),
-        };
-        let after = self.block_store().last_block_id(context_id);
 
         // `pull` is a send the caller performs on their own behalf: they asked
         // for the summary and it lands in their context, so the performer
         // authors it — never the requester that opened the connection.
-        let block = match self.block_store().insert_drift_block_as(
-            context_id,
-            None,
-            after.as_ref(),
-            &summary,
-            source_id,
-            source_model.clone(),
-            DriftKind::Pull,
-            Some(caller.actor_id),
-        ) {
-            Ok(block) => block,
-            Err(e) => return KjResult::Err(format!("kj drift pull: failed to insert drift block: {e}")),
-        };
-        self.offer_drift(context_id, block);
-
-        // Record drift edge
+        match self
+            .deliver_drift(source_id, context_id, &summary, source_model, DriftKind::Pull, "pull".into(), caller.actor_id, caller)
+            .await
         {
-            let db = self.kernel_db().lock();
-            let edge = crate::kernel_db::ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id,
-                target_id: context_id,
-                metadata: Some("pull".to_string()),
-                created_at: kaijutsu_types::now_millis() as i64,
-            };
-            if let Err(e) = db.insert_edge(&edge) {
-                tracing::warn!("failed to insert pull drift edge: {e}");
+            Ok(DriftDeliveryOutcome::Complete) => {}
+            Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => {
+                return KjResult::Err(format!(
+                    "kj drift pull: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
+                ));
             }
-        }
-
-        let lifecycle = crate::rc::run(
-            self,
-            crate::rc::RcInvocation {
-                drift: Some(crate::rc::DriftInfo {
-                    kind: DriftKind::Pull,
-                    source_ctx: source_id,
-                    target_ctx: context_id,
-                    source_model,
-                }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
-            },
-            caller,
-        )
-            .await;
-        if caller.cancel.is_cancelled() {
-            let error = lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into());
-            return KjResult::Err(format!(
-                "kj drift pull: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
-            ));
-        }
-        if let Err(error) = lifecycle {
-            return KjResult::Err(format!(
-                "kj drift pull: delivery and edge were committed, but its rc lifecycle could not settle: {error}"
-            ));
+            Ok(DriftDeliveryOutcome::LifecycleFault(error)) => {
+                return KjResult::Err(format!(
+                    "kj drift pull: delivery and edge were committed, but its rc lifecycle could not settle: {error}"
+                ));
+            }
+            Err(e) => return KjResult::Err(format!("kj drift pull: {e}")),
         }
 
         // Preview: first ~200 chars
@@ -620,6 +579,9 @@ impl KjDispatcher {
         if target_id == context_id {
             return KjResult::Err("kj drift merge: cannot merge into self".to_string());
         }
+        if let Some(why) = self.drift_target_refusal(target_id) {
+            return KjResult::Err(format!("kj drift merge: {why}"));
+        }
 
         // Summarize caller's context on the caller's `distill` slot.
         let summary = match self
@@ -632,68 +594,25 @@ impl KjDispatcher {
 
         // Insert drift block into the TARGET (parent) context
         let source_model = self.bound_model_name(context_id);
-        let admission = match self.kernel().admit_context(target_id) {
-            Ok(admission) => admission,
-            Err(error) => return KjResult::Err(format!("kj drift merge: {error}")),
-        };
-        let after = self.block_store().last_block_id(target_id);
         // `merge` sends the child's distillation up to the parent — the
         // performer is the sender, and the block lands in a context they may
         // not own.
-        let block = match self.block_store().insert_drift_block_as(
-            target_id,
-            None,
-            after.as_ref(),
-            &summary,
-            context_id,
-            source_model.clone(),
-            DriftKind::Merge,
-            Some(caller.actor_id),
-        ) {
-            Ok(block) => block,
-            Err(e) => return KjResult::Err(format!("kj drift merge: failed to insert drift block: {e}")),
-        };
-        self.offer_drift(target_id, block);
-
-        // Record drift edge
+        match self
+            .deliver_drift(context_id, target_id, &summary, source_model, DriftKind::Merge, "merge".into(), caller.actor_id, caller)
+            .await
         {
-            let db = self.kernel_db().lock();
-            let edge = crate::kernel_db::ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id: context_id,
-                target_id,
-                metadata: Some("merge".to_string()),
-                created_at: kaijutsu_types::now_millis() as i64,
-            };
-            if let Err(e) = db.insert_edge(&edge) {
-                tracing::warn!("failed to insert merge drift edge: {e}");
+            Ok(DriftDeliveryOutcome::Complete) => {}
+            Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => {
+                return KjResult::Err(format!(
+                    "kj drift merge: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
+                ));
             }
-        }
-
-        let lifecycle = crate::rc::run(
-            self,
-            crate::rc::RcInvocation {
-                drift: Some(crate::rc::DriftInfo {
-                    kind: DriftKind::Merge,
-                    source_ctx: context_id,
-                    target_ctx: target_id,
-                    source_model,
-                }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
-            },
-            caller,
-        )
-            .await;
-        if caller.cancel.is_cancelled() {
-            let error = lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into());
-            return KjResult::Err(format!(
-                "kj drift merge: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
-            ));
-        }
-        if let Err(error) = lifecycle {
-            return KjResult::Err(format!(
-                "kj drift merge: delivery and edge were committed, but its rc lifecycle could not settle: {error}"
-            ));
+            Ok(DriftDeliveryOutcome::LifecycleFault(error)) => {
+                return KjResult::Err(format!(
+                    "kj drift merge: delivery and edge were committed, but its rc lifecycle could not settle: {error}"
+                ));
+            }
+            Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
         }
 
         // Preview: first ~200 chars
@@ -792,90 +711,48 @@ impl KjDispatcher {
                 failed.push(drift);
                 continue;
             }
-            let admission = match self.kernel().admit_context(drift.target_ctx) {
-                Ok(admission) => admission,
-                Err(error) => {
-                    tracing::warn!(target = %drift.target_ctx.short(),
-                        "drift flush: {error}, requeuing");
-                    failed.push(drift);
-                    continue;
-                }
-            };
-            let after = self.block_store().last_block_id(drift.target_ctx);
             // The author is whoever STAGED this item, not whoever is running
-            // flush — see `StagedDrift::staged_by`.
-            match self.block_store().insert_drift_block_as(
-                drift.target_ctx,
-                None,
-                after.as_ref(),
-                drift.content.clone(),
-                source_ctx,
-                drift.source_model.clone(),
-                drift.drift_kind,
-                Some(drift.staged_by),
-            ) {
-                Ok(block) => {
+            // flush — see `StagedDrift::staged_by`. The pre-flush staged id
+            // goes in the edge metadata so post-flush queries can trace back
+            // to the staging event (the same namespace `kj drift cancel`
+            // uses).
+            let delivered = self
+                .deliver_drift(
+                    source_ctx,
+                    drift.target_ctx,
+                    &drift.content,
+                    drift.source_model.clone(),
+                    drift.drift_kind,
+                    format!("{}#{}", drift.drift_kind, drift.id),
+                    drift.staged_by,
+                    caller,
+                )
+                .await;
+            match delivered {
+                Ok(outcome) => {
                     injected += 1;
-                    self.offer_drift(drift.target_ctx, block);
                     // Delivered — clear the in-flight bookkeeping `drain`
                     // set so this item stops showing up in `queue()` and a
                     // stray `cancel` on its id becomes a normal "not found"
-                    // instead of silently doing nothing. Lock is taken and
-                    // dropped here, never held across the `.await` below.
+                    // instead of silently doing nothing.
                     self.drift_router().write().complete(drift.id);
-
-                    // Record the drift edge in context_edges so `kj drift
-                    // history` can find it. `drift_kind` and `source_model`
-                    // are recoverable from the inserted block itself, but we
-                    // stash the pre-flush staged id in metadata so post-flush
-                    // queries can trace back to the staging event (the same
-                    // namespace `kj drift cancel` uses).
-                    {
-                        let db = self.kernel_db().lock();
-                        let edge = crate::kernel_db::ContextEdgeRow {
-                            edge_id: uuid::Uuid::now_v7(),
-                            source_id: source_ctx,
-                            target_id: drift.target_ctx,
-                            metadata: Some(format!("{}#{}", drift.drift_kind, drift.id)),
-                            created_at: kaijutsu_types::now_millis() as i64,
-                        };
-                        if let Err(e) = db.insert_edge(&edge) {
-                            tracing::warn!(
-                                "drift flush: failed to insert edge {} → {}: {e}",
-                                source_ctx.short(),
-                                drift.target_ctx.short()
-                            );
+                    match outcome {
+                        DriftDeliveryOutcome::Complete => {}
+                        DriftDeliveryOutcome::LifecycleCancelled(_) => {
+                            released.extend(staged);
+                            lifecycle_cancelled = true;
+                            break;
                         }
-                    }
-
-                    let lifecycle = crate::rc::run(
-                        self,
-                        crate::rc::RcInvocation {
-                            drift: Some(crate::rc::DriftInfo {
-                                kind: drift.drift_kind,
-                                source_ctx,
-                                target_ctx: drift.target_ctx,
-                                source_model: drift.source_model.clone(),
-                            }),
-                            ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
-                        },
-                        caller,
-                    )
-                        .await;
-                    if caller.cancel.is_cancelled() {
-                        released.extend(staged);
-                        lifecycle_cancelled = true;
-                        break;
-                    }
-                    if let Err(error) = lifecycle {
-                        released.extend(staged);
-                        lifecycle_fault = Some(error);
-                        break;
+                        DriftDeliveryOutcome::LifecycleFault(error) => {
+                            released.extend(staged);
+                            lifecycle_fault = Some(error);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "drift flush failed: {} → {}: {e}",
+                        "drift flush failed: {} → {}: {e}, requeuing",
                         source_ctx.short(),
                         drift.target_ctx.short()
                     );
@@ -1034,22 +911,6 @@ impl KjDispatcher {
         }
     }
 
-    /// The lost+found context id, creating the context if this kernel has none.
-    ///
-    /// Lookup order is router cache → well-known registry → mint
-    /// (docs/drifting-dead-letters.md, slice 1). The registry step is what
-    /// keeps a cold start from minting a duplicate: a fresh `DriftRouter` has
-    /// no cache, and without consulting `WellKnownRole::LostFound` first this
-    /// would mint a second lost+found every time it ran before cold-start
-    /// recovery (`rpc.rs`) got around to adopting the persisted one.
-    ///
-    /// Order matters on the mint path and is the point of this helper: the
-    /// `documents` row (via the block store), the `contexts` row, and the
-    /// registry row all land BEFORE the router claims the handle, so the "a
-    /// registered handle implies a KernelDb row" invariant holds even when a
-    /// DB write fails. A failure rolls the document back and returns `Err` —
-    /// the caller keeps its dead letters queued rather than writing them into
-    /// a context that isn't there.
     /// Make sure the drift router has a durable backing before an item is
     /// staged into it (docs/drifting-dead-letters.md, slice 3).
     ///
@@ -1085,113 +946,14 @@ impl KjDispatcher {
         Ok(())
     }
 
+    /// The lost+found context id; see [`crate::drift::ensure_lost_found_context`].
     fn ensure_lost_found_context(&self) -> Result<ContextId, String> {
-        // 1. Router cache — cheap, and correct once this process has resolved
-        //    lost+found at least once.
-        if let Some(id) = self.drift_router().read().lost_found_id() {
-            return Ok(id);
-        }
-
-        // 2. Well-known registry — a persisted assignment from this kernel's
-        //    history (this process's own earlier mint, a prior process, or a
-        //    rotation). A hit means the row already exists; adopt it into the
-        //    router rather than minting a duplicate.
-        {
-            let registry_hit = self
-                .kernel_db()
-                .lock()
-                .well_known_context(crate::kernel_db::WellKnownRole::LostFound);
-            match registry_hit {
-                Ok(Some(id)) => {
-                    self.drift_router().write().adopt_lost_found(id);
-                    return Ok(id);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "well-known registry lookup for lost+found failed, minting instead: {e}"
-                    );
-                }
-            }
-        }
-
-        // 3. Mint.
-        let id = ContextId::new();
-        let system = kaijutsu_types::PrincipalId::system();
-
-        // 3a. The document — this is what writes the `documents` row.
-        self.block_store()
-            .create_document(id, crate::DocumentKind::Conversation, None)
-            .map_err(|e| format!("failed to create lost+found document: {e}"))?;
-
-        // 3b. The context row (+ registry row), so cold start rehydrates and
-        //     re-adopts it and the dead letters survive a restart.
-        let persist: Result<String, String> = {
-            let db = self.kernel_db().lock();
-            let now = kaijutsu_types::now_millis() as i64;
-            // A rotation leaves the incumbent registered under "lost+found"
-            // (rotate_lost_found only vacates the registry role, it does not
-            // rename or unregister the outgoing context) — so a fresh mint
-            // must never collide with it. Disambiguate instead of renaming
-            // the incumbent.
-            match db.find_context_by_label("lost+found") {
-                Err(e) => Err(format!("failed to check lost+found label: {e}")),
-                Ok(existing) => {
-                    let label = match existing {
-                        Some(_) => format!("lost+found-{}", id.short()),
-                        None => "lost+found".to_string(),
-                    };
-                    db.get_or_create_default_workspace(system)
-                        .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
-                        .and_then(|ws| {
-                            let row = crate::kernel_db::ContextRow {
-                                context_id: id,
-                                label: Some(label.clone()),
-                                system_prompt: None,
-                                context_state: kaijutsu_types::ContextState::Live,
-                                context_type: "default".to_string(),
-                                created_at: now,
-                                created_by: system,
-                                forked_from: None,
-                                fork_kind: None,
-                                archived_at: None,
-                                workspace_id: Some(ws),
-                                preset_id: None,
-                                concluded_at: None,
-                                last_activity_at: None,
-                                promoted_at: None,
-                                demoted_at: None,
-                                paused_at: None,
-                                origin_host: None,
-                                played_by: None,
-                            };
-                            db.insert_well_known_context(&row, ws, crate::kernel_db::WellKnownRole::LostFound)
-                                .map_err(|e| format!("failed to publish lost+found context: {e}"))
-                        })
-                        .map(|_| label)
-                }
-            }
-        };
-        let label = match persist {
-            Ok(label) => label,
-            Err(e) => {
-                // Roll the document back so a retry starts clean instead of
-                // leaving an orphan `documents` row behind per attempt.
-                if let Err(cleanup) = self.block_store().delete_document(id) {
-                    tracing::error!(
-                        context = %id.short(),
-                        "lost+found rollback failed, orphan document row left behind: {cleanup}"
-                    );
-                }
-                return Err(e);
-            }
-        };
-
-        // 3c. Only now is a handle legitimate.
-        self.drift_router()
-            .write()
-            .claim_lost_found(id, &label)
-            .map_err(|e| format!("failed to claim lost+found: {e}"))
+        crate::drift::ensure_lost_found_context(
+            self.drift_router(),
+            self.block_store(),
+            self.kernel_db(),
+        )
+        .map_err(|e| e.to_string())
     }
 
     async fn drift_queue(&self) -> KjResult {
@@ -2878,6 +2640,147 @@ mod tests {
             "msg: {}",
             result.message()
         );
+    }
+
+    /// `drift merge` refuses an archived target the way `push` does, and
+    /// before it distills anything: the child here has no blocks, so a
+    /// merge that reached distillation would fail with "no blocks" instead.
+    #[tokio::test]
+    async fn drift_merge_refuses_an_archived_target_before_distilling() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
+        d.block_store().create_document(parent, crate::DocumentKind::Conversation, None).unwrap();
+        d.block_store().create_document(child, crate::DocumentKind::Conversation, None).unwrap();
+        d.kernel_db().lock().archive_context(parent).unwrap();
+
+        let result = d.dispatch(&[s("drift"), s("merge")], &caller_with_context(child)).await;
+        assert!(!result.is_ok(), "an archived target must refuse a merge");
+        assert!(result.message().contains("archived"), "msg: {}", result.message());
+        let blocks = d.block_store().block_snapshots(parent).unwrap();
+        assert!(!blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift), "{blocks:?}");
+    }
+
+    /// Register a mock LLM answering every distillation with `summary`. The
+    /// context that distills needs a `distill` slot from
+    /// `register_context_with_model`.
+    async fn mock_distiller(d: &crate::kj::KjDispatcher, summary: &str) {
+        use crate::llm::{MockClient, Provider};
+        let mut reg = d.kernel().llm().write().await;
+        reg.register("mock", std::sync::Arc::new(Provider::Mock(MockClient::new(summary))));
+    }
+
+    /// Run `argv` as `caller` while `dst` has a running turn and a `drift` rc
+    /// script that blocks, and return what that turn had been offered when
+    /// the script ran. The caller is cancelled once the script is seen, so
+    /// the verb returns without waiting for the script to end.
+    async fn offered_while_drift_rc_runs(
+        d: &std::sync::Arc<crate::kj::KjDispatcher>,
+        dst: kaijutsu_types::ContextId,
+        argv: &[String],
+        caller: &crate::kj::KjCaller,
+    ) -> Vec<crate::runtime::turn_state::LiveInput> {
+        d.kernel_db().lock().update_context_type(dst, "drift-order").unwrap();
+        install_rc_script_file(
+            d,
+            "/config/rc/drift-order/drift/S00-block.kai",
+            "kj block create --role system --kind notification --content drift-rc-ran; sleep 10",
+        )
+        .await;
+        let turns = d.kernel().turns();
+        let lease = turns.begin(dst);
+        turns.open_ingress(dst, lease.id(), lease.interrupt());
+
+        let verb = d.dispatch(argv, caller);
+        tokio::pin!(verb);
+        let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
+        let offered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut verb => panic!("the verb ended before its drift rc ran: {}", crate::kj::KjResult::message(&result)),
+                    _ = inspect.tick() => {
+                        let blocks = d.block_store().block_snapshots(dst).unwrap_or_default();
+                        if blocks.iter().any(|block| block.content == "drift-rc-ran") {
+                            break turns.close_ingress(dst, lease.id());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the drift rc script must run");
+        caller.cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut verb)
+            .await
+            .expect("the verb must end after cancellation");
+        offered
+    }
+
+    /// Pull, merge, and flush run the target's `drift` rc before they offer
+    /// the drift block to its running turn, as push does, so the turn wakes
+    /// with the rc output already in the log.
+    #[tokio::test]
+    async fn drift_pull_runs_its_rc_before_waking_the_turn() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("order-source"), None, principal);
+        let dest = register_context_with_model(&d, Some("order-dest"), None, principal, &["distill"]);
+        for ctx in [source, dest] {
+            d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        }
+        d.block_store()
+            .insert_block(
+                source, None, None, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text,
+                "material", kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        mock_distiller(&d, "PULL-SUMMARY").await;
+
+        let argv = [s("drift"), s("pull"), s("order-source")];
+        let offered = offered_while_drift_rc_runs(&d, dest, &argv, &caller_with_context(dest)).await;
+        assert!(offered.is_empty(), "the drift was offered before its rc ran: {offered:?}");
+    }
+
+    #[tokio::test]
+    async fn drift_merge_runs_its_rc_before_waking_the_turn() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("order-parent"), None, principal);
+        let child = register_context_with_model(&d, Some("order-child"), Some(parent), principal, &["distill"]);
+        for ctx in [parent, child] {
+            d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        }
+        d.block_store()
+            .insert_block(
+                child, None, None, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text,
+                "material", kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        mock_distiller(&d, "MERGE-SUMMARY").await;
+
+        let argv = [s("drift"), s("merge")];
+        let offered = offered_while_drift_rc_runs(&d, parent, &argv, &caller_with_context(child)).await;
+        assert!(offered.is_empty(), "the drift was offered before its rc ran: {offered:?}");
+    }
+
+    #[tokio::test]
+    async fn drift_flush_runs_its_rc_before_waking_the_turn() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("order-sender"), None, principal);
+        let dst = register_context(&d, Some("order-receiver"), None, principal);
+        d.block_store().create_document(dst, crate::DocumentKind::Conversation, None).unwrap();
+        let caller = caller_with_context(src);
+        let staged = d.dispatch(&[s("drift"), s("push"), s("--stage"), s("order-receiver"), s("staged")], &caller).await;
+        assert!(staged.is_ok(), "stage failed: {}", staged.message());
+
+        let argv = [s("drift"), s("flush")];
+        let offered = offered_while_drift_rc_runs(&d, dst, &argv, &caller).await;
+        assert!(offered.is_empty(), "the drift was offered before its rc ran: {offered:?}");
     }
 
     /// End-to-end coverage for `summarize`'s merge path (mirrors

@@ -74,14 +74,6 @@ pub enum ActiveSurface {
 }
 
 impl ActiveSurface {
-    /// Symmetric toggle between Chat and Shell.
-    pub fn toggle(&mut self) {
-        *self = match self {
-            Self::Chat => Self::Shell,
-            Self::Shell => Self::Chat,
-        };
-    }
-
     pub fn is_shell(&self) -> bool {
         matches!(self, Self::Shell)
     }

@@ -1,1 +1,0 @@
-The command deletes /src/app/.partb, a scratch copy inside the workspace that the brief says was made only to split the diff, after the commit is done. It is ordinary files from the seat's own work, not a database or system state, so it needs no backup. Nothing outside the workspace changes and nothing uses the network.

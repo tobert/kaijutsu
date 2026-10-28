@@ -2957,21 +2957,21 @@ impl BlockStore {
     /// one-time single-context scan and populates the cache — it does NOT
     /// default to `Pending` for an unread context. A context with no
     /// document at all (never existed, or not yet hydrated from the DB) has
-    /// no blocks to be `Running`/`Error` about, so `Pending` is correct there.
+    /// no blocks to be `Running`/`Error` about, so it reads as `Pending`,
+    /// uncached: once it loads, its blocks decide.
     pub fn live_status(&self, context_id: ContextId) -> Status {
         let entry = self.get(context_id);
         if let Some(status) = self.live_status.get(&context_id) {
             return *status;
         }
-        let computed = match entry.as_ref() {
-            Some(entry) => {
-                // Status-only, same reasoning as `journal_op`'s recompute:
-                // no need to materialize every block's text for a one-time
-                // cold-cache fill.
-                derive_context_live_status(&entry.doc.statuses_ordered())
-            }
-            None => Status::Pending,
+        // A context that is not loaded reads as Pending without caching it,
+        // so its blocks decide the status once it loads.
+        let Some(entry) = entry else {
+            return Status::Pending;
         };
+        // Status-only, same reasoning as `journal_op`'s recompute: no need to
+        // materialize every block's text for a one-time cold-cache fill.
+        let computed = derive_context_live_status(&entry.doc.statuses_ordered());
         self.live_status.insert(context_id, computed);
         computed
     }
@@ -4606,6 +4606,36 @@ mod tests {
 
         store.delete_document(ctx).unwrap();
         assert!(store.get(ctx).is_none());
+    }
+
+    /// A mutation of a deleted block is refused before it changes the
+    /// document, so the context stays usable and re-deleting journals nothing.
+    #[test]
+    fn mutating_a_deleted_block_is_refused_and_the_context_stays_usable() {
+        use crate::blocks::BlockDocumentError;
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let id = store
+            .insert_block(ctx, None, None, Role::User, BlockKind::Text, "gone", Status::Done, ContentType::Plain)
+            .unwrap();
+        store.delete_block(ctx, &id).unwrap();
+        let version = store.version(ctx).unwrap();
+
+        let refused = |name: &str, result: BlockStoreResult<()>| {
+            assert!(
+                matches!(result, Err(BlockStoreError::Block(BlockDocumentError::BlockNotFound(b))) if b == id),
+                "{name} on a deleted block must be refused, got {result:?}"
+            );
+        };
+        refused("set_excluded", store.set_excluded(ctx, &id, true));
+        refused("set_ephemeral", store.set_ephemeral(ctx, &id, true));
+        refused("set_content_type", store.set_content_type(ctx, &id, ContentType::Markdown));
+        refused("set_exit_code", store.set_exit_code(ctx, &id, Some(1)));
+        refused("delete_block", store.delete_block(ctx, &id));
+
+        assert_eq!(store.version(ctx).unwrap(), version, "a refused mutation must not bump the version");
+        assert!(store.get(ctx).is_some(), "the context must stay usable");
     }
 
     #[test]
@@ -8403,6 +8433,23 @@ mod tests {
 
         let eager = drop_and_reload(db, ws);
         assert_eq!(eager.version(ctx).unwrap(), before);
+    }
+
+    /// Asking for the live status of a context that is not loaded yet must
+    /// not pin a guess: once it loads, its blocks decide the status.
+    #[test]
+    fn live_status_of_an_unloaded_context_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+        store
+            .insert_block(ctx, None, None, Role::Model, BlockKind::Text, "failed", Status::Error, ContentType::Plain)
+            .unwrap();
+        drop(store);
+
+        let lazy = BlockStore::with_db(db, ws, PrincipalId::system());
+        assert_eq!(lazy.live_status(ctx), Status::Pending, "nothing is loaded yet");
+        assert!(lazy.load_one_from_db(ctx).unwrap());
+        assert_eq!(lazy.live_status(ctx), Status::Error);
     }
 
     /// A snapshot row that fails to decode must refuse the context loudly

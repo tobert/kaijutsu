@@ -3518,3 +3518,74 @@ contract tree, and the other two asked it for changes instead of editing
 it, after two of us wrote the same `check_ask` at the same moment. The
 servers pin gogi by git rev, so one session's work in progress no longer
 breaks another's build.
+
+## The root takes a seat (October 25)
+
+The root console started as a REPL: a root's chat draft ran as shell on every
+submit (`64870bbd`). Amy used it and found the wrong shape. The shell belongs
+behind a key, not on every submit, so the routing was reverted (`91b6ed90`).
+What she wanted was a root with a model, and a shell beside it. Ctrl-Z in a
+root opens its child shell context, type `shell`, which has no model and whose
+chat submit runs as shell. The output stays in that child's log, and reaches
+the model only by fork or drift. Ctrl-Z in the shell returns to the root.
+
+The root's model is a cast like any other seat's. Its stance names the
+privileged position and asks for care, and its `kj` requests go through the
+regular approval policy. Amy chose that over a root-only override, and noted
+that a bump may come later. Root approvals need a reviewer distinct from the
+root's performer, so the only human above the root is Amy, who answers its
+asks. Council review for the root was rejected: the root is where Amy goes
+when the council is failing.
+
+Both clients got the same behavior, and this is the part to keep. The TUI and
+app Ctrl-Z share one decision (`ctrl_z::toggle` in each client, same rules,
+same tests), and both clients open into their last context, else the live
+root (`kaijutsu_client::start_candidate`). The TUI's double Ctrl-Z suspends,
+as a shell job would. The app has no such suspend. Each change got a
+failing test first, then kaibo reviewed the staged diff before the commit.
+Kaibo found no bugs in any of them. It did find stale rows in
+`docs/character.md` and `docs/approval-identity.md` that still said roots
+could not perform, and those were fixed before landing.
+
+The old in-context chat/shell toggle was dead once Ctrl-Z moved, and it came
+out (`531fea08`). Git keeps its history. Deploying the kernel meant rebuilding
+the container image and restarting `kaijutsu.service`, which abandoned four
+pending asks from earlier MCP sessions. Those sessions retry, and the restart
+was otherwise clean.
+
+## Bootstrap, and the review comes due (October 27)
+
+A fresh `init` left a kernel with no backend, no model and no console.
+Amy wanted one step from nothing to a ROOT that answers: experienced users
+"don't want to learn all this silly syntax. That's why they're using an
+agent." `kaijutsu-server bootstrap` writes the root character and key
+directly, then runs real `kj` verbs on an offline-booted kernel, each only
+when its result is missing (`387486e9`). `kj` stays for direct changes. The
+ACP fleet, solo-acp and the bench harness went the same day; what they
+covered in the kernel moved into the server E2E suites, standing up their
+kernels with bootstrap (`c2c8e120`, `e3a39dd2`, `f29dd492`).
+
+Re-bootstrapping spaceghost from fresh data was the first real run, and it
+found two gaps. A model bootstrap had no window for got no model row and no
+word about it; now the report names it (`321918af`). In the container `~` is
+the data directory and the keys sit under `/run/secrets`, so detection finds
+nothing, and `docs/container.md` now shows `--backend` with
+`--api-key-file`. Bootstrap makes no casts, so ROOT runs on the default.
+
+The October 14 renovation review had sat untracked for two weeks. A
+subagent checked all 39 findings against main: 38 still held in some form,
+because most of the audited files had not changed. Three worktree agents
+then took disjoint batches, each finding red/green, and 21 fixes landed by
+cherry-pick. The worst were the quiet ones: a failed buffer read that
+truncated the host file, an index load failure that deleted synthesis rows,
+an SFTP rename that unlinked first, a tombstoned-block edit that poisoned a
+context. Three findings were wrong or deliberate. The beat grid's small
+catch-up is doctrine, pinned by a test, so the audit's "never catch up" was
+the error. The rest is one `issues.md` section, and the review lives in git
+(`d54a4fed`).
+
+The app's Esc Esc left compose, so a stray second Esc sent the next `dd` to
+the block list (`96766b0d`). Esc in compose now belongs to vi alone, as it
+already did in the TUI. Amy's lost prompt turned out to be a slow echo: the
+submit reply waits for turn startup, so the editor keeps the text while the
+kernel has already committed it.

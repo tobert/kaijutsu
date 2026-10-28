@@ -785,13 +785,19 @@ impl DriftRouter {
         let Some(p) = &self.persistence else {
             return;
         };
-        if let Some(block_id) = self.persisted_blocks.remove(&staged_id)
-            && let Err(e) = p.blocks.set_status(p.queue_ctx, &block_id, Status::Done)
-        {
-            tracing::error!(
+        let Some(&block_id) = self.persisted_blocks.get(&staged_id) else {
+            return;
+        };
+        // On failure the record stays mapped and Pending; rehydrate keeps
+        // only the latest record per drift id.
+        match p.blocks.set_status(p.queue_ctx, &block_id, Status::Done) {
+            Ok(()) => {
+                self.persisted_blocks.remove(&staged_id);
+            }
+            Err(e) => tracing::error!(
                 drift_id = staged_id,
                 "failed to mark drift-queue block consumed: {e}"
-            );
+            ),
         }
     }
 
@@ -813,6 +819,10 @@ impl DriftRouter {
     /// moment a process starts, so recovered items always come back with
     /// `in_flight`/`cancelled` cleared even if the persisted record predates
     /// that (a crash mid-flush cannot leave a phantom in-flight item behind).
+    ///
+    /// A drift id with more than one Pending record (a superseded record
+    /// whose consumption failed) restores once, from its latest record; the
+    /// earlier records are marked consumed.
     pub fn rehydrate_from_block_log(&mut self) -> Result<(), DriftError> {
         let Some(p) = &self.persistence else {
             return Ok(());
@@ -826,6 +836,7 @@ impl DriftRouter {
         self.staging.clear();
         self.dead_letter.clear();
         self.persisted_blocks.clear();
+        let mut superseded = Vec::new();
 
         for block in &snapshots {
             if block.status != Status::Pending {
@@ -843,13 +854,22 @@ impl DriftRouter {
                 }
             };
             self.next_staged_id = self.next_staged_id.max(payload.drift.id + 1);
-            self.persisted_blocks.insert(payload.drift.id, block.id);
+            if let Some(earlier) = self.persisted_blocks.insert(payload.drift.id, block.id) {
+                superseded.push(earlier);
+                self.staging.retain(|d| d.id != payload.drift.id);
+                self.dead_letter.retain(|d| d.id != payload.drift.id);
+            }
             let mut item = payload.drift;
             item.in_flight = false;
             item.cancelled = false;
             match payload.slot {
                 QueueSlot::Staging => self.staging.push(item),
                 QueueSlot::DeadLetter => self.dead_letter.push(item),
+            }
+        }
+        for block_id in superseded {
+            if let Err(e) = p.blocks.set_status(p.queue_ctx, &block_id, Status::Done) {
+                tracing::error!(?block_id, "failed to mark a superseded drift-queue record consumed: {e}");
             }
         }
 
@@ -1149,12 +1169,17 @@ impl DriftRouter {
     /// Move a dead-letter item back into the staging queue by id (M2-B4).
     ///
     /// Resets `retry_count` to 0 so the requeued item gets a full set of
-    /// retry attempts. Returns the requeued drift on success, or `None` if
-    /// no dead-letter entry has the given id.
+    /// retry attempts, and clears `in_flight` and `cancelled` so it drains
+    /// even if a lost+found flush had checked it out; that flush's
+    /// [`ack_dead_letter`](Self::ack_dead_letter) then returns `false`.
+    /// Returns the requeued drift on success, or `None` if no dead-letter
+    /// entry has the given id.
     pub fn replay_dead_letter(&mut self, id: u64) -> Option<StagedDrift> {
         let pos = self.dead_letter.iter().position(|d| d.id == id)?;
         let mut item = self.dead_letter.remove(pos);
         item.retry_count = 0;
+        item.in_flight = false;
+        item.cancelled = false;
         // Consume the dead-letter record, write a fresh staging one.
         self.mark_consumed(item.id);
         self.persist_item(QueueSlot::Staging, &item);
@@ -1234,13 +1259,127 @@ impl DriftRouter {
     }
 }
 
+/// Resolve (creating if necessary) the lost+found context: the one sink for
+/// content the kernel accepted but could not deliver. Dead-letter drifts and
+/// undeliverable track-failure feedback both land here.
+///
+/// Lookup order is router cache, then the well-known registry, then mint
+/// (`docs/drifting-dead-letters.md`). The registry step keeps a cold start
+/// from minting a duplicate: a fresh router has no cache, and without
+/// consulting `WellKnownRole::LostFound` first this would mint a second
+/// lost+found before cold-start recovery adopted the persisted one.
+///
+/// On the mint path the `documents` row, the `contexts` row, and the registry
+/// row all land before the router claims the handle, so a registered handle
+/// always implies a `KernelDb` row. A failure rolls the document back and
+/// returns `Err`; the caller keeps its undeliverable content rather than
+/// writing it into a context that does not exist.
+pub fn ensure_lost_found_context(
+    router: &SharedDriftRouter,
+    blocks: &SharedBlockStore,
+    kernel_db: &Mutex<KernelDb>,
+) -> Result<ContextId, DriftError> {
+    // 1. Router cache.
+    if let Some(id) = router.read().lost_found_id() {
+        return Ok(id);
+    }
+
+    // 2. Well-known registry: a persisted assignment from this kernel's
+    //    history (an earlier mint, a prior process, or a rotation). A hit
+    //    means the row already exists; adopt it rather than mint a duplicate.
+    {
+        let registry_hit = kernel_db.lock().well_known_context(WellKnownRole::LostFound);
+        match registry_hit {
+            Ok(Some(id)) => {
+                router.write().adopt_lost_found(id);
+                return Ok(id);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "well-known registry lookup for lost+found failed, minting instead: {e}"
+                );
+            }
+        }
+    }
+
+    // 3. Mint.
+    let id = ContextId::new();
+    let system = PrincipalId::system();
+
+    blocks
+        .create_document(id, crate::DocumentKind::Conversation, None)
+        .map_err(|e| {
+            DriftError::DocumentError(format!("failed to create lost+found document: {e}"))
+        })?;
+
+    let persist: Result<String, String> = {
+        let db = kernel_db.lock();
+        let now = kaijutsu_types::now_millis() as i64;
+        // A rotation leaves the incumbent registered under "lost+found"
+        // (`rotate_lost_found` only vacates the registry role), so a fresh
+        // mint must never collide with it. Disambiguate instead of renaming
+        // the incumbent.
+        match db.find_context_by_label("lost+found") {
+            Err(e) => Err(format!("failed to check lost+found label: {e}")),
+            Ok(existing) => {
+                let label = match existing {
+                    Some(_) => format!("lost+found-{}", id.short()),
+                    None => "lost+found".to_string(),
+                };
+                db.get_or_create_default_workspace(system)
+                    .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
+                    .and_then(|ws| {
+                        let row = ContextRow {
+                            context_id: id,
+                            label: Some(label.clone()),
+                            system_prompt: None,
+                            context_state: ContextState::Live,
+                            context_type: "default".to_string(),
+                            created_at: now,
+                            created_by: system,
+                            forked_from: None,
+                            fork_kind: None,
+                            archived_at: None,
+                            workspace_id: Some(ws),
+                            preset_id: None,
+                            concluded_at: None,
+                            last_activity_at: None,
+                            promoted_at: None,
+                            demoted_at: None,
+                            paused_at: None,
+                            origin_host: None,
+                            played_by: None,
+                        };
+                        db.insert_well_known_context(&row, ws, WellKnownRole::LostFound)
+                            .map_err(|e| format!("failed to publish lost+found context: {e}"))
+                    })
+                    .map(|_| label)
+            }
+        }
+    };
+    let label = match persist {
+        Ok(label) => label,
+        Err(e) => {
+            // Roll the document back so a retry starts clean instead of
+            // leaving an orphan `documents` row behind per attempt.
+            if let Err(cleanup) = blocks.delete_document(id) {
+                tracing::error!(
+                    context = %id.short(),
+                    "lost+found rollback failed, orphan document row left behind: {cleanup}"
+                );
+            }
+            return Err(DriftError::DocumentError(e));
+        }
+    };
+
+    // Only now is a handle legitimate.
+    router.write().claim_lost_found(id, &label)
+}
+
 /// Resolve (creating if necessary) the durable drift-queue context that
-/// backs [`DriftRouter::attach_persistence`] — the slice-3 counterpart to
-/// `KjDispatcher::ensure_lost_found_context` (`kj/drift.rs`), which this
-/// mirrors: router cache → well-known registry → mint. It lives here rather
-/// than there because `WellKnownRole::DriftQueue` and the persistence it
-/// backs are this router's concern, and because `kj/drift.rs` is a
-/// different lane's file this slice does not touch.
+/// backs [`DriftRouter::attach_persistence`]. It mirrors
+/// [`ensure_lost_found_context`]: router cache → well-known registry → mint.
 ///
 /// Unlike lost+found there is no rotation story for this role yet, so there
 /// is no reserved-label disambiguation to do on mint — `"drift-queue"` is
@@ -1893,6 +2032,30 @@ mod tests {
 
         // Replay of a missing id is a no-op.
         assert!(router.replay_dead_letter(99_999).is_none());
+    }
+
+    /// Replaying a dead letter that a lost+found flush has checked out puts
+    /// it back in staging as a fresh, drainable item.
+    #[test]
+    fn a_replayed_checked_out_dead_letter_drains() {
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("tgt"), None, PrincipalId::system()).unwrap();
+        let id = router
+            .stage(src, tgt, "fail".into(), None, DriftKind::Push, PrincipalId::new())
+            .unwrap();
+        for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+            let drained = router.drain(None);
+            router.requeue(drained);
+        }
+        assert_eq!(router.drain_dead_letter().len(), 1);
+
+        router.replay_dead_letter(id).expect("replay");
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 1, "the replayed item must be deliverable");
+        assert_eq!(drained[0].id, id);
     }
 
     #[test]
@@ -3546,6 +3709,35 @@ mod tests {
             let dl = router2.dead_letters();
             assert_eq!(dl.len(), 1, "a restored-after-failed-write dead letter must survive a restart");
             assert_eq!(dl[0].content, "write failed, restored");
+        }
+
+        /// A record whose consumption failed stays Pending beside the fresh
+        /// record for the same item. Rehydrate keeps the later record, marks
+        /// the earlier one consumed, and so restores the item once.
+        #[test]
+        fn rehydrate_keeps_one_entry_per_drift_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, blocks) = open_store(&dir.path().join("t.db"));
+            let (mut router, queue_ctx, src, tgt) = attached_router(&blocks);
+            let id = router
+                .stage(src, tgt, "twice recorded".into(), None, DriftKind::Push, PrincipalId::new())
+                .unwrap();
+            for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+                let drained = router.drain(None);
+                router.requeue(drained);
+            }
+            blocks.arm_accept_fault(1);
+            router.replay_dead_letter(id).expect("replay");
+            let pending = |blocks: &SharedBlockStore| {
+                blocks.block_snapshots(queue_ctx).unwrap().iter().filter(|b| b.status == Status::Pending).count()
+            };
+            assert_eq!(pending(&blocks), 2, "fixture: the dead-letter record was not consumed");
+
+            router.rehydrate_from_block_log().unwrap();
+            assert!(router.dead_letters().is_empty(), "the later staging record wins");
+            assert_eq!(router.queue().len(), 1);
+            assert_eq!(router.queue()[0].id, id);
+            assert_eq!(pending(&blocks), 1, "the superseded record is consumed");
         }
 
         #[test]

@@ -424,9 +424,6 @@ receivers:
     start_at: beginning
 ```
 
-The Harbor adapter sets `KAIJUTSU_OTEL_FILE_DIR=/logs/agent/otel` by default;
-see `contrib/bench/harbor/README.md`.
-
 ## Per-Context Traces
 
 Each context gets a `trace_id` ([u8; 16], UUIDv4) at registration time. Every RPC

@@ -780,11 +780,19 @@ impl RegisterFailure {
         }
     }
 
-    /// A failed `kj kohai create`, reported as `message`.
+    /// A failed `kj kohai create`, reported as `message`. A held create
+    /// also says how to join once the reviewer allows it.
     fn create(message: String, error: &kaijutsu_client::CreateContextError) -> Self {
         match error {
             kaijutsu_client::CreateContextError::Refused(_) => Self::Verdict(message),
             kaijutsu_client::CreateContextError::Unread(_) => Self::Fault(message),
+            kaijutsu_client::CreateContextError::Held { .. } => Self::Verdict(format!(
+                "{message}\nThis session is not joined. When the reviewer allows the create, \
+                 the kernel creates the context; then call register_session again with the \
+                 same label to join it. If the kernel cannot use this agent's directory when \
+                 the create runs, the context starts without it; after joining, set one with \
+                 `kj context set . --cwd DIR`."
+            )),
             kaijutsu_client::CreateContextError::Call(e) => Self::call(message, e),
         }
     }
@@ -1864,7 +1872,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). A created context starts in this agent's working directory; when the kernel cannot see that directory, the context is created without it and the reply's \"cwd_refused\" says why. Returns the context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). A created context starts in this agent's working directory; when the kernel cannot see that directory, the context is created without it and the reply's \"cwd_refused\" says why. When a reviewer must allow the create, the reply names the ask and this session is not joined; call register_session again with the same label after the create is allowed. Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
@@ -3315,6 +3323,13 @@ mod tests {
         assert_eq!(RegisterFailure::create("m".into(), &timed_out), RegisterFailure::Fault("m".into()));
         let unread = kaijutsu_client::CreateContextError::Unread("character 'x' has no sheet".into());
         assert_eq!(RegisterFailure::create("m".into(), &unread), RegisterFailure::Fault("m".into()));
+        let held = kaijutsu_client::CreateContextError::Held {
+            refusal: refusal(kaijutsu_types::RefusalKind::Pending),
+        };
+        let RegisterFailure::Verdict(message) = RegisterFailure::create("m".into(), &held) else {
+            panic!("a held create is the kernel's answer, not a fault");
+        };
+        assert!(message.contains("register_session again"), "{message}");
         assert_eq!(
             RegisterFailure::Verdict("no parent".into()).doing("Error choosing"),
             RegisterFailure::Verdict("Error choosing: no parent".into())

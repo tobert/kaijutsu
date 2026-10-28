@@ -622,13 +622,13 @@ ask", below.
 
 Today (`kj/gate.rs:526`, the one production call site): the caller re-sends
 the statement, the gate re-renders it, re-derives a digest per statement, and
-`find_redeemable` requires an exact **set** match of those digests against
-the ask's stored statements — plus label, context, principal, `status IN
+`find_redeemable` requires an exact match of that digest sequence, in
+order and with repetition, against the ask's stored statements — plus label, context, principal, `status IN
 ('allowed','denied')`, `auto_reason IS NULL`, and not already in
 `approval_redemptions`.
 
 Under Shape B the caller presents `request_id`. Everything in that predicate
-**except the digest set match** still has to hold. The digest comparison is
+**except the digest match** still has to hold. The digest comparison is
 replaced by a direct lookup, and the statement text to execute is read back
 from the ledger (`ask::load_ask_statements`), so there is one copy instead of
 two and nothing to reconcile.
@@ -765,7 +765,7 @@ describe.
 - `approval_redemptions.request_id` is a `PRIMARY KEY` and `redeem_ask`
   decides on the `INSERT`'s row count, so exactly-once is already structural
   and does not change.
-- **`find_redeemable`'s digest set match STAYS, and deleting it would have
+- **`find_redeemable`'s digest match STAYS, and deleting it would have
   been wrong.** It is only removable for an ask that redeems by id, and the
   subscriber does not call `find_redeemable` at all — it looks a row up
   directly. What still uses the matcher is the RETRY path, which is every

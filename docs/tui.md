@@ -448,6 +448,10 @@ harmless: compose always holds the keyboard. On a submit the
 tui sends the newest block the transcript showed as the player's edge, with
 its character count as rendered (`ContextView::edge`, `docs/prompts.md`,
 "The submit verb"). A context that has shown nothing at all sends no edge.
+The kernel replies once the draft commits, before the turn starts, so
+compose clears at once and the promoted block reaches the transcript through
+the change feed. A refused submit leaves the draft as typed and shows the
+kernel's reason on the status line.
 
 Rules the figure carries:
 
@@ -760,14 +764,25 @@ connection leaving `Connected` — with a notice saying so, because the
 stream is the only thing that clears it and a flag nothing clears would
 make `:q` refuse forever.
 
-**The `Ctrl+Z` shell surface retired in favor of `:!`.** `shell.rs`,
-`Intent::ShellToggle`, `CtrlZ::Toggled` and `app.shell` are gone — deleted,
-not deprecated (`CLAUDE.md`, "Kaijutsu is the learning space"). `:kj` and
-`:!` both always act on the context on screen, the same context the old
-shell surface always acted on too, so there is no separate "acting context"
-cursor left to show — the bar draws no context label at all. `Ctrl+Z` is a
-single-press suspend now, not a toggle: leave raw mode, raise `SIGTSTP` on
-ourselves; on `SIGCONT` re-enter raw mode and redraw the viewport. Nothing
+**The `Ctrl+Z` shell surface retired in favor of `:!`, and returned as a
+seat toggle.** `shell.rs`, `Intent::ShellToggle`, `CtrlZ::Toggled` and
+`app.shell` are gone — deleted, not deprecated (`CLAUDE.md`, "Kaijutsu is the
+learning space"). `:kj` and `:!` both always act on the context on screen, so
+the bar draws no context label at all. `Ctrl+Z` now moves the screen between a
+root context and its shell child (`crate::ctrl_z`): from a root it switches to
+the root's live child of type `shell`, labelled `<root-label>-shell`, and
+creates that child under the root the first time; from a shell it switches to
+its parent; from any other context it does nothing and says so on the status
+line. It goes through the seat switch, so the draft and the place in the
+transcript travel with the context.
+
+A double `Ctrl+Z` suspends. The first press always acts (the toggle happens
+at once, and cannot be taken back). A second press within the 500 ms window
+(`DOUBLE_TAP`, the window `Ctrl+C` and `Ctrl+A Ctrl+A` use) leaves raw mode,
+raises `SIGTSTP` on ourselves, and keeps the context the first press landed
+on. The pending first press is cleared after the suspend, so a press after
+`fg` starts a fresh tap. On `SIGCONT` the loop re-enters raw mode and redraws
+the viewport. Nothing
 else needs restoring — the inline viewport leaves the transcript in
 scrollback and the host shell's prompt appears under it; `fg` brings the
 instrument back. Over `ssh -t zorak kaijutsu-tui` that puts zorak's login
@@ -944,6 +959,11 @@ Rules the figure carries:
 - `j`/`k` move, `Tab` hops sections, `Enter` switches, `p d z a c` are the
   placement verbs unchanged, `/` filters, `h` opens the horizon as a filtered
   list. Digits address the ACTIVE seats, as in the well.
+- Each placement verb runs `kj context <verb> <id>` through `executeKj`.
+  A press that comes back latched (`a`, and the `d` step that archives)
+  waits: the same verb on the same row confirms it with `--confirm`, and
+  any other key clears it. A press that ran arms nothing, so `d` after a
+  demote step that ran is another plain step.
 - A switch through the picker keeps each context's own scrolled place, like
   every switch (`docs/tui.md`, "The buffer").
 - The live tail is the context's own last line (`live.rs` tail buffers,
@@ -955,7 +975,7 @@ Rules the figure carries:
   `:kj` line that ran (`App::roster_changed`) starts a refresh round now
   instead of on the next tick, and every round
   rebuilds an open picker over the new roster (`PickerModel::refreshed`):
-  the filter, the open horizon and the archive confirm latch stay, and the
+  the filter, the open horizon and a pending confirm stay, and the
   cursor follows the context it was on — after `p` it sits on the same row
   in ACTIVE. A row that left the roster clamps the cursor into what remains.
 
@@ -1360,8 +1380,9 @@ compose row while a prefix is pending — never the status line, whose seat digi
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
-`Ctrl+Z` is a single-press suspend (`raise SIGTSTP`; `fg` or `SIGCONT`
-brings it back), not a toggle. `:q` (warns first if a turn is known
+`Ctrl+Z` toggles a root context and its shell child (below). A second
+`Ctrl+Z` within 500 ms suspends the process (`raise SIGTSTP`; `fg` or
+`SIGCONT` brings it back). `:q` (warns first if a turn is known
 running) and `:q!` (quits regardless) are the only quits. Amy, on the
 mockup: *"the legend in the status line is awesome, that'll help me a lot, I
 tend to forget keys outside the core stuff I use."* Every overlay (picker,

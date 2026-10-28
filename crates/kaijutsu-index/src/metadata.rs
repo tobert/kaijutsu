@@ -261,6 +261,19 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Remove only `ctx`'s `index_entries` row. Rebuild uses this to repair a
+    /// row with no graph point; the synthesis rows do not depend on graph
+    /// slots and stay.
+    pub fn remove_entry(&mut self, ctx: ContextId) -> Result<(), IndexError> {
+        self.conn
+            .execute(
+                "DELETE FROM index_entries WHERE context_id = ?1",
+                [ctx.as_bytes().as_slice()],
+            )
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Persist a synthesis result for `ctx`, replacing any prior result.
     ///
     /// One transaction: clears this context's rows from all three synthesis

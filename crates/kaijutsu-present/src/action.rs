@@ -25,8 +25,9 @@ pub enum Action {
     FocusCompose,
     /// Summon input overlay in chat mode (i/Space in Navigation)
     SummonChat,
-    /// Toggle active surface between Chat and Shell (Ctrl+Z)
-    ToggleSurface,
+    /// Ctrl+Z: a root context to its live shell child (created on first
+    /// use), and a shell back to its root. Other context types refuse.
+    ToggleShellContext,
     /// Escape / gamepad East — the one "walk up a level" action
     /// (docs/input.md "Escape — two meanings total"):
     /// - Compose → Conversation (via double-Esc in Normal mode)

@@ -273,6 +273,21 @@ context is, and it is the evidence an auto-approve gate would need later.
 Amy wants the queue watchable in the app *"like a context... when we have a lot
 going on"* — slice 3 delivers that without app work, because it is a context.
 
+## Lost+found receives more than drifts
+
+Lost+found is the kernel's one sink for content it accepted but could not
+deliver. `drift::ensure_lost_found_context` resolves or mints it for every
+writer. Two writers use it today:
+
+- `kj drift flush` writes dead-letter drifts as `Drift` blocks, keeping the
+  original sender.
+- The beat scheduler writes track-failure feedback that could not reach its
+  producer within 16 pulses as `Error` blocks authored by `beat()`; see
+  `docs/tracks.md`, "Concurrent producers — one open future, per-producer
+  failures".
+
+`kj block list -c lost+found` shows both.
+
 ## Open questions
 
 - Rotation policy: manual (`kj`) only, or a size/age threshold that rotates on

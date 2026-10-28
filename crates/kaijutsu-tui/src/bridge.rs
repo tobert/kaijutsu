@@ -9,11 +9,13 @@
 
 use anyhow::{Context, Result, bail};
 use kaijutsu_client::rpc::KjExecutionResult;
+use kaijutsu_client::start_candidate;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
 use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Per-process subscription identity.
 ///
@@ -49,6 +51,8 @@ pub struct KernelBridge {
     /// The character that performs a context this client creates. `None` is
     /// this seat's own character, which must not be a root.
     character: Option<String>,
+    /// This installation's id, the key of the kernel's per-client view row.
+    client_id: Uuid,
 }
 
 impl KernelBridge {
@@ -141,6 +145,7 @@ impl KernelBridge {
             context_type,
             parent,
             character,
+            client_id: crate::client_id::load_or_seed(),
         })
     }
 
@@ -156,7 +161,7 @@ impl KernelBridge {
     #[cfg(test)]
     pub(crate) fn never_answers_for_test() -> Self {
         let (actor, _cmds) = ActorHandle::never_answers_for_test();
-        Self { actor, context_type: "default".to_string(), parent: None, character: None }
+        Self { actor, context_type: "default".to_string(), parent: None, character: None, client_id: Uuid::nil() }
     }
 
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
@@ -184,33 +189,81 @@ impl KernelBridge {
         }
         let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &self.list_contexts().await?)
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        let cwd = client_cwd();
-        // A context is an instance of a character: the one named with
-        // `--character`, else this seat's own, which must not be a root.
-        let performer = self
-            .actor
-            .performer_for_new_contexts(parent.context_id, self.character.as_deref(), "--character <name>")
-            .await
-            .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        let created = self
-            .actor
-            .create_context_in_client_cwd(parent.context_id, target, &self.context_type, &performer, cwd.as_deref())
-            .await
-            .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        if let Some(refused) = &created.cwd_refused {
+        let (info, cwd_refused) = self.create_child(parent.context_id, target, &self.context_type).await?;
+        if let Some(refused) = &cwd_refused {
             // Printed before the screen is taken, so it stays in scrollback.
             eprintln!(
                 "kaijutsu-tui: created {target} without this directory as its cwd, because the \
                  kernel refused it: {refused}. Set one with `kj context set . --cwd DIR`."
             );
         }
+        Ok(info)
+    }
+
+    /// Create `label` of `context_type` under `parent`, in this process's
+    /// working directory, and join it. Returns the new context and, when the
+    /// kernel refused the directory, its refusal (the context then takes the
+    /// parent's cwd). Used by `open` before the screen is taken, and by
+    /// `Ctrl+Z` mid-session, where the caller must not print.
+    pub async fn create_child(
+        &self,
+        parent: ContextId,
+        label: &str,
+        context_type: &str,
+    ) -> Result<(ContextInfo, Option<String>)> {
+        let cwd = client_cwd();
+        // A context is an instance of a character: the one named with
+        // `--character`, else this seat's own, which must not be a root.
+        let performer = self
+            .actor
+            .performer_for_new_contexts(parent, self.character.as_deref(), "--character <name>")
+            .await
+            .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
+        let created = self
+            .actor
+            .create_context_in_client_cwd(parent, label, context_type, &performer, cwd.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
         let id = created.id;
         self.actor.join_context(id).await?;
         let contexts = self.list_contexts().await?;
-        contexts
+        let info = contexts
             .into_iter()
             .find(|c| c.id == id)
-            .with_context(|| format!("created context {} vanished from the listing", id.short()))
+            .with_context(|| format!("created context {} vanished from the listing", id.short()))?;
+        Ok((info, created.cwd_refused))
+    }
+
+    /// Open the context this client last viewed, else the live root console,
+    /// else the highest-ranked live context (see [`start_candidate`]).
+    pub async fn open_last_or_root(&self) -> Result<ContextInfo> {
+        let contexts = self.list_contexts().await?;
+        // Best-effort: an unreadable view row must not refuse the start.
+        let saved = match self.actor.get_client_view(&self.client_id.to_string()).await {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not read the last context");
+                None
+            }
+        };
+        let Some(id) = start_candidate(saved, &contexts) else {
+            return self.open_ranked().await;
+        };
+        let info = contexts
+            .into_iter()
+            .find(|c| c.id == id)
+            .context("start candidate names a context the listing does not carry")?;
+        self.actor.join_context(info.id).await?;
+        Ok(info)
+    }
+
+    /// Record `context_id` as this client's last-viewed context, so the next
+    /// start without `--context` opens it.
+    pub async fn remember_context(&self, context_id: ContextId) -> Result<()> {
+        self.actor
+            .set_last_context(&self.client_id.to_string(), context_id)
+            .await
+            .context("record the last context")
     }
 
     /// Join the highest-ranked live context, for a start with no `--context`.

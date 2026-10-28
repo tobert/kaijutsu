@@ -1,0 +1,50 @@
+# Rootless Podman Quadlet for amy-dev, Amy's development workspace. One container, one user, all of ~/src.
+#   mkdir -p ~/.local/share/amy-dev/{state,rustup,cargo} ~/.config/amy-dev
+#   cp ~/.ssh/id_ed25519.pub ~/.config/amy-dev/authorized_keys
+#   cp contrib/amy-dev/amy-dev.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload && systemctl --user start amy-dev
+# Then `ssh -p 2230 <host>`, `tmux new -As main`. See contrib/amy-dev/README.md.
+[Unit]
+Description=amy-dev development workspace
+
+[Container]
+Image=localhost/amy-dev:latest
+ContainerName=amy-dev
+# The host user is the same user inside, so files written in ~/src are the host user's.
+UserNS=keep-id
+# Audio and MIDI: ALSA's PCM and sequencer nodes, and the audio group that owns them on the host.
+AddDevice=/dev/snd
+PodmanArgs=--init --group-add=keep-groups
+DropCapability=all
+NoNewPrivileges=true
+# The root file system is read-only. Everything that writes goes to a volume or a tmpfs.
+ReadOnly=true
+Tmpfs=/tmp:rw,nosuid,nodev,size=8g
+Tmpfs=/run/user:rw,nosuid,nodev,mode=0755
+PublishPort=127.0.0.1:2230:2222
+
+# Projects: every source tree, read-write, at its host path.
+Volume=%h/src:%h/src:rw
+# Claude Code's state and login. Host secrets stay out of here (see README.md, "Secrets").
+Volume=%h/.claude:%h/.claude:rw
+Volume=%h/.claude.json:%h/.claude.json:rw
+Volume=%h/.gitconfig:%h/.gitconfig:ro
+
+# sshd state (host key, pid file) and XDG state, cache, and data.
+Volume=%h/.local/share/amy-dev/state:/var/lib/amy-dev
+# rustup toolchains and cargo's registry and bin directory.
+Volume=%h/.local/share/amy-dev/rustup:%h/.rustup
+Volume=%h/.local/share/amy-dev/cargo:%h/.cargo
+
+# Public keys allowed to log in. Read-only; the container never writes here.
+Volume=%h/.config/amy-dev/authorized_keys:/etc/amy-dev/authorized_keys:ro
+
+# The host's PipeWire socket goes here once PipeWire runs on the host (pawlsa's PipeWire tools need it).
+# Volume=%t/pipewire-0:%t/pipewire-0
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

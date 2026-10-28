@@ -378,15 +378,17 @@ impl BlockDocument {
     /// valid base62, they participate normally in midpoint calculations — no
     /// stripping needed. Sequential inserts by the same agent naturally group
     /// because they all share the same suffix in their key lineage.
+    ///
+    /// The suffix never contains '0'. Every key ends with it, and a key that
+    /// ends in '0' leaves no key between itself and its prefix.
     fn agent_order_suffix(&self) -> String {
         let bytes = self.principal_id.as_bytes();
         // Use bytes 10-13 (random portion of UUIDv7, not the timestamp prefix)
         // to maximize entropy and minimize suffix collisions between agents.
-        let c1 = super::content::BASE62[(bytes[10] as usize) % 62] as char;
-        let c2 = super::content::BASE62[(bytes[11] as usize) % 62] as char;
-        let c3 = super::content::BASE62[(bytes[12] as usize) % 62] as char;
-        let c4 = super::content::BASE62[(bytes[13] as usize) % 62] as char;
-        format!("{c1}{c2}{c3}{c4}")
+        bytes[10..14]
+            .iter()
+            .map(|&b| super::content::BASE62[1 + (b as usize) % 61] as char)
+            .collect()
     }
 
     /// A bounded, monotonic `order_key` derived from a timeline `tick`.
@@ -986,6 +988,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.mark_deleted();
         self.version += 1;
@@ -1156,6 +1159,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_content_type(content_type);
         self.version += 1;
@@ -1237,6 +1241,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_exit_code(exit_code);
         self.version += 1;
@@ -1248,6 +1253,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_ephemeral(ephemeral);
         self.version += 1;
@@ -1259,6 +1265,7 @@ impl BlockDocument {
         let block = self
             .blocks
             .get_mut(id)
+            .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_excluded(excluded);
         self.version += 1;
@@ -3001,6 +3008,19 @@ mod tests {
             key,
             suffix
         );
+    }
+
+    /// A key that ends in '0' has no key between it and its prefix, so the
+    /// agent suffix that ends every key never contains '0'. Bytes that are
+    /// multiples of 62 used to map to '0'.
+    #[test]
+    fn agent_order_suffix_never_contains_zero() {
+        let mut bytes = [7u8; 16];
+        bytes[10..14].copy_from_slice(&[0, 62, 124, 186]);
+        let store = BlockDocument::new(ContextId::new(), PrincipalId::from_bytes(bytes));
+        let suffix = store.agent_order_suffix();
+        assert_eq!(suffix.len(), 4);
+        assert!(!suffix.contains('0'), "suffix {suffix:?} must not contain '0'");
     }
 
     #[test]

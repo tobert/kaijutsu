@@ -7,9 +7,9 @@
 //!   well works identically from the conversation view.
 //! - `Ctrl+A Ctrl+A` → [`Action::SwitchToPreviousContext`] — MRU toggle.
 //! - `Ctrl+A n`/`p` → [`Action::ActiveSeatStep`] — walk ring-0 seats.
-//! - `Ctrl+A q` → [`Action::CloseAndDemoteContext`] — demote the current
-//!   context one ladder step (kernel-owned ladder) and land on the
-//!   MRU-previous one.
+//! - `Ctrl+A q` → [`Action::CloseAndDemoteContext`] — `kj context demote`
+//!   on the current context, then land on the MRU-previous one once the
+//!   demote has run ([`super::placement`]).
 //!
 //! Replaces the old raw Ctrl+1/2/3 MRU shortcuts (retired 2026-07-16 — they
 //! fired underneath the fullscreen vi editor, and their `ids[0]` target was
@@ -39,8 +39,8 @@ pub fn handle_prefix_context_verbs(
     mut actions: MessageReader<ActionFired>,
     drift: Res<crate::connection::drift::DriftState>,
     doc_cache: Res<DocumentCache>,
-    actor: Option<Res<crate::connection::RpcActor>>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
+    mut placements: MessageWriter<super::placement::PlacementRequested>,
 ) {
     for ActionFired { action, .. } in actions.read() {
         match action {
@@ -96,37 +96,10 @@ pub fn handle_prefix_context_verbs(
                     info!("prefix: no active context to close");
                     continue;
                 };
-                // Demote via the kernel-owned ladder (fire-and-forget, same
-                // pattern as the well's `d` verb — failures warn loudly).
-                if let Some(actor) = actor.as_ref() {
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.demote_context(current).await {
-                                log::warn!(
-                                    "prefix: demote {} failed: {e}",
-                                    current.short()
-                                );
-                            }
-                        })
-                        .detach();
-                }
-                // Land on the MRU-previous context; nowhere to land → stay
-                // (the demotion is placement, the conversation stays open).
-                match doc_cache.mru_ids().get(1).copied() {
-                    Some(id) => {
-                        switch_writer.write(ContextSwitchRequested { context_id: id });
-                        info!(
-                            "prefix: close-and-demote {} → {}",
-                            current.short(),
-                            id.short()
-                        );
-                    }
-                    None => info!(
-                        "prefix: demoted {} (no previous context to land on)",
-                        current.short()
-                    ),
-                }
+                placements.write(super::placement::PlacementRequested {
+                    context_id: current,
+                    key: super::placement::PlacementKey::CloseAndDemote,
+                });
             }
 
             _ => {}

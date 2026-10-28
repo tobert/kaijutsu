@@ -1,7 +1,6 @@
-# root: a root character's admin console. A person types `kj` here; no model
-# performs a root context, so this bundle composes no instruction blocks.
-# Other characters' seats start from here, so their lineage and their
-# accountability begin at this root (docs/character.md, "Roots and rotation").
+# root: a root character's admin console. The human root has no model and
+# composes no stance; the model console is a `console` context under it
+# (assets/defaults/rc/console). The root refuses drives.
 set -e
 kj binding allow "builtin.block"
 kj binding allow "builtin.file:read"
@@ -16,9 +15,9 @@ kj binding allow "admin"
 # `kj backend`, `kj cast`, `kj alias`, `kj hook`, and `kj mcp reload`.
 kj binding allow "config-write"
 # Context and workspace lifecycle, and the verbs that move work between
-# contexts.
+# contexts. The root has no `drive`: it refuses every autonomous turn that
+# another seat would clock on it.
 kj binding allow "operator"
-kj binding allow "drive"
 kj binding allow "fork"
 kj binding allow "drift"
 kj binding allow "transport"

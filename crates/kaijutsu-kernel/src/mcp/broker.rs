@@ -1540,19 +1540,18 @@ impl Broker {
     /// Compute the visible tool list for `context_id` by walking the
     /// binding's `allowed_instances` and applying sticky `Auto` resolution
     /// (D-20). Updates the sticky `name_map` side-effectfully with
-    /// freshly-resolved names.
+    /// freshly-resolved names, and persists the binding when it gains any.
+    /// A fault reading or persisting the binding is this call's error, and
+    /// nothing is cached for it.
     pub async fn list_visible_tools(
         &self,
         context_id: ContextId,
         ctx: &CallContext,
     ) -> McpResult<Vec<(String, KernelTool)>> {
-        // Use the lazy-loading accessor, not the in-memory map directly —
-        // `binding()` hydrates from the kernel DB on cache miss. Reading
-        // `self.bindings` here bypassed that hydration, so the FIRST
-        // dispatch in a fresh process saw an empty binding (deny-all) and
-        // queried zero servers, until some other caller's `binding()` call
-        // populated the cache. Self-healing, but a latent surprise.
-        let binding = self.binding(&context_id).await.unwrap_or_default();
+        // The hydrating accessor, so the first listing in a fresh process
+        // reads the persisted binding, and the checked one, so a DB fault is
+        // not listed (and cached) as an empty deny-all binding.
+        let binding = self.binding_checked(&context_id).await?;
         // Candidate servers span every instance referenced by a grant —
         // instance-wide *or* tool-granular — so a context that was granted a
         // single `instance:tool` still has that instance's server queried.
@@ -1613,9 +1612,13 @@ impl Broker {
             resolutions.push(((kt.instance.clone(), kt.name.clone()), visible));
         }
 
-        // Merge stickily into the binding and write back.
+        // Merge stickily into the binding, persist any new names, and cache.
         let mut binding = binding;
+        let names_before = binding.name_map.len();
         binding.apply_resolutions(resolutions);
+        if binding.name_map.len() != names_before {
+            self.persist_binding(context_id, &binding).await?;
+        }
         self.bindings
             .write()
             .await
@@ -11101,7 +11104,9 @@ mod tests {
     /// `binding()` collapses the read failure to deny-all instead of
     /// surfacing it. Mirrors `binding_checked_surfaces_a_real_db_failure`'s
     /// setup exactly.
-    async fn broker_with_poisoned_binding_row() -> (Arc<Broker>, ContextId) {
+    /// A kernel DB holding one live context, for binding tests that need
+    /// the `context_bindings` foreign key satisfied.
+    fn kernel_db_with_context() -> (DbHandle, ContextId) {
         use crate::kernel_db::{ContextRow, DocumentRow, KernelDb};
         use kaijutsu_types::{now_millis, ContextState, DocKind};
 
@@ -11143,6 +11148,14 @@ mod tests {
                 played_by: None,
             })
             .unwrap();
+        }
+        (kernel_db, ctx)
+    }
+
+    async fn broker_with_poisoned_binding_row() -> (Arc<Broker>, ContextId) {
+        let (kernel_db, ctx) = kernel_db_with_context();
+        {
+            let mut db = kernel_db.lock();
             db.upsert_context_binding(ctx, &ContextToolBinding::with_instances(vec![]))
                 .unwrap();
             db.poison_context_binding_detail_table_for_test().unwrap();
@@ -11151,6 +11164,54 @@ mod tests {
         let broker = Arc::new(Broker::new());
         broker.set_db(kernel_db).await;
         (broker, ctx)
+    }
+
+    /// A DB fault reading the binding fails `list_visible_tools` and leaves
+    /// nothing cached. Caching the empty fallback would deny every tool to
+    /// the context until restart, long after the fault cleared.
+    #[tokio::test]
+    async fn list_visible_tools_surfaces_a_db_failure_and_caches_nothing() {
+        let (broker, ctx) = broker_with_poisoned_binding_row().await;
+        let err = broker
+            .list_visible_tools(ctx, &CallContext::system_for_context(ctx))
+            .await
+            .expect_err("a binding read fault must not list as an empty binding");
+        assert!(matches!(err, McpError::BindingUnavailable { context, .. } if context == ctx), "{err:?}");
+        assert!(broker.bindings.read().await.get(&ctx).is_none(), "the fallback must not be cached");
+    }
+
+    /// The sticky names `list_visible_tools` resolves reach the kernel DB,
+    /// so a restart reads the same visible names back.
+    #[tokio::test]
+    async fn list_visible_tools_persists_the_names_it_resolves() {
+        let (kernel_db, ctx) = kernel_db_with_context();
+        let broker = Arc::new(Broker::new());
+        broker.set_db(kernel_db.clone()).await;
+        for name in ["alpha", "beta"] {
+            let server = Arc::new(MockServer::new(name).with_tool("read"));
+            broker.register_silently(server, InstancePolicy::default()).await.unwrap();
+            broker.bind(ctx, InstanceId::new(name)).await.unwrap();
+        }
+        // Names resolved before this point came from the bind path; start
+        // the read from a binding with none.
+        {
+            let mut binding = broker.binding_checked(&ctx).await.unwrap();
+            binding.name_map.clear();
+            kernel_db.lock().upsert_context_binding(ctx, &binding).unwrap();
+            broker.bindings.write().await.clear();
+        }
+
+        let visible = broker.list_visible_tools(ctx, &CallContext::system_for_context(ctx)).await.unwrap();
+        assert_eq!(visible.len(), 2, "{visible:?}");
+
+        let stored = kernel_db.lock().get_context_binding(ctx).unwrap().expect("a binding row");
+        assert_eq!(
+            stored.name_map.get("alpha__read"),
+            Some(&(InstanceId::new("alpha"), "read".to_string())),
+            "{:?}",
+            stored.name_map
+        );
+        assert_eq!(stored.name_map.len(), 2, "{:?}", stored.name_map);
     }
 
     /// `check_facade` must surface a real binding-fetch DB failure as

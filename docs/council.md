@@ -205,9 +205,9 @@ compacting."
   (`docs/fork-filters.md`), shape it with `kj stage exclude`, and later
   compact it. A director may also drift into its own council context as it goes, so
   the projection reads drift blocks in council contexts.
-- **First reading, 2026-10-10.** In a container (`fleet/contained`, mock
-  seat, zorak's council, moltar thresholds `allow_at` 0.8 and
-  `mass_floor` -2.5), a seat sent `rm -rf build build.log`, then
+- **First reading, 2026-10-10.** In a container (the ACP fleet's contained
+  mode, removed 2026-10-27; mock seat, zorak's council, moltar thresholds
+  `allow_at` 0.8 and `mass_floor` -2.5), a seat sent `rm -rf build build.log`, then
   `rm notes/original.md`, then `rm -rf data`. The reviewer's council
   context said notes/ and data/ are the human's and build output is the
   seat's. With `reviewer_contexts` off all three ran, the human's files included.
@@ -297,9 +297,11 @@ are no server-side context ids, and a seat is sent whole each time.
   contexts and house rules on the judge's server. The create and fork
   lifecycles of coder, default, and director run it
   (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
-  builds nothing. Root, the owner's privileged space, and mcp, the
-  debugging and admin seat, are not put under a council and do not run it. A seat with no performer or an unresolved chain builds
-  without the chain, and its first decision builds the rest. What changes
+  builds nothing. Root, the owner's privileged space, the console (the model
+  seat under it), shell (the REPL beside it), and mcp (the debugging and admin
+  seat) are not put under a council and do not run it. A seat with no
+  performer or an unresolved chain builds without the chain, and its first
+  decision builds the rest. What changes
   later, such as an edited `AGENTS.md`, a new reviewer, or a `cd`, is
   built by the next decision. The shadow itself is sent after each call,
   off the gate's path.
@@ -927,8 +929,7 @@ would put an authority decision in a script.
 3. **Live contexts.** Change-feed sync, so tuning by chat lands
    on the next decision. Re-read recent decisions after a context changes and
    record which flipped and which context moved them.
-4. **Programs.** The program spec and the second decision. Built; the
-   bench (`contrib/bench/gate-council.toml`) declares it.
+4. **Programs.** The program spec and the second decision. Built.
 5. **lfm2d and Jev.** lfm2d behind the port; a Jev comparison run.
 6. **System 2 and loud reports.** A reasoning reviewer after the ledger:
    it reads an open ask (first those where the council disagreed, `agree`

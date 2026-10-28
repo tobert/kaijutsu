@@ -973,9 +973,10 @@ mod tests {
     /// Every seat that ships the shell guard can run `shell_write`, so the
     /// council may gate it: its create lifecycle, and its fork lifecycle
     /// when it has one, ship `S50-council-seats.kai`, which builds the
-    /// seat's council seats ahead of its first decision. Root and mcp are
-    /// the exceptions: root is the owner's privileged space and mcp the
-    /// debugging and admin seat, and neither is put under a council. No
+    /// seat's council seats ahead of its first decision. Root, console, shell,
+    /// and mcp are the exceptions: root is the owner's privileged space, the
+    /// console is the model seat under it, shell is the REPL beside it, and mcp
+    /// is the debugging and admin seat, and none is put under a council. No
     /// other seat ships it.
     #[test]
     fn the_gated_seats_build_their_council_seats_at_create_and_fork() {
@@ -991,7 +992,7 @@ mod tests {
         types.dedup();
         let mut wrong = Vec::new();
         for ty in types {
-            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai")) && !["root", "mcp"].contains(&ty);
+            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai")) && !["root", "console", "shell", "mcp"].contains(&ty);
             let forks = seeds.iter().any(|(p, _)| p.starts_with(&format!("{RC_VFS_ROOT}/{ty}/fork/")));
             for (verb, wanted) in [("create", gated), ("fork", gated && forks)] {
                 let path = format!("{RC_VFS_ROOT}/{ty}/{verb}/S50-council-seats.kai");
@@ -1020,6 +1021,32 @@ mod tests {
             .map(|(path, _)| path)
             .collect();
         assert!(reaching.is_empty(), "seeds that reach the network: {reaching:#?}");
+    }
+
+    /// The root seat is a model context, so it ships a stance: a system
+    /// block that opens on the cybernetic system, names the seat as
+    /// privileged, and names the accountable human, and a Markdown companion.
+    #[test]
+    fn the_root_seat_ships_its_privileged_stance() {
+        let seeds = seed_files();
+        let body = |path: &str| {
+            seeds
+                .iter()
+                .find(|(p, _)| p == &format!("{RC_VFS_ROOT}/{path}"))
+                .map(|(_, body)| body.clone())
+                .unwrap_or_else(|| panic!("{path} is not seeded"))
+        };
+        let script = body("console/create/S00-stance.kai");
+        assert!(script.contains("kj block create --role system"), "{script}");
+        assert!(script.contains("text/markdown"), "{script}");
+        assert!(script.contains("cybernetic system"), "{script}");
+        for needle in ["privileged", "Amy"] {
+            assert!(script.contains(needle), "root stance must say {needle:?}: {script}");
+        }
+        let stance = body("console/create/S00-stance.md");
+        assert!(stance.contains("頑張って"), "the companion closes with 頑張って: {stance}");
+        assert!(stance.chars().filter(|c| !c.is_ascii()).all(|c| "頑張って".contains(c)),
+            "only the closing Japanese may be non-ASCII: {stance}");
     }
 
     /// Plant every retired seed path: a link where the seed shipped one, a

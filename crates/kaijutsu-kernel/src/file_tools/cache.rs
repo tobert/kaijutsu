@@ -801,17 +801,16 @@ impl FileDocumentCache {
             }
         };
 
+        // A buffer that cannot be read is an error, never empty text: writing
+        // "" would truncate the host file and clear the swap marker.
         let content = self
             .block_store
             .block_snapshots(ctx_id)
-            .ok()
-            .and_then(|snaps| {
-                snaps
-                    .iter()
-                    .find(|s| s.id == block_id)
-                    .map(|s| s.content.clone())
-            })
-            .unwrap_or_default();
+            .map_err(|e| FlushError::Backend(format!("flush_one({path}): cannot read the buffer: {e}")))?
+            .into_iter()
+            .find(|s| s.id == block_id)
+            .map(|s| s.content)
+            .ok_or_else(|| FlushError::Backend(format!("flush_one({path}): buffer block {block_id} is missing")))?;
 
         let vfs_path = std::path::Path::new(path);
         self.vfs
@@ -2010,6 +2009,30 @@ mod tests {
             "a flushed buffer's marker must be cleared, so a later cold load reconciles"
         );
         assert!(!cache.swap_recovered("/tmp/flushed.md"));
+    }
+
+    /// A flush whose buffer text cannot be read must fail before it writes:
+    /// the host file and its swap marker stay as they were.
+    #[tokio::test]
+    async fn flush_one_refuses_when_the_buffer_cannot_be_read() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/unreadable.md";
+
+        vfs.write_all(p(path), b"disk-v1").await.unwrap();
+        cache
+            .create_or_replace(path, "unsaved-edit", PrincipalId::system())
+            .await
+            .unwrap();
+        cache.mark_dirty(path).unwrap();
+        cache.block_store.delete_document(file_context_id(path)).unwrap();
+
+        let err = cache.flush_one(path).await.expect_err("flush must fail");
+        assert!(matches!(err, FlushError::Backend(_)), "got {err:?}");
+        assert_eq!(vfs.read_all(p(path)).await.unwrap(), b"disk-v1");
+        assert!(
+            cache.db.lock().get_dirty_file_buffer(path).unwrap().is_some(),
+            "the swap marker must survive a failed flush"
+        );
     }
 
     /// `flush_one` must refuse an unacknowledged recovered swap (rule 4,

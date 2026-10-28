@@ -15,7 +15,7 @@ use kaijutsu_client::{ActorHandle, ConnectionStatus, KernelClockHandle, ServerEv
 use crate::audio_sched::AudioSchedulerHandle;
 
 use super::audio::{dispatch_render_cue, handle_prefetch_outcome};
-use super::core::{ClockTransition, CuePlacement, DjCore, MetronomeConfig};
+use super::core::{ClockFallback, ClockTransition, CuePlacement, DjCore, MetronomeConfig};
 use super::midi::{AUTOCONNECT_POLL, MidiDispatch, MidiRoutes, MidiSink, dispatch_midi_cue};
 use super::prefetch::{CasPrefetch, PrefetchOutcome};
 
@@ -178,28 +178,11 @@ pub(crate) enum DjEffect {
     /// silently, telemetry-counted, never rescued onto the wallclock
     /// ladder).
     ///
-    /// NOTE (documented gap, not silently swallowed): only the THREE
-    /// `dj::core::DjCore` entry points whose return type actually surfaces a
-    /// `dropped_cues` count — `on_flush`/`on_disconnect` (via
-    /// `ClockFallback`) and `due_cues` (via `DueCues`) — can produce this
-    /// effect below. Two OTHER entry points also run `settle()` internally
-    /// and can therefore ALSO trip a fallback that drops `pending_cues`, but
-    /// their return types don't carry a count out, so that drop goes
-    /// unreported when THEY are the call that trips it:
-    /// - `due_clicks` (`dj::core::DueClicks` has no `dropped_cues` field) —
-    ///   if its `settle` call trips first in a `sleep_until` iteration (it
-    ///   runs before `due_cues` in the arm below), `pending_cues` is already
-    ///   empty by the time `due_cues`'s own `settle` call runs, so `due_cues`
-    ///   reports nothing either.
-    /// - `decide_placement` (`(CuePlacement, Option<ClockTransition>)` has
-    ///   no `dropped_cues` slot either) — a cue arriving exactly as the
-    ///   clock goes stale settles (correctly) to `Immediate`, but any OTHER
-    ///   cues already buffered from earlier get dropped by that same
-    ///   `settle` call with no count surfacing here.
-    ///
-    /// Fixing either needs `dj::core` to grow a `dropped_cues` count on
-    /// `DueClicks` and/or `decide_placement`'s return shape — out of this
-    /// task's scope (constrained to `dj::thread` only).
+    /// Every `DjCore` entry point that can fall back reports its drop count:
+    /// `on_flush`/`on_disconnect` and `decide_placement` through
+    /// `ClockFallback`, `due_clicks` through `DueClicks`, and `due_cues`
+    /// through `DueCues`. The call that drops the cues is the one that
+    /// reports them.
     CueDropped { reason: &'static str, count: usize },
     /// `kaijutsu.clock.future_stamps`, consumer `"dj"` — a wire timing
     /// artifact arrived stamped ahead of this node's clock by more than
@@ -334,7 +317,7 @@ fn handle_server_event(
 /// below is that invariant made loud rather than a silent `unwrap_or`
 /// (house fail-loud posture: if this invariant is ever violated, that's a
 /// `DjCore` bug worth a panic, not a quietly wrong `reason` label).
-fn fallback_effects(fallback: super::core::ClockFallback) -> Vec<DjEffect> {
+fn fallback_effects(fallback: ClockFallback) -> Vec<DjEffect> {
     let mut effects: Vec<DjEffect> = fallback.transition.map(DjEffect::Transition).into_iter().collect();
     if fallback.dropped_cues > 0 {
         let reason = fallback
@@ -385,7 +368,7 @@ fn handle_due_clicks(
             effects.push(DjEffect::Click);
         }
     }
-    effects.extend(due.transition.map(DjEffect::Transition));
+    effects.extend(fallback_effects(ClockFallback { transition: due.transition, dropped_cues: due.dropped_cues }));
     effects
 }
 
@@ -617,15 +600,11 @@ async fn run_loop<H, F, M>(
                         // never a clone).
                         if let ServerEvent::RenderCue { cue, .. } = ev {
                             // `decide_placement` runs its own `settle` check
-                            // internally and can trip a fallback that drops
-                            // whatever's ALREADY buffered — but its return
-                            // shape has no `dropped_cues` slot, so that drop
-                            // (unlike a flush/disconnect/`due_cues`-triggered
-                            // one) goes unreported here. Documented gap, see
-                            // `DjEffect::CueDropped`'s doc.
-                            let (placement, transition) = core.decide_placement(&cue, event_now);
-                            if let Some(t) = transition {
-                                record_effect(DjEffect::Transition(t));
+                            // and can trip a fallback that drops whatever is
+                            // already buffered; report both halves.
+                            let (placement, fallback) = core.decide_placement(&cue, event_now);
+                            for effect in fallback_effects(fallback) {
+                                record_effect(effect);
                             }
                             match placement {
                                 CuePlacement::Immediate => {
@@ -700,30 +679,13 @@ async fn run_loop<H, F, M>(
 
                 // The cue-placement analog of the click dispatch above: any
                 // beat-grid-buffered cue whose predicted instant just
-                // entered the horizon fires now. NOTE: this call's own
-                // `settle` only ever reports a fallback (and drops cues) if
-                // `due_clicks`'s `settle` call just above did NOT already
-                // trip one — see `DjEffect::CueDropped`'s doc for the
-                // known, documented gap this leaves (a `due_clicks`-
-                // triggered fallback drops `pending_cues` silently, since by
-                // the time this call runs there's nothing left to report).
+                // entered the horizon fires now. This call's own `settle`
+                // reports a fallback only if `due_clicks` just above did not
+                // already trip one (and report its drops).
                 let due_cues = core.due_cues(Instant::now(), SCHEDULE_HORIZON);
-                if let Some(t) = due_cues.transition {
-                    record_effect(DjEffect::Transition(t));
-                }
-                if due_cues.dropped_cues > 0 {
-                    // `DueCues`'s own doc: `dropped_cues > 0` only ever
-                    // happens alongside `transition.is_some()` (a fallback
-                    // mid-`due_cues` always changes mode when it clears
-                    // `pending_cues`) — loud `.expect()`, not a silent
-                    // fallback label, same invariant `fallback_effects` above
-                    // already leans on.
-                    let reason = due_cues
-                        .transition
-                        .expect("due_cues only drops cues alongside its own reported transition")
-                        .reason
-                        .as_str();
-                    record_effect(DjEffect::CueDropped { reason, count: due_cues.dropped_cues });
+                let fallback = ClockFallback { transition: due_cues.transition, dropped_cues: due_cues.dropped_cues };
+                for effect in fallback_effects(fallback) {
+                    record_effect(effect);
                 }
                 // Reuse the SAME dispatch functions the events arm uses —
                 // never a bespoke redispatch path. Each due cue gets a FRESH
@@ -1261,7 +1223,7 @@ mod tests {
     fn due_clicks_dispatch_to_the_sink_when_enabled() {
         let (mut sink, rx) = RecordingMidiSink::new();
         let cfg = MetronomeConfig { enabled: true, note: 84, channel: 15, velocity: 110, gate_ms: 60 };
-        let due = DueClicks { offsets: vec![Duration::from_millis(200)], transition: None };
+        let due = DueClicks { offsets: vec![Duration::from_millis(200)], transition: None, dropped_cues: 0 };
 
         let effects = handle_due_clicks(&cfg, Some(&mut sink), due);
         assert_eq!(effects, vec![DjEffect::Click], "one Click effect per dispatched offset");
@@ -1276,7 +1238,7 @@ mod tests {
     fn due_clicks_skip_the_sink_when_disabled() {
         let (mut sink, rx) = RecordingMidiSink::new();
         let cfg = MetronomeConfig { enabled: false, note: 84, channel: 15, velocity: 110, gate_ms: 60 };
-        let due = DueClicks { offsets: vec![Duration::from_millis(200)], transition: None };
+        let due = DueClicks { offsets: vec![Duration::from_millis(200)], transition: None, dropped_cues: 0 };
 
         let effects = handle_due_clicks(&cfg, Some(&mut sink), due);
         assert!(effects.is_empty(), "disabled config dispatches nothing, no Click effects either");
@@ -1289,6 +1251,7 @@ mod tests {
         let due = DueClicks {
             offsets: vec![Duration::ZERO],
             transition: Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Stale }),
+            dropped_cues: 0,
         };
         let effects = handle_due_clicks(&cfg, None, due);
         assert_eq!(
@@ -1296,6 +1259,38 @@ mod tests {
             vec![DjEffect::Transition(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Stale })],
             "a headless DJ (no click sink) still reports clock transitions correctly"
         );
+    }
+
+    /// The click timer runs `due_clicks` before `due_cues`, so a stale clock
+    /// is usually caught by `due_clicks`. The cues that fallback drops must
+    /// still be counted.
+    #[test]
+    fn a_due_clicks_fallback_reports_the_buffered_cues_it_dropped() {
+        let mut core = DjCore::default();
+        let t0 = Instant::now();
+        core.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        core.enqueue_cue(
+            4.0,
+            RenderCue {
+                mime: ABC_MIME.into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+                onset_beat: Some(4.0),
+            },
+        );
+        let stale_now = t0 + kaijutsu_audio::REF_STALE_MAX + Duration::from_millis(1);
+
+        let effects = handle_due_clicks(&MetronomeConfig::default(), None, core.due_clicks(stale_now, SCHEDULE_HORIZON));
+        assert_eq!(
+            effects,
+            vec![
+                DjEffect::Transition(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Stale }),
+                DjEffect::CueDropped { reason: "stale", count: 1 },
+            ]
+        );
+        let due = core.due_cues(stale_now, SCHEDULE_HORIZON);
+        assert_eq!(due.dropped_cues, 0, "the drop is reported once, by the call that made it");
     }
 
     // ── The real thread: subscription swap + shutdown ──────────────────

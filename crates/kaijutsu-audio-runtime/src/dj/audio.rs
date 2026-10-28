@@ -365,7 +365,7 @@ pub(crate) fn handle_prefetch_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio_sched::{self, SchedulerCmd};
+    use crate::audio_sched::{self, SchedulerCmd, test_wav_bytes};
     use kaijutsu_audio::RenderCue;
     use kaijutsu_cas::ContentHash;
     use std::str::FromStr;
@@ -378,12 +378,6 @@ mod tests {
             .as_nanos() as u64
     }
 
-    const TEST_WAV: &str = "/home/atobey/src/pawlsa-mcp/pawlsa-test.wav";
-
-    fn test_wav_bytes() -> Option<Vec<u8>> {
-        std::fs::read(TEST_WAV).ok()
-    }
-
     // ── Real WAV bytes, play-now / scheduled dispatch ─────────────────────
 
     /// A zero-lead, unstamped inline `audio/wav` cue is the play-now fast
@@ -391,10 +385,7 @@ mod tests {
     /// `PlayNow` with the untouched bytes.
     #[test]
     fn inline_audio_cue_zero_lead_sends_one_play_now() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let (scheduler, rx) = audio_sched::test_handle();
         let (prefetch, _prefetch_rx) = CasPrefetch::new();
         let cue = RenderCue::now_inline("audio/wav", bytes.clone());
@@ -412,10 +403,7 @@ mod tests {
     /// roughly 500ms out, not a `PlayNow`.
     #[test]
     fn inline_audio_cue_with_lead_sends_a_scheduled_play_at() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let (scheduler, rx) = audio_sched::test_handle();
         let (prefetch, _prefetch_rx) = CasPrefetch::new();
         let now = Instant::now();
@@ -452,10 +440,7 @@ mod tests {
     /// never fired late, never even reaching the scheduler.
     #[test]
     fn a_stale_audio_cue_is_rejected_outright() {
-        let Some(bytes) = test_wav_bytes() else {
-            eprintln!("skipping: {TEST_WAV} not present on this machine");
-            return;
-        };
+        let bytes = test_wav_bytes();
         let (scheduler, rx) = audio_sched::test_handle();
         let (prefetch, _prefetch_rx) = CasPrefetch::new();
         let epoch = now_epoch_ns();

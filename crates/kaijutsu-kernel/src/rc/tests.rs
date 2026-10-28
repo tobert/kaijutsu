@@ -2908,7 +2908,9 @@ esac
                     db.assign_test_review(ctx, Some(performer), Some(reviewer)).unwrap();
                 }
                 // No provider is configured, so startup fails after the
-                // lifecycle; only the run row is under test.
+                // lifecycle; only the run row is under test. The submit
+                // replies on commit, so the failure is awaited here.
+                let mut failed = d.kernel().turn_flows().subscribe("turn.failed");
                 let _ = crate::runtime::prompt::submit(
                     d.kernel(),
                     ctx,
@@ -2917,6 +2919,8 @@ esac
                     crate::runtime::prompt::PromptSource::Draft { edge: None },
                 )
                 .await;
+                tokio::time::timeout(std::time::Duration::from_secs(5), failed.recv())
+                    .await.expect("the submitted turn reports its failed startup");
                 ctx
             }
             VERB_ARCHIVE => {

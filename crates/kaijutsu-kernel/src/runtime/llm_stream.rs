@@ -8451,14 +8451,14 @@ mod lifetime_tests {
         let landed = kernel.blocks().non_draft_snapshots(context).unwrap().len();
 
         let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Draft { edge: None }).await.unwrap_err();
+            crate::runtime::prompt::PromptSource::Draft { edge: None }).await.unwrap_err().to_string();
         assert!(error.contains("No performer assigned"), "{error}");
         let draft = kernel.blocks().draft_block(context, player).unwrap().expect("the draft survives");
         assert_eq!(draft.content, "keep me");
         assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
 
         let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
-            crate::runtime::prompt::PromptSource::Text { content: "typed".into() }).await.unwrap_err();
+            crate::runtime::prompt::PromptSource::Text { content: "typed".into() }).await.unwrap_err().to_string();
         assert!(error.contains("No performer assigned"), "{error}");
         assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
         assert!(!kernel.turn_in_flight(context));
@@ -8476,13 +8476,6 @@ mod lifetime_tests {
             crate::runtime::prompt::PromptSource::Text { content: "landed".into() }).await
             .expect("the input landed, so the submit succeeded");
 
-        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
-        assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
-        let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
-        assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
-        assert!(errors[0].contains("runs no model"), "{errors:?}");
-        assert!(errors[0].contains("slot in its cast") && errors[0].contains("kj context rotate"),
-            "the error's summary says how to give the character a model: {errors:?}");
         let failed = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let TurnFlow::Failed { .. } = flows.recv().await.unwrap().payload {
@@ -8491,6 +8484,13 @@ mod lifetime_tests {
             }
         }).await;
         assert!(failed.is_ok(), "observers learn the turn failed");
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
+        let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
+        assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
+        assert!(errors[0].contains("runs no model"), "{errors:?}");
+        assert!(errors[0].contains("slot in its cast") && errors[0].contains("kj context rotate"),
+            "the error's summary says how to give the character a model: {errors:?}");
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
     }
@@ -9360,13 +9360,16 @@ mod lifetime_tests {
             }
             let mock = MockClient::new("").with_scripted_stream(vec![events]);
             let mock = if ending == "cancel" { mock.hangs_when_exhausted() } else { mock };
+            let (mock, sent) = mock.recording_sent_messages();
             let (kernel, context, _after, call) = fixture(Some(mock)).await;
             let mut completed = kernel.turn_flows().subscribe("turn.completed");
             let mut failed = kernel.turn_flows().subscribe("turn.failed");
             submit_text(&kernel, context, call.principal_id, "go").await;
             if ending == "cancel" {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while !kernel.turn_in_flight(context)
+                    // The submit replies before startup, so the interrupt
+                    // waits for the model call the notice is about.
+                    while sent.lock().is_empty()
                         || (partial && !kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.content == "half an answer"))
                     {
                         tokio::task::yield_now().await;

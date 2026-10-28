@@ -934,7 +934,7 @@ impl Provider {
         match config.kind {
             BackendKind::Anthropic => {
                 let api_key = resolve_key_or_placeholder(config, "Anthropic")?;
-                let mut client = claude::Client::new(api_key)
+                let mut client = claude::Client::new(api_key)?
                     .with_request_timeout(resolve_request_timeout(config))
                     .with_endpoint(endpoint()?);
                 if let Some(ref url) = config.base_url {
@@ -1903,7 +1903,7 @@ mod tests {
     #[test]
     fn test_provider_names() {
         assert_eq!(
-            Provider::Claude(claude::Client::new("fake")).name(),
+            Provider::Claude(claude::Client::new("fake").unwrap()).name(),
             "anthropic"
         );
         assert_eq!(
@@ -1948,6 +1948,24 @@ mod tests {
             err.to_string().to_lowercase().contains("key"),
             "auth error should mention key: {err}"
         );
+    }
+
+    /// An Anthropic key that cannot be an HTTP header value is an auth error
+    /// from `from_backend`, not a kernel panic, and the error does not repeat
+    /// the key. A key file with two lines is the ordinary way to get one:
+    /// trimming keeps the newline between them.
+    #[test]
+    fn from_backend_invalid_header_anthropic_key_is_an_auth_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key");
+        std::fs::write(&key_file, "sk-first\nsk-second\n").unwrap();
+        let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
+            .with_api_key_file(key_file.to_str().unwrap());
+        let err = Provider::from_backend(&config, &endpoint::Endpoints::default())
+            .err()
+            .expect("a bad key must not build a client");
+        assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
+        assert!(!err.to_string().contains("sk-"), "the error must not repeat the key: {err}");
     }
 
     #[test]
@@ -1999,7 +2017,7 @@ mod tests {
     #[test]
     fn test_registry_concrete_type() {
         let mut registry = LlmRegistry::new();
-        let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
+        let provider = Arc::new(Provider::Claude(claude::Client::new("fake").unwrap()));
         registry.register("anthropic", provider);
 
         assert!(registry.get("anthropic").is_some());
@@ -2009,7 +2027,7 @@ mod tests {
     #[test]
     fn test_model_alias_resolution() {
         let mut registry = LlmRegistry::new();
-        let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
+        let provider = Arc::new(Provider::Claude(claude::Client::new("fake").unwrap()));
         registry.register("anthropic", provider);
 
         let mut aliases = HashMap::new();
@@ -2887,6 +2905,58 @@ mod tests {
             assert_eq!(msgs[2].role, Role::User);
             assert!(msgs[2].as_text().unwrap().contains("[User ran `sleep 10`]"));
             assert!(msgs[2].as_text().unwrap().contains("done sleeping"));
+        }
+
+        /// A user shell command that runs while a model's tool batch is
+        /// open waits for the batch: both model results stay adjacent to
+        /// their calls, and the shell message follows them.
+        #[test]
+        fn user_shell_result_inside_a_model_batch_keeps_every_model_result() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+            let model_call = |seq, id: &str| {
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, seq), None, ToolKind::Mcp, "read_file",
+                    serde_json::json!({}), BlockRole::Model, Some(id.to_string()),
+                )
+            };
+            let model_result = |seq, call_seq, id: &str| {
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, seq), BlockId::new(c, m, call_seq), ToolKind::Mcp,
+                    &format!("{id} output"), false, Some(0), Some(id.to_string()),
+                )
+            };
+            let user_call_id = BlockId::new(c, u, 0);
+            let user_tc = BlockSnapshot::tool_call(
+                user_call_id, None, ToolKind::Shell, "shell",
+                serde_json::json!({"code": "ls"}), BlockRole::User, None,
+            );
+            let user_tr = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 1), user_call_id, ToolKind::Shell, "src", false, Some(0), None,
+            );
+
+            for order in [
+                vec![model_call(0, "t1"), model_call(1, "t2"), user_tc.clone(), model_result(0, 0, "t1"),
+                     user_tr.clone(), model_result(2, 1, "t2")],
+                vec![model_call(0, "t1"), model_call(1, "t2"), model_result(0, 0, "t1"), user_tc.clone(),
+                     user_tr.clone(), model_result(2, 1, "t2")],
+                vec![model_call(0, "t1"), model_call(1, "t2"), user_tc.clone(), user_tr.clone(),
+                     model_result(0, 0, "t1"), model_result(2, 1, "t2")],
+            ] {
+                let msgs = hydrate_from_blocks(&order);
+                let roles: Vec<_> = msgs.iter().map(|m| &m.role).collect();
+                assert_eq!(msgs.len(), 3, "got: {roles:?}");
+                assert_eq!(msgs[0].role, Role::Assistant);
+                let MessageContent::Blocks(results) = &msgs[1].content else { panic!("expected results: {:?}", msgs[1]) };
+                let contents: Vec<_> = results.iter().map(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, content, .. } => (tool_use_id.as_str(), content.as_str()),
+                    other => panic!("expected only tool results: {other:?}"),
+                }).collect();
+                assert_eq!(contents, [("t1", "t1 output"), ("t2", "t2 output")]);
+                assert!(msgs[2].as_text().unwrap().contains("[User ran `ls`]"), "{:?}", msgs[2]);
+            }
         }
 
         #[test]

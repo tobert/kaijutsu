@@ -25,7 +25,8 @@ of a genuinely good substrate. None of the fixes should cost us any of this.
 - **Content is never silently lost.** Failed delivery requeues up to
   `MAX_DRIFT_RETRIES = 5`, then moves to a kernel-global dead-letter queue, and
   is eventually written into a lazily-created `lost+found` context
-  (`drift.rs:606-680`). A previous bug that *did* lose dead letters is fixed and
+  (`drift::ensure_lost_found_context`), which also receives track-failure
+  feedback the beat scheduler could not deliver. A previous bug that *did* lose dead letters is fixed and
   commented as such. This is the CLAUDE.md silent-fallback stance made real.
 - **It is many-hands by construction.** A drift block is visible to every
   player attached to that context — human, model, app, sibling. cc messaging is

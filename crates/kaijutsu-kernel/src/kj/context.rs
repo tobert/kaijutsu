@@ -192,15 +192,18 @@ enum ContextCommand {
         context_type: Option<String>,
     },
     /// Conclude a context — mark this work "done" (the time-well's hot→recent
-    /// transition). Reversible via fork; not latched, not destructive.
+    /// transition). Reversible via fork; not latched. The character that
+    /// plays the context or its lineage root may conclude it; anyone else
+    /// needs the operator capability.
     #[command(alias = "done")]
     Conclude {
         /// Context to conclude. Does not recurse into children. Ids and
         /// labels come from `kj context list`.
         context: String,
     },
-    /// Promote a context into ring 0 ("active"). Not latched, not
-    /// capability-gated (same as conclude). First promote wins the
+    /// Promote a context into ring 0 ("active"). Not latched. The character
+    /// that plays the context or its lineage root may promote it; anyone
+    /// else needs the operator capability. First promote wins the
     /// timestamp — re-promoting an already-promoted context is a no-op.
     Promote {
         /// Context to promote. An archived context (reachable by full id)
@@ -210,8 +213,11 @@ enum ContextCommand {
     },
     /// Push a context outward one step on the demote ladder: promoted →
     /// unpromoted, unpromoted/undemoted → demoted, already demoted →
-    /// archived, after its `archive` rc lifecycle runs. Not latched;
-    /// restore with `kj context promote <id>`.
+    /// archived, after its `archive` rc lifecycle runs. The archiving step
+    /// is latched like `kj context archive`; restore with
+    /// `kj context promote <id>`. The character that plays the context or
+    /// its lineage root may demote it; anyone else needs the operator
+    /// capability.
     Demote {
         /// Context to push one step down the ladder. Ids and labels come
         /// from `kj context list`.
@@ -525,6 +531,10 @@ impl KjDispatcher {
         // capability that exact context cannot hold — the lockout it exists to
         // undo. Its own guards (no usable loadout, not archived) are in
         // `context_rebind`.
+        //
+        // `conclude`, `promote`, and `demote` need Operator only outside the
+        // caller's own lineage; their handlers decide that per target
+        // (`require_placement_authority`).
         if matches!(
             parsed.command,
             ContextCommand::Set { .. }
@@ -1264,6 +1274,7 @@ impl KjDispatcher {
         parent: Option<&str>,
         senpai: Option<&str>,
         character: &str,
+        cwd_optional: bool,
         config: ContextConfigArgs,
         caller: &KjCaller,
     ) -> KjResult {
@@ -1402,6 +1413,18 @@ impl KjDispatcher {
         // (funkMusician, …) need no kernel edit. `docs/chameleon.md`,
         // "context_type is an rc bundle of features".
 
+        // `--cwd-optional` drops a `--cwd` the kernel cannot use, and the
+        // create continues as if it had not been given.
+        let mut cwd_refused = None;
+        if cwd_optional
+            && let Some(cwd) = cfg.cwd_spec.clone()
+            && let Some(check_in) = parent_id.or(caller.context_id)
+            && let Err(e) = self.check_cwd(caller, check_in, &cwd).await
+        {
+            cwd_refused = Some(format!("--cwd {e}"));
+            cfg.cwd_spec = None;
+        }
+
         // Without `--cwd`, the new context starts in the caller's cwd, as
         // `kj fork` does. A cwd that no longer resolves refuses the create.
         if cfg.cwd_spec.is_none()
@@ -1444,9 +1467,6 @@ impl KjDispatcher {
                 match db.get_character_by_name(character) {
                     Ok(Some(row)) if row.retired_at.is_some() => return KjResult::Err(format!(
                         "kj kohai create: character '{character}' is retired; choose a live character with `kj character list`"
-                    )),
-                    Ok(Some(row)) if row.root => return KjResult::Err(format!(
-                        "kj kohai create: '{character}' is a root character and has no model, so it cannot be cast"
                     )),
                     Ok(Some(row)) => row.principal_id,
                     Ok(None) => return KjResult::Err(format!(
@@ -1551,6 +1571,9 @@ impl KjDispatcher {
             msg.push('\n');
             msg.push_str(line);
         }
+        if let Some(refused) = &cwd_refused {
+            msg.push_str(&format!("\n{refused}; created without it"));
+        }
         // Report whether the retained context received a usable loadout.
         match self.has_usable_loadout(new_id) {
             Ok(true) => {}
@@ -1567,6 +1590,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(msg, serde_json::json!({
             "context_id": new_id.to_hex(),
             "no_model": no_model,
+            "cwd_refused": cwd_refused,
         }))
     }
 
@@ -2255,6 +2279,7 @@ impl KjDispatcher {
             let inserted = db.in_transaction(|db| {
                 insert_new_context_rows(db, &successor, placement)?;
                 db.copy_context_env(predecessor.context_id, successor_id)?;
+                db.copy_context_egress(predecessor.context_id, successor_id)?;
                 db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
                 if let Some(shell) = db.get_context_shell(predecessor.context_id)? {
                     db.upsert_context_shell(&ContextShellRow {
@@ -2366,13 +2391,48 @@ impl KjDispatcher {
         }))
     }
 
+    /// Authority to conclude a context or change its ring placement. The
+    /// character that plays the context and its lineage root hold it
+    /// ([`crate::kernel_db::KernelDb::lineage_root`], the rule
+    /// `kj context rotate` uses); any other caller needs Operator.
+    fn require_placement_authority(&self, verb: &str, target_id: ContextId, caller: &KjCaller) -> Result<(), KjResult> {
+        let (row, lineage_root) = {
+            let db = self.kernel_db().lock();
+            let row = match db.get_context(target_id) {
+                Ok(Some(row)) => row,
+                Ok(None) => return Err(KjResult::Err(format!("kj context {verb}: context {} not found", target_id.short()))),
+                Err(e) => return Err(KjResult::Err(format!("kj context {verb}: {e}"))),
+            };
+            if row.played_by == Some(caller.actor_id) {
+                return Ok(());
+            }
+            (row, db.lineage_root(target_id))
+        };
+        if matches!(lineage_root, Ok(root) if root == caller.actor_id) {
+            return Ok(());
+        }
+        self.require_cap(caller, crate::mcp::Capability::Operator, &format!("context {verb}")).map_err(|denied| {
+            let name = row.label.clone().unwrap_or_else(|| target_id.short());
+            let reason = match lineage_root {
+                Ok(_) => String::new(),
+                Err(e) => format!(" ({e})"),
+            };
+            KjResult::Err(format!(
+                "{}\nWithout the 'operator' capability, only the character that plays {name} \
+                 or its lineage root may {verb} it{reason}.",
+                denied.message()
+            ))
+        })
+    }
+
     /// `kj context conclude <ctx>` — the explicit "this work is done" act.
     ///
     /// Sets `concluded_at` + the `Concluded` lifecycle state (KernelDb first as
     /// the authoritative stamp, then the in-memory drift router so `listContexts`
     /// reflects it immediately). Single context — unlike archive it does NOT
     /// recurse into children. Reversible by forking; idempotent (re-concluding a
-    /// concluded context is a no-op success).
+    /// concluded context is a no-op success). Authority:
+    /// [`Self::require_placement_authority`].
     async fn context_conclude(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let target_id = {
             let db = self.kernel_db().lock();
@@ -2381,6 +2441,9 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context conclude: {e}")),
             }
         };
+        if let Err(denied) = self.require_placement_authority("conclude", target_id, caller) {
+            return denied;
+        }
 
         let newly = {
             let db = self.kernel_db().lock();
@@ -2405,7 +2468,8 @@ impl KjDispatcher {
     }
 
     /// `kj context promote <ctx>` — bring a context into ring 0 ("active").
-    /// Not latched, not capability-gated (same as conclude). First-write-wins
+    /// Not latched; authority as for conclude
+    /// ([`Self::require_placement_authority`]). First-write-wins
     /// on the timestamp — re-promoting an already-promoted context is a no-op
     /// success. Promoting an ARCHIVED context (reachable by full id only)
     /// resurrects it — promote is the resurrection door; the archive is
@@ -2421,6 +2485,9 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context promote: {e}")),
             }
         };
+        if let Err(denied) = self.require_placement_authority("promote", target_id, caller) {
+            return denied;
+        }
 
         let outcome = {
             let db = self.kernel_db().lock();
@@ -2459,8 +2526,9 @@ impl KjDispatcher {
 
     /// `kj context demote <ctx>` — push a context outward one step on the
     /// demote ladder (see [`crate::kernel_db::KernelDb::demote_context`]).
-    /// Not latched. Only the ladder's terminal step (archive) touches the
-    /// drift router.
+    /// Authority as for conclude ([`Self::require_placement_authority`]).
+    /// Only the ladder's terminal step (archive) latches without
+    /// `--confirm` and touches the drift router.
     async fn context_demote(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let target_id = {
             let db = self.kernel_db().lock();
@@ -2469,19 +2537,45 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
             }
         };
+        if let Err(denied) = self.require_placement_authority("demote", target_id, caller) {
+            return denied;
+        }
 
-        // The ladder's next step archives an already demoted context; its
-        // archive lifecycle runs first, as `kj context archive` runs it.
-        let archives = matches!(
-            self.kernel_db().lock().get_context(target_id),
-            Ok(Some(row)) if row.demoted_at.is_some() && !row.is_archived()
-        );
-        if archives && let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
+        // The ladder's next step archives an already demoted context. That
+        // step latches as `kj context archive` does, and its archive
+        // lifecycle runs first, as `kj context archive` runs it.
+        let archives = |row: &Option<ContextRow>| {
+            matches!(row, Some(row) if row.demoted_at.is_some() && !row.is_archived())
+        };
+        let latch = || KjResult::Latch {
+            command: "kj context demote".to_string(),
+            target: ctx_ref.to_string(),
+            message: format!(
+                "kj context demote {ctx_ref} archives it, because it is already demoted; re-run with --confirm"
+            ),
+        };
+        let archiving = match self.kernel_db().lock().get_context(target_id) {
+            Ok(row) => archives(&row),
+            Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
+        };
+        if archiving && !caller.confirmed {
+            return latch();
+        }
+        if archiving && let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
             return KjResult::Err(format!("kj context demote: {} stays live: {e}", target_id.short()));
         }
 
         let outcome = {
             let db = self.kernel_db().lock();
+            // Another demote may have landed after the read above; an
+            // unconfirmed step still must not archive.
+            if !caller.confirmed {
+                match db.get_context(target_id) {
+                    Ok(row) if archives(&row) => return latch(),
+                    Ok(_) => {}
+                    Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
+                }
+            }
             match db.demote_context(target_id) {
                 Ok(v) => v,
                 Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
@@ -3389,10 +3483,10 @@ mod tests {
         assert_eq!(d.kernel_db().lock().list_context_egress(context).unwrap(), vec!["crates.io".to_string()]);
     }
 
-    /// A root character has no model, so no caller can cast it as an
-    /// instance's character, whoever holds the senpai.
+    /// A root character is a model context: a senpai can cast it as the
+    /// character of a kohai it creates, and the instance records it.
     #[tokio::test]
-    async fn a_root_character_cannot_be_cast_as_a_performer() {
+    async fn a_root_character_can_be_cast_as_a_performer() {
         let d = test_dispatcher().await;
         let amy_id = test_reviewer_principal();
         let banto = PrincipalId::new();
@@ -3410,19 +3504,35 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
         let refused = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("sovereign"), s("sovereign-lane")], &banto_caller).await;
-        assert!(!refused.is_ok(), "a root has no model to cast");
-        assert!(refused.message().contains("root character"), "{}", refused.message());
-        assert!(d.kernel_db().lock().find_context_by_label("sovereign-lane").unwrap().is_none());
+        assert!(refused.is_ok(), "a root can be cast: {}", refused.message());
+        let lane = d.kernel_db().lock().find_context_by_label("sovereign-lane").unwrap()
+            .expect("the kohai exists");
+        assert_eq!(
+            d.kernel_db().lock().context_character(lane.context_id).unwrap().unwrap().principal_id,
+            sovereign,
+            "the instance's character is the root"
+        );
+    }
 
-        // A root cannot cast a root either.
-        let amy = crate::kj::KjCaller {
-            principal_id: amy_id, actor_id: amy_id, reviewer_id: None, context_id: Some(context),
+    /// A root character may play its own root context. At the top of a
+    /// lineage there is no one above it to ask, so its own confirmation is
+    /// the human's act (`docs/approval-identity.md`).
+    #[tokio::test]
+    async fn a_root_character_may_play_its_own_root_context() {
+        let d = test_dispatcher().await;
+        let amy = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: amy, name: "owner".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        d.kernel_db().lock().update_character_root(amy, true).unwrap();
+        let context = register_context(&d, Some("owner-root"), None, amy);
+        let caller = crate::kj::KjCaller {
+            principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let refused = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("sovereign"), s("sovereign-lane")], &amy).await;
-        assert!(!refused.is_ok(), "{}", refused.message());
-        assert!(refused.message().contains("root character"), "{}", refused.message());
+        let created = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("owner"), s("owner-lane")], &caller).await;
+        assert!(created.is_ok(), "a root plays the top of its own lineage: {}", created.message());
     }
 
     #[tokio::test]
@@ -3545,6 +3655,7 @@ mod tests {
         db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
         db.set_context_env(seat, "ROTATED_FROM", "an-older-seat").unwrap();
+        db.add_context_egress(seat, "api.example.com").unwrap();
         db.upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(s("/tmp/seat")), updated_at: 1 }).unwrap();
         db.promote_context(seat).unwrap();
         drop(db);
@@ -3605,6 +3716,7 @@ mod tests {
             db.context_character(f.seat).unwrap().unwrap().principal_id,
             "the successor is the same character"
         );
+        assert_eq!(db.list_context_egress(successor).unwrap(), [s("api.example.com")], "egress hosts carry over");
         assert_eq!(db.get_character(f.amy).unwrap().unwrap().root_ctx, Some(f.root), "other consoles stay");
         drop(db);
         assert!(f.d.has_usable_loadout(successor).unwrap(), "the create lifecycle ran on the successor");
@@ -4758,7 +4870,7 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("falling"), None, principal);
-        let c = caller_with_context(ctx);
+        let mut c = caller_with_context(ctx);
 
         d.dispatch(&[s("context"), s("promote"), s("falling")], &c)
             .await;
@@ -4777,7 +4889,9 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.message().contains("demoted"), "msg: {}", result.message());
 
-        // already demoted → archived, and the drift router reflects it
+        // already demoted → archived once confirmed, and the drift router
+        // reflects it
+        c.confirmed = true;
         let result = d
             .dispatch(&[s("context"), s("demote"), s("falling")], &c)
             .await;
@@ -4815,40 +4929,125 @@ mod tests {
         assert_eq!(db.get_context(ctx).unwrap().unwrap().paused_at, None);
     }
 
+    /// amy (a root) plays her root context `amy`; coder plays `lane`
+    /// beneath it; bob (another root) plays `elsewhere`, a separate
+    /// lineage. Every context's binding denies Operator, so authority comes
+    /// from the lineage alone.
+    struct PlacementFixture {
+        d: std::sync::Arc<crate::kj::KjDispatcher>,
+        amy: PrincipalId,
+        coder: PrincipalId,
+        root: ContextId,
+        lane: ContextId,
+        elsewhere: ContextId,
+    }
+
+    async fn placement_fixture() -> PlacementFixture {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let [amy, coder, bob] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
+        let root = register_context(&d, Some("amy"), None, amy);
+        let lane = register_context(&d, Some("lane"), Some(root), amy);
+        let elsewhere = register_context(&d, Some("elsewhere"), None, bob);
+        let mut db = d.kernel_db().lock();
+        for (principal_id, name, root) in [(amy, "placement-amy", true), (coder, "placement-coder", false), (bob, "placement-bob", true)] {
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
+            }).unwrap();
+        }
+        db.update_played_by(root, Some(amy)).unwrap();
+        db.update_played_by(lane, Some(coder)).unwrap();
+        db.update_played_by(elsewhere, Some(bob)).unwrap();
+        for context in [root, lane, elsewhere] {
+            db.upsert_context_binding(context, &crate::mcp::ContextToolBinding::new()).unwrap();
+        }
+        drop(db);
+        PlacementFixture { d, amy, coder, root, lane, elsewhere }
+    }
+
+    fn placement_caller(context: ContextId, actor: PrincipalId) -> crate::kj::KjCaller {
+        crate::kj::KjCaller {
+            principal_id: PrincipalId::new(), actor_id: actor, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// A seat changes its own placement and conclusion, and the lineage
+    /// root changes any context in its lineage, without Operator. Authority
+    /// follows the performer, not the requester on the connection.
     #[tokio::test]
-    async fn context_promote_and_demote_are_not_capability_gated() {
-        // Same authority level as conclude: an unprivileged caller whose
-        // context binding denies everything (Operator included) can still
-        // promote/demote — unlike `archive`, which `require_cap`
-        // would deny here. Deny-all is written straight to the DB — the
-        // authoritative store `require_cap` reads (see
-        // `drive_denied_without_drive_capability` for the same pattern).
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("plain"), None, principal);
-        d.kernel_db()
-            .lock()
-            .upsert_context_binding(ctx, &crate::mcp::ContextToolBinding::new())
-            .unwrap();
-        let c = caller_with_context(ctx); // caller_with_context: privileged = false
+    async fn context_placement_in_the_callers_own_lineage_needs_no_operator() {
+        let f = placement_fixture().await;
+        let coder = placement_caller(f.lane, f.coder);
+        for verb in ["promote", "demote", "demote", "conclude"] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s("lane")], &coder).await;
+            assert!(result.is_ok(), "coder plays the lane, so {verb} needs no Operator: {}", result.message());
+        }
+        let row = f.d.kernel_db().lock().get_context(f.lane).unwrap().unwrap();
+        assert!(row.demoted_at.is_some() && row.concluded_at.is_some(), "{row:?}");
 
-        let result = d
-            .dispatch(&[s("context"), s("promote"), s("plain")], &c)
-            .await;
-        assert!(
-            result.is_ok(),
-            "promote should not be capability-gated: {}",
-            result.message()
-        );
+        let amy = placement_caller(f.root, f.amy);
+        let result = f.d.dispatch(&[s("context"), s("promote"), s("lane")], &amy).await;
+        assert!(result.is_ok(), "amy is the lane's lineage root: {}", result.message());
+        assert!(f.d.kernel_db().lock().get_context(f.lane).unwrap().unwrap().promoted_at.is_some());
+    }
 
-        let result = d
-            .dispatch(&[s("context"), s("demote"), s("plain")], &c)
-            .await;
-        assert!(
-            result.is_ok(),
-            "demote should not be capability-gated: {}",
-            result.message()
-        );
+    /// A context outside the caller's lineage needs Operator: coder may not
+    /// touch its lineage root's own context or another lineage, and the
+    /// refusal names the capability. Granting Operator opens all three verbs.
+    #[tokio::test]
+    async fn context_placement_outside_the_callers_lineage_needs_operator() {
+        let f = placement_fixture().await;
+        let coder = placement_caller(f.lane, f.coder);
+        for (verb, target, id) in [
+            ("promote", "elsewhere", f.elsewhere), ("demote", "elsewhere", f.elsewhere),
+            ("conclude", "elsewhere", f.elsewhere), ("demote", "amy", f.root),
+        ] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s(target)], &coder).await;
+            assert!(!result.is_ok(), "coder may not {verb} {target}: {}", result.message());
+            assert!(result.message().contains("'operator'"), "the refusal names the capability: {}", result.message());
+            assert!(result.message().contains("lineage"), "the refusal says what grants it otherwise: {}", result.message());
+            let row = f.d.kernel_db().lock().get_context(id).unwrap().unwrap();
+            assert!(row.promoted_at.is_none() && row.demoted_at.is_none() && row.concluded_at.is_none(), "a refusal changes nothing: {row:?}");
+        }
+
+        let mut operator = crate::mcp::ContextToolBinding::new();
+        operator.grant(crate::mcp::Capability::Operator);
+        f.d.kernel_db().lock().upsert_context_binding(f.lane, &operator).unwrap();
+        for verb in ["promote", "demote", "conclude"] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s("elsewhere")], &coder).await;
+            assert!(result.is_ok(), "Operator may {verb} another lineage's context: {}", result.message());
+        }
+    }
+
+    /// The demote step that archives a context latches like
+    /// `kj context archive`: without `--confirm` nothing changes and no
+    /// archive lifecycle runs; with it the context is archived. The latch
+    /// holds for a privileged caller too.
+    #[tokio::test]
+    async fn context_demote_latches_the_step_that_archives() {
+        let f = placement_fixture().await;
+        install_archive_script(&f.d, f.lane, "true").await;
+        let mut coder = placement_caller(f.lane, f.coder);
+        let demoted = f.d.dispatch(&[s("context"), s("demote"), s("lane")], &coder).await;
+        assert!(demoted.is_ok() && demoted.message().contains("demoted"), "{}", demoted.message());
+
+        let mut privileged = coder.clone();
+        privileged.privileged = true;
+        for caller in [&coder, &privileged] {
+            let latched = f.d.dispatch(&[s("context"), s("demote"), s("lane")], caller).await;
+            assert!(latched.is_latch(), "archiving needs --confirm: {latched:?}");
+            assert!(latched.message().contains("--confirm") && latched.message().contains("archive"), "{}", latched.message());
+            assert!(!f.d.kernel_db().lock().get_context(f.lane).unwrap().unwrap().is_archived());
+            assert!(!archive_lifecycle_ran(&f.d, f.lane), "a latched demote runs no archive lifecycle");
+        }
+
+        coder.confirmed = true;
+        let archived = f.d.dispatch(&[s("context"), s("demote"), s("lane")], &coder).await;
+        assert!(archived.is_ok() && archived.message().contains("archived"), "{}", archived.message());
+        assert!(f.d.kernel_db().lock().get_context(f.lane).unwrap().unwrap().is_archived());
     }
 
     #[tokio::test]
@@ -5119,6 +5318,46 @@ mod tests {
 
         let result = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("found"), s("--cwd"), s("/scratch/work")], &c).await;
         assert!(result.is_ok(), "create --cwd on a directory succeeds: {}", result.message());
+    }
+
+    /// `--cwd-optional` decides when the create runs: a directory the kernel
+    /// cannot use is dropped, the context takes the caller's cwd, and the
+    /// result says why in its message and its `cwd_refused` data.
+    #[tokio::test]
+    async fn context_create_cwd_optional_drops_a_directory_the_kernel_cannot_use() {
+        let d = wired_dispatcher().await;
+        let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
+        mount_scratch_work(&d).await;
+        let c = caller_with_context(parent);
+        crate::kj::test_helpers::seed_test_performer(&d.kernel_db().lock());
+        crate::kj::test_helpers::give_character(&d, &c);
+        let cwd_of = |id: ContextId| d.kernel_db().lock().get_context_shell(id).unwrap().and_then(|shell| shell.cwd);
+        let create = |label: &'static str, cwd: &'static str| {
+            let d = d.clone();
+            let c = c.clone();
+            async move {
+                d.dispatch(&[s("kohai"), s("create"), s(label), s("--as"), s(crate::kj::test_helpers::TEST_PERFORMER), s("--cwd"), s(cwd), s("--cwd-optional")], &c).await
+            }
+        };
+
+        let result = create("lost", "/scratch/missing").await;
+        let KjResult::Ok { message, data: Some(data), .. } = &result else {
+            panic!("--cwd-optional creates without a missing directory: {}", result.message());
+        };
+        let refused = data["cwd_refused"].as_str().expect("the result carries the refusal");
+        assert!(refused.contains("'/scratch/missing'"), "the refusal names the directory: {refused}");
+        assert!(message.contains(refused), "the message says why too: {message}");
+        let lost = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        assert_eq!(cwd_of(lost), None, "the parent has no cwd to inherit");
+
+        let result = create("found", "/scratch/work").await;
+        let KjResult::Ok { data: Some(data), .. } = &result else { panic!("{}", result.message()) };
+        assert!(data["cwd_refused"].is_null(), "a usable directory is not refused: {data}");
+        let found = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        assert_eq!(cwd_of(found).as_deref(), Some("/scratch/work"));
+
+        let result = d.dispatch(&[s("kohai"), s("create"), s("bare"), s("--as"), s(crate::kj::test_helpers::TEST_PERFORMER), s("--cwd-optional")], &c).await;
+        assert!(!result.is_ok(), "--cwd-optional needs --cwd: {}", result.message());
     }
 
     /// `/` is accepted as a cwd, and every command that leaves a context
@@ -6071,11 +6310,10 @@ mod tests {
 
     /// A coder context's rc create lifecycle may widen the egress list of the
     /// context it is creating, when the creator holds the authority
-    /// `docs/egress.md` names. The setup mirrors kaijutsu-solo-acp: the
-    /// root character `solo` plays the root context and creates a `coder`
-    /// context under it, performed by `coder`. The rc shell's `kj` acts as
-    /// the creator, which is the new context's lineage root. The benchmark
-    /// overlay relies on this; a change to who rc acts as fails here.
+    /// `docs/egress.md` names. The root character `solo` plays the root
+    /// context and creates a `coder` context under it, performed by
+    /// `coder`. The rc shell's `kj` acts as the creator, which is the new
+    /// context's lineage root; a change to who rc acts as fails here.
     /// Afterwards the context's own shell builds `curl` with that list, so
     /// a request to a non-loopback name gets past the egress check and
     /// fails at name resolution instead (`.invalid` never resolves).

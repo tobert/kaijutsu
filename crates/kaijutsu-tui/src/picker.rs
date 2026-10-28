@@ -300,11 +300,14 @@ pub struct PickerModel {
     pub index: usize,
     pub horizon_open: bool,
     filter_editing: bool,
-    /// A placement verb pressed once on this exact (verb, context) pair,
-    /// waiting for a repeat to confirm a latched op (`kj context archive`).
-    /// A second press of the SAME verb on the SAME row appends `--confirm`;
-    /// any other key clears it — see [`Self::handle_key`].
+    /// A placement verb whose press on this exact (verb, context) pair came
+    /// back latched (`kj context archive`, the demote step that archives),
+    /// waiting for a repeat to confirm it. A second press of the SAME verb
+    /// on the SAME row appends `--confirm`; any other key clears it — see
+    /// [`Self::handle_key`] and [`Self::latched`].
     pending_confirm: Option<(char, ContextId)>,
+    /// The last placement press, until its result says whether it latched.
+    last_placement: Option<(char, ContextId)>,
 }
 
 impl PickerModel {
@@ -363,6 +366,7 @@ impl PickerModel {
             horizon_open: false,
             filter_editing: false,
             pending_confirm: None,
+            last_placement: None,
         }
     }
 
@@ -401,6 +405,7 @@ impl PickerModel {
         next.horizon_open = self.horizon_open;
         next.filter_editing = self.filter_editing;
         next.pending_confirm = self.pending_confirm;
+        next.last_placement = self.last_placement;
         next.follow(selected);
         next
     }
@@ -486,11 +491,20 @@ impl PickerModel {
         .unwrap_or(Outcome::None)
     }
 
+    /// The last placement press came back latched: a repeat of the same
+    /// verb on the same row confirms it. A press that ran arms nothing, so
+    /// `d` after a demote step that ran is another plain step, and the step
+    /// that archives always waits for its own latch.
+    pub fn latched(&mut self) {
+        self.pending_confirm = self.last_placement.take();
+    }
+
     /// `p`/`d`/`z`/`a`/`c` on the selected row — `docs/input.md`'s placement
     /// verbs, mapped to `kj context <verb>` (`kj/context.rs`'s
     /// `ContextCommand`): `p` promote, `d` demote, `z` pause/resume
-    /// (whichever the row's current `paused` flag calls for), `a` archive
-    /// (latched — a repeat confirms), `c` conclude.
+    /// (whichever the row's current `paused` flag calls for), `a` archive,
+    /// `c` conclude. A repeat confirms a press that came back latched: `a`,
+    /// and the `d` step that archives.
     fn placement(&mut self, verb: char) -> Outcome {
         let selected = match self.section {
             Section::Active => self.visible_active().get(self.index).map(|r| (r.context_id, r.paused)),
@@ -511,11 +525,12 @@ impl PickerModel {
             _ => return Outcome::None,
         };
         let mut argv = vec!["context".to_string(), sub.to_string(), target.to_hex()];
+        self.pending_confirm = None;
         if confirm {
             argv.push("--confirm".to_string());
-            self.pending_confirm = None;
+            self.last_placement = None;
         } else {
-            self.pending_confirm = Some((verb, target));
+            self.last_placement = Some((verb, target));
         }
         Outcome::Placement { context_id: target, argv }
     }
@@ -996,17 +1011,20 @@ mod tests {
         assert_eq!(model.handle_key(ctrl_a), Outcome::None);
         // A pending latch does not survive one either.
         assert!(matches!(model.handle_key(press(KeyCode::Char('a'))), Outcome::Placement { .. }));
+        model.latched();
+        assert_eq!(model.pending_confirm, Some(('a', a.id)));
         assert_eq!(model.handle_key(ctrl_a), Outcome::None);
         assert_eq!(model.pending_confirm, None);
     }
 
     #[test]
-    fn a_second_press_of_the_same_verb_on_the_same_row_confirms() {
+    fn a_second_press_of_the_same_verb_on_the_same_row_confirms_a_latch() {
         let mut a = ctx("kaijutsu");
         a.promoted_at = Some(1_000);
         let mut model = PickerModel::build(std::slice::from_ref(&a), &[], &no_activity(), &empty_tails(), 0);
         let first = model.handle_key(press(KeyCode::Char('a')));
         assert_eq!(first, Outcome::Placement { context_id: a.id, argv: vec!["context".into(), "archive".into(), a.id.to_hex()] });
+        model.latched();
         let second = model.handle_key(press(KeyCode::Char('a')));
         assert_eq!(
             second,
@@ -1017,6 +1035,20 @@ mod tests {
         );
     }
 
+    /// `d` on a promoted row runs a demote step, and so does the next one:
+    /// only a press that came back latched waits for a confirm. A repeat
+    /// after a step that ran must not confirm the step that archives.
+    #[test]
+    fn a_repeat_after_a_step_that_ran_does_not_confirm() {
+        let mut a = ctx("kaijutsu");
+        a.promoted_at = Some(1_000);
+        let mut model = PickerModel::build(std::slice::from_ref(&a), &[], &no_activity(), &empty_tails(), 0);
+        let demote = Outcome::Placement { context_id: a.id, argv: vec!["context".into(), "demote".into(), a.id.to_hex()] };
+        assert_eq!(model.handle_key(press(KeyCode::Char('d'))), demote);
+        assert_eq!(model.handle_key(press(KeyCode::Char('d'))), demote);
+        assert_eq!(model.pending_confirm, None);
+    }
+
     #[test]
     fn moving_the_selection_clears_a_pending_confirm() {
         let mut a = ctx("kaijutsu");
@@ -1024,7 +1056,8 @@ mod tests {
         let mut b = ctx("kaish");
         b.promoted_at = Some(2_000);
         let mut model = PickerModel::build(&[a.clone(), b.clone()], &[], &no_activity(), &empty_tails(), 0);
-        model.handle_key(press(KeyCode::Char('d'))); // pending confirm on a (index 0)
+        model.handle_key(press(KeyCode::Char('d')));
+        model.latched(); // pending confirm on a (index 0)
         model.handle_key(press(KeyCode::Char('j'))); // moves to b (index 1), clears it
         let outcome = model.handle_key(press(KeyCode::Char('d')));
         assert_eq!(
@@ -1196,6 +1229,7 @@ mod tests {
         // First `a` latches; the refresh must not clear it, or the second
         // press starts over instead of confirming.
         assert!(matches!(model.handle_key(press(KeyCode::Char('a'))), Outcome::Placement { .. }));
+        model.latched();
 
         let model = model.refreshed(&[a.clone(), b.clone()], &[], &no_activity(), &empty_tails(), 0);
         assert_eq!(model.filter, "k");

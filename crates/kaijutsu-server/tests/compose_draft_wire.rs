@@ -47,6 +47,43 @@ async fn draft(kernel: &KernelHandle, context_id: ContextId) -> Option<BlockSnap
         .find(|b| b.status == Status::Draft)
 }
 
+/// Every block once `done` holds of them. A submit replies when its input
+/// commits; its `submit` scripts and its turn run after the reply.
+async fn blocks_once(
+    kernel: &KernelHandle,
+    context_id: ContextId,
+    done: impl Fn(&[BlockSnapshot]) -> bool,
+) -> Vec<BlockSnapshot> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let all = blocks(kernel, context_id).await;
+            if done(&all) {
+                return all;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the blocks never settled")
+}
+
+/// Every block once the submitted turn has ended, so its `submit` scripts
+/// have run.
+async fn blocks_after_turn(
+    live_kernel: &kaijutsu_server::SharedKernel,
+    kernel: &KernelHandle,
+    context_id: ContextId,
+) -> Vec<BlockSnapshot> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while live_kernel.kernel.turn_in_flight(context_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the submitted turn never ended");
+    blocks(kernel, context_id).await
+}
+
 async fn open_context(kernel: &KernelHandle, label: &str) -> ContextId {
     let context_id = create_context(&kernel, label).await.unwrap();
     kernel.join_context(context_id, "draft-test").await.unwrap();
@@ -232,9 +269,8 @@ fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
             .unwrap()
             .block_id;
 
-        // Read synchronously after the call returns: the script's block must
-        // already be durable, and it must sit after the user block.
-        let all = blocks(&kernel, context_id).await;
+        // The script's block sits after the user block.
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let expected = format!(
             "input={} edge={} shown=3 tail={} live=",
             third.to_key(),
@@ -312,7 +348,11 @@ fn chat_submit_reports_a_live_turn() {
         kernel.edit_input(context_id, 0, "while you work", 0).await.unwrap();
         let input = kernel.submit_input(context_id, false).await.unwrap().block_id;
 
-        let all = blocks(&kernel, context_id).await;
+        let prefix = format!("input={} ", input.to_key());
+        let all = blocks_once(&kernel, context_id, |all| {
+            all.iter().any(|b| b.kind == BlockKind::Notification && b.content.starts_with(&prefix))
+        })
+        .await;
         let facts = facts_for(&all, input);
         assert!(facts.ends_with("live=true"), "facts: {facts}");
     });
@@ -376,7 +416,7 @@ fn chat_submit_log_tail_counts_ephemeral_blocks_but_not_drafts() {
             .unwrap()
             .block_id;
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let facts = facts_for(&all, input);
         assert!(
             facts.contains(&format!(" tail={} ", marker.to_key())),
@@ -415,7 +455,7 @@ fn chat_submit_survives_a_failing_submit_script() {
             .expect("a script failure never refuses the submit")
             .block_id;
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let sent = all.iter().find(|b| b.id == input).expect("the message is durable");
         assert_eq!(sent.status, Status::Done);
         assert!(
@@ -475,7 +515,7 @@ fn chat_submit_example_script_renders_the_edge_excerpt() {
             .await
             .unwrap();
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         let rendered = all
             .iter()
             .filter(|b| b.kind == BlockKind::Notification)
@@ -534,7 +574,7 @@ fn chat_submit_example_script_is_silent_at_the_tail() {
             .await
             .unwrap();
 
-        let all = blocks(&kernel, context_id).await;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
         assert!(
             !all.iter().any(|b| b.content.starts_with("The player wrote the message above")),
             "an edge at the tail renders nothing"
@@ -596,6 +636,45 @@ fn shell_submit_authors_the_command_before_clearing_the_draft() {
             command.kind,
             BlockKind::ToolCall,
             "shell submit authors a ToolCall, not the draft"
+        );
+        assert!(
+            draft(&kernel, context_id).await.is_none(),
+            "the draft is consumed once the command block exists"
+        );
+    });
+}
+
+/// A shell context is a REPL: a chat-mode submit runs the draft as a shell
+/// command, the way a shell-mode submit does, and starts no model turn.
+#[test]
+fn shell_context_chat_submit_runs_the_draft_as_shell() {
+    run_local(async {
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-shell-repl").await;
+        server
+            .kernel_db
+            .lock()
+            .update_context_type(context_id, "shell")
+            .unwrap();
+
+        kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
+        let result = kernel.submit_input(context_id, false).await.unwrap();
+
+        let all = blocks(&kernel, context_id).await;
+        let command = all
+            .iter()
+            .find(|b| b.id == result.block_id)
+            .expect("the command block exists");
+        assert_eq!(
+            command.kind,
+            BlockKind::ToolCall,
+            "a shell context's submit authors the shell command, not a chat message"
+        );
+        assert!(
+            !all.iter().any(|b| b.role == Role::Model),
+            "a shell context's submit starts no model turn"
         );
         assert!(
             draft(&kernel, context_id).await.is_none(),
@@ -710,6 +789,60 @@ fn refused_shell_submit_keeps_its_draft() {
         let after = draft(&kernel, context_id).await.expect("refusal preserves the draft");
         assert_eq!(after.id, before.id);
         assert_eq!(after.content, before.content);
+    });
+}
+
+/// Typing in the human root is refused as a refusal, not a fault: the human
+/// root runs no model turns, and the reason points to `ROOT` and `Ctrl+Z`
+/// instead of asking for a reviewer. The draft stays as typed.
+#[test]
+fn a_chat_submit_in_the_human_root_says_it_runs_no_model_turns() {
+    run_local(async {
+        let (addr, _live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let root = kernel.list_contexts().await.unwrap().into_iter()
+            .find(|c| c.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE)
+            .expect("the kernel has a human root")
+            .id;
+        kernel.join_context(root, "draft-test").await.unwrap();
+        kernel.edit_input(root, 0, "hello root", 0).await.unwrap();
+        let before = draft(&kernel, root).await.unwrap();
+
+        let error = kernel.submit_input(root, false).await.unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else {
+            panic!("expected a refusal, not a fault: {error:?}");
+        };
+        assert!(refusal.reason.contains("human root runs no model turns"), "{refusal:?}");
+        assert!(refusal.reason.contains("ROOT") && refusal.reason.contains("Ctrl+Z"), "{refusal:?}");
+        assert!(!refusal.reason.contains("review"), "{refusal:?}");
+        let after = draft(&kernel, root).await.expect("refusal preserves the draft");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.content, "hello root");
+    });
+}
+
+/// Outside the human root, a performer assigned as its own reviewer is
+/// still refused with the self-review reason, as a refusal.
+#[test]
+fn a_chat_submit_that_would_review_itself_is_refused() {
+    run_local(async {
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-self-review").await;
+        let performer = seed_turn_identity(&live_kernel, context_id);
+        live_kernel.kernel_db.lock()
+            .assign_test_review_recasting(context_id, Some(performer), Some(performer))
+            .unwrap();
+        kernel.edit_input(context_id, 0, "review yourself", 0).await.unwrap();
+
+        let error = kernel.submit_input(context_id, false).await.unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else {
+            panic!("expected a refusal, not a fault: {error:?}");
+        };
+        assert!(refusal.reason.contains("cannot review its own work"), "{refusal:?}");
+        assert!(draft(&kernel, context_id).await.is_some(), "refusal preserves the draft");
     });
 }
 
@@ -858,6 +991,13 @@ fn a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge() {
 
         kernel.submit_input_with_edge(context_id, false, Some(InputEdge { block: earlier, shown: None }))
             .await.unwrap();
+        // The submit replies before its scripts run and the running turn
+        // takes the input; the note's own lease ends once the turn has it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_kernel.kernel.turns().active_count(context_id) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the running turn takes the note");
         hold.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(10), async {

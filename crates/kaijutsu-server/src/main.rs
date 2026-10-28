@@ -23,11 +23,12 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
     name = "kaijutsu-server",
     about = "SSH + Cap'n Proto server for kaijutsu",
     long_about = "With no subcommand, runs the SSH server. It refuses to start until \
-        `init` has created a root character.",
+        `bootstrap` or `init` has created a root character.",
     after_help = "EXAMPLES:\n    \
         kaijutsu-server                                              run on the default port\n    \
         kaijutsu-server --port 2222                                  run on port 2222\n    \
-        kaijutsu-server init --as amy --key ~/.ssh/id_ed25519.pub    before the first start\n    \
+        kaijutsu-server bootstrap                                    before the first start\n    \
+        kaijutsu-server init --as amy --key ~/.ssh/id_ed25519.pub    the root alone, no model\n    \
         kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind\n    \
         kaijutsu-server list-keys\n    \
         kaijutsu-server list-characters\n    \
@@ -52,7 +53,7 @@ struct Cli {
 }
 
 /// Flags every subcommand accepts, but only the serving default, `rc reseed`,
-/// and `kj` actually read: where the `/config` trees and read-write
+/// `kj`, and `bootstrap` actually read: where the `/config` trees and read-write
 /// workspaces come from, and the port the serving default binds. May appear
 /// before or after a subcommand name. The direct-database commands (`init`,
 /// `add-key`, `list-keys`, `list-characters`, `migrate-keyring`) always read
@@ -85,6 +86,11 @@ struct PathArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set up a kernel so its ROOT console can answer: the root character
+    /// and its key, a backend for each provider key found, the default
+    /// model, ROOT's performer, and ROOT. Run with the service stopped. A
+    /// second run adds only what is missing.
+    Bootstrap(BootstrapArgs),
     /// Create the kernel's root character and bind its public key. Run once,
     /// with the service stopped, before the first start.
     Init {
@@ -171,6 +177,43 @@ enum BlocksCommand {
 }
 
 #[derive(Args)]
+struct BootstrapArgs {
+    /// The root character: you. Default: $USER.
+    #[arg(long = "as", value_name = "NAME")]
+    as_name: Option<String>,
+
+    /// Your public key, in OpenSSH format.
+    #[arg(long, value_name = "FILE", default_value = "~/.ssh/id_ed25519.pub")]
+    key: String,
+
+    /// The provider ROOT talks to: anthropic or deepseek. Default: each
+    /// provider whose key is in its environment variable
+    /// (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY) or its key file
+    /// (~/.anthropic-key.txt, ~/.deepseek-key), the first one found as the
+    /// default.
+    #[arg(long, value_name = "KIND")]
+    backend: Option<String>,
+
+    /// The default model. Default: claude-sonnet-5-5 or deepseek-flash.
+    #[arg(long, value_name = "ID")]
+    model: Option<String>,
+
+    /// The file holding the --backend provider's key, as the kernel sees it
+    /// (~ expanded where the kernel runs).
+    #[arg(long, value_name = "FILE", requires = "backend")]
+    api_key_file: Option<String>,
+
+    /// Set up ROOT without a model. Add one later from your root with
+    /// `kj backend set`, or ask bootstrap again with a key.
+    #[arg(long, conflicts_with_all = ["backend", "model"])]
+    no_model: bool,
+
+    /// The model character that plays ROOT.
+    #[arg(long = "console-as", value_name = "NAME", default_value = "root")]
+    console_as: String,
+}
+
+#[derive(Args)]
 struct KjCliArgs {
     /// The root character to act as. Required and refused with the full
     /// list when more than one live root character exists; omit when there
@@ -218,7 +261,7 @@ async fn async_main() -> ExitCode {
     // defaults quieter (`kaijutsu_server::offline::default_log_directive`)
     // unless the operator set RUST_LOG explicitly.
     let cli = Cli::parse();
-    let is_kj = matches!(cli.command, Some(Command::Kj(_)));
+    let is_kj = matches!(cli.command, Some(Command::Kj(_) | Command::Bootstrap(_)));
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(kaijutsu_server::offline::default_log_directive(is_kj)));
 
@@ -242,6 +285,7 @@ async fn async_main() -> ExitCode {
             let mode = if cli.headless { KernelMode::Headless } else { KernelMode::Interactive };
             run_server(port, config_root, mount, rw_mount, mode).await
         }
+        Some(Command::Bootstrap(args)) => cmd_bootstrap(args, config_root, &mount, rw_mount).await,
         Some(Command::Init { as_name, key }) => cmd_init(as_name, key),
         Some(Command::AddKey { pubkey_file, as_name, rebind }) => {
             cmd_add_key(pubkey_file, as_name, rebind)
@@ -727,6 +771,108 @@ fn cmd_migrate_keyring() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Set up the kernel so `ROOT` can answer (`kaijutsu_server::bootstrap`).
+async fn cmd_bootstrap(
+    args: BootstrapArgs,
+    config_root: Option<PathBuf>,
+    mount: &[String],
+    rw_mount: Vec<PathBuf>,
+) -> ExitCode {
+    match bootstrap_options(args) {
+        Ok(opts) => {
+            let mut config = SshServerConfig::production(DEFAULT_SSH_PORT);
+            config.config_mounts = match into_mounts(config_root, mount) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("config mounts: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            config.rw_mounts = match config.config_mounts.rw_mounts_with(&rw_mount) {
+                Ok(rw) => rw,
+                Err(e) => {
+                    eprintln!("config mounts: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match kaijutsu_server::bootstrap::bootstrap(&config, &opts).await {
+                Ok(report) => {
+                    for line in &report.ran {
+                        println!("ran: {line}");
+                    }
+                    for note in &report.notes {
+                        println!("{note}");
+                    }
+                    println!("Start the server and connect as {}; ROOT is where to begin.", opts.root);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("bootstrap: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("bootstrap: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolve the flags and the environment into what to set up.
+fn bootstrap_options(args: BootstrapArgs) -> Result<kaijutsu_server::bootstrap::BootstrapOptions, String> {
+    use kaijutsu_server::bootstrap::{BackendChoice, BootstrapOptions, detect_backends};
+
+    let root = match args.as_name.or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty())) {
+        Some(name) => name,
+        None => return Err("$USER is unset; name the root character with --as <name>".to_string()),
+    };
+    let key_path: PathBuf = shellexpand::tilde(&args.key).as_ref().into();
+    let key_data = std::fs::read_to_string(&key_path)
+        .map_err(|e| format!("read {}: {e}; name your public key with --key <file>", key_path.display()))?;
+    let root_key = ssh_key::PublicKey::from_openssh(key_data.trim())
+        .map_err(|e| format!("parse the public key {}: {e}", key_path.display()))?;
+
+    let backends = match args.backend {
+        Some(kind) => {
+            let mut backend = BackendChoice::provider(&kind)
+                .ok_or_else(|| format!("--backend takes anthropic or deepseek, not '{kind}'"))?;
+            if let Some(model) = args.model {
+                backend.model = model;
+            }
+            if let Some(file) = args.api_key_file {
+                backend.api_key_file = Some(file);
+            }
+            vec![backend]
+        }
+        None if args.no_model => Vec::new(),
+        None => {
+            let mut found = detect_backends(
+                |var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()),
+                |file| PathBuf::from(shellexpand::tilde(file).as_ref()).is_file(),
+            );
+            match (args.model, found.first_mut()) {
+                (Some(model), Some(first)) => first.model = model,
+                (Some(model), None) => {
+                    return Err(format!(
+                        "--model {model} needs a provider, and no key was found; name one with --backend"
+                    ));
+                }
+                (None, _) => {}
+            }
+            found
+        }
+    };
+
+    Ok(BootstrapOptions {
+        root,
+        root_key,
+        key_comment: extract_comment(key_data.trim()),
+        backends,
+        console_performer: args.console_as,
+    })
 }
 
 /// Run one `kj` verb against a stopped kernel (`docs/server-cli.md`).

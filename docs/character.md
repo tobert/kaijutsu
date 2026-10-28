@@ -14,9 +14,9 @@ an instruction to use nonexistent features.
 
 | Part | Contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, `handoff_ctx`, a `root` flag, and an optional cast (`characters.cast_id`), read only when a binding is written; `kj character create [--root]\|list\|show\|set --root\|--no-root\|--cast\|retire`. `kj character show` lists the character's live instances. Persona text moves onto the sheet in step 6 |
-| Bootstrap | `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
-| Root console | Each live root character has one root instance with no senpai; its conversation is a context of type `root` (a model-less admin bundle), labeled with the character's name. `kj character create --root` and `set --root` start it; the server starts any missing one at start. `set --no-root` refuses while it is live |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, and `root_ctx`; `kj character create [--root]\|list\|show\|set --root\|--no-root\|retire` |
+| Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give `ROOT` a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
+| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
 | Character instance | One run of one character (`docs/senpai-kohai.md`). `kj kohai create <label> --as <character> --type <t>` needs the Operator capability and a live character caller, requires `--as`, refuses an unknown, retired or root character and one that would review itself, and preserves the requester's `created_by`. It writes binding `seq` 1 from the character's cast. A fork joins its source's instance and binding; a rotation appends the next binding. The performer of a context is its instance's character, which never changes; to put another character on the work, start an instance of it |
 | Client creation | There is no create RPC. A client runs `kj kohai create --as <character>` through `executeKj` from an existing context, whose instance becomes the new instance's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses |
@@ -148,19 +148,36 @@ Two things follow, and they are the ones to check a change against:
   instance, not to "banto" in general, and two bantos never collide. There is no
   `accountable_to` on the character sheet; Amy: "accountable_to is a
   relation at runtime, so if banto forks a coder, that coder is accountable
-  to the precise banto that forked it, not any banto." The edge, its
-  routing, and the one authority rule are in `docs/senpai-kohai.md` and
-  `docs/approval-identity.md`. `forked_from` is provenance only.
-- **A root console has no senpai.** A root character's console is an
-  instance with no senpai. `kj kohai create` always has a senpai: the
-  caller's instance, or the `--senpai` it has authority over. A root confirms
-  itself.
-- **A root character has no model.** The sheet carries a `root` flag set at
-  create; a root has no cast and turn identity refuses it as a performer. A
-  root is a place with hands on it: Amy fools around there, and during
-  bootstrap asks a Claude Code session to do something through the MCP
-  bridge, where the model is outside the kernel and drives through `kj`.
-  Autonomous operation restricts it further later.
+  to the precise banto that forked it, not any banto."
+- **A root context has no `forked_from`.** A root character's console is a
+  root of the forest, and `kj context create` always names a parent
+  (`docs/fork-and-create.md`, "Where a created context sits"). Its
+  responsible character is a root character.
+- **A root character can have a model.** The sheet carries a `root` flag set
+  at create. A root may be cast as a performer, and turn identity accepts it
+  when it has a reviewer distinct from itself. A root is a place with hands on
+  it: Amy fools around there, and during bootstrap asks a Claude Code session
+  to do something through the MCP bridge, where the model is outside the
+  kernel and drives through `kj`. Autonomous operation restricts it further
+  later.
+- **The root console and its shell.** Amy, 2026-10-25. The human root, the
+  `root` context of a root character, has no model and composes no stance. It
+  holds the operator's authority set, minus `drive`. A root character may play
+  the top of its own lineage: nobody sits above it to ask, so its own
+  confirmation is the human's act (`kj/context.rs`, `plays_own_root`). A turn
+  still refuses a performer that is its own reviewer. A chat submit in the
+  human root is refused before the self-review check, with a reason that
+  points to `ROOT` and `Ctrl+Z` (`runtime/turn_identity.rs`).
+  The model console is a `console` context under the human root, labeled
+  `ROOT`. Its performer is a model character (`root`, cast with a fast model;
+  Haiku on this machine, for now). Its stance (`console/create/S00-stance`)
+  names its privileged position and asks for care. Its `kj` requests go
+  through the regular approval policy, and it refuses every `drive`. Its
+  reviewer is the human root above it. Ctrl-Z in the console, or in the human
+  root, opens a shell context under it (type `shell`, no model). Its output
+  stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
+  the shell returns to its parent. Incoming drifts into the console are not
+  yet gated: see `docs/issues.md`, "Root console".
 - **`ROOT` is reserved and single.** One live holder per kernel, played by
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,
@@ -562,14 +579,16 @@ inheritance from a calling model context remains a design question.
 
 **Two identities ride every turn, and neither replaces the other.** The
 **requester** is who caused the turn: the principal on the `KjCaller`, on the
-user's prompt or `kj drive` seed (`kj/drive.rs:135–172`), on a gate's ask,
-and on `TurnFlow` events. The **effective actor** is the character whose
+user's prompt, on a gate's ask, and on `TurnFlow` events. `kj drive` makes
+the caller's performer the driven turn's requester, and its seed carries
+that performer. The **effective actor** is the character whose
 performance this is, resolved once at turn start from `played_by`. Who gets
 stamped where:
 
 | Block or record | Principal |
 |---|---|
-| capability checks, drive origin, user prompt and seed, approval ask, `TurnFlow` | requester, unchanged |
+| capability checks, drive origin, user prompt, approval ask, `TurnFlow` | requester, unchanged |
+| `kj drive` seed, and the requester of the driven turn | the driving caller's performer |
 | provider-emitted thinking, model text, model tool call | effective actor (today `system`) |
 | tool result, structured tool error, kernel warning, error and interrupt markers | `system`, unchanged |
 | rc output | the context's `created_by`, unchanged (`rc/mod.rs`) |
@@ -589,8 +608,7 @@ the human who drove the turn; the matrix above says tool output is kernel
 output and should stamp `system`, and those servers should follow it. And
 the gate-resume seed passes no principal (`rpc.rs:1316`), falling through
 to the store default `system` (`rpc.rs:2431`), where `kj drive`'s seed stamps
-the caller (`kj/drive.rs:158`); the resume seed is a requester act and should
-say so.
+the caller's performer; the resume seed is a requester act and should say so.
 
 Two invariants to pin with tests, because both are already load-bearing:
 

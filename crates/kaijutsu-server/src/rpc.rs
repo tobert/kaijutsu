@@ -84,8 +84,8 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, TaskStatus};
 #[cfg(test)]
 use kaijutsu_kernel::block_store::derive_context_live_status;
 use kaijutsu_kernel::kernel_db::{
-    context_used_pct, ContextRow, ContextShellRow, ContextUsageRow, DemoteOutcome, KernelDb,
-    KernelDbError, PromoteOutcome, WellKnownRole,
+    context_used_pct, ContextRow, ContextShellRow, ContextUsageRow, KernelDb,
+    KernelDbError, WellKnownRole,
 };
 use kaijutsu_kernel::{
     // FlowBus
@@ -1651,8 +1651,9 @@ pub async fn create_shared_kernel_in(
             .any(|row| row.root);
         if !has_root {
             return Err(capnp::Error::failed(format!(
-                "no live root character in {}. Stop here and run \
-                 `kaijutsu-server init --as <name> --key <pubkey-file>`, then start again",
+                "no live root character in {}. Stop here and run `kaijutsu-server bootstrap`, \
+                 or `kaijutsu-server init --as <name> --key <pubkey-file>` for the root alone, \
+                 then start again",
                 db_path.display()
             )));
         }
@@ -3502,7 +3503,7 @@ impl kernel::Server for KernelImpl {
                 kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel, context_id,
                     user_principal_id, session_id,
                     kaijutsu_kernel::runtime::prompt::PromptSource::Text { content })
-                    .await.map_err(capnp::Error::failed)?;
+                    .await.map_err(|error| capnp::Error::failed(error.to_string()))?;
                 results.get().set_prompt_id(&uuid::Uuid::new_v4().to_string());
                 Ok(())
             }
@@ -5445,6 +5446,13 @@ impl kernel::Server for KernelImpl {
 
                 let documents = kernel.documents.clone();
 
+                // A shell context is a REPL: its draft runs as a shell command
+                // whatever mode the client sent, and no model turn starts.
+                let is_shell = is_shell || kernel.kernel.kernel_db().lock()
+                    .get_context(context_id)
+                    .map_err(|e| capnp::Error::failed(format!("read context type: {e}")))?
+                    .is_some_and(|row| row.context_type == kaijutsu_types::SHELL_CONTEXT_TYPE);
+
                 if is_shell {
                     // A shell draft runs the shell its seat's facade chose,
                     // under the same gate as `shell_execute`.
@@ -5489,13 +5497,22 @@ impl kernel::Server for KernelImpl {
                     }
                 } else {
                     let session_id = connection.borrow().session_id;
-                    let user_block_id = kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel,
+                    use kaijutsu_kernel::runtime::prompt::SubmitError;
+                    match kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel,
                         context_id, user_principal_id, session_id,
-                        kaijutsu_kernel::runtime::prompt::PromptSource::Draft { edge })
-                        .await.map_err(capnp::Error::failed)?;
-
-                    let mut b = results.get().init_outcome().init_ok();
-                    set_block_id_builder(&mut b, &user_block_id);
+                        kaijutsu_kernel::runtime::prompt::PromptSource::Draft { edge }).await
+                    {
+                        Ok(user_block_id) => {
+                            let mut b = results.get().init_outcome().init_ok();
+                            set_block_id_builder(&mut b, &user_block_id);
+                        }
+                        // A refused draft stays as typed.
+                        Err(SubmitError::Refused(refusal)) => {
+                            let mut b = results.get().init_outcome().init_refused();
+                            set_refusal(&mut b, &refusal);
+                        }
+                        Err(SubmitError::Failed(message)) => return Err(capnp::Error::failed(message)),
+                    }
                 }
 
                 Ok(())
@@ -6033,14 +6050,7 @@ impl kernel::Server for KernelImpl {
         // Validate transition: only Staging → Live allowed in v1
         let drift_router = self.kernel.kernel.drift().clone();
         {
-            let drift = match drift_router.try_read() {
-                Some(d) => d,
-                None => {
-                    results.get().set_success(false);
-                    results.get().set_error("drift router busy");
-                    return Promise::ok(());
-                }
-            };
+            let drift = drift_router.read();
             if let Some(current) = drift.context_state(context_id) {
                 use kaijutsu_types::ContextState::*;
                 match (current, new_state) {
@@ -6064,30 +6074,17 @@ impl kernel::Server for KernelImpl {
             }
         }
 
-        // Update DriftRouter
+        // The DB commits first; the router follows it.
         {
-            let mut drift = match drift_router.try_write() {
-                Some(d) => d,
-                None => {
-                    results.get().set_success(false);
-                    results.get().set_error("drift router busy (write)");
-                    return Promise::ok(());
-                }
-            };
-            if let Err(e) = drift.set_state(context_id, new_state) {
+            let db = self.kernel.kernel_db.lock();
+            if let Err(e) = db.update_context_state(context_id, new_state) {
                 results.get().set_success(false);
                 results.get().set_error(e.to_string());
                 return Promise::ok(());
             }
         }
-
-        // Update KernelDb
-        {
-            let db = self.kernel.kernel_db.lock();
-            if let Err(e) = db.update_context_state(context_id, new_state) {
-                log::error!("set_context_state: KernelDb update failed: {e}");
-                // DriftRouter was already updated — log but don't fail
-            }
+        if let Err(e) = drift_router.write().set_state(context_id, new_state) {
+            log::error!("set_context_state: drift set_state failed: {e}");
         }
 
         log::info!(
@@ -6116,14 +6113,7 @@ impl kernel::Server for KernelImpl {
 
         // Inspect current state for idempotency + guards.
         {
-            let drift = match drift_router.try_read() {
-                Some(d) => d,
-                None => {
-                    results.get().set_success(false);
-                    results.get().set_error("drift router busy");
-                    return Promise::ok(());
-                }
-            };
+            let drift = drift_router.read();
             use kaijutsu_types::ContextState::*;
             match drift.context_state(context_id) {
                 None => {
@@ -6169,18 +6159,10 @@ impl kernel::Server for KernelImpl {
         }
 
         // Reflect in the DriftRouter so `listContexts` shows the new state
-        // immediately. If the router is busy, the DB is already authoritative and
-        // `concluded_at` drives the client's banding regardless — report success.
-        match drift_router.try_write() {
-            Some(mut drift) => {
-                if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Concluded)
-                {
-                    log::error!("conclude: drift set_state failed: {e}");
-                }
-            }
-            None => {
-                log::warn!("conclude: drift router busy (write); DB concluded, router state lags");
-            }
+        // immediately. A router guard is held only briefly, so waiting for one
+        // keeps the router in step with the DB.
+        if let Err(e) = drift_router.write().set_state(context_id, kaijutsu_types::ContextState::Concluded) {
+            log::error!("conclude: drift set_state failed: {e}");
         }
 
         log::info!("conclude: context={}", context_id.short());
@@ -6211,141 +6193,12 @@ impl kernel::Server for KernelImpl {
             }
         }
 
-        // Keep the live label index in step. try_write like conclude/promote:
-        // the DB is authoritative and a busy router only lags — never block
-        // the single-threaded RPC loop on it.
-        match self.kernel.kernel.drift().try_write() {
-            Some(mut drift) => {
-                if let Err(e) = drift.rename(context_id, Some(&label)) {
-                    log::error!("rename_context: drift rename failed: {e}");
-                }
-            }
-            None => {
-                log::warn!(
-                    "rename_context: drift router busy (write); DB renamed, router label lags"
-                );
-            }
+        // Keep the live label index in step with the DB.
+        if let Err(e) = self.kernel.kernel.drift().write().rename(context_id, Some(&label)) {
+            log::error!("rename_context: drift rename failed: {e}");
         }
 
         log::info!("rename_context: context={} label={label}", context_id.short());
-        Promise::ok(())
-    }
-
-    fn promote_context(
-        self: Rc<Self>,
-        params: kernel::PromoteContextParams,
-        mut results: kernel::PromoteContextResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "promote_context").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        // No drift-router existence pre-check: the DB is authoritative (it
-        // errors NotFound for unknown ids), and an archived context must be
-        // promotable — resurrection — whether or not the router remembers it.
-        let outcome = {
-            let db = self.kernel.kernel_db.lock();
-            match db.promote_context(context_id) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(e.to_string());
-                    return Promise::ok(());
-                }
-            }
-        };
-
-        // Resurrection reverses archive's DriftRouter sync: without this the
-        // router still holds Archived and sessions can't touch the context.
-        // Conclusion is orthogonal to placement — a resurrected concluded
-        // context comes back Concluded, not Live. try_write like `conclude`:
-        // the DB is authoritative and a busy router only lags, so never
-        // block the single-threaded RPC loop on it.
-        if let PromoteOutcome::Resurrected { concluded } = outcome {
-            let state = if concluded {
-                kaijutsu_types::ContextState::Concluded
-            } else {
-                kaijutsu_types::ContextState::Live
-            };
-            match self.kernel.kernel.drift().try_write() {
-                Some(mut drift) => {
-                    if let Err(e) = drift.set_state(context_id, state) {
-                        log::error!("promote_context: drift set_state failed: {e}");
-                    }
-                }
-                None => {
-                    log::warn!(
-                        "promote_context: drift router busy (write); DB resurrected, router state lags"
-                    );
-                }
-            }
-        }
-
-        log::info!(
-            "promote_context: context={} outcome={:?}",
-            context_id.short(),
-            outcome
-        );
-        results.get().set_success(true);
-        Promise::ok(())
-    }
-
-    fn demote_context(
-        self: Rc<Self>,
-        params: kernel::DemoteContextParams,
-        mut results: kernel::DemoteContextResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "demote_context").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        let outcome = {
-            let db = self.kernel.kernel_db.lock();
-            match db.demote_context(context_id) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(e.to_string());
-                    return Promise::ok(());
-                }
-            }
-        };
-
-        // Only the ladder's terminal step (archive) touches lifecycle state
-        // the drift router tracks; unpromote/demote are ring placement only.
-        // try_write like `conclude`: the DB is authoritative and a busy
-        // router only lags, so never block the single-threaded RPC loop.
-        if outcome == DemoteOutcome::Archived {
-            match self.kernel.kernel.drift().try_write() {
-                Some(mut drift) => {
-                    if let Err(e) =
-                        drift.set_state(context_id, kaijutsu_types::ContextState::Archived)
-                    {
-                        log::error!("demote_context: drift set_state failed: {e}");
-                    }
-                }
-                None => {
-                    log::warn!(
-                        "demote_context: drift router busy (write); DB archived, router state lags"
-                    );
-                }
-            }
-        }
-
-        log::info!(
-            "demote_context: context={} outcome={:?}",
-            context_id.short(),
-            outcome
-        );
-        results.get().set_success(true);
         Promise::ok(())
     }
 
@@ -6665,20 +6518,8 @@ impl kernel::Server for KernelImpl {
 
         // Sync the in-memory drift router (M2-B3 pattern): without this an
         // active session could still resurrect the context with the next op.
-        // try_write like `conclude` — the DB is authoritative, never block
-        // the single-threaded RPC loop on a busy router.
-        match self.kernel.kernel.drift().try_write() {
-            Some(mut drift) => {
-                if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Archived)
-                {
-                    log::error!("archive_context: drift set_state failed: {e}");
-                }
-            }
-            None => {
-                log::warn!(
-                    "archive_context: drift router busy (write); DB archived, router state lags"
-                );
-            }
+        if let Err(e) = self.kernel.kernel.drift().write().set_state(context_id, kaijutsu_types::ContextState::Archived) {
+            log::error!("archive_context: drift set_state failed: {e}");
         }
 
         log::info!("archive_context: context={}", context_id.short());
@@ -7477,21 +7318,9 @@ fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
         Value::Bytes(_) => kaish_kernel::interpreter::value_to_json(value).to_string(),
     }
 }
-async fn context_reviewer(
-    kernel: &SharedKernelState,
-    context_id: ContextId,
-) -> Option<PrincipalId> {
-    match kernel.kernel.resolve_context_review(context_id).await {
-        Ok(review) => Some(review.reviewer.principal_id),
-        Err(error) => {
-            log::warn!("approval reviewer unavailable for direct RPC in {context_id}: {error}");
-            None
-        }
-    }
-}
 
-/// Like [`context_reviewer`], but resolves for `actor` explicitly rather
-/// than the context's own configured performer. A human's direct shell
+/// The reviewer for a direct RPC in `context_id`, resolved for `actor`
+/// rather than the context's own configured performer. A human's direct shell
 /// command is performed by the CONNECTED human, so that is the identity
 /// the walk excludes — resolving for the context's `played_by` instead
 /// would answer a different question, and in a context with no performer
@@ -7529,7 +7358,7 @@ async fn set_context_cwd(
         let conn = connection.borrow();
         (conn.principal, conn.session_id)
     };
-    let reviewer = context_reviewer(kernel, context_id).await;
+    let reviewer = context_reviewer_for(kernel, context_id, principal).await;
     let identity = ShellIdentity { requester: principal, performer: principal, reviewer, context: context_id, session };
     if let Err(refusal) = kaijutsu_kernel::runtime::shell_state::check_shell_cwd(
         &kernel.kj_dispatcher, identity, std::path::Path::new(path),

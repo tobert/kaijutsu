@@ -374,7 +374,8 @@ async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
 }
 
 /// A root context is a human's admin console with no model: it holds the
-/// operator's whole authority set and composes no instruction blocks.
+/// operator's authority set, minus drives, and composes no instruction blocks.
+/// The model console is a `console` context under it, with the stance.
 ///
 /// A root context is minted at boot (`ensure_root_contexts`) or by `kj
 /// character create --root` — never by `kj kohai create --type root`,
@@ -407,7 +408,6 @@ async fn root_role_is_a_model_less_admin_console_body() {
     for cap in [
         Capability::Operator,
         Capability::ConfigWrite,
-        Capability::Drive,
         Capability::Fork,
         Capability::Drift,
         Capability::Transport,
@@ -421,6 +421,7 @@ async fn root_role_is_a_model_less_admin_console_body() {
     ] {
         assert!(binding.allows(&cap), "root should allow {cap:?}");
     }
+    assert!(!binding.allows(&Capability::Drive), "the root refuses every drive");
     let file = InstanceId::new("builtin.file");
     assert!(binding.allows_tool(&file, "write"), "root should allow file write");
     assert!(binding.allows_tool(&InstanceId::new("builtin.block"), "block_create"));

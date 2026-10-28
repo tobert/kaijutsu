@@ -1955,7 +1955,7 @@ mod card_route_tests {
     fn control_keys_act_under_a_card() {
         let mut keys = Keys::new();
         assert_eq!(route_under_card(ctrl('c'), &mut keys), CardRoute::Chord(Intent::Interrupt));
-        assert_eq!(route_under_card(ctrl('z'), &mut keys), CardRoute::Chord(Intent::Suspend));
+        assert_eq!(route_under_card(ctrl('z'), &mut keys), CardRoute::Chord(Intent::CtrlZ));
     }
 }
 

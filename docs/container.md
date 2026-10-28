@@ -49,43 +49,35 @@ The server stores its host key, auth database, config, and kernel data under
 agent-writable project mount. Mount provider credentials and other secrets
 independently and read-only; do not put them in either directory.
 
-## Add the first SSH key
+## Bootstrap the kernel
 
-The server refuses to start until `init` has created a root character and
-bound its key (`docs/character.md`, "Bootstrap: the person creates
-themself"). Run `init` before the first start; the public-key mount need not
-persist.
+The server refuses to start until a root character exists with a bound key
+(`docs/character.md`, "Bootstrap: the person creates themself").
+`bootstrap` writes them, registers a model backend, and creates the `ROOT`
+console (`docs/server-cli.md`, "bootstrap"). Run it while the server is
+stopped. The public-key mount need not persist.
+
+In the container, `~` is `/var/lib/kaijutsu`, so bootstrap finds no key file
+on its own. Mount each provider key read-only under `/run/secrets`, as the
+service does, and name it with `--backend` and `--api-key-file`. One run
+takes one backend; the first run sets the kernel default.
 
 ```bash
 podman run --rm \
   --userns=keep-id:uid=10001,gid=10001 --user kaijutsu \
   --mount type=bind,src=/tank/kaijutsu/kernel-data,dst=/var/lib/kaijutsu \
   --mount type=bind,src="$HOME/.ssh/id_ed25519.pub",dst=/keys/operator.pub,ro \
+  --mount type=bind,src="$HOME/.deepseek-key",dst=/run/secrets/deepseek-key,ro \
   --entrypoint /usr/local/bin/kaijutsu-server \
-  localhost/kaijutsu:dev init --as operator --key /keys/operator.pub
+  localhost/kaijutsu:dev bootstrap --as operator --key /keys/operator.pub \
+    --backend deepseek --api-key-file /run/secrets/deepseek-key
 ```
 
-`init` writes `kernel.db`, so run it while the server is stopped. To bind more
-keys later, `add-key <pubkey-file> --as <character>` is safe while the server
-runs: `auth.db` is WAL and never cached.
-
-## Configure a model backend
-
-A new kernel has no model backends and no cast, so a model turn
-fails with how to add them. Configure them from a client's shell after the
-first start:
-
-```bash
-kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY
-kj backend model set deepseek deepseek-flash --max-tokens 16384
-kj cast create house
-kj cast slot set house coder --backend deepseek --model deepseek-flash
-kj character set <name> --cast house   # then `kj context rotate` to bind it
-```
-
-The key reaches the kernel through the container's environment or a file
-the row names with `--api-key-file`; the row stores only the variable name or
-the path. README.md, "Quick Start" has more examples.
+The row stores only the key's environment variable name and path, so the
+service needs the same `/run/secrets` mount. To bind more keys later,
+`add-key <pubkey-file> --as <character>` is safe while the server runs:
+`auth.db` is WAL and never cached. `init` remains for the root alone, without
+a backend or `ROOT`.
 
 ## Devcontainer
 
@@ -266,14 +258,16 @@ project per kernel where a parameter costs nothing.
 2. Raise the DeepSeek backend's request and idle timeouts on this kernel.
    The 600 s request timeout covers the whole stream, which a long
    reasoning turn can exceed.
-3. Smoke test with `fleet/contained/live/council-cleanup.toml`
-   (`docs/acp-fleet.md`, "Live scenarios").
+3. Smoke test with one live turn that cleans up a scratch directory under
+   the council gate, and check the asks and the ledger rows it leaves.
 4. Check that the request prefix is byte-stable across turns with
    `KJ_LLM_REQUEST_DUMP` (`docs/telemetry.md`).
 5. The `agent-dev` stage, a `kaijutsu-dev.container` Quadlet, and the GPU
    drop-in.
-6. A bootstrap script: `init`, `add-key` for the supervisor,
-   `kj backend set`, the characters and their contexts (`kj kohai create`), `gate.toml`, and `rc reseed`.
+6. A bootstrap script around `kaijutsu-server bootstrap` (`docs/server-cli.md`,
+   "bootstrap"), which writes the root character and key and sets the
+   backend; the script adds `add-key` for the supervisor, the characters,
+   `gate.toml`, and `rc reseed`.
 7. A standalone test task: a one-page spec for a small Rust crate,
    acceptance tests the seat cannot see, a kaibo review step, and a step
    that writes `rocminfo` output to `GPU.md`. The supervisor runs the
@@ -288,6 +282,25 @@ project per kernel where a parameter costs nothing.
 - The 120 s idle timeout default and whether DeepSeek's `: keep-alive`
   comments reset it.
 - Whether the broker's tool list order is stable across turns.
+
+## amy-dev: a personal development workspace
+
+`contrib/amy-dev/` is one rootless container per machine for Amy's development: Arch, rustup, the ALSA and
+PipeWire client libraries, Claude Code, tmux, and sshd. Amy connects over SSH on port 2230, starts tmux, and
+works in `~/src`. The host keeps no build state. See `contrib/amy-dev/README.md` for setup.
+
+- **One Containerfile for every machine.** The `GPU` build argument (`none`, `rocm`, `intel`, `nvidia`) selects
+  that machine's GPU userspace. `contrib/amy-dev/machines/<host>.env` sets it, and `build.sh` reads it from
+  `uname -n` or takes `--gpu`.
+- **Device passthrough lives in a per-machine drop-in**, `machines/<host>.conf`, installed as
+  `amy-dev.container.d/gpu.conf`. The image does not know its hardware.
+- **Rust toolchains and cargo live in volumes**, so a toolchain update does not rebuild the image.
+- **Upgrades are rebuilds.** The root filesystem is read-only. The GPU userspace must match the host's kernel
+  driver, so a host upgrade is followed by a rebuild and a check (`contrib/amy-dev/README.md`, "Host upgrades").
+- **Back up state, not images.** The image rebuilds from its Containerfile. The state is `~/src`,
+  `~/.local/share/amy-dev/`, and `~/.claude`, and each machine's copy is separate.
+
+Nagaya builds inside it without a GPU: its `hip` feature is off by default, so `cargo test` needs no ROCm.
 
 ## Kubernetes later
 

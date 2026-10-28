@@ -41,10 +41,12 @@
 pub mod app;
 pub mod asks;
 pub mod bridge;
+pub mod client_id;
 pub mod cmdline;
 pub mod compose;
 pub mod completion;
 pub mod copy;
+pub mod ctrl_z;
 pub mod inflight;
 pub mod interrupt;
 pub mod keys;

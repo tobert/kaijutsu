@@ -6,15 +6,185 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Eight `solo_acp_stdio` turn tests exhaust their mock script (2026-10-18)
+## senpai/kohai branch: main's root rules still to port (2026-10-28)
 
-On zorak at `f70bba30`, `cargo test -p kaijutsu-solo-acp --features test-mock
---test solo_acp_stdio` fails 8 of 30. Each failing test runs a prompt; the
-agentic loop calls `stream()` once more than the script gives, and the turn
-panics: "MockClient script for model 'solo-mock' exhausted after 2 turn(s)"
-(`crates/kaijutsu-kernel/src/llm/mod.rs:1170`). The failures are the same with
-and without `S36-house-rules.kai`, so they predate it. Find which change added
-the extra call, then fix the scripts or the loop.
+`feat/senpai-kohai` merged `main` at `913277fd`. The merge builds, and these
+tests still fail. Each needs a ruling on the branch's rule or a rewrite of
+the test for it.
+
+- Roots. `main` lets a root character be a performer and play the top of its
+  own lineage (`kj/context.rs`, `plays_own_root` on `main`). The branch
+  refuses a root nowhere now, and `insert_new_context_rows` exempts every
+  root from the self-review check, which is wider than `main`'s rule. Decide
+  the narrow rule, then port `plays_own_root` to the kohai path.
+  `a_root_character_may_play_its_own_root_context` fails: a root console has
+  no context character, so nothing can answer to it.
+- A model's create held for Amy. `a_held_create_*` in `context_create_cwd_wire`
+  and `register_session_upsert` fail: the branch finds a reviewer through the
+  senpai chain, and a model acting in Amy's root context has none ("nobody
+  reviews claude in context amy"). `main` found Amy through the lineage root.
+- `a_chat_submit_that_would_review_itself_is_refused` (`compose_draft_wire`)
+  submits successfully: `assign_test_review_recasting(.., performer,
+  performer)` no longer yields a performer that reviews itself. Rewrite the
+  setup for senpai-chain review.
+- `kj context set --as` and the `played_by` column are gone, so `main`'s tests
+  for director casting went with them. Re-express "a director may cast a
+  root" on `kj kohai create`.
+- `kernel_db::context_characters::a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai`
+  and `kj::context::rotate_carries_the_seat_to_its_successor` failed before
+  the merge too: a rotation keeps the predecessor's slots instead of reading
+  the cast again.
+- The "performer reassignment rejects a queued inference" wire test
+  (`turn_events_wire`) was deleted with the performer column. Its behavior
+  (a reassigned context drops a queued turn) has no test.
+- `kaijutsu-server bootstrap` now builds a `house` cast with `console` and
+  `distill` slots and rotates ROOT when the cast arrives later. A kernel
+  bootstrapped before the branch has no cast: run bootstrap again.
+- The prose in `docs/approval-identity.md` still says "a root can never be a
+  performer" in places; read it against `docs/character.md`, "Roots".
+
+---
+
+## Root console: model, approval, and the shell child (2026-10-25)
+
+The design is in `docs/character.md`, "The root console and its shell".
+Landed: the human root has no model and refuses `drive`; its model console is
+a `console` context under it, labeled `ROOT`, with the stance; Ctrl-Z toggles
+root, console, and shell; the start choice prefers `ROOT`. Still open:
+
+- Incoming drifts into the console reach a model unreviewed. A drift starts
+  no turn (`Wake::Drift`, `runtime/turn_state.rs`), but it joins a running
+  turn at its next tool round (`offer_drift`, `kj/drift.rs`), and an idle
+  drift rides the next submit. The plan (Amy, 2026-10-27): when a drift
+  lands, the client pauses compose input, as it does for a ledger accept;
+  after reading, the human releases it with a key or excludes it
+  (`kj stage exclude`). A drift into a running console turn waits for that
+  release instead of joining at the tool round.
+- The console and council stances name Amy as fixed text, so another
+  person's `bootstrap` tells their ROOT that Amy is accountable. A small fix:
+  rc exposes the reviewer's name and the stance uses it.
+- `kaijutsu-mcp` `prepare_session_create` still records no performer for a
+  root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
+- `docs/character.md` says ROOT is played by a root character. The console is
+  played by a model character. The reserved-label rule needs the same edit.
+- The root's shell child has only the `shell` bundle (`exec` and the shell
+  facades), so `kj cast` and `kj context create` there are denied for lack of
+  `config-write`/`operator`. Admin work runs through the TUI's `:kj` in the
+  human root. Decide whether the shell child carries the root's admin grants,
+  or the denial names `:kj`.
+- A gate-held command's result reaches no one: the caller's reply has
+  closed, and `kj ledger allow` answers only "allowed ask". So a held
+  `kj context create --cwd-optional` that drops its directory says why to
+  nobody; only the missing cwd shows it.
+- `register_session` after an approved create does not rejoin when the
+  label named a concluded or archived context: the held create used a
+  suffixed label, and the second call derives the next suffix and creates
+  another context.
+- ACP still sends a required `--cwd` (`create_context_under`); a gate-held
+  ACP create in a directory the kernel cannot see fails after approval.
+  Probably right, since ACP must run in its directory.
+- `submitInput` still reports reviewer-walk errors (such as "no reviewer")
+  as Cap'n Proto faults, not refusals (`runtime/turn_identity.rs`).
+- Live checks: the Ctrl-Z toggle creating a shell child against the kernel; the
+  TUI double Ctrl-Z suspend and `fg` resume; the app's Ctrl-Z.
+- Pipe a shell snippet back to the model's draft. Later, after the above.
+- Typed shell-return rendering: `ls` looks bad in the TUI. Start with a live
+  block dump to see whether `output` is missing on the wire.
+- Key delivery: the Anthropic and DeepSeek keys sit in the container as
+  read-only mounts. Later, startup-only or SSH injection.
+
+---
+
+## Renovation review, 2026-10-14 — what is still open
+
+Review at `040f9b21`, kept in git at `d54a4fed`
+(`docs/audits/2026-10-14-codebase-renovation-review.md`); the IDs are its
+section numbers. Triaged against main on 2026-10-27, and its S-sized
+data-integrity, approval, hydration, kj, beat and media fixes landed the
+same day. Findings already tracked elsewhere stay there: 6.1 (Anticipation
+and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
+and the `lineage_root` refusal wording. Still open:
+
+Behavior:
+- **4.2b** Three RPCs still skip their `kj` verb: `archiveContext` (the
+  app well's `a`, and kaijutsu-acp; no latch, no archive rc, no authority
+  check, documented as deliberately unlatched), `conclude` (the well's `c`;
+  skips the lineage authority check), and `setContextPaused` (the well's
+  `z`). `demoteContext` and `promoteContext` are gone (Amy: "drop that rpc
+  for demote"). The TUI's `Ctrl+A q` is still a "not built yet" notice.
+- **2.3** `approval_resume` runs approved commands inline in its one task,
+  so a long command stalls ask delivery for every context. M.
+- **2.6** The submit-rc race, `interrupt.hard()` on a persistence failure,
+  and a turn that runs without an admission permit. M.
+- **4.6** Block and task tools edit any context a caller's `BlockId` names,
+  and `block_list` lists every document. Not a security boundary, but it
+  breaks focus. M.
+- **4.7b** Notification, Resource, Task, Error and Drift blocks inside an
+  open model batch still flush it during hydration and can split its
+  results, as a user shell result did (`llm/hydrate.rs`).
+- **2.2** Clean cached files keep serving after a delete or rename;
+  `MountBackend` never invalidates the cache. M.
+- **5.1** The client refuses subscribe while connecting, a failed
+  resubscribe freezes the view, and `BlockEventsForwarder::closed` latches.
+- **5.2** `run_context_feed` wakes on every context's events;
+  `spawn_editor_reconciler` holds an `Arc` cycle, so the kernel never drops.
+- **5.3c** `cherry_pick_block` drops metadata. A correct copy needs a
+  block-store API that mints a target id and decides what a copy keeps.
+- **3.1** The council shadow's `CREATE` lock is dropped before
+  `run_create_lifecycle`, and the shadow is primed twice per call.
+- **6.3** CAS-backed ABC cues do not play: `dispatch_midi_cue` has no
+  prefetch path. M.
+- **7.2** The app spawns a new `RpcActor` on every cache-miss context switch
+  and loses collapse state (`view/sync.rs`). M.
+- **7.3** App input and scroll handlers fire on every screen; split panes
+  all draw the main cell; the shell dock never tracks cursor kind or
+  selection. M.
+- **8.1** A garbage graph header panics inside `hnsw_rs` 0.3.4
+  (`HnswIo::init`) instead of returning an error, and the `HnswIo` leaked
+  on a successful load is not reclaimed when rebuild replaces the index.
+- **5.4** SFTP posix-rename does not detect two names for one file, and the
+  replace is not atomic. Share `getattr` follows symlinks (`share.rs`).
+- **2.4** Unverified: a late denial may leave a background hold waiting.
+- **6.2** Unverified: a phase slew may put the next master beat a fraction
+  of a period after `scheduled`, firing one beat twice.
+
+Clarity:
+- **1.7** Two hydration loaders; `promote_context` returns a raw SQLite
+  error on a label conflict; `publish_batch` takes one lock per message.
+- **3.3** `council_programs(program_decision_id)` has no index, and
+  `list_bump_flavors` lacks the program filter.
+- **3.5** `approval_identity` locks the DB up to four times per call;
+  `approval_ledger::claim` has only test callers while help describes it;
+  `rules::revoke` is not transactional.
+- **8.2** The index watcher treats a closed stream like a timeout, and
+  corrupt `context_id` blobs are skipped silently.
+
+## amy-dev: open items before its first run (2026-10-24)
+
+- tenchi (the DGX Spark) is aarch64. `contrib/amy-dev/Containerfile` takes an x86_64 Arch `BASE`, so tenchi needs an
+  aarch64 base image. Decide between Arch Linux ARM and another base.
+- The Intel host has no `contrib/amy-dev/machines/` profile. Name it by `uname -n`.
+- The `none`, `rocm`, `intel`, and `nvidia` images built on x86_64 but have not run. Their GPU and sshd entrypoints
+  are unchecked, and `zorak`'s `rocm` image is untested on zorak.
+- No `check.sh` yet: the host-upgrade check in `contrib/amy-dev/README.md` is a manual list.
+
+---
+
+## Two tests fail on main at `87e70c20` (2026-10-19)
+
+- `kaijutsu-tui` `terminal_fit`: `ctrl_a_r_rotates_the_seat_and_follows_its_successor`
+  (the `operator` capability gate refuses `kj context rotate`) and
+  `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` (a vi
+  document-cache miss).
+
+## `SshServerConfig::unlisted` has no production entry point (2026-10-27)
+
+Only `kaijutsu-solo-acp --unlist <path>` set `SshServerConfig::unlisted`,
+and that binary was removed on 2026-10-27. The kernel still honors the list
+(`docs/mounts.md`, "Unlisted paths"), but no shipped binary fills it, so
+only tests reach it. Decide whether `kaijutsu-server` gets an `--unlist`
+flag (or a `mounts.toml` key) or the feature is removed. The footprint is
+about a dozen files in `kaijutsu-kernel` and `kaijutsu-server`.
 
 ## Anticipation and commitment — iteration order
 
@@ -97,8 +267,8 @@ Measure and design recovery before promising durable admission or delivery.
 
 ## First System 1 benchmark runs (2026-10-04, Sonnet 5.5, deny mode)
 
-Five Sonnet runs of db-wal-recovery under contrib/bench/gate-council.toml
-with Harbor `--ak permission_mode=deny`. Each found the XOR key, tried to
+Five Sonnet runs of db-wal-recovery under the benchmark's council gate, in
+deny mode (`docs/benchmarks.md`). Each found the XOR key, tried to
 back up first, and ended `blocked` with a correct plan and an honest
 account; none passed. What each step fixed:
 
@@ -116,8 +286,9 @@ account; none passed. What each step fixed:
   rollout step 4) and a bump outcome (refuse with the readout and invite a
   retry) are the next design steps.
 - The kernel logs a council answer loudly only for `report`; allow and ask
-  answers are in the ledger and the `council_*` tables but not in the log
-  a Harbor run keeps. A Harbor run cannot show why a command was refused.
+  answers are in the ledger and the `council_*` tables but not in the
+  kernel log, so a run that keeps only the log cannot show why a command
+  was refused.
 
 Exploration settings used: `allow_at` 0.7 to 0.9, `mass_floor` -0.3, and
 read-only inspection programs in `[global] allow`; the committed gate file
@@ -211,9 +382,6 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   is the tool label, shared by many asks, so each check reads every
   collected allow with a stored command under that label in the context.
   The cost grows with approval history; unmeasured.
-- **No kernel test for the same-statements match.** `asks_about_submission`'s
-  digest-set-under-one-label branch is tested only through the ledger query,
-  not as `approved_run_unsettled` uses it (e.g. `touch  x` against `touch x`).
 - **A prepare miss records empty identity fields.** `council_decisions`
   makes `server_*` and `spec_id` NOT NULL, but a miss inside `prepare` has
   neither, so the gate writes empty strings and the cause explains. Make
@@ -647,9 +815,8 @@ tool's `**/*` lists nothing under `build/`; the kaish builtin `glob
 build/obj/*.o` finds the file, and the same `cat` under `other/obj/`
 works. kaish's agent ignore defaults
 (`kaish-glob` `IgnoreFilter::with_defaults`: `build`, `dist`, `target`,
-`node_modules`, and others) apply to argument expansion. Seen in the
-contained live fleet (`fleet/contained/live/council-cleanup.toml`, an
-earlier draft): a DeepSeek seat spent most of a prompt probing why its
+`node_modules`, and others) apply to argument expansion. Seen in a
+contained live council-cleanup run: a DeepSeek seat spent most of a prompt probing why its
 build left `build/app` empty, guessed at `.gitignore`, and read the gate
 config. Contributing factors: the error does not say a rule skipped the
 match, and the `glob` builtin and argument expansion disagree. A seat
@@ -745,16 +912,6 @@ producer measuring council latency must use its own wall time.
   (`llm/db_config.rs`): it never puts an unparseable kind in the table, so
   `load_backends` skipping one would stay green.
 
-## acp_fleet's forget-a-human-rule scenario predates the worker loadout (2026-10-06)
-
-`cargo test -p kaijutsu-solo-acp --features test-mock --test acp_fleet`
-fails `f-model-cannot-forget-human-rule`: the scenario expects a coder's
-`kj ledger forget` to reach "ask the reviewer who made it", but since
-13fff761 a coder has no `kj ledger` at all ("not part of this seat's
-work"). The property holds more strongly; the scenario should expect the
-house refusal, or move to a seat that holds the house capability. Which
-it should test is a choice to make, not a typo to fix.
-
 ## Two tui terminal_fit tests fail on moltar (2026-10-06)
 
 `ctrl_a_r_rotates_the_seat_and_follows_its_successor` (the client never
@@ -846,7 +1003,8 @@ sent to the server is meant.
 ## Architecture cleanup plan
 
 Source review at `f7e46f8e`, September 16:
-[evidence and proposed tests](audits/2026-09-16-architecture-debt.md).
+evidence and proposed tests in `docs/audits/2026-09-16-architecture-debt.md`,
+kept in git before `4ed9406d`.
 This is the live plan; the audit records the review. Planning added source
 markers and corrected misleading comments, without changing behavior.
 
@@ -1194,9 +1352,10 @@ servers"). Open, most likely to bite first:
   spawn a host command for any context and add one explicit grant to its
   loadout. Amy, 2026-10-01: "no exec gate for now ... acp would have to
   auth over ssh in the first place". Revisit with exec on declaration.
-- **The fleet has no `mcpServers` key.** The end-to-end tests live in
-  `crates/kaijutsu-solo-acp/tests/acp_mcp_servers.rs`, so the Harbor-shape
-  invariants are not checked against an MCP tool call yet.
+- **No end-to-end test calls a declared server's tool.**
+  `crates/kaijutsu-acp/tests/kernel_e2e.rs` declares a server through the
+  bridge and checks that resume and load keep its process, but no model turn
+  calls one of its tools through ACP.
 
 ## From the coder orientation preload (2026-10-01)
 
@@ -1354,16 +1513,16 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
 
 Harbor's ACP runner drove a coder context on a throwaway kernel with
 deepseek-v4-flash. Evidence, event logs and the code audit:
-`~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`. Recipe:
-`contrib/bench/README.md`. Amy's observation that prompted it: contexts "stop
+`~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`. The harness was
+removed on 2026-10-27 (`docs/benchmarks.md`). Amy's observation that prompted it: contexts "stop
 more readily than other agents". Open, most costly first:
 
-- **Rerun the every-command-asks benchmark.** It spent 35 inferences and
+- **Recheck the every-command-asks run.** It spent 35 inferences and
   1.09M input tokens against 9 and 173K with the commands allowed, mostly
   the model hunting for output it had already produced. A model's turn now
   holds on its ask and reads the real output as its tool result
-  (`docs/gate-resume.md`, "The turn holds"). Rerun the task, and delete this
-  entry if the spiral and `asks_orphaned` are gone.
+  (`docs/gate-resume.md`, "The turn holds"). Run a task where every command
+  asks, and delete this entry if the spiral and orphaned asks are gone.
 - **The waiting receipt is ambiguous on the non-blocking paths.** The MCP
   and RPC shell paths still return "the command has not run" with
   `is_error=false`; the refusal remedy (`kaijutsu-types/src/refusal.rs`)
@@ -1383,15 +1542,13 @@ more readily than other agents". Open, most costly first:
   driver that does not wait. Build the push when a driver needs it.
 - **Over ACP, a kernel notice reads as the model's own words.** The bridge
   sends a `(System, Notification)` block (the ceiling notice) as
-  `agent_message_chunk` text with no separator, so Harbor's trajectory
-  records the notice as model output. A thought chunk or a separated,
-  labeled message would read honestly (`fleet/done-headless.toml` pins
-  today's shape).
+  `agent_message_chunk` text with no separator, so an ACP client records
+  the notice as model output. A thought chunk or a separated, labeled
+  message would read honestly.
 - **A background completion after `done` starts a turn that calls `done`
-  again.** `kj wait` and `classify_run.py` read the last verdict, so they
-  report the follow-up turn's, not the task's. Harbor reads the first.
-- **The `coder-driven` bench overlay still asks for a `RESULT:` line**, now
-  beside `done`. Retire the line or the overlay at the next bench arm.
+  again.** `kj wait` reads the last verdict, so it reports the follow-up
+  turn's, not the task's. An ACP client that stops at the prompt response
+  reads the first.
 - **Measure the narrowed coder seat.** It was about 14,400 input tokens on
   2026-10-01, 80% of it tool schemas, before the coder got its own binding
   and one shell. Most input tokens are reasoning replay, not the seat: one
@@ -1399,7 +1556,7 @@ more readily than other agents". Open, most costly first:
 - **Cut shell output accumulates in CAS.** Every model-facing result past
   8 KiB stores its whole stream (up to 4 MiB) in CAS, and CAS has no
   retention or reference counting (`kj cas rm` is unconditional). Measure
-  growth over a benchmark run before choosing a policy.
+  growth over a long unattended run before choosing a policy.
 - **kaish builtins differ from the programs a model expects.** `timeout`
   takes the wrapped command's flags as its own (`timeout 10 python3 -c` is
   refused, the same bug as tobert/kaish#484 for `env`); `grep -x`, `find -o`,
@@ -1412,16 +1569,16 @@ more readily than other agents". Open, most costly first:
   `docs/conversation-session.md`, "When an inference stops at the output
   ceiling". A model that reasons past the ceiling every time therefore costs
   up to that many ceilings before the turn ends anyway. Measure continuations
-  per turn and how many of them recovered in the next benchmark arm before
+  per turn and how many of them recovered in the next long unattended run before
   tuning the bound, and decide there whether the notice should also lower
   `effort` for the continuation.
 - **No cumulative token count.** `context_usage` is a last-call snapshot, no
   real run emitted an ACP `usage_update`, and `PromptResponse.usage` is unset,
-  so Harbor's token columns are empty. Totals come from the kernel log's
+  so an ACP client gets no token totals. Totals come from the kernel log's
   `LLM stream completed` lines today.
-- **ACP has no model selection.** Harbor's runner raises when `--model` is
-  passed and the agent advertises none; the model is chosen through the
-  agent's own flags meanwhile.
+- **ACP has no model selection.** A client that asks for a model fails
+  (Harbor's runner raises when `--model` is passed and the agent advertises
+  none); the model comes from the kernel's own configuration meanwhile.
 - **ACP `mcpServers` run, stdio only.** See "Client-declared MCP servers:
   what stays open" for what an MCPMark run may still hit.
 - **File tools:** `read` truncates a line at 2000 characters with no way to
@@ -1441,20 +1598,11 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   written block a resend would duplicate the partial blocks. Open: decide what
   happens to those partial blocks, and whether a cut after only a thinking
   block may be sent again, before widening the rule.
-- **The bench adapter duplicates DeepSeek's output budget.**
-  `contrib/bench/harbor/kaijutsu_solo_agent.py` passes 65536 on DeepSeek
-  when `KAIJUTSU_ACP_MAX_TOKENS` is unset. The DeepSeek model rows
-  `kaijutsu-solo-acp` writes carry `max_tokens` 65536 at effort `high`
-  (`provider::DEEPSEEK_V4`), so the adapter's copy can go once a run confirms
-  the kernel sends 65536.
-- **Harbor puts the provider key in process arguments.** `run-harbor.sh`
-  passes `--ae DEEPSEEK_API_KEY=…`, and Harbor's `docker-compose exec -e
-  DEEPSEEK_API_KEY=sk-…` shows the key to anyone running `ps` on the host
-  (seen 2026-10-03). Pass it through the environment or an env file instead.
 - **A process the model spawns can read the kernel's environment through
   `/proc/<pid>/environ`** when it runs as root, which is usual in task
-  containers. kaish clears the child environment and `kaijutsu-solo-acp` clears
-  its dumpable flag, which stops a same-uid reader but not root. A provider key
+  containers. kaish clears the child environment, but no shipped binary
+  clears its dumpable flag (the removed `kaijutsu-solo-acp` did), and that
+  flag stops a same-uid reader, not root. A provider key
   that reaches the kernel by environment is readable there; use a run-scoped
   key in a disposable container.
 From the Qwen runs on current main (2026-09-30, `docs/benchmarks.md`, "Qwen
@@ -1470,14 +1618,6 @@ on current main"):
   clients read a `[stderr]` line (`shell_envelope::join_streams`). A person
   cannot tell the streams apart. Color, not the text marker, may suit the
   tui better; decide against `docs/tui.md`.
-
-## contrib/bench/boot-kernel.sh stops at its gate patch (2026-10-04)
-
-The seeded `gate.toml` already carries a `[context_type.coder]` tier, so the
-patch step reports "a [context_type.coder] tier is already present" and the
-script exits before it writes `env.sh`. The kernel is left running and
-usable, but callers that source `env.sh` fail. Treat an existing tier as done
-(or check that it matches) and continue.
 
 ## From kj-ds4-tb2-20-64d8b208 (deepseek-v4-flash, binary 64d8b208)
 
@@ -1506,7 +1646,7 @@ usable, but callers that source `env.sh` fail. Treat an existing tier as done
 - **A coder opened its own kernel's live `kernel.db`.** Run 2 lost the WAL,
   then searched kaijutsu's state directory for a copy and ran `sqlite3`
   against the running kernel's `kernel.db` before the agent process exited
-  nonzero. The solo state directory is visible to the coder's shell. Either
+  nonzero. The kernel's state directory was visible to the coder's shell. Either
   keep it out of the coder's reach or have the command check refuse writes
   and opens there.
 - **The backup rule did not hold.** db-wal-recovery opened `main.db` with
@@ -1542,15 +1682,13 @@ usable, but callers that source `env.sh` fail. Treat an existing tier as done
   question).
 - **The `curl` builtin's egress allowlist** refused pypi.org and
   sourceforge.net while host `pip` and `apt-get` reached the network in the
-  same container. Benchmarks now open it (`egress_allow`, default `*`,
-  `docs/benchmarks.md`). Open: say in the refusal that the allowlist is
+  same container. The later benchmark runs opened it to every host. Open: say in the refusal that the allowlist is
   kaijutsu's.
 - **Three losses were reasoning past a 16K ceiling** (dna-assembly,
   headless-terminal, model-extraction-relu-logits): 4 `length` stops each,
   166-186K characters of reasoning, no tool call. The baseline ran with
   `max_tokens` 32768; this run left it unset (factory 16384) at effort
-  `max`. The adapter now passes 65536 on DeepSeek. Comparisons must match
-  the ceiling in provenance.
+  `max`. Comparisons must match the ceiling in provenance.
 - **Nothing tracks the OS processes a context starts** (design, Amy: "a
   cgroup later would be rad"). Daemons a model launches from a script
   (configure-git-webserver's sshd and web server) leave no record: no way
@@ -1593,8 +1731,7 @@ Contributing factors:
 
 Not factors: in a kaish shell `/dev` is kaish's own device mount, and a whole
 read of `zero` or `urandom` fails with an error, so `grep` skips it. Walks of
-`/v` finished; they cost time, not memory. That `solo-acp` reported exit 1
-rather than a signal is not explained.
+`/v` finished; they cost time, not memory.
 
 Shipped 2026-10-02: the kernel unlists the host's `/proc` and `/sys`
 (`MountTable::unlist`, `docs/mounts.md`, "Unlisted paths"), so a walk from
@@ -1655,9 +1792,11 @@ one purpose:
    `/r`, and `/v` beside the harness's `/installed-agent` and `/logs`. Models
    read `/logs/agent/acp.txt`, which is this kernel's own stderr with the
    model's own thinking in it. In fix-code-vulnerability, `grep -rl
-   report.jsonl /` found only that log. The Harbor adapter now unlists
+   report.jsonl /` found only that log. The Harbor adapter then unlisted
    `/logs` and `/installed-agent` (`kaijutsu-solo-acp --unlist`), so walks
-   and `ls /` skip them; naming them still works. Proposed fix: the inversion in
+   and `ls /` skipped them; that adapter is removed, and nothing sets the
+   list now (see "`SshServerConfig::unlisted` has no production entry
+   point"). Proposed fix: the inversion in
    `docs/mounts.md`, "The inversion". `/` holds the workspace, `/tmp`, the
    kernel's own trees, and the mounted toolchain, not the host. A walk
    from `/` is then short and finds only the model's space, and it cannot
@@ -1846,7 +1985,7 @@ Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
 - **A background job's live stream is uncut and unbounded on the kernel
   side** (`command.rs`, an unbounded channel of cloned results).
 
-## Leftovers from the solo-acp state work (2026-09-18)
+## Leftovers from the client key and state work (2026-09-18)
 
 Smaller, from the same work:
 
@@ -1856,16 +1995,16 @@ Smaller, from the same work:
 - `kaijutsu-mcp` names its context flag `--context-name`; `kaijutsu-acp` uses
   `--context-type` and `--character`. There is still no way to run one `kj`
   command against a kernel from a shell without speaking MCP or ACP;
-  `contrib/bench/kjmcp.py` fills that gap for the harness.
+  `contrib/kjmcp.py` fills that gap over the MCP stdio bridge.
 - Provider HTTPS verifies through `rustls-platform-verifier`, which reads the
   on-disk CA bundle with no bundled fallback. A static binary in an image
   without `ca-certificates` fails every model call.
-- Static builds: `contrib/bench/Containerfile.static` duplicates the root
-  `Containerfile`'s build stage. Amy prefers static binaries for deployment.
-  Put the per-target link flags in `.cargo/config.toml`
-  (`[target.x86_64-unknown-linux-musl]`; a blanket `RUSTFLAGS` breaks
-  proc-macro crates), build the root image static, export the binaries from
-  it, and delete the second Containerfile. Measure musl's allocator under load
+- Static builds: the root `Containerfile` builds dynamic binaries, and the
+  static build lived in the removed `contrib/bench`. Amy prefers static
+  binaries for deployment. Put the per-target link flags in
+  `.cargo/config.toml` (`[target.x86_64-unknown-linux-musl]`; a blanket
+  `RUSTFLAGS` breaks proc-macro crates), build the root image static, and
+  export the binaries from it. Measure musl's allocator under load
   before a static kernel serves real work.
 
 ## The uncovered tier does not reach a `KjVerb` ask (2026-09-18)
@@ -1878,8 +2017,8 @@ uncovered tier: a sandbox posture") rides the config layers, and an
 `Uncovered` for that origin because there is no planned program to key on.
 So a sandboxed kernel still asks on those. Either those callers should load
 the file and the evaluator should let the tier decide a plan-less ask, or
-the boundary stays and the `kj cc` help says so. No benchmark has hit it
-yet.
+the boundary stays and the `kj cc` help says so. No recorded run has hit
+it.
 
 ## The uncovered tier: three seams left open (2026-09-18)
 
@@ -2994,7 +3133,8 @@ problem.
 
 ## Tech-debt audits, 2026-08-20 — what is still open
 
-Full reports: `docs/audits/`. Re-verified against the current tree:
+Full reports were in `docs/audits/`, kept in git before `4ed9406d`.
+Re-verified against the current tree:
 
 - **`dirty_file_buffers.context_id` is loaded and never used.**
   `get_dirty_file_buffer` and `list_dirty_file_buffers` select it, and
@@ -3579,17 +3719,20 @@ and burn down all the approval options". Delete each line as it ships.
   when run with the rest of `kj::ledger` (`--test-threads=4`, reproduced
   twice on a953a6ab). Probably a tracing callsite-interest race
   under `with_subscriber`.
-- **Tests** The ACP part of the conformance matrix ships in
-  `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
-  approval matrix"); scenarios marked `known_gap` name F8.
-  The ACP bridge offers "always allow" and "always deny", so rule scenarios
-  run through ACP. Paths C and D need a harness of their own. A rule added
-  between an ask and its answer does not reach that approval: Amy, "the
-  policy at the time the command was first evaluated should cover its
-  lifetime"; `e-rule-added-after-ask-leaves-it-alone.toml` holds it. A
-  model's turn holds on its ask, so that scenario and
-  `d-shell-write-runs-what-was-shown.toml` change state between ask and
-  answer through a sibling call in the same reply.
+- **Tests** `crates/kaijutsu-server/tests/gate_scenarios_wire.rs` drives
+  the approval paths through a running kernel, and
+  `crates/kaijutsu-acp/tests/kernel_e2e.rs` drives allow, deny, and "always
+  allow" answers through the ACP bridge. F8's config-deny row is
+  `a_config_deny_is_listed_in_the_ledger_history`, ignored until F8 is
+  fixed; today the reviewer's `kj ledger list --status denied` prints "(no
+  decided asks)", while `a_denied_ask_is_listed_in_the_ledger_history`, the
+  control, shows a denied ask. Paths C and D need a harness of their own. A rule
+  added between an ask and its answer does not reach that approval: Amy,
+  "the policy at the time the command was first evaluated should cover its
+  lifetime"; `a_rule_remembered_after_an_ask_leaves_that_ask_alone` holds
+  it. A model's turn holds on its ask, so that test and
+  `an_approved_shell_write_runs_with_the_cwd_and_env_it_showed` change state
+  between ask and answer through a sibling call in the same reply.
 
 ## What a replacement risk scorer inherits (2026-09-28)
 
@@ -3669,14 +3812,12 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
   sibling on different threads, release, and assert the sibling settles
   with the stop observed.
 
-## ACP fleet: what stays open (2026-09-27)
+## ACP bridge: what stays open (2026-09-27)
 
-The fleet (`docs/acp-fleet.md`) runs Harbor-shaped scenarios against
-`kaijutsu-solo-acp` with the scripted mock model: host scenarios test that
-the gate and pre_call hooks hold, and contained ones run a permissive ("yolo")
-kernel in podman with no network and only the workspace writable. Amy:
-"some of those acp sessions can use modified rc too, maybe a more yolo mode
-for when it's contained in docker". Open:
+Found by the ACP fleet, which drove `kaijutsu-solo-acp` with the scripted
+mock model; both were removed on 2026-10-27.
+`crates/kaijutsu-acp/tests/kernel_e2e.rs` drives the bridge against a real
+kernel now. Open:
 
 - **A hook never lowers an ask by its exit status** (Amy, 2026-09-30):
   "a lower should be spelled out and almost impossible to do by accident."
@@ -3694,13 +3835,12 @@ for when it's contained in docker". Open:
   - *Turn state.* Every kernel turn start and end, follow-ups included,
     emits v2's `state_update` (`running`/`idle`/`requires_action`, with
     `stopReason` and `usage` on idle). Send it as `_kaijutsu/state_update`
-    unless the client declares support for the update variant. The fleet
-    then waits for `idle` after the last `running`. This replaces the
-    quiet wait below.
+    unless the client declares support for the update variant. A client
+    then waits for `idle` after the last `running`.
   - *Failure.* Record `_meta.kaijutsu.failure = {kind, category, severity,
     title, details?, retryable?}` on the `PromptResponse` and on the idle
     update, shaped after claude-agent-acp's `sessionFailure`. `stopReason`
-    stays standard. The fleet reads `kind`, not text.
+    stays standard. A client reads `kind`, not text.
   - *Cancel.* Split `interruptContext`'s result into `turn_interrupted` and
     `continuation_closed` at the source, and carry them as
     `_meta.kaijutsu.cancel` on the idle update that follows.
@@ -3708,47 +3848,19 @@ for when it's contained in docker". Open:
     `rawInput`, and the hook's reason in `content`. Mirror v2's
     `permission.subject` under `_meta.kaijutsu.permission`. Name the rule
     in the `allow_always` label.
-  - *Harbor* has a first-class ACP adapter (`acp:<id>` or a local
-    `agent.json` with a `distribution.local` entry). Its runner treats the
-    `session/prompt` return as run end and ignores follow-up turns. It
-    auto-answers the first allow option and builds ATIF from
-    `tool_call`/`tool_call_update` by `toolCallId`, taking cost from
-    `usage_update.cost`. A kaijutsu `agent.json` is cheap to add.
-    Amy, 2026-09-30: an opt-in flag holds `session/prompt` open until
-    the context goes idle, with follow-up turns included, so Harbor
-    sees the whole run. A model's own ask no longer starts a follow-up
-    turn: the turn holds on it, inside the prompt.
-- **Harbor shape** (`docs/acp-fleet.md`, "Harbor shape"): every fleet
-  scenario is checked for what Harbor reads. Open findings:
-  - **H2: a background completion starts a turn after `session/prompt`
-    returns.** Harbor ends the run at the response and never sees it; the
-    job's own `shell` call is still `in_progress` then. The planned opt-in
-    flag above closes it. `harbor-background-after-response.toml`,
-    `contained/background.toml`.
-  - **H3: no cost is reported.** `usage_update` carries only the context
-    fill, and only when the model's window is known (none for the mock),
-    and the prompt response has no `usage`. The kernel keeps no price
-    table or cumulative cost. `harbor-usage-cost.toml`.
-  - **No model selection.** `session/new` offers no `models` or model
-    `configOptions`, so a Harbor run given a model fails before its
-    prompt. The bench names the model at launch.
-- **A failed follow-up turn has no structured ACP signal.** The runner
-  matches agent text "stream error: …".
+- **A failed follow-up turn has no structured ACP signal.** A client can
+  only match agent text "stream error: …".
 - **A hook-raised permission request's title is the hook's stderr**, not
   the command asked about.
-- **The fleet's cargo test takes about 110 s** (host and approval
-  scenarios run as two tests at once), mostly a 3 s quiet wait after each
-  prompt. Mock replies a scenario never used go unreported. ACP v1 has no
-  idle notification, and the bridge reports turn completion only for the
+- **A follow-up turn can end with no ACP message.** ACP v1 has no idle
+  notification, and the bridge reports turn completion only for the
   interactive turn a `session/prompt` waits on
   (`crates/kaijutsu-acp/src/session.rs`). A follow-up turn started by an
   answer to an ask that holds no turn (no stored command, the MCP path) or
   by a background completion ends with no ACP message. A model's own ask
-  holds `session/prompt` open, so for those prompts the quiet wait only
-  catches unexpected late messages and could shrink.
-- Add the `kaijutsu-acp --connect` agent.
-- **A `session/cancel` has no acknowledgment**, so the cancel scenario reads
-  the kernel's `turn_interrupted=true` log line from stderr. The bridge's
+  holds `session/prompt` open, so it is not one of these.
+- **A `session/cancel` has no acknowledgment**, so only the kernel's
+  `turn_interrupted=true` log line shows that a turn stopped. The bridge's
   own "soft interrupt sent" line does not serve: `interruptContext` answers
   `success` when it only closed a continuation (`turn_interrupted ||
   continuation_closed`, `crates/kaijutsu-server/src/rpc.rs`), so the line
@@ -3759,13 +3871,6 @@ for when it's contained in docker". Open:
   wire is final. An approved call's last update carries only
   `rawOutput.exit_code`, so the client shows the waiting text as its only
   content, though the model read the real output.
-- **Contained mode, after the DeepSeek review** (`docs/acp-fleet.md`,
-  "Limits and hardening"). The key scrub catches only an exact copy; a
-  model that encodes the key gets it into the report, so a live key must
-  be one we can revoke. The relay keeps every upstream connection error
-  with no cap (`crates/kaijutsu-acp-fleet/src/relay.rs`); the pids limit
-  bounds concurrent connections, not their count over a run. The relay
-  also spawns a thread per connection with no limit of its own.
 
 ## Egress: what stays open (2026-09-21)
 
@@ -4044,16 +4149,6 @@ non-4xx/5xx status on `ApiError`, and a JSON-parse failure of a successful
 response does too (`openai/mod.rs`, `claude/mod.rs:246`); `retry_disposition`
 treats every `ApiError` as transient. Decide whether those cases need a
 permanent variant. Found by kaibo reviewing the retry-classification commit.
-
-## `cargo test -p kaijutsu-solo-acp` fails 21 tests for a missing feature (2026-09-20)
-
-`solo_acp_stdio.rs` drives real turns through `BackendKind::Mock`, which
-exists only under the `test-mock` feature, so a plain
-`cargo test -p kaijutsu-solo-acp` fails 21 of 23 with
-`invalid value 'mock' for '--backend-kind'` rather than skipping them. Declare
-the target in `Cargo.toml` with `required-features = ["test-mock"]` so cargo
-leaves it alone without the feature, and say in the file which invocation runs
-it.
 
 ## The theme mirror test only spot-checks fields (2026-09-20)
 

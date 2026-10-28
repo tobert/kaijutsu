@@ -499,9 +499,9 @@ pub fn follow_target(data: Option<&serde_json::Value>, current: ContextId) -> Re
 /// Follow a finished `kj` line from the shell surface (`Ctrl+A r`'s
 /// `kj context rotate`, a typed `kj context switch`): switch to the context
 /// its data names, but only while the context it ran against is still the
-/// one on screen. The hints line says what the tui's status row says: a
-/// latch's message, else the first stdout line. A failed run, or data that
-/// cannot be followed, says why.
+/// one on screen. The hints line says the command that confirms a latch,
+/// else the first stdout line. A failed run, or data that cannot be
+/// followed, says why.
 pub fn follow_kj_results(
     mut results: MessageReader<RpcResultMessage>,
     doc_cache: Res<crate::cell::DocumentCache>,
@@ -514,15 +514,16 @@ pub fn follow_kj_results(
         let RpcResultMessage::KjLineFinished { from, result } = result else {
             continue;
         };
+        // A latch exits 2; its message is the command that confirms it.
+        if let Some(latch) = &result.latch {
+            notice.say(format!("to confirm, run: {}", latch.message), now);
+            continue;
+        }
         if result.exit_code != 0 {
             let why = result.stderr.lines().next().unwrap_or("").trim();
             let text = format!("kj failed (exit {}){}{why}", result.exit_code, if why.is_empty() { "" } else { ": " });
             log::warn!("{text}");
             notice.say(text, now);
-            continue;
-        }
-        if let Some(latch) = &result.latch {
-            notice.say(latch.message.clone(), now);
             continue;
         }
         let said = result.stdout.lines().next().unwrap_or("done");
@@ -675,7 +676,8 @@ mod tests {
         app.world().resource::<crate::ui::ask_sheet::AskNotice>().current(0.0).map(str::to_string)
     }
 
-    /// As the tui says it: the first stdout line, or a latch's own message.
+    /// The first stdout line, or a latch's confirming command. A latch exits
+    /// 2, so it is read before the exit code.
     #[test]
     fn a_finished_line_says_its_first_stdout_line_or_its_latch() {
         let here = ContextId::new();
@@ -687,17 +689,17 @@ mod tests {
         app.world_mut().write_message(said);
         app.update();
         assert_eq!(notice(&app).as_deref(), Some("renamed to banto"));
-        let mut latched = finished(here, 0, "", None);
+        let mut latched = finished(here, 2, "kj context archive: confirmation required\n", None);
         if let RpcResultMessage::KjLineFinished { result, .. } = &mut latched {
             result.latch = Some(kaijutsu_client::rpc::KjLatch {
-                command: "archive".into(),
+                command: "kj context archive".into(),
                 target: "x".into(),
-                message: "run it again to confirm".into(),
+                message: "kj context archive x --confirm".into(),
             });
         }
         app.world_mut().write_message(latched);
         app.update();
-        assert_eq!(notice(&app).as_deref(), Some("run it again to confirm"));
+        assert_eq!(notice(&app).as_deref(), Some("to confirm, run: kj context archive x --confirm"));
     }
 
     #[test]

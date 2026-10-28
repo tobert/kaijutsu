@@ -903,16 +903,17 @@ fn load_vars(conn: &Connection, statement_digest: &str) -> Result<(Vec<String>, 
 /// `presented_label` (`docs/gate-resume.md`'s "an answered ask is
 /// redeemable" half) — `status = 'allowed'`, no `approval_redemptions` row
 /// yet, `authorized_label` equal to `presented_label`, `context_id`/
-/// `principal_id` matching when supplied, and its own statement set (via
+/// `principal_id` matching when supplied, and its own statement list (via
 /// `approval_ask_statements`) EXACTLY equal to `statement_digests` — not a
 /// subset and not a superset. Exactness matters: the gate never applies a
 /// submission partially (`AskCoverage::verdict`'s doc — a partially covered
 /// ask escalates rather than running part of itself), so an ask covering
 /// three statements must never authorize a call presenting only two of
 /// them, and a call presenting a fourth must never be waved through by an
-/// ask that only ever saw three. Both sides are compared as sets (not
-/// multisets): a statement digest repeating within one ask's own list is
-/// collapsed the same way `statement_digests` would be.
+/// ask that only ever saw three. Both sides are compared as ordered
+/// sequences in `stmt_seq` order, repetition included: `rm x; touch x` is
+/// not `touch x; rm x`, and a statement presented twice is not the one
+/// statement a human allowed.
 ///
 /// **Only a human's answer is redeemable.** A row with `auto_reason` set was
 /// decided by a rule or a classifier, never by a person: it is an audit
@@ -935,10 +936,6 @@ pub fn find_redeemable(
     principal_id: Option<&[u8]>,
     actor_id: &[u8],
 ) -> Result<Option<(String, crate::types::ApprovalStatus)>> {
-    use std::collections::BTreeSet;
-
-    let wanted: BTreeSet<&str> = statement_digests.iter().copied().collect();
-
     let mut candidates_q = conn.prepare(
         "SELECT request_id, status FROM approvals
          WHERE status IN ('allowed', 'denied')
@@ -957,15 +954,13 @@ pub fn find_redeemable(
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     for (request_id, status) in candidates {
-        let mut digest_q =
-            conn.prepare("SELECT statement_digest FROM approval_ask_statements WHERE request_id = ?1")?;
-        let has: BTreeSet<String> = digest_q
+        let mut digest_q = conn.prepare(
+            "SELECT statement_digest FROM approval_ask_statements WHERE request_id = ?1 ORDER BY stmt_seq",
+        )?;
+        let has: Vec<String> = digest_q
             .query_map(params![request_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?
-            .into_iter()
-            .collect();
-        let has_ref: BTreeSet<&str> = has.iter().map(String::as_str).collect();
-        if has_ref == wanted {
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        if has.iter().map(String::as_str).eq(statement_digests.iter().copied()) {
             // Total because the query above admits exactly these two
             // statuses; widening that `IN` clause without widening this
             // is a compile error, not a silent misread.
@@ -1883,7 +1878,7 @@ mod tests {
     /// a call presenting only one of their digests, and must not be
     /// redeemable by a call presenting a digest the ask never covered
     /// either — only the exact pair matches. Falsified by changing the
-    /// match condition from set equality (`has_ref == wanted`) to subset
+    /// match condition from exact equality to subset
     /// containment (`wanted.is_subset(&has_ref)`): the single-digest
     /// lookup then incorrectly returned `Some(request_id)` instead of the
     /// expected `None`; reverted afterward.
@@ -1908,6 +1903,33 @@ mod tests {
             find_redeemable(&conn, &["fr-digest-a", "fr-digest-b"], "two statements", None, None, b"coder").unwrap(),
             Some((request_id, crate::types::ApprovalStatus::Allowed)),
             "presenting the exact pair must match"
+        );
+    }
+
+    /// Statement order and repetition are part of what a human allowed:
+    /// `rm x; touch x` is not `touch x; rm x`, and running a statement
+    /// twice is not running it once. An ask for `[a, b]` is redeemable only
+    /// by a call presenting exactly `[a, b]`.
+    #[test]
+    fn find_redeemable_compares_statement_order_and_repetition() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &two_statement_ask("ordered")).unwrap();
+        allow(&conn, &request_id);
+
+        assert_eq!(
+            find_redeemable(&conn, &["fr-digest-b", "fr-digest-a"], "ordered", None, None, b"coder").unwrap(),
+            None,
+            "the same statements in another order must not match"
+        );
+        assert_eq!(
+            find_redeemable(&conn, &["fr-digest-a", "fr-digest-b", "fr-digest-b"], "ordered", None, None, b"coder")
+                .unwrap(),
+            None,
+            "a repeated statement must not match"
+        );
+        assert_eq!(
+            find_redeemable(&conn, &["fr-digest-a", "fr-digest-b"], "ordered", None, None, b"coder").unwrap(),
+            Some((request_id, crate::types::ApprovalStatus::Allowed)),
         );
     }
 

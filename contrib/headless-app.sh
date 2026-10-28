@@ -21,7 +21,7 @@
 # execution is denied (the kernel default). The app authenticates with a
 # generated key bound to the root character `headless-director` (--key-file),
 # so no ssh-agent is involved. Seeding goes through kaijutsu-mcp (there is no
-# standalone `kj`), via contrib/bench/kjmcp.py.
+# standalone `kj`), via contrib/kjmcp.py.
 #
 # The last seed step raises one pending ask (`git push` is in gate.toml's ask
 # list). It runs last because a kaijutsu-mcp built before the ledger push
@@ -69,7 +69,7 @@ stop_pid() { # pidfile, cmdline-substring
 }
 
 kjmcp() {
-  KJMCP_QUIET=1 python3 "$REPO_ROOT/contrib/bench/kjmcp.py" \
+  KJMCP_QUIET=1 python3 "$REPO_ROOT/contrib/kjmcp.py" \
     --binary "$MCP_BIN" --port "$KERNEL_PORT" --key-file "$STATE/keys/$DIRECTOR" \
     --home "$STATE/home" --insecure --context headless-admin "$@" 2>>"$STATE/logs/seed.log"
 }
@@ -196,7 +196,7 @@ cmd_start() {
   # The ask: `git push` is on gate.toml's ask list. The call parks until the
   # reviewer answers; we leave after it is raised and the ask stays pending.
   echo "== raise one pending ask"
-  (timeout 8 python3 "$REPO_ROOT/contrib/bench/kjmcp.py" --binary "$MCP_BIN" \
+  (timeout 8 python3 "$REPO_ROOT/contrib/kjmcp.py" --binary "$MCP_BIN" \
     --port "$KERNEL_PORT" --key-file "$key" --home "$STATE/home" --insecure \
     --context headless-admin "git push origin headless-harness" \
     >"$STATE/logs/ask.log" 2>&1 || true)

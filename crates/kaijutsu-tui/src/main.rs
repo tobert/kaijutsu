@@ -49,7 +49,8 @@ struct Cli {
 
     /// Context to attach to, by id or label. Creates it when the label names
     /// nothing live, with this directory as its cwd when the kernel can see
-    /// it. Without this, the highest-ranked live context is used.
+    /// it. Without this, the context this client last viewed opens, else the
+    /// live root console, else the highest-ranked live context.
     #[arg(long)]
     context: Option<String>,
 
@@ -178,7 +179,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     let start = match &cli.context {
         Some(target) => bridge.open(target).await?,
-        None => bridge.open_ranked().await?,
+        None => bridge.open_last_or_root().await?,
     };
     tracing::info!(context = %start.id.short(), label = %start.label, "attached");
 

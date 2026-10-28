@@ -161,7 +161,7 @@ cached system text, unlike the orientation notification. It is read at create
 and does not update when the file changes; a rotated or new context reads it
 again. The block is cut at 32000 characters and says so. No working directory,
 or no `AGENTS.md`, writes no block. Tests:
-`crates/kaijutsu-solo-acp/tests/solo_acp_stdio.rs`, the `agents_md` cases.
+`crates/kaijutsu-server/tests/house_rules_wire.rs`.
 
 ## Explicit instruction scripts
 
@@ -278,8 +278,10 @@ Every client that knows its working directory must create the context with
 (`--context` naming a new label) and kaijutsu-mcp (`register_session`) pass
 their own directory through `ActorHandle::create_context_in_client_cwd`: the
 kernel may run on another host, so a refused directory creates the context
-without it and the client shows the refusal. A later `kj context set --cwd`
-does not rerun create.
+without it and the client shows the refusal. They pass `--cwd-optional`, so
+the kernel decides when the create runs: a create a gate holds runs after
+approval with the arguments it was given, and the directory may differ by
+then. A later `kj context set --cwd` does not rerun create.
 A create without `--cwd` takes the current context's cwd, so a context
 created from a model's shell starts where that model works. `kj fork` gives
 the child the source's cwd, or `--pwd DIR`. Create and fork check an
@@ -464,14 +466,20 @@ and `--preset`; use a filtered fork for those selections.
 
 `submit` fires after the server promotes a player's chat submission to a
 durable user block, the way `drift` fires after a drift block lands
-(`rc/mod.rs`, `rc::run`). It runs awaited inline, so
-anything a script writes is durable before `submitInput` returns.
+(`rc/mod.rs`, `rc::run`). It runs in turn startup, before the turn reads the
+input, so anything a script writes is durable before the model sees the
+input. `submitInput` does not wait for it.
 
-A submit either commits or fails with nothing changed (`prompt::submit`).
-A context with no performer, or whose senpai has no live holder, is refused before the draft
-commits, so the draft stays as typed. Once the input commits, `submitInput`
-returns its block; a turn that then fails to start is recorded once in the
-transcript and published as a turn failure, not returned as a submit error.
+A submit either commits or is refused with nothing changed
+(`prompt::submit`). A context with no performer or no reviewer is refused
+before the draft commits, so the draft stays as typed. The human root runs
+no model turns, so a chat submit there is refused with a reason that points
+to the `ROOT` console and `Ctrl+Z`. Turn identity refusals reach the client
+as `submitInput`'s refused outcome, not as an RPC failure. Once the input
+commits, `submitInput` returns its block at once, and the `submit` scripts
+and turn startup run after the reply. A turn that then fails to start is
+recorded once in the transcript and published as a turn failure, not
+returned as a submit error.
 
 Its scripts read the submit facts as `KJ_*` variables. Every name is always
 set, empty rather than absent when the fact does not apply:

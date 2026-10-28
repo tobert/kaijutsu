@@ -119,6 +119,14 @@ pub enum CreateContextError {
     /// a missing character and a failed lookup the same untyped way, so this
     /// is not a refusal.
     Unread(String),
+    /// A gate holds the create for its reviewer. When the reviewer allows
+    /// it, the create runs with the arguments it was given, and the caller
+    /// joins the new context on a later call. Only
+    /// [`ActorHandle::create_context_in_client_cwd`] reports this.
+    Held {
+        /// The gate's refusal, which names the ask.
+        refusal: kaijutsu_types::Refusal,
+    },
 }
 
 impl CreateContextError {
@@ -149,6 +157,7 @@ impl std::fmt::Display for CreateContextError {
         match self {
             Self::Call(error) => write!(f, "{error}"),
             Self::Refused(message) | Self::Unread(message) => f.write_str(message),
+            Self::Held { refusal } => write!(f, "{refusal}"),
         }
     }
 }
@@ -215,10 +224,13 @@ impl ActorHandle {
     /// Create from `parent` in `cwd`, the client's own working directory.
     ///
     /// The kernel may run on another host, where that directory does not
-    /// exist. When the kernel refuses the directory, create without `--cwd`
-    /// instead and return the refusal in [`CreatedContext::cwd_refused`]; the
-    /// new context then takes `parent`'s cwd. Every other refusal is an
-    /// error. A client that must run in `cwd`, such as an ACP agent, calls
+    /// exist. The create carries `--cwd-optional`, so the kernel decides when
+    /// the create runs: it drops a directory it cannot use, the new context
+    /// takes `parent`'s cwd, and the kernel's reason comes back in
+    /// [`CreatedContext::cwd_refused`]. A create that a gate holds decides
+    /// the same way when the reviewer allows it. A held create is
+    /// [`CreateContextError::Held`]; every other refusal is an error. A
+    /// client that must run in `cwd`, such as an ACP agent, calls
     /// [`Self::create_context_under`] instead.
     pub async fn create_context_in_client_cwd(
         &self,
@@ -228,14 +240,25 @@ impl ActorHandle {
         performer: &str,
         cwd: Option<&str>,
     ) -> Result<CreatedContext, CreateContextError> {
-        match self.create_context_under(parent, label, context_type, performer, cwd).await {
-            Ok(id) => Ok(CreatedContext { id, cwd_refused: None }),
-            Err(error) if cwd.is_some() && error.is_cwd_refusal() => {
-                let id = self.create_context_under(parent, label, context_type, performer, None).await?;
-                Ok(CreatedContext { id, cwd_refused: Some(error.to_string()) })
-            }
-            Err(error) => Err(error),
+        let mut argv = context_create_argv(label, context_type, performer, cwd);
+        if cwd.is_some() {
+            argv.push("--cwd-optional".to_string());
         }
+        let result = match self.execute_kj_quiet(parent, argv).await {
+            Ok(result) => result,
+            Err(CallError::Refused(refusal)) if refusal.ask_id().is_some() => {
+                return Err(CreateContextError::Held { refusal });
+            }
+            Err(error) => return Err(CreateContextError::Call(error)),
+        };
+        let id = context_id_from_create_result(&result).map_err(CreateContextError::Refused)?;
+        let cwd_refused = result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("cwd_refused"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Ok(CreatedContext { id, cwd_refused })
     }
 }
 

@@ -66,6 +66,10 @@ pub fn base62_encode_padded(value: i64, width: usize) -> String {
 /// Once the result's prefix sorts below `b`, `b` bounds nothing further: the
 /// walk continues along `a` against an open upper bound until a digit leaves
 /// room, so the result never stops at a prefix of `a`.
+///
+/// Keys must not end in '0': no key lies between `"V"` and `"V0"`. Results
+/// never end in '0', and neither do agent suffixes. Given a `b` that extends
+/// `a` with only '0's, the result sorts after `b` and an error is logged.
 pub(crate) fn order_midpoint(a: &str, b: &str) -> String {
     if a >= b {
         // Stored keys can already tie (`block_ids_ordered` breaks ties by
@@ -78,6 +82,9 @@ pub(crate) fn order_midpoint(a: &str, b: &str) -> String {
     let mut below_b = false;
     for i in 0.. {
         let a_val = a.get(i).map_or(0, |&c| base62_index(c));
+        if !below_b && i == b.len() && a.len() < b.len() {
+            tracing::error!(a, b, "order_midpoint: no key lies between a and b; b extends a with only '0's");
+        }
         let b_val = if below_b { 62 } else { b.get(i).map_or(62, |&c| base62_index(c)) };
         if a_val + 1 < b_val {
             result.push(BASE62[(a_val + b_val) / 2]);

@@ -39,8 +39,8 @@ pub struct InterruptOutcome {
 }
 
 /// How much a kernel expects of the people at its prompts. Set once when the
-/// kernel is built (`--headless` on `kaijutsu-server` and
-/// `kaijutsu-solo-acp`) and fixed for its lifetime.
+/// kernel is built (`kaijutsu-server --headless`) and fixed for its
+/// lifetime.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum KernelMode {
     /// A person reads each reply and answers it. A turn they prompted ends
@@ -3544,9 +3544,7 @@ mod tests {
         let kernel = Kernel::new_ephemeral("test").await;
 
         // Register a provider (uses fake key, won't actually call API)
-        let provider = Arc::new(Provider::Claude(crate::llm::claude::Client::new(
-            "fake-key",
-        )));
+        let provider = Arc::new(Provider::Claude(crate::llm::claude::Client::new("fake-key").unwrap()));
         kernel.register_llm("anthropic", provider).await;
 
         // Check provider is listed

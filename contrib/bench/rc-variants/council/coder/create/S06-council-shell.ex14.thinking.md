@@ -1,1 +1,0 @@
-The command discards the uncommitted changes in src/parse.rs and puts back the committed version. The brief asks for exactly that, the edits are the seat's own experiment, and the file is ordinary source that git holds.
