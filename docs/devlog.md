@@ -3552,3 +3552,40 @@ out (`531fea08`). Git keeps its history. Deploying the kernel meant rebuilding
 the container image and restarting `kaijutsu.service`, which abandoned four
 pending asks from earlier MCP sessions. Those sessions retry, and the restart
 was otherwise clean.
+
+## Bootstrap, and the review comes due (October 27)
+
+A fresh `init` left a kernel with no backend, no model and no console.
+Amy wanted one step from nothing to a ROOT that answers: experienced users
+"don't want to learn all this silly syntax. That's why they're using an
+agent." `kaijutsu-server bootstrap` writes the root character and key
+directly, then runs real `kj` verbs on an offline-booted kernel, each only
+when its result is missing (`387486e9`). `kj` stays for direct changes. The
+ACP fleet, solo-acp and the bench harness went the same day; what they
+covered in the kernel moved into the server E2E suites, standing up their
+kernels with bootstrap (`c2c8e120`, `e3a39dd2`, `f29dd492`).
+
+Re-bootstrapping spaceghost from fresh data was the first real run, and it
+found two gaps. A model bootstrap had no window for got no model row and no
+word about it; now the report names it (`321918af`). In the container `~` is
+the data directory and the keys sit under `/run/secrets`, so detection finds
+nothing, and `docs/container.md` now shows `--backend` with
+`--api-key-file`. Bootstrap makes no casts, so ROOT runs on the default.
+
+The October 14 renovation review had sat untracked for two weeks. A
+subagent checked all 39 findings against main: 38 still held in some form,
+because most of the audited files had not changed. Three worktree agents
+then took disjoint batches, each finding red/green, and 21 fixes landed by
+cherry-pick. The worst were the quiet ones: a failed buffer read that
+truncated the host file, an index load failure that deleted synthesis rows,
+an SFTP rename that unlinked first, a tombstoned-block edit that poisoned a
+context. Three findings were wrong or deliberate. The beat grid's small
+catch-up is doctrine, pinned by a test, so the audit's "never catch up" was
+the error. The rest is one `issues.md` section, and the review lives in git
+(`d54a4fed`).
+
+The app's Esc Esc left compose, so a stray second Esc sent the next `dd` to
+the block list (`96766b0d`). Esc in compose now belongs to vi alone, as it
+already did in the TUI. Amy's lost prompt turned out to be a slow echo: the
+submit reply waits for turn startup, so the editor keeps the text while the
+kernel has already committed it.
