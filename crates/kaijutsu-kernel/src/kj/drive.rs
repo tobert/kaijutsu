@@ -144,9 +144,11 @@ impl KjDispatcher {
             ));
         };
 
-        // A prompt becomes a durable User/Text block authored by the caller.
-        // Without one, anchor at the existing tail. The model reads the log;
-        // event content is an observation, not another copy to insert.
+        // A prompt becomes a durable User/Text block authored by the caller's
+        // performer, who wrote it; the turn request below keeps the
+        // requester. Without a prompt, anchor at the existing tail. The model
+        // reads the log; event content is an observation, not another copy
+        // to insert.
         let seed: String = parsed.prompt.clone().unwrap_or_default();
         let after = match parsed.prompt.as_deref() {
             Some(prompt) => {
@@ -159,7 +161,7 @@ impl KjDispatcher {
                     prompt.to_string(),
                     kaijutsu_types::Status::Done,
                     ContentType::Plain,
-                    Some(caller.principal_id),
+                    Some(caller.actor_id),
                 ) {
                     Ok(id) => id,
                     Err(e) => {
@@ -453,6 +455,35 @@ mod tests {
                     after_block_id, seed.id,
                     "the turn anchors AFTER the seed block, not the prior tail"
                 );
+            }
+            other => panic!("expected Requested, got {other:?}"),
+        }
+    }
+
+    /// A model that drives another context with a prompt wrote that prompt,
+    /// so the seed block carries the performer, as a drift block does
+    /// (`docs/approval-identity.md`, "Three identities"). The turn request
+    /// keeps the requester, which scopes the driven turn's capabilities.
+    #[tokio::test]
+    async fn drive_seed_block_carries_the_performer_not_the_requester() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("here"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        let banto = PrincipalId::new();
+        let c = caller_with_context(ctx).with_actor(banto, None);
+        assert_ne!(c.principal_id, c.actor_id, "fixture needs a performer distinct from the requester");
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d.dispatch(&[s("drive"), s("--prompt"), s("go")], &c).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+
+        let seed = d.block_store().block_snapshots(ctx).unwrap().pop().unwrap();
+        assert_eq!(seed.content, "go");
+        assert_eq!(seed.id.principal_id, banto, "the performer wrote the prompt");
+        match sub.try_recv().expect("drive --prompt should publish").payload {
+            crate::flows::TurnFlow::Requested { principal_id, .. } => {
+                assert_eq!(principal_id, c.principal_id, "the turn keeps its requester");
             }
             other => panic!("expected Requested, got {other:?}"),
         }
