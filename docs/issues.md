@@ -66,15 +66,11 @@ same day. Findings already tracked elsewhere stay there: 6.1 (Anticipation
 and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
 and the `lineage_root` refusal wording. Still open:
 
-Needs Amy's decision:
-- **4.2** `kj context demote`, `promote` and `conclude` have no capability
-  check. A test pins this as intended.
-- **4.4** `kj drive` keeps the requester as the driven turn's
-  `TurnRequest.principal_id`, as fork and completion notices do; its
-  prompt block now carries the performer. Moving the turn's principal
-  moves approval and capability scope.
-
 Behavior:
+- **4.2b** The `demoteContext` RPC (the app's `d` and `Ctrl+A q`) calls
+  `db.demote_context` directly: no lineage check, no `--confirm` latch on
+  the archiving step, and no archive rc lifecycle, unlike `kj context
+  demote`. Route it through the verb or delete it.
 - **2.3** `approval_resume` runs approved commands inline in its one task,
   so a long command stalls ask delivery for every context. M.
 - **2.6** The submit-rc race, `interrupt.hard()` on a persistence failure,
