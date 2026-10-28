@@ -33,6 +33,17 @@ root, console, and shell; the start choice prefers `ROOT`. Still open:
   `config-write`/`operator`. Admin work runs through the TUI's `:kj` in the
   human root. Decide whether the shell child carries the root's admin grants,
   or the denial names `:kj`.
+- A gate-held command's result reaches no one: the caller's reply has
+  closed, and `kj ledger allow` answers only "allowed ask". So a held
+  `kj context create --cwd-optional` that drops its directory says why to
+  nobody; only the missing cwd shows it.
+- `register_session` after an approved create does not rejoin when the
+  label named a concluded or archived context: the held create used a
+  suffixed label, and the second call derives the next suffix and creates
+  another context.
+- ACP still sends a required `--cwd` (`create_context_under`); a gate-held
+  ACP create in a directory the kernel cannot see fails after approval.
+  Probably right, since ACP must run in its directory.
 - `submitInput` still reports reviewer-walk errors (such as "no reviewer")
   as Cap'n Proto faults, not refusals (`runtime/turn_identity.rs`).
 - Live checks: the Ctrl-Z toggle creating a shell child against the kernel; the
