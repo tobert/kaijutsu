@@ -315,7 +315,8 @@ The verbs (keys provisional; the in-well legend — the transient `?` toggle,
   resurrects; visits never do.
 - **`d` demote** — one step outward per press, kernel-owned ladder:
   promoted → automatic placement; automatic → demoted; already demoted →
-  **archived** (single context, no subtree, no latch). The kernel's ladder is
+  **archived** (single context, no subtree, no latch on the key;
+  `kj context demote` latches that last step behind `--confirm`). The kernel's ladder is
   unchanged by the ring collapse; what changed is that its middle rung now
   *renders* as the horizon rather than as a ring of its own.
 - **`a` archive** — straight past the horizon from anywhere (same unlatched
