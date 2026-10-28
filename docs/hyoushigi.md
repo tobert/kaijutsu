@@ -226,7 +226,10 @@ from future hydration before delivery fails. The timeline separately records the
 failed commitment and its fallback. Failure feedback carries the original seed
 anchor, so it remains addressed after detachment or performer reassignment.
 The scheduler retries failed feedback writes on later pulses without redelivering
-successful inserts; this cursor is live state, not restart recovery.
+successful inserts; this cursor is live state, not restart recovery. A report
+that misses 16 consecutive pulses moves to `lost+found` so later reports on the
+track can deliver; see `docs/tracks.md`, "Concurrent producers — one open
+future, per-producer failures".
 
 `turn_events_wire::timed_drives_keep_admission_targets_through_the_client` exercises
 this path through SSH using mock inference, manual beats and the shipped rc tick

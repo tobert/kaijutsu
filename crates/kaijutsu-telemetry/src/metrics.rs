@@ -151,6 +151,11 @@ pub struct BeatMetrics {
     /// instead (missed beats are missed). Should read ~0 on a healthy
     /// scheduler; sustained nonzero says the beat thread is falling behind.
     grid_reseeds: Counter<u64>,
+    /// `kaijutsu.beat.failure_feedback_lost`, by `track`: resolver-failure
+    /// feedback that could not reach its producer within the pulse budget and
+    /// moved to lost+found. Should read 0; nonzero means a producer missed its
+    /// own failure report.
+    failure_feedback_lost: Counter<u64>,
     /// `kaijutsu.beat.sync_published` — `BeatSync` references published
     /// (server-side, low-rate — see `BEAT_SYNC_EVERY`).
     beat_sync_published: Counter<u64>,
@@ -202,6 +207,14 @@ impl BeatMetrics {
                  actual wakeup, by track",
             )
             .build();
+        let failure_feedback_lost = meter
+            .u64_counter("kaijutsu.beat.failure_feedback_lost")
+            .with_unit("{failure}")
+            .with_description(
+                "Resolver-failure feedback moved to lost+found after its producer could not \
+                 be reached within the pulse budget, by track",
+            )
+            .build();
         let beat_sync_published = meter
             .u64_counter("kaijutsu.beat.sync_published")
             .with_unit("{reference}")
@@ -240,6 +253,7 @@ impl BeatMetrics {
         Self {
             beats_fired,
             grid_reseeds,
+            failure_feedback_lost,
             beat_sync_published,
             metronome_clicks,
             phasor_slew,
@@ -257,6 +271,11 @@ impl BeatMetrics {
     /// Record one grid re-seed for `track`.
     pub fn record_grid_reseed(&self, track: &str) {
         self.grid_reseeds.add(1, &[KeyValue::new("track", track.to_owned())]);
+    }
+
+    /// Record one failure report moved to lost+found for `track`.
+    pub fn record_failure_feedback_lost(&self, track: &str) {
+        self.failure_feedback_lost.add(1, &[KeyValue::new("track", track.to_owned())]);
     }
 
     /// Record one published `BeatSync` reference.
@@ -325,6 +344,12 @@ pub fn record_beat_fired(track: &str) {
 /// Record one grid re-seed for `track` to the global meter provider.
 pub fn record_grid_reseed(track: &str) {
     BEAT_METRICS.record_grid_reseed(track);
+}
+
+/// Record one failure report moved to lost+found for `track` to the global
+/// meter provider.
+pub fn record_failure_feedback_lost(track: &str) {
+    BEAT_METRICS.record_failure_feedback_lost(track);
 }
 
 /// Record one published `BeatSync` reference to the global meter provider.

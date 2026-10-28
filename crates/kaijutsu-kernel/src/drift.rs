@@ -1302,13 +1302,132 @@ impl DriftRouter {
     }
 }
 
+/// Resolve (creating if necessary) the lost+found context: the one sink for
+/// content the kernel accepted but could not deliver. Dead-letter drifts and
+/// undeliverable track-failure feedback both land here.
+///
+/// Lookup order is router cache, then the well-known registry, then mint
+/// (`docs/drifting-dead-letters.md`). The registry step keeps a cold start
+/// from minting a duplicate: a fresh router has no cache, and without
+/// consulting `WellKnownRole::LostFound` first this would mint a second
+/// lost+found before cold-start recovery adopted the persisted one.
+///
+/// On the mint path the `documents` row, the `contexts` row, and the registry
+/// row all land before the router claims the handle, so a registered handle
+/// always implies a `KernelDb` row. A failure rolls the document back and
+/// returns `Err`; the caller keeps its undeliverable content rather than
+/// writing it into a context that does not exist.
+pub fn ensure_lost_found_context(
+    router: &SharedDriftRouter,
+    blocks: &SharedBlockStore,
+    kernel_db: &Mutex<KernelDb>,
+) -> Result<ContextId, DriftError> {
+    // 1. Router cache.
+    if let Some(id) = router.read().lost_found_id() {
+        return Ok(id);
+    }
+
+    // 2. Well-known registry: a persisted assignment from this kernel's
+    //    history (an earlier mint, a prior process, or a rotation). A hit
+    //    means the row already exists; adopt it rather than mint a duplicate.
+    {
+        let registry_hit = kernel_db.lock().well_known_context(WellKnownRole::LostFound);
+        match registry_hit {
+            Ok(Some(id)) => {
+                router.write().adopt_lost_found(id);
+                return Ok(id);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "well-known registry lookup for lost+found failed, minting instead: {e}"
+                );
+            }
+        }
+    }
+
+    // 3. Mint.
+    let id = ContextId::new();
+    let system = PrincipalId::system();
+
+    blocks
+        .create_document(id, crate::DocumentKind::Conversation, None)
+        .map_err(|e| {
+            DriftError::DocumentError(format!("failed to create lost+found document: {e}"))
+        })?;
+
+    let persist: Result<String, String> = {
+        let db = kernel_db.lock();
+        let now = kaijutsu_types::now_millis() as i64;
+        // A rotation leaves the incumbent registered under "lost+found"
+        // (`rotate_lost_found` only vacates the registry role), so a fresh
+        // mint must never collide with it. Disambiguate instead of renaming
+        // the incumbent.
+        match db.find_context_by_label("lost+found") {
+            Err(e) => Err(format!("failed to check lost+found label: {e}")),
+            Ok(existing) => {
+                let label = match existing {
+                    Some(_) => format!("lost+found-{}", id.short()),
+                    None => "lost+found".to_string(),
+                };
+                db.get_or_create_default_workspace(system)
+                    .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
+                    .and_then(|ws| {
+                        let row = ContextRow {
+                            context_id: id,
+                            label: Some(label.clone()),
+                            provider: None,
+                            model: None,
+                            system_prompt: None,
+                            context_state: ContextState::Live,
+                            context_type: "default".to_string(),
+                            created_at: now,
+                            created_by: system,
+                            forked_from: None,
+                            fork_kind: None,
+                            archived_at: None,
+                            workspace_id: Some(ws),
+                            preset_id: None,
+                            concluded_at: None,
+                            last_activity_at: None,
+                            promoted_at: None,
+                            demoted_at: None,
+                            paused_at: None,
+                            cast_id: None,
+                            origin_host: None,
+                            played_by: None,
+                            reviewer_id: None,
+                            director_id: None,
+                        };
+                        db.insert_well_known_context(&row, ws, WellKnownRole::LostFound)
+                            .map_err(|e| format!("failed to publish lost+found context: {e}"))
+                    })
+                    .map(|_| label)
+            }
+        }
+    };
+    let label = match persist {
+        Ok(label) => label,
+        Err(e) => {
+            // Roll the document back so a retry starts clean instead of
+            // leaving an orphan `documents` row behind per attempt.
+            if let Err(cleanup) = blocks.delete_document(id) {
+                tracing::error!(
+                    context = %id.short(),
+                    "lost+found rollback failed, orphan document row left behind: {cleanup}"
+                );
+            }
+            return Err(DriftError::DocumentError(e));
+        }
+    };
+
+    // Only now is a handle legitimate.
+    router.write().claim_lost_found(id, &label)
+}
+
 /// Resolve (creating if necessary) the durable drift-queue context that
-/// backs [`DriftRouter::attach_persistence`] — the slice-3 counterpart to
-/// `KjDispatcher::ensure_lost_found_context` (`kj/drift.rs`), which this
-/// mirrors: router cache → well-known registry → mint. It lives here rather
-/// than there because `WellKnownRole::DriftQueue` and the persistence it
-/// backs are this router's concern, and because `kj/drift.rs` is a
-/// different lane's file this slice does not touch.
+/// backs [`DriftRouter::attach_persistence`]. It mirrors
+/// [`ensure_lost_found_context`]: router cache → well-known registry → mint.
 ///
 /// Unlike lost+found there is no rotation story for this role yet, so there
 /// is no reserved-label disambiguation to do on mint — `"drift-queue"` is

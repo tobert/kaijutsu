@@ -158,6 +158,10 @@ struct TrackState {
     /// PRODUCING context (matched by `played_by`) so a producer reads its own
     /// failures, never a sibling's. Monotone — never re-surfaces a drained event.
     failure_water: usize,
+    /// Consecutive pulses the event at `failure_water` failed to reach its
+    /// producer. Reset to 0 whenever the cursor advances; at
+    /// [`FAILURE_FEEDBACK_PULSE_BUDGET`] the event moves to lost+found.
+    failure_misses: u32,
     /// The binding set: which contexts are attached and how each rides the beat.
     /// The track holds this passive view; the *context* drives the bind (entity #3)
     /// and a forked child re-binds on the way up.
@@ -197,6 +201,26 @@ impl AttachedContext {
 /// the bridge gives up on it and skips it (loudly). Crash-over-corruption favors a
 /// bounded, observable failure over an unbounded silent retry loop.
 const MATERIALIZE_RETRY_BUDGET: u32 = 3;
+
+/// How many consecutive pulses the first undelivered failure on a track may fail
+/// to reach its producer before it moves to lost+found. Feedback is drained in
+/// order, so a stuck head blocks every later failure on the track. Sixteen beats
+/// (four 4/4 bars) leaves room for a source context that is still being created
+/// and for a transient insert failure. Counted in track pulses, so a paused track
+/// does not age its pending feedback.
+const FAILURE_FEEDBACK_PULSE_BUDGET: u32 = 16;
+
+/// The Error payload for a resolver failure reported to a producer or to lost+found.
+fn failure_payload(detail: &str) -> kaijutsu_types::ErrorPayload {
+    kaijutsu_types::ErrorPayload {
+        category: kaijutsu_types::ErrorCategory::Parse,
+        severity: kaijutsu_types::ErrorSeverity::Error,
+        code: None,
+        detail: Some(detail.to_string()),
+        span: None,
+        source_kind: None,
+    }
+}
 
 /// What to do after a `materialize_committed` error, given how many consecutive
 /// times the SAME poison cell has now failed. Pure so the budget logic is unit-
@@ -621,6 +645,7 @@ impl BeatScheduler {
                     cursor: MaterializeCursor { high_water: restored_n, ..Default::default() },
                     materialize_failures: 0,
                     failure_water: 0,
+                    failure_misses: 0,
                     attached: HashMap::new(),
                     last_fire_scheduled: Instant::now(),
                 },
@@ -1896,7 +1921,11 @@ impl BeatScheduler {
     /// failure. `failure_water` prevents repeated delivery on later beats.
     ///
     /// Use the admission's source block when available, otherwise the document
-    /// tail. A missing anchor or failed insert stays pending for the next pulse.
+    /// tail. Delivery is in ledger order: a missing anchor or failed insert stays
+    /// pending for the next pulse and holds back later failures on the track.
+    /// After [`FAILURE_FEEDBACK_PULSE_BUDGET`] consecutive missed pulses the
+    /// pending failure moves to lost+found and the drain continues behind it.
+    /// Every write here is a synchronous block-store insert; nothing awaits.
     fn drain_track_failures(&mut self, track_id: &TrackId) {
         let Some(timeline) = self.kernel.track_timeline(track_id) else {
             return;
@@ -1919,54 +1948,115 @@ impl BeatScheduler {
         };
 
         for event in &new_events {
-            let (start, played_by, resolver, error) = (event.start, event.played_by, &event.resolver, &event.error);
-            let resolver = resolver.as_str();
+            let detail = format!(
+                "a scheduled phrase failed to resolve at beat {} (resolver {}): {}",
+                event.start.get(),
+                event.resolver.as_str(),
+                event.error,
+            );
             // Route to the PRODUCING context (so a player reads its own failures, not
             // a sibling's); an orphan (producer rotated out) goes to the score context
             // rather than being dropped.
             let score_ctx = self.tracks.get(track_id).map(|t| t.score_context);
-            let Some(target) = event.source_block.as_ref().map(|id| id.context_id)
-                .or_else(|| self.producer_ctx_for(track_id, played_by)).or(score_ctx) else {
-                break;
+            let target = event.source_block.as_ref().map(|id| id.context_id)
+                .or_else(|| self.producer_ctx_for(track_id, event.played_by)).or(score_ctx);
+            let delivered = match target {
+                Some(target) => self.deliver_track_failure(target, event.source_block, &detail),
+                None => Err("no producer or score context to deliver to".to_string()),
             };
-            let payload = kaijutsu_types::ErrorPayload {
-                category: kaijutsu_types::ErrorCategory::Parse,
-                severity: kaijutsu_types::ErrorSeverity::Error,
-                code: None,
-                detail: Some(format!(
-                    "a scheduled phrase failed to resolve at beat {} (resolver {resolver}): {error}",
-                    start.get()
-                )),
-                span: None,
-                source_kind: None,
-            };
-            let summary = payload.summary_line();
-            let Some(anchor) = event.source_block.clone().or_else(|| self.documents.last_block_id(target)) else {
-                log::error!(
-                    "beat: failure ledger drain for {target} found no anchor block for the \
-                     resolve failure at beat {} (resolver {resolver}): {error}",
-                    start.get()
+            if let Err(reason) = delivered {
+                let Some(misses) = self.tracks.get_mut(track_id).map(|t| {
+                    t.failure_misses += 1;
+                    t.failure_misses
+                }) else {
+                    return;
+                };
+                let target = target.map_or_else(|| "no target".to_string(), |t| t.to_string());
+                if misses == 1 {
+                    log::warn!(
+                        "beat: track {} failure feedback for {target} is pending ({reason}); \
+                         later failures wait behind it for up to \
+                         {FAILURE_FEEDBACK_PULSE_BUDGET} pulses: {detail}",
+                        track_id.as_str(),
+                    );
+                }
+                if misses < FAILURE_FEEDBACK_PULSE_BUDGET {
+                    break;
+                }
+                let lost = format!(
+                    "failure feedback for {target} on track {} was undeliverable for {misses} \
+                     pulses; {detail}; last delivery error: {reason}",
+                    track_id.as_str(),
                 );
-                break;
-            };
-            if let Err(e) = self.documents.insert_error_block_as(
-                target,
-                &anchor,
-                &payload,
-                summary,
-                Some(PrincipalId::beat()),
-            ) {
-                log::error!(
-                    "beat: failed to surface resolve-failure Error block for {target} \
-                     (start {}): {e}",
-                    start.get()
-                );
-                break;
+                match self.write_lost_found_error(&lost) {
+                    Ok(lost_found) => {
+                        log::error!(
+                            "beat: moved undeliverable failure feedback to lost+found \
+                             {lost_found}: {lost}"
+                        );
+                        kaijutsu_telemetry::record_failure_feedback_lost(track_id.as_str());
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "beat: could not move failure feedback to lost+found, retrying next \
+                             pulse ({e}): {lost}"
+                        );
+                        break;
+                    }
+                }
             }
-            // Advance only after the durable insert succeeds. A failed event
-            // remains first in line on the next pulse; prior deliveries stay done.
-            if let Some(t) = self.tracks.get_mut(track_id) { t.failure_water += 1; }
+            // Advance only after a durable insert succeeds, into the producer or
+            // into lost+found. Prior deliveries stay done.
+            if let Some(t) = self.tracks.get_mut(track_id) {
+                t.failure_water += 1;
+                t.failure_misses = 0;
+            }
         }
+    }
+
+    /// Insert one resolver-failure Error block into `target`, anchored at the
+    /// failure's source block or, without one, at the document tail.
+    fn deliver_track_failure(
+        &self,
+        target: ContextId,
+        source_block: Option<BlockId>,
+        detail: &str,
+    ) -> Result<(), String> {
+        let payload = failure_payload(detail);
+        let summary = payload.summary_line();
+        let anchor = source_block
+            .or_else(|| self.documents.last_block_id(target))
+            .ok_or_else(|| format!("{target} has no anchor block"))?;
+        self.documents
+            .insert_error_block_as(target, &anchor, &payload, summary, Some(PrincipalId::beat()))
+            .map(|_| ())
+            .map_err(|e| format!("insert into {target} failed: {e}"))
+    }
+
+    /// Append an Error block to lost+found, creating that context if needed,
+    /// and return its id. Lost+found is the same sink dead-letter drifts use.
+    fn write_lost_found_error(&self, detail: &str) -> Result<ContextId, String> {
+        let lost_found = kaijutsu_kernel::drift::ensure_lost_found_context(
+            self.kernel.drift(),
+            &self.documents,
+            self.kernel.kernel_db(),
+        )
+        .map_err(|e| format!("lost+found unavailable: {e}"))?;
+        let payload = failure_payload(detail);
+        let summary = payload.summary_line();
+        let block_id = self
+            .documents
+            .reserve_block_id(lost_found, PrincipalId::beat())
+            .map_err(|e| format!("lost+found reserve: {e}"))?;
+        let snapshot = kaijutsu_types::BlockSnapshotBuilder::new(block_id, kaijutsu_types::BlockKind::Error)
+            .error_payload(payload)
+            .content(summary)
+            .build();
+        let after = self.documents.last_block_id(lost_found);
+        self.documents
+            .insert_from_snapshot_as(lost_found, snapshot, after.as_ref(), Some(PrincipalId::beat()))
+            .map_err(|e| format!("lost+found insert: {e}"))?;
+        Ok(lost_found)
     }
 
     /// Snapshot the transport heartbeat for `ctx` — `KJ_TICK`/`KJ_PHRASE`/`KJ_TEMPO`
@@ -2309,8 +2399,8 @@ mod tests {
 
     use super::BeatScheduler;
     use super::{
-        MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json, poison_action, render_instant,
-        transport_vars,
+        FAILURE_FEEDBACK_PULSE_BUDGET, MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json,
+        poison_action, render_instant, transport_vars,
     };
     use kaijutsu_types::{
         BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, Role as BlockRole,
@@ -4872,6 +4962,73 @@ mod tests {
             .filter(|block| block.kind == kaijutsu_types::BlockKind::Error).collect();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].parent_id, Some(anchor));
+    }
+
+    /// Feedback that cannot be delivered within the pulse budget moves to
+    /// lost+found, and the track's later failures then deliver in order.
+    #[tokio::test]
+    async fn undeliverable_failure_goes_to_lost_found_and_unblocks_the_track() {
+        struct SourcedFailure(BlockId);
+        impl Resolver for SourcedFailure {
+            fn id(&self) -> ResolverId { ResolverId::new("sourced-failure") }
+            fn source_block(&self) -> Option<BlockId> { Some(self.0) }
+            fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { Duration::ZERO }
+            fn compute_basis(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> ContextHash { ContextHash::of(b"fixed") }
+            fn resolve(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> kaijutsu_hyoushigi::ResolveFuture {
+                Box::pin(std::future::ready(Err(ResolveError::failed("source failure"))))
+            }
+        }
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let attached = ContextId::new();
+        documents.create_document(attached, DocumentKind::Conversation, None).unwrap();
+        let anchor = insert_player_abc(&documents, attached, PrincipalId::new(), "X:1\nK:C\nCDEF|\n");
+        let missing = BlockId::new(ContextId::new(), PrincipalId::new(), 0);
+        let track = TrackId::solo();
+        let mut scheduler = BeatScheduler::new(kernel.clone(), documents.clone());
+        scheduler.attach(track.clone(), attached, slow_attachment(), slow_policy()).unwrap();
+        let recipe = || Recipe {
+            resolver: ResolverId::new("sourced-failure"), params: serde_json::Value::Null,
+            query: ContextQuery::default(), fallback: Fallback::Skip,
+        };
+        {
+            let timeline = kernel.track_timeline(&track).unwrap();
+            let mut g = timeline.lock();
+            g.schedule_preparing(Cell::deferred_on(Span::instant(Tick::new(5)), recipe(),
+                track.clone(), missing.principal_id), Box::new(SourcedFailure(missing))).unwrap();
+            g.schedule_preparing(Cell::deferred_on(Span::instant(Tick::new(6)), recipe(),
+                track.clone(), anchor.principal_id), Box::new(SourcedFailure(anchor))).unwrap();
+        }
+        let errors_in = |ctx: ContextId| -> Vec<BlockSnapshot> {
+            documents.block_snapshots(ctx).unwrap().into_iter()
+                .filter(|block| block.kind == BlockKind::Error).collect()
+        };
+        let base = Instant::now();
+        scheduler.play(&track, base);
+        scheduler.fire_due(base + Duration::from_secs(1));
+        assert_eq!(scheduler.tracks[&track].failure_water, 0, "the head failure is still pending");
+        assert!(errors_in(attached).is_empty(), "a later failure waits behind the pending head");
+
+        let mut pulses = 1u64;
+        while kernel.drift().read().lost_found_id().is_none() {
+            pulses += 1;
+            assert!(pulses <= 4 * u64::from(FAILURE_FEEDBACK_PULSE_BUDGET), "the stuck failure never moved");
+            scheduler.fire_due(base + Duration::from_secs(pulses));
+        }
+        assert!(pulses >= u64::from(FAILURE_FEEDBACK_PULSE_BUDGET),
+            "the stuck failure moved after {pulses} pulses, before the budget");
+        let lost_found = kernel.drift().read().lost_found_id().unwrap();
+        let dead = errors_in(lost_found);
+        assert_eq!(dead.len(), 1, "one lost+found entry for the stuck failure");
+        let detail = dead[0].error.as_ref().and_then(|e| e.detail.clone()).unwrap_or_default();
+        assert!(detail.contains("sourced-failure") && detail.contains(&missing.context_id.to_string()),
+            "the lost+found entry names the resolver and the missing target: {detail}");
+
+        for beat in 1..=3 { scheduler.fire_due(base + Duration::from_secs(pulses + beat)); }
+        assert_eq!(scheduler.tracks[&track].failure_water, 2, "the later failure delivers");
+        let delivered = errors_in(attached);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].parent_id, Some(anchor));
+        assert_eq!(errors_in(lost_found).len(), 1, "the stuck failure moves exactly once");
     }
 
     /// Stage 2 concurrent producers: two contexts share ONE track timeline, each

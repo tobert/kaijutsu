@@ -98,8 +98,10 @@ and a `lost+found` sink. `register`/`register_fork`/`unregister`,
 `stage`/`drain`/`requeue`, `resolve_context` (label / label-prefix / hex-prefix),
 `adopt_lost_found` for cold-start recovery. The router never *creates* the
 lost+found context — `claim_lost_found` only claims an id whose DB row the caller
-(`KjDispatcher::ensure_lost_found_context`) has already written, so a registered
-handle always implies a KernelDb row; `restore_dead_letters` puts drained items
+(`drift::ensure_lost_found_context`) has already written, so a registered
+handle always implies a KernelDb row. Lost+found receives dead-letter drifts
+from `kj drift flush` and track-failure feedback the beat scheduler could not
+deliver (`docs/tracks.md`); `restore_dead_letters` puts drained items
 back when a write into the sink fails, so the flush cannot lose them.
 `build_distillation_prompt` (`:1366`) lives here too.
 

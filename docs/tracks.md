@@ -248,6 +248,16 @@ rc just doesn't spawn it (an ergonomic nudge, not enforcement).
   `played_by`, and draining is per-context — producer B's resolve failures
   surface in **B's** conversation, never A's. Error blocks land in the
   *producer's* conversation, not the score context.
+- **Failure feedback is delivered in ledger order, and a stuck report moves to
+  lost+found.** One cursor (`failure_water`) drains the track's ledger. A report
+  whose anchor is missing or whose insert fails stays first in line and is
+  retried each pulse; later reports on the track wait behind it. After 16
+  consecutive missed pulses (`FAILURE_FEEDBACK_PULSE_BUDGET`, four 4/4 bars) the
+  report is written as an Error block into the kernel's `lost+found` context,
+  the same sink as dead-letter drifts, and the drain continues. The move logs
+  once and counts `kaijutsu.beat.failure_feedback_lost` by track. A paused
+  track does not age the pending report. Inspect moved reports with
+  `kj block list -c lost+found --kind error`.
 - **`UseLastGood` stays lane-scoped** (the track's last committed cell,
   regardless of producer) — the listener hears the lane continue. A's fallback
   may repeat B's last phrase; that is a decision, not a bug.
