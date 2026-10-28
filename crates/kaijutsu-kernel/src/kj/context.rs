@@ -2396,6 +2396,11 @@ impl KjDispatcher {
             (target_id, label)
         };
 
+        match self.kernel_db().lock().held_drift_refusal(target_id) {
+            Ok(None) => {}
+            Ok(Some(why)) => return KjResult::Err(format!("kj context archive: {why}")),
+            Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+        }
         if let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
             return KjResult::Err(format!("kj context archive: {target_label} stays live: {e}"));
         }
@@ -2523,6 +2528,13 @@ impl KjDispatcher {
         let name = predecessor.label.clone().unwrap_or_else(|| predecessor.context_id.short());
         if predecessor.is_archived() {
             return KjResult::Err(format!("kj context rotate: {name} is archived; rotate a live context"));
+        }
+        // Rotation archives the predecessor at its last step; refuse before
+        // the successor and its lifecycle run.
+        match self.kernel_db().lock().held_drift_refusal(predecessor.context_id) {
+            Ok(None) => {}
+            Ok(Some(why)) => return KjResult::Err(format!("kj context rotate: {why}")),
+            Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
         }
         if predecessor.played_by != Some(caller.actor_id) {
             match self.kernel_db().lock().lineage_root(predecessor.context_id) {
@@ -2870,6 +2882,13 @@ impl KjDispatcher {
             Ok(row) => archives(&row),
             Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
         };
+        if archiving {
+            match self.kernel_db().lock().held_drift_refusal(target_id) {
+                Ok(None) => {}
+                Ok(Some(why)) => return KjResult::Err(format!("kj context demote: {why}")),
+                Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
+            }
+        }
         if archiving && !caller.confirmed {
             return latch();
         }

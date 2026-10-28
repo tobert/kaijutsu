@@ -1682,6 +1682,26 @@ mod tests {
         assert!(h.d.kernel_db().lock().archive_context(h.console).unwrap());
     }
 
+    /// Rotating, archiving, or demoting ROOT past the rim while it holds a
+    /// drift is refused before anything runs: no successor is made and no
+    /// archive lifecycle starts.
+    #[tokio::test]
+    async fn root_is_not_rotated_or_archived_by_kj_while_it_holds_a_drift() {
+        let h = root_house().await;
+        let pushed = h.d.dispatch(&[s("drift"), s("push"), s("ROOT"), s("hold")], &seat(h.lane, h.coder)).await;
+        assert!(pushed.is_ok(), "{}", pushed.message());
+        let before = h.d.kernel_db().lock().list_all_contexts().unwrap().len();
+        let mut amy = seat(h.console, h.amy);
+        amy.confirmed = true;
+        for argv in [vec![s("context"), s("rotate"), s("ROOT")], vec![s("context"), s("archive"), s("ROOT")]] {
+            let refused = h.d.dispatch(&argv, &amy).await;
+            assert!(!refused.is_ok(), "{argv:?} ran: {}", refused.message());
+            assert!(refused.message().contains("kj ledger"), "{argv:?}: {}", refused.message());
+        }
+        assert_eq!(h.d.kernel_db().lock().list_all_contexts().unwrap().len(), before, "a successor was made");
+        assert!(!h.d.kernel_db().lock().get_context(h.console).unwrap().unwrap().is_archived());
+    }
+
     /// A pull and a merge into ROOT tell their caller the drift is held,
     /// with no preview of its content: a pull runs in ROOT, so its model
     /// would read the preview before its human does.

@@ -188,8 +188,9 @@ Two things follow, and they are the ones to check a change against:
   - A drift ask survives a restart; every other unresolved ask is retired.
     At start, a held drift with no open or unsettled ask is dismissed
     (`reconcile_root_held_drifts`).
-  - ROOT is not archived, or rotated, while a drift ask is open or its
-    answer is unsettled: the archive is refused, naming the asks.
+  - ROOT is not archived, rotated, or demoted past the rim while a drift
+    ask is open or its answer is unsettled. Each verb refuses before it
+    runs anything, naming the asks.
   - `kj stage include` and `setBlockExcluded` refuse a held drift; only the
     ask's allow includes it. A held `pull` or `merge` tells its caller the
     ask id and shows no preview.

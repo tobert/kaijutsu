@@ -4458,18 +4458,28 @@ impl KernelDb {
         }
     }
 
-    fn archive_context_writes(&self, id: ContextId) -> KernelDbResult<bool> {
-        // A held drift is settled by its ask, and an archived context
-        // answers nothing, so archiving here would leave the drift held
-        // with no ask that can release it. Refuse until it is answered.
+    /// Why `id` may not be archived yet: it holds drifts whose asks are
+    /// unanswered or unsettled. A held drift is settled by its ask, and an
+    /// archived context answers nothing, so archiving would leave the drift
+    /// held with no ask that can release it. Verbs that archive check this
+    /// before they run anything; [`Self::archive_context_writes`] checks it
+    /// again inside the write.
+    pub(crate) fn held_drift_refusal(&self, id: ContextId) -> KernelDbResult<Option<String>> {
         let held = approval_ledger::ask::list_unsettled_drift_asks(&self.conn, id.as_bytes())?;
-        if !held.is_empty() {
-            let asks = held.iter().map(|id| id.split('-').next().unwrap_or(id)).collect::<Vec<_>>().join(", ");
-            return Err(KernelDbError::Validation(format!(
-                "context {} holds {} drift(s) waiting for its human (ask {asks}); answer each with \
-                 `kj ledger allow <id>` or `kj ledger deny <id>`, then archive it",
-                id.short(), held.len()
-            )));
+        if held.is_empty() {
+            return Ok(None);
+        }
+        let asks = held.iter().map(|id| id.split('-').next().unwrap_or(id)).collect::<Vec<_>>().join(", ");
+        Ok(Some(format!(
+            "context {} holds {} drift(s) waiting for its human (ask {asks}); answer each with \
+             `kj ledger allow <id>` or `kj ledger deny <id>`, then archive it",
+            id.short(), held.len()
+        )))
+    }
+
+    fn archive_context_writes(&self, id: ContextId) -> KernelDbResult<bool> {
+        if let Some(why) = self.held_drift_refusal(id)? {
+            return Err(KernelDbError::Validation(why));
         }
         let now = now_millis();
         let updated = self.conn.execute(
