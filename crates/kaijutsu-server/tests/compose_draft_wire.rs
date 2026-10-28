@@ -822,26 +822,29 @@ fn a_chat_submit_in_the_human_root_says_it_runs_no_model_turns() {
     });
 }
 
-/// Outside the human root, a performer assigned as its own reviewer is
-/// still refused with the self-review reason, as a refusal.
+/// Outside the human root, a performer whose senpai chain ends at a context
+/// it holds itself has no one to review it, and the submit is refused as a
+/// refusal, not a fault.
 #[test]
-fn a_chat_submit_that_would_review_itself_is_refused() {
+fn a_chat_submit_with_nobody_above_the_performer_is_refused() {
     run_local(async {
         let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
         let context_id = open_context(&kernel, "draft-self-review").await;
         let performer = seed_turn_identity(&live_kernel, context_id);
-        live_kernel.kernel_db.lock()
-            .assign_test_review_recasting(context_id, Some(performer), Some(performer))
-            .unwrap();
+        {
+            let db = live_kernel.kernel_db.lock();
+            db.assign_test_review_recasting(context_id, Some(performer), None).unwrap();
+            db.note_senpai_intent(context_id, None).unwrap();
+        }
         kernel.edit_input(context_id, 0, "review yourself", 0).await.unwrap();
 
         let error = kernel.submit_input(context_id, false).await.unwrap_err();
         let kaijutsu_client::RpcError::Refused(refusal) = error else {
             panic!("expected a refusal, not a fault: {error:?}");
         };
-        assert!(refusal.reason.contains("cannot review its own work"), "{refusal:?}");
+        assert!(refusal.reason.contains("nobody reviews"), "{refusal:?}");
         assert!(draft(&kernel, context_id).await.is_some(), "refusal preserves the draft");
     });
 }

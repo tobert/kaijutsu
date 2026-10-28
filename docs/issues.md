@@ -6,40 +6,25 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## senpai/kohai branch: main's root rules still to port (2026-10-28)
+## senpai/kohai branch: what the merge with `main` leaves open (2026-10-28)
 
-`feat/senpai-kohai` merged `main` at `913277fd`. The merge builds, and these
-tests still fail. Each needs a ruling on the branch's rule or a rewrite of
-the test for it.
+`feat/senpai-kohai` merged `main` at `befa6384`. Four `kaijutsu-tui`
+`terminal_fit` tests fail and are not caused by the branch (listed under the
+TUI entries below). Open:
 
-- Roots. `main` lets a root character be a performer and play the top of its
-  own lineage (`kj/context.rs`, `plays_own_root` on `main`). The branch
-  refuses a root nowhere now, and `insert_new_context_rows` exempts every
-  root from the self-review check, which is wider than `main`'s rule. Decide
-  the narrow rule, then port `plays_own_root` to the kohai path.
-  `a_root_character_may_play_its_own_root_context` fails: a root console has
-  no context character, so nothing can answer to it.
-- A model's create held for Amy. `a_held_create_*` in `context_create_cwd_wire`
-  and `register_session_upsert` fail: the branch finds a reviewer through the
-  senpai chain, and a model acting in Amy's root context has none ("nobody
-  reviews claude in context amy"). `main` found Amy through the lineage root.
-- `a_chat_submit_that_would_review_itself_is_refused` (`compose_draft_wire`)
-  submits successfully: `assign_test_review_recasting(.., performer,
-  performer)` no longer yields a performer that reviews itself. Rewrite the
-  setup for senpai-chain review.
+- `insert_new_context_rows` (`kj/context.rs`) exempts every root character
+  from its self-review check. A root performer under its own root is still
+  refused by `validate_model_review_assignment`, so the gap shows only when
+  that second check is skipped. Remove the exemption once nothing creates a
+  root-performed context through this path.
 - `kj context set --as` and the `played_by` column are gone, so `main`'s tests
   for director casting went with them. Re-express "a director may cast a
   root" on `kj kohai create`.
-- `kernel_db::context_characters::a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai`
-  and `kj::context::rotate_carries_the_seat_to_its_successor` failed before
-  the merge too: a rotation keeps the predecessor's slots instead of reading
-  the cast again.
 - The "performer reassignment rejects a queued inference" wire test
   (`turn_events_wire`) was deleted with the performer column. Its behavior
   (a reassigned context drops a queued turn) has no test.
-- `kaijutsu-server bootstrap` now builds a `house` cast with `console` and
-  `distill` slots and rotates ROOT when the cast arrives later. A kernel
-  bootstrapped before the branch has no cast: run bootstrap again.
+- Kernels bootstrapped before the branch have no `house` cast: run
+  `kaijutsu-server bootstrap` again.
 - The prose in `docs/approval-identity.md` still says "a root can never be a
   performer" in places; read it against `docs/character.md`, "Roots".
 

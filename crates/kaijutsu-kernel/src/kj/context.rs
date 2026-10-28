@@ -351,8 +351,7 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
         }
         CharacterPlacement::Rotate { predecessor } => {
             let predecessor = db.require_context_character(predecessor)?;
-            db.copy_context_character(predecessor.context_id, row.context_id)?;
-            db.set_context_senpai(row.context_id, predecessor.senpai_ctx)?;
+            db.write_context_character(row.context_id, predecessor.principal_id, predecessor.senpai_ctx, predecessor.persona.as_deref())?;
         }
         CharacterPlacement::Fork { source } => {
             db.copy_context_character(source, row.context_id)?;
@@ -3596,11 +3595,12 @@ mod tests {
         );
     }
 
-    /// A root character may play its own root context. At the top of a
-    /// lineage there is no one above it to ask, so its own confirmation is
-    /// the human's act (`docs/approval-identity.md`).
+    /// A root character does not perform below its own root: the climb from
+    /// the new context reaches the root itself, and a performer never reviews
+    /// its own work. A root's own context comes from `kj character create`,
+    /// and a model plays the ROOT console above it.
     #[tokio::test]
-    async fn a_root_character_may_play_its_own_root_context() {
+    async fn a_root_character_cannot_perform_a_kohai_under_its_own_root() {
         let d = test_dispatcher().await;
         let amy = PrincipalId::new();
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
@@ -3608,13 +3608,16 @@ mod tests {
         }).unwrap();
         d.kernel_db().lock().update_character_root(amy, true).unwrap();
         let context = register_context(&d, Some("owner-root"), None, amy);
+        d.kernel_db().lock().update_played_by(context, Some(amy)).unwrap();
         let caller = crate::kj::KjCaller {
             principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let created = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("owner"), s("owner-lane")], &caller).await;
-        assert!(created.is_ok(), "a root plays the top of its own lineage: {}", created.message());
+        let refused = d.dispatch(&[s("kohai"), s("create"), s("--as"), s("owner"), s("owner-lane")], &caller).await;
+        assert!(!refused.is_ok(), "a root would review its own work");
+        assert!(refused.message().contains("cannot review its own work"), "{}", refused.message());
+        assert!(d.kernel_db().lock().find_context_by_label("owner-lane").unwrap().is_none(), "nothing was written");
     }
 
     #[tokio::test]

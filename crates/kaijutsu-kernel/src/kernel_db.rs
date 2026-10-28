@@ -2522,6 +2522,11 @@ impl KernelDb {
             Some(sheet) if sheet.root && sheet.retired_at.is_none() && at.principal_id == actor => {
                 Ok(EffectiveReviewer::SelfConfirmation(actor))
             }
+            Some(sheet) if !sheet.root
+                && self.get_character(at.principal_id)?.is_some_and(|holder| holder.root && holder.retired_at.is_none()) =>
+            {
+                Ok(EffectiveReviewer::Assigned(at.principal_id))
+            }
             sheet => {
                 let who = sheet.map_or_else(|| actor.short(), |sheet| sheet.name);
                 Err(KernelDbError::Validation(format!(
@@ -12146,6 +12151,31 @@ mod tests {
         let abandoned = senpai_ctx_row(&db, ws_id, "abandoned-root", None, Some(retired_root));
         let error = db.route_review(ReviewQuery::ask(abandoned.context_id, retired_root)).unwrap_err();
         assert!(error.to_string().contains("gone"), "a retired root does not confirm itself: {error}");
+    }
+
+    /// A non-root character acting in a root context it does not hold is
+    /// reviewed by the live root that holds it: the climb starts at the
+    /// context itself. A holder that is not a live root does not review, so a
+    /// non-root top still refuses, and a root in another root's console is
+    /// still refused.
+    #[test]
+    fn route_review_makes_a_live_root_review_a_model_acting_in_its_context() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [claude, amy, bob] = seed_characters(&db, &["claude", "amy", "bob"])[..] else { unreachable!() };
+        db.update_character_root(amy, true).unwrap();
+        let root = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
+        assert_eq!(
+            db.route_review(ReviewQuery::ask(root.context_id, claude)).unwrap(),
+            EffectiveReviewer::Assigned(amy),
+            "amy holds the top context, so she reviews what claude does in it",
+        );
+        let orphan = senpai_ctx_row(&db, ws_id, "orphan-top", None, Some(bob));
+        assert!(db.route_review(ReviewQuery::ask(orphan.context_id, claude)).is_err(), "bob is no live root");
+        assert!(
+            db.route_review(ReviewQuery::ask(root.context_id, claude).above(amy)).is_err(),
+            "an escalation past amy has nobody above her",
+        );
     }
 
     /// A retired holder refuses by name; it never substitutes another character.

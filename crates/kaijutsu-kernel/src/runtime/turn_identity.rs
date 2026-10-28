@@ -133,7 +133,13 @@ pub(crate) async fn resolve_for_context(
         return Err(IdentityError::Refused(HUMAN_ROOT_REFUSAL.to_string()));
     }
     let actor = row.played_by;
-    require_performer(actor).map_err(IdentityError::Refused)?;
+    let performer = require_performer(actor).map_err(IdentityError::Refused)?;
+    // A chain with nobody to review the performer is an assignment the
+    // senpai's holder repairs, so it refuses; any other failure is a fault.
+    let routed = kernel.kernel_db().lock().route_review(crate::kernel_db::ReviewQuery::ask(context_id, performer));
+    if let Err(crate::kernel_db::KernelDbError::Validation(why)) = routed {
+        return Err(IdentityError::Refused(why));
+    }
     let review = kernel.resolve_context_review(context_id).await.map_err(IdentityError::Failed)?;
     let db = kernel.kernel_db().lock();
     resolve(&db, actor, review.reviewer.principal_id)
