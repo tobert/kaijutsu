@@ -174,6 +174,20 @@ Clarity:
   `cd sub` (`shell_write: 1 statement(s) — cd sub`), and passed three times
   alone. Load-dependent; cause not found.
 
+## TUI draft scrambles on spaceghost (2026-10-28)
+
+Amy, in the TUI on the human root's chat surface: "I can't type 'are', the
+letters come in out of order", through several client restarts; `dd` and
+`x` did not clear it. The shell surface works, but a shell command
+sometimes fails with `input is empty` (`tui.log`, 12:33 and 14:20 local).
+Typing the same text against a `terminal_fit` kernel landed in order. Not
+yet known: the exact text that lands, her terminal and whether tmux or
+screen is in between, the mode line while typing, and whether the text was
+on the compose line at Enter.
+
+Related, Amy: the shell surface and the prompt surface should differ at a
+glance, for example by background, so it is clear which one takes input.
+
 ## `SshServerConfig::unlisted` has no production entry point (2026-10-27)
 
 Only `kaijutsu-solo-acp --unlist <path>` set `SshServerConfig::unlisted`,
