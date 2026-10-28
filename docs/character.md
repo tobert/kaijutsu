@@ -172,6 +172,38 @@ Two things follow, and they are the ones to check a change against:
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,
   and the factory preset labels.
+- **ROOT places contexts.** Amy, 2026-10-28: "I think we are simplifying
+  on having ROOT be the privileged context for getting stuff moving. A
+  banto/director should have privileges to drive other contexts, and fall
+  back to the ROOT when it needs to do something on itself. This gives me
+  one place for things to bubble down to me." `kj context promote`,
+  `demote`, and `conclude` follow this rule (`kj/context.rs`,
+  `require_placement_authority`). Asked where a person's own authority
+  comes from, Amy chose "It follows the human": a live root character (a
+  sheet with `root` set, not retired) is a human root wherever it acts, so
+  its keys work in any client on any card, and it needs no capability. A
+  model seat is ROOT only in the ROOT console (the `console` context
+  labeled `ROOT`), and needs the operator capability there. A call that
+  runs in a `root` context is a human root too.
+  - ROOT may act on any context, including itself and directors.
+  - Only a human root demotes or concludes a human root or a console.
+    Nobody concludes a human root: conclusion has no undo, and a concluded
+    context refuses drifts, which is how work reaches the human. A human
+    root that wants fresh history rotates.
+  - Any other seat with Operator, such as a director, may act on any other
+    context in the house, in any lineage. It may not act on a human root,
+    a console, or its own context. Its own context is the one the call
+    runs in, or any context its character plays. The refusal says to ask
+    ROOT, for example with `kj drift push ROOT`.
+  - A seat without Operator acts on nothing. The refusal names the
+    capability and says to go through its director or ROOT. A `shell`
+    context holds no Operator, so it places nothing.
+
+  `kj context archive` follows the same principle: it needs Operator, or a
+  live root character acting from any context, and it always latches.
+  `kj drive` and `kj context rotate` keep their own rules: `drive` needs
+  the drive capability on any target, including the caller's own context,
+  and the performer or lineage root rotates.
 - **Rotation replaces a context, not a character.** Amy, 2026-09-17:
   rotate a context, and move a character's `root_ctx` pointer only when it
   named that context. The successor is created from the predecessor's own

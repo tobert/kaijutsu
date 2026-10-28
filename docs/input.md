@@ -155,7 +155,10 @@ follows the kernel's `ContextSwitched` push instead.
 run a `kj context` verb on the context they move, through `executeKj` and
 against that context, as the tui's picker does: `p` promote, `d` and
 `Ctrl+A q` demote, `c` conclude, `z` pause (or resume, when the context is
-paused), and `a` archive. There is no placement RPC: the verb checks
+paused), and `a` archive. The verb runs as the person at the keys, whose
+live root character acts as a human root from any context, so the keys work
+on a card whose loadout lacks Operator (`docs/character.md`, "ROOT places
+contexts"). There is no placement RPC: the verb checks
 authority, latches each step that archives behind `--confirm`, and runs the
 archive rc lifecycle. The hints line shows the first stdout line, or why the
 verb failed. A latched step moves nothing; the hints line says what the step

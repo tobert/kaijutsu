@@ -49,9 +49,10 @@ predecessor after the successor's `create` lifecycle and before the
 rotation commits, and `kj context demote` runs it before the step that
 archives; a cancelled or unsettled lifecycle refuses either and leaves the
 context live. That demote step needs `--confirm`, as archive does.
-`kj context conclude`, `promote`, and `demote` need no capability when the
-caller's character plays the target or is its lineage root; otherwise they
-need the operator capability.
+`kj context conclude`, `promote`, `demote`, and `archive` need the operator
+capability unless a live root character runs them. For the first three, no
+seat but ROOT acts on its own context, a human root, or a console
+(`docs/character.md`, "ROOT places contexts").
 `kj context archive --children [--type <type>]` archives a context's live
 children, each through its own lifecycle.
 Already accepted commands retain their settlement destination across archive.

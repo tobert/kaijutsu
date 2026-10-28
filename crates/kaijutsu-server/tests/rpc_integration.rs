@@ -1295,7 +1295,8 @@ fn test_client_view_is_namespaced_per_client() {
 /// app's and the tui's placement keys take — round-trip over the real wire,
 /// and `listContexts` reflects the ladder as it steps: promoted →
 /// unpromoted → demoted → latched → archived once confirmed, with
-/// pause/resume independent of ring placement.
+/// pause/resume independent of ring placement. The verbs run from a
+/// steward context, because no seat places its own context.
 #[test]
 fn test_promote_demote_pause_round_trip_over_rpc() {
     run_local(async {
@@ -1303,6 +1304,7 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
         let (_client, kernel) = setup_execute_context(addr).await;
 
         let ctx = create_context(&kernel, "ring-rider").await.unwrap();
+        let steward = create_context(&kernel, "steward").await.unwrap();
 
         let find = |contexts: &[kaijutsu_client::ContextInfo], id: kaijutsu_types::ContextId| {
             contexts.iter().find(|c| c.id == id).cloned()
@@ -1315,7 +1317,7 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
             argv
         };
 
-        let promoted = kernel.execute_kj(ctx, &placement("promote", false)).await.unwrap();
+        let promoted = kernel.execute_kj(steward, &placement("promote", false)).await.unwrap();
         assert_eq!(promoted.exit_code, 0, "{}", promoted.stderr);
         let contexts = kernel.list_contexts().await.unwrap();
         let row = find(&contexts, ctx).expect("promoted context still listed");
@@ -1323,7 +1325,7 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
         assert!(row.demoted_at.is_none());
 
         // promoted → unpromoted
-        let stepped = kernel.execute_kj(ctx, &placement("demote", false)).await.unwrap();
+        let stepped = kernel.execute_kj(steward, &placement("demote", false)).await.unwrap();
         assert_eq!(stepped.exit_code, 0, "{}", stepped.stderr);
         let contexts = kernel.list_contexts().await.unwrap();
         let row = find(&contexts, ctx).unwrap();
@@ -1332,7 +1334,7 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
         assert!(!row.archived);
 
         // neither → demoted
-        let stepped = kernel.execute_kj(ctx, &placement("demote", false)).await.unwrap();
+        let stepped = kernel.execute_kj(steward, &placement("demote", false)).await.unwrap();
         assert_eq!(stepped.exit_code, 0, "{}", stepped.stderr);
         let contexts = kernel.list_contexts().await.unwrap();
         let row = find(&contexts, ctx).unwrap();
@@ -1341,24 +1343,21 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
 
         // already demoted → the archiving step comes back as a latch with
         // its confirming command, and nothing is archived.
-        let latched = kernel.execute_kj(ctx, &placement("demote", false)).await.unwrap();
+        let latched = kernel.execute_kj(steward, &placement("demote", false)).await.unwrap();
         let latch = latched.latch.expect("the archiving demote latches");
         assert_eq!(latch.command, "kj context demote");
         assert_eq!(latch.message, format!("kj context demote {} --confirm", ctx.to_hex()));
         let contexts = kernel.list_contexts().await.unwrap();
         assert!(!find(&contexts, ctx).unwrap().archived, "a latched demote archives nothing");
 
-        let archived = kernel.execute_kj(ctx, &placement("demote", true)).await.unwrap();
+        let archived = kernel.execute_kj(steward, &placement("demote", true)).await.unwrap();
         assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
         assert!(archived.latch.is_none());
         let contexts = kernel.list_contexts().await.unwrap();
         let row = find(&contexts, ctx).unwrap();
         assert!(row.archived, "the confirmed demote step archives the context");
 
-        // An archived context runs no new work, so the verbs that follow run
-        // from another context. A further demote fails loudly, not as a
-        // silent no-op.
-        let steward = create_context(&kernel, "steward").await.unwrap();
+        // A further demote fails loudly, not as a silent no-op.
         let past = kernel.execute_kj(steward, &placement("demote", true)).await.unwrap();
         assert_ne!(past.exit_code, 0);
         assert!(past.stderr.contains("cannot demote an archived context"), "{}", past.stderr);
@@ -1423,6 +1422,43 @@ fn test_kj_context_archive_latches_then_archives_over_rpc() {
     });
 }
 
+/// A person's keys on a coder card run the verbs from inside the card, whose
+/// loadout lacks Operator. The connection's root character carries ROOT
+/// privilege there: promote, the demote ladder, and a confirmed archive all
+/// succeed (`docs/character.md`, "ROOT places contexts").
+#[test]
+fn test_the_human_places_and_archives_a_coder_card_from_inside_it() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+        let verb = |verb: &str, ctx: kaijutsu_types::ContextId, confirm: bool| {
+            let mut argv = vec!["context".to_string(), verb.to_string(), ctx.to_hex()];
+            if confirm {
+                argv.push("--confirm".to_string());
+            }
+            argv
+        };
+
+        let card = create_context_typed(&kernel, "card", "coder").await.unwrap();
+        for step in ["promote", "demote", "demote"] {
+            let result = kernel.execute_kj(card, &verb(step, card, false)).await.unwrap();
+            assert_eq!(result.exit_code, 0, "{step}: {}", result.stderr);
+        }
+        let latched = kernel.execute_kj(card, &verb("demote", card, false)).await.unwrap();
+        assert!(latched.latch.is_some(), "the archiving step still latches: {}", latched.stderr);
+        let archived = kernel.execute_kj(card, &verb("demote", card, true)).await.unwrap();
+        assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
+
+        let other = create_context_typed(&kernel, "other-card", "coder").await.unwrap();
+        let archived = kernel.execute_kj(other, &verb("archive", other, true)).await.unwrap();
+        assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
+        let contexts = kernel.list_contexts().await.unwrap();
+        for id in [card, other] {
+            assert!(contexts.iter().find(|c| c.id == id).unwrap().archived);
+        }
+    });
+}
+
 /// `setLastContext` auto-promotes a context that has never had an explicit
 /// ring placement (design brief's "auto-promote on visit" rule) — but a
 /// context that's been explicitly demoted stays demoted; explicit demotion
@@ -1444,8 +1480,9 @@ fn test_set_last_context_auto_promotes_a_fresh_context_but_not_a_demoted_one() {
         );
 
         let demoted = create_context(&kernel, "stay-demoted").await.unwrap();
+        let steward = create_context(&kernel, "steward").await.unwrap();
         let argv = ["context".to_string(), "demote".to_string(), demoted.to_hex()];
-        let stepped = kernel.execute_kj(demoted, &argv).await.unwrap();
+        let stepped = kernel.execute_kj(steward, &argv).await.unwrap();
         assert_eq!(stepped.exit_code, 0, "{}", stepped.stderr);
         kernel.set_last_context(&client_id, demoted).await.unwrap();
         let contexts = kernel.list_contexts().await.unwrap();
@@ -1478,17 +1515,18 @@ fn test_active_ring_cap_enforced_over_rpc() {
     run_local(async {
         let addr = start_server().await;
         let (_client, kernel) = setup_execute_context(addr).await;
+        let steward = create_context(&kernel, "steward").await.unwrap();
 
         for i in 0..10 {
             let ctx = create_context(&kernel, &format!("cap-seat-{i}")).await.unwrap();
             let argv = ["context".to_string(), "promote".to_string(), ctx.to_hex()];
-            let promoted = kernel.execute_kj(ctx, &argv).await.unwrap();
+            let promoted = kernel.execute_kj(steward, &argv).await.unwrap();
             assert_eq!(promoted.exit_code, 0, "{}", promoted.stderr);
         }
 
         let overflow = create_context(&kernel, "cap-overflow").await.unwrap();
         let argv = ["context".to_string(), "promote".to_string(), overflow.to_hex()];
-        let refused = kernel.execute_kj(overflow, &argv).await.unwrap();
+        let refused = kernel.execute_kj(steward, &argv).await.unwrap();
         assert_ne!(refused.exit_code, 0);
         assert!(refused.stderr.contains("active ring full"), "{}", refused.stderr);
 
