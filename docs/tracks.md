@@ -56,9 +56,9 @@ Attachment {                           // the persisted binding contract
 }
 ```
 
-Each `AttachedContext` bundles the `Attachment` with runtime-only materialization
-bookkeeping (failure counters, drain water marks) that is never persisted. A
-context is attached to **at most one track** at a time; attaching to a new track
+Each `AttachedContext` holds only the context's `Attachment`. The runtime-only
+materialization bookkeeping (failure counters, drain water marks) lives on the
+track's `TrackState` and is never persisted. A context is attached to **at most one track** at a time; attaching to a new track
 detaches from the old, so one track's beat can never inject another's `KJ_*`
 facts.
 
