@@ -258,7 +258,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             let Some(known) = known_model(&backend.kind, &backend.model) else {
                 report.notes.push(format!(
                     "bootstrap does not know the context window of {}/{}; `kj backend model set {} {} \
-                     --context-window <tokens>` records it",
+                     --context-window <tokens>` records it, and `kj context rotate ROOT` gives ROOT the window",
                     backend.name, backend.model, backend.name, backend.model
                 ));
                 continue;
@@ -298,7 +298,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
 
     // A model binds through its character's cast, one slot per role. The
     // first backend's model fills the slots ROOT and its forks need.
-    let mut cast_attached = false;
+    let mut has_model = false;
     match opts.backends.first() {
         Some(backend) => {
             if read(shared, |db| db.get_cast_by_label(HOUSE_CAST))?.is_none() {
@@ -323,10 +323,16 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             }
             let played = read(shared, |db| db.get_character_by_name(performer))?
                 .ok_or_else(|| format!("no '{performer}' character row after creating it"))?;
-            if read(shared, |db| db.character_cast(played.principal_id))?.map(|row| row.cast_id) != Some(house.cast_id) {
-                dispatch(shared, caller, words(&["character", "set", performer, "--cast", HOUSE_CAST]), &mut report).await?;
-                cast_attached = true;
+            match read(shared, |db| db.character_cast(played.principal_id))?.map(|row| row.cast_id) {
+                Some(cast) if cast == house.cast_id => {}
+                None => {
+                    dispatch(shared, caller, words(&["character", "set", performer, "--cast", HOUSE_CAST]), &mut report).await?;
+                }
+                Some(_) => report.notes.push(format!(
+                    "{performer} already has a cast of its own; bootstrap leaves it, and ROOT's slots come from it"
+                )),
             }
+            has_model = true;
         }
         None => report.notes.push(
             "ROOT has no model yet. Give the kernel a key and run bootstrap again, or set one \
@@ -336,6 +342,9 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         ),
     }
 
+    let played_id = read(shared, |db| db.get_character_by_name(performer))?
+        .ok_or_else(|| format!("no '{performer}' character row"))?
+        .principal_id;
     match read(shared, |db| db.find_context_by_label(ROOT_LABEL))? {
         None => {
             // ROOT is a kohai of the human root, the context the root
@@ -355,9 +364,17 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
              to create the console",
             row.context_type
         )),
-        // A binding copies its character's cast when it is written, so a
-        // ROOT made before the cast existed takes the model on rotation.
-        Some(_) if cast_attached => {
+        Some(row) if read(shared, |db| db.context_character(row.context_id))?.map(|c| c.principal_id) != Some(played_id) => {
+            report.notes.push(format!(
+                "ROOT is not played by {performer}; rotation keeps its character, so archive ROOT and run \
+                 bootstrap again to create it as {performer}"
+            ))
+        }
+        // A context copies its character's slots when it is written, so a
+        // ROOT made before its cast had a role takes the model on rotation.
+        Some(row) if has_model && read(shared, |db| {
+            HOUSE_ROLES.iter().try_fold(false, |lacking, role| Ok(lacking || db.context_slot(row.context_id, role)?.is_none()))
+        })? => {
             dispatch(shared, caller, words(&["context", "rotate", ROOT_LABEL]), &mut report).await?;
         }
         Some(_) => report.notes.push("ROOT is already set up".to_string()),

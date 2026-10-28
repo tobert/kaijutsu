@@ -23,6 +23,38 @@ TUI entries below). Open:
 - The "performer reassignment rejects a queued inference" wire test
   (`turn_events_wire`) was deleted with the performer column. Its behavior
   (a reassigned context drops a queued turn) has no test.
+- A kaibo review of the landed branch (2026-10-28, `deepseek` cast, read of
+  the files, no test run) found guards that `docs/senpai-kohai.md` promises
+  and the code lacks. Each needs a test that fails first:
+  - A root console can be forked, archived (leaving `characters.root_ctx` on
+    an archived context) and moved under a senpai (`kj/fork.rs`,
+    `kj/context.rs` `context_archive`, `kj/senpai.rs` `move_kohai`).
+    `kj senpai set` also refuses neither a root console nor a judge shadow.
+  - `Start { performer: root, senpai: None }` and `set_context_senpai(ctx,
+    None)` can make a live top that is not a `root_ctx`; only the migration
+    enforces "no senpai means root console".
+  - `kj kohai create` applies the placing rule only to an explicit
+    `--senpai`; the default senpai (the caller's context) skips it, and
+    `kj context switch` has no authority check.
+  - The root exemption in `insert_new_context_rows` is load-bearing for
+    rotating a root console, so narrow it to "the performer's `root_ctx`"
+    rather than removing it, and delete the design line that calls the check
+    dead.
+  - `resolve_for_context` types a `Validation` error from `route_review` as a
+    refusal, but that variant also covers a senpai cycle and a missing
+    character sheet, which are corruption. `KernelDbError` has no variant to
+    tell them apart. The second call maps everything to a fault.
+  - `resolve_review` labels every `Assigned` reviewer `ReviewSource::Senpai`,
+    so `kj context info` prints `(senpai)` for a root holding a top context.
+  - `drift_reviewer` falls back to the sender when the console has no
+    context character, and flattens refusal and corruption into one message.
+  - `docs/approval-identity.md` still says "instance" outside its routing
+    sections, and `docs/senpai-kohai.md` describes `--model`/`--max-tokens`
+    create options and a no-casts hard cut that the code does not have.
+- Load-dependent flakes seen in full-suite runs and green alone, at
+  `bd1dc251` plus the review fixes: `council::gate_e2e::a_council_miss_asks_and_records_its_cause`,
+  `a_contained_model_commits_with_real_git`, and `a_learned_allow_beats_a_config_deny_added_later`.
+  Causes not found.
 - Kernels bootstrapped before the branch have no `house` cast: run
   `kaijutsu-server bootstrap` again.
 - The prose in `docs/approval-identity.md` still says "a root can never be a

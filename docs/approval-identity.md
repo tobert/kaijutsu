@@ -19,13 +19,12 @@ authority to anyone beyond what the senpai edge gives.
 
 ## The senpai edge
 
-`character_instances.senpai_instance` names the senpai instance. It is null only for a root console. A context
-belongs to at most one instance (`contexts.instance_id`); a context with none (scratch, the handoff log, the drift
-queue, lost+found, the beat score) routes nothing. The edge points at an instance, not at a context, so a rotation,
-which starts a new conversation in the same instance, moves neither the senpai nor the kohai.
+`context_characters.senpai_ctx` names the senpai context. It is null only for a root console. A context with no
+context character (scratch, the handoff log, the drift queue, lost+found, the beat score) routes nothing. A
+rotation writes the successor with the predecessor's character and senpai, so the edge moves with the seat.
 
-- The **character** of an instance answers for it, and never changes.
-- The **kohai** of an instance are the live instances whose `senpai_instance` is that instance.
+- The **character** of a context is fixed when the context is made, and never changes.
+- The **kohai** of a context are the live contexts whose `senpai_ctx` is that context.
 - The chain never has a cycle. Setting an edge that would close one is refused.
 
 `kj senpai show [<ctx>]` prints the instance, its senpai (label and character), the lineage root, and who would
@@ -36,12 +35,13 @@ any context of an instance and uses that context's instance.
 
 The reviewer of an ask raised in context K by actor A:
 
-1. Let I be K's instance. A context with no instance refuses, naming K.
-2. Let S be `senpai_instance(I)`. If S is null (I is a root console): when A is I's live root character, the ask
-   is a self-confirmation; otherwise resolution refuses and names A and K.
-3. The reviewer is S's character when it is live and is not A.
-4. When S's character is A, climb: I becomes S, and repeat from 2. A banto that forks itself stays in its own
-   instance, so its fork answers to the banto's senpai.
+1. A context with no context character refuses, naming K.
+2. Let S be K's `senpai_ctx`. If S is null (K is a root console): when A is K's live root character, the ask is a
+   self-confirmation; when A is not a root and K's performer is a live root, that root reviews it; otherwise
+   resolution refuses and names A and K.
+3. The reviewer is S's character when it is live, is not A, and is not K's performer.
+4. When S's character is A or K's performer, climb: K becomes S, and repeat from 2. A fork's performer is its
+   source's character, so an ask in a fork, by anyone, climbs past that character.
 5. A retired character refuses by name. It never substitutes another character.
 
 One resolver does this. Every ask, the model-turn check, `kj senpai show` and `kj ledger escalate` use it.

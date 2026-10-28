@@ -150,7 +150,8 @@ Reviewer of an ask raised in context K by actor A:
 
 1. K with no context character refuses, naming K.
 2. Let S be K's `senpai_ctx`. If S is null (K is a root console): when A is K's live root character, the ask is a
-   self-confirmation; otherwise refuse, naming A and K.
+   self-confirmation; when A is not a root and K's performer is a live root, that root reviews it (a model acting
+   in a root's context); otherwise refuse, naming A and K.
 3. The reviewer is S's character when that character is not retired, is not A, and is not K's performer. S may
    be archived; asks route to a character, so an archived senpai's character still reviews.
 4. When S's character is A or K's performer, climb: K := S, and repeat from 2. A fork's performer is its

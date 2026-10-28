@@ -2454,6 +2454,9 @@ impl KernelDb {
             }
             ReviewFrom::Senpai(context) => (None, None, Some(context)),
         };
+        // The performer of the context the ask is raised in never reviews it,
+        // whoever the actor is: a fork's performer is its source's holder.
+        let performer = below.as_ref().map(|row| row.principal_id);
         let mut visited = HashSet::new();
         if let Some(row) = &below {
             visited.insert(row.context_id);
@@ -2488,7 +2491,7 @@ impl KernelDb {
                 below = Some(above);
                 continue;
             }
-            if holder == actor || Some(holder) == past {
+            if holder == actor || Some(holder) == past || Some(holder) == performer {
                 senpai = above.senpai_ctx;
                 below = Some(above);
                 continue;
@@ -5353,7 +5356,7 @@ impl KernelDb {
         let asks = held.iter().map(|id| id.split('-').next().unwrap_or(id)).collect::<Vec<_>>().join(", ");
         Ok(Some(format!(
             "context {} holds {} drift(s) waiting for its human (ask {asks}); answer each with \
-             `kj ledger allow <id>` or `kj ledger deny <id>`, then archive it",
+             `kj ledger allow <id>` or `kj ledger deny <id>`, then run the verb again",
             id.short(), held.len()
         )))
     }
@@ -12099,8 +12102,8 @@ mod tests {
         // A human at the top of the chain, acting in the fork, confirms themself.
         assert_eq!(
             db.route_review(ReviewQuery::ask(fork.context_id, amy)).unwrap(),
-            EffectiveReviewer::Assigned(banto),
-            "amy acting in the fork is reviewed by the seat's holder, not herself",
+            EffectiveReviewer::SelfConfirmation(amy),
+            "a fork's performer is its source's holder, so the climb passes banto and then amy herself",
         );
     }
 

@@ -50,14 +50,19 @@ result is missing:
    kernel finds the key wherever it runs.
 2. `kj backend model set` with the context window of a model it knows. For
    a model it does not know, the report names the model and this verb.
-3. `kj backend default set`, when the kernel has no default, to the first
-   provider found.
-4. `kj character create root`, the model character that plays `ROOT`
+3. `kj character create root`, the model character that plays `ROOT`
    (`--console-as` names another).
-5. `kj context create ROOT --type console --as root`, under the root context.
+4. `kj cast create house`, with a `console` and a `distill` slot on the first
+   provider's model, and `kj character set root --cast house` when the
+   character has no cast. A cast the character already has is left alone.
+5. `kj kohai create ROOT --type console --as root`, a kohai of the root
+   character's own context. When ROOT exists but lacks a slot its cast now
+   fills, bootstrap runs `kj context rotate ROOT`. When ROOT is played by
+   another character than `--console-as` names, the report says so and
+   changes nothing, since a rotation keeps the character.
 
-It prints each line it ran. A second run runs nothing, and a kernel set up by
-hand is completed rather than overwritten. With no key found, it still
+It prints each line it ran. A second run runs nothing once every step is in place, and a kernel set up
+by hand is completed rather than overwritten. With no key found, it still
 creates `ROOT` and prints the two `kj backend` lines that give it a model.
 
 Run it with the service stopped: it takes the same lock as the service and

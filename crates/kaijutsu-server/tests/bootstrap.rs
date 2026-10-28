@@ -169,3 +169,22 @@ fn the_root_cannot_play_root() {
         assert!(kernel_db(&config).find_context_by_label("ROOT").unwrap().is_none(), "nothing was made");
     });
 }
+
+/// Rotation keeps a context's character, so a re-run naming another performer
+/// cannot move ROOT to it: the report says to archive ROOT, and ROOT is not
+/// rotated for nothing.
+#[test]
+fn a_different_console_performer_is_reported_and_root_is_left_alone() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let mut opts = options(&config, Some(BackendChoice::mock("mock-model")));
+        bootstrap(&config, &opts).await.expect("bootstrap");
+        opts.console_performer = "other".to_string();
+        let again = bootstrap(&config, &opts).await.expect("bootstrap as another performer");
+        assert!(
+            again.notes.iter().any(|note| note.contains("ROOT is not played by other")),
+            "the report names the mismatch: {again:?}"
+        );
+        assert!(!again.ran.iter().any(|line| line.contains("context rotate")), "ROOT was not rotated: {again:?}");
+    });
+}
