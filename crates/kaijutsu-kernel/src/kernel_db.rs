@@ -12476,8 +12476,9 @@ mod tests {
         db.set_context_senpai(c.context_id, Some(d.context_id)).unwrap();
         assert_eq!(edge(&c), Some(d.context_id));
         assert_eq!(db.senpai_of(c.context_id).unwrap(), Some(d.context_id));
-        db.set_context_senpai(c.context_id, None).unwrap();
-        assert_eq!(edge(&c), None);
+        let top = db.set_context_senpai(c.context_id, None).unwrap_err().to_string();
+        assert!(top.contains("root console"), "only a root console has no senpai: {top}");
+        assert_eq!(edge(&c), Some(d.context_id), "the refusal wrote nothing");
         db.set_context_senpai(c.context_id, Some(b.context_id)).unwrap();
 
         let own = db.set_context_senpai(a.context_id, Some(a.context_id)).unwrap_err().to_string();

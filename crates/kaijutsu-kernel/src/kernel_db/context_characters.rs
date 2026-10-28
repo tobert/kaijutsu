@@ -456,6 +456,13 @@ impl KernelDb {
         Ok(self.get_character(principal_id)?.filter(|sheet| sheet.root).and_then(|sheet| sheet.root_ctx))
     }
 
+    /// Whether `context` is the root console of the character that performs
+    /// it: the context `characters.root_ctx` names.
+    pub fn is_root_console(&self, context: ContextId) -> KernelDbResult<bool> {
+        let Some(row) = self.context_character(context)? else { return Ok(false) };
+        Ok(self.root_console(row.principal_id)? == Some(context))
+    }
+
     /// Point a character's `root_ctx` at its console, or clear it.
     pub fn set_character_root_ctx(&self, principal_id: PrincipalId, ctx: Option<ContextId>) -> KernelDbResult<()> {
         let updated = self.conn.execute(
@@ -510,6 +517,13 @@ impl KernelDb {
             return Err(KernelDbError::NotFound(format!("context {}", context.short())));
         }
         self.require_context_character(context)?;
+        if senpai.is_none() && !self.is_root_console(context)? {
+            return Err(KernelDbError::Validation(format!(
+                "context {} is not a root console, and only a root console has no senpai; \
+                 `kj character create` makes a root's console",
+                self.context_name(context)
+            )));
+        }
         if let Some(senpai) = senpai {
             if senpai == context {
                 return Err(KernelDbError::Validation(format!(

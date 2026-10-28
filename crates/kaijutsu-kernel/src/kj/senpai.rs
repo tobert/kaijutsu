@@ -390,6 +390,19 @@ fn move_kohai(
 ) -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
     let row = db.context_character(target).map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{} has no context character", db.context_name(target)))?;
+    if db.is_root_console(target).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "{} is a root console, the top of its lineage, and has no senpai to move to; `kj context rotate` replaces it",
+            db.context_name(target)
+        ));
+    }
+    let target_type = db.get_context(target).map_err(|e| e.to_string())?.map(|row| row.context_type);
+    if target_type.as_deref() == Some("judge") {
+        return Err(format!(
+            "{} is a judge shadow, which answers to the coder it shadows; archive it with the coder instead",
+            db.context_name(target)
+        ));
+    }
     let senpai_row = db.context_character(senpai).map_err(|e| e.to_string())?.ok_or_else(|| {
         format!(
             "{} has no context character, so nobody would answer for {}",
@@ -534,6 +547,25 @@ mod tests {
         assert_eq!(d.kernel().resolve_context_review(h.lane).await.unwrap().reviewer.name, "judge");
         let back = d.dispatch(&[s("senpai"), s("set"), h.other.to_hex(), h.seat.to_hex()], &caller(h.banto, h.seat)).await;
         assert!(back.is_ok(), "banto holds other-lane's senpai and the target seat: {}", back.message());
+    }
+
+    /// A root character's console is the top of its lineage, and a judge
+    /// shadow answers to its coder: `kj senpai set` moves neither, even for
+    /// the lineage root.
+    #[tokio::test]
+    async fn senpai_set_refuses_a_root_console_and_a_judge_shadow() {
+        let d = test_dispatcher().await;
+        let h = house(&d);
+        let refused = d.dispatch(&[s("senpai"), s("set"), h.root.to_hex(), h.seat.to_hex()], &caller(h.amy, h.root)).await;
+        assert!(!refused.is_ok(), "a root console has no senpai");
+        assert!(refused.message().contains("root console"), "{}", refused.message());
+        assert_eq!(d.kernel_db().lock().senpai_of(h.root).unwrap(), None);
+
+        d.kernel_db().lock().update_context_type(h.other, "judge").unwrap();
+        let refused = d.dispatch(&[s("senpai"), s("set"), h.other.to_hex(), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
+        assert!(!refused.is_ok(), "a judge shadow stays under its coder");
+        assert!(refused.message().contains("judge shadow"), "{}", refused.message());
+        assert_eq!(d.kernel_db().lock().senpai_of(h.other).unwrap(), Some(h.seat));
     }
 
     /// `kj senpai set` refuses the kohai itself and a sibling (the rule), a

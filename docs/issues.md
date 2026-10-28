@@ -25,17 +25,8 @@ TUI entries below). Open:
   (a reassigned context drops a queued turn) has no test.
 - A kaibo review of the landed branch (2026-10-28, `deepseek` cast, read of
   the files, no test run) found guards that `docs/senpai-kohai.md` promises
-  and the code lacks. Each needs a test that fails first:
-  - A root console can be forked, archived (leaving `characters.root_ctx` on
-    an archived context) and moved under a senpai (`kj/fork.rs`,
-    `kj/context.rs` `context_archive`, `kj/senpai.rs` `move_kohai`).
-    `kj senpai set` also refuses neither a root console nor a judge shadow.
-  - `Start { performer: root, senpai: None }` and `set_context_senpai(ctx,
-    None)` can make a live top that is not a `root_ctx`; only the migration
-    enforces "no senpai means root console".
-  - `kj kohai create` applies the placing rule only to an explicit
-    `--senpai`; the default senpai (the caller's context) skips it, and
-    `kj context switch` has no authority check.
+  and the code lacked. The root-console, no-senpai and default-senpai guards
+  have shipped. Still open, each needing a test that fails first:
   - The root exemption in `insert_new_context_rows` is load-bearing for
     rotating a root console, so narrow it to "the performer's `root_ctx`"
     rather than removing it, and delete the design line that calls the check

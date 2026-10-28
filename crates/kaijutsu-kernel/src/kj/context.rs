@@ -332,8 +332,13 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
         Ok(())
     };
     let performer = match placement {
-        CharacterPlacement::Start { performer, .. } => {
+        CharacterPlacement::Start { performer, senpai } => {
             live_character(performer)?;
+            if senpai.is_none() {
+                return Err(KernelDbError::Validation(
+                    "a new context answers to a senpai: only a root console has none, and `kj character create` makes it".into(),
+                ));
+            }
             Some(performer)
         }
         CharacterPlacement::Rotate { predecessor } => {
@@ -1369,7 +1374,17 @@ impl KjDispatcher {
                 )),
                 Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
             }
-            if via_flag {
+            // By default, anyone may start a kohai in a root's own console
+            // (the gate's ask to the root is the control there), and a
+            // context's own rc lifecycle may start one under itself, as it
+            // may archive its own kohai. Every other context, and any
+            // explicit --senpai, follows the placing rule.
+            let in_rc_lifecycle = caller.privileged && caller.rc_depth > 0;
+            let exempt = !via_flag && (in_rc_lifecycle || match db.is_root_console(context) {
+                Ok(root_console) => root_console,
+                Err(e) => return KjResult::Err(format!("kj kohai create: {e}")),
+            });
+            if !exempt {
                 match db.may_place_under(context, caller.actor_id) {
                     Ok(Ok(_)) => {}
                     Ok(Err(refusal)) => return KjResult::Err(format!("kj kohai create: {refusal}")),
@@ -2103,6 +2118,14 @@ impl KjDispatcher {
             };
             (target_id, label)
         };
+        match self.kernel_db().lock().is_root_console(target_id) {
+            Ok(false) => {}
+            Ok(true) => return KjResult::Err(format!(
+                "kj context archive: {target_label} is a root console, and archiving it would leave its \
+                 character with none; `kj context rotate {target_label}` replaces it"
+            )),
+            Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+        }
         // A nested archive from an rc lifecycle (a coder's archive bucket
         // retiring its judge shadows) is checked with the seat — the
         // context whose lifecycle runs — as the actor, not whoever started
@@ -4396,11 +4419,80 @@ mod tests {
             origin_host: None,
             played_by: None,
         };
-        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
+        let top = register_context(&d, Some("held-by-performer"), None, amy);
+        d.kernel_db().lock().assign_stand_in_character(top, performer).unwrap();
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: Some(top) }).unwrap_err();
         assert!(error.to_string().contains("nobody reviews") && error.to_string().contains("reviewer-changed-after-validation"), "{error}");
         let db = d.kernel_db().lock();
         assert!(db.get_context(context_id).unwrap().is_none());
         assert!(!db.list_documents().unwrap().iter().any(|doc| doc.document_id == context_id));
+    }
+
+    /// Archiving a root console would leave `root_ctx` on an archived
+    /// context; rotation is the only way out of one.
+    #[tokio::test]
+    async fn a_root_console_is_not_archived() {
+        let d = test_dispatcher().await;
+        let root = register_root_context(&d);
+        let amy = d.kernel_db().lock().context_character(root).unwrap().unwrap().principal_id;
+        let caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, context_id: Some(root), confirmed: true, ..test_caller() };
+        let refused = d.dispatch(&[s("context"), s("archive"), root.to_hex()], &caller).await;
+        assert!(!refused.is_ok(), "a root console was archived");
+        assert!(refused.message().contains("root console") && refused.message().contains("kj context rotate"), "{}", refused.message());
+        assert!(!d.kernel_db().lock().get_context(root).unwrap().unwrap().is_archived());
+    }
+
+    /// A context with no senpai is its character's root console, which
+    /// `kj character create` makes. A kohai start with no senpai refuses, and
+    /// so does clearing the senpai of a context that is not a root console.
+    #[tokio::test]
+    async fn only_a_root_console_has_no_senpai() {
+        let d = test_dispatcher().await;
+        let performer = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: performer, name: s("topless"), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let root = register_root_context(&d);
+        let lane = register_context(&d, Some("topless-lane"), Some(root), test_reviewer_principal());
+        d.kernel_db().lock().update_played_by(lane, Some(performer)).unwrap();
+        d.kernel_db().lock().set_context_senpai(lane, Some(root)).unwrap();
+        let error = d.kernel_db().lock().set_context_senpai(lane, None).unwrap_err();
+        assert!(error.to_string().contains("root console"), "{error}");
+        assert_eq!(d.kernel_db().lock().senpai_of(lane).unwrap(), Some(root), "nothing was written");
+
+        let context_id = ContextId::new();
+        let row = crate::kernel_db::ContextRow {
+            context_id, label: Some(s("topless-start")), system_prompt: None, context_state: ContextState::Live,
+            context_type: s("default"), created_at: 1, created_by: test_reviewer_principal(), forked_from: None,
+            fork_kind: None, archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
+            last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None, origin_host: None, played_by: None,
+        };
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
+        assert!(error.to_string().contains("root console"), "{error}");
+        assert!(d.kernel_db().lock().get_context(context_id).unwrap().is_none(), "nothing was inserted");
+    }
+
+    /// The default senpai, the caller's own context, follows the placing
+    /// rule as `--senpai` does: a character that neither plays that context,
+    /// holds its senpai, nor is its lineage root cannot start a kohai under it.
+    #[tokio::test]
+    async fn kohai_create_under_a_context_the_caller_cannot_place_under_is_refused() {
+        let d = test_dispatcher().await;
+        let [owner, visitor, performer] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
+        for (principal_id, name) in [(owner, "owner-x"), (visitor, "visitor-x"), (performer, "performer-x")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+        d.kernel_db().lock().seed_test_cast_roles(performer, &[("default", "mock", "mock-model")]).unwrap();
+        let root = register_root_context(&d);
+        let seat = register_context(&d, Some("owner-seat"), Some(root), test_reviewer_principal());
+        d.kernel_db().lock().update_played_by(seat, Some(owner)).unwrap();
+        d.kernel_db().lock().set_context_senpai(seat, Some(root)).unwrap();
+        let visiting = crate::kj::KjCaller { principal_id: visitor, actor_id: visitor, context_id: Some(seat), privileged: true, ..test_caller() };
+        let refused = d.dispatch(&[s("kohai"), s("create"), s("visited"), s("--as"), s("performer-x")], &visiting).await;
+        assert!(!refused.is_ok(), "a visitor placed a kohai under the owner's context");
+        assert!(d.kernel_db().lock().find_context_by_label("visited").unwrap().is_none(), "nothing was written");
     }
 
     /// A context's character is the instance's character, so `--as` is
@@ -4867,8 +4959,6 @@ mod tests {
             .dispatch(&[s("context"), s("archive"), s("ROOT-old")], &c)
             .await;
         assert!(result.is_ok(), "archive failed: {}", result.message());
-
-        let c = caller_with_context(parent);
 
         crate::kj::test_helpers::give_character(&d, &c);
         let result = d

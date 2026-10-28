@@ -367,6 +367,18 @@ impl KjDispatcher {
             return denied;
         }
 
+        if let Some(source) = caller.context_id {
+            match self.kernel_db().lock().is_root_console(source) {
+                Ok(false) => {}
+                Ok(true) => return KjResult::Err(
+                    "kj fork: a root console is not forked, since the fork would be a second context its \
+                     character performs; `kj context rotate` starts it fresh"
+                        .to_string(),
+                ),
+                Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+            }
+        }
+
         if args.compact {
             return self.fork_compact(&args, caller).await;
         }
@@ -2163,6 +2175,23 @@ mod tests {
         );
         assert_eq!(db.senpai_of(child).unwrap(), Some(source), "and answers to the context it forked from");
         assert_eq!(db.senpai_of(source).unwrap(), Some(top), "the source keeps its own senpai");
+    }
+
+    /// A root character's console is not forked: the fork would be a second
+    /// context the root performs. The refusal points to rotate, and nothing is
+    /// written.
+    #[tokio::test]
+    async fn a_root_console_is_not_forked() {
+        let d = test_dispatcher().await;
+        let root = register_root_context(&d);
+        d.block_store().create_document(root, crate::DocumentKind::Conversation, None).unwrap();
+        let before = d.kernel_db().lock().list_all_contexts().unwrap().len();
+        for argv in [vec![s("fork"), s("--name"), s("root-fork")], vec![s("fork"), s("--compact"), s("--name"), s("root-compact")]] {
+            let result = d.dispatch(&argv, &caller_with_context(root)).await;
+            assert!(!result.is_ok(), "{argv:?} forked a root console");
+            assert!(result.message().contains("root console") && result.message().contains("kj context rotate"), "{}", result.message());
+        }
+        assert_eq!(d.kernel_db().lock().list_all_contexts().unwrap().len(), before, "nothing was written");
     }
 
     #[tokio::test]

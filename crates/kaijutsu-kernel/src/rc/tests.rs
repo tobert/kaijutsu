@@ -308,10 +308,11 @@
     /// the trusted control plane would.
 fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
-        // A person at a console is a live character, which `kj kohai create` needs.
+        // A person at a console is a live root character, which `kj kohai
+        // create` needs and whose console anyone may create under.
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
         let console = register_context(d, None, None, principal_id);
         d.kernel_db().lock().update_played_by(console, Some(principal_id)).unwrap();
