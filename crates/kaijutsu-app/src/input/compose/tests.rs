@@ -135,24 +135,20 @@ fn a_colon_line_comes_back_raw() {
     assert_eq!(buffer.text(), "draft");
 }
 
-/// Esc leaves insert mode; a second Esc in normal mode changes nothing, on
-/// either surface, and the vi keys after it act on the text.
+/// Esc Esc in normal mode dismisses; `Esc x Esc` does not, and neither does
+/// a lone Esc out of insert mode.
 #[test]
-fn a_second_escape_in_normal_mode_does_nothing() {
+fn a_double_escape_in_normal_mode_dismisses() {
     let mut state = ComposeState::default();
     ready(&mut state, "hi");
     state.chat.press(Submit::FromNormalMode, press(KeyCode::Char('a')));
-    state.press_chat(press(KeyCode::Esc));
-    assert!(state.chat.in_normal_mode(), "the first Esc leaves insert mode");
-    let second = state.press_chat(press(KeyCode::Esc)).unwrap();
-    assert_eq!(second, ComposeAction::default(), "a second Esc asks for nothing");
-    state.press_chat(press(KeyCode::Char('x')));
-    assert_eq!(state.chat.text(), "h", "`x` deletes under the cursor");
+    let first = state.press_chat(press(KeyCode::Esc)).unwrap();
+    assert!(!first.dismiss, "the first Esc leaves insert mode");
+    assert!(state.press_chat(press(KeyCode::Esc)).unwrap().dismiss);
 
-    state.shell = ComposeBuffer::prefilled("kj context rename ");
-    state.press_shell(press(KeyCode::Esc));
-    assert_eq!(state.press_shell(press(KeyCode::Esc)), ComposeAction::default());
-    assert_eq!(state.shell.text(), "kj context rename ");
+    state.press_chat(press(KeyCode::Esc));
+    state.press_chat(press(KeyCode::Char('l')));
+    assert!(!state.press_chat(press(KeyCode::Esc)).unwrap().dismiss, "Esc l Esc is no gesture");
 }
 
 /// A surface opens in insert mode when empty and in normal mode when it
@@ -258,6 +254,17 @@ fn a_second_load_drops_the_keys_held_for_the_first() {
     let held = state.finish_load(b, second.read, Some("b's draft")).expect("the newest read");
     assert!(held.is_empty(), "nothing typed for a reaches b: {held:?}");
     assert_eq!(state.chat.text(), "b's draft");
+}
+
+/// The double-Esc is one surface's gesture: an Esc on chat, a surface
+/// change, and an Esc on the shell is no dismiss.
+#[test]
+fn a_surface_change_breaks_the_double_escape() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "hi");
+    assert!(!state.press_chat(press(KeyCode::Esc)).unwrap().dismiss);
+    state.reset_escape();
+    assert!(!state.press_shell(press(KeyCode::Esc)).dismiss, "the shell's first Esc");
 }
 
 /// The tui's routing (`kaijutsu-tui`'s `cmdline::parse`): a line whose

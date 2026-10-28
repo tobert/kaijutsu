@@ -251,17 +251,15 @@ fn a_small_in_place_edit_redraws_the_overlay() {
     assert_eq!(h.overlay().vim_mode, None, "back in normal mode");
 }
 
-/// A second Esc in normal mode is vi's no-op: compose keeps the keyboard,
-/// fires nothing, and `dd` after it still clears the draft.
+/// Esc Esc in normal mode leaves compose: `PopLevel`, once.
 #[test]
-fn a_double_escape_stays_in_compose() {
+fn a_double_escape_fires_one_pop_level() {
     let mut h = Harness::new("");
     h.load();
     h.keys("ihi<Esc><Esc>");
-    assert_eq!(h.pops(), 0, "Esc Esc fired PopLevel");
-    assert_eq!(h.focus(), FocusArea::Compose);
-    h.keys("dd");
-    assert_eq!(h.overlay().text, "");
+    let actions = h.app.world().resource::<Messages<ActionFired>>();
+    let pops = actions.iter_current_update_messages().filter(|a| a.action == Action::PopLevel).count();
+    assert_eq!(pops, 1);
 }
 
 /// Keys outside the compose grab are not compose's, now or later.
@@ -487,6 +485,17 @@ fn an_edit_lost_before_a_failed_send_is_counted_and_shown() {
     h.keys("b");
     assert_eq!(h.compose().edits_in_flight(), 0, "both edits counted as landed");
     assert!(h.errors().iter().any(|e| e.contains("writer stopped")), "{:?}", h.errors());
+}
+
+/// The double-Esc is broken by a bypass key.
+#[test]
+fn a_bypass_key_breaks_the_double_escape() {
+    let mut h = Harness::new("hi");
+    h.load();
+    h.keys("<Esc>");
+    h.ctrl(KeyCode::KeyC, 'c');
+    h.keys("<Esc>");
+    assert_eq!(h.pops(), 0, "Esc, Ctrl+C, Esc");
 }
 
 /// Ctrl+Z in compose asks for the root/shell context toggle. The chat draft

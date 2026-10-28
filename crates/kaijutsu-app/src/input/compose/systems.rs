@@ -40,7 +40,7 @@ pub struct ComposeIo<'w, 's> {
     scroll: ResMut<'w, ConversationScrollState>,
     errors: ResMut<'w, GlobalErrorQueue>,
     time: Res<'w, Time>,
-    /// Actions a keystroke fires (the Ctrl bypasses), written
+    /// Actions a keystroke fires (`PopLevel`, the Ctrl bypasses), written
     /// by [`compose_dispatch_keys`]. The handlers that also take this
     /// parameter read `ActionFired`, so it cannot hold the writer itself.
     fired: Local<'s, Vec<Action>>,
@@ -92,6 +92,9 @@ impl ComposeIo<'_, '_> {
                 ActiveSurface::Chat => self.submit_chat(),
                 ActiveSurface::Shell => self.submit_shell(),
             }
+        }
+        if action.dismiss {
+            self.fired.push(Action::PopLevel);
         }
     }
 
@@ -352,6 +355,7 @@ pub fn compose_dispatch_keys(
             _ => None,
         };
         if let Some(action) = bypass {
+            io.compose.reset_escape();
             io.fired.push(action);
             continue;
         }
@@ -431,14 +435,14 @@ pub fn handle_focus_compose(mut actions: MessageReader<ActionFired>, mut io: Com
         }
         *io.focus = FocusArea::Compose;
         *io.surface = ActiveSurface::Chat;
+        io.compose.reset_escape();
         let ops = io.compose.chat.settle_for_focus();
         io.send_chat_ops(&ops);
     }
 }
 
-/// `PopLevel` while composing (the gamepad's East button; Esc in compose
-/// belongs to vi): back to the conversation in normal mode, and from the
-/// shell surface back to chat as the default.
+/// `PopLevel` while composing: back to the conversation in normal mode, and
+/// from the shell surface back to chat as the default.
 pub fn handle_pop_level(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {
     for ActionFired { action, .. } in actions.read() {
         if !matches!(action, Action::PopLevel) || !matches!(*io.focus, FocusArea::Compose) {
@@ -457,7 +461,7 @@ pub fn handle_pop_level(mut actions: MessageReader<ActionFired>, mut io: Compose
 
 /// The prefilled-`kj` prompt (`docs/input.md`, "The prefix table"): open the
 /// shell surface with a command typed up to its argument, in insert mode at
-/// the end. Enter runs it.
+/// the end. Enter runs it; Esc Esc abandons it.
 pub fn handle_prompt_prefill(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {
     for ActionFired { action, .. } in actions.read() {
         let prefill = match action {
@@ -468,6 +472,7 @@ pub fn handle_prompt_prefill(mut actions: MessageReader<ActionFired>, mut io: Co
         };
         *io.surface = ActiveSurface::Shell;
         *io.focus = FocusArea::Compose;
+        io.compose.reset_escape();
         io.compose.shell = ComposeBuffer::prefilled(prefill);
     }
 }

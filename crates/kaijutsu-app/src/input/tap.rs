@@ -6,7 +6,8 @@
 //! Semantics: `press()` returns the running count, restarting at 1 when the
 //! previous press fell outside the window and **saturating at `max`** — it
 //! never self-resets; the caller decides when a count consumes the gesture
-//! and calls `reset()`. That caller-owned reset is load-bearing: the
+//! and calls `reset()`. That caller-owned reset is load-bearing: the escape
+//! dismiss stays armed at 2 until vim is actually in Normal mode, and the
 //! interrupt ladder holds at 3 while the user mashes.
 
 use std::time::Instant;

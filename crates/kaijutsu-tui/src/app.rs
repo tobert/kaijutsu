@@ -22,7 +22,7 @@ use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 
 /// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
-/// `Ctrl+A Ctrl+A`.
+/// `Ctrl+A Ctrl+A` (`docs/input.md`, the app's `Esc Esc` pattern).
 pub const DOUBLE_TAP: Duration = Duration::from_millis(500);
 
 /// Where one context's transcript view sits over its blocks.
