@@ -96,12 +96,11 @@ and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
 and the `lineage_root` refusal wording. Still open:
 
 Behavior:
-- **4.2b** Three RPCs still skip their `kj` verb: `archiveContext` (the
-  app well's `a`, and kaijutsu-acp; no latch, no archive rc, no authority
-  check, documented as deliberately unlatched), `conclude` (the well's `c`;
-  skips the lineage authority check), and `setContextPaused` (the well's
-  `z`). `demoteContext` and `promoteContext` are gone (Amy: "drop that rpc
-  for demote"). The TUI's `Ctrl+A q` is still a "not built yet" notice.
+- **4.2b** The TUI's `Ctrl+A q` is still a "not built yet" notice; the app
+  runs `kj context demote`. A root character cast as a model performer
+  carries the human root's placement privilege into that model's `kj`
+  calls (`require_placement_authority`, `kj/context.rs`), because the
+  kernel has no marker for human input.
 - **2.3** `approval_resume` runs approved commands inline in its one task,
   so a long command stalls ask delivery for every context. M.
 - **2.6** The submit-rc race, `interrupt.hard()` on a persistence failure,
@@ -166,6 +165,10 @@ Clarity:
   (the `operator` capability gate refuses `kj context rotate`) and
   `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` (a vi
   document-cache miss).
+- Two more fail only inside the Claude Code sandbox, at `f29dd492` and
+  later alike: `ctrl_z_suspends_and_sigcont_resumes_a_responsive_client`
+  and `the_kitty_keyboard_is_taken_with_the_screen_and_given_back`. The
+  client process never stops there. Outside the sandbox is unchecked.
 
 ## `SshServerConfig::unlisted` has no production entry point (2026-10-27)
 
