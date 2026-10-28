@@ -204,7 +204,8 @@ enum ContextCommand {
     /// Replace a context with a fresh successor (default: current). The
     /// successor is created from the same parent and copies the type, cast,
     /// performer, director, reviewer override, model, system prompt,
-    /// workspace, env, and cwd, then runs the `create` rc lifecycle.
+    /// workspace, env, egress hosts, and cwd, then runs the `create` rc
+    /// lifecycle.
     /// `ROTATED_FROM` names the predecessor by id. When the successor has a
     /// loadout, it takes the label, the ring seat, and any character's
     /// `root_ctx` pointer, and the predecessor is archived after its
@@ -2424,7 +2425,8 @@ impl KjDispatcher {
     /// `kj context rotate [<ctx>]` — replace a context with a successor that
     /// carries its configuration (`docs/character.md`, "Roots and rotation").
     ///
-    /// The successor row, env, and cwd land in one transaction, unlabeled.
+    /// The successor row, env, egress hosts, and cwd land in one
+    /// transaction, unlabeled.
     /// The `create` rc lifecycle runs next and cannot share a transaction.
     /// Only a successor with a usable loadout takes over: one more
     /// transaction archives the predecessor and moves its label, ring seat,
@@ -2506,6 +2508,7 @@ impl KjDispatcher {
             let inserted = db.in_transaction(|db| {
                 insert_new_context_rows(db, &successor, parent)?;
                 db.copy_context_env(predecessor.context_id, successor_id)?;
+                db.copy_context_egress(predecessor.context_id, successor_id)?;
                 db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
                 if let Some(shell) = db.get_context_shell(predecessor.context_id)? {
                     db.upsert_context_shell(&ContextShellRow {
@@ -3911,6 +3914,7 @@ mod tests {
         db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
         db.set_context_env(seat, "ROTATED_FROM", "an-older-seat").unwrap();
+        db.add_context_egress(seat, "api.example.com").unwrap();
         db.upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(s("/tmp/seat")), updated_at: 1 }).unwrap();
         db.promote_context(seat).unwrap();
         drop(db);
@@ -3926,7 +3930,8 @@ mod tests {
     }
 
     /// `kj context rotate` replaces a seat with a successor that carries its
-    /// whole configuration, takes its label, ring seat, and character
+    /// whole configuration (env, shell, and egress hosts included), takes
+    /// its label, ring seat, and character
     /// pointer, names the predecessor in `ROTATED_FROM`, and archives it.
     async fn rotate_carries_the_seat_to_its_successor_body() {
         let f = rotation_fixture().await;
@@ -3957,6 +3962,7 @@ mod tests {
         assert_eq!(env.get("SEAT_VAR").map(String::as_str), Some("kept"));
         assert_eq!(env.get("ROTATED_FROM"), Some(&f.seat.to_hex()), "names the predecessor it replaced, by id");
         assert_eq!(db.get_context_shell(successor).unwrap().and_then(|shell| shell.cwd).as_deref(), Some("/tmp/seat"));
+        assert_eq!(db.list_context_egress(successor).unwrap(), [s("api.example.com")], "egress hosts carry over");
         assert_eq!(db.get_character(f.banto).unwrap().unwrap().root_ctx, Some(successor), "the pointer moves");
         assert_eq!(db.get_character(f.amy).unwrap().unwrap().root_ctx, Some(f.root), "other pointers stay");
         drop(db);

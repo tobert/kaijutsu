@@ -299,7 +299,7 @@ may read the archived seat's blocks.
 
 `kj context rotate` creates a successor from the predecessor's own parent. It
 copies the type, cast, performer, director, reviewer override, model, system
-prompt, workspace, env, and cwd, sets `ROTATED_FROM` to the
+prompt, workspace, env, egress hosts, and cwd, sets `ROTATED_FROM` to the
 predecessor's id, and runs the `create` lifecycle. The hydration window is not
 copied; a musician's create lifecycle sets its own. When the successor has a
 usable loadout, the predecessor's `archive` lifecycle runs, then one
