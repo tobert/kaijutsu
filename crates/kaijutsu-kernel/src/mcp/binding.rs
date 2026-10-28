@@ -169,7 +169,7 @@ pub enum Capability {
     /// and `kj attach`. Operator authority over the durable structure, kept
     /// distinct from `Admin` (which is narrowly loadout-write).
     Operator,
-    /// Gates the SQL-native model surfaces — `kj backend`/`kj cast`/`kj
+    /// Gates the SQL-native model surfaces — `kj backend`/`kj character slot`/`kj
     /// alias` set/create/remove verbs — plus `kj hook add/remove` and `kj mcp
     /// reload`. Dedicated so a broad loadout (e.g. `coder` with "*") can't
     /// silently rewrite which model runs. Does **not** gate `/config/kernel`
@@ -225,7 +225,7 @@ pub enum Capability {
     /// back. See `docs/system-verbs.md`.
     System,
     /// The kaijutsu administration verbs: `kj ledger`, `rc`, `binding`,
-    /// `cast`, `backend`, `config`, `transport`, and the rest of the table
+    /// `character`, `backend`, `config`, `transport`, and the rest of the table
     /// in `kj/house.rs`. A worker seat (coder, toolie, musician) does not
     /// need them, so its loadout omits this grant and the verbs are
     /// refused and left out of `kj help`.

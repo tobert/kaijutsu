@@ -20,7 +20,7 @@
 //! the reseed tool Amy asked to keep.
 //!
 //! Model configuration is **not** here. It is SQL-native — `kj backend`,
-//! `kj cast`, `kj alias` over `kernel_db` tables — and `models.toml` was
+//! `kj character slot`, `kj alias` over `kernel_db` tables — and `models.toml` was
 //! demolished along with its config document. The write-time provider-type check
 //! this module used to carry moved with it: the closed set now lives in
 //! `BackendKind`, enforced by `kj backend set` and a SQL CHECK.
@@ -35,7 +35,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "Read or reset files under /config/kernel and /config/client. Edit them with the file tools or `kj vi`. For model configuration, see `kj backend`, `kj cast`, and `kj alias`.",
+    about = "Read or reset files under /config/kernel and /config/client. Edit them with the file tools or `kj vi`. For model configuration, see `kj backend`, `kj character slot`, and `kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]

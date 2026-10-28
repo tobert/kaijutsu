@@ -531,8 +531,7 @@ impl App {
         match block.role {
             Role::User => self.identity.clone(),
             Role::Model => info
-                .and_then(|c| c.cast_label.clone())
-                .or_else(|| info.map(|c| model_leaf(&c.model).to_string()))
+                .map(|c| model_leaf(&c.model).to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "model".to_string()),
             Role::System => "system".to_string(),
@@ -920,7 +919,6 @@ mod tests {
             background_last_finished_at: None,
             background_last_finished_status: None,
             background_last_exit_code: None,
-            cast_label: None,
             origin_host: None,
             cwd: None,
             last_call_at: None,

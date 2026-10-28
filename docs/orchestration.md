@@ -179,12 +179,12 @@ invoke moves action between peers.
 ### 5. Cheap-then-expensive
 
 A common shape: a cheap model compresses, the instance's own model continues.
-Give the cast a `distill` slot on the cheap model and a slot for the context
-type on the expensive one:
+Give the character a `distill` slot on the cheap model and a slot for the
+context type on the expensive one:
 
 ```bash
-kj cast slot set house distill --backend anthropic --model claude-haiku-4-5-20251001
-kj cast slot set house coder   --backend anthropic --model claude-opus-4
+kj character slot set coder distill --backend anthropic --model claude-haiku-4-5-20251001
+kj character slot set coder coder   --backend anthropic --model claude-opus-4
 kj fork --name big-task --compact
 ```
 

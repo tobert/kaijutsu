@@ -473,12 +473,6 @@ pub struct ContextInfo {
     /// when nothing has finished (-1 sentinel on the wire — real exit
     /// codes, including the `128 + signal` convention, are never negative).
     pub background_last_exit_code: Option<i32>,
-    /// The named model ensemble this context plays under (Track D,
-    /// 2026-08-03), resolved kernel-side from `ContextRow::cast_id` — the
-    /// wire ships the label, never a bare id. `None` when uncast (empty on
-    /// the wire), same falls-through-to-registry-default semantics as an
-    /// absent `provider`/`model` override.
-    pub cast_label: Option<String>,
     /// Advisory hostname the registering client self-reported at creation
     /// (`ContextRow::origin_host`), or `None` when unknown (old client, a
     /// creation path with nothing to report, or a pre-migration row). Set
@@ -3534,15 +3528,8 @@ fn parse_context_info(
 
     // Empty = uncast (Track D) — same "absence is the wire sentinel"
     // convention as `context_type`/`track_id` above.
-    let cast_label_str = reader.get_cast_label()?.to_str().unwrap_or("");
-    let cast_label = if cast_label_str.is_empty() {
-        None
-    } else {
-        Some(cast_label_str.to_string())
-    };
-
     // Empty = unknown (old client, no client to ask, or pre-migration row) —
-    // same "absence is the wire sentinel" convention as `cast_label` above.
+    // the "absence is the wire sentinel" convention.
     let origin_host_str = reader.get_origin_host()?.to_str().unwrap_or("");
     let origin_host = if origin_host_str.is_empty() {
         None
@@ -3551,7 +3538,7 @@ fn parse_context_info(
     };
 
     // Empty = no durable cwd recorded yet — same "absence is the wire
-    // sentinel" convention as `cast_label`/`origin_host` above.
+    // sentinel" convention as `origin_host` above.
     let cwd_str = reader.get_cwd()?.to_str().unwrap_or("");
     let cwd = if cwd_str.is_empty() {
         None
@@ -3612,7 +3599,6 @@ fn parse_context_info(
         background_last_finished_at,
         background_last_finished_status,
         background_last_exit_code,
-        cast_label,
         origin_host,
         cwd,
         last_call_at,

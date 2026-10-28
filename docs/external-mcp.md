@@ -132,7 +132,7 @@ The same `ToolChanged` notice follows a server's own `list_changed`.
 `list` is a read, ungated. `reload` and `restart` materialize `mcp.toml` as running
 processes — spawning and killing subprocesses, not a file edit — so it's
 gated on `Capability::ConfigWrite`, the same authority that gates `kj config
-reset` and the other administrative config verbs (`kj backend`, `kj cast`,
+reset` and the other administrative config verbs (`kj backend`, `kj character slot`,
 `kj alias`), rather than a bespoke capability. Editing `mcp.toml` itself —
 with the file tools, `kj vi`, or vim — carries no capability gate: config
 is an ordinary write surface (`docs/config-namespace.md`).

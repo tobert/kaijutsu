@@ -621,11 +621,10 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   PreCall has no database and sees no edge: the pre_call hooks still run, then the gate allows. The
   decision reads `gate policy: senpai edge allows kj drift push to <ctx>, its senpai` (or `its kohai`, or
   `kj senpai report to <ctx>`).
-- **The gate's model comes from its own cast** (step 7). Today the `gate` slot of a seat's cast names the
-  council server and served model that decide its gate (`docs/council.md`, "Configuration"). The reserved
-  `gate` role leaves `cast_slots`, and the gate gets a cast of its own, as kaibo's config does.
-  To be decided in step 7: the config shape (a key in `gate.toml` or a separate cast), and whether one gate
-  cast serves every seat or one is chosen per `[context_type.<type>]`.
+- **The gate's own model setup** (step 7). Today the `gate` slot of a character names the council server and
+  served model that decide its gate (`docs/council.md`, "Configuration"). The plan is for the gate to get a
+  setup of its own, as kaibo's config does. To be decided in step 7: the config shape (a key in `gate.toml`
+  or a separate setup), and whether one serves every seat or one is chosen per `[context_type.<type>]`.
 - **The director tier** (`[context_type.director]` above) is keyed by the context type, which step 6 reworks
   or replaces. The tier's contents (allow `kj context create`, `kj fork`, `kj drive`) do not change.
   To be decided in step 6: the new type name; the section is renamed with it, and a section naming no live

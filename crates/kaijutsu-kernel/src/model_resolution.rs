@@ -3,7 +3,7 @@
 //!
 //! A model call in context K runs on the `context_slots` row for K's context
 //! type. A context with no context character, or one with no slot for the
-//! type, has no model. No cast, `backend_models` row or registry default
+//! type, has no model. No character slot, `backend_models` row or registry default
 //! stands in.
 
 use kaijutsu_types::ContextId;
@@ -17,17 +17,17 @@ use crate::llm::SlotTunables;
 /// chat model from them, and no context may have one as its type.
 pub const RESERVED_ROLES: &[&str] = &[crate::council::gate::GATE, crate::council::shadow::JUDGE, DISTILL];
 
-/// The cast slot role a fork's distillation runs on.
+/// The slot role a fork's distillation runs on.
 pub const DISTILL: &str = "distill";
 
-/// Refuses `context_type` when it names a reserved cast role.
+/// Refuses `context_type` when it names a reserved slot role.
 pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
     if !RESERVED_ROLES.contains(&context_type) {
         return Ok(());
     }
     Err(format!(
-        "'{context_type}' is a cast role, not a context type: a cast's `{context_type}` slot configures \
-         a council or distillation model for the contexts that characters of the cast play; choose another --type"
+        "'{context_type}' is a slot role, not a context type: a character's `{context_type}` slot configures \
+         a council or distillation model for the contexts it plays; choose another --type"
     ))
 }
 
@@ -99,7 +99,7 @@ impl NoModel {
                 self.context
             ),
             NoModelReason::NoSlot => format!(
-                "{} {what}: character {character} has no {} slot. Fix: give the character a {} slot in its cast, \
+                "{} {what}: character {character} has no {} slot. Fix: give the character a {} slot with `kj character slot set`, \
                  then `kj context rotate`",
                 self.context, self.role, self.role
             ),

@@ -36,7 +36,7 @@ use crate::kj::gate_policy::GateConfigLoad;
 
 use super::gate::SlotServer;
 
-/// The context_type, and the cast slot role, of a judge shadow.
+/// The context_type, and the slot role, of a judge shadow.
 pub(crate) const JUDGE: &str = "judge";
 
 /// The most bytes of a call's input a shadow turn keeps; the rest is cut
@@ -91,7 +91,7 @@ struct Judge {
 
 /// Appends the call `spec` describes to the judge shadow of `seat`, creating
 /// the shadow on the seat's first call, and primes a council-server judge.
-/// `None` when the seat has no judge slot in its cast, or when writing
+/// `None` when the seat has no judge slot, or when writing
 /// failed (logged).
 pub(crate) async fn record_call(
     kernel: &Arc<crate::Kernel>,
@@ -255,7 +255,7 @@ async fn judge_one(
     };
     let server = match &read.server {
         Ok(slot) => slot.clone(),
-        Err(why) => return miss(judged, format!("the seat's cast slot `{JUDGE}` names {why}")),
+        Err(why) => return miss(judged, format!("the seat's slot `{JUDGE}` names {why}")),
     };
     let Some(spec) = spec else {
         return miss(judged, "gate.toml declares no council shell spec for the seat's type".into());

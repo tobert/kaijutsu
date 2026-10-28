@@ -1296,9 +1296,8 @@ struct ContextHandleInfo {
                                                  # (real exit codes, incl. 128+signal, are never negative — see
                                                  # background_exec.rs's exit_code_from_status)
 
-  # The label of the cast the context's binding was written from, resolved
-  # kernel-side. Empty = the binding has no cast, or the context belongs to no
-  # character instance (see `kaijutsu-kernel`'s `model_resolution` module).
+  # UNUSED — always empty; do not repurpose. A context's model comes from its
+  # own slots, and no cast exists to name.
   castLabel @28 :Text;
 
   # Advisory hostname the registering client self-reported (`gethostname` on
@@ -2145,7 +2144,7 @@ interface Kernel {
   prompt @20 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
 
   # A turn's model comes from its context's character instance binding alone
-  # (`kj cast`, `kj character set --cast`, `kj context rotate`); there is no
+  # (`kj character slot set`, `kj context rotate`); there is no
   # default provider or model, and no per-context model assignment.
   retired21 @21 ();
 

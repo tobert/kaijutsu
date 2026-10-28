@@ -70,7 +70,7 @@ pub(crate) const VERDICT: &str = "verdict";
 /// The question that reads whether a statement can be taken back. It is
 /// recorded and shown in a bump; it never decides.
 pub(crate) const UNDO: &str = "undo";
-/// The cast slot role that names the council server a seat's gate decisions
+/// The slot role that names the council server a seat's gate decisions
 /// run on. It is not a context type, so no context resolves its own model
 /// from it.
 pub(crate) const GATE: &str = "gate";
@@ -1407,7 +1407,7 @@ fn other_word(outcome: &Outcome) -> &'static str {
 /// Ask the council once about `submission` and return its verdict. Every
 /// failure is a verdict too: a miss with its cause, including a cause
 /// found before any server is asked (`chain`: a reviewer chain that could
-/// not be walked, or a cast slot that names no council server). With `[council] house_rules` on, the
+/// not be walked, or a slot that names no council server). With `[council] house_rules` on, the
 /// decision also reads the house rules of the caller's workspace. Runs with no database
 /// lock held; `deadline_ms` bounds preparing the server and the decision
 /// call together.
@@ -1731,7 +1731,7 @@ pub(crate) fn seat_slot_backend(
     Ok(Some((backend, bound.slot.model)))
 }
 
-/// A council server a cast slot names, and the served model the slot names
+/// A council server a slot names, and the served model the slot names
 /// on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SlotServer {

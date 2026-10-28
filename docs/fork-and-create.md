@@ -13,7 +13,7 @@ Two verbs mint context rows, and each means one thing.
   what `--compact`, `--include`, `--exclude`, and `--preset` are for:
   rotation, KV reuse, a windowed continuation.
 - **`kj context create` begins a new performance.** It takes `--type`, a
-  character `--as`, `--cast`, `--cwd`, `--env`, `--parent` and `--senpai`, and
+  character `--as`, `--cwd`, `--env`, `--parent` and `--senpai`, and
   carries no history. Without `--cwd` it starts in the current context's cwd,
   as fork does; a current cwd that no longer resolves refuses the create and
   names `--cwd`. A lane gets its brief from the prompt it is driven with. This

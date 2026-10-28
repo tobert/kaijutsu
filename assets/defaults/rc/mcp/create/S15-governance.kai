@@ -13,7 +13,7 @@
 # be able to swap which model runs by accident. Granting it here is the
 # explicit, intentional opt-in for the producer voice.
 set -e
-kj binding allow "config-write"  # kj backend/cast/alias (which model runs),
+kj binding allow "config-write"  # kj backend/character slot/alias (which model runs),
                                  # kj hook add/remove, kj mcp reload
 kj binding allow "system"        # kj system ps/status, and the stopping verbs
 

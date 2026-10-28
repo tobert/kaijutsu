@@ -8592,7 +8592,7 @@ mod lifetime_tests {
         let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
         assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
         assert!(errors[0].contains("runs no model"), "{errors:?}");
-        assert!(errors[0].contains("slot in its cast") && errors[0].contains("kj context rotate"),
+        assert!(errors[0].contains("kj character slot set") && errors[0].contains("kj context rotate"),
             "the error's summary says how to give the character a model: {errors:?}");
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
@@ -8722,7 +8722,7 @@ mod lifetime_tests {
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("performer"), "names the character: {error}");
         assert!(error.contains("has no default slot"), "names the type: {error}");
-        assert!(error.contains("slot in its cast") && error.contains("kj context rotate"), "names the fix: {error}");
+        assert!(error.contains("kj character slot set") && error.contains("kj context rotate"), "names the fix: {error}");
         assert!(kernel.kernel_db().lock().list_turns(successor, 5).unwrap().is_empty(), "no turn was recorded");
     }
 

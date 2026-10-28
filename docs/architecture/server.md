@@ -125,8 +125,8 @@ calls use the same owner without transcript pairs or operation receipts.
 The kernel owns the stream loop, conversation sessions, and interrupt state.
 Server RPC uses `spawn_llm_for_prompt`; headless callers use
 `Kernel::request_turn`. Both converge on shared startup, which resolves
-provider/model (explicit parameter > context override > cast slot > registry
-default), builds tools through the broker, assembles instructions and runtime
+the context's own slot for its type (no explicit parameter, override or
+registry default), builds tools through the broker, assembles instructions and runtime
 facts, and admits `process_llm_stream` to the kernel worker. Each accepted turn
 owns a lease for its liveness and interrupt registration, including queue time.
 The worker owns cancellation, cleanup, and joining during shutdown. Headless

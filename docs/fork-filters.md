@@ -162,16 +162,10 @@ This **extends the existing preset concept** (cast / system_prompt)
 rather than adding a parallel one: today's presets are
 patches that only move the model knobs; `window` is a patch that only
 moves filter knobs; a future `player` patch moves both (spawn-shaped
-filter + a cast) in one recall.
+filter + a model) in one recall.
 
-Track D (2026-08-03, cast-on-context renovation) narrowed the model knob a
-preset moves: a preset no longer pins a provider/model pair directly — it
-references a **cast** (`PresetRow::cast_id`), and the cast's own slots
-carry the provider/model/tunables per role. "Cast = who plays; preset =
-patch recall over verb args." `kj preset save <label> --cast <cast-label>`
-replaces the old `--model p/m`; `kj fork --preset <label>` still recalls
-it, assigning the cast to the child (an explicit `--model` at fork time
-still wins — it's an orthogonal column).
+A preset names no model: it holds fork filters only (`kj preset save` takes no
+`--cast` or `--system-prompt`). A context's model comes from its own slots.
 
 - **Factory presets** ship embedded, names reserved (same pattern as
   the `assets/defaults/rc` seed tree):

@@ -12,7 +12,7 @@ kj binding allow "builtin.kernel_info"
 kj binding allow "builtin.bindings"
 # Binding administration: may write any context's loadout.
 kj binding allow "admin"
-# `kj backend`, `kj cast`, `kj alias`, `kj hook`, and `kj mcp reload`.
+# `kj backend`, `kj character slot`, `kj alias`, `kj hook`, and `kj mcp reload`.
 kj binding allow "config-write"
 # Context and workspace lifecycle, and the verbs that move work between
 # contexts. The root has no `drive`: it refuses every autonomous turn that
@@ -23,7 +23,7 @@ kj binding allow "drift"
 kj binding allow "transport"
 # See and stop the running kernel.
 kj binding allow "system"
-# The kj administration verbs (ledger, rc, binding, cast, config, ...).
+# The kj administration verbs (ledger, rc, binding, config, ...).
 kj binding allow "house"
 # Host subprocesses from the context shell.
 kj binding allow "exec"

@@ -3094,7 +3094,7 @@ mod tests {
     }
 
     /// A caller whose binding has no `distill` slot cannot pull: the refusal
-    /// names the cast and the fix, lands before any mutation, and no
+    /// names the character and the fix, lands before any mutation, and no
     /// registered provider stands in.
     ///
     /// Falsified by a pull that falls back to the source's or a default model.

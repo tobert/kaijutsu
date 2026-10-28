@@ -52,12 +52,12 @@ result is missing:
    a model it does not know, the report names the model and this verb.
 3. `kj character create root`, the model character that plays `ROOT`
    (`--console-as` names another).
-4. `kj cast create house`, with a `console` and a `distill` slot on the first
-   provider's model, and `kj character set root --cast house` when the
-   character has no cast. A cast the character already has is left alone.
+4. `kj character slot set root console` and `kj character slot set root
+   distill` on the first provider's model, for each slot the character does
+   not already hold. A slot the character has is left alone.
 5. `kj context create ROOT --type console --as root`, a kohai of the root
-   character's own context. When ROOT exists but lacks a slot its cast now
-   fills, bootstrap runs `kj context rotate ROOT`. When ROOT is played by
+   character's own context. When ROOT exists but lacks a slot its character now
+   holds, bootstrap runs `kj context rotate ROOT`. When ROOT is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.
 

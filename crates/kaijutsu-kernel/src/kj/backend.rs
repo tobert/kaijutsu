@@ -92,7 +92,7 @@ enum BackendCommand {
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
     },
-    /// Remove a backend. Refused while a cast slot, a context's slot, or an
+    /// Remove a backend. Refused while a character slot, a context's slot, or an
     /// alias still names it.
     #[command(alias = "rm")]
     Remove {
@@ -107,7 +107,7 @@ enum BackendCommand {
 #[derive(Subcommand, Debug)]
 enum BackendModelCommand {
     /// Pin one model's metadata and tunables on a backend. Only the flags you
-    /// pass change. A cast slot's own value wins; a tunable the slot leaves
+    /// pass change. A character slot's own value wins; a tunable the slot leaves
     /// unset is read from here when a context character's slots are
     /// written, so a change reaches contexts after `kj context rotate`.
     Set {
@@ -231,9 +231,9 @@ fn model_summary(m: &BackendModelRow) -> String {
 /// How to configure a backend, for a kernel that has none. A kernel ships no
 /// backends; README.md, "Quick Start" has more examples.
 pub(crate) const NO_BACKEND_HINT: &str = "No LLM backend is configured: add one with \
-     `kj backend set`, then give a cast a slot on it with `kj cast slot set`. For example, \
+     `kj backend set`, then give a character a slot on it with `kj character slot set`. For example, \
      `kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY`, then \
-     `kj cast slot set house coder --backend deepseek --model deepseek-flash --max-tokens 65536`.";
+     `kj character slot set coder coder --backend deepseek --model deepseek-flash --max-tokens 65536`.";
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_backend(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -736,14 +736,14 @@ mod tests {
     }
 
     /// A kernel ships no backends, so the empty list says how to configure
-    /// one and how to give a cast a slot on it.
+    /// one and how to give a character a slot on it.
     #[tokio::test]
     async fn a_kernel_with_no_backends_says_how_to_configure_one() {
         let d = test_dispatcher().await;
         let c = test_caller();
         let list = d.dispatch(&argv(&["backend", "list"]), &c).await;
         assert!(list.is_ok(), "{}", list.message());
-        for verb in ["kj backend set", "kj cast slot set"] {
+        for verb in ["kj backend set", "kj character slot set"] {
             assert!(list.message().contains(verb), "{}", list.message());
         }
         assert!(!list.message().contains("default"), "no default backend is advertised: {}", list.message());

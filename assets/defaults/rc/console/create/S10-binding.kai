@@ -1,5 +1,5 @@
 # console: the model console under a root character's context. The console is
-# a model context, cast with a fast model, and its stance (S00-stance) names
+# a model context, given a fast model, and its stance (S00-stance) names
 # its privileged position. Its kj requests go through approval, and it has no
 # `drive`: no seat clocks an autonomous turn on it. Its shell child is a
 # `shell` context under it, reached with Ctrl-Z.
@@ -14,7 +14,7 @@ kj binding allow "builtin.kernel_info"
 kj binding allow "builtin.bindings"
 # Binding administration: may write any context's loadout.
 kj binding allow "admin"
-# `kj backend`, `kj cast`, `kj alias`, `kj hook`, and `kj mcp reload`.
+# `kj backend`, `kj character slot`, `kj alias`, `kj hook`, and `kj mcp reload`.
 kj binding allow "config-write"
 # Context and workspace lifecycle, and the verbs that move work between
 # contexts. The root has no `drive`: it refuses every autonomous turn that
@@ -25,7 +25,7 @@ kj binding allow "drift"
 kj binding allow "transport"
 # See and stop the running kernel.
 kj binding allow "system"
-# The kj administration verbs (ledger, rc, binding, cast, config, ...).
+# The kj administration verbs (ledger, rc, binding, config, ...).
 kj binding allow "house"
 # Host subprocesses from the context shell.
 kj binding allow "exec"

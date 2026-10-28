@@ -4189,8 +4189,10 @@ impl KernelDb {
         if let Some(parent) = path.as_ref().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
         Self::init_connection(&conn)?;
+        Self::back_up_before_character_slots(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
         Self::migrate_ledger(&conn)?;
@@ -4200,6 +4202,39 @@ impl KernelDb {
             #[cfg(any(test, feature = "test-util"))]
             _temp_dir: None,
         })
+    }
+
+    /// Where a database still on casts is copied before `character-slots-v1`
+    /// drops them: `kernel.db.pre-character-slots`, beside the database.
+    fn pre_character_slots_backup_path(path: &Path) -> std::path::PathBuf {
+        let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".pre-character-slots");
+        path.with_file_name(name)
+    }
+
+    /// Copy a database that still has its casts aside before the migration
+    /// that drops them runs. The copy is a consistent snapshot
+    /// (`VACUUM INTO`). A copy that already exists is the state before an
+    /// earlier attempt and stays as it is. When the copy cannot be made the
+    /// open fails and says why, and nothing is migrated.
+    fn back_up_before_character_slots(conn: &Connection, path: &Path) -> KernelDbResult<()> {
+        if !Self::has_table(conn, "casts")? {
+            return Ok(());
+        }
+        let backup = Self::pre_character_slots_backup_path(path);
+        if backup.exists() {
+            info!(backup = %backup.display(), "a pre-character-slots backup already exists; keeping it");
+            return Ok(());
+        }
+        conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()]).map_err(|e| {
+            KernelDbError::Validation(format!(
+                "the casts become character slots on this open, and the copy of the database at {} could not be made: {e}; \
+                 free the space or the path and start again",
+                backup.display()
+            ))
+        })?;
+        info!(backup = %backup.display(), "copied the database aside before the casts become character slots");
+        Ok(())
     }
 
     /// Open an existing `kernel.db` as a genuine read-only SQLite connection:
@@ -10516,6 +10551,50 @@ mod tests {
             ).unwrap();
         }
         cast_id
+    }
+
+    /// A database still on casts is copied aside before they move, and the
+    /// copy holds the casts. A database already on character slots makes no
+    /// copy.
+    #[test]
+    fn a_database_on_casts_is_copied_aside_before_it_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        drop(KernelDb::open(&path).unwrap());
+        assert!(!KernelDb::pre_character_slots_backup_path(&path).exists(), "a database on the new shape makes no backup");
+        {
+            let conn = Connection::open(&path).unwrap();
+            KernelDb::ensure_legacy_cast_tables(&conn).unwrap();
+            conn.execute("ALTER TABLE characters ADD COLUMN cast_id BLOB", []).unwrap();
+            conn.execute(
+                "INSERT INTO casts (cast_id, label, created_by) VALUES (?1, 'house', ?2)",
+                params![CastId::new().as_bytes().to_vec(), blob_param(PrincipalId::system().as_bytes())],
+            ).unwrap();
+        }
+
+        let db = KernelDb::open(&path).unwrap();
+
+        assert!(!KernelDb::has_table(&db.conn, "casts").unwrap(), "the casts were dropped");
+        let backup = KernelDb::pre_character_slots_backup_path(&path);
+        let copy = Connection::open(&backup).unwrap();
+        let labels: Vec<String> = copy.prepare("SELECT label FROM casts").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<SqliteResult<_>>().unwrap();
+        assert_eq!(labels, vec!["house"], "the copy holds what the migration dropped");
+    }
+
+    /// A copy that cannot be made refuses with the reason, and a database
+    /// that has no casts is not copied at all.
+    #[test]
+    fn a_failed_backup_refuses_naming_the_path() {
+        let db = KernelDb::temporary().unwrap();
+        KernelDb::ensure_legacy_cast_tables(&db.conn).unwrap();
+        let unwritable = Path::new("/nonexistent-kernel-db-directory/kernel.db");
+        let error = KernelDb::back_up_before_character_slots(&db.conn, unwritable).unwrap_err().to_string();
+        assert!(error.contains("kernel.db.pre-character-slots") && error.contains("could not be made"), "{error}");
+
+        KernelDb::migrate_character_slots(&db.conn).unwrap();
+        KernelDb::back_up_before_character_slots(&db.conn, unwritable)
+            .expect("a database with no casts needs no copy, so an unwritable path is not consulted");
     }
 
     /// Each character gets a copy of the slots of the cast it names; a

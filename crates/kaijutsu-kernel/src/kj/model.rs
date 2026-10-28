@@ -2,7 +2,7 @@
 //!
 //! A read-only verb, no capability gate (discovery is not escalation). It
 //! enumerates the configured providers, each provider's known models, and the
-//! friendly aliases — the specs you can hand to `kj cast slot set --model`.
+//! friendly aliases — the specs you can hand to `kj character slot set --model`.
 //! The structured `.data` is an array of those specs (alias names +
 //! fully-qualified `provider/model`) so `for m in $(kj models)` iterates usable
 //! handles, per the kj list-data convention. A context's model is not here:

@@ -2,8 +2,7 @@
 
 > Design + rollout plan, 2026-09-05, revised 2026-10-18 for senpai/kohai.
 > **Slices 0a–4 are built; slices 5–8 remain planned.**
-> The review-routing, persona and cast parts describe the system once
-> `docs/senpai-kohai.md` lands (steps 1-7 of that branch).
+> The review-routing, persona and slot parts follow `docs/senpai-kohai.md`.
 > Amy's statements are guidance, not rulings.
 
 ## Current implementation
@@ -18,27 +17,27 @@ an instruction to use nonexistent features.
 | Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give `ROOT` a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
 | Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Character instance | One run of one character (`docs/senpai-kohai.md`). `kj context create <label> --as <character> --type <t>` needs the Operator capability and a live character caller, requires `--as`, refuses an unknown, retired or root character and one that would review itself, and preserves the requester's `created_by`. It writes binding `seq` 1 from the character's cast. A fork joins its source's instance and binding; a rotation appends the next binding. The performer of a context is its instance's character, which never changes; to put another character on the work, start an instance of it |
-| Client creation | There is no create RPC. A client runs `kj context create --as <character>` through `executeKj` from an existing context, whose instance becomes the new instance's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses |
-| Senpai edge | Every working instance answers to one senpai instance (`character_instances.senpai_instance`); the senpai's character reviews the instance's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
-| Model | Every model call reads the instance's binding for its context's type: `instance_slots` copies the cast slot and fills unset parameters from `backend_models` when the binding is written. No default stands in; a binding with no slot for the type gives no model, and a turn refuses naming the fix. The judge, the gate and distillation use the binding's `judge`, `gate` and `distill` slots |
+| Context character | One character in one context (`docs/senpai-kohai.md`). `kj context create <label> --as <character> --type <t>` needs the Operator capability and a live character caller, requires `--as`, refuses an unknown or retired character and one that would review itself, and preserves the requester's `created_by`. It writes the context character with slots copied from the character's own. A fork continues its source's performance; a rotation writes a successor with the same character and fresh slots. The performer of a context is its context character's character, which never changes; to put another character on the work, start a context of it |
+| Client creation | There is no create RPC. A client runs `kj context create --as <character>` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses |
+| Senpai edge | Every working context answers to one senpai context (`context_characters.senpai_ctx`); the senpai's character reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
+| Model | A character holds slots (`character_slots`), set with `kj character slot set\|unset\|list`. A context copies them into `context_slots` when it is made, filling unset parameters from `backend_models`. Every model call reads the context's own slot for its type. No default stands in; a context with no slot for its type gives no model, and a turn refuses naming the fix. The judge, the gate and distillation use the context's `judge`, `gate` and `distill` slots |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation at a root context. See `docs/approval-identity.md` |
 | Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts whose senpai that character holds. See `docs/approval-identity.md`, "Standing rules for a character" |
-| Retirement | Concludes and archives the live contexts of the character's instances, judge shadows included; existing block authors stay unchanged. A retired senpai character refuses reviewer resolution below it, by name |
+| Retirement | Concludes and archives the live contexts the character plays, judge shadows included; existing block authors stay unchanged. A retired senpai character refuses reviewer resolution below it, by name |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer and the senpai from context metadata |
-| Rotation | `kj context rotate [<context>]` creates a successor in the same instance on the next binding, read fresh from the character's cast, copying env and cwd, setting `ROTATED_FROM` to the predecessor's id, and running `create` rc. Only a successor with a loadout takes over: the predecessor's `archive` rc runs, then one transaction archives the predecessor and moves its label and ring position. The kohai and the senpai point at the instance, so they do not move. Rotating a handoff log points `handoff_ctx` at the successor. The performer, the senpai's character, or the lineage root may rotate. See `docs/prompts.md`, "Rotating a context" |
-| Accountability | The senpai edge, not `forked_from`. `forked_from` is provenance only; a fork stays in its source's instance. The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
+| Rotation | `kj context rotate [<context>]` creates a successor with the same character and the predecessor's senpai, slots read fresh from the character's own, copying env and cwd, setting `ROTATED_FROM` to the predecessor's id, and running `create` rc. Only a successor with a loadout takes over: the predecessor's `archive` rc runs, then one transaction archives the predecessor and moves its label and ring position. The kohai point at the context, so they do not move. Rotating a handoff log points `handoff_ctx` at the successor. The performer, the senpai's character, or the lineage root may rotate. See `docs/prompts.md`, "Rotating a context" |
+| Accountability | The senpai edge, not `forked_from`. `forked_from` is provenance only. The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
 
-Sources: `kernel_db.rs::CharacterRow`, `kernel_db/instances.rs`, `model_resolution.rs`, `kj/context.rs`, `kj/character.rs`, `kj/handoff.rs`,
+Sources: `kernel_db.rs::CharacterRow`, `kernel_db/context_characters.rs`, `model_resolution.rs`, `kj/context.rs`, `kj/character.rs`, `kj/handoff.rs`,
 `rc/mod.rs::load_scripts` in `crates/kaijutsu-kernel/src/`;
 `crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
 `assets/defaults/rc/director/create/S00-stance.kai` and
 `assets/defaults/rc/lib/create/S16-handoff.kai`.
 
 Banto is a character that plays the `director` context type. It does not need a new
-type to have its own identity and handoff. Its instance is created with
+type to have its own identity and handoff. Its context is created with
 `kj context create <label> --type director --as banto`; director instructions read
 the performer from context metadata.
 
@@ -58,12 +57,11 @@ a performer never changes credentials or rewrites existing asks and block author
   its persona file (`S00-stance`) moves to the character that plays it.
   To be decided in step 6: how the sheet stores the persona (a column, or a context or directory the sheet points
   at, as the "pointers, not content" rule below prefers) and the new name of the `director` type.
-- **No cast on the context** (step 5, built). A context's model is the slot for its type in its instance's
-  binding, copied from the character's cast when the binding was written. To run another model, start an instance
-  of a character whose cast has it, or change the cast and rotate. Each turn row names its instance and binding
-  `seq`, so the model of any past turn is traceable.
-- **The gate has its own cast** (step 7). The reserved `gate` role leaves `cast_slots`; today it is a slot of the
-  character's cast, copied into the binding like the others.
+- **No cast.** Built. A character holds its own slots, and a context copies them when it is made, so a context's
+  model is the slot for its type in its own `context_slots`. To run another model, start a context of a character
+  whose slots have it, or change the character's slot and rotate.
+- **The gate has its own setup** (step 7). Today `gate` is a slot of the character, copied into the context like
+  the others.
 
 ## The problem, in one paragraph
 
@@ -109,16 +107,12 @@ Two things follow, and they are the ones to check a change against:
   Opaque UUIDv7 id in records and `.data`; given name in the UI and as the
   drift address. The word fits the cast vocabulary kaijutsu already uses: a
   character is what an actor is cast *as*, and a context is one performance.
-- **A character has a cast.** Built: `kj character set <name> --cast <cast>`
-  (`--no-cast` clears it), shown by `kj character show`. A context's model
-  comes from its performer's cast slot for the context's type (the slot is
-  named by the type string), copied into the instance's binding when the
-  binding is written. One cast covers every type a character plays, since a
-  cast holds one slot per role; a `judge` slot gives the contexts it plays a
-  judge shadow (`docs/council.md`, "Shadow context"), a `gate` slot names the
-  council server its gate decisions run on (`docs/council.md`,
-  "Configuration"), and a `distill` slot runs its forks' and pulls'
-  distillation.
+- **A character has slots.** Built: `kj character slot set <name> <role> --backend B --model M` (`unset` removes
+  one, `list` shows them, `kj character show` prints them). A context's model comes from its own slot for the
+  context's type (the slot is named by the type string), copied from its performer's when the context is made. A
+  character holds one slot per role; a `judge` slot gives the contexts it plays a judge shadow
+  (`docs/council.md`, "Shadow context"), a `gate` slot names the council server its gate decisions run on
+  (`docs/council.md`, "Configuration"), and a `distill` slot runs its forks' and pulls' distillation.
 - **Accountability replaces any group concept.** Every model character
   answers to a character above it; a human is a root. No party. The relation is
   between character instances, not between sheets: see "Roots and rotation".
@@ -142,10 +136,10 @@ Two things follow, and they are the ones to check a change against:
 ## Roots and rotation (guidance, Amy, 2026-09-15; senpai edge 2026-10-18)
 
 - **Accountability is a relation between performances, not between
-  sheets.** A character instance answers to its **senpai**, another
-  instance (`character_instances.senpai_instance`); the senpai's character
+  sheets.** A context answers to its **senpai**, another context
+  (`context_characters.senpai_ctx`); the senpai's character
   reviews its work. A coder lane banto creates answers to that banto
-  instance, not to "banto" in general, and two bantos never collide. There is no
+  context, not to "banto" in general, and two bantos never collide. There is no
   `accountable_to` on the character sheet; Amy: "accountable_to is a
   relation at runtime, so if banto forks a coder, that coder is accountable
   to the precise banto that forked it, not any banto."
@@ -241,29 +235,29 @@ Two things follow, and they are the ones to check a change against:
   the drive capability on any target, including the caller's own context,
   and the performer or lineage root rotates.
 - **Rotation replaces a conversation, not a character.** Amy, 2026-09-17,
-  and step 5 of `docs/senpai-kohai.md`: the successor is a new conversation
-  in the same instance, on the instance's next binding, read fresh from the
-  character's cast. It copies env and cwd, sets `ROTATED_FROM`, and takes the
-  label and ring position as the predecessor archives. The kohai and the
-  senpai point at the instance, so they do not move. A root rotates too,
+  and step 5 of `docs/senpai-kohai.md`: the successor is a new context
+  with the same character and senpai, its slots read fresh from the
+  character's own. It copies env and cwd, sets `ROTATED_FROM`, and takes the
+  label and ring position as the predecessor archives. The kohai
+  point at the context, so they do not move. A root rotates too,
   when its history goes stale; a root confirms itself, so no one else is
   asked. The performer, the senpai's character, or the lineage root may
   rotate.
-- **banto starts from `ROOT`.** Its instance is created from the root
-  console, so its senpai is Amy's console. Its conversation takes the
-  character's name as its label. `ROOT` is Amy's, banto's conversation is
+- **banto starts from `ROOT`.** Its context is created from the root
+  console, so its senpai is Amy's console. It takes the
+  character's name as its label. `ROOT` is Amy's, banto's context is
   `banto`.
 - **The reviewer is the senpai's character, climbing past the actor.**
   Resolution takes the actor and the context: the character of the context's
-  instance's senpai, or, when that character is the actor, the character of
+  senpai, or, when that character is the actor, the character of
   the senpai's senpai, and so on. A root console self-confirms. There is no configured
   default and no override. See `docs/approval-identity.md`, "Routing".
-- **A character instance's character never changes.** The senpai's
-  character, or the lineage root, starts another instance of the character that
+- **A context's character never changes.** The senpai's
+  character, or the lineage root, starts another context of the character that
   should do the work (`kj context create --as`). Roots cannot be cast, since
   they have no model.
 - **A model rotates itself with `kj context rotate`.** Amy, 2026-09-17:
-  the performer may rotate its own conversation, so no ask is needed.
+  the performer may rotate its own context, so no ask is needed.
   `kj context create --as` follows the same shape: Operator and a live
   character caller, with no ask.
 
@@ -344,7 +338,6 @@ CREATE TABLE IF NOT EXISTS characters (
     retired_at       INTEGER,                     -- characters retire; never deleted
     -- arrive with later slices:
     root             INTEGER NOT NULL DEFAULT 0, -- no model; see "Roots and rotation"
-    cast_id          BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     rc_dir           TEXT,                        -- default /config/rc/character/<name>
     handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
@@ -598,8 +591,8 @@ inert one would deadlock the whole tree beneath it.
 label is the character's name, the character plays it, and it has no parent.
 The `root` rc bundle grants the operator authority (`admin`, `config-write`,
 `operator`, `exec`, the shell facades) and composes no instruction blocks.
-Instances a root starts, such as banto's, are created from it, so their
-senpai is the root console's instance.
+Contexts a root starts, such as banto's, are created from it, so their
+senpai is the root console.
 
 **Roots are equal, and one is typical.** A second person joins through a
 root: `kj character create bob --root` creates bob and bob's root context,

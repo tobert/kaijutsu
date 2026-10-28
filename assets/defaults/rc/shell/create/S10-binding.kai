@@ -1,6 +1,6 @@
 # shell: a REPL beside a root. A person types a command here and the kernel
-# runs it as shell; no model performs this context, so the bundle grants no
-# cast and composes no instruction blocks. The root opens it with Ctrl-Z.
+# runs it as shell; no model performs this context, so the bundle gives it no
+# slots and composes no instruction blocks. The root opens it with Ctrl-Z.
 set -e
 # The shell facades. `shell_write` is the hot shell (ExternalExec::Allow, with
 # `exec` below for host programs); `shell` is the read-only one it falls back

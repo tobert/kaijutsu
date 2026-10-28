@@ -201,12 +201,12 @@ its own work; a model turn refuses to start when its performer would review itse
 ## Creating, forking, rotating
 
 - `kj context create <label> --as <character> --type <t> [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
-  [--env K=V]... [--model <backend>/<model>] [--max-tokens N] [--effort E]` makes a context and its context
+  [--env K=V]...` makes a context and its context
   character. `--as` is required. The senpai is the caller's context, or `--senpai <ctx>` under "Placing under a
   senpai". `--parent` sets `forked_from` only. The slots
-  are copied from the character. `--model`, `--max-tokens` and `--effort` replace the slot for `<t>` in the copy
-  and are the only create options; unset parameters of a `--model` override are filled from that model's
-  `backend_models` row. It needs the Operator capability and a live character caller.
+  are copied from the character, with unset parameters filled from each model's `backend_models` row. There is no
+  per-create model option: to run another model, start a context of a character whose slot has it (Amy,
+  2026-10-28: a kohai has regular slots). It needs the Operator capability and a live character caller.
 - `kj fork`: the child gets a copy of the forking context's context character, slots included, with the forking
   context as its senpai. Asks from a fork climb past its performer to the forking context's senpai (Routing,
   rule 4). A root console cannot be forked.
@@ -520,9 +520,9 @@ Choices made where the design was silent, the smaller shape each time.
 - **Archiving a holderless top**: a parentless system context with no holder has no senpai and no lineage root, so
   `kj context archive` refuses it for everyone. Nothing in the shipped rc or bootstrap archives one.
 - **The old columns** are on `contexts` (`contexts.reviewer_id`, `contexts.director_id`), not on `characters`.
-- **`kj context create` flags**: it keeps `kj context create`'s whole flag set (`--name`, `-m/--model`,
-  `--system-prompt`, an optional `--type` defaulting to `default`) minus `--top`, plus `--senpai`. The spec's
-  synopsis lists fewer; step 5 removes the per-context model.
+- **`kj context create` flags** (named `kj context create` while the verb was a relationship word, Amy,
+  2026-10-28): `--name`, `--type` defaulting to `default`, `--parent`, `--senpai`, `--cwd`, `--cwd-optional`,
+  `--env` and the rest of the create config, with `--as` required and no per-create model.
 - **`kj senpai set`** also needs the caller to hold the new senpai or be its lineage root, the same rule as
   `--senpai` at create, and the operator capability, as other changes to an existing context do. It refuses an
   archived senpai. A successful set clears the migration report row, so `kj senpai show` stops printing the note.

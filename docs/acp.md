@@ -166,9 +166,8 @@ moment `clientInfo` arrives, replayed on reconnect like every other actor
 peer.
 
 Client identity is ergonomic routing and presence, not a security boundary.
-A session's context runs the model its performer's character instance binding
-gives its type; the client's identity chooses none (there is no per-client
-cast file, and no `kj context set --cast`).
+A session's context runs the model its performer's slot gives its type; the
+client's identity chooses none (there is no per-client model file).
 
 ### Rich prompt content
 

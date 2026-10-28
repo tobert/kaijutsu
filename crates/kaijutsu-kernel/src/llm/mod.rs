@@ -99,7 +99,7 @@ pub struct MockClient {
     script_dir: Option<std::path::PathBuf>,
     /// Per-model turn queues loaded from `script_dir` — one `<model>.json`
     /// file's parsed content per model whose file was found there. `stream()`
-    /// keys into this by `BuildOpts::model`, the model the caller's cast slot
+    /// keys into this by `BuildOpts::model`, the model the caller's slot
     /// resolved to, so a director's and a coder's scripts never collide even
     /// though both run through the same Mock backend. `None` means no
     /// directory was loaded (`KJ_MOCK_SCRIPT_DIR` unset); `Some` with a model
@@ -1331,7 +1331,7 @@ impl ProviderStream {
 ///
 /// A **snapshot** of the DB config, not a view onto it: the whole thing is
 /// rebuilt from `kernel_db` and swapped in behind the kernel's
-/// `RwLock<LlmRegistry>` whenever a `kj backend`/`kj cast`/`kj alias` write
+/// `RwLock<LlmRegistry>` whenever a `kj backend`/`kj character slot`/`kj alias` write
 /// lands (see `db_config::build_llm_registry` and
 /// `KjDispatcher::reload_llm_registry`). Reads stay lock-cheap on the hot turn
 /// path, and config changes take effect without a kernel restart.

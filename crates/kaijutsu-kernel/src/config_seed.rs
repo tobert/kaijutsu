@@ -15,7 +15,7 @@
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.toml");
 
 // NOTE: there is deliberately no `models.toml` here. Model configuration is
-// SQL-native — `backends` / `backend_models` / `casts` / `cast_slots` /
+// SQL-native — `backends` / `backend_models` / `character_slots` /
 // `model_aliases` / `llm_defaults` / `embedding_config` in `kernel_db.rs` —
 // and a kernel ships none of it: an operator configures backends with `kj`.
 // The `/config/kernel/models.toml` document and its loader were demolished; do

@@ -22,6 +22,6 @@ kj binding allow "drift"
 kj binding allow "exec"
 kj binding allow "editor"
 # Deliberately NOT granted: house (the kj administration verbs: ledger, rc,
-# binding, cast, config, and the rest), operator, transport, drive, system.
+# binding, config, and the rest), operator, transport, drive, system.
 # A coder works on the task; the kernel's own running is not its work, and
 # every verb it can see costs a turn it may spend studying instead.

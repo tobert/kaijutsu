@@ -45,7 +45,7 @@
 # sections below and enable it per context type. The file refuses to load
 # on an unknown field, a threshold naming no spec, or two thresholds for one
 # spec. The council server is not named here: a context decides on its
-# `gate` slot (`kj cast slot set <cast> gate --backend <mk backend> --model
+# `gate` slot (`kj character slot set <character> gate --backend <mk backend> --model
 # <served model>`, then `kj context rotate`), and a context with no `gate`
 # slot has no council. See docs/council.md, "Configuration".
 #

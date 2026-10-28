@@ -292,8 +292,8 @@ are no server-side context ids, and a seat is sent whole each time.
   background, with the prepare a decision runs, so its first decision
   finds them held: under the shell and program specs, the voting reviewer
   contexts along its performer's chain and its house rules, routed to the
-  server its cast names; each observing reviewer context under
-  `direction-check`; and, with an `mk` judge in its cast, the judge read's
+  server its `gate` slot names; each observing reviewer context under
+  `direction-check`; and, with an `mk` judge slot, the judge read's
   contexts and house rules on the judge's server. The create and fork
   lifecycles of coder, default, and director run it
   (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
@@ -393,11 +393,12 @@ too. not the results. so it's small and makes up the workstream of things
 the model under observation has tried." It starts with `shell_write` and
 grows with the gate.
 
-- **Contexts and casts, not `gate.toml`.** Amy, 2026-10-09: "I want to do
+- **Contexts and slots, not `gate.toml`.** Amy, 2026-10-09: "I want to do
   less in gate.toml over time and move to more configurable and
-  transparent setups with casts and contexts." A shadow needs no
+  transparent setups with casts and contexts." (Casts have since melted into
+  character slots.) A shadow needs no
   `gate.toml` entry: its context_type's rc says what it does, and the
-  seat's cast says which model plays it.
+  seat's slots say which model plays it.
 - **Two types: `judge` and `bump`.** A `judge` gives its opinion of each
   command. A `bump` answers proceed or bump, as bumper mode does today,
   with the seat's history. Each type's rc holds its framing and its
@@ -419,11 +420,11 @@ grows with the gate.
   shadow joins the seat's instance and binding. A binding with a `judge` slot
   gives the seat a judge, pointing at the megakernel, lfm2d, or Jev through
   OpenRouter; a binding with no such slot gives none. "mk bumps", "lfm2d
-  bumps", and "Jev bumps" become casts. A character names its cast
-  (`kj character set coder --cast mk-judge`), and each instance binds that
-  cast's slots when it starts or rotates, so every instance a `coder`
-  character runs gets the judge with nothing to turn on per seat; to give a
-  seat another cast, rotate it after the character's cast changes.
+  bumps", and "Jev bumps" become character slots. A character holds a
+  `judge` slot (`kj character slot set coder judge --backend mk-zorak --model ...`),
+  and each context copies the slots when it is made or rotated, so every
+  context a `coder` character plays gets the judge with nothing to turn on per
+  seat; to give a seat another slot, rotate it after the character's slot changes.
 - **Outward actions only.** Council time is limited on our hardware, so a
   shadow records what the seat does to the world, not what it reads. The
   gate already draws that line: the read-only `shell` tool runs no gate,
@@ -478,7 +479,7 @@ Each step lands with its tests, and its line here changes to say what
 shipped. A fresh session resumes at the first step not marked done.
 
 1. **Done: the judge child and its dialogue,** on the `shell_write` tool
-   path. A seat whose cast has a `judge` slot gets one `judge` fork child
+   path. A seat whose character has a `judge` slot gets one `judge` fork child
    on the first call the gate evaluates; each call is a user turn
    (`shell_write: <command>`, cut at 800 bytes) and the outcome is the
    model turn (`ran`, `asked the reviewer`, `bumped (<flavor>)`,
@@ -770,7 +771,7 @@ does, so the council reads the file too (`council/programs.rs`).
 - **A threshold is fit to one server.** Two servers read the same case
   with different distributions, so a threshold fit on the megakernel's
   decisions says little about lfm2d's. One spec has one threshold today,
-  whichever server a seat's cast chooses; each decision records the
+  whichever server a seat's slot chooses; each decision records the
   server identity it was read under, so a refit can select its own
   server's decisions.
 - **The starting threshold is a guess.** `allow_at = 0.98` with a mass
@@ -821,19 +822,18 @@ enabled = true
 contexts = ["council-amy", "council-banto"]
 ```
 
-`gate.toml` names no council server and no served model. An instance decides on the `gate` slot of its
-binding: `kj cast slot set mk-bumps gate --backend mk-zorak --model gemma-4` sends the gate decisions of every
-instance whose binding was written from cast `mk-bumps` to the served model `gemma-4` on the council server at
-backend `mk-zorak`'s `base_url`. The character names the cast (`kj character set coder --cast mk-bumps`), and
-the binding copies the slot when the instance starts or rotates, so a cast change moves no running instance. An
-instance whose binding has no `gate` slot has no council: its gate decides without one, whatever `gate.toml`
+`gate.toml` names no council server and no served model. A context decides on its own `gate` slot:
+`kj character slot set coder gate --backend mk-zorak --model gemma-4` sends the gate decisions of every
+context `coder` plays, made after the slot was set, to the served model `gemma-4` on the council server at
+backend `mk-zorak`'s `base_url`. A context copies the slot when it is made or rotated, so a slot change moves no
+running context. A context with no `gate` slot has no council: its gate decides without one, whatever `gate.toml`
 enables. A `[council] server` or `[council] model` key is refused as an unknown field. The slot's backend must have
 kind `mk` and a `base_url`; any other backend makes every decision on the submission a miss that names the
 backend, and no other server is asked in its place. The slot's `--model` names the served model; the served
 model's identity is recorded with each decision. The role is `gate`, not `council`, because `council` is a
-context type: a council context playing a cast with a `council` slot would take that slot as its chat model.
+context type: a council context whose character holds a `council` slot would take that slot as its chat model.
 `gate`, `judge` and `distill` are reserved roles: no context resolves its chat model from one, and `kj context
-create` and `kj context set` refuse `--type gate` as a cast role, not a context type. The binding chooses only
+create` and `kj context set` refuse `--type gate` as a slot role, not a context type. The slot chooses only
 the server and its served model; whether a type gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program decisions included, and the
 observing reviewer contexts read after it go to the binding's server, under that server's endpoint concurrency

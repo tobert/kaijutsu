@@ -75,24 +75,26 @@ Its identity is a `PrincipalId`; its sheet lives in `kernel.db` and holds
 static settings: name, root flag, creation/retirement timestamps, its cast,
 and its handoff log. `auth.db` binds credentials to principals; it does not
 own character names. `kj character` manages sheets, and `kj handoff
-note|tail` accesses their logs. Retirement archives the contexts of the
-character's instances.
+note|tail` accesses their logs. Retirement archives the contexts the
+character plays.
 
-A **character instance** is one run of one character: `kj context create
-<label> --as <character> --type <t>` starts it with its conversation, and
-its character never changes. A **binding** copies the character's cast slots
-into the instance when it is written; every model call reads the binding for
-its context's type and nothing else, so editing a cast moves no running
-instance. A fork joins its source's instance and binding; `kj context
-rotate` starts a new conversation on the instance's next binding, read fresh.
-Every working instance answers to one **senpai** instance (`kj senpai
-show`): its asks, reports and escalations go to the senpai's character, and
-the senpai's character or the lineage root moves, rotates and archives it.
+A **context character** is one character in one context: `kj context create
+<label> --as <character> --type <t>` makes the context with it, and its
+character never changes. The character holds **slots**, one per role (a
+context type, or `distill`, `gate`, `judge`), set with `kj character slot
+set`. A context copies its character's slots when it is made; every model
+call reads the context's own slot for its type and nothing else, so editing a
+character's slots moves no running context until `kj context rotate`. A fork
+continues its source's performance; rotation starts a new conversation with
+slots read fresh. Every working context answers to one **senpai** context
+(`kj senpai show`): its asks, reports and escalations go to the senpai's
+character, and the senpai's character or the lineage root moves, rotates and
+archives it.
 
-We keep requester, performer, context type, and cast distinct. `created_by`
-names the requester who created a context; the performer is its instance's
-character. A `context_type` selects the context's rc bundle, gate tier and
-cast slot. Model turns require a live performer and a distinct reviewer.
+We keep requester, performer, and context type distinct. `created_by`
+names the requester who created a context; the performer is the character
+of its context character. A `context_type` selects the context's rc bundle, gate tier and
+slot. Model turns require a live performer and a distinct reviewer.
 Provider output and tools carry the performer; the connection keeps its own
 identity. `forked_from` is provenance only. See `docs/senpai-kohai.md` and
 `docs/approval-identity.md`.

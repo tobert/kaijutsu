@@ -482,7 +482,7 @@ async fn mcp_role_holds_config_governance_body() {
     // The `mcp` context_type is the producer/orchestrator voice (Claude Code
     // over MCP, cheaper than API rates). On top of the shared broad loadout it
     // adds the config governance cap via S15-governance.kai, so it can drive
-    // the SQL-native model surfaces (`kj backend`/`kj cast`/`kj alias`) and
+    // the SQL-native model surfaces (`kj backend`/`kj character slot`/`kj alias`) and
     // `kj hook add/remove`/`kj mcp reload`. `/config/rc` and `/config/kernel`
     // carry no capability of their own — the file:write grant from the
     // shared loadout (S10 → lib) already reaches them, same as any other file.

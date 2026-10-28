@@ -16,7 +16,7 @@ kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
 # config-write opens `kj config reset` (restore a shipped default) over the
 # /config/kernel files (theme.toml, mcp.toml, gate.toml) AND the SQL-native
-# model config surfaces (`kj backend`, `kj cast`, `kj alias`) — i.e. which
+# model config surfaces (`kj backend`, `kj character slot`, `kj alias`) — i.e. which
 # model runs. Dedicated, not implied by the grants above.
 kj binding allow "config-write"
 # kj verb authorities: a director coordinates contexts end-to-end — drives and
@@ -33,7 +33,7 @@ kj binding allow "operator"
 # and a director is the seat that coordinates, so it holds it. A coder or
 # musician does not, and drifts the question instead (docs/system-verbs.md).
 kj binding allow "system"
-# house: the kj administration verbs (ledger, rc, binding, cast, config, ...).
+# house: the kj administration verbs (ledger, rc, binding, config, ...).
 # A director runs the house; worker seats (coder, toolie, musician) do not
 # hold it and do not see these verbs in `kj help`.
 kj binding allow "house"

@@ -8,7 +8,7 @@
 //!
 //! The registry is a **snapshot**, rebuilt and swapped wholesale. The kernel
 //! holds it as `RwLock<LlmRegistry>` (`Kernel::llm()`), so every `kj
-//! backend`/`kj cast`/`kj alias` mutation ends with
+//! backend`/`kj character slot`/`kj alias` mutation ends with
 //! `KjDispatcher::reload_llm_registry()`, which calls [`build_llm_registry`]
 //! and assigns through the write guard. A config change therefore takes effect
 //! on the next turn, with no kernel restart — and readers on the turn path

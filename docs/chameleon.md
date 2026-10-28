@@ -186,8 +186,8 @@ makes an unbounded wait tolerable rather than lost.
 Where a model fits: a seat built like `musician` — narrow loadout, rc-driven,
 no human turn — that reads the tool plan and the classifier's signals and
 *prepares* the ask, writing a clear description and a recommendation. It does
-not decide; a human still answers. A cast slot is keyed by `context_type`, so
-casting that seat is a config line, exactly like casting a chair. Full record
+not decide; a human still answers. A character slot is keyed by `context_type`, so
+giving that seat a model is a config line, exactly like casting a chair. Full record
 and the open pieces: `docs/issues.md`, "The escalation seat: a small model
 that prepares the ask".
 

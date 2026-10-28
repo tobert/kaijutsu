@@ -165,9 +165,9 @@ Rules:
   (`llm::Role::System`) is a `system` message at its point; see
   `docs/conversation-session.md`, "Kernel instructions".
 - An `effort` outside the four tokens above is an error, not a pass-through.
-  The character instance's slot chooses it: the cast slot's value, or the
-  model row's where the slot leaves it unset, copied when the binding is
-  made. So `thinking: false` for routine turns is a model-row or cast
+  The context's slot chooses it: the character slot's value, or the
+  model row's where the slot leaves it unset, copied when the context is
+  made. So `thinking: false` for routine turns is a model-row or character-slot
   setting.
 - The service has no tool-call ids. The adapter makes an id for each call
   (`mk-<turn>-<index>`), matches results to calls by position, and refuses a
@@ -331,7 +331,7 @@ a small trait only when one exists, not a change to the gate.
 
 A maintenance seat on `mk` needs:
 
-- A backend row and a cast row naming the `mk` backend and its model, with
+- A backend row and a character slot naming the `mk` backend and its model, with
   the model row's tunables (`effort none` for routine turns, a `max_tokens`
   sized to the window).
 - A context type and rc bundle for the seat, written as other seats are
@@ -400,7 +400,7 @@ Kernel tests deny host subprocess execution; none of these needs it.
    error events.
 4. Done: the live probes (`llm/mk/probes.rs`, ignored by default). Resend
    stays; tool calls are reliable enough for a seat. See "Probe results".
-5. Add the cast, rc, and seat, and decide liveness.
+5. Add the character slot, rc, and seat, and decide liveness.
 
 ## Probe results
 

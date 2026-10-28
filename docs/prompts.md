@@ -105,7 +105,7 @@ The council type is a chat context for council guidance. Its own stance asks
 the model to think about submitted guidance and acknowledge it in one or two
 sentences. Its loadout grants compose input, capture, and editor access, with
 no model tools. Assign a live performer (whose senpai's holder is a distinct,
-live character) and cast a character with a model before chatting. Finished thinking and replies become council guidance;
+live character) and give the character a slot for its type before chatting. Finished thinking and replies become council guidance;
 see `docs/council.md`, "Council contexts are kaijutsu contexts".
 
 The judge type is a seat's shadow: the kernel creates it, runs its `create`
@@ -333,9 +333,9 @@ the successor.
 
 A context's model is the slot for its type in its instance's binding. A
 successor gets the next binding, so it runs whatever the character's cast
-holds at rotation. To move a running instance to another model, change the
-cast and rotate; to run two models side by side, start a second instance of a
-character whose cast has the other one.
+holds at rotation. To move a running context to another model, change the
+character's slot and rotate; to run two models side by side, start a second
+context of a character whose slot has the other one.
 
 `ROTATED_FROM` names the predecessor. `S17-predecessor.kai` reads
 up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes

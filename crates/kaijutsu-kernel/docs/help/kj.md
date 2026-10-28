@@ -58,8 +58,8 @@ backend         list, show, set, remove, model set|remove —
                 tables, no TOML, no host file to edit): a free-form `name` plus
                 a closed `kind` (anthropic | deepseek | openai | codex-app | mk),
                 and each model's context window and parameters. A new kernel has
-                none: `kj backend set` adds one and `kj cast slot set` gives a
-                cast a model on it. There is no default backend or model.
+                none: `kj backend set` adds one and `kj character slot set` gives a
+                character a model on it. There is no default backend or model.
                 No key material is ever stored — only an env-var name or a
                 file path.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
@@ -75,28 +75,24 @@ block           list, inspect, count, read, render, cat, original, reproject,
                 bytes and re-run its style-span parser
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
-cast            list, show, create, remove, set, slot set|remove — named model
-                ensembles (role → backend/model + parameters); a role is a
-                context_type, or `gate`, `judge` or `distill`; a character's
-                cast is copied into each instance's binding when the instance
-                starts or rotates; `set --desc` edits the description after
-                create ("" clears it to NULL)
 cc              list — roster of live Claude Code sessions on this machine,
                 read from ~/.claude/sessions/*.json (never reads *.key files);
                 send — deliver a message into a live session's inbox, gated
                 behind the approval ledger (`--dry-run` exempt)
-character       create, list, show, retire — the sheet a name resolves to
-                (principal id + given name); create mints a fresh principal
-                and is idempotent on the name; show lists its live instances;
-                retire concludes and archives every live context of its
-                instances
+character       create, list, show, set, slot set|unset|list, retire — the sheet
+                a name resolves to (principal id + given name); create mints a
+                fresh principal and is idempotent on the name; show lists its
+                slots and live contexts; slot sets the model each role runs
+                (a role is a context_type, or `gate`, `judge` or `distill`), and
+                a context copies the slots when it is made or rotated; retire
+                concludes and archives every live context it plays
 config          Read or reset files under /config/kernel and /config/client.
                 Edit them with the file tools or `kj vi`. For model
-                configuration, see `kj backend`, `kj cast`, and `kj alias`.
+                configuration, see `kj backend`, `kj character slot`, and `kj alias`.
 council         build — build this context's council seats (reviewer chain,
                 house rules, judge) in the background ahead of its first
                 gate decision; the create and fork rc lifecycles call it
-context (ctx)   list, info, prompt, current, switch, scratch, rebind,
+context (ctx)   create, list, info, prompt, current, switch, scratch, rebind,
                 set, unset, log, move, rename, rotate, archive, conclude, promote,
                 demote, pause, resume, retag, hydrate — prompt renders
                 a context's system prompt; rebind repairs a context left with
@@ -160,11 +156,6 @@ midi            list, show, send note|cc|pc|sysex, identify, panic — device
                 device (the kernel never touches hardware — a sink resolves
                 the port); identify asks a device what it is and records the
                 answer at /run/midi/<device>
-kohai           create, list — start a character instance, with a new
-                conversation, that answers to this one (--as is required;
-                --senpai, --parent, --type, --cwd, --env), and list an
-                instance's live kohai with character and type; a verb that
-                takes an instance accepts any of its contexts
 models          List configured providers, their models, and aliases
 play            Play a sample now (a host path, or --cas <hash> for an object
                 already in the CAS), or commit it as a clip cell onto a track
@@ -181,10 +172,11 @@ roster          status <text> [--availability], list — the live roster: post
                 your own self-reported status (identity is always the
                 caller's own) or list who's around right now
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
-senpai          show, set, report — the character instance an instance answers
+senpai          show, kohai, set, report — the context a context answers
                 to: show prints the senpai, the lineage root and who reviews
-                the character's asks; set moves an instance under another
-                senpai; report puts text in the senpai's conversation
+                the character's asks; kohai lists the live contexts that answer
+                to a context, with character and type; set moves a context
+                under another senpai; report puts text in the senpai's context
 stage           commit, status, include, exclude — curate a staged (liminal) fork
 swap            list, ack, discard — resolve a file buffer recovered after a
                 kernel restart (docs/file-buffers.md rule 4); read it first at

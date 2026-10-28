@@ -59,8 +59,8 @@ impl From<ContextConfigArgs> for ContextConfig {
 enum ContextCommand {
     /// Make a new context performed by a character, that answers to this
     /// context. Label is positional or `--name`. The new context runs the
-    /// model in the character's cast slot for its type, copied now; the
-    /// output says when the cast has none. Needs the operator capability and
+    /// model in the character's slot for its type, copied now; the
+    /// output says when the character has none. Needs the operator capability and
     /// a live character caller.
     #[command(alias = "new")]
     Create {
@@ -4623,7 +4623,7 @@ mod tests {
         );
     }
 
-    /// `gate` is a cast role, not a context type: creating or setting a
+    /// `gate` is a slot role, not a context type: creating or setting a
     /// context of that type is refused with a message that says so, and no
     /// row changes.
     ///
@@ -4639,7 +4639,7 @@ mod tests {
 
         let created = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("--type"), s("gate"), s("g")], &c).await;
         assert!(!created.is_ok(), "expected error, got: {}", created.message());
-        assert!(created.message().contains("is a cast role, not a context type"), "{}", created.message());
+        assert!(created.message().contains("is a slot role, not a context type"), "{}", created.message());
         assert!(
             !d.kernel_db().lock().list_active_contexts().unwrap().iter().any(|r| r.label.as_deref() == Some("g")),
             "a refused create must not leave a row"
@@ -4647,7 +4647,7 @@ mod tests {
 
         let set = d.dispatch(&[s("context"), s("set"), s("."), s("--type"), s("gate")], &c).await;
         assert!(!set.is_ok(), "expected error, got: {}", set.message());
-        assert!(set.message().contains("is a cast role, not a context type"), "{}", set.message());
+        assert!(set.message().contains("is a slot role, not a context type"), "{}", set.message());
         let row = d.kernel_db().lock().get_context(parent).unwrap().unwrap();
         assert_ne!(row.context_type, "gate", "a refused set changes nothing");
     }
@@ -6473,15 +6473,15 @@ mod tests {
         let list = d.dispatch(&[s("context"), s("list")], &c).await;
         assert!(list.is_ok());
         assert!(list.message().contains("mock/mock-model"), "list: {}", list.message());
-        assert!(!list.message().contains("[cast:"), "no cast label is stored: {}", list.message());
+        assert!(!list.message().contains("[cast:"), "no cast label is shown: {}", list.message());
     }
-    /// `kj context create --as <character>` copies the character's cast slots:
-    /// the new context's info reports the model, and a character whose cast
-    /// has no slot for the type is told so at create.
+    /// `kj context create --as <character>` copies the character's slots:
+    /// the new context's info reports the model, and a character with no
+    /// slot for the type is told so at create.
     ///
     /// Falsified by a create that prints nothing when the context has no slot.
     #[tokio::test]
-    async fn context_create_copies_the_cast_and_reports_a_missing_slot() {
+    async fn context_create_copies_the_slots_and_reports_a_missing_one() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("staffing-parent"), None, principal);
@@ -6502,7 +6502,7 @@ mod tests {
         let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info returns structured data: {info:?}") };
         assert_eq!(data["resolved_model"], "mock-model", "info json: {data}");
 
-        // Another type has no slot in that cast.
+        // Another type has no slot on that character.
         let slotless = d
             .dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("slotless-child"), s("--type"), s("coder")], &c)
             .await;
@@ -6513,9 +6513,9 @@ mod tests {
         );
     }
 
-    /// A character with no cast says so at create.
+    /// A character with no slots says so at create.
     #[tokio::test]
-    async fn context_create_says_when_the_character_has_no_cast() {
+    async fn context_create_says_when_the_character_has_no_slot() {
         let d = test_dispatcher().await;
         let parent = register_context(&d, Some("castless-parent"), None, PrincipalId::new());
         let c = caller_with_context(parent);
