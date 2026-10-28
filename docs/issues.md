@@ -67,10 +67,12 @@ and commitment, step 3), 7.1, 1.2, 2.5, 4.1b, 5.4b, 3.4a, `CancelOnDrop`,
 and the `lineage_root` refusal wording. Still open:
 
 Behavior:
-- **4.2b** The `demoteContext` RPC (the app's `d` and `Ctrl+A q`) calls
-  `db.demote_context` directly: no lineage check, no `--confirm` latch on
-  the archiving step, and no archive rc lifecycle, unlike `kj context
-  demote`. Route it through the verb or delete it.
+- **4.2b** Three RPCs still skip their `kj` verb: `archiveContext` (the
+  app well's `a`, and kaijutsu-acp; no latch, no archive rc, no authority
+  check, documented as deliberately unlatched), `conclude` (the well's `c`;
+  skips the lineage authority check), and `setContextPaused` (the well's
+  `z`). `demoteContext` and `promoteContext` are gone (Amy: "drop that rpc
+  for demote"). The TUI's `Ctrl+A q` is still a "not built yet" notice.
 - **2.3** `approval_resume` runs approved commands inline in its one task,
   so a long command stalls ask delivery for every context. M.
 - **2.6** The submit-rc race, `interrupt.hard()` on a persistence failure,
