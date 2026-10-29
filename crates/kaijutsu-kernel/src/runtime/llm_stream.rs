@@ -257,18 +257,24 @@ fn raw_usage(
     extra: &Option<crate::llm::UsageExtra>,
 ) -> crate::RawUsage {
     use crate::llm::UsageExtra;
-    let (cache_read, cache_write, reasoning) = match extra {
-        Some(UsageExtra::OpenAiCompat(d)) => (d.prompt_cache_hit_tokens, 0, d.reasoning_tokens),
-        Some(UsageExtra::Claude(c)) => (c.cache_read_input_tokens, c.cache_creation_input_tokens, 0),
+    let (cache_read, cache_write, cache_write_1h, reasoning) = match extra {
+        Some(UsageExtra::OpenAiCompat(d)) => (d.prompt_cache_hit_tokens, 0, 0, d.reasoning_tokens),
+        Some(UsageExtra::Claude(c)) => (
+            c.cache_read_input_tokens,
+            c.cache_creation_input_tokens,
+            c.cache_creation_1h_input_tokens,
+            0,
+        ),
         // A held prefix is the megakernel's cache hit.
-        Some(UsageExtra::Mk(m)) => (m.kept, 0, 0),
-        None => (0, 0, 0),
+        Some(UsageExtra::Mk(m)) => (m.kept, 0, 0, 0),
+        None => (0, 0, 0, 0),
     };
     crate::RawUsage {
         input: input_tokens.unwrap_or(0),
         output: output_tokens.unwrap_or(0),
         cache_read,
         cache_write,
+        cache_write_1h,
         reasoning,
     }
 }
@@ -3863,7 +3869,7 @@ mod usage_log_tests {
     fn claude_logs_additive_cache_counts() {
         let extra = Some(UsageExtra::Claude(ClaudeUsageExtra {
             cache_read_input_tokens: 12000,
-            cache_creation_input_tokens: 345,
+            cache_creation_input_tokens: 345, cache_creation_1h_input_tokens: 0,
         }));
         assert_eq!(usage_log_suffix(&extra), ", cache_read=12000, cache_write=345");
     }
@@ -6832,7 +6838,7 @@ mod usage_tests {
                             output_tokens: Some(7),
                             extra: Some(UsageExtra::Claude(ClaudeUsageExtra {
                                 cache_read_input_tokens: 10,
-                                cache_creation_input_tokens: 5,
+                                cache_creation_input_tokens: 5, cache_creation_1h_input_tokens: 0,
                             })),
                         },
                     ]],
@@ -6881,7 +6887,7 @@ mod usage_tests {
                     output_tokens: Some(7),
                     extra: Some(UsageExtra::Claude(ClaudeUsageExtra {
                         cache_read_input_tokens: 10,
-                        cache_creation_input_tokens: 5,
+                        cache_creation_input_tokens: 5, cache_creation_1h_input_tokens: 0,
                     })),
                 });
                 let provider = Provider::Mock(
@@ -6923,7 +6929,7 @@ mod usage_tests {
                             output_tokens: Some(7),
                             extra: Some(UsageExtra::Claude(ClaudeUsageExtra {
                                 cache_read_input_tokens: 10,
-                                cache_creation_input_tokens: 5,
+                                cache_creation_input_tokens: 5, cache_creation_1h_input_tokens: 0,
                             })),
                         },
                     ]],
@@ -8104,7 +8110,7 @@ mod lifetime_tests {
 
     fn claude_extra(read: u64, write: u64) -> Option<crate::llm::UsageExtra> {
         Some(crate::llm::UsageExtra::Claude(crate::llm::ClaudeUsageExtra {
-            cache_read_input_tokens: read, cache_creation_input_tokens: write,
+            cache_read_input_tokens: read, cache_creation_input_tokens: write, cache_creation_1h_input_tokens: 0,
         }))
     }
 
@@ -8178,11 +8184,11 @@ mod lifetime_tests {
     fn raw_usage_keeps_each_providers_own_input() {
         use crate::llm::{ClaudeUsageExtra, OpenAiCompatUsageExtra, UsageExtra};
         let claude = raw_usage(Some(10), Some(5), &Some(UsageExtra::Claude(ClaudeUsageExtra {
-            cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 })));
-        assert_eq!(claude, crate::RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, reasoning: 0 });
+            cache_read_input_tokens: 1000, cache_creation_input_tokens: 200, cache_creation_1h_input_tokens: 150 })));
+        assert_eq!(claude, crate::RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, cache_write_1h: 150, reasoning: 0 });
         let deepseek = raw_usage(Some(1100), Some(5), &Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
             prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 100, reasoning_tokens: 7 })));
-        assert_eq!(deepseek, crate::RawUsage { input: 1100, output: 5, cache_read: 1000, cache_write: 0, reasoning: 7 });
+        assert_eq!(deepseek, crate::RawUsage { input: 1100, output: 5, cache_read: 1000, cache_write: 0, cache_write_1h: 0, reasoning: 7 });
         assert_eq!(raw_usage(None, None, &None), crate::RawUsage::default());
     }
 

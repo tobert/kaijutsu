@@ -551,7 +551,13 @@ pub enum UsageExtra {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeUsageExtra {
     pub cache_read_input_tokens: u64,
+    /// Every cache write, whatever its TTL.
     pub cache_creation_input_tokens: u64,
+    /// The part of `cache_creation_input_tokens` written with the 1-hour TTL,
+    /// billed at twice the base input price. The rest is the 5-minute write,
+    /// billed at 1.25 times. 0 when the API reported no split.
+    #[serde(default)]
+    pub cache_creation_1h_input_tokens: u64,
 }
 
 /// Usage extras for OpenAI-compatible chat-completions providers.

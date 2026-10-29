@@ -617,7 +617,10 @@ pub struct RawUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
+    /// Every cache write, whatever its TTL.
     pub cache_write: u64,
+    /// The part of `cache_write` written with the 1-hour TTL. Claude only.
+    pub cache_write_1h: u64,
     pub reasoning: u64,
 }
 
@@ -636,6 +639,8 @@ pub struct TurnRow {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// The part of `cache_write_tokens` written with the 1-hour TTL.
+    pub cache_write_1h_tokens: i64,
     pub reasoning_tokens: i64,
 }
 
@@ -648,6 +653,7 @@ pub struct TurnTotals {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    pub cache_write_1h_tokens: i64,
     pub reasoning_tokens: i64,
 }
 
@@ -1124,7 +1130,8 @@ CREATE TABLE IF NOT EXISTS turns (
     output_tokens      INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens   INTEGER NOT NULL DEFAULT 0
+    reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_turns_context ON turns(context_id, started_at);
 
@@ -3006,6 +3013,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE turns ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
                  CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0)",
             "ALTER TABLE backends ADD COLUMN max_concurrent INTEGER \
@@ -6504,7 +6512,8 @@ impl KernelDb {
                 output_tokens = output_tokens + ?3,
                 cache_read_tokens = cache_read_tokens + ?4,
                 cache_write_tokens = cache_write_tokens + ?5,
-                reasoning_tokens = reasoning_tokens + ?6
+                reasoning_tokens = reasoning_tokens + ?6,
+                cache_write_1h_tokens = cache_write_1h_tokens + ?7
              WHERE turn_id = ?1 AND ended_at IS NULL",
             params![
                 blob_param(turn_id.as_bytes()),
@@ -6513,6 +6522,7 @@ impl KernelDb {
                 usage.cache_read as i64,
                 usage.cache_write as i64,
                 usage.reasoning as i64,
+                usage.cache_write_1h as i64,
             ],
         )?;
         if changed == 0 {
@@ -6537,7 +6547,7 @@ impl KernelDb {
 
     const TURN_COLUMNS: &'static str = "turn_id, context_id, performer, role, provider, model,
         started_at, ended_at, stop_reason, llm_calls, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, reasoning_tokens";
+        cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_write_1h_tokens";
 
     fn read_turn_row(row: &rusqlite::Row<'_>) -> SqliteResult<TurnRow> {
         let turn_bytes: Vec<u8> = row.get(0)?;
@@ -6563,6 +6573,7 @@ impl KernelDb {
             cache_read_tokens: row.get(12)?,
             cache_write_tokens: row.get(13)?,
             reasoning_tokens: row.get(14)?,
+            cache_write_1h_tokens: row.get(15)?,
         })
     }
 
@@ -6596,7 +6607,8 @@ impl KernelDb {
         Ok(self.conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(llm_calls), 0), COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(reasoning_tokens), 0)
+                    COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(reasoning_tokens), 0),
+                    COALESCE(SUM(cache_write_1h_tokens), 0)
              FROM turns WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
             |row| Ok(TurnTotals {
@@ -6607,6 +6619,7 @@ impl KernelDb {
                 cache_read_tokens: row.get(4)?,
                 cache_write_tokens: row.get(5)?,
                 reasoning_tokens: row.get(6)?,
+                cache_write_1h_tokens: row.get(7)?,
             }),
         )?)
     }
@@ -13285,8 +13298,8 @@ mod tests {
         insert_context_with_doc(&db, &ctx, ws_id);
         let start = turn_start(ctx.context_id);
         db.begin_turn(&start).unwrap();
-        db.add_turn_usage(start.turn_id, RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, reasoning: 0 }).unwrap();
-        db.add_turn_usage(start.turn_id, RawUsage { input: 20, output: 7, cache_read: 1200, cache_write: 0, reasoning: 3 }).unwrap();
+        db.add_turn_usage(start.turn_id, RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, cache_write_1h: 150, reasoning: 0 }).unwrap();
+        db.add_turn_usage(start.turn_id, RawUsage { input: 20, output: 7, cache_read: 1200, cache_write: 0, cache_write_1h: 0, reasoning: 3 }).unwrap();
         let running = db.get_turn(start.turn_id).unwrap().unwrap();
         assert_eq!(running.start, start);
         assert_eq!((running.ended_at, running.stop_reason.clone()), (None, None));
@@ -13296,9 +13309,10 @@ mod tests {
         assert_eq!((done.ended_at, done.stop_reason.as_deref()), (Some(2_000), Some("end_turn")));
         assert_eq!(
             (done.llm_calls, done.input_tokens, done.output_tokens, done.cache_read_tokens,
-             done.cache_write_tokens, done.reasoning_tokens),
-            (2, 30, 12, 2200, 200, 3),
+             done.cache_write_tokens, done.cache_write_1h_tokens, done.reasoning_tokens),
+            (2, 30, 12, 2200, 200, 150, 3),
         );
+        assert_eq!(db.context_turn_totals(ctx.context_id).unwrap().cache_write_1h_tokens, 150);
     }
 
     /// A count or an end with nowhere to land is an error, not a no-op: the

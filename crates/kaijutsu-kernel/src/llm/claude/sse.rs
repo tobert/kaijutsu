@@ -15,7 +15,7 @@
 
 use serde::Deserialize;
 
-use super::types::ResponseUsage;
+use super::types::{CacheCreation, ResponseUsage};
 use crate::llm::stream::StreamErrorKind;
 
 /// Typed Anthropic streaming event.
@@ -164,6 +164,8 @@ pub struct DeltaUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -6102,7 +6102,7 @@ mod tests {
             role: "coder".into(), provider: "deepseek".into(), model: "deepseek-flash".into(),
             started_at: at,
         }).unwrap();
-        db.add_turn_usage(turn_id, crate::RawUsage { input, output: 3, cache_read: 7, cache_write: 0, reasoning: 1 }).unwrap();
+        db.add_turn_usage(turn_id, crate::RawUsage { input, output: 3, cache_read: 7, cache_write: 0, cache_write_1h: 0, reasoning: 1 }).unwrap();
         db.finish_turn(turn_id, at + 5, "end_turn").unwrap();
         turn_id
     }

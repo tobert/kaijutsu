@@ -460,6 +460,26 @@ pub struct ResponseUsage {
     /// 1.25x base input cost for the 5-minute variant, 2x for 1-hour).
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    /// The cache writes split by TTL, when the API reports it.
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+impl ResponseUsage {
+    /// Cache write tokens billed at the 1-hour rate; 0 when no split came.
+    pub fn cache_creation_1h_input_tokens(&self) -> u64 {
+        self.cache_creation.as_ref().map(|c| c.ephemeral_1h_input_tokens).unwrap_or(0)
+    }
+}
+
+/// `usage.cache_creation`: cache write tokens by TTL. They add up to
+/// `cache_creation_input_tokens`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u64,
 }
 
 // ============================================================================
@@ -630,6 +650,18 @@ mod tests {
         assert_eq!(v["id"], "toolu_01ABC");
         assert_eq!(v["name"], "get_weather");
         assert_eq!(v["input"]["location"], "Tokyo");
+    }
+
+    /// The response splits cache writes by TTL: the 1-hour part is billed at
+    /// twice the base input price, the 5-minute part at 1.25 times.
+    #[test]
+    fn usage_reads_the_cache_write_split_by_ttl() {
+        let json = r#"{"input_tokens":5,"output_tokens":9,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":900}}"#;
+        let usage: ResponseUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.cache_creation_1h_input_tokens(), 900);
+        let json = r#"{"input_tokens":5,"output_tokens":9,"cache_creation_input_tokens":1000}"#;
+        let usage: ResponseUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.cache_creation_1h_input_tokens(), 0, "no split reported");
     }
 
     #[test]

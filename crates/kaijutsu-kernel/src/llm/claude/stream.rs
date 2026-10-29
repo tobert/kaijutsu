@@ -150,6 +150,8 @@ pub struct StateMachine {
     /// instead of dropping them.
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
+    /// The part of the cache writes billed at the 1-hour rate.
+    cache_creation_1h_input_tokens: u64,
     /// An `Error` was emitted. Nothing follows it.
     failed: bool,
 }
@@ -187,6 +189,7 @@ impl StateMachine {
                 self.input_tokens = Some(p.message.usage.input_tokens);
                 self.cache_read_input_tokens = p.message.usage.cache_read_input_tokens;
                 self.cache_creation_input_tokens = p.message.usage.cache_creation_input_tokens;
+                self.cache_creation_1h_input_tokens = p.message.usage.cache_creation_1h_input_tokens();
                 for t in &p.message.input_transformations {
                     tracing::warn!(
                         kind = %t.kind,
@@ -220,6 +223,9 @@ impl StateMachine {
                 if let Some(n) = p.usage.cache_creation_input_tokens {
                     self.cache_creation_input_tokens = n;
                 }
+                if let Some(split) = p.usage.cache_creation {
+                    self.cache_creation_1h_input_tokens = split.ephemeral_1h_input_tokens;
+                }
                 vec![]
             }
             ClaudeSseEvent::MessageStop => {
@@ -237,6 +243,7 @@ impl StateMachine {
                             crate::llm::stream::ClaudeUsageExtra {
                                 cache_read_input_tokens: self.cache_read_input_tokens,
                                 cache_creation_input_tokens: self.cache_creation_input_tokens,
+                                cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
                             },
                         )
                     });
@@ -873,11 +880,46 @@ data: {\"type\":\"message_stop\"}
                     output_tokens: Some(5),
                     extra: Some(crate::llm::UsageExtra::Claude(crate::llm::stream::ClaudeUsageExtra {
                         cache_read_input_tokens: 30,
-                        cache_creation_input_tokens: 4,
+                        cache_creation_input_tokens: 4, cache_creation_1h_input_tokens: 0,
                     })),
                 })
             ),
             other => panic!("expected one Error, got {other:?}"),
+        }
+    }
+
+    /// The 1-hour share of the cache writes rides on `Done`, from
+    /// `message_start`'s `cache_creation` split, and a `message_delta` that
+    /// restates the split replaces it.
+    #[tokio::test]
+    async fn done_carries_the_one_hour_cache_write_share() {
+        let start = |split: &str| format!("\
+event: message_start
+data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-haiku-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":3,\"output_tokens\":1,\"cache_creation_input_tokens\":1000{split}}}}}}}
+
+");
+        let tail = "event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        let split = ",\"cache_creation\":{\"ephemeral_5m_input_tokens\":100,\"ephemeral_1h_input_tokens\":900}";
+        let events = run(&format!("{}{tail}", start(split))).await;
+        match events.as_slice() {
+            [StreamEvent::Done { extra: Some(crate::llm::UsageExtra::Claude(c)), .. }] => {
+                assert_eq!(c.cache_creation_input_tokens, 1000);
+                assert_eq!(c.cache_creation_1h_input_tokens, 900);
+            }
+            other => panic!("expected Done with a Claude extra, got {other:?}"),
+        }
+        let events = run(&format!("{}{tail}", start(""))).await;
+        match events.as_slice() {
+            [StreamEvent::Done { extra: Some(crate::llm::UsageExtra::Claude(c)), .. }] => {
+                assert_eq!(c.cache_creation_1h_input_tokens, 0, "no split reported");
+            }
+            other => panic!("expected Done with a Claude extra, got {other:?}"),
         }
     }
 
@@ -930,7 +972,7 @@ data: {\"type\":\"content_block_stop\",\"index\":0}
                 extra: Some(crate::llm::stream::UsageExtra::Claude(
                     crate::llm::stream::ClaudeUsageExtra {
                         cache_read_input_tokens: 40,
-                        cache_creation_input_tokens: 2,
+                        cache_creation_input_tokens: 2, cache_creation_1h_input_tokens: 0,
                     }
                 )),
             }]
