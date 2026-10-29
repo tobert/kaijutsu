@@ -1697,6 +1697,14 @@ pub struct BlockSnapshot {
     /// during staging to shape the conversation before LLM invocation.
     #[serde(default)]
     pub excluded: bool,
+    /// A turn-scoped instruction: a `(System, Notification)` block that
+    /// serves only the turn it precedes, such as a per-turn reminder. Set at
+    /// creation (`kj block create --turn-scoped`). On a model that takes it,
+    /// the next user message clears it; elsewhere it stays like any
+    /// instruction. See `docs/conversation-session.md`, "Turn-scoped
+    /// instructions".
+    #[serde(default)]
+    pub turn_scoped: bool,
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
 
@@ -2006,6 +2014,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2057,6 +2066,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2120,6 +2130,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
@@ -2183,6 +2194,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -2253,6 +2265,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -2311,6 +2324,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2367,6 +2381,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2423,6 +2438,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2475,6 +2491,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2538,6 +2555,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2600,6 +2618,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2661,6 +2680,7 @@ impl BlockSnapshot {
             collapsed: false,
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -2805,6 +2825,7 @@ impl BlockSnapshotBuilder {
                 collapsed: false,
                 ephemeral: false,
                 excluded: false,
+                turn_scoped: false,
                 created_at: crate::now_millis(),
                 tool_kind: None,
                 tool_name: None,
@@ -2868,6 +2889,12 @@ impl BlockSnapshotBuilder {
 
     pub fn excluded(mut self, excluded: bool) -> Self {
         self.snap.excluded = excluded;
+        self
+    }
+
+    /// Mark this block a turn-scoped instruction.
+    pub fn turn_scoped(mut self, turn_scoped: bool) -> Self {
+        self.snap.turn_scoped = turn_scoped;
         self
     }
 

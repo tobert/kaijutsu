@@ -297,7 +297,7 @@ mod tests {
     }
 
     fn said(blocks: Vec<ContentBlock>) -> Message {
-        Message { role: Role::Assistant, content: MessageContent::Blocks(blocks) }
+        Message { role: Role::Assistant, content: MessageContent::Blocks(blocks), turn_scoped: false }
     }
 
     fn wire(messages: &[MkMessage]) -> serde_json::Value {

@@ -92,13 +92,20 @@ in the next request. Only the next hydrate drops it
 (`docs/conversation-session.md`, "Original target": excludes on blocks already
 sent are no-ops).
 
-We need a way for a notification to replace the one before it. It must work
-both in the live conversation and at hydration. One possible design is a
-supersede key on the notification: a new block with the same key hides the
-older ones. That would serve reminders, current state, and the notebook below.
-It touches the mailbox and snapshot code, so it needs a design conversation.
-The rotation filter in `docs/issues.md` is the alternative that needs only
-existing mechanisms. It is coarser.
+Deleting old copies is the wrong tool on current Anthropic models: removing an
+earlier message edits history, which breaks the prompt cache from there and
+invalidates every later thinking block. The API's own answer is a turn-scoped
+system message (`clear_at: "next_user_message"`), which stays in the request
+cleared. Built that way: `kj block create --turn-scoped`, and the
+storyteller's reminder uses it (`docs/conversation-session.md`, "Turn-scoped
+instructions"). Current state and the notebook can use the same mark. On
+providers without `clear_at`, copies stay, and Amy chose to keep them; a
+filtered fork sheds them when wanted.
+
+Done with it: Anthropic now gets native mid-conversation system messages, and
+adaptive thinking sends `drop_block`, so a filtered fork or a sliding window
+drops invalid thinking blocks instead of failing. Still to build: a trace that
+names what a request's divergence from the previous prefix costs.
 
 ### A scribe seat on the pulse
 

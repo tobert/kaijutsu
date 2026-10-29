@@ -1241,6 +1241,28 @@ impl BlockStore {
         content_type: ContentType,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
+        self.insert_block_marked(
+            context_id, parent_id, after, role, kind, content, status, content_type, principal_id, false,
+        )
+    }
+
+    /// [`Self::insert_block_as`], optionally marking the block a turn-scoped
+    /// instruction ([`kaijutsu_types::BlockSnapshot::turn_scoped`]). The mark
+    /// is set in the same acceptance, so the inserted event carries it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_block_marked(
+        &self,
+        context_id: ContextId,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        role: Role,
+        kind: BlockKind,
+        content: impl Into<String>,
+        status: Status,
+        content_type: ContentType,
+        principal_id: Option<PrincipalId>,
+        turn_scoped: bool,
+    ) -> BlockStoreResult<BlockId> {
         self.accept(context_id, |entry| {
             let mut events = Vec::new();
             let after_id = after.cloned();
@@ -1252,6 +1274,9 @@ impl BlockStore {
             let block_id = entry
                 .doc
                 .insert_block(parent_id, after, role, kind, content, status, content_type)?;
+            if turn_scoped {
+                entry.doc.set_turn_scoped(&block_id)?;
+            }
             let snapshot = entry
                 .doc
                 .get_block_snapshot(&block_id)

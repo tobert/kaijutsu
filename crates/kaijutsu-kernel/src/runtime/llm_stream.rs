@@ -4779,12 +4779,12 @@ mod publish_tests {
             assert_eq!(sent.len(), 2, "the nudge continued the turn once");
             let request = serde_json::to_value(&sent[1]).unwrap();
             let n = sent[1].len();
-            let LlmMessage { role: crate::LlmRole::Assistant, content: crate::llm::MessageContent::Blocks(reply) } = &sent[1][n - 2] else {
+            let LlmMessage { role: crate::LlmRole::Assistant, content: crate::llm::MessageContent::Blocks(reply), .. } = &sent[1][n - 2] else {
                 panic!("the call joins the reply: {request}");
             };
             assert!(matches!(&reply[..], [crate::llm::ContentBlock::Text { text }, crate::llm::ContentBlock::ToolUse { name, input, .. }]
                 if text == "Next I'll run the tests." && name == SYSTEM_MESSAGES_TOOL && *input == serde_json::json!({})), "{request}");
-            let LlmMessage { role: crate::LlmRole::User, content: crate::llm::MessageContent::Blocks(result) } = &sent[1][n - 1] else {
+            let LlmMessage { role: crate::LlmRole::User, content: crate::llm::MessageContent::Blocks(result), .. } = &sent[1][n - 1] else {
                 panic!("a result answers the call: {request}");
             };
             let [crate::llm::ContentBlock::ToolResult { content, is_error: false, .. }] = &result[..] else { panic!("{request}") };

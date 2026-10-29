@@ -619,7 +619,7 @@ mod tests {
     }
 
     fn said(text: &str) -> Message {
-        Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]) }
+        Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]), turn_scoped: false }
     }
 
     fn bodies(seen: &std::sync::Mutex<Vec<kaijutsu_mk::test_server::Captured>>, path_prefix: &str) -> Vec<serde_json::Value> {
@@ -680,7 +680,7 @@ mod tests {
         };
         assert_eq!((stop_reason.as_deref(), *input_tokens, x.kept, x.seed, x.model.as_str()), (Some("tool_use"), Some(47), 40, Some(11), "gemma-4"));
 
-        history.push(Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::ToolUse { id, name, input: json!({"path": "/tmp"}) }]) });
+        history.push(Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::ToolUse { id, name, input: json!({"path": "/tmp"}) }]), turn_scoped: false });
         history.push(Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "c0".into(), content: "a\nb".into(), is_error: false }]));
         let second = drain(&mut c.stream(o, history).await.unwrap()).await;
         assert!(second.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "Two files.")), "{second:?}");
@@ -944,7 +944,7 @@ mod tests {
         assert_eq!(name, "ls");
         history.push(Message { role: crate::llm::Role::Assistant, content: crate::llm::MessageContent::Blocks(vec![
             ContentBlock::ToolUse { id: id.clone(), name, input },
-        ]) });
+        ]), turn_scoped: false });
         history.push(Message::tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: id,
             content: "notes.txt\nplan.md".into(),
@@ -981,6 +981,7 @@ mod tests {
                     name: "ls".into(),
                     input: written,
                 }]),
+                turn_scoped: false,
             },
             Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "a".into(), content: String::new(), is_error: false }]),
         ];

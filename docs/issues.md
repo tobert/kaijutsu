@@ -66,10 +66,10 @@ entertainment seat, from a read of SillyTavern's prompt assembly. See
   moves into the character's directory and `S05-card.kai` goes.
 - The model has no tools, so it cannot write its own handoff note. The handoff
   and predecessor notifications still name `kj` commands it cannot run.
-- Submit reminders accumulate, one per submit. A rotation for long stories
-  could filter reminders and other droppable blocks from the successor; that
-  filter has no design yet. `kj fork --compact` and handoffs are what carries a
-  story past its context limit today.
+- Submit reminders are turn-scoped: on Anthropic models with `clear_at`,
+  only the newest costs tokens. On other providers they accumulate, and Amy
+  chose to keep them; a filtered fork or `kj fork --compact` sheds them when
+  wanted.
 - No greeting or example dialogue. SillyTavern's `first_mes` and `mes_example`
   set a voice better than description does on small models; a card could
   carry them as a model-role block at create.

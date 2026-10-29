@@ -351,14 +351,26 @@ pub struct Message {
     pub role: Role,
     /// Message content (text or blocks).
     pub content: MessageContent,
+    /// A system message that serves only the turn it precedes. A provider
+    /// that can clear it at the next user message does; others send it as
+    /// any system message.
+    #[serde(default)]
+    pub turn_scoped: bool,
 }
 
 impl Message {
+    /// This message, marked turn-scoped.
+    pub fn turn_scoped(mut self) -> Self {
+        self.turn_scoped = true;
+        self
+    }
+
     /// Create a user message with text content.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             content: MessageContent::Text(content.into()),
+            turn_scoped: false,
         }
     }
 
@@ -367,6 +379,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: MessageContent::Text(content.into()),
+            turn_scoped: false,
         }
     }
 
@@ -375,6 +388,7 @@ impl Message {
         Self {
             role: Role::System,
             content: MessageContent::Text(content.into()),
+            turn_scoped: false,
         }
     }
 
@@ -383,6 +397,7 @@ impl Message {
         Self {
             role: Role::User,
             content: MessageContent::Blocks(results),
+            turn_scoped: false,
         }
     }
 
@@ -425,6 +440,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: MessageContent::Blocks(blocks),
+            turn_scoped: false,
         }
     }
 
@@ -3713,6 +3729,37 @@ mod tests {
             assert_eq!(msgs[3].as_text(), Some("a handoff note"));
         }
 
+        /// A turn-scoped instruction is a system message whoever wrote it,
+        /// such as the rc reminder a person's submit runs, and carries the
+        /// mark a provider clears it by. Only the newest copy serves a turn,
+        /// but every copy stays in the history.
+        #[test]
+        fn a_turn_scoped_instruction_hydrates_as_a_turn_scoped_system_message() {
+            let c = ctx();
+            let m = model();
+            let person = user();
+            let reminder = |seq: u64| {
+                kaijutsu_types::BlockSnapshotBuilder::new(BlockId::new(c, person, seq), kaijutsu_types::BlockKind::Notification)
+                    .role(BlockRole::System)
+                    .content("Stay in the scene.")
+                    .turn_scoped(true)
+                    .build()
+            };
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, person, 0), None, BlockRole::User, "I sit on the step."),
+                reminder(1),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Clack, clack."),
+                BlockSnapshot::text(BlockId::new(c, person, 2), None, BlockRole::User, "I wave."),
+                reminder(3),
+            ];
+            let msgs = hydrate_from_blocks(&blocks);
+            let roles: Vec<Role> = msgs.iter().map(|m| m.role).collect();
+            assert_eq!(roles, [Role::User, Role::System, Role::Assistant, Role::User, Role::System]);
+            let scoped: Vec<bool> = msgs.iter().map(|m| m.turn_scoped).collect();
+            assert_eq!(scoped, [false, true, false, false, true]);
+            assert_eq!(msgs[4].as_text(), Some("Stay in the scene."));
+        }
+
         /// In the `SystemMessagesTool` form, kernel instructions and drifts
         /// that arrive together are one `get_system_messages` call joined to
         /// the reply, with one entry each in log order. A person's text
@@ -4159,6 +4206,7 @@ mod tests {
                     media_type: "image/png".to_string(),
                     data_base64: None,
                 }]),
+                turn_scoped: false,
             }];
             resolve_image_blocks_from_cas(&mut messages, cas, None).await;
             match &messages[0].content {
@@ -4188,6 +4236,7 @@ mod tests {
                     media_type: "image/png".to_string(),
                     data_base64: None,
                 }]),
+                turn_scoped: false,
             }];
             // Should not panic, should leave block unresolved.
             resolve_image_blocks_from_cas(&mut messages, cas, None).await;
@@ -4288,6 +4337,7 @@ mod tests {
                         media_type: "image/png".to_string(),
                         data_base64: None,
                     }]),
+                    turn_scoped: false,
                 }]
             };
 

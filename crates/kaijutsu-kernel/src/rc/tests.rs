@@ -2542,6 +2542,12 @@ esac
             (Role::User, _, b), (Role::System, BlockKind::Notification, rb),
         ] if a == "We open the door." && b == "We sit by the window."
             && ra.contains(reminder) && rb.contains(reminder)), "{after_inputs:#?}");
+        // Each reminder serves only the turn it precedes.
+        let reminders: Vec<bool> = blocks.iter()
+            .filter(|b| b.kind == BlockKind::Notification && b.content.contains(reminder))
+            .map(|b| b.turn_scoped)
+            .collect();
+        assert_eq!(reminders, [true, true]);
         let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
         assert!(!sections.contains(reminder), "a reminder must stay out of the cached system text");
     }

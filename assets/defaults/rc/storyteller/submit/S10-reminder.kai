@@ -4,8 +4,10 @@
 # wins; otherwise this script's companion Markdown is the reminder.
 #
 # NOTIFICATION, never (Role::System, BlockKind::Text): it lands behind the
-# input it follows and stays out of the cached system prompt. Reminders
-# accumulate in the log; rotation is how a long story sheds them.
+# input it follows and stays out of the cached system prompt. --turn-scoped:
+# a model that supports it stops reading the reminder at the next user
+# message, so only the newest one costs tokens; elsewhere they accumulate,
+# and rotation or a filtered fork sheds them.
 set -e
 who="$(kj context info --json | jq -r '.played_by_name // empty')"
 reminder="$(dirname "$0")/$(basename "$0" .kai).md"
@@ -18,5 +20,5 @@ case "$who" in
     fi
     ;;
 esac
-kj block create --role system --kind notification < "$reminder"
+kj block create --role system --kind notification --turn-scoped < "$reminder"
 echo "reminder: $reminder"

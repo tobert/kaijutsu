@@ -287,6 +287,8 @@ pub struct BlockContent {
     /// was set — the discriminator that makes "unedited" checkable. See
     /// [`kaijutsu_types::BlockSnapshot::edited_since_ingest`].
     edited_since_ingest: bool,
+    /// [`kaijutsu_types::BlockSnapshot::turn_scoped`], set at creation.
+    turn_scoped: bool,
 
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
@@ -329,6 +331,7 @@ impl BlockContent {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            turn_scoped: false,
             deleted: false,
         }
     }
@@ -386,6 +389,7 @@ impl BlockContent {
         block.style_spans = snap.style_spans.clone();
         block.provenance = snap.provenance.clone();
         block.edited_since_ingest = snap.edited_since_ingest;
+        block.turn_scoped = snap.turn_scoped;
         block
     }
 
@@ -748,6 +752,11 @@ impl BlockContent {
         self.header.updated_at = now_millis();
     }
 
+    /// Mark this block a turn-scoped instruction. Only creation does this.
+    pub fn set_turn_scoped(&mut self) {
+        self.turn_scoped = true;
+    }
+
     /// Update `exit_code`.
     pub fn set_exit_code(&mut self, val: Option<i32>) {
         self.header.exit_code = val;
@@ -768,6 +777,7 @@ impl BlockContent {
             collapsed: self.header.collapsed,
             ephemeral: self.header.ephemeral,
             excluded: self.header.excluded,
+            turn_scoped: self.turn_scoped,
             created_at: self.header.created_at,
             tool_kind: self.header.tool_kind,
             tool_name: self.tool_name.clone(),

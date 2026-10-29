@@ -144,7 +144,7 @@ impl Turn {
                 _ => {}
             }
         }
-        Message { role: Role::Assistant, content: MessageContent::Blocks(blocks) }
+        Message { role: Role::Assistant, content: MessageContent::Blocks(blocks), turn_scoped: false }
     }
 
     /// The results message answering every call, valid or not.

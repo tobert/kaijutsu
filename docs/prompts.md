@@ -117,9 +117,11 @@ The storyteller type is a seat for telling stories with the person, for
 enjoyment. Its model has no tools. `S05-card.kai` reads the performer's card
 from `/config/rc/storyteller/cards/<performer>.md` as instruction text after
 the stance; no card ships. After each submit, `submit/S10-reminder.kai` writes
-a `(System, Notification)` reminder behind the input: the card's
-`<performer>.reminder.md`, or the type's `S10-reminder.md`. Reminders
-accumulate; rotation sheds them. Open work is in `docs/issues.md`,
+a turn-scoped `(System, Notification)` reminder behind the input: the card's
+`<performer>.reminder.md`, or the type's `S10-reminder.md`. On a model that
+supports it, each reminder stops costing tokens at the next user message;
+elsewhere reminders accumulate until rotation or a filtered fork sheds them
+(`docs/conversation-session.md`, "Turn-scoped instructions"). Open work is in `docs/issues.md`,
 "Storyteller: what the prototype leaves open".
 
 The executable filename controls order. Default handles general work;

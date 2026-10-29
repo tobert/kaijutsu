@@ -159,6 +159,18 @@ pub(crate) fn is_kernel_instruction(block: &BlockSnapshot) -> bool {
         && block.id.principal_id == kaijutsu_types::PrincipalId::system()
 }
 
+/// Whether a block is a turn-scoped instruction: a payload-less
+/// `(System, Notification)` block marked `turn_scoped`, whoever wrote it,
+/// such as the reminder an rc submit script adds. It hydrates like a kernel
+/// instruction, marked so a provider that can clears it at the next user
+/// message.
+pub(crate) fn is_turn_scoped_instruction(block: &BlockSnapshot) -> bool {
+    block.role == BlockRole::System
+        && block.kind == BlockKind::Notification
+        && block.notification.is_none()
+        && block.turn_scoped
+}
+
 /// How a message to the model from another player reaches it: a kernel
 /// instruction or a drift arrival. See `docs/conversation-session.md`,
 /// "Kernel instructions".
@@ -315,7 +327,8 @@ impl HydrationState {
     fn system_message(&mut self, block: &BlockSnapshot, text: String) {
         if self.form == InstructionForm::SystemText {
             self.flush_all();
-            self.messages.push(Message::system(text));
+            let message = Message::system(text);
+            self.messages.push(if block.turn_scoped { message.turn_scoped() } else { message });
             return;
         }
         // Reasoning with no reply to carry it is dropped, as at any flush.
@@ -460,6 +473,7 @@ impl HydrationState {
                             media_type: ContentType::Image.as_mime().to_string(),
                             data_base64: None,
                         }]),
+                        turn_scoped: false,
                     };
                     self.push_after_open_batch(message);
                 }
@@ -613,9 +627,10 @@ impl HydrationState {
                     self.messages.push(standalone_error(block, envelope));
                 }
             }
-            (_, BlockKind::Notification) if is_kernel_instruction(block) => {
+            (_, BlockKind::Notification) if is_kernel_instruction(block) || is_turn_scoped_instruction(block) => {
                 // A kernel instruction to the model, such as a completion
-                // notice, is never a user message.
+                // notice, is never a user message, and neither is a
+                // turn-scoped one.
                 self.system_message(block, block.content.clone());
             }
             (_, BlockKind::Notification) => {
@@ -978,6 +993,7 @@ mod pairing_repair_tests {
                 name: "shell".to_string(),
                 input: serde_json::json!({}),
             }]),
+            turn_scoped: false,
         }
     }
 
@@ -993,6 +1009,7 @@ mod pairing_repair_tests {
                     })
                     .collect(),
             ),
+            turn_scoped: false,
         }
     }
 
@@ -1451,6 +1468,7 @@ mod estimate_tokens_tests {
                 media_type: "image/png".to_string(),
                 data_base64: None, // unresolved, as it always is at hydration time
             }]),
+            turn_scoped: false,
         }];
         assert_eq!(
             estimate_tokens(&messages),
@@ -1488,6 +1506,7 @@ mod estimate_tokens_tests {
                     is_error: false,
                 },
             ]),
+            turn_scoped: false,
         }];
 
         let expected = PER_MESSAGE_TOKEN_OVERHEAD
@@ -1507,6 +1526,7 @@ mod estimate_tokens_tests {
                 text,
                 signature: Some("sig".to_string()),
             }]),
+            turn_scoped: false,
         }];
         assert_eq!(estimate_tokens(&messages), PER_MESSAGE_TOKEN_OVERHEAD + 10);
     }

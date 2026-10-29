@@ -86,6 +86,7 @@ mod tests {
             content: content.to_string(),
             ephemeral: false,
             excluded: false,
+            turn_scoped: false,
             collapsed: false,
             created_at: 0,
             tool_name: None,

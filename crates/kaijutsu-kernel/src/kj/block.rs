@@ -268,6 +268,12 @@ struct BlockCreateArgs {
     /// Target context: . (default) | .parent | <label> | <hex prefix>
     #[arg(long, short = 'c')]
     context: Option<String>,
+    /// Make a system notification serve only the turn it precedes, such as
+    /// a per-turn reminder. A model that supports it stops reading the block
+    /// at the next user message; others keep it. Requires --role system
+    /// --kind notification
+    #[arg(long)]
+    turn_scoped: bool,
 }
 
 impl KjDispatcher {
@@ -1712,7 +1718,7 @@ impl KjDispatcher {
 
     /// Create a Done block and return its id as text and structured data.
     fn block_create(&self, args: BlockCreateArgs, caller: &KjCaller) -> KjResult {
-        let BlockCreateArgs { role, kind, content, content_type, parent, after, context } = args;
+        let BlockCreateArgs { role, kind, content, content_type, parent, after, context, turn_scoped } = args;
         let ctx_id = {
             let db = self.kernel_db().lock();
             match resolve_context_arg(context.as_deref(), caller, &db) {
@@ -1736,6 +1742,11 @@ impl KjDispatcher {
                 ));
             }
         };
+        if turn_scoped && (role_p != Role::System || kind_p != BlockKind::Notification) {
+            return KjResult::Err(format!(
+                "kj block create: --turn-scoped needs --role system --kind notification, not --role {role} --kind {kind}"
+            ));
+        }
         let parent_id = match parent.as_deref() {
             None => None,
             Some(s) => match kaijutsu_types::BlockId::from_key(s) {
@@ -1775,7 +1786,7 @@ impl KjDispatcher {
         // The new block is authored by the performer, not the requester —
         // same rule as block_append/block_edit
         // (docs/approval-identity.md, "Three identities").
-        let new_id = match self.blocks.insert_block_as(
+        let new_id = match self.blocks.insert_block_marked(
             ctx_id,
             parent_id.as_ref(),
             after_id.as_ref(),
@@ -1785,6 +1796,7 @@ impl KjDispatcher {
             Status::Done,
             declared_content_type,
             Some(caller.actor_id),
+            turn_scoped,
         ) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block create: {e}")),
@@ -3512,6 +3524,37 @@ mod tests {
         ], &caller).await;
         assert!(!result.is_ok(), "invalid MIME type must fail");
         assert_eq!(d.block_store().block_snapshots(ctx).unwrap().len(), 1);
+    }
+
+    /// `--turn-scoped` marks a system notification that serves only the turn
+    /// it precedes. It is set at creation, and only a payload-less system
+    /// notification can carry it.
+    #[tokio::test]
+    async fn block_create_turn_scoped_marks_a_system_notification() {
+        let d = test_dispatcher().await;
+        let ctx = register_context_with_doc(&d, Some("tale"), PrincipalId::new());
+        let caller = caller_with_context(ctx);
+        let result = d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("system"), s("--kind"), s("notification"),
+            s("--turn-scoped"), s("--content"), s("Stay in the scene."),
+        ], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let plain = d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("system"), s("--kind"), s("notification"),
+            s("--content"), s("a note"),
+        ], &caller).await;
+        assert!(plain.is_ok(), "{}", plain.message());
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.iter().map(|b| b.turn_scoped).collect::<Vec<_>>(), [true, false]);
+
+        for (role, kind) in [("system", "text"), ("user", "notification"), ("user", "text")] {
+            let refused = d.dispatch(&[
+                s("block"), s("create"), s("--role"), s(role), s("--kind"), s(kind), s("--turn-scoped"),
+            ], &caller).await;
+            assert!(!refused.is_ok(), "{role}/{kind} must refuse --turn-scoped");
+            assert!(refused.message().contains("--turn-scoped"), "{}", refused.message());
+        }
+        assert_eq!(d.block_store().block_snapshots(ctx).unwrap().len(), 2, "a refusal writes nothing");
     }
 
     #[tokio::test]

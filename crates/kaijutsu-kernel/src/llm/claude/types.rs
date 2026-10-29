@@ -123,9 +123,14 @@ impl SystemBlock {
 pub struct RequestMessage {
     pub role: MessageRole,
     pub content: MessageContent,
+    /// `"next_user_message"` on a turn-scoped system message: it renders
+    /// only until a user message follows it, then stays cleared. Needs the
+    /// clear-at beta header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_at: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     User,
@@ -473,6 +478,7 @@ mod tests {
             messages: vec![RequestMessage {
                 role: MessageRole::User,
                 content: MessageContent::Text("hi".into()),
+                clear_at: None,
             }],
             system: None,
             tools: vec![],

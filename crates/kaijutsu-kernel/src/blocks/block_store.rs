@@ -1272,6 +1272,18 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Mark a block just inserted a turn-scoped instruction, before anything
+    /// reads it.
+    pub fn set_turn_scoped(&mut self, id: &BlockId) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        block.set_turn_scoped();
+        Ok(())
+    }
+
     /// Move a block to a new position.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {

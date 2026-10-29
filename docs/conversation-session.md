@@ -214,6 +214,32 @@ earlier turn in its thought, and never read the notice as the user's words.
 The system form read it as the user's words 2/16 times and the user form
 16/16 times.
 
+## Turn-scoped instructions
+
+A turn-scoped instruction serves only the turn it precedes, such as the
+storyteller's reminder after each submit. A script writes one with
+`kj block create --role system --kind notification --turn-scoped`; the mark
+is set at creation (`BlockSnapshot::turn_scoped`) and refused on any other
+role or kind. It hydrates as a system message whoever wrote it
+(`is_turn_scoped_instruction` in `llm/hydrate.rs`), so the model does not read
+it as the person's words. Delivery is unchanged: the mailbox delivers it like
+any block.
+
+Every copy stays in the log and in the conversation; nothing is edited.
+What changes is what each copy costs:
+
+- Anthropic, on a model that takes system messages mid-conversation, where
+  the API allows one at that point: the message carries
+  `clear_at: "next_user_message"` and the request names the
+  `mid-conversation-system-clear-at-2026-08-21` beta. It renders until the
+  next user message, then stays in the request cleared: no input tokens, and
+  no change to the conversation before later thinking blocks. A cache
+  breakpoint asked for on it lands on the message before it; the automatic
+  tail breakpoint skips it, so the cache advances on user turns.
+- Anywhere else (other providers, the `get_system_messages` form, a place the
+  API refuses a system message) it is an ordinary instruction and each copy
+  stays. Copies accumulate until a filtered fork or a rotation sheds them.
+
 ## A turn that ended without a reply
 
 A turn that is interrupted or fails leaves a kernel instruction after its own

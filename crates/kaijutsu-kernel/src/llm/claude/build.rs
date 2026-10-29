@@ -29,6 +29,9 @@ use crate::llm::{ContentBlock, LlmError, Message, MessageContent as KaiContent, 
 /// Anthropic's hard cap on `cache_control` breakpoints per request.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
+/// The beta header a turn-scoped system message's `clear_at` needs.
+pub(crate) const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+
 /// The beta header `thinking.block_binding` needs.
 pub(crate) const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
@@ -210,8 +213,25 @@ pub fn build_request(
         .enumerate()
         .map(|(index, message)| build_message(index, message, native[index], dialect))
         .collect::<Result<Vec<_>, _>>()?;
-    apply_message_breakpoints(&mut request_messages, &plan.message_indices);
+    // The API refuses `cache_control` on a turn-scoped message, and a
+    // cleared one is never part of a cache key: its breakpoint lands on the
+    // message before it. The automatic tail breakpoint skips them itself.
+    let message_indices: Vec<(usize, CacheTtl)> = plan
+        .message_indices
+        .iter()
+        .map(|&(mut index, ttl)| {
+            while index > 0 && request_messages.get(index).is_some_and(|m| m.clear_at.is_some()) {
+                index -= 1;
+            }
+            (index, ttl)
+        })
+        .collect();
+    apply_message_breakpoints(&mut request_messages, &message_indices);
     let cache_control = auto_tail_cache(&plan, request_messages.len(), dialect);
+    let mut betas = Vec::new();
+    if request_messages.iter().any(|m| m.clear_at.is_some()) {
+        betas.push(CLEAR_AT_BETA);
+    }
 
     Ok(MessagesRequest {
         model: opts.model.clone(),
@@ -227,7 +247,7 @@ pub fn build_request(
         output_config: None, // and this, when the adaptive tier carries effort
         stop_sequences: vec![],
         cache_control,
-        betas: Vec::new(),
+        betas,
     })
 }
 
@@ -589,7 +609,10 @@ fn build_message(index: usize, msg: &Message, native_system: bool, dialect: Dial
              unusable reasoning were dropped; the API rejects an empty message"
         )));
     }
-    Ok(RequestMessage { role, content })
+    // A turn-scoped message clears only as a system message; as user text
+    // it stays, like any other.
+    let clear_at = (role == MessageRole::System && msg.turn_scoped).then_some("next_user_message");
+    Ok(RequestMessage { role, content, clear_at })
 }
 
 /// Whether `signature` is one a stream of this dialect produced. Anthropic's
@@ -800,6 +823,65 @@ mod tests {
         assert_eq!(roles(&first), ["user", "user"]);
     }
 
+    /// A turn-scoped system message the API can take goes with
+    /// `clear_at: "next_user_message"` and its beta header: it renders for
+    /// the turn it precedes, then stays in the history cleared, costing no
+    /// input tokens and changing nothing before later thinking blocks.
+    /// Cleared copies are sent again as they were.
+    #[test]
+    fn a_turn_scoped_system_message_clears_at_the_next_user_message() {
+        let messages = [
+            Message::user("I sit."),
+            Message::system("Stay in the scene.").turn_scoped(),
+            Message::assistant("Clack, clack."),
+            Message::user("I wave."),
+            Message::system("Stay in the scene.").turn_scoped(),
+        ];
+        let req = build_request(&opts("claude-haiku-5-5"), &messages, false);
+        assert_eq!(roles(&req), ["user", "system", "assistant", "user", "system"]);
+        assert_eq!(req.betas, vec![CLEAR_AT_BETA]);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["messages"][1]["clear_at"], "next_user_message", "{v}");
+        assert_eq!(v["messages"][4]["clear_at"], "next_user_message", "{v}");
+        assert!(v["messages"][0].get("clear_at").is_none(), "{v}");
+
+        let plain = build_request(&opts("claude-haiku-5-5"), &[Message::user("hi"), Message::system("note")], false);
+        assert!(plain.betas.is_empty());
+        assert!(serde_json::to_value(&plain).unwrap()["messages"][1].get("clear_at").is_none());
+    }
+
+    /// Where the API cannot take the message as a system message, or the
+    /// model has no turn-scoped messages, it is plain user text: it stays,
+    /// and no header names a feature the body does not use.
+    #[test]
+    fn a_turn_scoped_message_without_a_system_place_is_kept_user_text() {
+        let before_user = build_request(
+            &opts("claude-haiku-5-5"),
+            &[Message::user("hi"), Message::system("note").turn_scoped(), Message::user("again")],
+            false,
+        );
+        assert_eq!(roles(&before_user), ["user", "user", "user"]);
+        assert!(before_user.betas.is_empty());
+        assert!(serde_json::to_value(&before_user).unwrap()["messages"][1].get("clear_at").is_none());
+
+        let old = build_request(&opts("claude-haiku-4-5"), &[Message::user("hi"), Message::system("note").turn_scoped()], false);
+        assert_eq!(roles(&old), ["user", "user"]);
+        assert!(old.betas.is_empty());
+    }
+
+    /// The API refuses `cache_control` on a turn-scoped message, and a
+    /// cleared one is never part of a cache key, so a breakpoint asked for
+    /// there lands on the message before it.
+    #[test]
+    fn a_cache_breakpoint_on_a_turn_scoped_message_lands_on_the_turn_before_it() {
+        let mut o = opts("claude-haiku-5-5");
+        o.cache_breakpoints = vec![CacheTarget::MessageIndex(1, CacheTtl::Ephemeral)];
+        let req = build_request(&o, &[Message::user("I sit."), Message::system("Stay.").turn_scoped()], false);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral", "{v}");
+        assert_eq!(v["messages"][1]["content"], "Stay.", "the turn-scoped message keeps plain text: {v}");
+    }
+
     /// Claude Sonnet 5, models before the feature, and DeepSeek's endpoint
     /// keep user text.
     #[test]
@@ -903,6 +985,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data_base64: Some("AAAA".into()),
             }]),
+            turn_scoped: false,
         }];
         let req = build_request(&opts("claude-haiku-4-5"), &messages, false);
         let blocks = match &req.messages[0].content {
@@ -928,6 +1011,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data_base64: None,
             }]),
+            turn_scoped: false,
         }];
         let req = build_request(&opts("claude-haiku-4-5"), &messages, false);
         let blocks = match &req.messages[0].content {
@@ -1281,6 +1365,7 @@ mod tests {
                     signature: Some("sig".into()),
                 },
             ]),
+            turn_scoped: false,
         }];
         let req = build_request(&o, &messages, false);
 
@@ -1317,6 +1402,7 @@ mod tests {
                 text: "only thinking".into(),
                 signature: Some("sig".into()),
             }]),
+            turn_scoped: false,
         }];
         let req = build_request(&o, &messages, false);
 
@@ -1686,7 +1772,7 @@ mod tests {
     }
 
     fn assistant_with(blocks: Vec<ContentBlock>) -> Vec<Message> {
-        vec![Message { role: Role::Assistant, content: KaiContent::Blocks(blocks) }]
+        vec![Message { role: Role::Assistant, content: KaiContent::Blocks(blocks), turn_scoped: false }]
     }
 
     fn built_blocks(messages: &[Message]) -> Vec<RequestContent> {
