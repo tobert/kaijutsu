@@ -1553,6 +1553,7 @@ pub(crate) mod tests {
             cache_read_tokens: None,
             cache_write_tokens: None,
             cache_ttl_secs: None,
+            input_tokens: None,
         }
     }
 

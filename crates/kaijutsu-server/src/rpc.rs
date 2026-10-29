@@ -3674,12 +3674,13 @@ impl kernel::Server for KernelImpl {
                     // row, the fields `resolve_usage_wire_fields` above
                     // doesn't need. `resolve_cache_health_wire_fields` is
                     // unit tested directly (`cache_health_wire_tests` below).
-                    let (last_call_at, cache_read_tokens, cache_write_tokens, cache_ttl_secs) =
+                    let (last_call_at, cache_read_tokens, cache_write_tokens, cache_ttl_secs, input_tokens) =
                         resolve_cache_health_wire_fields(usage);
                     c.set_last_call_at(last_call_at);
                     c.set_cache_read_tokens(cache_read_tokens);
                     c.set_cache_write_tokens(cache_write_tokens);
                     c.set_cache_ttl_secs(cache_ttl_secs);
+                    c.set_input_tokens(input_tokens);
 
                     // Background-process ambient state — app visibility into
                     // `shell_operations.rs` (kaijutsu.capnp ContextHandleInfo
@@ -8745,22 +8746,23 @@ fn resolve_usage_wire_fields(
 }
 
 /// Resolve the cache-health wire quadruple (`ContextHandleInfo.lastCallAt`/
-/// `cacheReadTokens`/`cacheWriteTokens`/`cacheTtlSecs`, `kaijutsu.capnp`
-/// @31-@34) straight off the usage row — docs/tui.md "Cache health". Unlike
+/// `cacheReadTokens`/`cacheWriteTokens`/`cacheTtlSecs`/`inputTokens`,
+/// `kaijutsu.capnp` @31-@35) straight off the usage row — docs/tui.md "Cache health". Unlike
 /// `resolve_usage_wire_fields`, every field here is already a durable
 /// `context_usage` column, so this is a pass-through, not a derived
 /// computation — but it stays a named function so the "no row = every field
 /// 0" sentinel is unit-tested independent of the capnp builder, same as its
 /// sibling above.
-fn resolve_cache_health_wire_fields(usage: Option<&ContextUsageRow>) -> (u64, u64, u64, u64) {
+fn resolve_cache_health_wire_fields(usage: Option<&ContextUsageRow>) -> (u64, u64, u64, u64, u64) {
     match usage {
         Some(u) => (
             u.updated_at as u64,
             u.cache_read_tokens as u64,
             u.cache_write_tokens as u64,
             u.cache_ttl_secs as u64,
+            u.input_tokens as u64,
         ),
-        None => (0, 0, 0, 0),
+        None => (0, 0, 0, 0, 0),
     }
 }
 
@@ -8796,7 +8798,7 @@ mod cache_health_wire_tests {
 
     #[test]
     fn no_usage_row_is_every_field_zero() {
-        assert_eq!(resolve_cache_health_wire_fields(None), (0, 0, 0, 0));
+        assert_eq!(resolve_cache_health_wire_fields(None), (0, 0, 0, 0, 0));
     }
 
     #[test]
@@ -8804,7 +8806,7 @@ mod cache_health_wire_tests {
         let u = usage_with_cache(800, 100, 3600, 1_725_000_000_000);
         assert_eq!(
             resolve_cache_health_wire_fields(Some(&u)),
-            (1_725_000_000_000, 800, 100, 3600)
+            (1_725_000_000_000, 800, 100, 3600, 40_000)
         );
     }
 
@@ -8818,7 +8820,7 @@ mod cache_health_wire_tests {
     #[test]
     fn zero_cache_accounting_is_zero_not_a_missing_row() {
         let u = usage_with_cache(0, 0, 0, 1);
-        assert_eq!(resolve_cache_health_wire_fields(Some(&u)), (1, 0, 0, 0));
+        assert_eq!(resolve_cache_health_wire_fields(Some(&u)), (1, 0, 0, 0, 40_000));
     }
 }
 

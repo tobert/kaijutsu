@@ -79,17 +79,14 @@ pub struct CacheHealth {
 /// Read cache health off a `ContextInfo`. `now_millis` is unix milliseconds,
 /// the same base `last_call_at` carries.
 ///
-/// The cached share's denominator is `context_used_tokens` — the last call's
-/// fill. The wire carries no separate input-token count, so this reads
-/// "cached share of the last call" rather than "cached share of its prompt";
-/// the two differ by the completion. A future `inputTokens` field on
-/// `ContextHandleInfo` is what would make it exact.
+/// The cached share's denominator is `input_tokens` — the last call's whole
+/// prompt, cache traffic included — so a long completion does not pull it down.
 pub fn cache_health(info: &ContextInfo, now_millis: u64) -> CacheHealth {
     let age = info
         .last_call_at
         .map(|at| Duration::from_millis(now_millis.saturating_sub(at)));
     let ttl = info.cache_ttl_secs.map(Duration::from_secs);
-    let cached_share = match (info.cache_read_tokens, info.context_used_tokens) {
+    let cached_share = match (info.cache_read_tokens, info.input_tokens) {
         (Some(read), Some(total)) if total > 0 => Some(((read * 100) / total) as u32),
         _ => None,
     };
@@ -467,6 +464,7 @@ mod tests {
             cache_read_tokens: None,
             cache_write_tokens: None,
             cache_ttl_secs: None,
+            input_tokens: None,
         }
     }
 
@@ -539,11 +537,24 @@ mod tests {
         assert_eq!(health.age_figure().text, "1m");
     }
 
+    /// The share's denominator is the last call's prompt, not its fill: a
+    /// long completion must not pull the share down.
     #[test]
-    fn the_cached_share_is_read_over_the_last_calls_fill() {
+    fn the_cached_share_is_read_over_the_last_calls_prompt() {
+        let mut c = info();
+        c.cache_read_tokens = Some(900);
+        c.input_tokens = Some(1_000);
+        c.context_used_tokens = Some(1_800);
+        assert_eq!(cache_health(&c, 0).cached_share, Some(90));
+        c.input_tokens = None;
+        assert_eq!(cache_health(&c, 0).cached_share, None);
+    }
+
+    #[test]
+    fn the_cached_share_figure_reads_whole_percent() {
         let mut c = info();
         c.cache_read_tokens = Some(910);
-        c.context_used_tokens = Some(1000);
+        c.input_tokens = Some(1000);
         assert_eq!(cache_health(&c, 0).share_figure().text, "91%");
     }
 
@@ -551,7 +562,7 @@ mod tests {
     fn a_zero_denominator_reads_as_unknown_not_as_a_division() {
         let mut c = info();
         c.cache_read_tokens = Some(910);
-        c.context_used_tokens = Some(0);
+        c.input_tokens = Some(0);
         assert_eq!(cache_health(&c, 0).share_figure().text, "—");
     }
 

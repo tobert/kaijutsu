@@ -111,6 +111,7 @@ mod tests {
             cache_read_tokens: None,
             cache_write_tokens: None,
             cache_ttl_secs: None,
+            input_tokens: None,
             context_used_pct: None,
             background_running_count: 0,
             background_oldest_running_started_at: None,

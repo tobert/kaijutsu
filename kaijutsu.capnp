@@ -1334,6 +1334,9 @@ struct ContextHandleInfo {
                                  # (300 ephemeral, 3600 extended, longest wins when mixed); 0 = the
                                  # provider/request declared no cache TTL (DeepSeek, a local model,
                                  # or a request with no breakpoints)
+  inputTokens @35 :UInt64;      # `context_usage.input_tokens`: the last call's whole prompt, cache reads and
+                                 # writes included for every provider; `contextUsedTokens` is this plus the
+                                 # completion. The cache share's denominator. 0 = unknown/none
 }
 
 struct PresetInfo {

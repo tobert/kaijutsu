@@ -1212,15 +1212,14 @@ we have"*):
   turns warning color past 80% of it and reads `6m ✗` once past it. With
   no TTL known (DeepSeek, a local model) the age stands alone — an age is
   never dressed up as an expiry. No icon; the position says what it is.
-- **`91%`** — the cached share of the last call,
-  `cacheReadTokens / contextUsedTokens`. `—` when either is unknown. The
-  denominator is the last call's whole fill (input + output) because the wire
-  carries no separate input-token count; an `inputTokens` field beside
-  `cacheReadTokens` is what would make it the prompt share exactly.
+- **`91%`** — the cached share of the last call's prompt,
+  `cacheReadTokens / inputTokens`. `—` when either is unknown. `inputTokens`
+  is the whole prompt with cache reads and writes included, the same for
+  every provider, so a long completion does not pull the share down.
 
 The wire carries all of it on `ContextHandleInfo`, beside `contextWindow` /
 `contextUsedTokens`: `lastCallAt` (unix milliseconds of the last completed
-call), `cacheReadTokens`, `cacheWriteTokens` and `cacheTtlSecs`. The TTL is
+call), `inputTokens`, `cacheReadTokens`, `cacheWriteTokens` and `cacheTtlSecs`. The TTL is
 the longest `CacheTtl` among the request's cache breakpoints
 (`llm/stream.rs`: `Ephemeral` = 300, `Extended` = 3600), recorded on the
 usage row at call completion; it is `0` when the provider path never emits

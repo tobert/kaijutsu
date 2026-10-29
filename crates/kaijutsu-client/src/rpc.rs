@@ -508,6 +508,10 @@ pub struct ContextInfo {
     /// when the provider/request declared none (0 on the wire) — DeepSeek, a
     /// local model, or a request with no breakpoints configured.
     pub cache_ttl_secs: Option<u64>,
+    /// The last completed call's whole prompt, cache reads and writes
+    /// included, or `None` when unknown (0 on the wire). The cache share's
+    /// denominator; `context_used_tokens` is this plus the completion.
+    pub input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3575,6 +3579,11 @@ fn parse_context_info(
         s => Some(s),
     };
 
+    let input_tokens = match reader.get_input_tokens() {
+        0 => None,
+        t => Some(t),
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -3610,6 +3619,7 @@ fn parse_context_info(
         cache_read_tokens,
         cache_write_tokens,
         cache_ttl_secs,
+        input_tokens,
     })
 }
 
@@ -5868,6 +5878,7 @@ mod tests {
         assert_eq!(parsed.cache_read_tokens, None);
         assert_eq!(parsed.cache_write_tokens, None);
         assert_eq!(parsed.cache_ttl_secs, None);
+        assert_eq!(parsed.input_tokens, None);
 
         // Set: a completed Claude call with an Extended-TTL breakpoint.
         let mut message2 = MessageBuilder::new_default();
@@ -5878,6 +5889,7 @@ mod tests {
         builder2.set_cache_read_tokens(800);
         builder2.set_cache_write_tokens(100);
         builder2.set_cache_ttl_secs(3600);
+        builder2.set_input_tokens(40_000);
         let reader2 = message2
             .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
             .unwrap();
@@ -5886,6 +5898,7 @@ mod tests {
         assert_eq!(parsed2.cache_read_tokens, Some(800));
         assert_eq!(parsed2.cache_write_tokens, Some(100));
         assert_eq!(parsed2.cache_ttl_secs, Some(3600));
+        assert_eq!(parsed2.input_tokens, Some(40_000));
     }
 
     /// Background-process ambient-state wire spine (`ContextHandleInfo`

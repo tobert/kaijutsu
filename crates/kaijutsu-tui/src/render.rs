@@ -707,6 +707,7 @@ mod tests {
             cache_read_tokens: Some(910),
             cache_write_tokens: None,
             cache_ttl_secs: Some(300),
+            input_tokens: Some(1_000),
         }
     }
 
