@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use kaijutsu_client::{ConnectionStatus, ContextInfo};
+use kaijutsu_client::{ConnectionStatus, ContextCost, ContextInfo};
 use ratatui::text::{Line, Span};
 
 use crate::present::Palette;
@@ -192,6 +192,9 @@ pub struct StatusModel {
     /// The last completed call's tokens against the model's window —
     /// trailing, never an estimate (`docs/tui.md`, "Status line").
     pub tokens: Option<TokenFigure>,
+    /// What the context's turns have cost (`kj price`). `None` before any
+    /// call is recorded.
+    pub cost: Option<ContextCost>,
     pub cache: CacheHealth,
     /// Pending asks across every context. Rendered `!n`.
     pub pending_asks: usize,
@@ -247,6 +250,19 @@ fn format_count(n: u64) -> String {
     } else {
         format_k(n, true)
     }
+}
+
+/// The context's cost: `$1.24`, `$0.042` under ten cents, `$123` from a
+/// hundred dollars. A `+` after the amount says some calls had no price, so
+/// the cost is at least that; `$?` says no call had one. An unknown cost is
+/// never written as a free one.
+pub fn cost_figure(cost: &ContextCost) -> Figure {
+    if cost.priced_calls == 0 {
+        return Figure::ok("$?");
+    }
+    let amount = kaijutsu_types::format_micro_dollars(cost.micros);
+    let at_least = if cost.unpriced_calls > 0 { "+" } else { "" };
+    Figure::ok(format!("{amount}{at_least}"))
 }
 
 /// `17.3` / `128` / `1.2M`-free: thousands with one decimal under 100k,
@@ -307,7 +323,7 @@ impl StatusModel {
         figures
     }
 
-    /// The right half: separator, vi mode, tokens, cache health, connection trouble.
+    /// The right half: separator, vi mode, tokens, cost, cache health, connection trouble.
     pub fn right_figures(&self) -> Vec<Figure> {
         let mut figures = Vec::new();
         // The separator stands left of the mode whatever else is shown,
@@ -318,6 +334,9 @@ impl StatusModel {
         }
         if let Some(tokens) = &self.tokens {
             figures.push(tokens.figure());
+        }
+        if let Some(cost) = &self.cost {
+            figures.push(cost_figure(cost));
         }
         figures.push(self.cache.share_figure());
         figures.push(self.cache.age_figure());
@@ -464,6 +483,7 @@ mod tests {
             cache_write_tokens: None,
             cache_ttl_secs: None,
             input_tokens: None,
+            cost: None,
         }
     }
 
@@ -599,6 +619,7 @@ mod tests {
             ],
             mode: "-- NORMAL --".to_string(),
             tokens: Some(TokenFigure { used: 17_300, window: Some(128_000) }),
+            cost: None,
             cache: CacheHealth {
                 age: Some(Duration::from_secs(252)),
                 ttl: Some(Duration::from_secs(300)),
@@ -674,6 +695,52 @@ mod tests {
         assert_eq!(f.text, "1.2M/2M");
         assert_eq!(TokenFigure { used: 1_500_000, window: None }.figure().text, "1.5M");
         assert_eq!(TokenFigure { used: 950_000, window: Some(1_000_000) }.figure().severity, Severity::Alarm);
+    }
+
+    fn priced(micros: u64, priced_calls: u64, unpriced_calls: u64) -> ContextCost {
+        ContextCost { micros, priced_calls, unpriced_calls }
+    }
+
+    /// Dollars scale with the amount: thousandths under ten cents, cents to a
+    /// hundred dollars, whole dollars past it.
+    #[test]
+    fn the_cost_figure_scales_its_precision_with_the_amount() {
+        for (micros, text) in [
+            (0, "$0.000"),
+            (42_000, "$0.042"),
+            (99_600, "$0.100"),
+            (100_000, "$0.10"),
+            (1_240_000, "$1.24"),
+            (99_994_000, "$99.99"),
+            (123_400_000, "$123"),
+        ] {
+            assert_eq!(cost_figure(&priced(micros, 3, 0)).text, text, "{micros}");
+        }
+    }
+
+    /// Unpriced calls are never free: partly priced reads as at-least, and
+    /// wholly unpriced reads as unknown.
+    #[test]
+    fn unpriced_calls_read_as_at_least_or_unknown_never_as_free() {
+        assert_eq!(cost_figure(&priced(1_240_000, 3, 2)).text, "$1.24+");
+        assert_eq!(cost_figure(&priced(0, 0, 4)).text, "$?");
+        assert_eq!(cost_figure(&priced(0, 0, 4)).severity, Severity::Ok);
+    }
+
+    /// Cost stands between the tokens and the cache health, and is absent
+    /// until the context has recorded a call.
+    #[test]
+    fn the_status_line_puts_cost_after_the_tokens() {
+        let model = StatusModel {
+            mode: "-- NORMAL --".to_string(),
+            tokens: Some(TokenFigure { used: 17_300, window: Some(128_000) }),
+            cost: Some(priced(1_240_000, 3, 0)),
+            ..Default::default()
+        };
+        let texts: Vec<String> = model.right_figures().into_iter().map(|f| f.text).collect();
+        assert_eq!(texts[..4], ["│", "-- NORMAL --", "17.3/128k", "$1.24"]);
+        let none = StatusModel { cost: None, ..model };
+        assert!(none.right_figures().iter().all(|f| !f.text.starts_with('$')));
     }
 
     #[test]

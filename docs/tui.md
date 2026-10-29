@@ -1187,13 +1187,25 @@ spelling); the last completed call's tokens over the model's window,
 `17.3/128k` — both in thousands, the unit once (a window of a million or
 more puts each half in its own unit: `234k/1M`), trailing by one call and
 never an estimate (the kernel does not tokenize locally), warning at 75%
-of the window and alarm at 90%; cache health (next); bar.beat and pulse
+of the window and alarm at 90%; the context's cost, `$1.24` (`kj price`;
+`$0.042` under ten cents, `$123` from a hundred dollars), then cache health
+(next); bar.beat and pulse
 for the playing track; and connection state from `ConnectionStatus` only
 while it is not `Connected` — a healthy connection says nothing,
 `◐ connecting`, `◐ retrying` and `○ offline` do (Amy: *"where 'ok' is,
 that's not super useful"*). No icons on the right half (Amy, 2026-09-04:
 *"let's try without for now"*); the `▮ 42%` occupancy figure is gone,
 the token count says the same thing in the units we think in.
+
+- **Cost** is the lifetime cost of the current context, each turn priced by
+  the price in force when it started. Prices belong to `kj price`, whose
+  history is append-only. The figure is absent until
+  the context records a call. A `+` after the amount (`$1.24+`) says some
+  calls had no price, so the cost is at least that; `$?` says no call had
+  one. An unknown cost is never written as a free one: a model that costs
+  nothing has a price of zero (`kj price set <model> --free`). The wire
+  carries `costMicros`, `costPricedCalls` and `costUnpricedCalls` on
+  `ContextHandleInfo`, and `kj context info` says the same in words.
 
 - The pulse and the spinner stop while the terminal is unfocused
   (`render::strip_animating`, `docs/tui.md`, "What owning the screen lets

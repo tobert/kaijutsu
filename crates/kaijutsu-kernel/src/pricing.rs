@@ -97,15 +97,18 @@ pub struct ContextCost {
     pub unpriced_calls: u64,
 }
 
-/// Every context's cost, each turn priced by the price in force when it
-/// started. `style_of` maps a provider name to how it counts input.
+/// The cost of one context, or of every context with turns, each turn priced
+/// by the price in force when it started. `style_of` maps a provider name to
+/// how it counts input, or `None` for a provider that is no longer configured:
+/// its input convention is unknown, so its calls are unpriced.
 pub fn context_costs(
     db: &KernelDb,
-    style_of: impl Fn(&str) -> InputStyle,
+    context: Option<ContextId>,
+    style_of: impl Fn(&str) -> Option<InputStyle>,
 ) -> KernelDbResult<HashMap<ContextId, ContextCost>> {
     let mut prices: HashMap<i64, Option<ModelPriceRow>> = HashMap::new();
     let mut costs: HashMap<ContextId, ContextCost> = HashMap::new();
-    for group in db.context_cost_groups(None)? {
+    for group in db.context_cost_groups(context)? {
         let calls = group.llm_calls.max(0) as u64;
         let price = match group.price_id {
             Some(id) => match prices.entry(id) {
@@ -114,9 +117,9 @@ pub fn context_costs(
             },
             None => None,
         };
-        let micros = price
-            .as_ref()
-            .and_then(|p| cost_micros(p, style_of(&group.provider), &Tokens::from(&group)));
+        let micros = price.as_ref().zip(style_of(&group.provider)).and_then(|(p, style)| {
+            cost_micros(p, style, &Tokens::from(&group))
+        });
         let entry = costs.entry(group.context_id).or_default();
         match micros {
             Some(m) => {

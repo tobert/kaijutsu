@@ -1336,6 +1336,13 @@ struct ContextHandleInfo {
   inputTokens @35 :UInt64;      # `context_usage.input_tokens`: the last call's whole prompt, cache reads and
                                  # writes included for every provider; `contextUsedTokens` is this plus the
                                  # completion. The cache share's denominator. 0 = unknown/none
+  # What this context's turns have cost (`kj price`, `pricing.rs`): micro-dollars over the calls a
+  # price covered, and how many calls were and were not priced. A call is unpriced when no price was
+  # in force when its turn started or the price lacks a rate the call needed. Both counts 0 = the
+  # context has no recorded calls; priced 0 with unpriced > 0 = every call's cost is unknown.
+  costMicros @36 :UInt64;
+  costPricedCalls @37 :UInt64;
+  costUnpricedCalls @38 :UInt64;
 }
 
 struct PresetInfo {

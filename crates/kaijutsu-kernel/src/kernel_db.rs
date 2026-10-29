@@ -13451,11 +13451,15 @@ mod tests {
             db.begin_turn(&start).unwrap();
             db.add_turn_usage(start.turn_id, RawUsage { input: 1_000_000, ..Default::default() }).unwrap();
         }
-        let costs = context_costs(&db, |_| InputStyle::ExcludesCache).unwrap();
+        let costs = context_costs(&db, None, |p| (p == "anthropic").then_some(InputStyle::ExcludesCache)).unwrap();
         assert_eq!(
             costs[&ctx.context_id],
             ContextCost { micros: 3_000_000, priced_calls: 2, unpriced_calls: 2 }
         );
+        // A provider that is no longer configured has an unknown input
+        // convention, so even a priced turn on it is unpriced.
+        let unknown = context_costs(&db, Some(ctx.context_id), |_| None).unwrap();
+        assert_eq!(unknown[&ctx.context_id], ContextCost { micros: 0, priced_calls: 0, unpriced_calls: 4 });
     }
 
     /// A count or an end with nowhere to land is an error, not a no-op: the

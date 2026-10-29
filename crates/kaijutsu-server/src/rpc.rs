@@ -3588,6 +3588,30 @@ impl kernel::Server for KernelImpl {
                         Err(_) => HashMap::new(),
                     }
                 };
+                // Context → what its turns have cost, each turn priced by the
+                // price in force when it started (`kj price`). One query for
+                // the whole kernel. A read failure is logged and leaves every
+                // cost absent, which the client shows as no figure rather than
+                // a wrong one.
+                let cost_map: HashMap<ContextId, kaijutsu_kernel::pricing::ContextCost> = {
+                    use kaijutsu_kernel::pricing::InputStyle;
+                    let styles: HashMap<String, InputStyle> = kernel_arc
+                        .llm()
+                        .read()
+                        .await
+                        .backend_configs()
+                        .iter()
+                        .map(|b| (b.name.clone(), InputStyle::for_kind(&b.kind)))
+                        .collect();
+                    let db = kernel_db_arc.lock();
+                    match kaijutsu_kernel::pricing::context_costs(&db, None, |provider| styles.get(provider).copied()) {
+                        Ok(costs) => costs,
+                        Err(e) => {
+                            log::error!("list_contexts: context costs unreadable: {e}");
+                            HashMap::new()
+                        }
+                    }
+                };
                 // Background-process ambient state — one query for the whole
                 // kernel (same batching convention as usage_map/track_of
                 // above). A context absent from the map has no background
@@ -3681,6 +3705,12 @@ impl kernel::Server for KernelImpl {
                     c.set_cache_write_tokens(cache_write_tokens);
                     c.set_cache_ttl_secs(cache_ttl_secs);
                     c.set_input_tokens(input_tokens);
+
+                    let (cost_micros, cost_priced_calls, cost_unpriced_calls) =
+                        resolve_cost_wire_fields(cost_map.get(&ctx.id));
+                    c.set_cost_micros(cost_micros);
+                    c.set_cost_priced_calls(cost_priced_calls);
+                    c.set_cost_unpriced_calls(cost_unpriced_calls);
 
                     // Background-process ambient state — app visibility into
                     // `shell_operations.rs` (kaijutsu.capnp ContextHandleInfo
@@ -8763,6 +8793,33 @@ fn resolve_cache_health_wire_fields(usage: Option<&ContextUsageRow>) -> (u64, u6
             u.input_tokens as u64,
         ),
         None => (0, 0, 0, 0, 0),
+    }
+}
+
+/// Resolve the cost wire triple (`ContextHandleInfo.costMicros`/
+/// `costPricedCalls`/`costUnpricedCalls`, `kaijutsu.capnp` @36-@38) from a
+/// context's cost. A context with no recorded calls is `(0, 0, 0)`; one whose
+/// calls all lack a price is `(0, 0, n)`, which the client reads as an
+/// unknown cost, not a free one.
+fn resolve_cost_wire_fields(cost: Option<&kaijutsu_kernel::pricing::ContextCost>) -> (u64, u64, u64) {
+    match cost {
+        Some(c) => (c.micros, c.priced_calls, c.unpriced_calls),
+        None => (0, 0, 0),
+    }
+}
+
+#[cfg(test)]
+mod cost_wire_tests {
+    use super::resolve_cost_wire_fields;
+    use kaijutsu_kernel::pricing::ContextCost;
+
+    #[test]
+    fn no_cost_is_all_zero_and_unpriced_calls_ride_apart() {
+        assert_eq!(resolve_cost_wire_fields(None), (0, 0, 0));
+        let priced = ContextCost { micros: 1_240_000, priced_calls: 5, unpriced_calls: 2 };
+        assert_eq!(resolve_cost_wire_fields(Some(&priced)), (1_240_000, 5, 2));
+        let unknown = ContextCost { micros: 0, priced_calls: 0, unpriced_calls: 3 };
+        assert_eq!(resolve_cost_wire_fields(Some(&unknown)), (0, 0, 3));
     }
 }
 

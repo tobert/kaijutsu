@@ -222,6 +222,7 @@ mod tests {
             cache_write_tokens: None,
             cache_ttl_secs: None,
             input_tokens: None,
+            cost: None,
         }
     }
 

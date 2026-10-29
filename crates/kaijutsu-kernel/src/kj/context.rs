@@ -856,6 +856,11 @@ impl KjDispatcher {
             None => (None, None),
         };
 
+        let cost = match self.context_cost(row.context_id).await {
+            Ok(cost) => cost,
+            Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+        };
+
         let mut info = format_context_info(
             &row,
             children_count,
@@ -934,6 +939,9 @@ impl KjDispatcher {
             turn_totals.cache_write_tokens,
             turn_totals.reasoning_tokens,
         ));
+        if let Some(cost) = &cost {
+            info.push_str(&format!("\nCost:    {}", describe_cost(cost)));
+        }
 
         if let Some(paths) = workspace_paths.as_ref().filter(|p| !p.is_empty()) {
             let ws_label = workspace_label.clone().unwrap_or_else(|| "?".into());
@@ -1056,6 +1064,13 @@ impl KjDispatcher {
             "cache_write_tokens": turn_totals.cache_write_tokens,
             "reasoning_tokens": turn_totals.reasoning_tokens,
         });
+        // `micros` is null when no call could be priced: an unknown cost is
+        // not a zero one.
+        record["cost"] = serde_json::json!(cost.as_ref().map(|c| serde_json::json!({
+            "micros": (c.priced_calls > 0).then_some(c.micros),
+            "priced_calls": c.priced_calls,
+            "unpriced_calls": c.unpriced_calls,
+        })));
         record["reviewer_id"] = serde_json::json!(effective_review.as_ref().map(|review| review.reviewer.principal_id.to_hex()));
         record["reviewer_name"] = serde_json::json!(reviewer_name);
         record["review_source"] = serde_json::json!(effective_review.as_ref().map(|review| review.source.as_str()));
@@ -2936,6 +2951,19 @@ impl Classify for ContextCommand {
             | Self::Hydrate { .. } => Effect::Write,
             Self::Archive { .. } | Self::Retag { .. } => Effect::Destroy,
         }
+    }
+}
+
+/// How `kj context info` writes a context's cost. Calls with no price are
+/// said plainly: the amount is then a floor, or wholly unknown.
+fn describe_cost(cost: &crate::pricing::ContextCost) -> String {
+    let priced = |n: u64| if n == 1 { "1 call priced".to_string() } else { format!("{n} calls priced") };
+    let unpriced = |n: u64| if n == 1 { "1 call has no price".to_string() } else { format!("{n} calls have no price") };
+    let amount = kaijutsu_types::format_micro_dollars(cost.micros);
+    match (cost.priced_calls, cost.unpriced_calls) {
+        (_, 0) => format!("{amount} ({})", priced(cost.priced_calls)),
+        (0, n) => format!("unknown ({}: `kj price set <backend>/<model> --input <$/M> --output <$/M>`)", unpriced(n)),
+        (_, n) => format!("at least {amount} ({}, {}: `kj price list`)", priced(cost.priced_calls), unpriced(n)),
     }
 }
 
@@ -6140,6 +6168,52 @@ mod tests {
         let one = d.dispatch(&[s("context"), s("turns"), s("--limit"), s("1")], &c).await;
         let KjResult::Ok { data: Some(data), .. } = &one else { panic!("turns carries a record") };
         assert_eq!(data.as_array().unwrap().len(), 1);
+    }
+
+    /// `kj context info` says what the context's turns cost: a price makes a
+    /// dollar figure, a turn with no price is counted apart and called
+    /// unknown, and a context with no calls says nothing about cost.
+    #[tokio::test]
+    async fn context_info_says_what_the_turns_cost_and_what_has_no_price() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        {
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
+        }
+        d.reload_llm_registry().await.unwrap();
+        let ctx = register_context(&d, Some("pricey"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let none = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(!none.message().contains("Cost:"), "{}", none.message());
+
+        let run = |provider: &str, at: i64, input: u64| {
+            let db = d.kernel_db().lock();
+            let turn_id = kaijutsu_types::TurnId::new();
+            db.begin_turn(&crate::TurnStart {
+                turn_id, context_id: ctx, performer: PrincipalId::new(),
+                role: "coder".into(), provider: provider.into(), model: "m".into(), started_at: at,
+            }).unwrap();
+            db.add_turn_usage(turn_id, crate::RawUsage { input, output: 0, ..Default::default() }).unwrap();
+        };
+        run("anthropic", 1_000, 1_000_000);
+        let unknown = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(unknown.message().contains("\nCost:    unknown (1 call has no price"), "{}", unknown.message());
+        let KjResult::Ok { data: Some(data), .. } = &unknown else { panic!("info carries a record") };
+        assert_eq!(data["cost"]["priced_calls"], 0);
+        assert_eq!(data["cost"]["unpriced_calls"], 1);
+        assert!(data["cost"]["micros"].is_null(), "an unknown cost is null, not zero: {data}");
+
+        let set = d.dispatch(&[s("price"), s("set"), s("anthropic/m"), s("--input"), s("2"), s("--output"), s("10"), s("--from"), s("500")], &test_caller()).await;
+        assert!(set.is_ok(), "{}", set.message());
+        run("anthropic", 2_000, 1_000_000);
+        run("ollama", 3_000, 1_000_000);
+        let partial = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(partial.message().contains("\nCost:    at least $4.00 (2 calls priced, 1 call has no price"), "{}", partial.message());
+        let KjResult::Ok { data: Some(data), .. } = &partial else { panic!("info carries a record") };
+        assert_eq!(data["cost"]["micros"], 4_000_000);
+        assert_eq!(data["cost"]["priced_calls"], 2);
+        assert_eq!(data["cost"]["unpriced_calls"], 1);
     }
 
     /// `kj context info --json`'s `usage` field is the token-usage gauge's

@@ -47,6 +47,7 @@ pub mod ask;
 pub mod block;
 pub mod codec;
 pub mod context;
+pub mod cost;
 pub mod dag;
 pub mod editor;
 pub mod enums;
@@ -164,6 +165,7 @@ pub use block::{
 };
 pub use error_block::IntoErrorPayload;
 pub use summary::summarize_thinking;
+pub use cost::format_micro_dollars;
 pub use context::{CONSOLE_CONTEXT_TYPE, Context, ROOT_CONTEXT_TYPE, RING_SLOTS, SHELL_CONTEXT_TYPE, fork_lineage};
 pub use dag::ConversationDAG;
 pub use enums::{ContextState, DocKind, ForkKind};

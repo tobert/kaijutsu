@@ -6,6 +6,41 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Token and cost accounting: what is open (2026-10-29)
+
+Prices (`kj price`, `model_prices`), cache writes split by TTL, the cost
+figure in the TUI status line and `kj context info`, and usage recorded for a
+Claude reply cut short have shipped. Open:
+
+- A provider error that arrives while a turn is being cancelled returns before
+  the `Error` arm of `process_llm_stream`, so a failed call's usage is dropped
+  on that path. The megakernel and codex backends attach no usage to errors,
+  and codex reports none on `Done`.
+- A server that copies OpenAI's chat completions (lemonade, llama.cpp) may name
+  its cache fields differently from `prompt_tokens_details.cached_tokens`. The
+  share shows `—` there. Capture a real response before adding fields.
+- `reasoning_tokens` means different things: DeepSeek counts reasoning inside
+  output, Claude reports none. Claude thinking tokens count in `output_tokens`
+  and so in the fill gauge, though history drops them.
+- `list_contexts` attaches a window only when the bound model's `backend` equals
+  the usage row's `provider`; a mismatch hides the window with no message.
+- The app dock shows used/window only: no cache share, cache age or cost.
+- Turns recorded before the cache-write split keep `cache_write_1h_tokens` at
+  0, so a 1-hour write in one of them is priced at the 5-minute rate. No test
+  covers the `ALTER TABLE turns` migration on an old database.
+- A cost group is the unit of pricing: one turn that used a cache rate its
+  price lacks makes every turn in its (context, model, price) group unpriced.
+- Cost is the context's lifetime total. There is no last-call cost, no
+  per-model breakdown, and `kj context turns` does not show a cost per turn.
+- A kernel starts with no prices, so every cost reads unknown until someone
+  runs `kj price set`. Existing hosts get the `kj price set` allow for the
+  director and root seats only after `kj config reset gate.toml`.
+- SillyTavern's edit-cost notes (`llm::prefix::edit_cost_note`,
+  `report_divergence`) state token counts only. They can call
+  `pricing::cost_micros` once they know the provider, model and time.
+
+---
+
 ## senpai/kohai branch: what the merge with `main` leaves open (2026-10-28)
 
 `feat/senpai-kohai` merged `main` at `befa6384`. Four `kaijutsu-tui`

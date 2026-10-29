@@ -506,6 +506,18 @@ pub struct ContextInfo {
     /// included, or `None` when unknown (0 on the wire). The cache share's
     /// denominator; `context_used_tokens` is this plus the completion.
     pub input_tokens: Option<u64>,
+    /// What the context's turns have cost, or `None` when it has recorded no
+    /// calls. Unpriced calls are counted apart, never as free.
+    pub cost: Option<ContextCost>,
+}
+
+/// A context's cost: micro-dollars over the calls a price covered, and how
+/// many calls were and were not priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextCost {
+    pub micros: u64,
+    pub priced_calls: u64,
+    pub unpriced_calls: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3571,6 +3583,13 @@ fn parse_context_info(
         t => Some(t),
     };
 
+    let cost = match (reader.get_cost_priced_calls(), reader.get_cost_unpriced_calls()) {
+        (0, 0) => None,
+        (priced_calls, unpriced_calls) => {
+            Some(ContextCost { micros: reader.get_cost_micros(), priced_calls, unpriced_calls })
+        }
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -3606,6 +3625,7 @@ fn parse_context_info(
         cache_write_tokens,
         cache_ttl_secs,
         input_tokens,
+        cost,
     })
 }
 
@@ -5865,6 +5885,7 @@ mod tests {
         assert_eq!(parsed.cache_write_tokens, None);
         assert_eq!(parsed.cache_ttl_secs, None);
         assert_eq!(parsed.input_tokens, None);
+        assert_eq!(parsed.cost, None);
 
         // Set: a completed Claude call with an Extended-TTL breakpoint.
         let mut message2 = MessageBuilder::new_default();
@@ -5885,6 +5906,29 @@ mod tests {
         assert_eq!(parsed2.cache_write_tokens, Some(100));
         assert_eq!(parsed2.cache_ttl_secs, Some(3600));
         assert_eq!(parsed2.input_tokens, Some(40_000));
+    }
+
+    /// Cost rides as micro-dollars plus the priced and unpriced call counts;
+    /// no calls at all is no cost, and unpriced calls alone are an unknown
+    /// cost, not a zero one.
+    #[test]
+    fn test_parse_context_info_cost_roundtrip() {
+        let parse = |micros: u64, priced: u64, unpriced: u64| {
+            let mut message = MessageBuilder::new_default();
+            let mut builder = message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+            builder.set_id(&[12u8; 16]);
+            builder.set_cost_micros(micros);
+            builder.set_cost_priced_calls(priced);
+            builder.set_cost_unpriced_calls(unpriced);
+            let reader = message
+                .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+                .unwrap();
+            parse_context_info(&reader).unwrap().cost
+        };
+        assert_eq!(parse(0, 0, 0), None);
+        assert_eq!(parse(1_240_000, 5, 0), Some(ContextCost { micros: 1_240_000, priced_calls: 5, unpriced_calls: 0 }));
+        assert_eq!(parse(0, 0, 3), Some(ContextCost { micros: 0, priced_calls: 0, unpriced_calls: 3 }));
+        assert_eq!(parse(900, 2, 1), Some(ContextCost { micros: 900, priced_calls: 2, unpriced_calls: 1 }));
     }
 
     /// Background-process ambient-state wire spine (`ContextHandleInfo`

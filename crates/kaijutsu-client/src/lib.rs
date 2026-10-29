@@ -35,7 +35,7 @@ pub use actor::{
     UnansweredCommands, spawn_actor,
 };
 pub use rpc::{
-    AskAnswer, AskListing, AuthorBlock, Completion, CompletionKind, ContextCluster, ContextInfo, ContextMcpRefusal,
+    AskAnswer, AskListing, AuthorBlock, Completion, CompletionKind, ContextCluster, ContextCost, ContextInfo, ContextMcpRefusal,
     ContextMcpServerDecl, ContextMembership,
     EditorState, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     McpResource, MountSpec, PeerInfo, PresetInfo,

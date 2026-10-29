@@ -146,6 +146,28 @@ impl KjDispatcher {
         }
     }
 
+    /// What one context's turns have cost, each priced by the price in force
+    /// when it started. `None` when the context has recorded no calls.
+    pub(crate) async fn context_cost(
+        &self,
+        context: kaijutsu_types::ContextId,
+    ) -> Result<Option<crate::pricing::ContextCost>, String> {
+        use crate::pricing::InputStyle;
+        let styles: std::collections::HashMap<String, InputStyle> = self
+            .kernel()
+            .llm()
+            .read()
+            .await
+            .backend_configs()
+            .iter()
+            .map(|b| (b.name.clone(), InputStyle::for_kind(&b.kind)))
+            .collect();
+        let db = self.kernel_db().lock();
+        let mut costs = crate::pricing::context_costs(&db, Some(context), |p| styles.get(p).copied())
+            .map_err(|e| format!("context cost unreadable: {e}"))?;
+        Ok(costs.remove(&context))
+    }
+
     fn price_list(&self) -> KjResult {
         let now = kaijutsu_types::now_millis() as i64;
         let db = self.kernel_db().lock();

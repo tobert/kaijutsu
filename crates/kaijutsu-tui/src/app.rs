@@ -738,6 +738,7 @@ impl App {
             tokens: info.and_then(|c| {
                 c.context_used_tokens.map(|used| crate::status::TokenFigure { used, window: c.context_window })
             }),
+            cost: info.and_then(|c| c.cost),
             cache: self.cache_health(now_millis),
             pending_asks: self.open_asks.len(),
             connection: self.connection.clone(),
@@ -926,6 +927,7 @@ mod tests {
             cache_write_tokens: None,
             cache_ttl_secs: None,
             input_tokens: None,
+            cost: None,
         }
     }
 
