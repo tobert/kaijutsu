@@ -226,7 +226,7 @@ mod tests {
     impl crate::mcp::Hook for ReceiptReadFault {
         async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, _cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-            self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_test_mut().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                 AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,
                 _ => Authorization::Allow,
             })).unwrap();
@@ -270,7 +270,7 @@ mod tests {
             }
             // Drain accepted work while the receipt-source read remains unavailable.
             let shutdown = kernel.shutdown_runtime_worker().await;
-            kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
             if action == "panic" { assert!(shutdown.is_err()); } else { shutdown.unwrap(); }
             let operations = kernel.shell_operations().list_for_context(identity.context).unwrap();
             assert_eq!(operations.len(), 1);

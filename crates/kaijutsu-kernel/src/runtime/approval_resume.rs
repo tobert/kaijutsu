@@ -1923,7 +1923,7 @@ mod lifetime_tests {
                     "ALTER TABLE contexts RENAME TO unavailable_contexts"
                 ).unwrap();
             } else {
-                kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                kernel.kernel_db().lock().conn_for_test_mut().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                     AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,
                     _ => Authorization::Allow,
                 })).unwrap();
@@ -1947,7 +1947,7 @@ mod lifetime_tests {
                     "ALTER TABLE unavailable_contexts RENAME TO contexts"
                 ).unwrap();
             } else {
-                kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
             }
             let retried = act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
             assert!(matches!(retried, ExecAction::Tell(_) | ExecAction::Settled));

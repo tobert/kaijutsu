@@ -609,7 +609,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                                 }
                             }
                         }).await.expect("script must commit its effect before fault injection");
-                        d.kernel_db().lock().conn_for_ledger().authorizer(Some(move |auth: AuthContext<'_>| {
+                        d.kernel_db().lock().conn_for_test_mut().authorizer(Some(move |auth: AuthContext<'_>| {
                             match auth.action {
                                 AuthAction::Update { table_name: "rc_run_scripts", column_name } if column_name == column => Authorization::Deny,
                                 _ => Authorization::Allow,
@@ -619,7 +619,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                         let result = tokio::time::timeout(std::time::Duration::from_secs(3), &mut run).await.unwrap();
                         assert!(result.is_err(), "{column} fault must stop the lifecycle");
                         assert!(d.kernel().shutdown_runtime_worker().await.is_err(), "unsettled output must make shutdown fail");
-                        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                        d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
                         let contents = if column == "projected_at" {
                             assert!(d.kernel().shutdown_runtime_worker().await.is_err(),
                                 "a failed block journal transaction requires document recovery");
@@ -657,7 +657,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                     install_rc_script_file(&d, "/config/rc/record-refusal/create/S00-mutation.kai",
                         "kj block create --role system --kind text --content must-not-execute-unrecorded").await;
                     let admission = admit(&d, context);
-                    d.kernel_db().lock().conn_for_ledger().authorizer(Some(move |auth: AuthContext<'_>| {
+                    d.kernel_db().lock().conn_for_test_mut().authorizer(Some(move |auth: AuthContext<'_>| {
                         let denied = match auth.action {
                             AuthAction::Insert { table_name } => table_name == stage,
                             AuthAction::Update { table_name: "rc_runs", column_name: "script_count" } => stage == "script_count",
@@ -666,7 +666,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                         if denied { Authorization::Deny } else { Authorization::Allow }
                     })).unwrap();
                     let result = crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(context)).await;
-                    d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                    d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
                     assert!(result.is_err(), "a {stage} write failure must be returned");
                     let blocks = d.block_store().block_snapshots(context).unwrap_or_default();
                     assert!(!blocks.iter().any(|block| block.content == "must-not-execute-unrecorded"),

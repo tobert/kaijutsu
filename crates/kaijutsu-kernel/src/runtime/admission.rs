@@ -126,7 +126,7 @@ mod tests {
         let dispatcher = test_dispatcher_persistent().await;
         let kernel = dispatcher.kernel();
         let context = register_context(&dispatcher, Some("unreadable-admission"), None, PrincipalId::new());
-        kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        kernel.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Read { table_name: "contexts", .. } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
@@ -135,7 +135,7 @@ mod tests {
         let error = kernel.spawn_context_task(context, move |_, _| async move {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }).unwrap_err();
-        kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
         kernel.shutdown_runtime_worker().await.unwrap();
         assert!(error.contains("could not admit"), "{error}");
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));

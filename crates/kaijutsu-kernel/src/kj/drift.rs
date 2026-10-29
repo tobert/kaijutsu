@@ -2190,7 +2190,7 @@ mod tests {
         let target = register_context(&d, Some("rc-fault-drift-target"), None, principal);
         d.block_store().create_document(target, crate::DocumentKind::Conversation, None).unwrap();
         let c = caller_with_context(source);
-        d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        d.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
@@ -2198,7 +2198,7 @@ mod tests {
         let result = d.dispatch(
             &[s("drift"), s("push"), s("rc-fault-drift-target"), s("delivered-once")], &c,
         ).await;
-        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         assert!(!result.is_ok(), "rc admission fault must report the committed delivery");
         assert!(result.message().contains("delivered to"), "{}", result.message());
@@ -2549,12 +2549,12 @@ mod tests {
             ).await;
             assert!(staged.is_ok(), "stage failed: {}", staged.message());
         }
-        d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        d.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
         let result = d.dispatch(&[s("drift"), s("flush")], &caller).await;
-        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         assert!(!result.is_ok(), "rc admission fault must stop flush after committed delivery");
         assert!(result.message().contains("released without consuming a retry"), "{}", result.message());

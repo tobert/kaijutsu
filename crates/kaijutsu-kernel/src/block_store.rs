@@ -7384,7 +7384,7 @@ mod tests {
         {
             let counter = commits.clone();
             db.lock()
-                .conn_for_ledger()
+                .conn_for_test_mut()
                 .commit_hook(Some(move || {
                     counter.fetch_add(1, Ordering::SeqCst);
                     false

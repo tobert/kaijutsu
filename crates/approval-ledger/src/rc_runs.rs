@@ -652,7 +652,7 @@ mod tests {
         let entered = Arc::clone(&entered_update);
         let release = Arc::clone(&release_update);
         let writer = std::thread::spawn(move || {
-            let conn = Connection::open(thread_path).unwrap();
+            let mut conn = Connection::open(thread_path).unwrap();
             conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
                 if matches!(context.action, AuthAction::Update { table_name, column_name }
                     if table_name == "rc_run_scripts" && column_name == "result_json")

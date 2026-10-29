@@ -3527,8 +3527,8 @@ mod tests {
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         {
-            let db = d.kernel_db().lock();
-            db.conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            let mut db = d.kernel_db().lock();
+            db.conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
                 AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
                 _ => Authorization::Allow,
             })).unwrap();
@@ -3537,7 +3537,7 @@ mod tests {
         let result = d.dispatch(
             &[s("kohai"), s("create"), s("--as"), s("kohai-tester"), s("rc-admission-fault-child")], &c,
         ).await;
-        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         assert!(!result.is_ok(), "rc admission fault must not report a clean create");
         assert!(result.message().contains("was committed"), "{}", result.message());
@@ -3945,12 +3945,12 @@ mod tests {
 
         let f = rotation_fixture().await;
         let caller = rotation_caller(f.seat, f.banto);
-        f.d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        f.d.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
         let result = f.d.dispatch(&[s("context"), s("rotate")], &caller).await;
-        f.d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        f.d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         assert!(!result.is_ok(), "rc admission fault must report a partial rotation");
         assert!(result.message().contains("stays live"), "{}", result.message());

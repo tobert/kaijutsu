@@ -318,9 +318,9 @@ mod tests {
                     std::task::Poll::Ready(())
                 }).await;
                 {
-                    let db = review.kernel.kernel_db().lock();
+                    let mut db = review.kernel.kernel_db().lock();
                     if read_fault {
-                        db.conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                        db.conn_for_test_mut().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                             AuthAction::Read { table_name: "shell_operations" | "shell_result_reviews", .. } => Authorization::Deny,
                             _ => Authorization::Allow,
                         })).unwrap();
@@ -339,8 +339,8 @@ mod tests {
                 assert_eq!(serde_json::to_value(&interrupted).unwrap(), serde_json::to_value(&pending[0].1).unwrap(),
                     "cancellation must keep the exact interrupted result already owned by retention");
                 {
-                    let db = review.kernel.kernel_db().lock();
-                    db.conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                    let mut db = review.kernel.kernel_db().lock();
+                    db.conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
                     if !read_fault { db.conn_for_ledger().execute_batch("DROP TRIGGER fail_interrupt").unwrap(); }
                 }
                 review.settle(&interrupted).unwrap();

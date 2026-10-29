@@ -2366,7 +2366,7 @@ mod tests {
         let d = gate_dispatcher().await;
         let context = register_context(&d, Some("unreadable-gate"), None, kaijutsu_types::PrincipalId::new());
         let caller = caller_with_context(context);
-        d.kernel_db.lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        d.kernel_db.lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Read { table_name: "contexts", .. } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
@@ -2380,7 +2380,7 @@ mod tests {
         )
         .await;
 
-        d.kernel_db.lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        d.kernel_db.lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
         assert_eq!(outcome.verdict, GateVerdict::Unavailable, "an unreadable context must fail closed: {}", outcome.reason);
         assert!(outcome.ask.is_none(), "no reviewer may authorize an unreadable context");
         assert!(outcome.reason.contains("could not read"), "{}", outcome.reason);

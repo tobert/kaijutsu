@@ -781,7 +781,7 @@ mod fill_tests {
                     "CREATE TRIGGER fail_job_attachment BEFORE UPDATE OF job_id ON shell_operations BEGIN SELECT RAISE(ABORT, 'injected job attachment fault'); END;"
                 ).unwrap();
             }
-            kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            kernel.kernel_db().lock().conn_for_test_mut().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                 AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,
                 _ => Authorization::Allow,
             })).unwrap();
@@ -795,7 +795,7 @@ mod fill_tests {
             assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), jobs.wait(job.id)).await.unwrap().unwrap(), outcome.exec_result());
             let streams = jobs.streams(job.id).await.unwrap();
             assert!(streams.stdout.is_closed().await && streams.stderr.is_closed().await);
-            kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
             assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some());
             assert_eq!(documents.get_block_snapshot(context, &receipt.output_block_id).unwrap().unwrap().status, Status::Error);
         }
@@ -1164,7 +1164,7 @@ mod fill_tests {
     impl crate::mcp::Hook for InterruptWithReadFault {
         async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-            self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_test_mut().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                 AuthAction::Read { table_name: "shell_operations" | "shell_result_reviews", .. } => Authorization::Deny,
                 _ => Authorization::Allow,
             })).unwrap();
@@ -1216,7 +1216,7 @@ mod fill_tests {
             let jobs = kernel.context_job_manager(context);
             let job = jobs.list().await.into_iter().next().unwrap();
             assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), jobs.wait(job.id)).await.unwrap().unwrap(), outcome.exec_result());
-            kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
             retry_retained_outcomes(&kernel, 10).unwrap();
             assert_eq!(serde_json::to_value(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap()).unwrap(),
                 serde_json::to_value(outcome).unwrap());

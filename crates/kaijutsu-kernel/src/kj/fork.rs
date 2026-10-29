@@ -2728,7 +2728,7 @@ mod tests {
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         let c = caller_with_context(source);
         let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
-        d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        d.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
@@ -2736,7 +2736,7 @@ mod tests {
         let result = d.dispatch(
             &[s("fork"), s("--name"), s("rc-fault-child"), s("--prompt"), s("must not start")], &c,
         ).await;
-        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         assert!(!result.is_ok(), "rc admission fault must report partial fork");
         assert!(result.message().contains("was committed"), "{}", result.message());

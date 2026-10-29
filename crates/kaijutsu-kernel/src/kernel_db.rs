@@ -2933,6 +2933,14 @@ impl KernelDb {
         &self.conn
     }
 
+    /// The connection, mutably, for tests that install a SQLite authorizer
+    /// to inject a read or write fault (`Connection::authorizer` takes
+    /// `&mut self`).
+    #[cfg(test)]
+    pub(crate) fn conn_for_test_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Under WAL, `synchronous = NORMAL` fsyncs at checkpoint instead of on
     /// every commit, and stays consistent through a process crash; only a
     /// power loss or kernel panic can drop the most recent commits. The

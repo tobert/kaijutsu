@@ -366,7 +366,7 @@ mod tests {
             session_id: SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
             cancel: lease.interrupt().cancel.child_token(),
         };
-        kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        kernel.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
             AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
@@ -380,7 +380,7 @@ mod tests {
                 edge_shown: None, log_tail: None, turn_live: false }, caller)),
             joins_live_turn: false,
         }, None, slot).unwrap().await.unwrap();
-        kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        kernel.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         let error = result.expect_err("submit rc admission fault must stop startup");
         assert!(error.contains("rc submit lifecycle"), "{error}");
