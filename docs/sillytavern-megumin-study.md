@@ -47,8 +47,14 @@ credit. Borrowed text stays in host rc and never goes into `assets/defaults`.
   - `create/S03-local-megumin.kai` composes those sections into one
     instruction block between the stance and the card.
   - `cards/kotone.megumin` turns it on for one performer and sets its names.
-  - The performer is Kotone, the night watch of Sawari Lane, on
-    `anthropic/claude-haiku-5-5`.
+  - The performer is Kotone, the night watch of Sawari Lane. Her cast,
+    `kotone`, gives the storyteller slot `anthropic/claude-haiku-5-5`, so a
+    rotation keeps her model.
+- **Fixed in play** (commit `04f7f5e6`): a block inserted with no anchor, such
+  as the reminder `kj block create` writes, went to the top of every live
+  client's view, and the turn's reply followed it there. The tui looked
+  frozen until a restart. The kernel now publishes such an insert after the
+  block it follows.
 
 If the borrowed text works, Amy writes a new version by hand. That version
 can ship.
@@ -59,21 +65,15 @@ These need kernel, seed, or `kj` work.
 
 ### Local rc files survive a forced reseed
 
-Today a local file at a path the seed does not ship survives every reseed
-(`seed_scripts.rs`, `reseed_rc_files`). An edit to a stock file does not
-survive: `rc reseed --force` restores it, and nothing can turn a stock script
-off locally.
+Built (commit `90917b9f`). A `.keep` sidecar keeps a local edit through
+`rc reseed --force`: after `touch S00-stance.md.keep`, reseed leaves
+`S00-stance.md` alone, and a kept seed that the seed retires stays too.
 
-Proposal: a `.keep` sidecar file. After `touch S00-stance.md.keep`, reseed
-leaves `S00-stance.md` alone, even with `--force`.
-
-- Rc already ignores any name that is not `SXX-name.kai`, so only reseed
-  changes.
+- Rc runs only `SXX-name.kai` names, so the sidecar changes reseed alone.
 - To turn a stock script off, keep it and make its body `exit 0`.
-- A symlinked seed is replaced by a local file plus `.keep`.
-- Reseed lists kept files. Its report on each diverged file names the
+- Reseed lists kept files, and its report on each diverged file names the
   `.keep` command.
-- Later, the `.keep` file could store the seed hash it was kept against, so
+- Open: the `.keep` file could store the seed hash it was kept against, so
   that reseed can report a kept file whose seed changed since.
 
 We chose a sidecar over a marker comment in the file. A Markdown companion is
