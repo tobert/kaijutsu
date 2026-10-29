@@ -290,7 +290,7 @@ pub(crate) mod test_support {
             }},
             "reads": [{
                 "context": 0,
-                "snapshot": format!("snap:{}", "0".repeat(64)),
+                "snapshot": format!("blake3:{}", "0".repeat(64)),
                 "answers": {"follows": {
                     "type": "choice",
                     "choice": OPTIONS[math::argmax(&row.probs)],
@@ -299,7 +299,7 @@ pub(crate) mod test_support {
                     "logprobs": {"follows": logprobs[0], "strays": logprobs[1], "unclear": logprobs[2]},
                     "mass": row.mass,
                 }},
-                "rendered_sha256": "0".repeat(64),
+                "rendered_hash": format!("blake3:{}", "0".repeat(64)),
             }],
             "pool": {"method": method, "weights": weights, "normalized": {"follows": pooled.weights}},
             "signals": {"control_text": []},

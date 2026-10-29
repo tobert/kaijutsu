@@ -598,7 +598,7 @@ mod tests {
     }
 
     fn snap_id(n: u64) -> String {
-        format!("snap:{n:064x}")
+        format!("blake3:{n:064x}")
     }
 
     /// A streamed generation: `content` as one answer token, then `done`

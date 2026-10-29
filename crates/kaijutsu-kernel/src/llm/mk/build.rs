@@ -108,7 +108,7 @@ pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResul
             Walked::System(text) => V2Message::system(text),
             Walked::User(text) => V2Message::user(text),
             Walked::Assistant { content, reasoning, calls } => V2Message {
-                content: content.filter(|c| !c.is_empty()),
+                content: content.filter(|c| !c.is_empty()).map(Into::into),
                 reasoning,
                 tool_calls: calls
                     .into_iter()

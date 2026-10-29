@@ -43,7 +43,7 @@ fn spec_text() -> String {
 /// its system message names, `house-rules` for the house rules, and
 /// `shadow` for a judge's shadow.
 fn seat_name(seat: &Context) -> String {
-    let system = seat.messages.first().and_then(|m| m.content.as_deref()).unwrap_or("");
+    let system = seat.messages.first().and_then(|m| m.content.as_ref().and_then(|c| c.as_text())).unwrap_or("");
     if let Some(rest) = system.split("This conversation is the council context \"").nth(1) {
         return rest.split('"').next().unwrap().to_string();
     }
@@ -63,7 +63,7 @@ struct Built {
 
 impl Built {
     fn of(seat: &Context) -> Built {
-        let text = |i: usize| seat.messages.get(i).and_then(|m| m.content.clone()).unwrap_or_default();
+        let text = |i: usize| seat.messages.get(i).and_then(|m| m.content.as_ref()).and_then(|c| c.as_text()).unwrap_or_default().to_string();
         Built { system: text(0), turns: (1..seat.messages.len()).map(text).collect() }
     }
 }
@@ -285,7 +285,7 @@ async fn serve() -> Mock {
                     }
                     ("POST", "/council/v2/contexts") => {
                         let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        let head = format!("snap:{n:064x}");
+                        let head = format!("blake3:{n:064x}");
                         builds.lock().unwrap().push((serde_json::from_str(&body).unwrap(), head.clone()));
                         let delay = delays.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
                         Reply {

@@ -32,9 +32,10 @@ impl MkClient {
     }
 }
 
-/// One event of a streamed generation. A `ping`, and an event the
-/// contract does not name, is skipped; an `error` event is
-/// [`MkError::CouncilStream`].
+/// One event of a streamed generation. A `ping`, the `output`, `progress`
+/// and `preview` events of a reply this client never asks to write objects
+/// or preview, and an event the contract does not name, are skipped; an
+/// `error` event is [`MkError::CouncilStream`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum GenerationEvent {
     Token(TokenEvent),
@@ -56,7 +57,8 @@ impl StreamItem for GenerationEvent {
             Some(StreamEvent::Token(t)) => Ok(Some(GenerationEvent::Token(t))),
             Some(StreamEvent::Done(d)) => Ok(Some(GenerationEvent::Done(d))),
             Some(StreamEvent::Error(b)) => Err(MkError::CouncilStream { error: b.error, request_id: b.request_id }),
-            Some(StreamEvent::Ping) | None => Ok(None),
+            Some(StreamEvent::Ping | StreamEvent::Output(_) | StreamEvent::Progress(_) | StreamEvent::Preview(_))
+            | None => Ok(None),
         }
     }
 
@@ -232,6 +234,8 @@ mod tests {
             decisions: Vec::new(),
             class: None,
             priority: None,
+            output: None,
+            previews: None,
         }
     }
 
@@ -408,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn a_spec_held_under_another_id_is_an_error() {
         let spec = gate_spec();
-        let held = json!({"spec_id": format!("sha256:{}", "0".repeat(64)), "spec": spec.value});
+        let held = json!({"spec_id": format!("blake3:{}", "0".repeat(64)), "spec": spec.value});
         let (base, _) = serve(vec![reply(200, held.to_string())]).await;
         let err = client(&base).council().post_spec(&spec).await.unwrap_err();
         assert!(matches!(&err, MkError::SpecIdMismatch { computed, .. } if *computed == spec.id()), "{err:?}");
@@ -457,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn a_generation_cut_before_done_is_truncated_and_an_error_event_ends_it() {
         let token = json!({"id": 1, "piece": "Fi", "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
-        let token = format!("event: ping\ndata: {{}}\n\nevent: token\ndata: {token}\n\nevent: progress\ndata: {{}}\n\n");
+        let token = format!("event: ping\ndata: {{}}\n\nevent: token\ndata: {token}\n\nevent: rumor\ndata: {{}}\n\n");
         let error = r#"{"error":{"type":"model_unavailable","message":"the model unloaded","model":"m","status":"unloaded"},"request_id":"req_7"}"#;
         let (base, _) = serve(vec![sse(token.clone()), sse(format!("{token}event: error\ndata: {error}\n\n"))]).await;
         let c = client(&base);

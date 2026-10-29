@@ -5084,7 +5084,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a791e6620676a875f362f3156ed213e73ca099a09bf992c18812abe65cc37b1"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -5478,25 +5478,35 @@ dependencies = [
 [[package]]
 name = "gogi-fake"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=b007a097d04f469f74edbdcfa74f36bcfcc4db8c#b007a097d04f469f74edbdcfa74f36bcfcc4db8c"
+source = "git+https://github.com/tobert/gogi?rev=9aa356a5ec8a01aefc5b451741d2ec96959a9208#9aa356a5ec8a01aefc5b451741d2ec96959a9208"
 dependencies = [
+ "blake3",
  "gogi-proto",
+ "gogi-toy",
  "indexmap 2.14.0",
  "serde",
  "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]
 name = "gogi-proto"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=b007a097d04f469f74edbdcfa74f36bcfcc4db8c#b007a097d04f469f74edbdcfa74f36bcfcc4db8c"
+source = "git+https://github.com/tobert/gogi?rev=9aa356a5ec8a01aefc5b451741d2ec96959a9208#9aa356a5ec8a01aefc5b451741d2ec96959a9208"
 dependencies = [
+ "blake3",
  "indexmap 2.14.0",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gogi-toy"
+version = "0.1.0"
+source = "git+https://github.com/tobert/gogi?rev=9aa356a5ec8a01aefc5b451741d2ec96959a9208#9aa356a5ec8a01aefc5b451741d2ec96959a9208"
+dependencies = [
+ "gogi-proto",
+ "serde_json",
 ]
 
 [[package]]

@@ -3519,6 +3519,16 @@ it, after two of us wrote the same `check_ask` at the same moment. The
 servers pin gogi by git rev, so one session's work in progress no longer
 breaks another's build.
 
+kaijutsu fell eleven days behind while nagaya tracked gogi from a local
+path, and caught up to `9aa356a` on October 29. Content ids became whole
+BLAKE3 ids (`blake3:` and 64 hex digits) for snapshots, specs, and a
+read's rendered text, so the ledger's `council_reads.rendered_sha256`
+became `rendered_hash`. A message's content became text or parts. kaijutsu
+asks for no objects or previews, so it skips the new `output`, `progress`,
+and `preview` stream events as it skips `ping`. The rest of the 49
+commits (continuations, objects, media) are capabilities kaijutsu does not
+use yet.
+
 ## The root takes a seat (October 25)
 
 The root console started as a REPL: a root's chat draft ran as shell on every

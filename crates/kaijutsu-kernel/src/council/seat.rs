@@ -245,6 +245,7 @@ fn queue_call(id: String, input: serde_json::Map<String, serde_json::Value>) -> 
         tool_call_id: None,
         is_error: false,
         snap: false,
+        open: false,
     }
 }
 

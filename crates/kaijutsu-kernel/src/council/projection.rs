@@ -103,7 +103,7 @@ fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: 
     let mut thinking: Vec<&str> = Vec::new();
     let push = |turns: &mut Vec<Message>, role, content: String, reasoning| {
         let snap = turns.len() % SNAP_EVERY == 0;
-        turns.push(Message { role, content: Some(content), reasoning, tool_calls: Vec::new(), tool_call_id: None, is_error: false, snap });
+        turns.push(Message { role, content: Some(content.into()), reasoning, tool_calls: Vec::new(), tool_call_id: None, is_error: false, snap, open: false });
     };
     for b in blocks {
         if is_thinking(b) {
@@ -408,11 +408,11 @@ mod tests {
 
     fn system(p: &Context) -> &str {
         assert_eq!(p.messages[0].role, WireRole::System);
-        p.messages[0].content.as_deref().unwrap()
+        p.messages[0].content.as_ref().and_then(|c| c.as_text()).unwrap()
     }
 
     fn contents(p: &Context) -> Vec<&str> {
-        turns(p).iter().map(|t| t.content.as_deref().unwrap()).collect()
+        turns(p).iter().map(|t| t.content.as_ref().and_then(|c| c.as_text()).unwrap()).collect()
     }
 
     #[tokio::test]
@@ -595,10 +595,10 @@ mod tests {
     fn rules_larger_than_the_budget_keep_their_start() {
         let long = HouseRules { path: "/AGENTS.md".into(), text: format!("START{}", "r".repeat(200)) };
         let p = project_house_rules(Some(&long), 16).unwrap();
-        assert_eq!(turns(&p)[0].content.as_deref().unwrap(), format!("The house rules in /AGENTS.md:\n\n{}...", &long.text[..64]));
+        assert_eq!(turns(&p)[0].content.as_ref().and_then(|c| c.as_text()).unwrap(), format!("The house rules in /AGENTS.md:\n\n{}...", &long.text[..64]));
         let multi = HouseRules { path: "/AGENTS.md".into(), text: "é".repeat(100) };
         let p = project_house_rules(Some(&multi), 16).unwrap();
-        assert!(turns(&p)[0].content.as_deref().unwrap().ends_with("é..."), "a cut stays on a character boundary");
+        assert!(turns(&p)[0].content.as_ref().and_then(|c| c.as_text()).unwrap().ends_with("é..."), "a cut stays on a character boundary");
     }
 
     #[tokio::test]

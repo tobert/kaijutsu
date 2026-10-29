@@ -906,7 +906,7 @@ CREATE TABLE IF NOT EXISTS council_reads (
     context_id      BLOB,
     snapshot        TEXT    NOT NULL,
     expected_head   TEXT,
-    rendered_sha256 TEXT    NOT NULL,
+    rendered_hash   TEXT    NOT NULL,
     PRIMARY KEY (decision_id, read_idx)
 );
 
@@ -1090,6 +1090,7 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
             ("council_observations", "seat_context_id", "reviewer_context_id"),
             ("council_observations", "voice_label", "reviewer_label"),
             ("council_observations", "voice_context_id", "reviewer_context_id"),
+            ("council_reads", "rendered_sha256", "rendered_hash"),
         ],
     )?;
     add_columns_if_missing(conn, "council_decisions", &[("house_rules_head", "TEXT"), ("bump_flavor", "TEXT")])?;
@@ -1799,6 +1800,35 @@ mod tests {
         assert_eq!(read(1).as_deref(), Some("try_harder"));
         assert_eq!(read(2).as_deref(), Some("unjudged"));
         assert_eq!(read(3).as_deref(), Some("kept"), "the second migrate does not fill again");
+    }
+
+    /// A database built when a read's rendered-text hash was
+    /// `rendered_sha256` keeps it under `rendered_hash`, gogi's name since
+    /// that hash became a BLAKE3 content id. A second `migrate` is a no-op.
+    #[test]
+    fn migrate_renames_rendered_sha256_and_keeps_its_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old = DDL.replace("    rendered_hash   TEXT    NOT NULL,", "    rendered_sha256 TEXT    NOT NULL,");
+        assert!(old.contains("rendered_sha256 TEXT"), "the fixture gives the old shape");
+        conn.execute_batch(&old).unwrap();
+        conn.execute_batch(
+            "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms)
+             VALUES (X'01', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'miss', 'down', 0, 0, 0);
+             INSERT INTO council_reads (decision_id, read_idx, snapshot, rendered_sha256)
+             VALUES (X'01', 0, 'snap', 'sha-old');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let hash: String = conn.query_row("SELECT rendered_hash FROM council_reads", [], |row| row.get(0)).unwrap();
+        assert_eq!(hash, "sha-old");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('council_reads') WHERE name = 'rendered_sha256'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "council_reads still has rendered_sha256");
     }
 
     /// A database built when the column was `seat_head` and the observation

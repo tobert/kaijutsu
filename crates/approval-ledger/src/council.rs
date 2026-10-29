@@ -94,7 +94,7 @@ pub struct CouncilRead {
     pub context_id: Option<Vec<u8>>,
     pub snapshot: String,
     pub expected_head: Option<String>,
-    pub rendered_sha256: String,
+    pub rendered_hash: String,
     pub questions: Vec<CouncilQuestion>,
     pub described: Vec<CouncilDescribed>,
 }
@@ -268,9 +268,9 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
     for (read_idx, read) in d.reads.iter().enumerate() {
         let read_idx = read_idx as i64;
         tx.execute(
-            "INSERT INTO council_reads (decision_id, read_idx, context_id, snapshot, expected_head, rendered_sha256)
+            "INSERT INTO council_reads (decision_id, read_idx, context_id, snapshot, expected_head, rendered_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![decision_id, read_idx, read.context_id, read.snapshot, read.expected_head, read.rendered_sha256],
+            params![decision_id, read_idx, read.context_id, read.snapshot, read.expected_head, read.rendered_hash],
         )?;
         for q in &read.questions {
             tx.execute(
@@ -557,7 +557,7 @@ impl DecisionHead {
         let id = self.decision_id.as_slice();
         let mut reads = conn
             .prepare(
-                "SELECT context_id, snapshot, expected_head, rendered_sha256 FROM council_reads
+                "SELECT context_id, snapshot, expected_head, rendered_hash FROM council_reads
                  WHERE decision_id = ?1 ORDER BY read_idx",
             )?
             .query_map([id], |row| {
@@ -565,7 +565,7 @@ impl DecisionHead {
                     context_id: row.get(0)?,
                     snapshot: row.get(1)?,
                     expected_head: row.get(2)?,
-                    rendered_sha256: row.get(3)?,
+                    rendered_hash: row.get(3)?,
                     questions: Vec::new(),
                     described: Vec::new(),
                 })
@@ -735,7 +735,7 @@ mod tests {
             context_id: context.map(<[u8]>::to_vec),
             snapshot: format!("snap-{tag}"),
             expected_head: Some(format!("head-{tag}")),
-            rendered_sha256: format!("sha-{tag}"),
+            rendered_hash: format!("sha-{tag}"),
             questions: vec![
                 CouncilQuestion {
                     question_id: "undo".into(),

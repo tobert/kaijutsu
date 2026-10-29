@@ -738,7 +738,7 @@ impl Pinner {
                 return;
             }
         };
-        let gone: Vec<String> = pinned.snapshots.into_iter().filter(|p| !p.held).map(|p| p.id).collect();
+        let gone: Vec<String> = pinned.snapshots.into_iter().filter(|p| !p.held).map(|p| p.id.to_string()).collect();
         tracing::info!(server = %self.server, owner = %self.owner, seats = body.snapshots.len(), gone = gone.len(), expires_in_s = ?pinned.expires_in_s, "council seats pinned");
         if gone.is_empty() {
             return;
@@ -1075,7 +1075,7 @@ pub(super) mod mock {
     }
 
     pub(crate) fn snap(n: u64) -> String {
-        format!("snap:{n:064x}")
+        format!("blake3:{n:064x}")
     }
 
     /// The mock's identity: one served model, `m`, ready. The server and
@@ -1584,7 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_disagrees_on_the_spec_id_is_a_miss() {
         let r = rig().await;
-        let other = format!("sha256:{}", "0".repeat(64));
+        let other = format!("blake3:{}", "0".repeat(64));
         let spec: serde_json::Value = serde_json::from_str(SPEC).unwrap();
         r.mock.force(
             "POST",

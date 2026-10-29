@@ -1274,7 +1274,7 @@ fn build_verdict(
                         context_id,
                         snapshot: read.snapshot.as_ref().map(|s| s.to_string()).unwrap_or_default(),
                         expected_head: expected,
-                        rendered_sha256: read.rendered_sha256.clone(),
+                        rendered_hash: read.rendered_hash.to_string(),
                         questions: read.answers.iter().map(|(q, a)| read_question(q, a)).collect(),
                         described: read
                             .described
@@ -2044,9 +2044,9 @@ pub(crate) mod test_support {
             .map(|(i, answers)| {
                 serde_json::json!({
                     "context": i,
-                    "snapshot": format!("snap:{i:064x}"),
+                    "snapshot": format!("blake3:{i:064x}"),
                     "answers": answers,
-                    "rendered_sha256": "0".repeat(64),
+                    "rendered_hash": format!("blake3:{}", "0".repeat(64)),
                 })
             })
             .collect();
@@ -2077,7 +2077,7 @@ mod tests {
     use crate::kj::gate_policy::CouncilThreshold;
 
     fn spec_id() -> String {
-        format!("sha256:{}", "a".repeat(64))
+        format!("blake3:{}", "a".repeat(64))
     }
 
     /// The spec with a `text` question, `effect`, from gogi's example.
@@ -2238,7 +2238,7 @@ mod tests {
     fn a_response_for_another_spec_is_a_miss() {
         let req = request();
         let mut value = answer(&req, &ALLOW);
-        value["identity"]["spec_id"] = serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+        value["identity"]["spec_id"] = serde_json::json!(format!("blake3:{}", "b".repeat(64)));
         assert!(matches!(
             classify(&req, &decode(value), &council(0.98, -0.05, true), "shell-gate").outcome,
             Outcome::Miss(_)
@@ -2311,7 +2311,7 @@ mod tests {
                         messages: vec![gogi_proto::Message::system(format!("seat {i}"))],
                         ..Default::default()
                     }),
-                    head: gogi_proto::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
+                    head: gogi_proto::SnapshotId::parse(format!("blake3:{}", i.to_string().repeat(64))).unwrap(),
                     house_rules: false,
                 })
                 .collect(),

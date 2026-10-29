@@ -90,6 +90,8 @@ impl Client {
             decisions: Vec::new(),
             class: None,
             priority: None,
+            output: None,
+            previews: None,
         };
         let started = std::time::Instant::now();
         let (slot, inner) = self.call(&turn, true, |_| async { self.mk.council().generate_stream(&request, self.timeout).await }).await?;
