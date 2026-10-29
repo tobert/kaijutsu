@@ -3094,10 +3094,6 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Name of the migration that moves each character's cast into its own
-    /// slots and drops the casts.
-    pub const CHARACTER_SLOTS_MIGRATION: &'static str = "character-slots-v1";
-
     /// The pre-character-slot cast tables, created empty when a database old
     /// enough to lack them is about to be read by the migrations that carry
     /// casts forward. Only called on a database that still has
@@ -3138,7 +3134,8 @@ impl KernelDb {
     /// before it goes: a cast no character names, with its slots, and a
     /// slot's `loadout` and `extra`, which had no reader. Then
     /// `characters.cast_id`, `cast_slots` and `casts` are dropped. A database
-    /// with no `casts` table is on the new shape and does nothing; one that
+    /// with neither cast table is on the new shape and does nothing, and the
+    /// presence of the tables is the whole state: the move writes no marker. One that
     /// still has `characters.default_cast_id` has not been through
     /// `context-characters-v1` and refuses, because that migration reads the
     /// casts.
@@ -3196,14 +3193,25 @@ impl KernelDb {
             }
         }
         if has_cast_column {
+            // A character that plays a live context with nothing to copy now
+            // has no slots; the first create or rotate for it will refuse
+            // naming the role, so say so here, where the deploy happens.
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT ch.name FROM characters ch
+                 JOIN context_characters cc ON cc.principal_id = ch.principal_id
+                 JOIN contexts c ON c.context_id = cc.context_id AND c.archived_at IS NULL
+                 WHERE NOT EXISTS (SELECT 1 FROM character_slots s WHERE s.principal_id = ch.principal_id)
+                 ORDER BY ch.name",
+            )?;
+            let bare: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<SqliteResult<_>>()?;
+            drop(stmt);
+            for name in bare {
+                warn!(character = %name, "plays live contexts and has no slot after the casts moved; `kj character slot set` gives it one before the next create or rotate");
+            }
             tx.execute("ALTER TABLE characters DROP COLUMN cast_id", [])?;
         }
         tx.execute("DROP TABLE IF EXISTS cast_slots", [])?;
         tx.execute("DROP TABLE IF EXISTS casts", [])?;
-        tx.execute(
-            "INSERT OR IGNORE INTO kernel_migrations (name) VALUES (?1)",
-            [Self::CHARACTER_SLOTS_MIGRATION],
-        )?;
         tx.commit()?;
         info!("moved each character's cast into its own slots and dropped the casts");
         Ok(())
@@ -4178,10 +4186,11 @@ impl KernelDb {
 
     /// Open or create at the given path.
     ///
-    /// The DB schema (`SCHEMA`) is the single source of truth; the one
-    /// migration mechanism is [`Self::apply_additive_migrations`]'s guarded
-    /// `ALTER TABLE ... ADD COLUMN` array (new columns land in both places).
-    /// Anything beyond an additive column bump requires wiping the DB. rc
+    /// The DB schema (`SCHEMA`) is the source of truth for a new database;
+    /// [`Self::apply_additive_migrations`] brings an older one up to it with
+    /// guarded steps (additive columns, and the named migrations and drops
+    /// that each guard on what is still there). A database still on casts is
+    /// copied aside first ([`Self::back_up_before_character_slots`]). rc
     /// lifecycle scripts are no longer table rows — they live as files under
     /// `/config/rc` (see `seed_scripts` and `rc/mod.rs`), seeded to disk
     /// at server boot.
@@ -4218,7 +4227,7 @@ impl KernelDb {
     /// earlier attempt and stays as it is. When the copy cannot be made the
     /// open fails and says why, and nothing is migrated.
     fn back_up_before_character_slots(conn: &Connection, path: &Path) -> KernelDbResult<()> {
-        if !Self::has_table(conn, "casts")? {
+        if !Self::has_table(conn, "casts")? && !Self::has_table(conn, "cast_slots")? {
             return Ok(());
         }
         let backup = Self::pre_character_slots_backup_path(path);
@@ -4229,7 +4238,7 @@ impl KernelDb {
         conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()]).map_err(|e| {
             KernelDbError::Validation(format!(
                 "the casts become character slots on this open, and the copy of the database at {} could not be made: {e}; \
-                 free the space or the path and start again",
+                 free the space or the path, or stop the server that holds the database, and start again",
                 backup.display()
             ))
         })?;
@@ -10627,10 +10636,6 @@ mod tests {
         assert!(db.list_character_slots(b).unwrap().is_empty(), "a character with no cast gets no slot");
         assert!(!KernelDb::has_table(&db.conn, "casts").unwrap() && !KernelDb::has_table(&db.conn, "cast_slots").unwrap());
         assert!(!KernelDb::has_column(&db.conn, "characters", "cast_id").unwrap());
-        let marked: bool = db.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)", [KernelDb::CHARACTER_SLOTS_MIGRATION], |r| r.get(0),
-        ).unwrap();
-        assert!(marked, "the migration is recorded");
 
         KernelDb::migrate_character_slots(&db.conn).unwrap();
         assert_eq!(db.list_character_slots(a).unwrap().len(), 2, "a second run changes nothing");

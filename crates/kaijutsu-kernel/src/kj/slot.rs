@@ -207,8 +207,33 @@ impl KjDispatcher {
     }
 }
 
+/// The structured form of a character's slots: one object per role.
+pub(super) fn slot_data(
+    slots: &[CharacterSlotRow],
+    backends: &std::collections::HashMap<kaijutsu_types::BackendId, String>,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        slots
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "role": s.role,
+                    "backend": backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string()),
+                    "model": s.model,
+                    "max_tokens": s.max_tokens,
+                    "temperature": s.temperature,
+                    "top_p": s.top_p,
+                    "effort": s.effort,
+                    "thinking_budget": s.thinking_budget,
+                    "thinking_style": s.thinking_style,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// The text and the structured form of a character's slots.
-pub(super) fn slot_listing(
+fn slot_listing(
     character: &str,
     slots: &[CharacterSlotRow],
     backends: &std::collections::HashMap<kaijutsu_types::BackendId, String>,
@@ -217,7 +242,6 @@ pub(super) fn slot_listing(
     if slots.is_empty() {
         lines.push(format!("{character} has no slots (`kj character slot set {character} <role> --backend B --model M`)"));
     }
-    let mut data = Vec::new();
     for s in slots {
         let backend = backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
         let mut knobs = Vec::new();
@@ -248,19 +272,8 @@ pub(super) fn slot_listing(
             format!(" [{}]", knobs.join(", "))
         };
         lines.push(format!("  {:<12} {backend}/{}{knob_str}", s.role, s.model));
-        data.push(serde_json::json!({
-            "role": s.role,
-            "backend": backend,
-            "model": s.model,
-            "max_tokens": s.max_tokens,
-            "temperature": s.temperature,
-            "top_p": s.top_p,
-            "effort": s.effort,
-            "thinking_budget": s.thinking_budget,
-            "thinking_style": s.thinking_style,
-        }));
     }
-    KjResult::ok_with_data(lines.join("\n"), serde_json::Value::Array(data))
+    KjResult::ok_with_data(lines.join("\n"), slot_data(slots, backends))
 }
 
 // Verb class: kj/effect.rs

@@ -276,7 +276,7 @@ Steps 1-3 (context edge):
 
 - Columns `contexts.reviewer_id` and `contexts.director_id`; tables `approval_reviewer_delegations` and its events.
 - `kj context set --reviewer`, `--clear-reviewer` and `--director`; `kj ledger delegation grant|revoke|list`;
-  `kj context create` (now `kj context create`).
+  `kj context create` (once `kj kohai create`).
 - The `forked_from` review walk, `responsible_character_above`, and the duplicate resolver.
 
 Step 5 (context characters):
@@ -319,9 +319,11 @@ Presets keep only their fork filters (`kj fork --preset full|window|spawn`).
 
 ## Migration
 
-The migration runs once, in one transaction, after step 1's. It records every value it drops and every context
+The migration runs once, in one transaction, after the context character migration, which reads the casts the
+migration then drops. It records every value it drops and every context
 it cannot map in `context_character_migration_report` (kinds: `dropped`, `unmapped`, `no_slot`, `no_gate_slot`,
-`no_distill_slot`, `no_character_slot`), which `kj senpai show` reads. It never invents a value: each row it
+`no_distill_slot`, `no_character_slot`), which `kj senpai show` reads. `character-slots-v1` logs a character that
+plays live contexts and has no slot after the move, rather than writing the report. It never invents a value: each row it
 writes records an answer the old code would have given. The one exception is a judge shadow's character, which
 the old row did not have; the new model requires it, and it is the character of the context the shadow judges.
 

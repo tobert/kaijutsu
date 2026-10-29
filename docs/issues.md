@@ -31,6 +31,19 @@ TUI entries below). Open:
   - `docs/approval-identity.md` still says "instance" outside its routing
     sections, and `docs/senpai-kohai.md` describes `--model`/`--max-tokens`
     create options and a no-casts hard cut that the code does not have.
+- From a kaibo review of `feat/character-slots` (2026-10-29, deepseek, read only), not yet fixed:
+  - `context-characters-v1`'s refusal tells the operator to fix links "with the previous kernel", but
+    `drop_old_routing` has already dropped `reviewer_id`, `director_id` and the delegations by then. The only
+    copy of that routing is `kernel.db.pre-character-slots`, which the message should name.
+  - `kaijutsu-server add-key` opens `kernel.db` with no `KernelLock`, so on a database still on casts it takes
+    the backup while a live server holds the file, and a busy database reads as a failed copy.
+  - A hand-written `allow = ["kj context"]` (the verb family) now covers `kj context create`, which the old
+    `kj kohai` key kept apart. No shipped file does this.
+  - `contrib/council/seed-council-contexts.kai` and `contrib/headless-app.sh` create contexts with no `--as`,
+    which `kj context create` requires; they were stale before the rename.
+  - `ensure_legacy_cast_tables` and the pre-character columns commit before the migrations that read them can
+    refuse, so a refused open leaves two empty cast tables behind.
+  - `context_character_migration_report()` has no production reader.
 - Load-dependent flakes seen in full-suite runs and green alone, at
   `bd1dc251` plus the review fixes: `council::gate_e2e::a_council_miss_asks_and_records_its_cause`,
   `a_contained_model_commits_with_real_git`, and `a_learned_allow_beats_a_config_deny_added_later`.

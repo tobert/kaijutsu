@@ -4,9 +4,9 @@
 //! `retire` stamps `retired_at` and, in the same act, concludes and
 //! archives every live context the character performs.
 //!
-//! No attribution change in this slice: a context's `played_by` is metadata
-//! only, and every block is still stamped exactly as it is today
-//! (`docs/character.md`, "A context is played by a character").
+//! `slot set|unset|list` (`kj/slot.rs`) holds the model each of a
+//! character's roles runs. `unset` and `list` work on a retired character
+//! too, so its slots can be tidied; `set` refuses one.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState, PrincipalId, SessionId};
@@ -499,10 +499,7 @@ impl KjDispatcher {
                 );
                 text.push_str(&format!("\nLive contexts:   {}", if context_names.is_empty() { "-".to_string() } else { context_names.join(", ") }));
                 let mut data = character_to_json(&row);
-                data["slots"] = match super::slot::slot_listing(&row.name, &slots, &backends) {
-                    KjResult::Ok { data: Some(slots), .. } => slots,
-                    _ => serde_json::Value::Array(Vec::new()),
-                };
+                data["slots"] = super::slot::slot_data(&slots, &backends);
                 data["contexts"] = serde_json::Value::Array(
                     contexts.iter().map(|c| serde_json::json!({
                         "id": c.to_hex(),

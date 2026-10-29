@@ -18,18 +18,16 @@ done
 if ! kj character show council > /dev/null 2>&1; then
   kj character create council
 fi
-# The council context runs the model its character's cast gives its type.
-if ! kj cast show council > /dev/null 2>&1; then
-  kj cast create council
-  kj cast slot set council council --backend deepseek --model deepseek-flash --max-tokens 65536
+# The council context runs the model its character's slot gives its type.
+if ! kj character slot list council | grep -q council; then
+  kj character slot set council council --backend deepseek --model deepseek-flash --max-tokens 65536
 fi
-kj character set council --cast council
 for f in amy banto; do
   if kj context info "council-$f" > /dev/null 2>&1; then
     echo "council-$f: present"
   else
     # Run from Amy's console: the council context answers to it, so Amy reviews it.
-    kj kohai create "council-$f" --type council --as council
+    kj context create "council-$f" --type council --as council
     kj block create -c "council-$f" --role user --kind text --content-type text/markdown < "$data/$f.md"
     echo "council-$f: created"
   fi

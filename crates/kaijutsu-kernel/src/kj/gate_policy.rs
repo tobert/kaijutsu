@@ -1959,7 +1959,7 @@ mod tests {
         assert_eq!(target("context create child --type coder --as coder"), NewChild);
         assert_eq!(target("context create child --as coder --parent lane"), NewChild, "--parent is provenance only");
         assert_eq!(target("context create child --as coder --senpai lane"), NewUnder("lane".into()));
-        assert_eq!(target("context create child"), Unread, "kj context create is gone");
+        assert_eq!(target("context create child"), Unread, "--as is required, so a bare create does not parse");
         assert_eq!(target("context set lane --model m"), Unread);
         assert_eq!(target("fork"), Unread);
         assert_eq!(target("drive --no-such-flag"), Unread);

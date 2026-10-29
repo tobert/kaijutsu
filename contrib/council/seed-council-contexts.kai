@@ -11,8 +11,8 @@
 set -e
 
 # Run from Amy's console: both contexts answer to it.
-kj kohai create council-system --type default
-kj kohai create council-amy --type default
+kj context create council-system --type default
+kj context create council-amy --type default
 
 # council-system: the house rules. The opening, routine-work, risk, and
 # JSON paragraphs follow contrib/bench/rc-variants/council, whose wording was
