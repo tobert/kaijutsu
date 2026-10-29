@@ -14,7 +14,7 @@
 pub(crate) const HOUSE_VERBS: &[&str] = &[
     "alias", "attach", "audio", "backend", "binding", "cc", "character", "config", "council", "cp",
     "db", "doc", "drive", "hook", "interrupt", "ledger", "mcp", "midi", "play", "policy",
-    "preset", "rc", "roster", "swap", "system", "transport",
+    "preset", "price", "rc", "roster", "swap", "system", "transport",
 ];
 
 /// Top-level verbs a worker seat keeps. Read by the classification test,

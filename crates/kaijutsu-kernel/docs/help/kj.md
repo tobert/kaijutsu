@@ -162,6 +162,10 @@ play            Play a sample now (a host path, or --cas <hash> for an object
                 with --track/--at/--label (docs/pcm.md)
 policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove, reseed
+price           list, history, set — what a model's tokens cost: dollars per
+                million tokens, an append-only history, so a turn keeps the
+                price in force when it ran; no price means unknown cost, and
+                `set --free` is a price of zero. `set` needs `config-write`
 rc              add, list, rm, show — lifecycle scripts (/config/rc/<type>/<verb>/).
                 They are host files: edit one with `vi <path>` or the file
                 tools, and restore the shipped defaults with

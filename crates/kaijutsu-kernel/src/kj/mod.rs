@@ -48,6 +48,7 @@ pub mod plan_clauses;
 pub mod play;
 pub mod policy;
 pub mod preset;
+pub mod price;
 pub mod vi;
 pub mod effect;
 pub(crate) mod readonly;
@@ -542,6 +543,10 @@ impl KjDispatcher {
         // `kj config`, which they replaced for this surface).
         if cmd == "backend" {
             return self.dispatch_backend(&argv[1..], caller).await;
+        }
+        // Prices address (backend, model) pairs, never a context.
+        if cmd == "price" {
+            return self.dispatch_price(&argv[1..], caller).await;
         }
         if cmd == "alias" {
             return self.dispatch_alias(&argv[1..], caller).await;

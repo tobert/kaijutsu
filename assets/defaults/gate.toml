@@ -110,4 +110,10 @@ allow = [
   "kj context create",     # a director creates its lanes, `--type coder --as coder`
   "kj fork",             # a fork copies this seat's own performer and type
   "kj drive",            # runs a turn on a lane this seat directs
+  "kj price set",        # appends a price row; a correction is a later row
+]
+
+[context_type.root]
+allow = [
+  "kj price set",        # appends a price row; a correction is a later row
 ]
