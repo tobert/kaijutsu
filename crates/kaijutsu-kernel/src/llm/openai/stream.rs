@@ -139,8 +139,8 @@ impl StateMachine {
                         Some(u.prompt_tokens),
                         Some(u.completion_tokens),
                         Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
-                            prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
-                            prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
+                            prompt_cache_hit_tokens: u.cache_hit_tokens(),
+                            prompt_cache_miss_tokens: u.cache_miss_tokens(),
                             reasoning_tokens: u.reasoning_tokens(),
                         })),
                     ),
@@ -370,6 +370,35 @@ data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9,\"t
 data: [DONE]
 
 ";
+
+    const OPENAI_CACHED: &str = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2006,\"completion_tokens\":4,\"total_tokens\":2010,\"prompt_tokens_details\":{\"cached_tokens\":1920}}}
+
+data: [DONE]
+
+";
+
+    #[tokio::test]
+    async fn openai_cached_tokens_reach_the_done_extra() {
+        let events = run(OPENAI_CACHED).await;
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                stop_reason: Some("stop".into()),
+                input_tokens: Some(2006),
+                output_tokens: Some(4),
+                extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                    prompt_cache_hit_tokens: 1920,
+                    prompt_cache_miss_tokens: 86,
+                    reasoning_tokens: 0,
+                })),
+            })
+        );
+    }
 
     #[tokio::test]
     async fn reasoning_then_text_synthesizes_brackets_and_transition() {

@@ -540,7 +540,8 @@ pub struct ClaudeUsageExtra {
 /// Usage extras for OpenAI-compatible chat-completions providers.
 ///
 /// DeepSeek caches the prompt prefix automatically (no `cache_control`
-/// knob), reporting the split in `usage`; `reasoning_tokens` counts the
+/// knob), reporting the split in `usage`; OpenAI reports only the cached
+/// prefix, and the miss is the prompt less that prefix. `reasoning_tokens` counts the
 /// chain-of-thought tokens billed as output on thinking-mode turns. Local
 /// servers (lemonade/llama.cpp, Ollama) that don't report a cache split
 /// leave these zero — the field carrier is shared, not the guarantee.

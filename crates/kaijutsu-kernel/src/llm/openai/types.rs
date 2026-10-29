@@ -382,9 +382,35 @@ pub struct Usage {
     pub prompt_cache_miss_tokens: u64,
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// OpenAI's shape for the cached prefix, counted inside `prompt_tokens`.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 impl Usage {
+    /// Prompt tokens served from the provider's cache: DeepSeek's
+    /// `prompt_cache_hit_tokens` when it reports one, else OpenAI's
+    /// `prompt_tokens_details.cached_tokens`. 0 when neither is reported.
+    pub fn cache_hit_tokens(&self) -> u64 {
+        if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
+            return self.prompt_cache_hit_tokens;
+        }
+        self.prompt_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0)
+    }
+
+    /// Prompt tokens that missed the cache. DeepSeek reports it; for the
+    /// OpenAI shape it is the prompt less the cached prefix. 0 when the
+    /// server reported no cache accounting at all.
+    pub fn cache_miss_tokens(&self) -> u64 {
+        if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
+            return self.prompt_cache_miss_tokens;
+        }
+        match self.prompt_tokens_details.as_ref() {
+            Some(d) => self.prompt_tokens.saturating_sub(d.cached_tokens),
+            None => 0,
+        }
+    }
+
     /// Reasoning tokens, flattened from the nested details. 0 when the
     /// model didn't think or didn't report it.
     pub fn reasoning_tokens(&self) -> u64 {
@@ -393,6 +419,12 @@ impl Usage {
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0)
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -601,6 +633,30 @@ mod tests {
         assert_eq!(usage.prompt_cache_hit_tokens, 80);
         assert_eq!(usage.prompt_cache_miss_tokens, 20);
         assert_eq!(usage.reasoning_tokens(), 30);
+    }
+
+    /// OpenAI itself (and servers that copy it) report the cached prefix as
+    /// `prompt_tokens_details.cached_tokens`, inside `prompt_tokens`, with
+    /// no DeepSeek hit/miss fields.
+    #[test]
+    fn openai_cached_tokens_read_as_the_cache_hit() {
+        let json = r#"{"prompt_tokens":2006,"completion_tokens":300,"total_tokens":2306,"prompt_tokens_details":{"cached_tokens":1920}}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.cache_hit_tokens(), 1920);
+        assert_eq!(usage.cache_miss_tokens(), 86);
+    }
+
+    /// DeepSeek's own split wins when both are present, and a server that
+    /// reports neither is zero hits and zero misses, not a miss of the
+    /// whole prompt.
+    #[test]
+    fn deepseek_split_wins_and_no_report_is_zero() {
+        let json = r#"{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20,"prompt_tokens_details":{"cached_tokens":64}}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!((usage.cache_hit_tokens(), usage.cache_miss_tokens()), (80, 20));
+        let json = r#"{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!((usage.cache_hit_tokens(), usage.cache_miss_tokens()), (0, 0));
     }
 
     #[test]
