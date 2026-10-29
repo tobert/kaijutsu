@@ -53,7 +53,7 @@ pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, MkUsageExtra, OpenAiCompatUsageExtra,
-    InlineToolResult, RetryDisposition, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
+    InlineToolResult, RetryDisposition, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
 pub use system_prompt::{CharacterIdentity, CharacterFact, SenpaiFact, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};

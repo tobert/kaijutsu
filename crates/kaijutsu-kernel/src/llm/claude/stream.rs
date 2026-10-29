@@ -35,7 +35,8 @@
 //! complete: `pause_turn` (a server-tool loop this client does not run),
 //! `model_context_window_exceeded` (the reply is truncated by the window),
 //! a missing reason, and any reason this client does not know; the kind is
-//! [`StreamErrorKind::Truncated`] holding the reason.
+//! [`StreamErrorKind::Truncated`] holding the reason. That `Error` carries the
+//! usage the call reported, which was still spent.
 //!
 //! After an `Error` the machine emits nothing more: no `Done` follows a
 //! failure.
@@ -246,7 +247,19 @@ impl StateMachine {
                         output_tokens: self.output_tokens,
                         extra,
                     }),
-                    Err(error) => out.push(StreamEvent::Error(error)),
+                    // The reply did not complete, but the call still spent
+                    // what the provider reported.
+                    Err(error) => out.push(StreamEvent::Error(
+                        if self.input_tokens.is_some() || self.output_tokens.is_some() {
+                            error.with_usage(crate::llm::SpentUsage {
+                                input_tokens: self.input_tokens,
+                                output_tokens: self.output_tokens,
+                                extra,
+                            })
+                        } else {
+                            error
+                        },
+                    )),
                 }
                 out
             }
@@ -835,6 +848,37 @@ data: {\"type\":\"message_stop\"}
         let no_delta = run("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").await;
         assert!(matches!(no_delta.as_slice(), [StreamEvent::Error(e)]
             if e.kind == StreamErrorKind::Truncated("no_stop_reason".into())), "{no_delta:?}");
+    }
+
+    /// A reply that did not complete still spent what `message_start` and
+    /// `message_delta` reported; the error carries it.
+    #[tokio::test]
+    async fn a_truncated_reply_carries_the_usage_it_spent() {
+        let payload = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-haiku-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_read_input_tokens\":30,\"cache_creation_input_tokens\":4}}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        match run(payload).await.as_slice() {
+            [StreamEvent::Error(e)] => assert_eq!(
+                e.usage,
+                Some(crate::llm::SpentUsage {
+                    input_tokens: Some(12),
+                    output_tokens: Some(5),
+                    extra: Some(crate::llm::UsageExtra::Claude(crate::llm::stream::ClaudeUsageExtra {
+                        cache_read_input_tokens: 30,
+                        cache_creation_input_tokens: 4,
+                    })),
+                })
+            ),
+            other => panic!("expected one Error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

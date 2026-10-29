@@ -630,7 +630,7 @@ pub struct TurnRow {
     /// it could write its end.
     pub ended_at: Option<i64>,
     pub stop_reason: Option<String>,
-    /// Provider calls the turn made (one per `Done` it received).
+    /// Provider calls the turn made that reported usage (a `Done`, or an `Error` that carried counts).
     pub llm_calls: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,

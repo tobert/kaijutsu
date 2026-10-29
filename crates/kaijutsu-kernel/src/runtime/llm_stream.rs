@@ -2278,6 +2278,155 @@ impl Drop for TurnUsageOnSpan {
     }
 }
 
+/// Records one provider call's spend: the turn's row, the turn span, the
+/// meter, and the context's fill gauge. A `Done` and an `Error` that carries
+/// usage both come here, because a call that failed after the provider
+/// reported its counts still spent them.
+#[allow(clippy::too_many_arguments)]
+fn record_call_usage(
+    kernel_db: &parking_lot::Mutex<KernelDb>,
+    records_turn: bool,
+    turn_id: kaijutsu_types::TurnId,
+    context_id: ContextId,
+    provider_name: &str,
+    model_name: &str,
+    cache_breakpoints: &[crate::llm::stream::CacheTarget],
+    usage_on_span: &mut TurnUsageOnSpan,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    extra: &Option<crate::llm::UsageExtra>,
+    stop_reason: &Option<String>,
+) -> Result<(), StreamFailure> {
+        // DeepSeek reports an automatic-cache hit/miss split and
+        // reasoning tokens; Anthropic reports cache read/creation.
+        // Absent extra means zeros.
+        use crate::llm::UsageExtra;
+        let raw = raw_usage(input_tokens, output_tokens, extra);
+        let (cache_read, cache_write, reasoning) = (raw.cache_read, raw.cache_write, raw.reasoning);
+
+        // The turn's row sums every call's raw counts: each call
+        // is spend. A call that reported no counts spent nothing
+        // we know of. A write that fails fails the turn.
+        if records_turn && !(input_tokens.is_none() && output_tokens.is_none()) {
+            kernel_db.lock().add_turn_usage(turn_id, raw)
+                .map_err(|error| StreamFailure::TurnRecord(error.to_string()))?;
+        }
+
+        // The turn span gets this call's usage at turn exit, once
+        // (`TurnUsageOnSpan`); a later call replaces it.
+        usage_on_span.last = Some(TurnUsage {
+            input_tokens: input_tokens.unwrap_or(0),
+            output_tokens: output_tokens.unwrap_or(0),
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            reasoning_tokens: reasoning,
+            stop_reason: stop_reason.clone(),
+        });
+
+        // Record token usage to the global meter (no-op until OTel
+        // is enabled). Both the completed and cancelled paths spend
+        // tokens, so record before branching. cache_creation maps
+        // from the provider extra (Anthropic cache writes); reasoning
+        // rides as its own gen_ai.token.type.
+        kaijutsu_telemetry::record_llm_usage(
+            provider_name,
+            model_name,
+            kaijutsu_telemetry::TokenCounts {
+                input: input_tokens.unwrap_or(0),
+                output: output_tokens.unwrap_or(0),
+                cache_read,
+                cache_creation: cache_write,
+                reasoning,
+            },
+        );
+
+        // Context-usage gauge: persist a SNAPSHOT of this call's
+        // usage as "how full is this context right now" — NOT a
+        // running sum (see `ContextUsageRow` / the `context_usage`
+        // table doc comment). Every `Done` event overwrites the
+        // previous value: each provider call resends the ENTIRE
+        // growing conversation as input (the agentic loop below
+        // appends tool results and re-sends `messages` in full on
+        // every iteration), so the LAST `Done` event this turn
+        // produces already reflects the whole history — summing
+        // per-iteration `input_tokens` across a multi-tool-call
+        // turn would multiply-count the same resent history N
+        // times. Recorded before the cancel branch, same as
+        // telemetry above: a cancelled call still spent tokens and
+        // still tells us how full the context is.
+        //
+        // `total_input_tokens` normalizes a provider quirk:
+        // Anthropic's `input_tokens` EXCLUDES cache_read/
+        // cache_creation tokens (billed and reported separately
+        // even though they were part of what was sent), so the
+        // actual prompt size is input_tokens + cache_read +
+        // cache_creation. DeepSeek/OpenAI-compatible
+        // `prompt_tokens` already includes the cache hit/miss
+        // split (hit + miss == prompt_tokens — see
+        // `llm/openai/stream.rs` tests), so adding `cache_read`
+        // there would double-count.
+        // "The provider never told us" is NOT "the provider said
+        // zero" — and the write below is an unconditional upsert
+        // over the context's single row, so conflating the two
+        // DESTROYS a good snapshot. The OpenAI-compatible path
+        // only learns usage from a final chunk that never arrives
+        // if the stream is cancelled first (`llm/openai/stream.rs`
+        // yields `None` for both counts in that case), so a hard
+        // interrupt would otherwise overwrite a real "234k/1M"
+        // with "0" and leave the gauge quietly lying until the
+        // next completed call. Claude reports `input_tokens` at
+        // `message_start`, so a cancel there still carries real
+        // numbers and still records — which is the behavior we
+        // want and the reason this guard checks for the total
+        // absence of data rather than keying off cancellation.
+        if input_tokens.is_none() && output_tokens.is_none() {
+            tracing::debug!(
+                "context usage not recorded for {context_id}: provider \
+                 reported no token counts (stream ended before usage \
+                 arrived); keeping the previous snapshot"
+            );
+        } else {
+            let is_claude = matches!(extra, Some(UsageExtra::Claude(_)));
+            let total_input_tokens = input_tokens.unwrap_or(0)
+                + if is_claude { cache_read + cache_write } else { 0 };
+            // The TTL actually applied to this request's cache
+            // breakpoints. Only Claude's `build()` (`llm/claude/
+            // build.rs`) turns `BuildOpts::cache_breakpoints` into
+            // a real `cache_control` on the wire — every other
+            // provider's `build()` ignores the carrier, so a
+            // breakpoint sitting unused in `build_opts` there
+            // would be a TTL claim the request never made.
+            let cache_ttl_secs = if is_claude {
+                longest_cache_ttl_secs(cache_breakpoints)
+            } else {
+                0
+            };
+            let usage_row = crate::ContextUsageRow {
+                context_id,
+                provider: provider_name.to_string(),
+                model: model_name.to_string(),
+                input_tokens: total_input_tokens as i64,
+                output_tokens: output_tokens.unwrap_or(0) as i64,
+                cache_read_tokens: cache_read as i64,
+                cache_write_tokens: cache_write as i64,
+                reasoning_tokens: reasoning as i64,
+                cache_ttl_secs,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            };
+            if let Err(e) = kernel_db.lock().set_context_usage(&usage_row) {
+                // Non-fatal: the turn itself succeeded; only the
+                // usage gauge failed to persist. Loud log (not
+                // silent) so a persistently-failing write is
+                // observable, but the conversation must not fail
+                // because a telemetry-adjacent counter didn't write.
+                tracing::warn!(
+                    "Failed to persist context usage for {context_id}: {e}"
+                );
+            }
+        }
+    Ok(())
+}
+
 /// Process LLM streaming in a background task with agentic loop.
 ///
 /// Handles all stream events, executes tools, and loops until the model signals
@@ -3255,133 +3404,20 @@ async fn run_llm_stream(
                     output_tokens,
                     extra,
                 } => {
-                    // DeepSeek reports an automatic-cache hit/miss split and
-                    // reasoning tokens; Anthropic reports cache read/creation.
-                    // Absent extra means zeros.
-                    use crate::llm::UsageExtra;
-                    let raw = raw_usage(input_tokens, output_tokens, &extra);
-                    let (cache_read, cache_write, reasoning) = (raw.cache_read, raw.cache_write, raw.reasoning);
-
-                    // The turn's row sums every call's raw counts: each call
-                    // is spend. A call that reported no counts spent nothing
-                    // we know of. A write that fails fails the turn.
-                    if records_turn && !(input_tokens.is_none() && output_tokens.is_none()) {
-                        kernel_db.lock().add_turn_usage(turn_id, raw)
-                            .map_err(|error| StreamFailure::TurnRecord(error.to_string()))?;
-                    }
-
-                    // The turn span gets this call's usage at turn exit, once
-                    // (`TurnUsageOnSpan`); a later call replaces it.
-                    usage_on_span.last = Some(TurnUsage {
-                        input_tokens: input_tokens.unwrap_or(0),
-                        output_tokens: output_tokens.unwrap_or(0),
-                        cache_read_tokens: cache_read,
-                        cache_write_tokens: cache_write,
-                        reasoning_tokens: reasoning,
-                        stop_reason: stop_reason.clone(),
-                    });
-
-                    // Record token usage to the global meter (no-op until OTel
-                    // is enabled). Both the completed and cancelled paths spend
-                    // tokens, so record before branching. cache_creation maps
-                    // from the provider extra (Anthropic cache writes); reasoning
-                    // rides as its own gen_ai.token.type.
-                    kaijutsu_telemetry::record_llm_usage(
+                    record_call_usage(
+                        &kernel_db,
+                        records_turn,
+                        turn_id,
+                        context_id,
                         provider.name(),
                         &model_name,
-                        kaijutsu_telemetry::TokenCounts {
-                            input: input_tokens.unwrap_or(0),
-                            output: output_tokens.unwrap_or(0),
-                            cache_read,
-                            cache_creation: cache_write,
-                            reasoning,
-                        },
-                    );
-
-                    // Context-usage gauge: persist a SNAPSHOT of this call's
-                    // usage as "how full is this context right now" — NOT a
-                    // running sum (see `ContextUsageRow` / the `context_usage`
-                    // table doc comment). Every `Done` event overwrites the
-                    // previous value: each provider call resends the ENTIRE
-                    // growing conversation as input (the agentic loop below
-                    // appends tool results and re-sends `messages` in full on
-                    // every iteration), so the LAST `Done` event this turn
-                    // produces already reflects the whole history — summing
-                    // per-iteration `input_tokens` across a multi-tool-call
-                    // turn would multiply-count the same resent history N
-                    // times. Recorded before the cancel branch, same as
-                    // telemetry above: a cancelled call still spent tokens and
-                    // still tells us how full the context is.
-                    //
-                    // `total_input_tokens` normalizes a provider quirk:
-                    // Anthropic's `input_tokens` EXCLUDES cache_read/
-                    // cache_creation tokens (billed and reported separately
-                    // even though they were part of what was sent), so the
-                    // actual prompt size is input_tokens + cache_read +
-                    // cache_creation. DeepSeek/OpenAI-compatible
-                    // `prompt_tokens` already includes the cache hit/miss
-                    // split (hit + miss == prompt_tokens — see
-                    // `llm/openai/stream.rs` tests), so adding `cache_read`
-                    // there would double-count.
-                    // "The provider never told us" is NOT "the provider said
-                    // zero" — and the write below is an unconditional upsert
-                    // over the context's single row, so conflating the two
-                    // DESTROYS a good snapshot. The OpenAI-compatible path
-                    // only learns usage from a final chunk that never arrives
-                    // if the stream is cancelled first (`llm/openai/stream.rs`
-                    // yields `None` for both counts in that case), so a hard
-                    // interrupt would otherwise overwrite a real "234k/1M"
-                    // with "0" and leave the gauge quietly lying until the
-                    // next completed call. Claude reports `input_tokens` at
-                    // `message_start`, so a cancel there still carries real
-                    // numbers and still records — which is the behavior we
-                    // want and the reason this guard checks for the total
-                    // absence of data rather than keying off cancellation.
-                    if input_tokens.is_none() && output_tokens.is_none() {
-                        tracing::debug!(
-                            "context usage not recorded for {context_id}: provider \
-                             reported no token counts (stream ended before usage \
-                             arrived); keeping the previous snapshot"
-                        );
-                    } else {
-                        let is_claude = matches!(extra, Some(UsageExtra::Claude(_)));
-                        let total_input_tokens = input_tokens.unwrap_or(0)
-                            + if is_claude { cache_read + cache_write } else { 0 };
-                        // The TTL actually applied to this request's cache
-                        // breakpoints. Only Claude's `build()` (`llm/claude/
-                        // build.rs`) turns `BuildOpts::cache_breakpoints` into
-                        // a real `cache_control` on the wire — every other
-                        // provider's `build()` ignores the carrier, so a
-                        // breakpoint sitting unused in `build_opts` there
-                        // would be a TTL claim the request never made.
-                        let cache_ttl_secs = if is_claude {
-                            longest_cache_ttl_secs(&build_opts.cache_breakpoints)
-                        } else {
-                            0
-                        };
-                        let usage_row = crate::ContextUsageRow {
-                            context_id,
-                            provider: provider.name().to_string(),
-                            model: model_name.clone(),
-                            input_tokens: total_input_tokens as i64,
-                            output_tokens: output_tokens.unwrap_or(0) as i64,
-                            cache_read_tokens: cache_read as i64,
-                            cache_write_tokens: cache_write as i64,
-                            reasoning_tokens: reasoning as i64,
-                            cache_ttl_secs,
-                            updated_at: kaijutsu_types::now_millis() as i64,
-                        };
-                        if let Err(e) = kernel_db.lock().set_context_usage(&usage_row) {
-                            // Non-fatal: the turn itself succeeded; only the
-                            // usage gauge failed to persist. Loud log (not
-                            // silent) so a persistently-failing write is
-                            // observable, but the conversation must not fail
-                            // because a telemetry-adjacent counter didn't write.
-                            tracing::warn!(
-                                "Failed to persist context usage for {context_id}: {e}"
-                            );
-                        }
-                    }
+                        &build_opts.cache_breakpoints,
+                        &mut usage_on_span,
+                        input_tokens,
+                        output_tokens,
+                        &extra,
+                        &stop_reason,
+                    )?;
 
                     if cancel_deadline.is_some() {
                         // Usage may arrive during cancellation, but its notice
@@ -3437,6 +3473,22 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::Error(err) => {
+                    if let Some(spent) = &err.usage {
+                        record_call_usage(
+                            &kernel_db,
+                            records_turn,
+                            turn_id,
+                            context_id,
+                            provider.name(),
+                            &model_name,
+                            &build_opts.cache_breakpoints,
+                            &mut usage_on_span,
+                            spent.input_tokens,
+                            spent.output_tokens,
+                            &spent.extra,
+                            &None,
+                        )?;
+                    }
                     if err.kind == StreamErrorKind::CapacityCut {
                         usage_on_span.cuts += 1;
                         tracing::warn!(
@@ -6807,6 +6859,45 @@ mod usage_tests {
                 assert_eq!(
                     usage.cache_ttl_secs, 0,
                     "no cache breakpoints configured for this context — 0, not a guess"
+                );
+            })
+            .await;
+    }
+
+    /// A call that failed after the provider reported its counts still spent
+    /// them: the turn's row sums them and the gauge keeps them.
+    #[tokio::test]
+    async fn a_failed_call_that_reported_usage_is_recorded() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-failed-call").await);
+                let error = crate::llm::StreamError::new(
+                    crate::llm::StreamErrorKind::Truncated("pause_turn".into()),
+                    "the reply paused",
+                )
+                .with_usage(crate::llm::SpentUsage {
+                    input_tokens: Some(42),
+                    output_tokens: Some(7),
+                    extra: Some(UsageExtra::Claude(ClaudeUsageExtra {
+                        cache_read_input_tokens: 10,
+                        cache_creation_input_tokens: 5,
+                    })),
+                });
+                let provider = Provider::Mock(
+                    MockClient::new("unused").with_scripted_stream(vec![vec![StreamEvent::Error(error)]]),
+                );
+
+                let (_documents, ctx, _player, kernel_db) =
+                    drive_turn_with(provider, 0, kernel.clone()).await;
+
+                let db = kernel_db.lock();
+                let usage = db.get_context_usage(ctx).unwrap().expect("a failed call's spend is recorded");
+                assert_eq!((usage.input_tokens, usage.output_tokens), (57, 7));
+                let totals = db.context_turn_totals(ctx).unwrap();
+                assert_eq!(
+                    (totals.llm_calls, totals.input_tokens, totals.output_tokens, totals.cache_read_tokens, totals.cache_write_tokens),
+                    (1, 42, 7, 10, 5)
                 );
             })
             .await;

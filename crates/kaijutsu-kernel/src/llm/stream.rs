@@ -231,11 +231,28 @@ pub struct StreamError {
     pub message: String,
     /// The provider's id for the failed request, when it sent one.
     pub request_id: Option<String>,
+    /// What the failed call still spent, when the provider had reported it
+    /// before the stream failed. `None` means no counts arrived.
+    pub usage: Option<SpentUsage>,
+}
+
+/// Token counts a failed call reported before it failed. They are spend,
+/// recorded the way a `Done` event's counts are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpentUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub extra: Option<UsageExtra>,
 }
 
 impl StreamError {
     pub fn new(kind: StreamErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), request_id: None }
+        Self { kind, message: message.into(), request_id: None, usage: None }
+    }
+
+    pub fn with_usage(mut self, usage: SpentUsage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 
     pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
