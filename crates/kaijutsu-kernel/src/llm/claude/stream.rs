@@ -186,6 +186,14 @@ impl StateMachine {
                 self.input_tokens = Some(p.message.usage.input_tokens);
                 self.cache_read_input_tokens = p.message.usage.cache_read_input_tokens;
                 self.cache_creation_input_tokens = p.message.usage.cache_creation_input_tokens;
+                for t in &p.message.input_transformations {
+                    tracing::warn!(
+                        kind = %t.kind,
+                        reason = t.reason.as_deref().unwrap_or("-"),
+                        path = t.path.as_deref().unwrap_or("-"),
+                        "the API changed a thinking block in this request"
+                    );
+                }
                 vec![]
             }
             ClaudeSseEvent::ContentBlockStart(p) => self.on_block_start(p.index, p.content_block),

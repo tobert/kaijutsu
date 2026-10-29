@@ -73,6 +73,12 @@ pub struct MessagesRequest {
     /// breakpoints do not reach. It takes one of the 4 breakpoint slots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+
+    /// Beta features this body uses, sent as the `anthropic-beta` header
+    /// rather than in the body. The builder adds one for each field that
+    /// needs it, so a header never names a feature the body does not use.
+    #[serde(skip)]
+    pub betas: Vec<&'static str>,
 }
 
 /// `system` field shape — string or block list.
@@ -124,6 +130,9 @@ pub struct RequestMessage {
 pub enum MessageRole {
     User,
     Assistant,
+    /// A mid-conversation system message, on models that take one. See
+    /// [`super::build::takes_system_messages`].
+    System,
 }
 
 /// Message content — string or block list.
@@ -231,6 +240,11 @@ pub enum Thinking {
     Adaptive {
         #[serde(skip_serializing_if = "Option::is_none")]
         display: Option<ThinkingDisplay>,
+        /// What the API does with a thinking block whose earlier
+        /// conversation changed since it was written. Needs the
+        /// thinking-binding beta header.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        block_binding: Option<BlockBinding>,
     },
     Enabled {
         budget_tokens: u64,
@@ -240,6 +254,24 @@ pub enum Thinking {
     #[serde(rename = "enabled")]
     On,
     Disabled,
+}
+
+/// `thinking.block_binding`: what the API does with a thinking block whose
+/// earlier conversation changed, as after a filtered fork or a sliding
+/// hydration window.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct BlockBinding {
+    pub prefix_mismatch_behavior: PrefixMismatchBehavior,
+}
+
+/// `"drop_block"` drops the first mismatched thinking block and every one
+/// after it, and the request goes on; `"error"` fails it with a 400.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Error is the API's other value; we always send DropBlock
+pub enum PrefixMismatchBehavior {
+    DropBlock,
+    Error,
 }
 
 /// The request's top-level `output_config`: currently just the effort-ladder
@@ -265,6 +297,7 @@ impl Thinking {
     pub fn adaptive_summarized() -> Self {
         Self::Adaptive {
             display: Some(ThinkingDisplay::Summarized),
+            block_binding: None,
         }
     }
 
@@ -451,6 +484,7 @@ mod tests {
             output_config: None,
             stop_sequences: vec![],
             cache_control: None,
+            betas: Vec::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
         // Optional fields skip-serialize when None / empty.
@@ -472,7 +506,7 @@ mod tests {
 
     #[test]
     fn thinking_adaptive_without_display_omits_field() {
-        let v = serde_json::to_value(Thinking::Adaptive { display: None }).unwrap();
+        let v = serde_json::to_value(Thinking::Adaptive { display: None, block_binding: None }).unwrap();
         assert_eq!(v["type"], "adaptive");
         assert!(v.get("display").is_none());
         assert!(v.get("output_config").is_none());

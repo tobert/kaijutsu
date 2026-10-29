@@ -181,11 +181,28 @@ instructions (`llm/hydrate.rs`, `is_kernel_instruction`), and a drift is a
   `llm::Role::System` at its point in the history; a drift keeps its
   `[push from context 1a2b3c4d]` prefix. Council v2 and `/mk/v1`
   send it as a `system` message, which mkviolet renders as its own system
-  turn. Hosted OpenAI sends a `system` message. Anthropic, DeepSeek, and other
-  OpenAI-compatible servers send it as user text: Anthropic takes system text
-  only in its top-level field, DeepSeek's template moves every system message
-  into the system prompt, and some local templates refuse a later system
-  message. Broker notifications carry a payload and stay user messages.
+  turn. Hosted OpenAI sends a `system` message. Anthropic sends a
+  `role: "system"` message on models that take one mid-conversation (Fable,
+  Mythos, Opus 4.8 and later, Sonnet 5.5 and later, Haiku 5.5 and later),
+  where the API allows it: right after a user turn, and as the last message
+  or before a reply (`llm/claude/build.rs`, `native_system_messages`).
+  Elsewhere, and on other models, it sends user text, so a message whose
+  next neighbor changes from a reply to a user message (a turn that failed
+  before replying) changes form on the next request. DeepSeek and other
+  OpenAI-compatible servers send user text: DeepSeek's template moves every
+  system message into the system prompt, and some local templates refuse a
+  later system message. Broker notifications carry a payload and stay user
+  messages.
+
+On Anthropic, adaptive thinking sends
+`thinking.block_binding.prefix_mismatch_behavior: "drop_block"` with the
+`thinking-binding-controls-2026-08-01` beta header. A thinking block is bound
+to the conversation before it, and kaijutsu changes that conversation on
+purpose: a filtered fork, a sliding hydration window. The API then drops the
+first changed thinking block and every one after it and the request goes on,
+where it would otherwise fail (accounts created on or after 2026-08-31) or
+pass the stale blocks through. Each drop arrives in `message_start` as an
+`input_transformations` entry, which the stream logs as a warning.
 
 The turn records the nudge or the ceiling notice after any input pending at
 that point (`instruct` in `runtime/llm_stream.rs`) and delivers them

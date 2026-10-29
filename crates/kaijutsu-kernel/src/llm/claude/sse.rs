@@ -51,6 +51,27 @@ pub struct StartedMessage {
     #[serde(default)]
     pub stop_reason: Option<String>,
     pub usage: ResponseUsage,
+    /// With the thinking-binding beta header: each thinking block the API
+    /// dropped, or let through after its earlier conversation changed.
+    #[serde(default)]
+    pub input_transformations: Vec<InputTransformation>,
+}
+
+/// One `input_transformations` entry. Later checks add types and reasons, so
+/// both stay strings.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct InputTransformation {
+    /// `thinking_dropped` or `thinking_mismatch_allowed`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// `prefix_binding_mismatch` (the history changed),
+    /// `model_binding_mismatch` (another model wrote the block), or
+    /// `organization_binding_mismatch`.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The block's place in the request, such as `messages.5.content.0`.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -397,6 +418,36 @@ event: message_stop
 data: {\"type\":\"message_stop\"}
 
 ";
+
+    /// With the thinking-binding beta, `message_start` names each thinking
+    /// block the API dropped or let through, and why. An entry type we do
+    /// not know still parses.
+    #[tokio::test]
+    async fn message_start_carries_input_transformations() {
+        let stream = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_02\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-haiku-5-5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1},\"input_transformations\":[{\"type\":\"thinking_dropped\",\"reason\":\"prefix_binding_mismatch\",\"path\":\"messages.5.content.0\"},{\"type\":\"something_new\"}]}}
+
+";
+        let events = parse_all(stream).await;
+        match &events[0] {
+            Ok(ClaudeSseEvent::MessageStart(p)) => {
+                let t = &p.message.input_transformations;
+                assert_eq!(t.len(), 2);
+                assert_eq!(t[0].kind, "thinking_dropped");
+                assert_eq!(t[0].reason.as_deref(), Some("prefix_binding_mismatch"));
+                assert_eq!(t[0].path.as_deref(), Some("messages.5.content.0"));
+                assert_eq!(t[1].kind, "something_new");
+                assert!(t[1].reason.is_none());
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+        let plain = parse_all(SIMPLE_COMPLETION).await;
+        match &plain[0] {
+            Ok(ClaudeSseEvent::MessageStart(p)) => assert!(p.message.input_transformations.is_empty()),
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn parses_simple_text_completion_sequence() {

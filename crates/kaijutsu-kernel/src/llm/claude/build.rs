@@ -19,8 +19,8 @@ use std::collections::HashSet;
 
 use super::Dialect;
 use super::types::{
-    CacheControl, ImageSource, MessageContent, MessageRole, MessagesRequest, OutputConfig, RequestContent,
-    RequestMessage, RequestTool, SystemBlock, SystemPrompt, Thinking,
+    BlockBinding, CacheControl, ImageSource, MessageContent, MessageRole, MessagesRequest, OutputConfig, RequestContent,
+    PrefixMismatchBehavior, RequestMessage, RequestTool, SystemBlock, SystemPrompt, Thinking,
 };
 use super::stream::REDACTED_THINKING_PREFIX;
 use crate::llm::stream::{BuildOpts, CacheTarget, CacheTtl};
@@ -28,6 +28,69 @@ use crate::llm::{ContentBlock, LlmError, Message, MessageContent as KaiContent, 
 
 /// Anthropic's hard cap on `cache_control` breakpoints per request.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// The beta header `thinking.block_binding` needs.
+pub(crate) const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Whether `model` takes a `role: "system"` message mid-conversation: Fable
+/// and Mythos, Opus 4.8 and later, Sonnet 5.5 and later, Haiku 5.5 and later.
+/// Claude Sonnet 5 does not, and older models predate the feature.
+pub(crate) fn takes_system_messages(model: &str) -> bool {
+    let mut parts = model.split('-');
+    if parts.next() != Some("claude") {
+        return false;
+    }
+    let Some(family) = parts.next() else {
+        return false;
+    };
+    if matches!(family, "fable" | "mythos") {
+        return true;
+    }
+    let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return false;
+    };
+    // A date suffix on a pinned id reads as minor 0, as in
+    // `Thinking::default_for_model`.
+    let minor = parts
+        .next()
+        .and_then(|p| if p.len() <= 2 { p.parse::<u32>().ok() } else { None })
+        .unwrap_or(0);
+    let first = match family {
+        "opus" => (4, 8),
+        "sonnet" | "haiku" => (5, 5),
+        _ => return false,
+    };
+    (major, minor) >= first
+}
+
+/// Which messages go as the API's own `role: "system"`. The API takes one
+/// only right after a user turn (tool results count), and only as the last
+/// message or before an assistant turn; consecutive system messages are
+/// judged together. Anywhere else it is a 400, so those go as user text, as
+/// they do on every model and server without the feature.
+fn native_system_messages(messages: &[Message], model: &str, dialect: Dialect) -> Vec<bool> {
+    let mut native = vec![false; messages.len()];
+    if dialect != Dialect::Anthropic || !takes_system_messages(model) {
+        return native;
+    }
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role != Role::System {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < messages.len() && messages[i].role == Role::System {
+            i += 1;
+        }
+        let after_user = start > 0 && messages[start - 1].role == Role::User;
+        let before_reply = messages.get(i).is_none_or(|m| m.role == Role::Assistant);
+        if after_user && before_reply {
+            native[start..i].fill(true);
+        }
+    }
+    native
+}
 
 /// Map a kaijutsu TTL onto the wire-shape `cache_control` annotation.
 fn cache_control_for(ttl: CacheTtl) -> CacheControl {
@@ -141,10 +204,11 @@ pub fn build_request(
     // System prompt: block list form when caching, plain string otherwise.
     let system = build_system(opts.system.as_deref(), plan.system);
 
+    let native = native_system_messages(messages, &opts.model, dialect);
     let mut request_messages = messages
         .iter()
         .enumerate()
-        .map(|(index, message)| build_message(index, message, dialect))
+        .map(|(index, message)| build_message(index, message, native[index], dialect))
         .collect::<Result<Vec<_>, _>>()?;
     apply_message_breakpoints(&mut request_messages, &plan.message_indices);
     let cache_control = auto_tail_cache(&plan, request_messages.len(), dialect);
@@ -163,6 +227,7 @@ pub fn build_request(
         output_config: None, // and this, when the adaptive tier carries effort
         stop_sequences: vec![],
         cache_control,
+        betas: Vec::new(),
     })
 }
 
@@ -339,6 +404,16 @@ pub fn apply_thinking(
     dialect: Dialect,
 ) -> Result<(), LlmError> {
     body.thinking = resolve_thinking(opts, dialect)?;
+    // Kaijutsu edits history on purpose: a filtered fork, a sliding hydration
+    // window. The API then drops the thinking blocks that follow the change
+    // instead of failing the request (which it does by default for accounts
+    // created on or after 2026-08-31), and reports each drop.
+    if dialect == Dialect::Anthropic
+        && let Some(Thinking::Adaptive { block_binding, .. }) = &mut body.thinking
+    {
+        *block_binding = Some(BlockBinding { prefix_mismatch_behavior: PrefixMismatchBehavior::DropBlock });
+        body.betas.push(THINKING_BINDING_BETA);
+    }
     body.output_config = match (&body.thinking, &opts.effort) {
         (Some(Thinking::Adaptive { .. } | Thinking::On), Some(effort)) => Some(OutputConfig {
             effort: Some(effort.clone()),
@@ -493,10 +568,11 @@ fn build_system(
     }
 }
 
-fn build_message(index: usize, msg: &Message, dialect: Dialect) -> Result<RequestMessage, LlmError> {
-    // The Messages API takes system text only in its top-level `system`
-    // field, so a kernel instruction mid-conversation goes as user text.
+fn build_message(index: usize, msg: &Message, native_system: bool, dialect: Dialect) -> Result<RequestMessage, LlmError> {
+    // A system message the API cannot take at this point goes as user text
+    // (`native_system_messages`).
     let role = match msg.role {
+        Role::System if native_system => MessageRole::System,
         Role::User | Role::System => MessageRole::User,
         Role::Assistant => MessageRole::Assistant,
     };
@@ -658,14 +734,82 @@ mod tests {
         assert!(req.stream.is_none(), "non-streaming omits stream field");
     }
 
-    /// The Messages API has no system role mid-conversation, so a kernel
-    /// instruction goes as user text.
+    /// A model without mid-conversation system messages takes a kernel
+    /// instruction as user text.
     #[test]
     fn a_kernel_instruction_is_user_text() {
         let messages = vec![Message::user("hi"), Message::assistant("hello"), Message::system("call done")];
         let req = build_request(&opts("claude-haiku-4-5"), &messages, false);
         assert!(matches!(req.messages[2].role, MessageRole::User));
         assert!(matches!(&req.messages[2].content, MessageContent::Text(t) if t == "call done"));
+    }
+
+    fn roles(req: &MessagesRequest) -> Vec<&'static str> {
+        req.messages
+            .iter()
+            .map(|m| match m.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::System => "system",
+            })
+            .collect()
+    }
+
+    /// After a user turn, at the end or before a reply, a system message is
+    /// the API's own `role: "system"`, so the model never reads it as the
+    /// person's words.
+    #[test]
+    fn a_system_message_after_a_user_turn_is_native_where_the_model_takes_it() {
+        for model in ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-4-8", "claude-fable-5-1"] {
+            let last = build_request(&opts(model), &[Message::user("hi"), Message::system("note")], false);
+            assert_eq!(roles(&last), ["user", "system"], "{model}");
+            let before_reply = build_request(
+                &opts(model),
+                &[Message::user("hi"), Message::system("a"), Message::system("b"), Message::assistant("ok")],
+                false,
+            );
+            assert_eq!(roles(&before_reply), ["user", "system", "system", "assistant"], "{model}");
+        }
+        let v = serde_json::to_value(build_request(
+            &opts("claude-haiku-5-5"),
+            &[Message::user("hi"), Message::system("note")],
+            false,
+        ))
+        .unwrap();
+        assert_eq!(v["messages"][1]["role"], "system", "{v}");
+    }
+
+    /// The API takes a system message only right after a user turn, and only
+    /// at the end or before an assistant turn; anywhere else it is a 400, so
+    /// the message goes as user text.
+    #[test]
+    fn a_system_message_the_api_would_refuse_there_is_user_text() {
+        let after_reply = build_request(
+            &opts("claude-haiku-5-5"),
+            &[Message::user("hi"), Message::assistant("hello"), Message::system("note")],
+            false,
+        );
+        assert_eq!(roles(&after_reply), ["user", "assistant", "user"]);
+        let before_user = build_request(
+            &opts("claude-haiku-5-5"),
+            &[Message::user("hi"), Message::system("note"), Message::user("again")],
+            false,
+        );
+        assert_eq!(roles(&before_user), ["user", "user", "user"]);
+        let first = build_request(&opts("claude-haiku-5-5"), &[Message::system("note"), Message::user("hi")], false);
+        assert_eq!(roles(&first), ["user", "user"]);
+    }
+
+    /// Claude Sonnet 5, models before the feature, and DeepSeek's endpoint
+    /// keep user text.
+    #[test]
+    fn a_system_message_is_user_text_where_the_model_or_server_lacks_the_feature() {
+        let messages = [Message::user("hi"), Message::system("note")];
+        for model in ["claude-sonnet-5", "claude-opus-4-7", "claude-haiku-4-5", "claude-sonnet-4-6"] {
+            assert_eq!(roles(&build_request(&opts(model), &messages, false)), ["user", "user"], "{model}");
+        }
+        let deepseek = super::build_request(&opts("claude-haiku-5-5"), &messages, false, Dialect::DeepSeek).unwrap();
+        assert_eq!(roles(&deepseek), ["user", "user"]);
     }
 
     #[test]
@@ -1435,6 +1579,44 @@ mod tests {
             let err = resolve_thinking(&o, Dialect::Anthropic).unwrap_err();
             assert!(err.to_string().contains("bogus"), "{err}");
             assert!(err.to_string().contains("auto"), "{err}");
+        }
+
+        /// Adaptive thinking on Anthropic asks the API to drop thinking
+        /// blocks whose earlier conversation changed (a filtered fork, a
+        /// sliding window) instead of failing the request, and sends the
+        /// beta header that field needs.
+        #[test]
+        fn adaptive_thinking_drops_mismatched_thinking_blocks() {
+            let o = opts("claude-haiku-5-5");
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o, Dialect::Anthropic).unwrap();
+            let v = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block", "{v}");
+            assert_eq!(req.betas, vec![THINKING_BINDING_BETA]);
+            assert!(v.get("betas").is_none(), "the beta list is a header, not a body field: {v}");
+        }
+
+        /// Budget thinking, no thinking, and DeepSeek's endpoint take no
+        /// `block_binding`, and so no header.
+        #[test]
+        fn block_binding_only_rides_with_adaptive_thinking_on_anthropic() {
+            let o = opts("claude-haiku-4-5");
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o, Dialect::Anthropic).unwrap();
+            assert!(req.betas.is_empty());
+
+            let mut o = opts("claude-opus-4-8");
+            o.thinking_style = Some("off".into());
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o, Dialect::Anthropic).unwrap();
+            assert!(req.betas.is_empty());
+
+            let o = opts("deepseek-v4-pro");
+            let mut req = super::super::build_request(&o, &[Message::user("hi")], true, Dialect::DeepSeek).unwrap();
+            apply_thinking(&mut req, &o, Dialect::DeepSeek).unwrap();
+            let v = serde_json::to_value(&req).unwrap();
+            assert!(v["thinking"].get("block_binding").is_none(), "{v}");
+            assert!(req.betas.is_empty());
         }
 
         /// Effort rides on the request's top-level `output_config`, beside

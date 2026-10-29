@@ -221,6 +221,7 @@ impl Client {
             .post(format!("{}/v1/messages", self.base_url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body);
+        request = with_betas(request, &body);
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
@@ -290,6 +291,7 @@ impl Client {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body);
+        request = with_betas(request, &body);
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
@@ -314,6 +316,15 @@ impl Client {
 /// bodies fall back to raw status text — never silently swallow.
 ///
 /// A free function: it is pure over the response.
+/// Name the beta features the body uses in the `anthropic-beta` header.
+fn with_betas(request: reqwest::RequestBuilder, body: &types::MessagesRequest) -> reqwest::RequestBuilder {
+    if body.betas.is_empty() {
+        request
+    } else {
+        request.header("anthropic-beta", body.betas.join(","))
+    }
+}
+
 pub(crate) async fn error_for_status(response: reqwest::Response) -> LlmResult<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
