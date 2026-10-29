@@ -13421,6 +13421,43 @@ mod tests {
         assert_eq!(db.context_cost_groups(None).unwrap().len(), 3);
     }
 
+    /// A context's cost sums its turns, each at the price in force when it
+    /// started; turns with no price are counted apart, never as free.
+    #[test]
+    fn a_contexts_cost_prices_each_turn_by_the_price_in_force() {
+        use crate::pricing::{context_costs, ContextCost, InputStyle};
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cost"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        let per_million = |provider: &str, effective_from, input| NewModelPrice {
+            provider: provider.into(),
+            model: "claude-haiku-5-5".into(),
+            effective_from,
+            input,
+            output: input * 5,
+            cache_read: Some(0),
+            cache_write_5m: Some(0),
+            cache_write_1h: Some(0),
+            source: String::new(),
+            set_by: None,
+        };
+        db.insert_model_price(&per_million("anthropic", 2_000, 1_000_000)).unwrap();
+        db.insert_model_price(&per_million("anthropic", 4_000, 2_000_000)).unwrap();
+        for (provider, started_at) in [("anthropic", 1_000), ("anthropic", 3_000), ("anthropic", 5_000), ("other", 5_000)] {
+            let mut start = turn_start(ctx.context_id);
+            start.provider = provider.into();
+            start.started_at = started_at;
+            db.begin_turn(&start).unwrap();
+            db.add_turn_usage(start.turn_id, RawUsage { input: 1_000_000, ..Default::default() }).unwrap();
+        }
+        let costs = context_costs(&db, |_| InputStyle::ExcludesCache).unwrap();
+        assert_eq!(
+            costs[&ctx.context_id],
+            ContextCost { micros: 3_000_000, priced_calls: 2, unpriced_calls: 2 }
+        );
+    }
+
     /// A count or an end with nowhere to land is an error, not a no-op: the
     /// turn has no row, or the turn already ended.
     #[test]
