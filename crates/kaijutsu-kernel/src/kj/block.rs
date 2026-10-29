@@ -3124,12 +3124,10 @@ mod tests {
 
     // ── New: block cat ─────────────────────────────────────────────────
 
-    /// Insert a block explicitly appended after `after` (or, when `after` is
-    /// `None`, at the very *start* of the document — `insert_block_as`'s
-    /// "no ref given" semantics prepend, they don't append, so a sequence of
-    /// bare `after: None` inserts would land in REVERSE order). Tests that
-    /// care about timeline order (the `--latest` selector) must thread this
-    /// explicitly rather than reuse the order-agnostic `insert_text_block`.
+    /// Insert a block after `after`, or at the end of the document when
+    /// `after` is `None`. Tests that care about timeline order (the
+    /// `--latest` selector) use this rather than the order-agnostic
+    /// `insert_text_block`.
     fn insert_block_ordered(
         d: &crate::kj::KjDispatcher,
         ctx: kaijutsu_types::ContextId,

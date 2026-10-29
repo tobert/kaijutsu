@@ -325,6 +325,28 @@ pub struct BlockStore {
     after_compose_selection: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
+/// Name the block each inserted event follows.
+///
+/// A document appends a new block given no anchor, but on the change feed an
+/// insert with no anchor means the start of the document. An unanchored
+/// insert that did not land first is published after the block that precedes
+/// it, so a client's mirror places it where the kernel did.
+fn anchor_inserts(doc: &BlockDocument, mut events: Vec<BlockFlow>) -> Vec<BlockFlow> {
+    if !events.iter().any(|e| matches!(e, BlockFlow::Inserted { after_id: None, .. })) {
+        return events;
+    }
+    let ordered = doc.block_ids_ordered();
+    for event in &mut events {
+        if let BlockFlow::Inserted { block, after_id: after_id @ None, .. } = event
+            && let Some(at) = ordered.iter().position(|id| *id == block.id)
+            && at > 0
+        {
+            *after_id = Some(ordered[at - 1]);
+        }
+    }
+    events
+}
+
 impl BlockStore {
     /// Create a new in-memory block store.
     pub fn new(principal_id: PrincipalId) -> Self {
@@ -1100,7 +1122,7 @@ impl BlockStore {
         }
         drop(db_guard);
         self.recompute_live_status(context_id, &entry.doc.statuses_ordered());
-        self.emit_group(events);
+        self.emit_group(anchor_inserts(&entry.doc, events));
         entry.poisoned = false;
         Ok(result)
     }

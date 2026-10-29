@@ -299,6 +299,77 @@ fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
     });
 }
 
+/// A client following the feed through a chat submit ends with every block
+/// the kernel holds: the submitted input, a submit script's turn-scoped
+/// notification, and the turn's reply. A storyteller's reminder script is
+/// this shape.
+#[test]
+fn a_submit_script_and_its_turn_reach_a_feed_follower() {
+    run_local(async {
+        use kaijutsu_kernel::VfsOps;
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        live_kernel
+            .kernel
+            .vfs()
+            .write_all(
+                std::path::Path::new("/config/rc/default/submit/S10-reminder.kai"),
+                b"set -e\nkj block create --role system --kind notification --turn-scoped --content \"stay in the lane\"\n",
+            )
+            .await
+            .expect("plant the submit script");
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-feed").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        kernel.edit_input(context_id, 0, "a lantern swings", 0).await.unwrap();
+        let (observer, mut rx) = context_feed_channel(256);
+        kernel.subscribe_context(context_id, observer).await.unwrap();
+        let (snapshot, version) = kernel
+            .get_blocks_versioned(context_id, &BlockQuery::All)
+            .await
+            .unwrap();
+        let mut mirror = ContextMirror::new(context_id);
+        mirror.apply_snapshot(snapshot, version).unwrap();
+
+        let input = kernel.submit_input(context_id, false).await.unwrap().block_id;
+        let all = blocks_after_turn(&live_kernel, &kernel, context_id).await;
+        assert!(
+            all.iter().any(|b| b.kind == BlockKind::Notification && b.content.starts_with("stay in the lane")),
+            "the submit script ran"
+        );
+        assert!(all.iter().any(|b| b.role == Role::Model), "the turn replied");
+        let target = live_kernel.documents.get(context_id).unwrap().version();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while mirror.version() < target {
+                match rx.recv().await {
+                    Some(FeedEvent::Changed(delivery)) => {
+                        mirror.receive(delivery).expect("delivery applies cleanly")
+                    }
+                    other => panic!("feed ended at version {}: {other:?}", mirror.version()),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the feed stalled at version {} of {target}", mirror.version()));
+
+        let mirrored: Vec<BlockId> = mirror.blocks().iter().map(|b| b.id).collect();
+        let kernel_ids: Vec<BlockId> = all.iter().map(|b| b.id).collect();
+        let describe = |ids: &[BlockId]| -> Vec<String> {
+            ids.iter()
+                .map(|id| {
+                    let b = all.iter().find(|b| b.id == *id).unwrap();
+                    format!("{:?}/{:?}/{:?}", b.role, b.kind, b.status)
+                })
+                .collect()
+        };
+        assert_eq!(describe(&mirrored), describe(&kernel_ids), "the mirror holds what the kernel holds");
+        assert!(mirrored.contains(&input));
+    });
+}
+
 /// The facts script, planted into the default type. Returns nothing; the
 /// caller reads the notification it writes.
 async fn plant_facts_script(live_kernel: &kaijutsu_server::SharedKernel) {
