@@ -125,7 +125,11 @@ kj mcp restart <name>    # stop one server, then reconcile so it comes back
 `restart` is how a `command`/`args`/`env` edit reaches a running server:
 it unregisters that one instance and runs the same reconcile `reload`
 runs. If the stop succeeds and the start fails, the server is down and the
-error says so. `list` is a read, ungated. `reload` and `restart` materialize `mcp.toml` as running
+error says so. A restart tells each bound context once: "restarted; tools
+unchanged", or the delta (`ToolAdded`, `ToolRemoved`, and `ToolChanged`
+with the new description and schema of each tool whose definition differs).
+The same `ToolChanged` notice follows a server's own `list_changed`.
+`list` is a read, ungated. `reload` and `restart` materialize `mcp.toml` as running
 processes — spawning and killing subprocesses, not a file edit — so it's
 gated on `Capability::ConfigWrite`, the same authority that gates `kj config
 reset` and the other administrative config verbs (`kj backend`, `kj cast`,

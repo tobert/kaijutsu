@@ -7639,6 +7639,9 @@ pub(crate) fn set_block_snapshot(
                 crate::kaijutsu_capnp::NotificationKind::ToolRemoved
             }
             kaijutsu_types::NotificationKind::Log => crate::kaijutsu_capnp::NotificationKind::Log,
+            kaijutsu_types::NotificationKind::ToolChanged => {
+                crate::kaijutsu_capnp::NotificationKind::ToolChanged
+            }
             kaijutsu_types::NotificationKind::PromptsChanged => {
                 crate::kaijutsu_capnp::NotificationKind::PromptsChanged
             }

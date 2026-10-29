@@ -708,6 +708,9 @@ impl std::fmt::Display for LogLevel {
 pub enum NotificationKind {
     ToolAdded,
     ToolRemoved,
+    /// A tool kept its name but its description or input schema differs.
+    /// `detail` carries the new definitions in full.
+    ToolChanged,
     Log,
     PromptsChanged,
     Coalesced,
@@ -718,6 +721,7 @@ impl NotificationKind {
         match self {
             NotificationKind::ToolAdded => "tool_added",
             NotificationKind::ToolRemoved => "tool_removed",
+            NotificationKind::ToolChanged => "tool_changed",
             NotificationKind::Log => "log",
             NotificationKind::PromptsChanged => "prompts_changed",
             NotificationKind::Coalesced => "coalesced",
@@ -779,6 +783,9 @@ impl NotificationPayload {
             }
             NotificationKind::ToolRemoved => {
                 format!("[{}] {}", self.instance, format_tool_change("removed", &self.tools))
+            }
+            NotificationKind::ToolChanged => {
+                format!("[{}] {}", self.instance, format_tool_change("changed", &self.tools))
             }
             NotificationKind::Log => {
                 let level = self
@@ -853,7 +860,11 @@ pub fn format_notification_for_llm(block: &BlockSnapshot) -> String {
     }
 
     let body = if let Some(ref detail) = payload.detail {
-        if detail.chars().count() > NOTIFICATION_DETAIL_HYDRATION_BUDGET {
+        // A changed tool's definition is the point of the notice; cutting
+        // it would leave the model calling the tool with a half-known schema.
+        if payload.kind != NotificationKind::ToolChanged
+            && detail.chars().count() > NOTIFICATION_DETAIL_HYDRATION_BUDGET
+        {
             let truncated: String = detail
                 .chars()
                 .take(NOTIFICATION_DETAIL_HYDRATION_BUDGET)
@@ -5453,6 +5464,29 @@ mod tests {
             BlockSnapshot::notification_block(id, None, payload, "giant log");
         let formatted = format_notification_for_llm(&snap);
         assert!(formatted.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn format_notification_for_llm_keeps_full_tool_changed_schema() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let schema = "s".repeat(NOTIFICATION_DETAIL_HYDRATION_BUDGET + 500);
+        let payload = NotificationPayload {
+            instance: "gpal".into(),
+            kind: NotificationKind::ToolChanged,
+            level: None,
+            tools: vec!["ask".into()],
+            count: Some(1),
+            detail: Some(schema.clone()),
+        };
+        assert_eq!(
+            payload.summary_line(),
+            "[gpal] tool changed: ask"
+        );
+        let snap = BlockSnapshot::notification_block(id, None, payload, "changed");
+        let formatted = format_notification_for_llm(&snap);
+        assert!(formatted.contains(&schema));
+        assert!(!formatted.contains("...[truncated]"));
     }
 
     #[test]

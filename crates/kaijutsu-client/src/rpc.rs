@@ -4090,6 +4090,9 @@ pub(crate) fn parse_block_snapshot(
             crate::kaijutsu_capnp::NotificationKind::ToolRemoved => {
                 kaijutsu_types::NotificationKind::ToolRemoved
             }
+            crate::kaijutsu_capnp::NotificationKind::ToolChanged => {
+                kaijutsu_types::NotificationKind::ToolChanged
+            }
             crate::kaijutsu_capnp::NotificationKind::Log => {
                 kaijutsu_types::NotificationKind::Log
             }
@@ -4829,6 +4832,9 @@ mod tests {
                 }
                 kaijutsu_types::NotificationKind::Log => {
                     crate::kaijutsu_capnp::NotificationKind::Log
+                }
+                kaijutsu_types::NotificationKind::ToolChanged => {
+                    crate::kaijutsu_capnp::NotificationKind::ToolChanged
                 }
                 kaijutsu_types::NotificationKind::PromptsChanged => {
                     crate::kaijutsu_capnp::NotificationKind::PromptsChanged
@@ -5627,6 +5633,7 @@ mod tests {
             kaijutsu_types::NotificationKind::Log,
             kaijutsu_types::NotificationKind::PromptsChanged,
             kaijutsu_types::NotificationKind::Coalesced,
+            kaijutsu_types::NotificationKind::ToolChanged,
         ];
         for kind in kinds {
             let payload = kaijutsu_types::NotificationPayload {

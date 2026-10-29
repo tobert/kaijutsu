@@ -757,6 +757,7 @@ enum NotificationKind {
   log @2;
   promptsChanged @3;
   coalesced @4;
+  toolChanged @5;
 }
 
 # Severity for Log notifications. Kept in sync with kaijutsu-types::LogLevel.

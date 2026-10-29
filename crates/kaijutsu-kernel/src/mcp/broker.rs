@@ -165,6 +165,10 @@ pub struct Broker {
     /// Last-seen tool list per instance, used to diff ToolsChanged into
     /// per-tool ToolAdded/ToolRemoved emissions (D-35).
     tool_snapshots: Mutex<HashMap<InstanceId, Vec<KernelTool>>>,
+    /// Tool lists of instances taken down by `unregister_for_restart`, kept
+    /// until the instance registers again so that registration can report
+    /// the difference instead of every tool as new.
+    parked_snapshots: Mutex<HashMap<InstanceId, Vec<KernelTool>>>,
     /// (D-44) Live resource subscriptions tied to `ContextToolBinding`.
     /// `clear_binding` / `unregister` walk this table and call
     /// `server.unsubscribe` on each matching entry.
@@ -381,6 +385,7 @@ impl Broker {
             pump_handles: Mutex::new(HashMap::new()),
             flush_timers: Mutex::new(HashMap::new()),
             tool_snapshots: Mutex::new(HashMap::new()),
+            parked_snapshots: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
             resource_parents: Mutex::new(HashMap::new()),
             builtin_hooks: BuiltinHookRegistry::new(),
@@ -733,11 +738,20 @@ impl Broker {
             .await
             .insert(id.clone(), initial_tools.clone());
 
-        // Emit a single synthetic ToolAdded block listing every tool the
-        // server exposes, unless this is a silent registration. One block
-        // per (instance, batch) keeps the conversation document small when
-        // an instance exposes many tools (D-35 coalesced).
-        if emit_tool_added && !initial_tools.is_empty() {
+        // An instance returning from `unregister_for_restart` reports what
+        // differs from the list it had before. Any other registration
+        // emits a single synthetic ToolAdded block listing every tool the
+        // server exposes, unless it is silent. One block per
+        // (instance, batch) keeps the conversation document small when an
+        // instance exposes many tools (D-35 coalesced).
+        let parked = self.parked_snapshots.lock().await.remove(&id);
+        if let Some(before) = parked {
+            if emit_tool_added {
+                let delta = tool_delta(&before, &initial_tools);
+                self.emit_restart_notice(&id, &delta, initial_tools.len()).await;
+                self.emit_tool_delta(&id, delta).await;
+            }
+        } else if emit_tool_added && !initial_tools.is_empty() {
             let names: Vec<String> = initial_tools.iter().map(|t| t.name.clone()).collect();
             let count = names.len();
             let payload = NotificationPayload {
@@ -828,6 +842,21 @@ impl Broker {
     }
 
     pub async fn unregister(self: &Arc<Self>, id: &InstanceId) -> McpResult<()> {
+        self.unregister_inner(id, /* park_snapshot = */ false).await
+    }
+
+    /// Like `unregister`, for a restart: the tool list is parked instead of
+    /// announced as removed, and the next `register` of this id reports only
+    /// what differs from it. The caller must register the instance again.
+    pub async fn unregister_for_restart(self: &Arc<Self>, id: &InstanceId) -> McpResult<()> {
+        self.unregister_inner(id, /* park_snapshot = */ true).await
+    }
+
+    async fn unregister_inner(
+        self: &Arc<Self>,
+        id: &InstanceId,
+        park_snapshot: bool,
+    ) -> McpResult<()> {
         // Abort the pump first so no new events slip through during teardown.
         if let Some(handle) = self.pump_handles.lock().await.remove(id) {
             handle.abort();
@@ -849,7 +878,13 @@ impl Broker {
 
         // Pull the last-seen tool snapshot so we can emit per-tool
         // ToolRemoved events (D-35).
-        let removed_tools = self.tool_snapshots.lock().await.remove(id).unwrap_or_default();
+        let mut removed_tools = self.tool_snapshots.lock().await.remove(id).unwrap_or_default();
+        if park_snapshot {
+            self.parked_snapshots
+                .lock()
+                .await
+                .insert(id.clone(), std::mem::take(&mut removed_tools));
+        }
 
         // Remove from `instances` FIRST so any concurrent `subscribe()` that
         // has not yet reached `resolve_instance` fails fast with
@@ -3445,6 +3480,78 @@ impl Broker {
     /// Emit a notification block into every bound context that allows this
     /// instance. Walks bindings (no reverse index; the table stays small).
     /// No-op when `documents` is unset (broker constructed without bootstrap).
+    /// Emit one block per non-empty part of `delta` into the bound contexts.
+    /// A changed tool's block carries its new definition in full.
+    async fn emit_tool_delta(self: &Arc<Self>, id: &InstanceId, delta: ToolDelta) {
+        use kaijutsu_types::NotificationKind as Kind;
+        let batches = [
+            (Kind::ToolAdded, delta.added, None),
+            (Kind::ToolRemoved, delta.removed, None),
+            (
+                Kind::ToolChanged,
+                delta.changed.iter().map(|t| t.name.clone()).collect(),
+                (!delta.changed.is_empty()).then(|| {
+                    let defs: Vec<serde_json::Value> = delta
+                        .changed
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "name": t.name,
+                                "description": t.description,
+                                "input_schema": t.input_schema,
+                            })
+                        })
+                        .collect();
+                    serde_json::to_string_pretty(&defs).unwrap_or_default()
+                }),
+            ),
+        ];
+        for (kind, tools, detail) in batches {
+            if tools.is_empty() {
+                continue;
+            }
+            let count = tools.len();
+            let payload = NotificationPayload {
+                instance: id.as_str().to_string(),
+                kind,
+                level: None,
+                tools,
+                count: Some(count),
+                detail,
+            };
+            self.emit_for_bindings(id, payload).await;
+        }
+    }
+
+    /// Tell bound contexts the instance restarted and whether its tools
+    /// differ, ahead of the per-tool delta blocks.
+    async fn emit_restart_notice(
+        self: &Arc<Self>,
+        id: &InstanceId,
+        delta: &ToolDelta,
+        tool_count: usize,
+    ) {
+        let detail = if delta.is_empty() {
+            format!("restarted; tools unchanged ({tool_count} tools)")
+        } else {
+            format!(
+                "restarted; tools changed: {} added, {} removed, {} changed",
+                delta.added.len(),
+                delta.removed.len(),
+                delta.changed.len(),
+            )
+        };
+        let payload = NotificationPayload {
+            instance: id.as_str().to_string(),
+            kind: kaijutsu_types::NotificationKind::Log,
+            level: Some(kaijutsu_types::LogLevel::Info),
+            tools: Vec::new(),
+            count: None,
+            detail: Some(detail),
+        };
+        self.emit_for_bindings(id, payload).await;
+    }
+
     async fn emit_for_bindings(
         self: &Arc<Self>,
         instance: &InstanceId,
@@ -4105,31 +4212,8 @@ async fn handle_tools_changed(broker: &Arc<Broker>, id: &InstanceId) {
         snaps.insert(id.clone(), new_tools.clone());
         prev
     };
-    let (added, removed) = diff_tools(&old_tools, &new_tools);
-    if !added.is_empty() {
-        let count = added.len();
-        let payload = NotificationPayload {
-            instance: id.as_str().to_string(),
-            kind: kaijutsu_types::NotificationKind::ToolAdded,
-            level: None,
-            tools: added,
-            count: Some(count),
-            detail: None,
-        };
-        broker.emit_for_bindings(id, payload).await;
-    }
-    if !removed.is_empty() {
-        let count = removed.len();
-        let payload = NotificationPayload {
-            instance: id.as_str().to_string(),
-            kind: kaijutsu_types::NotificationKind::ToolRemoved,
-            level: None,
-            tools: removed,
-            count: Some(count),
-            detail: None,
-        };
-        broker.emit_for_bindings(id, payload).await;
-    }
+    let delta = tool_delta(&old_tools, &new_tools);
+    broker.emit_tool_delta(id, delta).await;
 }
 
 /// D-43 flush body: re-read the URI **once** and fan the fresh payload out
@@ -4284,13 +4368,30 @@ fn resource_payload_from_contents(
     }
 }
 
-fn diff_tools(old: &[KernelTool], new: &[KernelTool]) -> (Vec<String>, Vec<String>) {
-    use std::collections::HashSet;
-    let old_names: HashSet<&str> = old.iter().map(|t| t.name.as_str()).collect();
-    let new_names: HashSet<&str> = new.iter().map(|t| t.name.as_str()).collect();
+/// What differs between two tool lists of one instance. `changed` holds the
+/// new definition of every tool whose name is in both lists but whose
+/// description or input schema differs.
+struct ToolDelta {
+    added: Vec<String>,
+    removed: Vec<String>,
+    changed: Vec<KernelTool>,
+}
+
+impl ToolDelta {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+fn tool_delta(old: &[KernelTool], new: &[KernelTool]) -> ToolDelta {
+    use std::collections::HashMap;
+    let old_by_name: HashMap<&str, &KernelTool> =
+        old.iter().map(|t| (t.name.as_str(), t)).collect();
+    let new_names: std::collections::HashSet<&str> =
+        new.iter().map(|t| t.name.as_str()).collect();
     let added = new
         .iter()
-        .filter(|t| !old_names.contains(t.name.as_str()))
+        .filter(|t| !old_by_name.contains_key(t.name.as_str()))
         .map(|t| t.name.clone())
         .collect();
     let removed = old
@@ -4298,7 +4399,16 @@ fn diff_tools(old: &[KernelTool], new: &[KernelTool]) -> (Vec<String>, Vec<Strin
         .filter(|t| !new_names.contains(t.name.as_str()))
         .map(|t| t.name.clone())
         .collect();
-    (added, removed)
+    let changed = new
+        .iter()
+        .filter(|t| {
+            old_by_name.get(t.name.as_str()).is_some_and(|prev| {
+                prev.description != t.description || prev.input_schema != t.input_schema
+            })
+        })
+        .cloned()
+        .collect();
+    ToolDelta { added, removed, changed }
 }
 
 fn notif_kind_label(kind: NotifKind) -> &'static str {
@@ -4795,6 +4905,14 @@ mod tests {
                     input_schema: json!({ "type": "object" }),
                 });
             }
+        }
+
+        /// Give one advertised tool a description and schema.
+        fn set_tool_def(&self, name: &str, description: &str, schema: serde_json::Value) {
+            let mut tools = self.tools.lock().unwrap();
+            let tool = tools.iter_mut().find(|t| t.name == name).expect("tool exists");
+            tool.description = Some(description.to_string());
+            tool.input_schema = schema;
         }
 
         fn sender(&self) -> broadcast::Sender<ServerNotification> {
@@ -6108,6 +6226,7 @@ mod tests {
                 pump_handles: Mutex::new(HashMap::new()),
                 flush_timers: Mutex::new(HashMap::new()),
                 tool_snapshots: Mutex::new(HashMap::new()),
+            parked_snapshots: Mutex::new(HashMap::new()),
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
@@ -6225,6 +6344,109 @@ mod tests {
         );
     }
 
+    /// A tool that keeps its name but changes its schema is reported as
+    /// `ToolChanged` with the full new definition; unchanged tools are silent.
+    #[tokio::test]
+    async fn tools_changed_reports_schema_change_with_full_definition() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let server = Arc::new(MockServer::new("svc").with_tool("a").with_tool("b"));
+        let tx = server.sender();
+        broker
+            .register_silently(server.clone(), InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+        });
+        server.set_tool_def("a", "reads a path", schema.clone());
+        let _ = tx.send(ServerNotification::ToolsChanged);
+
+        for _ in 0..10 {
+            sleep(Duration::from_millis(20)).await;
+            if !notifications_in(&store, ctx).is_empty() {
+                break;
+            }
+        }
+        let notifs = notifications_in(&store, ctx);
+        assert_eq!(notifs.len(), 1, "only the changed tool is reported: {notifs:?}");
+        let n = &notifs[0];
+        assert_eq!(n.kind, kaijutsu_types::NotificationKind::ToolChanged);
+        assert_eq!(n.tools, vec!["a".to_string()]);
+        let detail = n.detail.as_deref().expect("changed tool carries its definition");
+        assert!(detail.contains("reads a path"), "description missing: {detail}");
+        assert!(detail.contains("\"required\""), "schema missing: {detail}");
+        assert!(!detail.contains("\"b\""), "unchanged tool leaked: {detail}");
+    }
+
+    /// A restart whose server advertises the same tools reads as one event,
+    /// not as every tool removed and then added.
+    #[tokio::test]
+    async fn restart_with_identical_tools_is_one_unchanged_notice() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let first = Arc::new(MockServer::new("svc").with_tool("a").with_tool("b"));
+        broker
+            .register_silently(first, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let id = InstanceId::new("svc");
+        broker.unregister_for_restart(&id).await.unwrap();
+        let second = Arc::new(MockServer::new("svc").with_tool("a").with_tool("b"));
+        broker
+            .register(second, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let notifs = notifications_in(&store, ctx);
+        assert_eq!(notifs.len(), 1, "expected a single restart notice: {notifs:?}");
+        assert_eq!(notifs[0].kind, kaijutsu_types::NotificationKind::Log);
+        let detail = notifs[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("restarted"), "{detail}");
+        assert!(detail.contains("unchanged"), "{detail}");
+    }
+
+    /// A restart reports only what differs: added, removed, and changed tools.
+    #[tokio::test]
+    async fn restart_reports_only_the_delta() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let first = Arc::new(MockServer::new("svc").with_tool("keep").with_tool("gone").with_tool("edit"));
+        broker
+            .register_silently(first, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let id = InstanceId::new("svc");
+        broker.unregister_for_restart(&id).await.unwrap();
+        let second = Arc::new(MockServer::new("svc").with_tool("keep").with_tool("edit").with_tool("new"));
+        second.set_tool_def("edit", "edits", json!({ "type": "object", "required": ["x"] }));
+        broker
+            .register(second, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let notifs = notifications_in(&store, ctx);
+        let by_kind = |k| notifs.iter().filter(|n| n.kind == k).collect::<Vec<_>>();
+        let added = by_kind(kaijutsu_types::NotificationKind::ToolAdded);
+        let removed = by_kind(kaijutsu_types::NotificationKind::ToolRemoved);
+        let changed = by_kind(kaijutsu_types::NotificationKind::ToolChanged);
+        assert_eq!(added.len(), 1, "{notifs:?}");
+        assert_eq!(added[0].tools, vec!["new".to_string()]);
+        assert_eq!(removed.len(), 1, "{notifs:?}");
+        assert_eq!(removed[0].tools, vec!["gone".to_string()]);
+        assert_eq!(changed.len(), 1, "{notifs:?}");
+        assert_eq!(changed[0].tools, vec!["edit".to_string()]);
+        assert!(
+            !notifs.iter().any(|n| n.tools.iter().any(|t| t == "keep")),
+            "unchanged tool reported: {notifs:?}"
+        );
+    }
+
     #[tokio::test]
     /// Phase 3 (D-44): ResourceUpdated without a live subscription emits
     /// nothing. The flush body walks `subscriptions`, finds no matching
@@ -6283,6 +6505,7 @@ mod tests {
                 pump_handles: Mutex::new(HashMap::new()),
                 flush_timers: Mutex::new(HashMap::new()),
                 tool_snapshots: Mutex::new(HashMap::new()),
+            parked_snapshots: Mutex::new(HashMap::new()),
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
@@ -7902,6 +8125,7 @@ mod tests {
                 pump_handles: Mutex::new(HashMap::new()),
                 flush_timers: Mutex::new(HashMap::new()),
                 tool_snapshots: Mutex::new(HashMap::new()),
+            parked_snapshots: Mutex::new(HashMap::new()),
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),

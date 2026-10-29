@@ -298,7 +298,7 @@ impl KjDispatcher {
         let broker = self.kernel().broker();
         let instance = external_instance_id(name);
         let was_running = broker.list_instances().await.contains(&instance);
-        if was_running && let Err(e) = broker.unregister(&instance).await {
+        if was_running && let Err(e) = broker.unregister_for_restart(&instance).await {
             return KjResult::Err(format!("kj mcp restart: stop '{name}': {e}"));
         }
 

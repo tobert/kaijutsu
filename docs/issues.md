@@ -41,6 +41,19 @@ TUI entries below). Open:
   performer" in places; read it against `docs/character.md`, "Roots".
 
 ---
+## MCP tool-change notices: what is open (2026-10-28)
+
+- `ExternalMcpServer::reconnect()` replaces its tool cache without a diff,
+  and nothing calls it. When automatic reconnect lands it needs the same
+  restart notice as `kj mcp restart`.
+- A restart parks the old tool list until the id registers again. If the
+  restart fails to start, the parked list stays and the next registration of
+  that id reports against it.
+- Notices go to contexts bound at the time. A context that bound earlier and
+  was not running sees them on its next turn; whether the model's live tool
+  list reads the broker each turn or from a hydrated snapshot is unchecked.
+- Tool search by embeddings: the per-tool definition comparison here is the
+  change signal a lookup cache would key on.
 
 ## Storyteller: what the prototype leaves open (2026-10-28)
 
