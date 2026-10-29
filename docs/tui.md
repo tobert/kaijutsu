@@ -1184,7 +1184,8 @@ an ask waiting in that seat, `!n` the pending count across all contexts);
 `│`, the one separator, always left of the mode so the eye finds it in
 the same place; the vi mode (`-- NORMAL --`, `-- INSERT --`, vim's
 spelling); the last completed call's tokens over the model's window,
-`17.3/128k` — both in thousands, the unit once, trailing by one call and
+`17.3/128k` — both in thousands, the unit once (a window of a million or
+more puts each half in its own unit: `234k/1M`), trailing by one call and
 never an estimate (the kernel does not tokenize locally), warning at 75%
 of the window and alarm at 90%; cache health (next); bar.beat and pulse
 for the playing track; and connection state from `ConnectionStatus` only

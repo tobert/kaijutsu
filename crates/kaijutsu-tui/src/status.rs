@@ -217,10 +217,15 @@ pub struct TokenFigure {
 
 impl TokenFigure {
     /// `17.3/128k`, or `17.3k` with no window known. Both in thousands, the
-    /// unit once. Warns past 75% of the window, alarms past 90%.
+    /// unit once. A window of a million or more puts each half in its own
+    /// unit: `234k/1M`. Warns past 75% of the window, alarms past 90%.
     pub fn figure(&self) -> Figure {
         let text = match self.window {
+            Some(window) if window >= 1_000_000 => {
+                format!("{}/{}", format_count(self.used), format_count(window))
+            }
             Some(window) => format!("{}/{}", format_k(self.used, false), format_k(window, true)),
+            None if self.used >= 1_000_000 => format_count(self.used),
             None => format_k(self.used, true),
         };
         let severity = match self.window {
@@ -229,6 +234,21 @@ impl TokenFigure {
             _ => Severity::Ok,
         };
         Figure::at(severity, text)
+    }
+}
+
+/// `17.3k`, `234k`, `1.2M`, `1M`: thousands as in [`format_k`], millions with
+/// one decimal that drops when it would be `.0`. The unit is always written.
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        let tenths = (n + 50_000) / 100_000;
+        if tenths % 10 == 0 {
+            format!("{}M", tenths / 10)
+        } else {
+            format!("{}.{}M", tenths / 10, tenths % 10)
+        }
+    } else {
+        format_k(n, true)
     }
 }
 
@@ -630,6 +650,20 @@ mod tests {
         assert_eq!(TokenFigure { used: 900, window: None }.figure().text, "0.9k");
         assert_eq!(TokenFigure { used: 96_100, window: Some(128_000) }.figure().severity, Severity::Warning);
         assert_eq!(TokenFigure { used: 120_000, window: Some(128_000) }.figure().severity, Severity::Alarm);
+    }
+
+    /// A window of a million tokens or more is written in millions, so the
+    /// two halves carry their own units: `234k/1M`, never `234.0/1000k`.
+    #[test]
+    fn a_million_token_window_reads_in_millions() {
+        let f = TokenFigure { used: 234_000, window: Some(1_000_000) }.figure();
+        assert_eq!(f.text, "234k/1M");
+        let f = TokenFigure { used: 17_300, window: Some(1_000_000) }.figure();
+        assert_eq!(f.text, "17.3k/1M");
+        let f = TokenFigure { used: 1_200_000, window: Some(2_000_000) }.figure();
+        assert_eq!(f.text, "1.2M/2M");
+        assert_eq!(TokenFigure { used: 1_500_000, window: None }.figure().text, "1.5M");
+        assert_eq!(TokenFigure { used: 950_000, window: Some(1_000_000) }.figure().severity, Severity::Alarm);
     }
 
     #[test]
