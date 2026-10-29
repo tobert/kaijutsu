@@ -60,6 +60,10 @@ pub struct ConversationMailbox {
     ///
     /// [`set_instruction_form`]: Self::set_instruction_form
     form: super::hydrate::InstructionForm,
+    /// What the last request from this conversation sent, so the next turn
+    /// can name where it stops extending it. Rebuilding the folded state
+    /// keeps it: that is exactly when a request can diverge.
+    sent: Option<super::prefix::SentPrefix>,
 }
 
 /// The keep-set a windowed conversation hydrates, as its maximal runs over the
@@ -102,7 +106,19 @@ impl ConversationMailbox {
             materialized: false,
             windowed: false,
             form: super::hydrate::InstructionForm::default(),
+            sent: None,
         }
+    }
+
+    /// Remember what a request sent.
+    pub fn record_sent(&mut self, sent: super::prefix::SentPrefix) {
+        self.sent = Some(sent);
+    }
+
+    /// What the last request sent, if one was sent since this mailbox was
+    /// created.
+    pub fn last_sent(&self) -> Option<&super::prefix::SentPrefix> {
+        self.sent.as_ref()
     }
 
     /// Render kernel instructions and drift arrivals in `form`, the form of

@@ -190,6 +190,53 @@ fn warn_if_near_context_window(
     }
 }
 
+/// Say what a request that does not extend the previous one costs: where it
+/// first differs, the estimated tokens a prompt cache cannot read from there,
+/// and the thinking blocks after it that a provider binding thinking to the
+/// conversation drops (Anthropic drops them under `drop_block`).
+///
+/// A windowed context diverges every turn by design, so its cost is logged,
+/// not written into the conversation. Everywhere else a `Trace` block lands
+/// after the turn's input, best effort, like the context-size warning.
+fn report_divergence(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    after_block_id: &kaijutsu_types::BlockId,
+    divergence: &crate::llm::prefix::Divergence,
+    windowed: bool,
+) {
+    let crate::llm::prefix::Divergence { at, messages, tokens_after, thinking_after } = *divergence;
+    let place = match at {
+        None => "its system prompt or tools changed".to_string(),
+        Some(i) => format!("it differs from message {} of {messages}", i + 1),
+    };
+    let detail = format!(
+        "This request does not extend the previous one: {place}. About {tokens_after} tokens from \
+         there are sent without a cache read, and {thinking_after} thinking block(s) from there are \
+         dropped by a provider that binds thinking to the conversation. Excluding or editing an \
+         earlier block, or a sliding window, causes this; `kj context turns` shows the cache \
+         reads and writes that resulted."
+    );
+    if windowed {
+        tracing::info!(%context_id, "{detail}");
+        return;
+    }
+    tracing::warn!(%context_id, "{detail}");
+    if let Err(e) = documents.insert_block_as(
+        context_id,
+        None,
+        Some(after_block_id),
+        kaijutsu_types::Role::System,
+        kaijutsu_types::BlockKind::Trace,
+        detail,
+        kaijutsu_types::Status::Done,
+        kaijutsu_types::ContentType::Plain,
+        Some(PrincipalId::system()),
+    ) {
+        tracing::warn!("Failed to insert divergence Trace block: {e}");
+    }
+}
+
 /// Whether this turn takes input submitted while it runs. A stopping turn
 /// does not, nor does one a beat waits on: its caller budgeted one piece of
 /// work, and the input starts the next turn instead.
@@ -1438,6 +1485,54 @@ mod hydration_tests {
 }
 
 #[cfg(test)]
+mod divergence_report_tests {
+    use super::*;
+    use crate::{DocumentKind, shared_block_store};
+    use crate::llm::prefix::Divergence;
+
+    fn conversation() -> (SharedBlockStore, ContextId, kaijutsu_types::BlockId) {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents.create_document(context_id, DocumentKind::Conversation, None).expect("create document");
+        let input = documents
+            .insert_block_as(context_id, None, None, Role::User, BlockKind::Text, "hello", Status::Done,
+                ContentType::Plain, Some(PrincipalId::new()))
+            .expect("insert user block");
+        (documents, context_id, input)
+    }
+
+    /// A request that does not extend the previous one leaves a Trace that
+    /// names where it differs, the tokens re-sent, and the thinking dropped.
+    #[test]
+    fn a_divergence_leaves_a_trace_with_its_cost() {
+        let (documents, context_id, input) = conversation();
+        let divergence = Divergence { at: Some(11), messages: 40, tokens_after: 8400, thinking_after: 3 };
+        report_divergence(&documents, context_id, &input, &divergence, false);
+        let blocks = documents.block_snapshots(context_id).unwrap();
+        let trace = blocks.iter().find(|b| b.kind == BlockKind::Trace).expect("a Trace block");
+        for part in ["message 12 of 40", "8400 tokens", "3 thinking block"] {
+            assert!(trace.content.contains(part), "{part}: {}", trace.content);
+        }
+
+        let head = Divergence { at: None, messages: 40, tokens_after: 9000, thinking_after: 4 };
+        report_divergence(&documents, context_id, &input, &head, false);
+        let blocks = documents.block_snapshots(context_id).unwrap();
+        assert!(blocks.iter().any(|b| b.kind == BlockKind::Trace && b.content.contains("system prompt or tools")));
+    }
+
+    /// A windowed context diverges every turn by design; its cost goes to
+    /// the log, not the conversation.
+    #[test]
+    fn a_windowed_divergence_writes_no_block() {
+        let (documents, context_id, input) = conversation();
+        let divergence = Divergence { at: Some(3), messages: 20, tokens_after: 900, thinking_after: 0 };
+        report_divergence(&documents, context_id, &input, &divergence, true);
+        let blocks = documents.block_snapshots(context_id).unwrap();
+        assert!(!blocks.iter().any(|b| b.kind == BlockKind::Trace));
+    }
+}
+
+#[cfg(test)]
 mod context_window_warning_tests {
     use super::*;
     use crate::{DocumentKind, shared_block_store};
@@ -2659,6 +2754,13 @@ async fn run_llm_stream(
         );
     }
 
+    // Name what this turn costs when it does not extend the last request: a
+    // hydration that applied an exclusion or an edit, or a sliding window.
+    let sent_prefix = crate::llm::prefix::SentPrefix::of(Some(&system_prompt), &tools, &messages);
+    if let Some(divergence) = mailbox.last_sent().and_then(|last| last.divergence(&sent_prefix, &messages)) {
+        report_divergence(&documents, context_id, &after_block_id, &divergence, hydration_policy.is_some());
+    }
+
     tracing::debug!(
         "Sending {} messages for context {}",
         messages.len(),
@@ -2818,6 +2920,7 @@ async fn run_llm_stream(
                 };
                 match started {
                     Ok(s) => {
+                        mailbox.record_sent(crate::llm::prefix::SentPrefix::of(Some(&system_prompt), &tools, &messages));
                         if attempt > 1 {
                             tracing::debug!("LLM stream started on attempt {}", attempt);
                         } else {

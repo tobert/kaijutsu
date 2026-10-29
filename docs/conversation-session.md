@@ -240,6 +240,27 @@ What changes is what each copy costs:
   API refuses a system message) it is an ordinary instruction and each copy
   stays. Copies accumulate until a filtered fork or a rotation sheds them.
 
+## A request that does not extend the last one
+
+Appending keeps a provider's prompt cache and every thinking block. A turn
+whose request changes or drops something the previous request sent does not:
+the system prompt or tools changed, a hydration applied an exclusion or an
+edit, or a sliding window moved. The mailbox keeps what the last request sent,
+one fingerprint per message (`llm/prefix.rs`, `SentPrefix`); an image counts
+by its content hash. At the start of each turn the request is compared with
+it. On a divergence the turn writes a `Trace` block after its input naming
+where the request first differs, the estimated tokens from there that no cache
+reads, and the thinking blocks from there that a provider binding thinking to
+the conversation drops (`report_divergence` in `runtime/llm_stream.rs`). A
+windowed context diverges every turn by design, so its cost goes to the log,
+not the conversation. `kj context turns` shows the cache reads and writes
+that resulted.
+
+The comparison is over kaijutsu's messages, not each provider's request, so
+a provider-side change of form is not seen: a system message that becomes
+user text because its neighbor changed. A new mailbox (fork, cold start,
+eviction) has nothing to compare against.
+
 ## A turn that ended without a reply
 
 A turn that is interrupted or fails leaves a kernel instruction after its own

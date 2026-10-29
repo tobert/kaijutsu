@@ -34,6 +34,7 @@ pub mod db_config;
 pub mod deepseek;
 pub mod endpoint;
 pub(crate) mod hydrate;
+pub mod prefix;
 pub mod image_cache;
 pub mod mailbox;
 pub mod mk;
