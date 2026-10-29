@@ -146,7 +146,8 @@ enum RcCommand {
     /// Install the embedded rc scripts into the rc tree. Installs anything
     /// absent, and names files that differ from their default and retired
     /// defaults still installed, leaving both alone; --force overwrites the
-    /// first and removes the second.
+    /// first and removes the second. A path with a <path>.keep file beside it
+    /// is left as it is, present, edited, or absent, even with --force.
     Reseed {
         /// Also overwrite files that differ from their embedded default and
         /// remove retired defaults.
@@ -410,7 +411,19 @@ fn cmd_rc_reseed(
                 for path in &r.diverged {
                     println!("  {path}");
                 }
-                println!("\nPass --force to overwrite them with the embedded defaults.");
+                println!(
+                    "\nPass --force to overwrite them with the embedded defaults. To keep \
+                     one through --force, create <path>.keep beside it."
+                );
+            }
+            if !r.kept.is_empty() {
+                println!(
+                    "\n{} file(s) have a .keep file and were left as they are:",
+                    r.kept.len()
+                );
+                for path in &r.kept {
+                    println!("  {path}");
+                }
             }
             if !r.retired.is_empty() {
                 println!(

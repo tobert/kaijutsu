@@ -18,6 +18,9 @@ tree is a materialization of the in-repo seed, and `kaijutsu-server rc reseed
 --force` is an ordinary operation to design around. The snowflake TOML under
 `/config/kernel` is the opposite case — local, secret-bearing, never reseeded
 over — which is one more reason the four roots do not all melt the same way.
+Local rc lives beside the seed in two ways that survive a forced reseed: a
+file at a path the seed does not ship, and a seeded path with a `<path>.keep`
+file beside it (`docs/config-namespace.md`, "What it buys beyond tidiness").
 
 **Amy's guidance on the git question (2026-08-28): plain files, the kernel
 never runs git.** `crates/kaijutsu-configgit` — the git-worktree write seam, built

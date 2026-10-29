@@ -158,6 +158,9 @@ pub struct RcSeedReport {
     pub retired: Vec<String>,
     /// Retired seed paths this reseed removed. Always empty without `force`.
     pub removed: Vec<String>,
+    /// Seed and retired paths with a `<path>.keep` file beside them, left as
+    /// they are (present, edited, or absent), even with `force`.
+    pub kept: Vec<String>,
 }
 
 /// Paths, relative to the rc root, that earlier seeds installed and the
@@ -225,6 +228,11 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
 /// script you added under any other path is never touched. Use `git diff` to see what a
 /// forced reseed changed.
 ///
+/// A seed or retired path with a `<path>.keep` file beside it is left exactly
+/// as it is, present, edited, or absent, with or without `force`, and named in
+/// [`RcSeedReport::kept`]. That is how a local edit survives a routine forced
+/// reseed, and how a removed stock script stays removed.
+///
 /// Per the crash-over-corruption stance this surfaces I/O errors rather than
 /// swallowing them: a half-written seed tree is corruption.
 pub fn reseed_rc_files(
@@ -240,6 +248,10 @@ pub fn reseed_rc_files(
             continue;
         };
         let dest = root.join(rel);
+        if is_kept(root, rel) {
+            report.kept.push(rel.to_string());
+            continue;
+        }
         // `symlink_metadata`, not `exists()`: `exists()` follows the link, so
         // a composed link whose target is not written yet would read as absent
         // and be created twice.
@@ -287,6 +299,10 @@ pub fn reseed_rc_files(
         if std::fs::symlink_metadata(&dest).is_err() {
             continue;
         }
+        if is_kept(root, rel) {
+            report.kept.push(rel.to_string());
+            continue;
+        }
         if force {
             std::fs::remove_file(&dest)?;
             report.removed.push(rel.to_string());
@@ -296,7 +312,15 @@ pub fn reseed_rc_files(
     }
     report.retired.sort();
     report.removed.sort();
+    report.kept.sort();
     Ok(report)
+}
+
+/// True if `<rel>.keep` exists beside a seed path: the player owns that entry,
+/// whether they edited it, replaced a link with a file, or removed it. Rc
+/// discovery ignores the marker, since only `SXX-name.kai` names run.
+fn is_kept(root: &std::path::Path, rel: &str) -> bool {
+    std::fs::symlink_metadata(root.join(format!("{rel}.keep"))).is_ok()
 }
 
 /// True if the entry at `dest` already is what the embedded seed says it
@@ -643,6 +667,85 @@ mod tests {
         assert!(report.diverged.is_empty(), "a pristine tree diverges nowhere: {report:?}");
         assert_eq!(report.written, 0, "nothing is absent");
         assert!(report.unchanged > 0, "every entry matched");
+    }
+
+    /// A `.keep` beside a seeded entry is how a local edit survives the
+    /// routine `--force`: the entry is named as kept, never replaced.
+    ///
+    /// Falsified by ignoring the marker: force restores the seed body and
+    /// counts it in `replaced`.
+    #[test]
+    fn reseed_force_leaves_a_kept_file_alone() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        let script = root.join("lib/create/S20-cache.kai");
+        std::fs::write(&script, "# mine\n").expect("diverge");
+        std::fs::write(root.join("lib/create/S20-cache.kai.keep"), "").expect("keep");
+        // A composed link replaced by a local file is kept the same way.
+        let link = root.join("default/create/S20-cache.kai");
+        std::fs::remove_file(&link).expect("remove link");
+        std::fs::write(&link, "# local, not a link\n").expect("clobber");
+        std::fs::write(root.join("default/create/S20-cache.kai.keep"), "").expect("keep");
+
+        for force in [false, true] {
+            let report = reseed_rc_files(root, force).expect("reseed");
+            assert_eq!(
+                report.kept,
+                vec![
+                    "default/create/S20-cache.kai".to_string(),
+                    "lib/create/S20-cache.kai".to_string()
+                ],
+                "force={force}: {report:?}"
+            );
+            assert!(report.diverged.is_empty(), "force={force}: a kept file is not also diverged");
+            assert_eq!(report.replaced, 0, "force={force}: nothing replaced");
+        }
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "# mine\n");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "# local, not a link\n");
+    }
+
+    /// Removing a seeded script and keeping the removal is how a stock
+    /// script is turned off locally: reseed never writes it back.
+    #[test]
+    fn a_kept_removal_stays_removed() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        let script = root.join("storyteller/submit/S10-reminder.kai");
+        std::fs::remove_file(&script).expect("remove");
+        std::fs::write(root.join("storyteller/submit/S10-reminder.kai.keep"), "").expect("keep");
+
+        for force in [false, true] {
+            let report = reseed_rc_files(root, force).expect("reseed");
+            assert_eq!(report.written, 0, "force={force}: the removed script is not written back");
+            assert_eq!(report.kept, vec!["storyteller/submit/S10-reminder.kai".to_string()]);
+        }
+        assert!(std::fs::symlink_metadata(&script).is_err(), "still removed");
+    }
+
+    /// A retired seed with a `.keep` is the player's now: force does not
+    /// remove it.
+    #[test]
+    fn reseed_force_leaves_a_kept_retired_seed() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        ensure_rc_seed_files(root).expect("seed");
+
+        let rel = RETIRED_RC_SEEDS[0];
+        let retired = root.join(rel);
+        std::fs::create_dir_all(retired.parent().unwrap()).expect("mkdir");
+        std::fs::write(&retired, "# still mine\n").expect("write");
+        std::fs::write(root.join(format!("{rel}.keep")), "").expect("keep");
+
+        let report = reseed_rc_files(root, true).expect("reseed --force");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.retired.is_empty(), "{report:?}");
+        assert_eq!(report.kept, vec![rel.to_string()]);
+        assert!(retired.exists());
     }
 
     #[test]

@@ -150,8 +150,15 @@ pointed somewhere unexpected reports every file in it.
   coder/create/S00-stance.kai
   lib/create/S20-cache.kai
 
-Pass --force to overwrite them with the embedded defaults.
+Pass --force to overwrite them with the embedded defaults. To keep one through --force, create <path>.keep beside it.
 ```
+
+A `<path>.keep` file beside a seeded entry makes reseed leave that entry as it
+is, present, edited, or absent, even with `--force`, and reseed names it under
+"have a .keep file". Rc discovery runs only `SXX-name.kai` names, so the marker
+never runs. To turn a stock script off locally, remove it and create its
+`.keep`. To replace a composed link with your own script, write the file over
+the link and create its `.keep`.
 
 An untouched tree says nothing, so the warning stays worth reading. `--force`
 is then an ordinary deliberate act by a player who has been told exactly what
