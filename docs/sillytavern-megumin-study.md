@@ -107,8 +107,8 @@ adaptive thinking sends `drop_block`, so a filtered fork or a sliding window
 drops invalid thinking blocks instead of failing. A turn whose request does not
 extend the previous one leaves a Trace naming the tokens and thinking it
 costs (`docs/conversation-session.md`, "A request that does not extend the
-last one"). Still to build: the same estimate printed before
-`kj stage exclude` of a block the model has read, and before a filtered
+last one"). The same estimate prints from
+`kj stage exclude` of a block the model has read and from a filtered
 `kj fork`.
 
 ### A scribe seat on the pulse

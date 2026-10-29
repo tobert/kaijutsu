@@ -83,6 +83,10 @@ struct ForkSelection {
     /// True when the fork narrows the parent → `ForkKind::Filtered` + the
     /// filtered copy path. False = a plain full copy (`ForkKind::Full`).
     filtered: bool,
+    /// What the child's first request costs against the parent's cache when
+    /// the fork drops history: estimated tokens after the first dropped
+    /// block, and the signed thinking blocks after it.
+    cost: Option<(u64, usize)>,
 }
 
 /// Parse a list of range specs into a canonical [`IntervalSet`], surfacing the
@@ -315,10 +319,32 @@ impl KjDispatcher {
             || !excludes.is_empty()
             || !exclude_block_ids.is_empty();
 
+        // The child shares the parent's cached prefix up to the first block
+        // the model would have read that the fork drops.
+        let carried = |pos: usize, snap: &kaijutsu_types::BlockSnapshot| {
+            kept.contains_position(pos) && !exclude_block_ids.contains(&snap.id.to_key())
+        };
+        let cost = if narrows {
+            snapshots
+                .iter()
+                .enumerate()
+                .position(|(pos, snap)| crate::llm::hydrate::is_history_eligible(snap) && !carried(pos, snap))
+                .map(|first| {
+                    let after: Vec<_> = snapshots.iter().enumerate().skip(first)
+                        .filter(|(pos, snap)| carried(*pos, snap))
+                        .map(|(_, snap)| snap.clone())
+                        .collect();
+                    crate::llm::prefix::edit_cost(&after)
+                })
+        } else {
+            None
+        };
+
         Ok(ForkSelection {
             selection: if narrows { Some(kept) } else { None },
             exclude_block_ids,
             filtered: narrows,
+            cost,
         })
     }
 
@@ -745,6 +771,13 @@ impl KjDispatcher {
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         let mut message = format!("forked to '{}' ({})", display, short);
+        if let Some((tokens, thinking)) = selection.cost {
+            message.push_str(&format!(
+                "\nThe child shares the parent's cache up to the first dropped block; on its first \
+                 request {}.",
+                crate::llm::prefix::edit_cost_note(tokens, thinking)
+            ));
+        }
         if let Some(line) = child_cwd.as_deref().and_then(|cwd| crate::runtime::shell_state::root_cwd_line(new_id, cwd)) {
             message.push('\n');
             message.push_str(&line);
@@ -2074,6 +2107,24 @@ mod tests {
             kid.iter().any(|c| c.contains("hydration policy not carried")),
             "drop must be visible: {kid:?}"
         );
+    }
+
+    /// A fork that drops history names what the child's first request costs
+    /// against the parent's cache; a full copy costs nothing and says so by
+    /// saying nothing.
+    #[tokio::test]
+    async fn a_filtered_fork_names_its_cost() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        let c = caller_with_context(source);
+        let full = d.dispatch(&[s("fork"), s("--name"), s("whole")], &c).await;
+        assert!(full.is_ok(), "{}", full.message());
+        assert!(!full.message().contains("tokens"), "{}", full.message());
+
+        let filtered = d.dispatch(&[s("fork"), s("--name"), s("trimmed"), s("--exclude"), s("1:2")], &c).await;
+        assert!(filtered.is_ok(), "{}", filtered.message());
+        assert!(filtered.message().contains("tokens"), "{}", filtered.message());
     }
 
     #[tokio::test]

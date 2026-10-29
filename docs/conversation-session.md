@@ -256,6 +256,13 @@ windowed context diverges every turn by design, so its cost goes to the log,
 not the conversation. `kj context turns` shows the cache reads and writes
 that resulted.
 
+The same estimate is printed while an edit is still a choice
+(`llm::prefix::edit_cost`): `kj stage exclude` or `include` on a block the
+model has read says the change applies at the next fork or hydration and what
+it will cost then, and a fork that drops history says what the child's first
+request costs against the parent's cache, which it shares up to the first
+dropped block.
+
 The comparison is over kaijutsu's messages, not each provider's request, so
 a provider-side change of form is not seen: a system message that becomes
 user text because its neighbor changed. A new mailbox (fork, cold start,

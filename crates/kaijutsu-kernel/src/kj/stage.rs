@@ -228,7 +228,22 @@ impl KjDispatcher {
                     return KjResult::Err(format!("kj stage: {e}"));
                 }
                 let verb = if excluded { "excluded" } else { "included" };
-                KjResult::ok(format!("{verb} block {}", block_id.to_key()))
+                let mut message = format!("{verb} block {}", block_id.to_key());
+                // A block the model has read is history: changing it costs the
+                // request that next hydrates it. Say so while it is a choice.
+                let blocks = self.block_store().block_snapshots(context_id).unwrap_or_default();
+                if let Some(pos) = blocks.iter().position(|b| b.id == block_id)
+                    && blocks[pos + 1..].iter().any(|b| b.role == kaijutsu_types::Role::Model)
+                {
+                    let from = if excluded { pos + 1 } else { pos };
+                    let (tokens, thinking) = crate::llm::prefix::edit_cost(&blocks[from..]);
+                    message.push_str(&format!(
+                        "\nThe model has read this block, so the change applies at the next fork or \
+                         hydration; then {}.",
+                        crate::llm::prefix::edit_cost_note(tokens, thinking)
+                    ));
+                }
+                KjResult::ok(message)
             }
             n => KjResult::Err(format!(
                 "kj stage: '{block_key}' matches {n} blocks — be more specific"
@@ -299,6 +314,38 @@ mod tests {
         let result = d.dispatch(&[s("stage"), s("include"), key], &c).await;
         assert!(result.is_ok(), "include on a live context: {}", result.message());
         assert!(!excluded(&d, ctx, &block));
+    }
+
+    /// Excluding a block the model has read edits history at the next
+    /// hydration, so the command says what that will cost first: the tokens
+    /// after it no cache reads, and the thinking blocks after it a provider
+    /// drops. A block the model has not read costs nothing to exclude.
+    #[tokio::test]
+    async fn excluding_a_read_block_names_its_cost() {
+        let d = test_dispatcher().await;
+        let (ctx, block) = context_with_block(&d, ContextState::Live);
+        let c = caller_with_context(ctx);
+        let key = super::super::block::short_key(&block);
+        let quiet = d.dispatch(&[s("stage"), s("exclude"), key.clone()], &c).await;
+        assert!(quiet.is_ok(), "{}", quiet.message());
+        assert!(!quiet.message().contains("tokens"), "unread: {}", quiet.message());
+        d.dispatch(&[s("stage"), s("include"), key.clone()], &c).await;
+
+        let model = PrincipalId::new();
+        let thinking = kaijutsu_types::BlockSnapshotBuilder::new(
+            kaijutsu_types::BlockId::new(ctx, model, 0), BlockKind::Thinking)
+            .role(Role::Model)
+            .content("hmm")
+            .signature("sig")
+            .build();
+        d.block_store().insert_from_snapshot_as(ctx, thinking, Some(&block), Some(model)).unwrap();
+        d.block_store()
+            .insert_block_as(ctx, None, None, Role::Model, BlockKind::Text, "a reply", Status::Done, ContentType::Plain, Some(model))
+            .unwrap();
+        let costly = d.dispatch(&[s("stage"), s("exclude"), key], &c).await;
+        assert!(costly.is_ok(), "{}", costly.message());
+        let message = costly.message();
+        assert!(message.contains("tokens") && message.contains("1 thinking block"), "{message}");
     }
 
     #[tokio::test]

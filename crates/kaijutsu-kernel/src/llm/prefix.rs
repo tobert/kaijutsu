@@ -75,6 +75,28 @@ impl SentPrefix {
     }
 }
 
+/// What a history edit will cost the next request that applies it, from the
+/// blocks it will send after the edit: the estimated tokens no cache reads,
+/// and the signed thinking blocks a provider binding thinking to the
+/// conversation drops.
+pub fn edit_cost(after: &[kaijutsu_types::BlockSnapshot]) -> (u64, usize) {
+    let tokens = estimate_tokens(&super::hydrate_from_blocks(after));
+    let thinking = after
+        .iter()
+        .filter(|b| b.kind == kaijutsu_types::BlockKind::Thinking && super::hydrate::is_history_eligible(b))
+        .filter(|b| b.signature.as_deref().is_some_and(|s| !s.is_empty()))
+        .count();
+    (tokens, thinking)
+}
+
+/// The sentence a history edit prints about its cost.
+pub fn edit_cost_note(tokens: u64, thinking: usize) -> String {
+    format!(
+        "about {tokens} tokens after it are sent without a cache read, and {thinking} thinking \
+         block(s) after it are dropped by a provider that binds thinking to the conversation"
+    )
+}
+
 /// One message's fingerprint. An image counts by its content hash, not the
 /// bytes a provider resolved for it, so resolving an image again is not a
 /// change.

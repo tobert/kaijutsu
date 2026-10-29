@@ -222,6 +222,10 @@ Clarity:
   in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for
   `cd sub` (`shell_write: 1 statement(s) — cd sub`), and passed three times
   alone. Load-dependent; cause not found.
+- `kaijutsu-kernel` `council::gate_e2e::a_council_miss_asks_and_records_its_cause`
+  failed once in a full-suite lib run on 2026-10-29 (`f3d46123` plus the
+  cost-note change) at its `started.elapsed() < 3s` deadline check, and
+  passed three times alone in 0.88 s. A wall-clock bound under load.
 
 ## TUI draft scrambles on spaceghost (2026-10-28)
 
