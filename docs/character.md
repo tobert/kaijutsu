@@ -229,11 +229,11 @@ Two things follow, and they are the ones to check a change against:
     capability and says to go through its director or ROOT. A `shell`
     context holds no Operator, so it places nothing.
 
-  `kj context archive` follows the same principle: it needs Operator, or a
-  live root character acting from any context, and it always latches.
-  `kj drive` and `kj context rotate` keep their own rules: `drive` needs
-  the drive capability on any target, including the caller's own context,
-  and the performer or lineage root rotates.
+  `kj context archive` and `kj context rotate` follow the same principle:
+  each needs Operator, or a live root character acting from any context,
+  and archive always latches. Rotate then asks the performer or lineage
+  root, as before. `kj drive` keeps its own rule: it needs the drive
+  capability on any target, including the caller's own context.
 - **Rotation replaces a conversation, not a character.** Amy, 2026-09-17,
   and step 5 of `docs/senpai-kohai.md`: the successor is a new context
   with the same character and senpai, its slots read fresh from the

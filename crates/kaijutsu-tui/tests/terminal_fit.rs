@@ -1525,7 +1525,9 @@ fn the_client_never_asks_where_the_cursor_is() {
     #[cfg(unix)]
     {
         let pid = session.pid().expect("pid available on unix");
-        session.send("\x1a"); // Ctrl+Z
+        session.send("\x1a"); // Ctrl+Z toggles; a second press within the window suspends
+        std::thread::sleep(Duration::from_millis(50));
+        session.send("\x1a");
         std::thread::sleep(Duration::from_millis(300));
         unsafe {
             libc::kill(pid as i32, libc::SIGCONT);
@@ -1600,7 +1602,9 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
     wait_for_attach(&session);
     let pid = session.pid().expect("pid available on Linux");
 
-    session.send("\x1a"); // Ctrl+Z
+    session.send("\x1a"); // Ctrl+Z toggles; a second press within the window suspends
+    std::thread::sleep(Duration::from_millis(50));
+    session.send("\x1a");
     let stopped = wait_for_proc_state(pid, 'T', Duration::from_secs(2));
     if !stopped {
         eprintln!(
@@ -1916,10 +1920,17 @@ fn a_burst_into_the_editor_lands_in_order_with_a_paste_in_place() {
     let (_server, _key_dir, session) = spawn_session(24, 100);
     wait_for_attach(&session);
 
-    session.send(":!vi /config/rc/lib/create/S00-base.md\r");
-    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S00-base.md") && !screen_contains(screen, '\u{276f}');
+    session.send(":!vi /config/rc/lib/create/S16-handoff.kai\r");
+    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S16-handoff.kai") && !screen_contains(screen, '\u{276f}');
     assert!(session.wait_until(Duration::from_secs(15), in_editor), "vi never opened: {}", session.dump("vi"));
 
+    // The status line names the file before the kernel has answered with its
+    // text; keys sent in that gap have no buffer to land in.
+    assert!(
+        session.wait_until(Duration::from_secs(15), |screen| screen_contains_str(screen, "inject a character")),
+        "the editor never drew the file: {}",
+        session.dump("vi loaded")
+    );
     session.send("ggOone two\x7f\x7f\x7fthree");
     session.send("\x1b[200~PASTED\x1b[201~");
     session.send("four");
@@ -1945,8 +1956,8 @@ fn the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it() {
     wait_for_attach(&session);
     let seat = seat_with_two_drafts(&session);
 
-    session.send(":!vi /config/rc/lib/create/S00-base.md\r");
-    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S00-base.md") && !screen_contains(screen, '\u{276f}');
+    session.send(":!vi /config/rc/lib/create/S10-binding.kai\r");
+    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S10-binding.kai") && !screen_contains(screen, '\u{276f}');
     assert!(session.wait_until(Duration::from_secs(15), in_editor), "vi never opened: {}", session.dump("vi"));
 
     session.send("\x01");
@@ -2337,7 +2348,9 @@ fn the_kitty_keyboard_is_taken_with_the_screen_and_given_back() {
     );
 
     let pid = session.pid().expect("pid available on unix");
-    session.send("\x1a"); // Ctrl+Z
+    session.send("\x1a"); // Ctrl+Z toggles; a second press within the window suspends
+    std::thread::sleep(Duration::from_millis(50));
+    session.send("\x1a");
     std::thread::sleep(Duration::from_millis(300));
     // SIGCONT the way a shell's `fg` would; harmless if the process was
     // never actually stopped (`ctrl_z_suspends_and_sigcont_resumes_a_

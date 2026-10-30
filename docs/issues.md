@@ -255,16 +255,14 @@ Clarity:
 
 ---
 
-## Two tests fail on main at `87e70c20` (2026-10-19)
+## Flaky tests and an early-keys race (2026-10-30)
 
-- `kaijutsu-tui` `terminal_fit`: `ctrl_a_r_rotates_the_seat_and_follows_its_successor`
-  (the `operator` capability gate refuses `kj context rotate`) and
-  `the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` (a vi
-  document-cache miss).
-- Two more fail only inside the Claude Code sandbox, at `f29dd492` and
-  later alike: `ctrl_z_suspends_and_sigcont_resumes_a_responsive_client`
-  and `the_kitty_keyboard_is_taken_with_the_screen_and_given_back`. The
-  client process never stops there. Outside the sandbox is unchecked.
+- The editor drops keys that arrive after the status line names the file and
+  before the kernel answers with its text. `a_burst_into_the_editor_lands_in_order_with_a_paste_in_place`
+  now waits for the file's first line before it types. The test's own claim,
+  that keys sent faster than the kernel answers land in order, holds only
+  once the buffer has loaded; decide whether the client should queue keys
+  until the first state arrives (`docs/vi.md`).
 - `kaijutsu-server` `gate_scenarios_wire`:
   `an_approved_shell_write_runs_with_the_cwd_and_env_it_showed` failed once
   in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for

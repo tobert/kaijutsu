@@ -584,8 +584,9 @@ impl KjDispatcher {
         // seat may act on which target is decided per target
         // (`require_placement_authority`).
         //
-        // `archive` takes Operator, or a live root character acting from any
-        // context (`docs/character.md`, "ROOT places contexts").
+        // `archive` and `rotate` take Operator, or a live root character
+        // acting from any context (`docs/character.md`, "ROOT places
+        // contexts").
         if matches!(
             parsed.command,
             ContextCommand::Create { .. }
@@ -599,10 +600,11 @@ impl KjDispatcher {
         ) && let Err(denied) =
             self.require_cap(caller, crate::mcp::Capability::Operator, "context")
         {
-            let human = matches!(parsed.command, ContextCommand::Archive { .. }) && match self.caller_is_live_root(caller) {
-                Ok(human) => human,
-                Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
-            };
+            let human = matches!(parsed.command, ContextCommand::Archive { .. } | ContextCommand::Rotate { .. })
+                && match self.caller_is_live_root(caller) {
+                    Ok(human) => human,
+                    Err(e) => return KjResult::Err(format!("kj context: {e}")),
+                };
             if !human {
                 return denied;
             }
@@ -5455,6 +5457,26 @@ mod tests {
         let archived = f.d.dispatch(&[s("context"), s("archive"), s("lane")], &amy).await;
         assert!(archived.is_ok(), "amy may archive the lane from inside it: {}", archived.message());
         assert!(placement_row(&f, f.lane).is_archived());
+    }
+
+    /// ROOT privilege follows the human for rotate as for archive: a live
+    /// root character rotates a worker that lacks Operator, as `Ctrl+A r`
+    /// does on a coder seat. The worker's model seat is refused.
+    #[tokio::test]
+    async fn a_root_character_rotates_from_inside_a_lane() {
+        let f = placement_fixture().await;
+        let coder = placement_caller(f.lane, f.coder);
+        let refused = f.d.dispatch(&[s("context"), s("rotate"), s("lane")], &coder).await;
+        assert!(!refused.is_ok(), "the lane's model seat may not rotate it: {}", refused.message());
+        assert!(refused.message().contains("'operator'"), "{}", refused.message());
+
+        let amy = placement_caller(f.lane, f.amy);
+        let rotated = f.d.dispatch(&[s("context"), s("rotate"), s("lane")], &amy).await;
+        assert!(
+            !rotated.message().contains("'operator'"),
+            "a live root character needs no capability to rotate: {}",
+            rotated.message()
+        );
     }
 
     /// A retired root character is no longer anyone's hands: it gets no
