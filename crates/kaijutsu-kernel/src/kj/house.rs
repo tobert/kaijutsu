@@ -43,18 +43,25 @@ pub(crate) fn is_house_verb(word: &str) -> bool {
 
 /// `kj help` text without the house verbs' entries.
 ///
-/// An entry starts on an unindented line of the command list and runs
-/// through the indented lines after it. Only text inside the first fenced
-/// block that follows a `## Commands` heading is filtered; the rest of the
-/// help is kept as written.
+/// The `## Commands` section holds the command list in fenced blocks. An
+/// entry starts on an unindented line inside a fence and runs through the
+/// indented lines after it. A `### ` heading starts a group that runs to the
+/// next heading; a group whose entries are all dropped is dropped whole,
+/// heading and prose included. Text outside the `## Commands` section is
+/// kept as written.
 pub(crate) fn without_house_verbs(help: &str) -> String {
     let mut out = String::with_capacity(help.len());
+    let mut group = Group::default();
     let mut in_commands_section = false;
     let mut in_fence = false;
     let mut dropping = false;
     for line in help.split_inclusive('\n') {
-        if line.starts_with("## ") {
-            in_commands_section = line.trim_end() == "## Commands";
+        if line.starts_with("## ") || (in_commands_section && line.starts_with("### ")) {
+            group.flush_into(&mut out);
+            group.in_group = line.starts_with("### ");
+            if line.starts_with("## ") {
+                in_commands_section = line.trim_end() == "## Commands";
+            }
         }
         if in_commands_section && line.starts_with("```") {
             in_fence = !in_fence;
@@ -63,14 +70,40 @@ pub(crate) fn without_house_verbs(help: &str) -> String {
             if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
                 let verb = line.split_whitespace().next().unwrap_or("");
                 dropping = is_house_verb(verb);
+                group.entries += 1;
+                group.kept += usize::from(!dropping);
             }
             if dropping {
                 continue;
             }
         }
-        out.push_str(line);
+        if group.in_group {
+            group.text.push_str(line);
+        } else {
+            out.push_str(line);
+        }
     }
+    group.flush_into(&mut out);
     out
+}
+
+/// One `### ` group of the command list, held until its end decides
+/// whether it is kept.
+#[derive(Default)]
+struct Group {
+    in_group: bool,
+    text: String,
+    entries: usize,
+    kept: usize,
+}
+
+impl Group {
+    fn flush_into(&mut self, out: &mut String) {
+        if self.entries == 0 || self.kept > 0 {
+            out.push_str(&self.text);
+        }
+        *self = Group::default();
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +124,16 @@ mod tests {
         let got = without_house_verbs(help);
         assert!(got.contains("ledger is outside the list"), "{got}");
         assert!(!got.contains("ledger x"), "{got}");
+    }
+
+    #[test]
+    fn a_group_left_with_no_entries_is_dropped_with_its_heading() {
+        let help = "## Commands\n\n### Work\n\n```\nblock    list\nrc       list\n```\n\n### House\n\n```\nledger   list\n         more\n```\n\n## Next\n\nRun it.\n";
+        let got = without_house_verbs(help);
+        assert!(got.contains("### Work") && got.contains("block    list"), "{got}");
+        assert!(!got.contains("### House") && !got.contains("ledger") && !got.contains("rc "), "{got}");
+        assert!(got.contains("## Next\n\nRun it."), "{got}");
+        assert_eq!(got.matches("```").count(), 2, "one fence pair remains: {got}");
     }
 
     #[test]

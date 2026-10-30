@@ -68,7 +68,7 @@ pub trait Classify {
 #[derive(Parser, Debug)]
 #[command(
     name = "kj",
-    about = "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.",
+    about = "Kernel command interface. Run `kj help` for the command map, and `kj <command> --help` for a command's detail.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -83,7 +83,7 @@ pub(crate) struct KjArgs {
     pub(crate) command: KjCommand,
 }
 
-/// One variant per domain, in the order `kj help` lists them.
+/// One variant per domain.
 #[derive(Subcommand, Debug)]
 pub(crate) enum KjCommand {
     Context(super::context::ContextArgs),

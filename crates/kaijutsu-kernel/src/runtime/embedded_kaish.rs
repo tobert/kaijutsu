@@ -168,7 +168,7 @@ const OUTPUT_CEILING_BYTES: usize = 4 * 1024 * 1024;
 
 /// A model-facing result past this many bytes, stdout or stderr, is cut to a
 /// preview.
-const PREVIEW_LIMIT_BYTES: usize = 8 * 1024;
+pub(crate) const PREVIEW_LIMIT_BYTES: usize = 8 * 1024;
 /// The preview keeps this much of the start.
 const PREVIEW_HEAD_BYTES: usize = 2 * 1024;
 /// And this much of the end, where test summaries and errors land.

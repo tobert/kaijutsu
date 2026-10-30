@@ -69,7 +69,7 @@ enum BindingCommand {
     Allow {
         /// Capability: <instance> | <instance>:<tool> | facade:<name> | * |
         /// facade:* | admin | drive | fork | drift | transport |
-        /// operator | config-write | exec | editor
+        /// operator | config-write | exec | editor | system | house
         cap: String,
         /// Target context: . (default) | .parent | <label> | <hex prefix>
         ctx: Option<String>,

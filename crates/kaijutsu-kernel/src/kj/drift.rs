@@ -105,7 +105,18 @@ fn held_message(target: &str, ask: &str) -> String {
 #[derive(Parser, Debug)]
 #[command(
     name = "drift",
-    about = "Cross-context communication (push/pull/merge/flush)",
+    about = "Move information between contexts: push text, or distill a context with a model",
+    after_help = concat!(
+        "Examples:\n",
+        "  kj fork --name approach-a --prompt \"try X\"\n",
+        "      Fork a child that runs its first turn; we stay on the parent.\n",
+        "  kj drift pull approach-a \"summarize what you tried\"\n",
+        "      Distill the child's work into this context.\n",
+        "  kj drift push main \"retry logic in client.rs:142 drops errors silently\"\n",
+        "      Send a finding now, with no model. A turn running there reads it after its next tool round.\n",
+        "  kj drift merge\n",
+        "      From inside a fork, distill the fork's work back into its parent.",
+    ),
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -120,10 +131,8 @@ enum DriftCommand {
     /// and a turn running there reads it after its next tool round. It
     /// never starts or extends a turn. A drift into the ROOT console waits
     /// for its human instead: it reaches ROOT's model only after
-    /// `kj ledger allow <id>`. With
-    /// --summarize, distill the caller's whole context (on the instance's
-    /// `distill` slot) instead of
-    /// sending literal content. With --stage, queue it for a later
+    /// `kj ledger allow <id>`. With --summarize, distill the caller's whole
+    /// context (on its `distill` slot) instead of sending literal content. With --stage, queue it for a later
     /// `flush` instead of delivering now. Refuses an archived or concluded
     /// target, at both push and flush time — fork it to continue.
     Push {
@@ -140,7 +149,7 @@ enum DriftCommand {
         content: Vec<String>,
     },
     /// Distill a source context into the caller's context. It runs on the
-    /// caller's `distill` slot and refuses when the caller's binding has none.
+    /// caller's `distill` slot and refuses when the caller has none.
     Pull {
         /// Source context reference
         src: String,
@@ -149,25 +158,24 @@ enum DriftCommand {
         prompt: Vec<String>,
     },
     /// Distill this fork back into the parent context (or a given ctx). It
-    /// runs on this instance's `distill` slot and refuses when the binding
-    /// has none.
+    /// runs on this context's `distill` slot and refuses when it has none.
     Merge {
-        /// Target context (defaults to forked_from parent)
+        /// Target context (default: the context this one was forked from)
         ctx: Option<String>,
     },
     /// Deliver all staged drifts.
     Flush,
-    /// Show the staging queue (yields queue u64 ids).
+    /// Show the staged drifts, each with its queue id.
     #[command(alias = "q")]
     Queue,
-    /// Remove a staged drift before flush (pre-flush only).
+    /// Remove a staged drift before it is flushed.
     Cancel {
-        /// Staged drift queue id (u64)
+        /// Queue id of the staged drift, from `kj drift queue`
         queue_id: String,
     },
-    /// Show drift edges for a context (yields edge UUIDs).
+    /// Show drift edges for a context, each with its edge UUID.
     History {
-        /// Target context (defaults to caller's context)
+        /// Target context (default: the current context)
         ctx: Option<String>,
     },
     /// Manage post-flush drift edges.

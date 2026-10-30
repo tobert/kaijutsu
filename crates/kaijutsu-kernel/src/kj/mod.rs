@@ -2408,19 +2408,56 @@ mod house_verb_tests {
         assert!(result.message().contains(REFUSAL), "{}", result.message());
     }
 
+    /// The first word of every unindented line inside the fences of the
+    /// `## Commands` section, the way `house::without_house_verbs` reads it.
     fn verbs_listed(help: &str) -> Vec<String> {
         let mut in_commands = false;
+        let mut in_fence = false;
         let mut out = Vec::new();
         for line in help.lines() {
-            if line.starts_with("## Commands") {
-                in_commands = true;
-            } else if in_commands && line.starts_with("```") && !out.is_empty() {
-                break;
-            } else if in_commands && !line.starts_with("```") && !line.starts_with(' ') && !line.is_empty() {
+            if line.starts_with("## ") {
+                in_commands = line.trim_end() == "## Commands";
+            } else if in_commands && line.starts_with("```") {
+                in_fence = !in_fence;
+            } else if in_commands && in_fence && !line.starts_with([' ', '\t']) && !line.is_empty() {
                 out.push(line.split_whitespace().next().unwrap().to_string());
             }
         }
         out
+    }
+
+    /// `kj help` stays at half the model-facing preview limit or less, so a
+    /// model reads the whole map, with room for a verb's `--help` in the
+    /// same shell call. Past the limit, a model reads only the first 2 KiB
+    /// and the last 4 KiB.
+    const HELP_BUDGET_BYTES: usize = crate::runtime::embedded_kaish::PREVIEW_LIMIT_BYTES / 2;
+
+    #[tokio::test]
+    async fn help_fits_the_model_preview_for_every_seat() {
+        let d = test_dispatcher().await;
+        for (label, binding) in [("house", house_binding()), ("worker", worker_binding())] {
+            let caller = caller_bound(&d, label, &binding);
+            let help = d.dispatch(&[s("help")], &caller).await;
+            let len = help.message().len();
+            assert!(
+                len <= HELP_BUDGET_BYTES,
+                "{label} `kj help` is {len} bytes, over the {HELP_BUDGET_BYTES}-byte budget; \
+                 move detail down to `kj <command> --help`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn help_names_every_verb_the_command_tree_has() {
+        let d = test_dispatcher().await;
+        let caller = caller_bound(&d, "house", &house_binding());
+        let listed = verbs_listed(d.dispatch(&[s("help")], &caller).await.message());
+        let missing: Vec<String> = kj_command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .filter(|name| !listed.contains(name))
+            .collect();
+        assert!(missing.is_empty(), "`kj help` lacks verbs {missing:?}; listed: {listed:?}");
     }
 
     #[tokio::test]

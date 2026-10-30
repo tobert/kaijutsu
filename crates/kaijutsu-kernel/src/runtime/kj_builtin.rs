@@ -299,7 +299,7 @@ impl Tool for KjBuiltin {
         let mut schema = kaish_kernel::tools::schema_tree_from_clap(
             &crate::kj::kj_command(),
             "kj",
-            "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.",
+            "Kernel command interface. Run `kj help` for the command map, and `kj <command> --help` for a command's detail.",
             [
                 ("Discover commands", "kj help"),
                 ("View context topology", "kj context list --tree"),
