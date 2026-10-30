@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::{Embedder, EmbeddingPurpose, IndexError};
 
@@ -67,7 +68,9 @@ pub struct OpenAiEmbedderConfig {
     /// The API root that has an `/embeddings` route, for example
     /// `https://openrouter.ai/api/v1`. No query or fragment.
     pub base_url: String,
-    pub api_key: String,
+    /// Sent as a bearer token. `None` sends no `Authorization` header, for a
+    /// local server that has no key.
+    pub api_key: Option<String>,
     pub model: String,
     /// Sent as `dimensions` and checked against every response, so a model
     /// that ignores it fails loudly instead of filling the index with the
@@ -82,7 +85,7 @@ impl std::fmt::Debug for OpenAiEmbedderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiEmbedderConfig")
             .field("base_url", &self.base_url)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
             .field("profile", &self.profile)
@@ -103,17 +106,24 @@ struct Item {
 
 /// Pins the model, dimensions and profile for this client's lifetime. A
 /// hosted provider can change a model's weights without notice and this
-/// client cannot see it; `revision` names the profile, not the weights.
+/// client cannot see it; `revision` names the profile and the endpoint, not
+/// the weights.
 pub struct OpenAiEmbedder {
     client: reqwest::Client,
     url: String,
-    api_key: String,
+    api_key: Option<String>,
     model: String,
     revision: String,
     dimensions: usize,
     profile: EmbeddingProfile,
     timeout: Duration,
     permits: tokio::sync::Semaphore,
+}
+
+/// A short, stable tag of the endpoint a vector came from.
+fn endpoint_tag(base_url: &str) -> String {
+    let digest = Sha256::digest(base_url.trim_end_matches('/').as_bytes());
+    digest.iter().take(6).map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn failure(error: impl std::fmt::Display) -> IndexError {
@@ -134,19 +144,24 @@ impl OpenAiEmbedder {
         if config.model.trim().is_empty() {
             return Err(failure("the model name is empty"));
         }
-        if config.api_key.trim().is_empty() {
+        if config.api_key.as_deref().is_some_and(|key| key.trim().is_empty()) {
             return Err(failure("the API key is empty"));
         }
         let base = reqwest::Url::parse(&config.base_url).map_err(failure)?;
         if !matches!(base.scheme(), "http" | "https") || base.query().is_some() || base.fragment().is_some() {
             return Err(failure("base_url must be an HTTP(S) URL without query or fragment"));
         }
+        if !base.username().is_empty() || base.password().is_some() {
+            return Err(failure("base_url must not carry credentials; use the backend's API key"));
+        }
         let client = reqwest::Client::builder().timeout(config.timeout).build().map_err(failure)?;
         let embedder = Self {
             client,
             url: format!("{}/embeddings", config.base_url.trim_end_matches('/')),
-            api_key: config.api_key.trim().to_owned(),
-            revision: format!("{}-hosted", config.profile.as_str()),
+            api_key: config.api_key.map(|key| key.trim().to_owned()),
+            // The endpoint is part of the vector space: the same model id at
+            // another provider is not the same weights.
+            revision: format!("{}-{}", config.profile.as_str(), endpoint_tag(&config.base_url)),
             model: config.model,
             dimensions: config.dimensions,
             profile: config.profile,
@@ -163,15 +178,16 @@ impl OpenAiEmbedder {
         // waiting indefinitely before reqwest's request timeout starts.
         tokio::time::timeout(self.timeout, async {
             let _permit = self.permits.acquire().await.map_err(failure)?;
-            let response = self.client.post(&self.url)
-                .bearer_auth(&self.api_key)
-                .json(&serde_json::json!({
-                    "model": self.model,
-                    "input": input,
-                    "dimensions": self.dimensions,
-                    "encoding_format": "float",
-                }))
-                .send().await.map_err(failure)?;
+            let mut request = self.client.post(&self.url).json(&serde_json::json!({
+                "model": self.model,
+                "input": input,
+                "dimensions": self.dimensions,
+                "encoding_format": "float",
+            }));
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            let response = request.send().await.map_err(failure)?;
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();

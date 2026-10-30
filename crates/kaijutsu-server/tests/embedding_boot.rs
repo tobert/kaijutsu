@@ -94,6 +94,40 @@ async fn boot_embeds_through_a_council_server() {
     assert_eq!(index.embedder().dimensions(), 32);
 }
 
+/// A local OpenAI-compatible server with no key: the backend says so with
+/// `key_optional`, and the request carries no `Authorization` header.
+#[tokio::test]
+async fn boot_embeds_through_a_keyless_local_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = stream.read(&mut request).await.unwrap();
+        let request = std::str::from_utf8(&request[..n]).unwrap().to_owned();
+        stream.write_all(vector_reply(8).as_bytes()).await.unwrap();
+        request
+    });
+    let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+    db.upsert_backend(&BackendRow {
+        backend_id: kaijutsu_types::BackendId::new(),
+        name: "openrouter".into(), kind: "openai".into(), base_url: Some(base_url),
+        api_key_env: Some("KAIJUTSU_EMBEDDING_TEST_UNSET_KEY".into()), api_key_file: None, key_optional: true,
+        request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
+        created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),
+    }).unwrap();
+    db.set_embedding_config(&row(8, 2000)).unwrap();
+    insert_root_character(&db);
+    drop(db);
+    let shared = boot(dir.path()).await;
+    let index = wait_for_index(&shared).await.expect("a keyless local server must initialize the index");
+    assert_eq!(index.embedder().dimensions(), 8);
+    let request = server.await.unwrap();
+    assert!(request.starts_with("POST /v1/embeddings "), "{request}");
+    assert!(!request.to_ascii_lowercase().contains("authorization:"), "{request}");
+}
+
 #[tokio::test]
 async fn unavailable_provider_leaves_index_unavailable() {
     let dir = tempfile::tempdir().unwrap();

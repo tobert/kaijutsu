@@ -1499,10 +1499,11 @@ async fn connect_semantic_index(
             }).await.map(|embedder| Box::new(embedder) as Box<dyn kaijutsu_index::Embedder>)
         }
         _ => {
-            let (Some(base_url), Some(api_key)) = (backend.base_url.clone(), backend.resolve_api_key()) else {
+            let api_key = backend.resolve_api_key();
+            let Some(base_url) = backend.base_url.clone().filter(|_| api_key.is_some() || backend.key_optional) else {
                 log::warn!(
-                    "Embedding backend `{}` needs a base_url and a resolvable API key (api_key_env or api_key_file); \
-                     the semantic index stays off",
+                    "Embedding backend `{}` needs a base_url and a resolvable API key (api_key_env or api_key_file) \
+                     or key_optional; the semantic index stays off",
                     backend.name
                 );
                 return None;

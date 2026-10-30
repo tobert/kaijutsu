@@ -171,3 +171,50 @@ async fn a_response_with_another_identity_is_refused() {
     let error = embedder.embed("later", EmbeddingPurpose::Document).await.unwrap_err().to_string();
     assert!(error.contains("identity"), "{error}");
 }
+
+/// The identity the fake advertises and the replies it gives, as text, so a
+/// test can change one field and serve the rest unchanged.
+async fn fake_replies(server: &Server) -> (serde_json::Value, serde_json::Value) {
+    let http = reqwest::Client::new();
+    let identity = http.get(format!("{}/council/v2/identity", server.url())).send().await.unwrap().text().await.unwrap();
+    let body = serde_json::json!({"model": EMBED, "task": "document", "inputs": ["dimension probe"], "dimensions": 32});
+    let probe = http.post(format!("{}/council/v2/embeddings", server.url())).json(&body).send().await.unwrap().text().await.unwrap();
+    (serde_json::from_str(&identity).unwrap(), serde_json::from_str(&probe).unwrap())
+}
+
+/// A server whose identity promises one size and whose probe returns
+/// another must fail at connect, not at the first block that needs a vector.
+#[tokio::test]
+async fn connect_refuses_a_probe_that_returns_the_wrong_size() {
+    use kaijutsu_mk::test_server::{reply, serve};
+
+    let server = embedder_server();
+    let (identity, mut probe) = fake_replies(&server).await;
+    probe["embeddings"][0]["vector"] = serde_json::json!(vec![0.5; 7]);
+    let (base_url, _seen) = serve(vec![reply(200, identity.to_string()), reply(200, probe.to_string())]).await;
+    let error = match CouncilEmbedder::connect(CouncilEmbedderConfig { base_url, ..config(&server, 32) }).await {
+        Ok(_) => panic!("a wrong-size probe must fail the boot probe"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains('7') && error.contains("32"), "names both sizes: {error}");
+}
+
+/// A server that takes no inputs per request would make every batch panic
+/// in `chunks(0)`; refuse it where the cause is visible.
+#[tokio::test]
+async fn connect_refuses_a_server_that_takes_no_inputs_per_request() {
+    use kaijutsu_mk::test_server::{reply, serve};
+
+    let server = embedder_server();
+    let (mut identity, probe) = fake_replies(&server).await;
+    let models = identity["models"].as_array_mut().unwrap();
+    for model in models.iter_mut().filter(|m| m["model"] == EMBED) {
+        model["embeddings"]["inputs_per_request"] = serde_json::json!(0);
+    }
+    let (base_url, _seen) = serve(vec![reply(200, identity.to_string()), reply(200, probe.to_string())]).await;
+    let error = match CouncilEmbedder::connect(CouncilEmbedderConfig { base_url, ..config(&server, 32) }).await {
+        Ok(_) => panic!("accepted a server that takes no inputs"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("inputs_per_request"), "{error}");
+}

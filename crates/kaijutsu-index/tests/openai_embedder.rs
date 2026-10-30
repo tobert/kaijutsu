@@ -62,7 +62,7 @@ async fn mock_service(replies: Vec<String>) -> (String, tokio::task::JoinHandle<
 fn config(base_url: &str, dimensions: usize, profile: EmbeddingProfile) -> OpenAiEmbedderConfig {
     OpenAiEmbedderConfig {
         base_url: base_url.to_owned(),
-        api_key: "sk-test".to_owned(),
+        api_key: Some("sk-test".to_owned()),
         model: "qwen/qwen3-embedding-8b".to_owned(),
         dimensions,
         profile,
@@ -230,12 +230,13 @@ async fn connect_refuses_an_unreachable_provider() {
 async fn a_bad_configuration_is_refused_before_any_request() {
     let base = "http://127.0.0.1:9/api/v1";
     let cases: Vec<(&str, OpenAiEmbedderConfig)> = vec![
-        ("empty key", OpenAiEmbedderConfig { api_key: " ".into(), ..config(base, 2, EmbeddingProfile::Plain) }),
+        ("empty key", OpenAiEmbedderConfig { api_key: Some(" ".into()), ..config(base, 2, EmbeddingProfile::Plain) }),
         ("empty model", OpenAiEmbedderConfig { model: String::new(), ..config(base, 2, EmbeddingProfile::Plain) }),
         ("zero dimensions", config(base, 0, EmbeddingProfile::Plain)),
         ("zero concurrency", OpenAiEmbedderConfig { max_in_flight: 0, ..config(base, 2, EmbeddingProfile::Plain) }),
         ("zero timeout", OpenAiEmbedderConfig { timeout: Duration::ZERO, ..config(base, 2, EmbeddingProfile::Plain) }),
         ("not http", config("ftp://example.com/v1", 2, EmbeddingProfile::Plain)),
+        ("credentials in the url", config("http://user:secret@example.com/v1", 2, EmbeddingProfile::Plain)),
         ("query string", config("http://example.com/v1?x=1", 2, EmbeddingProfile::Plain)),
     ];
     for (name, config) in cases {
@@ -284,4 +285,29 @@ fn profile_tokens_round_trip_and_unknown_tokens_are_refused() {
     }
     let error = "gemini".parse::<EmbeddingProfile>().unwrap_err();
     assert!(error.contains("plain") && error.contains("qwen3") && error.contains("embeddinggemma"), "{error}");
+}
+
+/// A local server with no key gets no `Authorization` header at all.
+#[tokio::test]
+async fn a_server_with_no_key_gets_no_authorization_header() {
+    let (base_url, server) = mock_service(vec![probe_reply(2), ok(&[vec![1.0, 0.0]])]).await;
+    let client = OpenAiEmbedder::connect(OpenAiEmbedderConfig { api_key: None, ..config(&base_url, 2, EmbeddingProfile::Plain) })
+        .await.unwrap();
+    client.embed("text", EmbeddingPurpose::Document).await.unwrap();
+    let requests = server.await.unwrap();
+    for request in &requests {
+        assert_eq!(request.header("authorization"), None, "{}", request.line);
+    }
+}
+
+/// The same model id at another endpoint is another vector space.
+#[tokio::test]
+async fn the_cache_identity_changes_with_the_endpoint() {
+    let (first, a) = mock_service(vec![probe_reply(2)]).await;
+    let (second, b) = mock_service(vec![probe_reply(2)]).await;
+    let one = client(&first, 2, EmbeddingProfile::Plain).await.cache_identity();
+    let two = client(&second, 2, EmbeddingProfile::Plain).await.cache_identity();
+    a.await.unwrap();
+    b.await.unwrap();
+    assert_ne!(one, two);
 }

@@ -36,7 +36,7 @@ pub struct CouncilEmbedder {
     model: String,
     /// A hash of the identity fields the vectors depend on.
     revision: String,
-    /// The identity as the server wrote it, for the next response to match.
+    /// The identity key, for each response to match.
     identity: String,
     dimensions: usize,
     batch: usize,
@@ -46,6 +46,15 @@ pub struct CouncilEmbedder {
 
 fn failure(error: impl std::fmt::Display) -> IndexError {
     IndexError::Embedding(format!("embedding service: {error}"))
+}
+
+/// The identity fields a vector depends on, in a fixed order that does not
+/// follow the wire type's layout: a field the server adds later does not
+/// change the key, and so does not re-index.
+fn identity_key(identity: &gogi_proto::decision::DecisionIdentity) -> Result<String, IndexError> {
+    serde_json::to_string(&[
+        &identity.model, &identity.weight_hash, &identity.tokenizer_hash, &identity.template, &identity.engine,
+    ]).map_err(failure)
 }
 
 fn task(purpose: EmbeddingPurpose) -> &'static str {
@@ -87,6 +96,9 @@ impl CouncilEmbedder {
                 )));
             }
         }
+        if offered.inputs_per_request == 0 {
+            return Err(failure(format!("model {} reports inputs_per_request 0; it takes no inputs", served.model)));
+        }
         if !offered.dimensions.contains(&dimensions) {
             let list: Vec<String> = offered.dimensions.iter().map(u32::to_string).collect();
             return Err(failure(format!(
@@ -103,10 +115,13 @@ impl CouncilEmbedder {
             timeout: config.timeout,
             permits: tokio::sync::Semaphore::new(config.max_in_flight),
         };
+        // The probe is the first response, so its identity is the one every
+        // later response must carry; it must also pass the checks they do.
         let probe = embedder.send(&["dimension probe"], EmbeddingPurpose::Document).await?;
-        let written = serde_json::to_string(&probe.identity).map_err(failure)?;
-        embedder.revision = format!("{:x}", Sha256::digest(written.as_bytes()));
-        embedder.identity = written;
+        let identity = identity_key(&probe.identity)?;
+        embedder.revision = format!("{:x}", Sha256::digest(identity.as_bytes()));
+        embedder.identity = identity;
+        embedder.verified(probe, 1, EmbeddingPurpose::Document)?;
         Ok(embedder)
     }
 
@@ -130,11 +145,19 @@ impl CouncilEmbedder {
 
     async fn request(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
         let response = self.send(texts, purpose).await?;
-        if !self.identity.is_empty() {
-            let written = serde_json::to_string(&response.identity).map_err(failure)?;
-            if written != self.identity {
-                return Err(failure("the server's identity changed; restart the semantic index"));
-            }
+        self.verified(response, texts.len(), purpose)
+    }
+
+    /// Check a response against the pinned identity and the request that
+    /// asked for it, and return its vectors normalized, in input order.
+    fn verified(
+        &self,
+        response: gogi_proto::embeddings::EmbeddingsResponse,
+        expected: usize,
+        purpose: EmbeddingPurpose,
+    ) -> Result<Vec<Vec<f32>>, IndexError> {
+        if identity_key(&response.identity)? != self.identity {
+            return Err(failure("the server's identity changed; restart the semantic index"));
         }
         if response.model != self.model || response.task != task(purpose) || response.dimensions as usize != self.dimensions {
             return Err(failure(format!(
@@ -142,10 +165,10 @@ impl CouncilEmbedder {
                 response.model, response.task, response.dimensions, self.model, task(purpose), self.dimensions
             )));
         }
-        if response.embeddings.len() != texts.len() {
-            return Err(failure(format!("expected {} vectors, received {}", texts.len(), response.embeddings.len())));
+        if response.embeddings.len() != expected {
+            return Err(failure(format!("expected {expected} vectors, received {}", response.embeddings.len())));
         }
-        let mut vectors = Vec::with_capacity(texts.len());
+        let mut vectors = Vec::with_capacity(expected);
         for (position, embedding) in response.embeddings.into_iter().enumerate() {
             if embedding.index != position as u64 {
                 return Err(failure(format!("vector {position} arrived with index {}", embedding.index)));

@@ -48,7 +48,9 @@ No `kj` verb writes this row yet; see
 The client is `kaijutsu_index::OpenAiEmbedder`, behind the `Embedder` trait.
 It posts `{base_url}/embeddings` with `model`, `input` (at most 32 per
 request), `dimensions` and `encoding_format: "float"`, and sends the key as a
-bearer token. It puts the response in input order and refuses a response that
+bearer token. A backend with `key_optional` and no key sends no `Authorization`
+header, for a local server. A `base_url` that carries credentials is refused:
+the key belongs to the backend. It puts the response in input order and refuses a response that
 has the wrong count, a repeated or out-of-range index, the wrong size, a
 non-finite component, or a zero vector. It L2-normalizes accepted vectors.
 An HTTP error names the status and the start of the provider's message, never
@@ -60,12 +62,13 @@ ready, has the `query` and `document` tasks, and offers `dimensions`; the
 refusal names what the server does offer. It then embeds one probe string and
 pins the `identity` the response carries (`model`, `weight_hash`,
 `tokenizer_hash`, `template`, `engine`). The cache identity covers a hash of
-those fields, so new weights, a new tokenizer or a new task prompt re-index. A
+those five fields, written in a fixed order, so new weights, a new tokenizer or a new task prompt re-index. A
 later response with any other identity is refused. The client sends text and
 the task name only: the server renders the task prompt and never cuts an
 input, so an input past the model's context limit is an error naming the
 limit (`413`, `context_tokens`), and nothing is embedded. A request carries at
-most 32 inputs, fewer if the server's `inputs_per_request` is lower.
+most 32 inputs, fewer if the server's `inputs_per_request` is lower. A server
+that reports `inputs_per_request` as 0 is refused at startup.
 
 The profile is the model's own preparation, written by the client because a
 provider's endpoint takes plain text: `qwen3` prefixes a query with an
@@ -73,9 +76,10 @@ instruction and leaves documents plain; `embeddinggemma` prefixes queries with
 `task: search result | query: ` and documents with `title: none | text: `.
 A server that adds the task prompt itself takes `plain`.
 
-Startup embeds one probe string. A wrong key, an unknown model, or a model
-that returns other than `dimensions` values fails there, and the index stays
-off. The index attaches in the background once the probe succeeds; boot never
+Startup embeds one probe string and runs the same checks as any later
+response. A wrong key, an unknown model, or a model that returns other than
+`dimensions` values fails there, and the index stays off. This holds for both
+clients. The index attaches in the background once the probe succeeds; boot never
 waits on it. A failure logs the cause and leaves the semantic index
 unavailable; restart after repairing the row or the backend. `kj synth` and
 semantic search report unavailability; search does not return an empty success
@@ -84,13 +88,13 @@ model selection.
 
 A hosted `openai` provider can change a model's weights without notice, and
 this client cannot see it. Its cache identity covers the model id, the
-dimensions and the profile, so changing any of them re-indexes. Changing only a
-provider's weights does not. A council server reports its weights, so it has no
+dimensions, the profile and the endpoint, so changing any of them re-indexes.
+Changing only a provider's weights does not. A council server reports its weights, so it has no
 such gap. Vectors from different models do not compare: change the
 row, and the index rebuilds.
 
 Opening a kernel DB drops an `embedding_config` row in an older shape (a
-builtin model directory, or a service endpoint). The index is then off until an
+builtin model directory, or a service endpoint) and logs what it held. The index is then off until an
 operator names a backend and model.
 
 ## Cache identity and concurrency

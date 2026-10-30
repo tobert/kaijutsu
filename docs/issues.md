@@ -2956,6 +2956,10 @@ registry and backend administration and so belongs with the kj verb-class work.
   inputs with the route's `dry_run` token counts is not built. The search
   projection is bounded in bytes (`max_context_bytes`); synthesis has no such
   bound that I checked, so a long block could hit the limit.
+- `OpenAiEmbedder` does not check the `model` a response names. A gateway that
+  falls back to another model returns vectors of that model under this
+  model's identity. Providers echo model ids with prefixes and aliases, so an
+  exact match would refuse good responses; decide on a rule per provider.
 - `OpenAiEmbedder` sends `dimensions` to every provider. A model that rejects
   the field (OpenAI's ada-002) needs a profile or flag that leaves it out.
 

@@ -2999,12 +2999,27 @@ impl KernelDb {
     /// leaving the DB silently short a column that later code assumes exists.
     fn apply_additive_migrations(conn: &Connection) -> KernelDbResult<()> {
         let legacy_embedding: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = 'model_dir' OR name = 'endpoint')",
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config'))
+                AND NOT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = 'backend')",
             [], |row| row.get(0),
         )?;
         if legacy_embedding {
             // The builtin-model and service-endpoint rows name no backend and
             // there is no default to supply, so the rebuilt table starts empty.
+            // The warning names what the row held, so the operator can
+            // choose a backend and model for it.
+            let held_column = ["endpoint", "model_dir"].into_iter().find(|column| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = ?1)",
+                    [column], |row| row.get::<_, bool>(0),
+                ).unwrap_or(false)
+            });
+            let held: Option<String> = match held_column {
+                Some(column) => conn
+                    .query_row(&format!("SELECT {column} FROM embedding_config WHERE id = 1"), [], |row| row.get(0))
+                    .optional()?,
+                None => None,
+            };
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch("DROP TABLE embedding_config;
                 CREATE TABLE embedding_config (
@@ -3019,8 +3034,8 @@ impl KernelDb {
                     max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
                 );")?;
             tx.commit()?;
-            tracing::warn!("dropped the old embedding configuration; the semantic index \
-                is off until embedding_config names a backend and model (docs/synthesis.md)");
+            tracing::warn!(held = held.as_deref().unwrap_or("nothing"), "dropped the old embedding configuration; \
+                the semantic index is off until embedding_config names a backend and model (docs/synthesis.md)");
         }
         // A database written before context characters still has the columns
         // they replaced; `contexts.provider` is in every such database and in
@@ -9792,6 +9807,20 @@ mod tests {
             drop(db);
             assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(embedding_row()), "{shape}");
         }
+    }
+
+    /// The old-shape test is whether the table lacks `backend`, not whether it
+    /// carries an old column: a table with the new columns keeps its row.
+    #[test]
+    fn a_table_with_the_new_columns_keeps_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.set_embedding_config(&embedding_row()).unwrap();
+            db.conn.execute_batch("ALTER TABLE embedding_config ADD COLUMN endpoint TEXT;").unwrap();
+        }
+        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(embedding_row()));
     }
 
     #[test]
