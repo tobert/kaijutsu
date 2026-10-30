@@ -403,12 +403,16 @@ pub struct SlotTunables {
     pub thinking_style: Option<String>,
 }
 
-/// Configuration for the HTTP embedding service (`embedding_config` singleton).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Configuration for the embedding service (`embedding_config` singleton):
+/// an `openai` kind backend, which owns the base URL and the key, plus the
+/// model, vector size and prompt profile to ask it for.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingModelConfig {
     pub enabled: bool,
-    /// HTTP(S) endpoint or unix:///absolute/socket/path.
-    pub endpoint: String,
+    pub backend: BackendConfig,
+    pub model: String,
+    pub dimensions: usize,
+    pub profile: kaijutsu_index::EmbeddingProfile,
     pub timeout_ms: u64,
     pub max_in_flight: usize,
     /// UTF-8 byte budget of the context projection used by semantic search.

@@ -1563,7 +1563,10 @@ CREATE INDEX IF NOT EXISTS idx_model_aliases_backend ON model_aliases(backend_id
 CREATE TABLE IF NOT EXISTS embedding_config (
     id                INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     enabled           INTEGER NOT NULL DEFAULT 1,
-    endpoint          TEXT NOT NULL CHECK (endpoint != ''),
+    backend           TEXT NOT NULL CHECK (backend != ''),
+    model             TEXT NOT NULL CHECK (model != ''),
+    dimensions        INTEGER NOT NULL CHECK (dimensions > 0),
+    profile           TEXT NOT NULL DEFAULT 'plain',
     timeout_ms        INTEGER NOT NULL CHECK (timeout_ms > 0),
     max_in_flight     INTEGER NOT NULL CHECK (max_in_flight > 0),
     max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
@@ -2985,9 +2988,9 @@ impl KernelDb {
     }
 
     /// Column backfills and guarded configuration migrations for existing DBs.
-    /// A builtin-model `embedding_config` is replaced by an empty service
-    /// table, and a row holding a retired factory endpoint is removed: the
-    /// kernel ships no endpoint to put in its place.
+    /// An `embedding_config` in an older shape (a builtin model or a service
+    /// endpoint) is replaced by an empty table: the kernel ships no backend
+    /// to put in its place.
     /// The project's stance is "schema is truth, bump = wipe", but a single
     /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
     /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the
@@ -2996,33 +2999,28 @@ impl KernelDb {
     /// leaving the DB silently short a column that later code assumes exists.
     fn apply_additive_migrations(conn: &Connection) -> KernelDbResult<()> {
         let legacy_embedding: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = 'model_dir')",
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = 'model_dir' OR name = 'endpoint')",
             [], |row| row.get(0),
         )?;
         if legacy_embedding {
-            // The builtin-model row names no service endpoint and there is no
-            // default to supply, so the rebuilt table starts empty.
+            // The builtin-model and service-endpoint rows name no backend and
+            // there is no default to supply, so the rebuilt table starts empty.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch("DROP TABLE embedding_config;
                 CREATE TABLE embedding_config (
                     id INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
                     enabled INTEGER NOT NULL DEFAULT 1,
-                    endpoint TEXT NOT NULL CHECK (endpoint != ''),
+                    backend TEXT NOT NULL CHECK (backend != ''),
+                    model TEXT NOT NULL CHECK (model != ''),
+                    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+                    profile TEXT NOT NULL DEFAULT 'plain',
                     timeout_ms INTEGER NOT NULL CHECK (timeout_ms > 0),
                     max_in_flight INTEGER NOT NULL CHECK (max_in_flight > 0),
                     max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
                 );")?;
             tx.commit()?;
-            tracing::warn!("dropped the builtin-model embedding configuration; the semantic index \
-                is off until embedding_config names an embedding service (docs/synthesis.md)");
-        }
-        for retired in RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
-            let removed = conn.execute("DELETE FROM embedding_config WHERE endpoint = ?1", [retired])?;
-            if removed > 0 {
-                tracing::warn!(endpoint = retired,
-                    "removed a retired factory embedding endpoint; the semantic index is off until \
-                     embedding_config names an embedding service (docs/synthesis.md)");
-            }
+            tracing::warn!("dropped the old embedding configuration; the semantic index \
+                is off until embedding_config names a backend and model (docs/synthesis.md)");
         }
         // A database written before context characters still has the columns
         // they replaced; `contexts.provider` is in every such database and in
@@ -8514,19 +8512,16 @@ pub(crate) const RETIRED_CLASSIFIER_HOOK: (&str, &str) = ("lfm2d-advisory", "/co
 /// removes them; nothing reads them.
 pub(crate) const RETIRED_CLASSIFIER_ENV: &[&str] = &["LFM2D_MODE", "LFM2D_BENIGN_LABEL", "LFM2D_URL"];
 
-/// Endpoints earlier kernels seeded into `embedding_config`. A row still
-/// holding one was never an operator's choice: opening the DB removes it and
-/// the semantic index stays off until an operator configures a service.
-pub(crate) const RETIRED_FACTORY_EMBEDDING_ENDPOINTS: &[&str] = &[
-    "http://lfm2d-1.taila4abc.ts.net:8088",
-    "http://lfm2d-system1.taila4abc.ts.net:8088",
-];
-
-/// The singleton `embedding_config` row.
+/// The singleton `embedding_config` row. `backend` names a `backends` row of
+/// kind `openai`, which owns the base URL and the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfigRow {
     pub enabled: bool,
-    pub endpoint: String,
+    pub backend: String,
+    pub model: String,
+    pub dimensions: i64,
+    /// An [`kaijutsu_index::EmbeddingProfile`] token.
+    pub profile: String,
     pub timeout_ms: i64,
     pub max_in_flight: i64,
     pub max_context_bytes: i64,
@@ -9098,26 +9093,34 @@ impl KernelDb {
     /// The singleton embedding row, or `None` when never seeded.
     pub fn get_embedding_config(&self) -> KernelDbResult<Option<EmbeddingConfigRow>> {
         Ok(self.conn.query_row(
-            "SELECT enabled, endpoint, timeout_ms, max_in_flight, max_context_bytes FROM embedding_config WHERE id = 1",
+            "SELECT enabled, backend, model, dimensions, profile, timeout_ms, max_in_flight, max_context_bytes
+             FROM embedding_config WHERE id = 1",
             [], |row| Ok(EmbeddingConfigRow {
-                enabled: row.get::<_, i64>(0)? != 0, endpoint: row.get(1)?,
-                timeout_ms: row.get(2)?, max_in_flight: row.get(3)?, max_context_bytes: row.get(4)?,
+                enabled: row.get::<_, i64>(0)? != 0, backend: row.get(1)?, model: row.get(2)?,
+                dimensions: row.get(3)?, profile: row.get(4)?,
+                timeout_ms: row.get(5)?, max_in_flight: row.get(6)?, max_context_bytes: row.get(7)?,
             }),
         ).optional()?)
     }
 
     /// Replace the singleton embedding service configuration.
     pub fn set_embedding_config(&self, row: &EmbeddingConfigRow) -> KernelDbResult<()> {
-        if row.timeout_ms <= 0 || row.max_in_flight <= 0 || row.max_context_bytes <= 0 || row.endpoint.trim().is_empty() {
-            return Err(KernelDbError::Validation("embedding endpoint must be nonempty and timeout_ms/max_in_flight/max_context_bytes must be positive".into()));
+        if row.backend.trim().is_empty() || row.model.trim().is_empty() {
+            return Err(KernelDbError::Validation("embedding backend and model must be nonempty".into()));
         }
+        if row.dimensions <= 0 || row.timeout_ms <= 0 || row.max_in_flight <= 0 || row.max_context_bytes <= 0 {
+            return Err(KernelDbError::Validation("embedding dimensions, timeout_ms, max_in_flight and max_context_bytes must be positive".into()));
+        }
+        row.profile.parse::<kaijutsu_index::EmbeddingProfile>().map_err(KernelDbError::Validation)?;
         self.conn.execute(
-            "INSERT INTO embedding_config (id, enabled, endpoint, timeout_ms, max_in_flight, max_context_bytes)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, endpoint = excluded.endpoint,
+            "INSERT INTO embedding_config (id, enabled, backend, model, dimensions, profile, timeout_ms, max_in_flight, max_context_bytes)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, backend = excluded.backend,
+                 model = excluded.model, dimensions = excluded.dimensions, profile = excluded.profile,
                  timeout_ms = excluded.timeout_ms, max_in_flight = excluded.max_in_flight,
                  max_context_bytes = excluded.max_context_bytes",
-            params![row.enabled as i64, row.endpoint, row.timeout_ms, row.max_in_flight, row.max_context_bytes],
+            params![row.enabled as i64, row.backend, row.model, row.dimensions, row.profile,
+                row.timeout_ms, row.max_in_flight, row.max_context_bytes],
         )?;
         Ok(())
     }
@@ -9754,56 +9757,61 @@ mod tests {
         ).is_err(), "the migrated column carries its CHECK");
     }
 
-    /// The builtin-model shape carries no service endpoint and the kernel
-    /// ships no default one, so the rebuild leaves the table empty: the
-    /// semantic index stays off until an operator writes an endpoint.
-    #[test]
-    fn legacy_embedding_config_migrates_to_an_unconfigured_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kernel.db");
-        {
-            let db = KernelDb::open(&path).unwrap();
-            db.conn.execute_batch("DROP TABLE embedding_config;
-                CREATE TABLE embedding_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL,
-                    model_dir TEXT NOT NULL, dimensions INTEGER NOT NULL, max_tokens INTEGER NOT NULL);
-                INSERT INTO embedding_config VALUES (1, 1, '/old/model', 384, 123);").unwrap();
-        }
-        let db = KernelDb::open(&path).unwrap();
-        assert_eq!(db.get_embedding_config().unwrap(), None);
-        let configured = EmbeddingConfigRow {
-            enabled: true, endpoint: "unix:///tmp/embed.sock".into(),
+    fn embedding_row() -> EmbeddingConfigRow {
+        EmbeddingConfigRow {
+            enabled: true, backend: "openrouter".into(), model: "qwen/qwen3-embedding-8b".into(),
+            dimensions: 1024, profile: "qwen3".into(),
             timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
-        };
-        db.set_embedding_config(&configured).unwrap();
-        drop(db);
-        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(configured));
+        }
     }
 
-    /// A row holding a former factory endpoint was seeded, not chosen, and
-    /// the kernel no longer ships a default: opening removes it, so the
-    /// index reports "no embedding service configured" instead of probing a
-    /// retired host at every boot. An operator's endpoint survives.
+    /// Both older shapes (a builtin model directory, then a service endpoint)
+    /// name no backend and the kernel ships no default, so the rebuild leaves
+    /// the table empty: the semantic index stays off until an operator names
+    /// a backend and model.
     #[test]
-    fn retired_factory_embedding_endpoints_are_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kernel.db");
-        for retired in RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
+    fn legacy_embedding_config_migrates_to_an_unconfigured_service() {
+        for (shape, legacy) in [
+            ("builtin model", "CREATE TABLE embedding_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL,
+                model_dir TEXT NOT NULL, dimensions INTEGER NOT NULL, max_tokens INTEGER NOT NULL);
+             INSERT INTO embedding_config VALUES (1, 1, '/old/model', 384, 123);"),
+            ("service endpoint", "CREATE TABLE embedding_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL,
+                endpoint TEXT NOT NULL, timeout_ms INTEGER NOT NULL, max_in_flight INTEGER NOT NULL,
+                max_context_bytes INTEGER NOT NULL);
+             INSERT INTO embedding_config VALUES (1, 1, 'http://embedder.example:8088', 30000, 2, 2048);"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("kernel.db");
             {
                 let db = KernelDb::open(&path).unwrap();
-                db.set_embedding_config(&EmbeddingConfigRow {
-                    enabled: true, endpoint: (*retired).into(),
-                    timeout_ms: 1234, max_in_flight: 2, max_context_bytes: 2048,
-                })
-                .unwrap();
+                db.conn.execute_batch(&format!("DROP TABLE embedding_config; {legacy}")).unwrap();
             }
-            assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), None, "{retired}");
+            let db = KernelDb::open(&path).unwrap();
+            assert_eq!(db.get_embedding_config().unwrap(), None, "{shape}");
+            db.set_embedding_config(&embedding_row()).unwrap();
+            drop(db);
+            assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(embedding_row()), "{shape}");
         }
-        let own = EmbeddingConfigRow {
-            enabled: true, endpoint: "http://embedder.example:8088".into(),
-            timeout_ms: 1234, max_in_flight: 2, max_context_bytes: 2048,
-        };
-        KernelDb::open(&path).unwrap().set_embedding_config(&own).unwrap();
-        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(own));
+    }
+
+    #[test]
+    fn an_embedding_row_is_refused_when_it_cannot_work() {
+        let db = KernelDb::temporary().unwrap();
+        for (what, row) in [
+            ("empty backend", EmbeddingConfigRow { backend: " ".into(), ..embedding_row() }),
+            ("empty model", EmbeddingConfigRow { model: String::new(), ..embedding_row() }),
+            ("zero dimensions", EmbeddingConfigRow { dimensions: 0, ..embedding_row() }),
+            ("zero timeout", EmbeddingConfigRow { timeout_ms: 0, ..embedding_row() }),
+            ("zero concurrency", EmbeddingConfigRow { max_in_flight: 0, ..embedding_row() }),
+            ("zero projection", EmbeddingConfigRow { max_context_bytes: 0, ..embedding_row() }),
+        ] {
+            assert!(db.set_embedding_config(&row).is_err(), "accepted: {what}");
+        }
+        let error = db.set_embedding_config(&EmbeddingConfigRow { profile: "gemini".into(), ..embedding_row() })
+            .unwrap_err().to_string();
+        assert!(error.contains("plain") && error.contains("qwen3") && error.contains("embeddinggemma"),
+            "an unknown profile names the valid ones: {error}");
+        assert_eq!(db.get_embedding_config().unwrap(), None, "a refusal writes nothing");
     }
 
     /// A DB whose `hooks` table predates `action_kaish_path` still opens:

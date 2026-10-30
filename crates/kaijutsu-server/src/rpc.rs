@@ -1473,7 +1473,7 @@ mod context_bootstrap_tests {
     }
 }
 
-/// Connect to the embedding service and load the semantic index, starting
+/// Connect to the embedding backend and load the semantic index, starting
 /// its re-index watcher. `None` when the service or the index is unavailable;
 /// each cause is logged. Runs after boot (`create_shared_kernel`).
 async fn connect_semantic_index(
@@ -1482,11 +1482,24 @@ async fn connect_semantic_index(
     documents: SharedBlockStore,
     flows: kaijutsu_kernel::flows::SharedBlockFlowBus,
 ) -> Option<Arc<kaijutsu_index::SemanticIndex>> {
-    match kaijutsu_index::HttpEmbedder::connect(
-        &emb_config.endpoint,
-        std::time::Duration::from_millis(emb_config.timeout_ms),
-        emb_config.max_in_flight,
-    ).await {
+    let backend = &emb_config.backend;
+    let (Some(base_url), Some(api_key)) = (backend.base_url.clone(), backend.resolve_api_key()) else {
+        log::warn!(
+            "Embedding backend `{}` needs a base_url and a resolvable API key (api_key_env or api_key_file); \
+             the semantic index stays off",
+            backend.name
+        );
+        return None;
+    };
+    match kaijutsu_index::OpenAiEmbedder::connect(kaijutsu_index::OpenAiEmbedderConfig {
+        base_url,
+        api_key,
+        model: emb_config.model.clone(),
+        dimensions: emb_config.dimensions,
+        profile: emb_config.profile,
+        timeout: std::time::Duration::from_millis(emb_config.timeout_ms),
+        max_in_flight: emb_config.max_in_flight,
+    }).await {
         Ok(embedder) => {
             use kaijutsu_index::Embedder;
             let index_config = kaijutsu_index::IndexConfig::new(
@@ -1528,8 +1541,8 @@ async fn connect_semantic_index(
                          Use `kj synth <context>` to synthesize on demand."
                     );
                     log::info!(
-                        "Semantic index initialized with {}",
-                        emb_config.endpoint
+                        "Semantic index initialized with {} on backend {}",
+                        emb_config.model, emb_config.backend.name
                     );
                     Some(idx)
                 }
@@ -1540,7 +1553,7 @@ async fn connect_semantic_index(
             }
         }
         Err(e) => {
-            log::warn!("Embedding service unavailable at {}: {}", emb_config.endpoint, e);
+            log::warn!("Embedding service unavailable on backend {}: {}", emb_config.backend.name, e);
             None
         }
     }

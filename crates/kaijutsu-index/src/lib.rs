@@ -25,8 +25,8 @@ pub mod watcher;
 pub use config::IndexConfig;
 pub use content::extract_context_content;
 pub use embedder::{Embedder, EmbeddingPurpose};
-pub mod http_embedder;
-pub use http_embedder::HttpEmbedder;
+pub mod openai_embedder;
+pub use openai_embedder::{EmbeddingProfile, OpenAiEmbedder, OpenAiEmbedderConfig};
 
 use std::future::Future;
 use std::pin::Pin;

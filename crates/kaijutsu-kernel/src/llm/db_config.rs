@@ -172,7 +172,9 @@ pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<Llm
 ///
 /// `enabled = 0` resolves to `None` — the same shape the kernel already
 /// handles as "no semantic index configured", so the disable knob needs no
-/// second code path.
+/// second code path. An enabled row whose backend is missing or cannot embed
+/// is an error: the operator asked for an index and would otherwise get
+/// silence.
 pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelConfig>> {
     let Some(row) = db
         .get_embedding_config()
@@ -183,8 +185,26 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
     if !row.enabled {
         return Ok(None);
     }
+    let backend = load_backends(db)?
+        .into_iter()
+        .find(|backend| backend.name.eq_ignore_ascii_case(&row.backend))
+        .ok_or_else(|| LlmError::InvalidRequest(format!(
+            "embedding_config names backend `{}`, which is not configured; add it with `kj backend set`",
+            row.backend
+        )))?;
+    if backend.kind != BackendKind::OpenAi {
+        return Err(LlmError::InvalidRequest(format!(
+            "embedding_config names backend `{}` of kind `{}`; embeddings need an `openai` kind backend \
+             whose base_url has an /embeddings route",
+            backend.name, backend.kind.as_str()
+        )));
+    }
+    let profile = row.profile.parse().map_err(LlmError::InvalidRequest)?;
     Ok(Some(EmbeddingModelConfig {
-        enabled: true, endpoint: row.endpoint,
+        enabled: true, backend, model: row.model,
+        dimensions: usize::try_from(row.dimensions)
+            .map_err(|_| LlmError::InvalidRequest("embedding_config dimensions is not positive".into()))?,
+        profile,
         timeout_ms: row.timeout_ms as u64, max_in_flight: row.max_in_flight as usize,
         max_context_bytes: row.max_context_bytes as usize,
     }))
@@ -378,16 +398,29 @@ mod tests {
         assert!(load_embedding_config(&db).unwrap().is_none());
     }
 
-    #[test]
-    fn a_configured_embedding_service_reads_back() {
-        let db = seeded_db();
-        db.set_embedding_config(&EmbeddingConfigRow {
-            enabled: true, endpoint: "http://embedder.example:8088".into(),
+    fn embedding_row(backend: &str) -> EmbeddingConfigRow {
+        EmbeddingConfigRow {
+            enabled: true, backend: backend.into(), model: "qwen/qwen3-embedding-8b".into(),
+            dimensions: 1024, profile: "qwen3".into(),
             timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_configured_embedding_service_reads_back_with_its_backend() {
+        let db = seeded_db();
+        crate::test_backends::backend(
+            &db, "openrouter", "openai", Some("https://openrouter.ai/api/v1"),
+            Some("OPENROUTER_API_KEY"), None, false,
+        );
+        db.set_embedding_config(&embedding_row("openrouter")).unwrap();
         let emb = load_embedding_config(&db).unwrap().expect("configured and enabled");
-        assert_eq!(emb.endpoint, "http://embedder.example:8088");
+        assert_eq!(emb.backend.name, "openrouter");
+        assert_eq!(emb.backend.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(emb.backend.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+        assert_eq!(emb.model, "qwen/qwen3-embedding-8b");
+        assert_eq!(emb.dimensions, 1024);
+        assert_eq!(emb.profile, kaijutsu_index::EmbeddingProfile::Qwen3);
         assert_eq!(emb.timeout_ms, 30_000);
         assert_eq!(emb.max_in_flight, 2);
         assert_eq!(emb.max_context_bytes, 2048);
@@ -396,12 +429,26 @@ mod tests {
     #[test]
     fn disabled_embedding_reads_as_none() {
         let db = seeded_db();
-        db.set_embedding_config(&EmbeddingConfigRow {
-            enabled: false, endpoint: "http://embedder.example:8088".into(),
-            timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
-        })
-        .unwrap();
-        assert!(load_embedding_config(&db).unwrap().is_none());
+        db.set_embedding_config(&EmbeddingConfigRow { enabled: false, ..embedding_row("openrouter") }).unwrap();
+        assert!(load_embedding_config(&db).unwrap().is_none(), "a disabled row needs no backend");
+    }
+
+    #[test]
+    fn an_embedding_row_naming_no_backend_is_an_error_not_silence() {
+        let db = seeded_db();
+        db.set_embedding_config(&embedding_row("openrouter")).unwrap();
+        let error = load_embedding_config(&db).unwrap_err().to_string();
+        assert!(error.contains("openrouter") && error.contains("kj backend"), "{error}");
+    }
+
+    #[test]
+    fn only_an_openai_kind_backend_can_embed() {
+        let db = seeded_db();
+        for backend in ["anthropic", "deepseek"] {
+            db.set_embedding_config(&embedding_row(backend)).unwrap();
+            let error = load_embedding_config(&db).unwrap_err().to_string();
+            assert!(error.contains(backend) && error.contains("openai"), "{backend}: {error}");
+        }
     }
 
     #[test]

@@ -263,6 +263,10 @@ Clarity:
   that keys sent faster than the kernel answers land in order, holds only
   once the buffer has loaded; decide whether the client should queue keys
   until the first state arrives (`docs/vi.md`).
+- `kaijutsu-kernel` `runtime::llm_stream::lifetime_tests::a_note_whose_inference_fails_gets_a_turn_of_its_own`
+  failed once in a full-suite lib run on 2026-10-30 (`8467dc40` plus the
+  embedding change) at `llm_stream.rs:9690`, and passed three times alone.
+  Load-dependent; cause not found.
 - `kaijutsu-server` `gate_scenarios_wire`:
   `an_approved_shell_write_runs_with_the_cwd_and_env_it_showed` failed once
   in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for
@@ -2933,13 +2937,21 @@ Found in kaibo's synthesis review (GLM-5.3 via Crusoe).
 
 ## Embedding service configuration has no `kj` verb
 
-The `embedding_config` singleton is the kernel's sole embedding configuration
-source (`llm/db_config.rs::load_embedding_config`), and the kernel ships no
-endpoint: a fresh kernel's semantic index is off until an operator writes the
-row with `sqlite3` while the kernel is stopped (`docs/synthesis.md`). Give it
-an administration path, probably a backend row with an embedding kind so the
-endpoint has one owner beside the LLM backends. That changes the registry and
-backend administration, so it belongs with the kj verb-class work.
+The `embedding_config` singleton names an `openai` kind backend, a model, a
+vector size, and a prompt profile, and `llm/db_config.rs::load_embedding_config`
+is its only reader. The backend row owns the URL and key; the row itself is
+still written with `sqlite3` while the kernel is stopped (`docs/synthesis.md`).
+Give it a `kj` verb (`kj embedding set|show`, probably), which changes the
+registry and backend administration and so belongs with the kj verb-class work.
+
+- A hosted provider's weights can change without the cache identity changing.
+  Decide whether the index should store a probe vector and compare it at boot.
+- The local route is planned in gogi (`POST /council/v2/embeddings`, EmbeddingGemma 2 on
+  nagaya). It adds the task prompt itself, so its row takes the `plain`
+  profile. Add a `council` embedder behind the same trait when the route
+  merges; vectors from different models do not compare, so the switch re-indexes.
+- `OpenAiEmbedder` sends `dimensions` to every provider. A model that rejects
+  the field (OpenAI's ada-002) needs a profile or flag that leaves it out.
 
 ## The terminal client — `kaijutsu-tui` follow-ups (first cut shipped 2026-09-02)
 

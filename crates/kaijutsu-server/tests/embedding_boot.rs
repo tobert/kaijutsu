@@ -1,72 +1,144 @@
-//! Service discovery, configuration, and semantic index initialization at boot.
-use kaijutsu_kernel::{KernelDb, kernel_db::EmbeddingConfigRow};
+//! Embedding backend configuration and semantic index initialization at boot.
+use kaijutsu_kernel::{KernelDb, kernel_db::{BackendRow, EmbeddingConfigRow}};
 use kaijutsu_server::{config_mounts::ConfigMounts, rpc::create_shared_kernel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn vector_reply(dimensions: usize) -> String {
+    let body = serde_json::json!({"data": [{"index": 0, "embedding": vec![1.0; dimensions]}]}).to_string();
+    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}")
+}
+
+/// A backend row of kind `openai` at `base_url`, its key in a file, and the
+/// `embedding_config` row that names it.
+fn configure(db: &KernelDb, dir: &std::path::Path, base_url: Option<String>, key: Option<&str>, row: EmbeddingConfigRow) {
+    let key_file = key.map(|key| {
+        let path = dir.join("embedding-key");
+        std::fs::write(&path, format!("{key}\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    });
+    db.upsert_backend(&BackendRow {
+        backend_id: kaijutsu_types::BackendId::new(),
+        name: "openrouter".into(), kind: "openai".into(), base_url,
+        // An explicitly named variable does not fall back to the standard one,
+        // so a missing key stays missing whatever the host exports.
+        api_key_env: key.is_none().then(|| "KAIJUTSU_EMBEDDING_TEST_UNSET_KEY".to_owned()),
+        api_key_file: key_file, key_optional: false,
+        request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
+        created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),
+    }).unwrap();
+    db.set_embedding_config(&row).unwrap();
+}
+
+fn row(dimensions: i64, timeout_ms: i64) -> EmbeddingConfigRow {
+    EmbeddingConfigRow {
+        enabled: true, backend: "openrouter".into(), model: "boot-test".into(),
+        dimensions, profile: "plain".into(), timeout_ms, max_in_flight: 2, max_context_bytes: 2048,
+    }
+}
+
+async fn boot(dir: &std::path::Path) -> std::sync::Arc<kaijutsu_server::rpc::SharedKernelState> {
+    create_shared_kernel(None, &ConfigMounts::new(dir.join("config")), Some(dir), &[], &[]).await.unwrap()
+}
+
 #[tokio::test]
-async fn boot_uses_discovered_dimensions_and_no_builtin_model_files() {
+async fn boot_probes_the_provider_and_indexes_at_the_configured_dimensions() {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let base_url = format!("http://{}/api/v1", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
         let n = stream.read(&mut request).await.unwrap();
-        assert!(std::str::from_utf8(&request[..n]).unwrap().starts_with("GET /v1/models "));
-        stream.write_all(concat!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-            "[{\"kind\":\"embedder\",\"id\":\"boot-test\",\"weight_hash\":\"",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "\",\"hidden_size\":1024}]").as_bytes()).await.unwrap();
+        let request = std::str::from_utf8(&request[..n]).unwrap().to_owned();
+        stream.write_all(vector_reply(1024).as_bytes()).await.unwrap();
+        request
     });
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-    db.set_embedding_config(&EmbeddingConfigRow { enabled: true, endpoint,
-        timeout_ms: 2000, max_in_flight: 2, max_context_bytes: 2048 }).unwrap();
+    configure(&db, dir.path(), Some(base_url), Some("sk-boot"), row(1024, 2000));
     insert_root_character(&db);
     drop(db);
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[], &[]).await.unwrap();
-    let index = wait_for_index(&shared).await.expect("service discovery must initialize the index");
+    let shared = boot(dir.path()).await;
+    let index = wait_for_index(&shared).await.expect("the probe must initialize the index");
     assert_eq!(index.embedder().model_name(), "boot-test");
     assert_eq!(index.embedder().dimensions(), 1024);
-    server.await.unwrap();
+    let request = server.await.unwrap();
+    assert!(request.starts_with("POST /api/v1/embeddings "), "{request}");
+    assert!(request.to_ascii_lowercase().contains("authorization: bearer sk-boot"), "{request}");
 }
 
 #[tokio::test]
-async fn unavailable_service_leaves_index_unavailable() {
+async fn unavailable_provider_leaves_index_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let base_url = format!("http://{}/api/v1", listener.local_addr().unwrap());
     drop(listener);
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-    db.set_embedding_config(&EmbeddingConfigRow { enabled: true, endpoint,
-        timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048 }).unwrap();
+    configure(&db, dir.path(), Some(base_url), Some("sk-boot"), row(1024, 100));
     insert_root_character(&db);
     drop(db);
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[], &[]).await.unwrap();
+    let shared = boot(dir.path()).await;
     assert!(wait_for_index(&shared).await.is_none(), "must not substitute another embedding model");
 }
 
-/// Boot does not wait for the embedding service: a service that accepts and
-/// never answers must not hold kernel construction for its timeout.
+/// A model that returns a different vector size than the row says must not
+/// feed an index of the wrong size.
 #[tokio::test]
-async fn a_silent_service_does_not_hold_boot() {
+async fn a_provider_returning_other_dimensions_leaves_index_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let base_url = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream.write_all(vector_reply(768).as_bytes()).await.unwrap();
+    });
+    let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+    configure(&db, dir.path(), Some(base_url), Some("sk-boot"), row(1024, 2000));
+    insert_root_character(&db);
+    drop(db);
+    let shared = boot(dir.path()).await;
+    assert!(wait_for_index(&shared).await.is_none());
+    server.await.unwrap();
+}
+
+/// No key, or a row naming a backend that is not there, leaves the index off
+/// and boot standing.
+#[tokio::test]
+async fn a_backend_without_a_key_or_a_row_without_a_backend_leaves_index_unavailable() {
+    for (what, key, backend) in [("no key", None, "openrouter"), ("no such backend", Some("sk-boot"), "missing")] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+        configure(&db, dir.path(), Some("http://127.0.0.1:9/api/v1".into()), key,
+            EmbeddingConfigRow { backend: backend.into(), ..row(1024, 100) });
+        insert_root_character(&db);
+        drop(db);
+        let shared = boot(dir.path()).await;
+        assert!(wait_for_index(&shared).await.is_none(), "{what}");
+    }
+}
+
+/// Boot does not wait for the provider: one that accepts and never answers
+/// must not hold kernel construction for its timeout.
+#[tokio::test]
+async fn a_silent_provider_does_not_hold_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/api/v1", listener.local_addr().unwrap());
     let held = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         drop(stream);
     });
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-    db.set_embedding_config(&EmbeddingConfigRow { enabled: true, endpoint,
-        timeout_ms: 30_000, max_in_flight: 1, max_context_bytes: 2048 }).unwrap();
+    configure(&db, dir.path(), Some(base_url), Some("sk-boot"), row(1024, 30_000));
     insert_root_character(&db);
     drop(db);
     let started = std::time::Instant::now();
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[], &[]).await.unwrap();
+    let shared = boot(dir.path()).await;
     assert!(started.elapsed() < std::time::Duration::from_secs(10),
-        "boot waited {:?} on a silent embedding service", started.elapsed());
-    assert!(shared.kj_dispatcher.semantic_index().is_none(), "no index before the service answers");
+        "boot waited {:?} on a silent embedding provider", started.elapsed());
+    assert!(shared.kj_dispatcher.semantic_index().is_none(), "no index before the provider answers");
     held.abort();
 }
 
