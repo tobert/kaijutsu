@@ -28,6 +28,7 @@ use std::sync::Arc;
 use crate::kernel_db::KernelDb;
 use crate::llm::endpoint::Endpoints;
 
+use kaijutsu_index::EmbeddingProfile;
 use super::config::{BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo, SlotTunables};
 use super::{LlmError, LlmRegistry, LlmResult, Provider};
 
@@ -192,14 +193,21 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
             "embedding_config names backend `{}`, which is not configured; add it with `kj backend set`",
             row.backend
         )))?;
-    if backend.kind != BackendKind::OpenAi {
+    if !matches!(backend.kind, BackendKind::OpenAi | BackendKind::Mk) {
         return Err(LlmError::InvalidRequest(format!(
             "embedding_config names backend `{}` of kind `{}`; embeddings need an `openai` kind backend \
-             whose base_url has an /embeddings route",
+             whose base_url has an /embeddings route, or an `mk` kind backend serving /council/v2/embeddings",
             backend.name, backend.kind.as_str()
         )));
     }
-    let profile = row.profile.parse().map_err(LlmError::InvalidRequest)?;
+    let profile: EmbeddingProfile = row.profile.parse().map_err(LlmError::InvalidRequest)?;
+    if backend.kind == BackendKind::Mk && profile != EmbeddingProfile::Plain {
+        return Err(LlmError::InvalidRequest(format!(
+            "embedding_config names backend `{}` of kind `mk` with profile `{}`; a council server renders \
+             its own task prompts, so use profile `plain`",
+            backend.name, profile.as_str()
+        )));
+    }
     Ok(Some(EmbeddingModelConfig {
         enabled: true, backend, model: row.model,
         dimensions: usize::try_from(row.dimensions)
@@ -442,13 +450,29 @@ mod tests {
     }
 
     #[test]
-    fn only_an_openai_kind_backend_can_embed() {
+    fn only_an_openai_or_mk_backend_can_embed() {
         let db = seeded_db();
         for backend in ["anthropic", "deepseek"] {
             db.set_embedding_config(&embedding_row(backend)).unwrap();
             let error = load_embedding_config(&db).unwrap_err().to_string();
-            assert!(error.contains(backend) && error.contains("openai"), "{backend}: {error}");
+            assert!(error.contains(backend) && error.contains("openai") && error.contains("mk"), "{backend}: {error}");
         }
+    }
+
+    /// A council server renders each task's prompt itself, so an `mk`
+    /// backend takes the `plain` profile; any other would prefix twice.
+    #[test]
+    fn an_mk_backend_embeds_with_the_plain_profile_only() {
+        let db = seeded_db();
+        crate::test_backends::backend(&db, "spaceghost", "mk", Some("http://100.65.47.5:8091"), None, None, true);
+        db.set_embedding_config(&EmbeddingConfigRow { profile: "plain".into(), ..embedding_row("spaceghost") }).unwrap();
+        let emb = load_embedding_config(&db).unwrap().expect("configured and enabled");
+        assert_eq!(emb.backend.kind, BackendKind::Mk);
+        assert_eq!(emb.profile, kaijutsu_index::EmbeddingProfile::Plain);
+
+        db.set_embedding_config(&embedding_row("spaceghost")).unwrap();
+        let error = load_embedding_config(&db).unwrap_err().to_string();
+        assert!(error.contains("spaceghost") && error.contains("plain"), "{error}");
     }
 
     #[test]

@@ -65,6 +65,7 @@ tempfile = { workspace = true }
 capnpc.workspace = true
 
 [dev-dependencies]
+gogi-fake = { workspace = true }
 approval-ledger.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-cas.workspace = true

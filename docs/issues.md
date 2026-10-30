@@ -2944,12 +2944,18 @@ still written with `sqlite3` while the kernel is stopped (`docs/synthesis.md`).
 Give it a `kj` verb (`kj embedding set|show`, probably), which changes the
 registry and backend administration and so belongs with the kj verb-class work.
 
-- A hosted provider's weights can change without the cache identity changing.
-  Decide whether the index should store a probe vector and compare it at boot.
-- The local route is planned in gogi (`POST /council/v2/embeddings`, EmbeddingGemma 2 on
-  nagaya). It adds the task prompt itself, so its row takes the `plain`
-  profile. Add a `council` embedder behind the same trait when the route
-  merges; vectors from different models do not compare, so the switch re-indexes.
+- A hosted `openai` provider's weights can change without the cache identity
+  changing. Decide whether the index should store a probe vector and compare
+  it at boot.
+- `CouncilEmbedder` is built against `gogi-fake`'s toy embedding model. Run it
+  against nagaya's EmbeddingGemma 2 when that route is live
+  (`100.65.47.5:8091`), then set the `embedding_config` row to an `mk` backend
+  with profile `plain`. Vectors from different models do not compare, so the
+  switch re-indexes.
+- An input past the council model's token limit is an error. Chunking long
+  inputs with the route's `dry_run` token counts is not built. The search
+  projection is bounded in bytes (`max_context_bytes`); synthesis has no such
+  bound that I checked, so a long block could hit the limit.
 - `OpenAiEmbedder` sends `dimensions` to every provider. A model that rejects
   the field (OpenAI's ada-002) needs a profile or flag that leaves it out.
 

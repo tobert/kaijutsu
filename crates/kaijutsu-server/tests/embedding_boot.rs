@@ -66,6 +66,34 @@ async fn boot_probes_the_provider_and_indexes_at_the_configured_dimensions() {
     assert!(request.to_ascii_lowercase().contains("authorization: bearer sk-boot"), "{request}");
 }
 
+/// A council server needs no key and renders its own task prompts: boot
+/// pins its identity and indexes at the configured size.
+#[tokio::test]
+async fn boot_embeds_through_a_council_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = gogi_fake::Config::default();
+    config.models.push(gogi_fake::FakeModel::embedding("embed-toy-1", 7));
+    let council = gogi_fake::Server::start(config).unwrap();
+    let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+    db.upsert_backend(&BackendRow {
+        backend_id: kaijutsu_types::BackendId::new(),
+        name: "spaceghost".into(), kind: "mk".into(), base_url: Some(council.url()),
+        api_key_env: None, api_key_file: None, key_optional: true,
+        request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
+        created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),
+    }).unwrap();
+    db.set_embedding_config(&EmbeddingConfigRow {
+        backend: "spaceghost".into(), model: "embed-toy-1".into(), dimensions: 32,
+        ..row(32, 2000)
+    }).unwrap();
+    insert_root_character(&db);
+    drop(db);
+    let shared = boot(dir.path()).await;
+    let index = wait_for_index(&shared).await.expect("a council server must initialize the index");
+    assert_eq!(index.embedder().model_name(), "embed-toy-1");
+    assert_eq!(index.embedder().dimensions(), 32);
+}
+
 #[tokio::test]
 async fn unavailable_provider_leaves_index_unavailable() {
     let dir = tempfile::tempdir().unwrap();

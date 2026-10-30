@@ -5478,7 +5478,7 @@ dependencies = [
 [[package]]
 name = "gogi-fake"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=9aa356a5ec8a01aefc5b451741d2ec96959a9208#9aa356a5ec8a01aefc5b451741d2ec96959a9208"
+source = "git+https://github.com/tobert/gogi?rev=6db7e989dbf5abb9f5de8c94d678c31416580c9b#6db7e989dbf5abb9f5de8c94d678c31416580c9b"
 dependencies = [
  "blake3",
  "gogi-proto",
@@ -5491,7 +5491,7 @@ dependencies = [
 [[package]]
 name = "gogi-proto"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=9aa356a5ec8a01aefc5b451741d2ec96959a9208#9aa356a5ec8a01aefc5b451741d2ec96959a9208"
+source = "git+https://github.com/tobert/gogi?rev=6db7e989dbf5abb9f5de8c94d678c31416580c9b#6db7e989dbf5abb9f5de8c94d678c31416580c9b"
 dependencies = [
  "blake3",
  "indexmap 2.14.0",
@@ -5503,7 +5503,7 @@ dependencies = [
 [[package]]
 name = "gogi-toy"
 version = "0.1.0"
-source = "git+https://github.com/tobert/gogi?rev=9aa356a5ec8a01aefc5b451741d2ec96959a9208#9aa356a5ec8a01aefc5b451741d2ec96959a9208"
+source = "git+https://github.com/tobert/gogi?rev=6db7e989dbf5abb9f5de8c94d678c31416580c9b#6db7e989dbf5abb9f5de8c94d678c31416580c9b"
 dependencies = [
  "gogi-proto",
  "serde_json",
@@ -6948,7 +6948,10 @@ version = "0.1.0"
 dependencies = [
  "anndists",
  "async-trait",
+ "gogi-fake",
+ "gogi-proto",
  "hnsw_rs",
+ "kaijutsu-mk",
  "kaijutsu-types",
  "ndarray",
  "petal-clustering",
@@ -7118,6 +7121,7 @@ dependencies = [
  "clap",
  "dashmap",
  "futures",
+ "gogi-fake",
  "hostname",
  "kaijutsu-abc",
  "kaijutsu-ansi",

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use gogi_proto::context::{Context, ContextBuild, ContextBuilt};
 use gogi_proto::decision::{DecisionRequest, DecisionResponse};
+use gogi_proto::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use gogi_proto::generation::{GenerationDone, GenerationRequest, StreamEvent, TokenEvent};
 use gogi_proto::identity::ServerIdentity;
 use gogi_proto::pins::{validate_owner, PinSet, PinsPut, PinsPutResult, SnapshotDetail};
@@ -161,6 +162,17 @@ impl Council<'_> {
             .await
     }
 
+    /// `POST /council/v2/embeddings`. The server checks the request against
+    /// the served model it names (`EmbeddingsRequest::check` holds the same
+    /// rules for a caller that has the model's identity); a refusal is
+    /// [`MkError::Status`] with the parameter it names. `timeout` bounds the
+    /// whole call.
+    pub async fn embeddings(&self, request: &EmbeddingsRequest, timeout: Duration) -> Result<EmbeddingsResponse, MkError> {
+        self.mk
+            .json(Family::Council, Method::POST, "/council/v2/embeddings", Some(to_body(request)?), &[], timeout, 200, "embeddings")
+            .await
+    }
+
     /// `POST /council/v2/generations` without streaming; the call sets
     /// `stream`. `timeout` bounds the whole call. A prompt with no room is
     /// [`MkError::ContextFull`].
@@ -200,6 +212,7 @@ fn pins_path(owner: &str) -> Result<String, MkError> {
 mod tests {
     use gogi_fake::{Config, Server};
     use gogi_proto::generation::{ReplyToolCall, Sample};
+    use gogi_proto::message::Content;
     use gogi_proto::spec::{parse_spec, SpecRules};
     use gogi_proto::{ErrorType, Message, Tier};
     use serde_json::json;
@@ -347,6 +360,83 @@ mod tests {
         let r = c.council().reads(&request, Duration::from_secs(5)).await.unwrap();
         assert_eq!(r.reads.iter().map(|r| (r.context, r.suffix)).collect::<Vec<_>>(), [(0, 0), (0, 1)]);
         assert_eq!(r.reads[0].logprobs.keys().collect::<Vec<_>>(), ["A", "B"]);
+    }
+
+    /// The fake's served model that only embeds.
+    const EMBED: &str = "embed-toy-1";
+
+    fn fake_embedder(context_tokens: Option<usize>) -> (Server, MkClient) {
+        let mut config = Config::default();
+        config.models.push(gogi_fake::FakeModel::embedding(EMBED, 7));
+        if let Some(tokens) = context_tokens {
+            config.context_tokens = tokens;
+        }
+        let server = Server::start(config).unwrap();
+        let c = client(&server.url());
+        (server, c)
+    }
+
+    fn embed_request(task: &str, inputs: &[&str]) -> EmbeddingsRequest {
+        EmbeddingsRequest {
+            model: EMBED.to_string(),
+            task: task.to_string(),
+            inputs: inputs.iter().map(|text| Content::Text((*text).to_string())).collect(),
+            dimensions: None,
+            dry_run: false,
+            class: None,
+            priority: None,
+        }
+    }
+
+    /// One unit vector comes back for each input, in input order, at the
+    /// largest dimensions the model offers, with the identity its vectors
+    /// depend on.
+    #[tokio::test]
+    async fn embeddings_return_one_unit_vector_per_input_with_the_identity() {
+        let (_server, c) = fake_embedder(None);
+        let identity = c.council().identity().await.unwrap();
+        let served = identity.route(EMBED).unwrap();
+        let offered = served.embeddings.as_ref().expect("an embedding model lists what it embeds");
+        let task = offered.tasks[0].clone();
+        let r = c.council().embeddings(&embed_request(&task, &["alpha", "beta beta"]), Duration::from_secs(5)).await.unwrap();
+        assert_eq!((r.model.as_str(), r.task.as_str()), (EMBED, task.as_str()));
+        assert_eq!(r.dimensions, *offered.dimensions.iter().max().unwrap());
+        assert_eq!(r.embeddings.iter().map(|e| e.index).collect::<Vec<_>>(), [0, 1]);
+        for e in &r.embeddings {
+            let vector = e.vector.as_ref().expect("a real request returns vectors");
+            assert_eq!(vector.len(), r.dimensions as usize);
+            assert!((gogi_proto::embeddings::norm(vector) - 1.0).abs() < 1e-5);
+        }
+        assert_eq!(r.identity.model, EMBED);
+    }
+
+    /// A dry run counts tokens and returns no vectors.
+    #[tokio::test]
+    async fn an_embeddings_dry_run_counts_tokens_and_returns_no_vectors() {
+        let (_server, c) = fake_embedder(None);
+        let identity = c.council().identity().await.unwrap();
+        let task = identity.route(EMBED).unwrap().embeddings.as_ref().unwrap().tasks[0].clone();
+        let request = EmbeddingsRequest { dry_run: true, ..embed_request(&task, &["alpha"]) };
+        let r = c.council().embeddings(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(r.embeddings[0].vector.is_none() && r.embeddings[0].tokens > 0, "{r:?}");
+    }
+
+    /// The server's refusals reach the caller with their status and the
+    /// parameter they name: a task it does not have is a 400 naming `task`,
+    /// and an input past the model's limit is a 413 that embeds nothing.
+    #[tokio::test]
+    async fn the_servers_refusals_name_their_parameter() {
+        let (_server, c) = fake_embedder(Some(64));
+        let err = c.council().embeddings(&embed_request("no-such-task", &["alpha"]), Duration::from_secs(5)).await.unwrap_err();
+        let MkError::Status { status: 400, error: Some(e), .. } = &err else { panic!("{err:?}") };
+        assert_eq!(e.param.as_deref(), Some("task"));
+
+        let identity = c.council().identity().await.unwrap();
+        let task = identity.route(EMBED).unwrap().embeddings.as_ref().unwrap().tasks[0].clone();
+        let long = "x".repeat(10_000);
+        let err = c.council().embeddings(&embed_request(&task, &[&long]), Duration::from_secs(5)).await.unwrap_err();
+        let MkError::Status { status: 413, error: Some(e), .. } = &err else { panic!("{err:?}") };
+        assert_eq!((e.r#type, e.param.as_deref()), (ErrorType::TooLarge, Some("context_tokens")));
     }
 
     /// A greedy reply streams the same text a call without streaming

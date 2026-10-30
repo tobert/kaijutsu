@@ -1483,30 +1483,48 @@ async fn connect_semantic_index(
     flows: kaijutsu_kernel::flows::SharedBlockFlowBus,
 ) -> Option<Arc<kaijutsu_index::SemanticIndex>> {
     let backend = &emb_config.backend;
-    let (Some(base_url), Some(api_key)) = (backend.base_url.clone(), backend.resolve_api_key()) else {
-        log::warn!(
-            "Embedding backend `{}` needs a base_url and a resolvable API key (api_key_env or api_key_file); \
-             the semantic index stays off",
-            backend.name
-        );
-        return None;
+    let timeout = std::time::Duration::from_millis(emb_config.timeout_ms);
+    let connected: Result<Box<dyn kaijutsu_index::Embedder>, kaijutsu_index::IndexError> = match backend.kind {
+        kaijutsu_kernel::BackendKind::Mk => {
+            let Some(base_url) = backend.base_url.clone() else {
+                log::warn!("Embedding backend `{}` needs a base_url; the semantic index stays off", backend.name);
+                return None;
+            };
+            kaijutsu_index::CouncilEmbedder::connect(kaijutsu_index::CouncilEmbedderConfig {
+                base_url,
+                model: emb_config.model.clone(),
+                dimensions: emb_config.dimensions,
+                timeout,
+                max_in_flight: emb_config.max_in_flight,
+            }).await.map(|embedder| Box::new(embedder) as Box<dyn kaijutsu_index::Embedder>)
+        }
+        _ => {
+            let (Some(base_url), Some(api_key)) = (backend.base_url.clone(), backend.resolve_api_key()) else {
+                log::warn!(
+                    "Embedding backend `{}` needs a base_url and a resolvable API key (api_key_env or api_key_file); \
+                     the semantic index stays off",
+                    backend.name
+                );
+                return None;
+            };
+            kaijutsu_index::OpenAiEmbedder::connect(kaijutsu_index::OpenAiEmbedderConfig {
+                base_url,
+                api_key,
+                model: emb_config.model.clone(),
+                dimensions: emb_config.dimensions,
+                profile: emb_config.profile,
+                timeout,
+                max_in_flight: emb_config.max_in_flight,
+            }).await.map(|embedder| Box::new(embedder) as Box<dyn kaijutsu_index::Embedder>)
+        }
     };
-    match kaijutsu_index::OpenAiEmbedder::connect(kaijutsu_index::OpenAiEmbedderConfig {
-        base_url,
-        api_key,
-        model: emb_config.model.clone(),
-        dimensions: emb_config.dimensions,
-        profile: emb_config.profile,
-        timeout: std::time::Duration::from_millis(emb_config.timeout_ms),
-        max_in_flight: emb_config.max_in_flight,
-    }).await {
+    match connected {
         Ok(embedder) => {
-            use kaijutsu_index::Embedder;
             let index_config = kaijutsu_index::IndexConfig::new(
                 embedder.dimensions(), emb_config.max_context_bytes, &data_dir,
             );
             let loaded = match tokio::task::spawn_blocking(move ||
-                kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder))
+                kaijutsu_index::SemanticIndex::new(index_config, embedder)
             ).await {
                 Ok(loaded) => loaded,
                 Err(e) => {

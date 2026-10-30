@@ -25,7 +25,9 @@ pub mod watcher;
 pub use config::IndexConfig;
 pub use content::extract_context_content;
 pub use embedder::{Embedder, EmbeddingPurpose};
+pub mod council_embedder;
 pub mod openai_embedder;
+pub use council_embedder::{CouncilEmbedder, CouncilEmbedderConfig};
 pub use openai_embedder::{EmbeddingProfile, OpenAiEmbedder, OpenAiEmbedderConfig};
 
 use std::future::Future;
