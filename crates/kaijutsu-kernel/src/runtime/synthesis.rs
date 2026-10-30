@@ -42,6 +42,10 @@ const TOP_BLOCKS_FOR_PREVIEW: usize = 3;
 const GIST_TOP_BLOCKS: usize = 5;
 const GIST_MAX_CANDIDATES: usize = 64;
 const GIST_MAX_CHARS: usize = 200;
+/// Each text is embedded by its head. A council server refuses an input past
+/// its window instead of cutting it, and a token is at least one byte, so this
+/// fits a 2048-token window with room for the task prompt.
+const EMBED_MAX_BYTES: usize = 1536;
 
 fn selected_blocks(blocks: &[BlockSnapshot]) -> Vec<&BlockSnapshot> {
     blocks.iter().filter(|block| block.kind != BlockKind::File && block.content.len() > 10).collect()
@@ -72,8 +76,15 @@ pub async fn run_synthesis(
     synthesize_blocks(&blocks, embedder.as_ref()).await
 }
 
+fn head(text: &str) -> &str {
+    let mut end = text.len().min(EMBED_MAX_BYTES);
+    while !text.is_char_boundary(end) { end -= 1; }
+    &text[..end]
+}
+
 async fn embed_texts(embedder: &dyn Embedder, texts: &[&str]) -> Result<Vec<Vec<f32>>, IndexError> {
-    let vectors = embedder.embed_batch(texts, EmbeddingPurpose::Document).await?;
+    let heads: Vec<&str> = texts.iter().map(|text| head(text)).collect();
+    let vectors = embedder.embed_batch(&heads, EmbeddingPurpose::Document).await?;
     if vectors.len() != texts.len() || vectors.iter().any(|v| v.len() != embedder.dimensions()) {
         return Err(IndexError::Embedding("synthesis received an incomplete embedding batch".into()));
     }
@@ -288,6 +299,31 @@ mod tests {
         assert!(empty.top_blocks.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), n, "empty context needs no inference");
         assert!(index.synthesis_cache().get_any(ctx).unwrap().gist.is_none());
+    }
+
+    /// Refuses any input past its window, as a council server does.
+    struct WindowedEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for WindowedEmbedder {
+        fn model_name(&self) -> &str { "mock" }
+        fn revision(&self) -> &str { "mock-v1" }
+        fn dimensions(&self) -> usize { 32 }
+        async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
+            if let Some(long) = texts.iter().find(|t| t.len() > 2048) {
+                return Err(IndexError::Embedding(format!("input of {} bytes is past the window", long.len())));
+            }
+            MockEmbedder { dims: 32 }.embed_batch(texts, purpose).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_longer_than_the_embedding_window_is_embedded_by_its_head() {
+        let ctx = ContextId::new();
+        let long = "A long block of plain words that goes on. ".repeat(250);
+        assert!(long.len() > 8192);
+        let blocks = vec![make_block(ctx, 1, &long), make_block(ctx, 2, "A short block that stays whole.")];
+        let result = synthesize_blocks(&blocks, &WindowedEmbedder).await.expect("long blocks fit the window");
+        assert!(!result.top_blocks.is_empty());
     }
 
     struct FailingEmbedder(Arc<std::sync::atomic::AtomicUsize>);
