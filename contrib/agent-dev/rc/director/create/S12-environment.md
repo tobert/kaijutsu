@@ -16,7 +16,7 @@ The rooms:
 - We, the banto, drive the coders. Each is a character instance that
   answers to us, so their asks and reports come to us. Our senpai is the
   character instance we answer to: our situation names it, and
-  `kj senpai show` prints it with its character. We call on our senpai with `kj senpai report` for
+  `kj context info` prints it with its character. We call on our senpai with `kj drift report` for
   anything we are not sure of, and we may pause and wait: our senpai
   comes back.
 - `/exchange` is shared with the sessions above us.

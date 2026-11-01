@@ -9,7 +9,7 @@ reviewer, no per-context override, and no grant that moves review from one chara
 ```sh
 kj character create coder
 kj context create repair --type coder --as coder
-kj senpai show repair
+kj context info repair
 ```
 
 `kj context create` starts an instance of coder, with `repair` as its conversation, as a kohai of the caller's
@@ -27,8 +27,8 @@ rotation writes the successor with the predecessor's character and senpai, so th
 - The **kohai** of a context are the live contexts whose `senpai_ctx` is that context.
 - The chain never has a cycle. Setting an edge that would close one is refused.
 
-`kj senpai show [<ctx>]` prints the instance, its senpai (label and character), the lineage root, and who would
-review an ask by its character. `kj senpai kohai [<ctx>]` lists the live kohai with character and type. Each takes
+`kj context info [<ctx>]` prints the instance, its senpai (label and character), the lineage root, and who would
+review an ask by its character. `kj context kohai [<ctx>]` lists the live kohai with character and type. Each takes
 any context of an instance and uses that context's instance.
 
 ## Routing
@@ -44,7 +44,7 @@ The reviewer of an ask raised in context K by actor A:
    source's character, so an ask in a fork, by anyone, climbs past that character.
 5. A retired character refuses by name. It never substitutes another character.
 
-One resolver does this. Every ask, the model-turn check, `kj senpai show` and `kj ledger escalate` use it.
+One resolver does this. Every ask, the model-turn check, `kj context info` and `kj ledger escalate` use it.
 
 ```
 coder lane ──senpai──► banto instance ──senpai──► amy (root console)
@@ -68,7 +68,7 @@ refuses with the reason.
 
 One rule: **the character of an instance's senpai, or its lineage root**, may
 
-- move it to another senpai (`kj senpai set <ctx> <senpai-ctx>`, each naming any context of its instance);
+- move it to another senpai (`kj context move <ctx> <senpai-ctx>`, each naming any context of its instance);
 - escalate its asks;
 - rotate it (its own performer may also rotate it, with no ask);
 - archive it.
@@ -86,7 +86,7 @@ A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root
 - A senpai move refuses while any context of the instance has pending asks. Performer and reviewer must resolve
   to live, distinct characters.
 
-Create sets the edge, and nothing else moves it but `kj senpai set`: `kj fork` joins the forking context's
+Create sets the edge, and nothing else moves it but `kj context move`: `kj fork` joins the forking context's
 instance, and `kj context rotate` starts a new conversation in the same instance, so neither touches the senpai or
 the kohai. Every client creation names its performer with `--as`.
 

@@ -62,7 +62,7 @@ character, the context's character instance and its senpai:
 `<instance label="<label>" character="<name>"/>` and
 `<senpai instance="<label>" character="<name>"/>`, where a label is the instance's
 conversation's label. The reviewer of the context's own asks is the senpai's
-character, or the climb past it; `kj senpai show` prints it. rc supplies the instruction
+character, or the climb past it; `kj context info` prints it. rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
 
 Director is the operator's context type. Its `S00-stance.kai` writes one line naming

@@ -3,7 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, PrincipalId};
 
-use crate::kernel_db::{ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
+use crate::kernel_db::{ContextCharacterRow, ContextRow, ContextShellRow, DemoteOutcome, GovernedAct, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
 use super::format::{
     ContextBound, format_context_info, format_context_table, format_context_tree, format_fork_lineage,
@@ -98,11 +98,33 @@ enum ContextCommand {
         tree: bool,
     },
     /// Show a context's metadata (default: current), including the model its
-    /// slot for its type gives it, or why it has none.
+    /// slot for its type gives it, or why it has none. For a context with a
+    /// character it also shows the senpai it answers to, the lineage root,
+    /// who reviews an ask its character raises, and any migration note.
     Info {
         /// Context to show. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
         context: Option<String>,
+    },
+    /// List the live kohai of a context, each with its character and type
+    /// (default: the current context). A kohai whose senpai is archived is
+    /// listed too.
+    Kohai {
+        /// Context whose kohai to list. Defaults to the current context. Ids
+        /// and labels come from `kj context list`.
+        context: Option<String>,
+    },
+    /// Move a context under another senpai. The character of its senpai, or
+    /// its lineage root, may move it; the caller must also be the new
+    /// senpai's character or its lineage root. Refuses while the context or
+    /// a kohai below it has pending asks, a move that would close a cycle, a
+    /// root console, a judge shadow, an archived senpai, and a senpai whose
+    /// character is retired. Needs the operator capability.
+    Move {
+        /// The context to move. Ids and labels come from `kj context list`.
+        context: String,
+        /// The context it answers to from now on.
+        senpai: String,
     },
     /// List a context's model turns, newest first: who performed each, which
     /// model answered, how it ended, and the provider's token counts
@@ -208,7 +230,7 @@ enum ContextCommand {
     /// Archive one context, retaining its history (latched). Needs the
     /// operator capability, or a person's live root character acting from
     /// any context. Children keep their parent edge and state. Reports to an
-    /// archived context and `kj senpai set` onto it refuse, and its forks and
+    /// archived context and `kj context move` onto it refuse, and its forks and
     /// kohai stay live. Restore with `kj context promote <id>`.
     /// The context's `archive` rc lifecycle runs first, while it is still
     /// live; a failing script is recorded and the archive still commits.
@@ -590,6 +612,7 @@ impl KjDispatcher {
         if matches!(
             parsed.command,
             ContextCommand::Create { .. }
+                | ContextCommand::Move { .. }
                 | ContextCommand::Set { .. }
                 | ContextCommand::Unset { .. }
                 | ContextCommand::Rename { .. }
@@ -615,6 +638,8 @@ impl KjDispatcher {
             ContextCommand::Info { context } => {
                 self.context_info(context.as_deref(), caller).await
             }
+            ContextCommand::Kohai { context } => self.context_kohai(context.as_deref(), caller),
+            ContextCommand::Move { context, senpai } => self.context_move(&context, &senpai, caller),
             ContextCommand::Turns { context, limit } => {
                 self.context_turns(context.as_deref(), limit, caller)
             }
@@ -970,25 +995,43 @@ impl KjDispatcher {
             info.push_str(&format!("\nReviewer: {} ({})", review.reviewer.name, review.source.as_str()));
         }
         // The context this one answers to, with its character. A context with
-        // no context character, or a root console, has none.
-        let senpai_view = {
+        // no context character has none; a root console has a character but
+        // no senpai.
+        let edge = {
             let db = self.kernel_db().lock();
             let found = (|| -> Result<_, String> {
                 let Some(character) = db.context_character(row.context_id).map_err(|e| e.to_string())? else {
                     return Ok(None);
                 };
-                let Some(senpai) = character.senpai_ctx else { return Ok(None) };
-                let senpai_character = db.context_character(senpai).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("senpai {} has no context character", db.context_name(senpai)))?;
-                Ok(Some((senpai, db.context_name(senpai), db.name_for(senpai_character.principal_id))))
+                let senpai = match character.senpai_ctx {
+                    Some(id) => Some(db.context_character(id).map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("senpai {} has no context character", db.context_name(id)))?),
+                    None => None,
+                };
+                let root = db.lineage_root(row.context_id).map(|root| (root, db.name_for(root))).map_err(|e| e.to_string());
+                let note = db.senpai_migration_report().map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|(c, _, _)| *c == row.context_id)
+                    .map(|(_, _, note)| note);
+                Ok(Some((senpai, root, note)))
             })();
             match found {
-                Ok(view) => view,
+                Ok(edge) => edge,
                 Err(error) => return KjResult::Err(format!("kj context info: senpai lookup: {error}")),
             }
         };
-        if let Some((_, senpai_name, senpai_character)) = &senpai_view {
-            info.push_str(&format!("\nSenpai: {senpai_name}, {senpai_character}"));
+        if let Some((senpai, root, note)) = &edge {
+            let db = self.kernel_db().lock();
+            if let Some(senpai) = senpai {
+                info.push_str(&format!("\nSenpai: {}", context_line(&db, senpai)));
+            }
+            match root {
+                Ok((_, name)) => info.push_str(&format!("\nLineage root: {name}")),
+                Err(reason) => info.push_str(&format!("\nLineage root: none ({reason})")),
+            }
+            if let Some(note) = note {
+                info.push_str(&format!("\nMigration note: {note}"));
+            }
         }
 
         // Structured record: full ids and the same fields the text view
@@ -1078,9 +1121,15 @@ impl KjDispatcher {
         record["reviewer_name"] = serde_json::json!(reviewer_name);
         record["review_source"] = serde_json::json!(effective_review.as_ref().map(|review| review.source.as_str()));
         record["reviewer_error"] = serde_json::json!(reviewer_error);
-        record["senpai"] = serde_json::json!(senpai_view.as_ref().map(
-            |(id, name, character)| serde_json::json!({ "id": id.to_hex(), "name": name, "character": character })
-        ));
+        {
+            let db = self.kernel_db().lock();
+            let senpai = edge.as_ref().and_then(|(senpai, _, _)| senpai.as_ref());
+            record["senpai"] = serde_json::json!(senpai.map(|senpai| context_json(&db, senpai)));
+            let root = edge.as_ref().and_then(|(_, root, _)| root.as_ref().ok());
+            record["lineage_root"] = serde_json::json!(root.map(|(id, name)| serde_json::json!({ "id": id.to_hex(), "name": name })));
+            record["lineage_root_error"] = serde_json::json!(edge.as_ref().and_then(|(_, root, _)| root.as_ref().err()));
+            record["migration_note"] = serde_json::json!(edge.as_ref().and_then(|(_, _, note)| note.as_ref()));
+        }
 
         KjResult::ok_with_data(info, record)
     }
@@ -2913,6 +2962,155 @@ where
     )
 }
 
+/// The context a verb argument names, with its context character.
+pub(super) fn resolve_character_arg(
+    arg: Option<&str>,
+    caller: &KjCaller,
+    db: &KernelDb,
+) -> Result<(ContextId, ContextCharacterRow), String> {
+    let context = super::refs::resolve_context_arg(arg, caller, db)?;
+    let character = db.context_character(context).map_err(|e| e.to_string())?.ok_or_else(|| {
+        format!("{} has no context character, so it has no senpai and no kohai", db.context_name(context))
+    })?;
+    Ok((context, character))
+}
+
+/// `label (short-id), character` of the context.
+pub(super) fn context_line(db: &KernelDb, character: &ContextCharacterRow) -> String {
+    format!("{}, {}", db.context_name(character.context_id), db.name_for(character.principal_id))
+}
+
+pub(super) fn context_json(db: &KernelDb, character: &ContextCharacterRow) -> serde_json::Value {
+    let label = db.get_context(character.context_id).ok().flatten().and_then(|row| row.label);
+    serde_json::json!({
+        "context": character.context_id.to_hex(),
+        "label": label,
+        "character": db.name_for(character.principal_id),
+        "character_id": character.principal_id.to_hex(),
+    })
+}
+
+impl KjDispatcher {
+    /// `kj context move <ctx> <senpai-ctx>`: every check and the write run
+    /// under one lock and one transaction.
+    fn context_move(&self, context: &str, senpai: &str, caller: &KjCaller) -> KjResult {
+        let db = self.kernel_db().lock();
+        let moved = (|| -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
+            let (target, _) = resolve_character_arg(Some(context), caller, &db)?;
+            let (senpai, _) = resolve_character_arg(Some(senpai), caller, &db)?;
+            db.in_transaction(|db| Ok(move_kohai(db, target, senpai, caller)))
+                .map_err(|e| e.to_string())?
+        })();
+        match moved {
+            Ok((row, senpai)) => KjResult::ok_with_data(
+                format!("{} now answers to {}", context_line(&db, &row), context_line(&db, &senpai)),
+                serde_json::json!({ "context": context_json(&db, &row), "senpai": context_json(&db, &senpai) }),
+            ),
+            Err(e) => KjResult::Err(format!("kj context move: {e}")),
+        }
+    }
+
+    /// `kj context kohai [<ctx>]`.
+    fn context_kohai(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
+        let db = self.kernel_db().lock();
+        let listed = (|| -> Result<(ContextCharacterRow, Vec<ContextRow>), String> {
+            let (context, row) = resolve_character_arg(context, caller, &db)?;
+            Ok((row, db.list_kohai(context).map_err(|e| e.to_string())?))
+        })();
+        let (row, kohai) = match listed {
+            Ok(listed) => listed,
+            Err(e) => return KjResult::Err(format!("kj context kohai: {e}")),
+        };
+        let character = |k: &ContextRow| k.played_by.map(|p| db.name_for(p));
+        let mut lines = Vec::with_capacity(kohai.len() + 1);
+        if kohai.is_empty() {
+            lines.push(format!("{} has no live kohai", db.context_name(row.context_id)));
+        }
+        for k in &kohai {
+            lines.push(format!(
+                "{}  {}  {}",
+                db.context_name(k.context_id), character(k).unwrap_or_else(|| "-".to_string()), k.context_type
+            ));
+        }
+        let data = serde_json::json!({
+            "context": context_json(&db, &row),
+            "kohai": kohai.iter().map(|k| serde_json::json!({
+                "context": k.context_id.to_hex(), "label": k.label, "context_type": k.context_type,
+                "character": character(k),
+            })).collect::<Vec<_>>(),
+        });
+        KjResult::ok_with_data(lines.join("\n"), data)
+    }
+}
+
+/// The checks and the write behind `kj context move`, inside the caller's
+/// transaction. The inner `Err` is the refusal.
+fn move_kohai(
+    db: &KernelDb,
+    target: ContextId,
+    senpai: ContextId,
+    caller: &KjCaller,
+) -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
+    let row = db.context_character(target).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} has no context character", db.context_name(target)))?;
+    if db.is_root_console(target).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "{} is a root console, the top of its lineage, and has no senpai to move to; `kj context rotate` replaces it",
+            db.context_name(target)
+        ));
+    }
+    let target_type = db.get_context(target).map_err(|e| e.to_string())?.map(|row| row.context_type);
+    if target_type.as_deref() == Some("judge") {
+        return Err(format!(
+            "{} is a judge shadow, which answers to the coder it shadows; archive it with the coder instead",
+            db.context_name(target)
+        ));
+    }
+    let senpai_row = db.context_character(senpai).map_err(|e| e.to_string())?.ok_or_else(|| {
+        format!(
+            "{} has no context character, so nobody would answer for {}",
+            db.context_name(senpai), db.context_name(target)
+        )
+    })?;
+    db.context_authority(target, caller.actor_id, GovernedAct::Move).map_err(|e| e.to_string())??;
+    db.may_place_under(senpai, caller.actor_id).map_err(|e| e.to_string())??;
+    let archived = db.get_context(senpai).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("senpai {} has no row", senpai.short()))?
+        .is_archived();
+    if archived {
+        return Err(format!(
+            "{} is archived; a context answers to a live senpai, or `kj context promote` it first",
+            db.context_name(senpai)
+        ));
+    }
+    let live = db.get_character(senpai_row.principal_id).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none());
+    if !live {
+        return Err(format!(
+            "{} has no live holder: its character is retired, so nobody would answer for {}",
+            db.context_name(senpai), db.context_name(target)
+        ));
+    }
+    // An ask raised in the moved context, or in a context below it, may
+    // climb through it, so it blocks the move.
+    let mut below = vec![target];
+    let mut next = 0;
+    while next < below.len() {
+        for kohai in db.kohai_of(below[next]).map_err(|e| e.to_string())? {
+            if !below.contains(&kohai) {
+                below.push(kohai);
+            }
+        }
+        next += 1;
+    }
+    let pending = db.list_pending_asks().map_err(|e| e.to_string())?;
+    if pending.iter().any(|ask| below.iter().any(|c| ask.context_id.as_slice() == c.as_bytes())) {
+        return Err(format!("settle or cancel the pending asks of {} before moving it", db.context_name(target)));
+    }
+    db.set_context_senpai(target, Some(senpai)).map_err(|e| e.to_string())?;
+    let moved = db.context_character(target).map_err(|e| e.to_string())?.unwrap_or(row);
+    Ok((moved, senpai_row))
+}
+
 // Verb class: kj/effect.rs
 use super::effect::{Classify, Effect};
 
@@ -2934,6 +3132,7 @@ impl Classify for ContextCommand {
         match self {
             Self::List { .. }
             | Self::Info { .. }
+            | Self::Kohai { .. }
             | Self::Turns { .. }
             | Self::Prompt { .. }
             | Self::Current
@@ -2943,6 +3142,7 @@ impl Classify for ContextCommand {
             | Self::Scratch
             | Self::Rebind { .. }
             | Self::Rotate { .. }
+            | Self::Move { .. }
             | Self::Set { .. }
             | Self::Unset { .. }
             | Self::Rename { .. }
@@ -4127,7 +4327,7 @@ mod tests {
     /// The successor keeps the predecessor's senpai. The kernel moves no
     /// kohai: they keep answering to the archived predecessor, whose
     /// character still reviews their asks, until the successor takes them
-    /// with `kj senpai set`. An archived kohai is not listed.
+    /// with `kj context move`. An archived kohai is not listed.
     async fn rotate_keeps_the_senpai_and_moves_no_kohai_body() {
         let f = rotation_fixture().await;
         let lane = register_context(&f.d, Some("seat-lane"), Some(f.seat), f.amy);
@@ -4167,7 +4367,7 @@ mod tests {
         assert_eq!(
             f.d.kernel_db().lock().list_kohai(successor).unwrap().into_iter().map(|row| row.context_id).collect::<Vec<_>>(),
             vec![lane],
-            "the successor takes a kohai with `kj senpai set`"
+            "the successor takes a kohai with `kj context move`"
         );
     }
 
@@ -7137,8 +7337,8 @@ mod tests {
 
     // ── kj context prompt ─────────────────────────────────────────────
 
-    /// The director stance names its senpai from the kernel fact (`kj senpai
-    /// show`), says "our senpai", and points reports at `kj senpai report`
+    /// The director stance names its senpai from the kernel fact (`kj context
+    /// info`), says "our senpai", and points reports at `kj drift report`
     /// (`docs/senpai-kohai.md`, "What a context sees").
     #[test]
     fn director_stance_names_its_senpai_from_the_kernel_fact() {
@@ -7170,7 +7370,7 @@ mod tests {
         for said in [
             "In this seat we are banto, the operator of this Kaijutsu kernel. Our senpai is sensei, in senpai-seat.",
             "Our own asks go to our senpai",
-            "kj senpai report",
+            "kj drift report",
         ] {
             assert!(flat.contains(said), "director stance is missing {said:?}: {flat}");
         }
@@ -7464,7 +7664,7 @@ mod tests {
         let KjResult::Ok { data: Some(data), .. } = &info else { panic!("expected data") };
         assert_eq!(data["played_by_name"], "coder");
         assert_eq!(data["senpai"]["character"], "coder");
-        assert_eq!(data["senpai"]["id"], lane.to_hex());
+        assert_eq!(data["senpai"]["context"], lane.to_hex());
         let lane_info = d.dispatch(&[s("context"), s("info"), s("lane")], &caller_with_context(lane)).await;
         let KjResult::Ok { data: Some(lane_data), .. } = &lane_info else { panic!("expected data") };
         assert_eq!(lane_data["senpai"]["character"], "amy");

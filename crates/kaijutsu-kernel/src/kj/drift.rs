@@ -148,6 +148,16 @@ enum DriftCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         content: Vec<String>,
     },
+    /// Report to this context's senpai: the text lands in the senpai context
+    /// as a drift block from the current context, as `push` would put it
+    /// there, with no context id to type. A drift along the senpai edge needs
+    /// no ask. Refuses a context with no senpai, an archived senpai, and
+    /// empty text.
+    Report {
+        /// The report (joined with spaces).
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
     /// Distill a source context into the caller's context. It runs on the
     /// caller's `distill` slot and refuses when the caller has none.
     Pull {
@@ -219,6 +229,7 @@ impl KjDispatcher {
         if matches!(
             parsed.command,
             DriftCommand::Push { .. }
+                | DriftCommand::Report { .. }
                 | DriftCommand::Pull { .. }
                 | DriftCommand::Merge { .. }
                 | DriftCommand::Flush
@@ -238,6 +249,7 @@ impl KjDispatcher {
                 self.drift_push(&dst, summarize, stage, &content, caller)
                     .await
             }
+            DriftCommand::Report { text } => self.drift_report(&text, caller).await,
             DriftCommand::Pull { src, prompt } => {
                 self.drift_pull(&src, &prompt, caller).await
             }
@@ -251,6 +263,51 @@ impl KjDispatcher {
             DriftCommand::Edge { op } => match op {
                 EdgeCommand::Rm { uuid } => self.drift_edge_rm(&uuid),
             },
+        }
+    }
+
+    /// `kj drift report <text>...`: `drift_push` to the caller's senpai, by
+    /// id, so the report can only reach the context this one answers to.
+    async fn drift_report(&self, text: &[String], caller: &KjCaller) -> KjResult {
+        let here = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let senpai = {
+            let db = self.kernel_db().lock();
+            let found = (|| -> Result<crate::kernel_db::ContextCharacterRow, String> {
+                let (_, row) = super::context::resolve_character_arg(Some(&here.to_hex()), caller, &db)?;
+                let senpai_id = row.senpai_ctx.ok_or_else(|| {
+                    format!("{} has no senpai, so there is nobody to report to", db.context_name(row.context_id))
+                })?;
+                let senpai = db.context_character(senpai_id).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai {} has no context character", db.context_name(senpai_id)))?;
+                let archived = db.get_context(senpai_id).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai {} has no row", senpai_id.short()))?
+                    .is_archived();
+                if archived {
+                    return Err(format!(
+                        "{} is archived; `kj context promote` it to reach it again, or move this context with `kj context move`",
+                        db.context_name(senpai_id)
+                    ));
+                }
+                Ok(senpai)
+            })();
+            match found {
+                Ok(found) => found,
+                Err(e) => return KjResult::Err(format!("kj drift report: {e}")),
+            }
+        };
+        match self.drift_push(&senpai.context_id.to_hex(), false, false, text, caller).await {
+            KjResult::Ok { .. } => {
+                let db = self.kernel_db().lock();
+                KjResult::ok_with_data(
+                    format!("reported → {}", super::context::context_line(&db, &senpai)),
+                    serde_json::json!({ "senpai": super::context::context_json(&db, &senpai) }),
+                )
+            }
+            KjResult::Err(e) => KjResult::Err(e.replacen("kj drift push", "kj drift report", 1)),
+            other => other,
         }
     }
 
@@ -408,7 +465,7 @@ impl KjDispatcher {
         if !human {
             return Err(format!(
                 "ROOT's reviewer resolves to {}, which is not a live root character, and only a human \
-                 releases a drift into ROOT; set one with `kj senpai set ROOT <root context>`",
+                 releases a drift into ROOT; set one with `kj context move ROOT <root context>`",
                 db.name_for(reviewer)
             ));
         }
@@ -1275,6 +1332,7 @@ impl Classify for DriftCommand {
         match self {
             DriftCommand::Queue | DriftCommand::History { .. } => Effect::Read,
             DriftCommand::Push { .. }
+            | DriftCommand::Report { .. }
             | DriftCommand::Pull { .. }
             | DriftCommand::Merge { .. }
             | DriftCommand::Flush

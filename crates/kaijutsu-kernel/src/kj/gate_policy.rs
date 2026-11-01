@@ -1440,7 +1440,7 @@ enum CharacterTarget {
 
 /// The verbs a `character` allow rule can cover, and the argument each
 /// names its target with. The ids are the clap field names in `drive.rs`,
-/// `interrupt.rs`, `context.rs` and `senpai.rs`.
+/// `interrupt.rs` and `context.rs`.
 fn character_target(args: &[String]) -> CharacterTarget {
     use CharacterTarget::*;
     // After `--` a token such as `--json` is a word, which `strip_flag`
@@ -1545,7 +1545,7 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
 ///   of its kohai, with one exception: a push up from a fork (a context of
 ///   the same character as its senpai) whose `created_by` is not that
 ///   character keeps the gate;
-/// - `kj senpai report` from a context that has a senpai.
+/// - `kj drift report` from a context that has a senpai.
 ///
 /// The edge is the context character's `senpai_ctx`. Every argument must be a
 /// literal word, and the command plain (no redirect, background flag or
@@ -1597,12 +1597,9 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
                     None
                 }
             }
-            _ => None,
-        },
-        ("senpai", m) => match m.subcommand()? {
             ("report", _) => {
                 let senpai = here_row.senpai_ctx?;
-                edge(format!("kj senpai report to {}", label(senpai)))
+                edge(format!("kj drift report to {}", label(senpai)))
             }
             _ => None,
         },

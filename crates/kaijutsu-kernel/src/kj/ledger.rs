@@ -3555,8 +3555,8 @@ mod tests {
             (&house.kei, "kj drift push lane-a 'not my kohai'", Pending),
             (&house.banto, "kj drift push $LANE 'which one?'", Pending),
             (&house.banto, "kj drift push lane-a 'x' > /tmp/out", Pending),
-            (&lane, "kj senpai report 'the first part is done'", Allowed),
-            (&root, "kj senpai report 'nobody above me'", Pending),
+            (&lane, "kj drift report 'the first part is done'", Allowed),
+            (&root, "kj drift report 'nobody above me'", Pending),
         ];
         for (caller, source, expected) in cases {
             let outcome = gate_once(&d, caller, planned_shell_spec(source)).await;

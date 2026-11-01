@@ -1405,7 +1405,7 @@ fn an_open_carries_the_old_columns_into_context_characters_then_drops_them() {
     );
     w.exec(
         "INSERT INTO senpai_migration_report (context_id, senpai_ctx, note, old_reviewer, recorded_at)
-         VALUES (?1, NULL, 'kept for kj senpai show', NULL, 1)",
+         VALUES (?1, NULL, 'kept for kj context info', NULL, 1)",
         params![blob_param(overridden.context_id.as_bytes())],
     );
     for dropped in DROPPED {
@@ -1431,7 +1431,7 @@ fn an_open_carries_the_old_columns_into_context_characters_then_drops_them() {
     assert_eq!(w.db.senpai_of(overridden.context_id).unwrap(), Some(seat.context_id), "the senpai edge was carried");
     assert_eq!(w.count("turns"), 1, "a turn survives the open");
     assert_eq!(w.count("presets"), 1, "a preset survives the loss of its columns");
-    assert_eq!(w.count("senpai_migration_report"), 1, "kj senpai show still reads the report");
+    assert_eq!(w.count("senpai_migration_report"), 1, "kj context info still reads the report");
 
     KernelDb::apply_additive_migrations(&w.db.conn).unwrap();
     assert_eq!(w.db.senpai_of(overridden.context_id).unwrap(), Some(seat.context_id), "a second open changes nothing");

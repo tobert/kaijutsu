@@ -243,7 +243,7 @@ name with no session lands durably and shows in that character's next
 hangs off characters, roster inverted) are all absorbed there.
 `docs/character.md`, "Drift addresses a character".
 
-The commonest address now needs none: `kj senpai report "<text>"` drifts to
+The commonest address now needs none: `kj drift report "<text>"` drifts to
 the context this one answers to, by id, and a drift either way along the
 senpai edge needs no ask (`docs/senpai-kohai.md`, "Reports and drift"). Seats
 in the 2026-10-18 nagaya run had drifted a character id where a context id

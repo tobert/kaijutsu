@@ -17,10 +17,9 @@ then unique prefix), or a hex prefix of a context id.
 ### Contexts
 
 ```
-context (ctx)   make, list, inspect, switch, rotate, and archive contexts
+context (ctx)   make, list, inspect, switch, move, rotate, and archive contexts; list kohai
 fork            fork this context into a child; we stay on the parent
 stage           leave blocks out of what models read; commit a staged fork
-senpai          show or move the context a context answers to; report to it
 attach          attach to a context and run its rc attach lifecycle
 workspace (ws)  group host paths and bind them to contexts
 preset          fork presets: what a child copies from its parent
@@ -29,7 +28,7 @@ preset          fork presets: what a child copies from its parent
 ### Work across contexts
 
 ```
-drift           send text to another context, or distill one context into another
+drift           send text to another context or report to our senpai, or distill one context into another
 wait            wait for a turn, a shell operation, an ask, or a kaish job
 drive           start one autonomous turn on a context
 interrupt       stop a turn; the context does not resume on its own after it

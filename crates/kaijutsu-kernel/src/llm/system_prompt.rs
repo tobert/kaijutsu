@@ -87,7 +87,7 @@ pub struct SituationalContext {
     /// The context character this context has.
     pub character: Option<CharacterFact>,
     /// The context this one answers to. Who reviews the performer's asks
-    /// follows from it (`kj senpai show` prints the climb).
+    /// follows from it (`kj context info` prints the climb).
     pub senpai: Option<SenpaiFact>,
 }
 

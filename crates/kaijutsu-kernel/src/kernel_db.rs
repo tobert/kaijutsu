@@ -261,7 +261,7 @@ pub enum ReviewFrom {
 pub enum GovernedAct {
     /// `kj context set <ctx> --egress-allow|--egress-deny`.
     Egress,
-    /// `kj senpai set`.
+    /// `kj context move`.
     Move,
     /// `kj ledger escalate` on an ask raised in the context.
     Escalate,
@@ -902,7 +902,7 @@ CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
 
 -- Contexts whose senpai the migration did not take from the nearest ancestor
--- (`docs/senpai-kohai.md`, "Migration"). `kj senpai show` prints the note until
+-- (`docs/senpai-kohai.md`, "Migration"). `kj context info` prints the note until
 -- the senpai is set again.
 CREATE TABLE IF NOT EXISTS senpai_migration_report (
     context_id   BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
@@ -918,7 +918,7 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
 -- the handoff log, system contexts) runs no turns and routes nothing.
 -- `principal_id` is a bare id like `contexts.created_by`: the kernel never
 -- reads `auth.db`. `senpai_ctx` is the one column that changes after the
--- context is made (`kj senpai set`); triggers refuse a change to the rest.
+-- context is made (`kj context move`); triggers refuse a change to the rest.
 CREATE TABLE IF NOT EXISTS context_characters (
     context_id   BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id),
     principal_id BLOB    NOT NULL,
@@ -2554,7 +2554,7 @@ impl KernelDb {
                 Some(sheet) if sheet.retired_at.is_none() => Ok(EffectiveReviewer::Assigned(holder)),
                 Some(sheet) => Err(KernelDbError::Validation(format!(
                     "{} is {}, the senpai of {under}, and is retired; routing does not pass over a retired character: \
-                     move {under} to another senpai with `kj senpai set`",
+                     move {under} to another senpai with `kj context move`",
                     sheet.name, self.context_name(above.context_id)
                 ))),
                 None => Err(KernelDbError::Corrupt(format!(
@@ -2589,7 +2589,7 @@ impl KernelDb {
                 Err(KernelDbError::Validation(format!(
                     "nobody reviews {who} in context {name}: {} has no senpai above it, and only the live \
                      root character holding a root console confirms its own statements; give the context a senpai \
-                     with `kj senpai set`",
+                     with `kj context move`",
                     self.context_name(at.context_id)
                 )))
             }
@@ -3894,7 +3894,7 @@ impl KernelDb {
                         senpai: console.context_id,
                         note: Some(format!(
                             "its {source} named {who}, who holds nothing above it: mapped to {who}'s root console; \
-                             set its senpai again with `kj senpai set`"
+                             set its senpai again with `kj context move`"
                         )),
                         old_reviewer: Some(reviewer),
                     };
@@ -3907,7 +3907,7 @@ impl KernelDb {
                         senpai: recent.context_id,
                         note: Some(format!(
                             "its {source} named {who}, who holds nothing above it: mapped to {who}'s most recent live context; \
-                             set its senpai again with `kj senpai set`"
+                             set its senpai again with `kj context move`"
                         )),
                         old_reviewer: Some(reviewer),
                     },
@@ -4068,7 +4068,7 @@ impl KernelDb {
     /// there; a column-level `REFERENCES` goes with its column. Each step is
     /// guarded by what is still there, so a database already on the new shape
     /// does nothing. The preset values are logged before they go;
-    /// `senpai_migration_report` stays, because `kj senpai show` prints its
+    /// `senpai_migration_report` stays, because `kj context info` prints its
     /// notes until the senpai is set again.
     fn drop_pre_context_character_columns(conn: &Connection) -> KernelDbResult<()> {
         let mapped: bool = conn.query_row(
@@ -4204,7 +4204,7 @@ impl KernelDb {
     }
 
     /// Contexts whose senpai the migration could not take from the nearest
-    /// ancestor: `(context, the senpai it chose, the note)`. `kj senpai show`
+    /// ancestor: `(context, the senpai it chose, the note)`. `kj context info`
     /// prints the note until the senpai is set again.
     pub fn senpai_migration_report(&self) -> KernelDbResult<Vec<(ContextId, Option<ContextId>, String)>> {
         let mut stmt = self.conn.prepare(
@@ -12445,7 +12445,7 @@ mod tests {
         assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
         let text = error.to_string();
         assert!(text.contains("bob") && text.contains("orphan-top") && text.contains("root"), "{text}");
-        assert!(text.contains("kj senpai set"), "names the fix: {text}");
+        assert!(text.contains("kj context move"), "names the fix: {text}");
 
         // A lane under a top held by the actor itself climbs into the same refusal.
         let lane = senpai_ctx_row(&db, ws_id, "under-bob", Some(&orphan), Some(coder));
@@ -13253,7 +13253,7 @@ mod tests {
         assert!(error.contains("bad-override") && error.contains("nobody"), "{error}");
         assert!(error.contains("retired-override") && error.contains("gone"), "{error}");
         assert!(!error.contains("archived-bad") && !error.contains("fine"), "{error}");
-        assert!(error.contains("kj senpai set") || error.contains("senpai"), "{error}");
+        assert!(error.contains("kj context move") || error.contains("senpai"), "{error}");
 
         assert_eq!(senpai_of(&db, &fine), None, "a refused migration writes nothing");
         assert_eq!(report_of(&db), vec![]);

@@ -44,7 +44,7 @@ Find the character who will perform a new piece of work. The `coder` character p
 kj context create fix-login --type coder --as coder
 Start one piece of work as a new context for a character. It answers to us, so its asks come to us. Pick the type that fits the work; coder is one type.
 
-kj senpai kohai
+kj context kohai
 See the contexts that answer to us, each with its character and type.
 
 kj drive fix-login --prompt "<the work, what it may touch, what done looks like, and how to check it>"
@@ -68,7 +68,7 @@ Correct or inform a context without running a model.
 kj drift pull fix-login "List the files you changed and each check you ran, with its exit status."
 Bring a distilled result from a context into ours.
 
-kj senpai report "Done: <...> Checked: <...> Open: <...>"
+kj drift report "Done: <...> Checked: <...> Open: <...>"
 Report to our senpai. It needs no context id.
 
 kj interrupt fix-login

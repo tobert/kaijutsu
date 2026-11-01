@@ -132,7 +132,7 @@ python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
 kj context create "$project-banto" --type director --as banto --cwd "$repo" --env LANG=C.UTF-8
 # The coder is a character instance that answers to banto's instance (its senpai), so banto's character reviews its
-# asks, and a drift either way between their conversations, or a `kj senpai report`, needs no ask. Banto starts the
+# asks, and a drift either way between their conversations, or a `kj drift report`, needs no ask. Banto starts the
 # coder's turns with `kj drive`.
 kj context create "$project-coder" --type coder --as "$project-coder" --senpai "$project-banto" --cwd /workspace --env LANG=C.UTF-8
 kj context list
@@ -143,4 +143,4 @@ echo "  cp $here/kaijutsu-dev@.container ~/.config/containers/systemd/"
 echo "  systemctl --user daemon-reload && systemctl --user start kaijutsu-dev@$project"
 echo
 echo "banto answers to Amy's root console. Once senpai's MCP session has made its context, Amy moves banto's instance under it:"
-echo "  kj senpai set $project-banto <senpai's context>"
+echo "  kj context move $project-banto <senpai's context>"

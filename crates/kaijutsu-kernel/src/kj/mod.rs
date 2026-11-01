@@ -58,7 +58,8 @@ pub mod roster;
 pub mod model;
 pub mod refs;
 pub mod search;
-pub mod senpai;
+#[cfg(test)]
+mod edge_tests;
 pub mod shell_gate;
 pub mod system;
 pub mod stage;
@@ -525,11 +526,6 @@ impl KjDispatcher {
         // Most context/workspace/preset subcommands work without an active context
         if cmd == "context" || cmd == "ctx" {
             return Box::pin(async { self.dispatch_context(&argv[1..], caller).await }).await;
-        }
-        // `kj senpai` takes an optional context and defaults to the current
-        // one, like `kj context`.
-        if cmd == "senpai" {
-            return Box::pin(async { self.dispatch_senpai(&argv[1..], caller).await }).await;
         }
         if cmd == "workspace" || cmd == "ws" {
             return self.dispatch_workspace(&argv[1..], caller);

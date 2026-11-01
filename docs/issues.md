@@ -1578,7 +1578,7 @@ resolution climbs `senpai_ctx`, so a human's command in a model's lane is review
 lane's senpai holder. What stays open is item 1 below: a context with no senpai.
 
 Every path that mints a context decides who reviews. Fork and `kj context create` from inside a
-context set the senpai; nothing re-parents a context except `kj senpai set`. This is not covered:
+context set the senpai; nothing re-parents a context except `kj context move`. This is not covered:
 
 1. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a

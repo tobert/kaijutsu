@@ -222,7 +222,7 @@ impl KernelDb {
 
     /// Triggers that keep the dynamic layer fixed. A context character's
     /// principal and persona never change; its slots are never changed or
-    /// deleted. `senpai_ctx` stays updatable (`kj senpai set`).
+    /// deleted. `senpai_ctx` stays updatable (`kj context move`).
     pub(super) fn ensure_context_character_guards(conn: &Connection) -> KernelDbResult<()> {
         conn.execute_batch(
             "CREATE TRIGGER IF NOT EXISTS context_slots_never_changed_u
