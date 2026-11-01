@@ -65,16 +65,21 @@ Decided by Amy on 2026-11-01, asked how a new install gets "a context with a cha
 - "senpai should not be a kj verb!" Its subcommands fold into `kj context` and `kj drift`: `kj context info`
   shows the senpai, `kj context kohai` lists kohai, `kj context move` sets the senpai, and `kj drift report`
   reports up.
+- `kj context create` names the character, not the label ("yeah that, agreed"). The label defaults to the
+  character's name, and a character carries the context type it usually plays, so `kj context create kohai` is
+  the whole command.
 
 A new install, end to end:
 
 ```
 kaijutsu-server bootstrap --as amy --backend deepseek --model deepseek-flash
-kj character create senpai --backend deepseek --model deepseek-flash
-kj character create kohai --backend deepseek --model deepseek-flash
-kj context create senpai --as senpai --type director
-kj context create kohai --as kohai --type coder --senpai senpai
+kj character create senpai --type director --backend deepseek --model deepseek-flash
+kj character create kohai --type coder --backend deepseek --model deepseek-flash
+kj context create senpai
+kj context create kohai --senpai senpai
 ```
+
+Run from the `senpai` context, the last line is `kj context create kohai`.
 
 Each `kj context create` is ready for a turn: the context copies the character's model for its type and for
 `distill`. A Claude Code session connects with `kaijutsu-mcp --connect` and gets an `mcp` context under the hub,
@@ -100,8 +105,10 @@ turns                           turn_id, context_id, provider, model, raw tokens
 ```
 
 - **A character** is the persistent someone a name resolves to. Keys in `auth.db` bind to it. Its row holds
-  static settings only: its name, the root flag, its persona (step 6) and its handoff log. Editing them changes
-  no context.
+  static settings only: its name, the root flag, the context type it usually plays (`characters.context_type`,
+  NULL for none), its persona (step 6) and its handoff log. Editing them changes no context.
+  `kj character create <name> --type <t>` and `kj character set <name> --type <t>|--no-type` set the type. A
+  root character has none.
 - **A character's model** (`character_models`, at most one row) is the model it runs wherever no role slot says
   otherwise. `kj character create <name> --backend <b> --model <m>` sets it, and `kj character model
   set|unset` changes it. A root character has none: a root runs no model.
@@ -241,9 +248,14 @@ its own work; a model turn refuses to start when its performer would review itse
 
 ## Creating, forking, rotating
 
-- `kj context create <label> --as <character> --type <t> [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
-  [--env K=V]...` makes a context and its context
-  character. `--as` is required. The senpai is the caller's context, or `--senpai <ctx>` under "Placing under a
+- `kj context create <character> [--name <label>] [--type <t>] [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
+  [--env K=V]...` makes a context and its context character. The positional names the live character that
+  performs it; there is no `--as`.
+  - **Label:** `--name`, else the character's name when no live context holds it, else `<name>-2`, `-3`, … (the
+    first free one); the output names the label. A `--name` another live context holds refuses.
+  - **Type:** `--type`, else the character's type. With neither, the create refuses, naming
+    `kj character set <name> --type <t>`; no type stands in.
+  - **Senpai:** the caller's context, or `--senpai <ctx>` under "Placing under a
   senpai". `--parent` sets `forked_from` only. The slots
   are copied from the character, with unset parameters filled from each model's `backend_models` row. There is no
   per-create model option: to run another model, start a context of a character whose slot has it (Amy,
@@ -326,7 +338,7 @@ asks, and no model.
   `kj context list --tree` shows every session of that root in one place.
 - **Registration.** When the parent is a root console (none named and the kernel has one root, or an explicit
   parent that is a root console), the client runs, from the root console:
-  `kj context create <label> --type mcp --as <character> --parent mcp/<root name>`. The root console is the
+  `kj context create <character> --name <label> --type mcp --parent mcp/<root name>`. The root console is the
   session's senpai, so its asks go to the root character. The hub is its `forked_from` (`--parent` sets nothing
   else, and takes a label with `/`). `<character>` is the connection's own character, or the one `--character`
   (`KAIJUTSU_CHARACTER`) names for a root connection. A client that names a `--parent` (`KAIJUTSU_PARENT`) that is
@@ -392,6 +404,7 @@ Presets keep only their fork filters (`kj fork --preset full|window|spawn`).
 
 2026-11-01:
 
+- `kj context create --as`: the positional names the character, and `--name` the label.
 - `kj senpai` (every subcommand): `show` folds into `kj context info`, `kohai` becomes `kj context kohai`, `set`
   becomes `kj context move`, and `report` becomes `kj drift report`.
 
@@ -483,6 +496,8 @@ the old row did not have; the new model requires it, and it is the character of 
   for `distill`; a role slot wins over the model for its role; the model never fills `gate`, `judge` or `mcp`; a
   root refuses a model; `kj character model set` moves no context until it rotates; `kj senpai` is unknown.
 - Bootstrap gives the console character a model, not slots, and a second run changes nothing.
+- `kj context create kohai` takes the character's type and the label `kohai`; a second one is `kohai-2`; `--name`
+  and `--type` win; a taken `--name` refuses; no type anywhere refuses; `--as` is unknown.
 - A root's MCP hub exists after `kj character create --root` and after start; an MCP registration with no
   `--parent` lands under the hub with the root console as senpai and raises no ask; a `gate.toml` ask key on
   `kj context create` still asks; the session's own character archives it at session end.
