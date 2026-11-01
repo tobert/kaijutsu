@@ -169,6 +169,8 @@ slot for K's context type. A context with no context character runs no model.
   `kj context info` shows the same line. An `mcp` context prints no such line. A model turn in K refuses before
   any provider work, naming the character, the type and the fix (`kj character model set`, then
   `kj context rotate`).
+  A judge shadow, whose type is a council role, has no chat model: `kj context info` says it runs on a council
+  server. A listing shows a context whose slot cannot be read with the error in its model column and lists the rest.
 - The judge shadow runs on its own `judge` slot and the gate on K's `gate` slot. The two are independent: a
   context with no `gate` slot has no council, and its gate decides without one; a context with a `gate` slot and
   no `judge` slot runs its council with no judge.
@@ -354,6 +356,45 @@ asks, and no model.
 - **Session end.** The client runs `kj context archive <id> --confirm` from the session context itself, which its
   character may archive (Authority). The gate would ask for it from an `mcp` context, so `gate.toml` ships `kj
   context archive` in `[context_type.mcp] allow`; a session can only archive what the authority rule lets it.
+
+## Planned: one senpai edge on every context (decided 2026-11-01)
+
+Not built yet. The sections above describe the code until this lands; then they are rewritten to match.
+
+Amy asked whether a structural change could reduce the exceptions to the rules. The senpai edge lives on
+`context_characters`, so a context with no character (the MCP hub, handoff logs, council contexts, contexts older
+than context characters) has no senpai, and authority, routing and archive each special-case "no context
+character" (78 sites in 16 files). Two predicates also call different contexts the root console. Decided: "1. yes
+[a context's own performer may archive it], 2. oh, I like console, let's do it."
+
+- **One table.** `context_characters` folds into `contexts`: `performer` (nullable), `senpai_ctx`, `persona`. The
+  two are one-to-one today, so this removes a table. `context_slots` stays, keyed by context. A context with no
+  performer runs no turns, as a context with no context character does today.
+- **Every context has a senpai, except the root console.** `senpai_ctx` is NULL only for a context that is its
+  character's `root_ctx`, and the database refuses any other NULL. The hub, the handoff logs and the council
+  contexts answer to a root console. A context made by a lifecycle (a handoff log, a hub) answers to the root
+  console of the lineage root of the context that made it; at start, to its root's console.
+- **One authority rule, with no "no character" branch.** The performer of a context's senpai, or its lineage root,
+  may act on it (`docs/senpai-kohai.md`, "Authority"). A context's own performer may also archive it, as it may
+  rotate it. The `LiveRoot` exception and the `mcp` self-archive rule go.
+- **Routing climbs past a senpai with no performer.** An ask raised in a context with no performer goes to the
+  performer of its senpai, climbing past senpais with no performer, by the same rule as today.
+- **One meaning of "root console".** The root console is `characters.root_ctx` and nothing else. The model
+  console a person talks to is "the console": type `console`, labeled `console` (no longer `ROOT`). The drift hold
+  applies to contexts of type `console`. `ContextRow::is_root_console` is renamed `is_console`, and the client's
+  ranking keys on the type, not the label.
+- **Migration.** One transaction, with a backup first: fold the columns, give every live context with no senpai
+  that is not a root console the senpai rule above (the only live root's console when the kernel has one; with
+  several roots, the root console of its `forked_from` lineage, and refuse naming any context that has neither),
+  relabel the live `ROOT` console `console`, and drop `context_characters`.
+- **Tests.** A context with no performer answers to a senpai and is archived by its senpai's performer or the
+  lineage root with no special case; a context's own performer archives it; a NULL senpai outside a root console
+  is refused by the database; an ask in a context with no performer reaches the right reviewer; the drift hold
+  keys on type `console`; bootstrap labels the console `console`; the migration on a copy of a pre-fold database
+  keeps every senpai, gives the characterless contexts one, and relabels `ROOT`.
+
+Order: after the `kernel_db.rs` split (`docs/kernel-db-split.md`), so the split and this change do not fight over
+one file.
 
 ## Removed (hard cut)
 
