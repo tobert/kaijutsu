@@ -213,7 +213,8 @@ One rule: **the character of a context's senpai, or its lineage root**, may:
 - change its egress (`kj context set --egress-allow|--egress-deny`).
 
 A character may also archive an `mcp` context it plays, so an MCP client archives its own session when the session
-ends ("MCP sessions").
+ends ("MCP sessions"). A live root character may archive a context with no context character, which
+has no senpai and no lineage root; no other act is open on one.
 
 **Placing under a senpai.** `kj context create --senpai <ctx>` and `kj context move` share one rule over the new
 senpai: the actor plays it, holds its senpai, or is its lineage root. A new edge refuses an archived senpai. A

@@ -293,6 +293,9 @@ pub enum Authority {
     SenpaiHolder,
     /// The actor is the context's lineage root.
     LineageRoot,
+    /// The actor is a live root character archiving a context with no
+    /// context character, which has no senpai and no lineage root.
+    LiveRoot,
 }
 
 /// One request to [`KernelDb::route_review`].
@@ -2671,8 +2674,14 @@ impl KernelDb {
             "context {} has no row to check authority over", target.short()
         )))?;
         let Some(character) = self.context_character(target)? else {
+            if act == GovernedAct::Archive
+                && self.get_character(actor)?.is_some_and(|sheet| sheet.root && sheet.retired_at.is_none())
+            {
+                return Ok(Ok(Authority::LiveRoot));
+            }
+            let only_root = if act == GovernedAct::Archive { "; only a live root character may archive it" } else { "" };
             return Ok(Err(format!(
-                "{} has no context character, so it has no senpai or lineage root to {}",
+                "{} has no context character, so it has no senpai or lineage root to {}{only_root}",
                 Self::context_display(&row), act.as_str()
             )));
         };
@@ -12861,6 +12870,28 @@ mod tests {
         // Over the seat, amy holds the senpai and is also the root.
         assert_eq!(db.context_authority(seat.context_id, amy, GovernedAct::Move).unwrap(), Ok(Authority::SenpaiHolder));
         assert!(db.context_authority(seat.context_id, banto, GovernedAct::Move).unwrap().is_err(), "a seat has no authority over itself");
+    }
+
+    /// A context with no context character has no senpai and no lineage
+    /// root, so a live root character may archive it; nobody else may, and
+    /// no other act is opened.
+    #[test]
+    fn a_live_root_archives_a_context_with_no_context_character() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [amy, coder, old_root] = seed_characters(&db, &["amy", "coder", "old-root"])[..] else { unreachable!() };
+        db.update_character_root(amy, true).unwrap();
+        db.update_character_root(old_root, true).unwrap();
+        db.retire_character(old_root, 1).unwrap();
+        let orphan = senpai_ctx_row(&db, ws_id, "orphan", None, None);
+        assert_eq!(db.context_authority(orphan.context_id, amy, GovernedAct::Archive).unwrap(), Ok(Authority::LiveRoot));
+        for refused in [coder, old_root] {
+            let why = db.context_authority(orphan.context_id, refused, GovernedAct::Archive).unwrap().unwrap_err();
+            assert!(why.contains("has no context character") && why.contains("a live root character"), "{why}");
+        }
+        for act in GovernedAct::ALL.into_iter().filter(|act| *act != GovernedAct::Archive) {
+            assert!(db.context_authority(orphan.context_id, amy, act).unwrap().is_err(), "{act:?}");
+        }
     }
 
     /// A context with no senpai and a lineage with no live root still answer
