@@ -6,6 +6,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## A held MCP registration leaves an ask nobody sees (2026-11-01)
+
+A `kaijutsu-mcp --connect` registration with the `kaijutsu-lead` key refused with "the gate policy is waiting on
+its reviewer: ask 01a1929e-f6e5-74c2-878d-43b338b96fd7 (pending)", and Amy's `kj ledger` showed nothing. Either
+the ask was swept when the probe process exited, or it routed to a reviewer other than Amy. Both strand the
+caller. Reproduce with a registration that the gate holds and `kj ledger list --reviewer amy`. The MCP-session
+design in `docs/senpai-kohai.md`, "MCP sessions", removes this registration's ask, but not the bug.
+
 ## Token and cost accounting: what is open (2026-10-29)
 
 Prices (`kj price`, `model_prices`), cache writes split by TTL, the cost

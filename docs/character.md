@@ -60,6 +60,10 @@ a performer never changes credentials or rewrites existing asks and block author
 - **No cast.** Built. A character holds its own slots, and a context copies them when it is made, so a context's
   model is the slot for its type in its own `context_slots`. To run another model, start a context of a character
   whose slots have it, or change the character's slot and rotate.
+- **A character has one model** (2026-11-01). `kj character create <name> --backend <b> --model <m>`, and a role
+  slot only where a role differs; MCP sessions get a model-less `mcp` context under a per-root hub; `kj senpai`
+  folds into `kj context` and `kj drift`. See `docs/senpai-kohai.md`, "MCP sessions" and "Where a model comes
+  from". The table above changes when this ships.
 - **The gate has its own setup** (step 7). Today `gate` is a slot of the character, copied into the context like
   the others.
 
