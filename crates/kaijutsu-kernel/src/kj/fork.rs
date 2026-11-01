@@ -2832,7 +2832,7 @@ mod tests {
         assert_eq!(child.workspace_id, Some(ws_id));
     }
 
-    // ── Track D: cast inherits/assigns across fork ───────────────────────
+    // ── Track D: slots and performer across fork ────────────────────────
 
     // ── A fork copies its source's context character ─────────────────────
 
@@ -2860,9 +2860,9 @@ mod tests {
     }
 
     /// A fork copies the slots its source has, not the character's current
-    /// cast: a cast edited after the source was made reaches no fork.
+    /// slots: a slot edited after the source was made reaches no fork.
     #[tokio::test]
-    async fn fork_copies_the_slots_of_its_source_not_the_characters_current_cast() {
+    async fn fork_copies_the_slots_of_its_source_not_the_characters_current_slots() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let character_id = PrincipalId::new();
@@ -3338,7 +3338,7 @@ mod tests {
     }
 
     /// A fork that asks for distillation from a context with no `distill`
-    /// slot refuses, naming the cast and the fix, before it creates anything.
+    /// slot refuses, naming the character and the fix, before it creates anything.
     ///
     /// Falsified by a compact fork that falls back to the chat model.
     #[tokio::test]

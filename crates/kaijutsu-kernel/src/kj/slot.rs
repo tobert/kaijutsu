@@ -689,6 +689,25 @@ mod tests {
         assert!(matches!(&refused, KjResult::Err(m) if m.contains("a root runs no model")), "{refused:?}");
     }
 
+    /// A character with a model cannot become a root, since a root runs no
+    /// model; unsetting the model first is the way through.
+    #[tokio::test]
+    async fn set_root_refuses_a_character_with_a_model() {
+        let d = seeded().await;
+        let c = test_caller();
+        let set = d
+            .dispatch(&argv(&["character", "model", "set", "house", "--backend", "anthropic", "--model", "m"]), &c)
+            .await;
+        assert!(set.is_ok(), "{set:?}");
+        let refused = d.dispatch(&argv(&["character", "set", "house", "--root"]), &c).await;
+        assert!(
+            matches!(&refused, KjResult::Err(m) if m.contains("a root runs no model") && m.contains("kj character model unset house")),
+            "{refused:?}"
+        );
+        let sheet = d.kernel_db().lock().get_character_by_name("house").unwrap().unwrap();
+        assert!(!sheet.root, "a refused set --root leaves the flag alone");
+    }
+
     /// `create --backend --model` writes the character and its model; a bad
     /// backend leaves no character; the flags come as a pair; a root refuses
     /// them.

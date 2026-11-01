@@ -1289,7 +1289,7 @@ impl KjDispatcher {
 
         // The model the slots give the context's type. Unlike the turn
         // path, a context with no model does not error here: previewing a
-        // prompt is what you do before fixing the cast.
+        // prompt is what you do before giving the character a model.
         let (resolved_backend, resolved_model) = match &bound_model {
             crate::model_resolution::ContextModelLookup::Model(m) => (Some(m.backend.clone()), Some(m.model.clone())),
             crate::model_resolution::ContextModelLookup::None(_) => (None, None),
@@ -4120,7 +4120,7 @@ mod tests {
     async fn rotate_carries_the_seat_to_its_successor_body() {
         let f = rotation_fixture().await;
         let before = f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap();
-        // The character's cast moves to another model after the seat was bound:
+        // The character's slots move to another model after the seat was bound:
         // the running seat keeps its slots, the successor copies the new ones.
         f.d.kernel_db().lock().seed_test_slots(f.banto, "mock", "mock-banto-next", &["default"]).unwrap();
         let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
@@ -4153,7 +4153,7 @@ mod tests {
             other => panic!("expected a model, got {other:?}"),
         };
         assert_eq!(model_of(f.seat), "mock-banto", "the predecessor keeps the slots it was made with");
-        assert_eq!(model_of(successor), "mock-banto-next", "the successor's slots are copied fresh from the character's cast");
+        assert_eq!(model_of(successor), "mock-banto-next", "the successor's slots are copied fresh from the character");
         assert_eq!(
             db.context_character(successor).unwrap().unwrap().principal_id,
             db.context_character(f.seat).unwrap().unwrap().principal_id,

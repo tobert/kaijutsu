@@ -12,9 +12,8 @@
 //! adjective, and they went stale — `default` pointed at a retired model id
 //! for a while. Aliases are operator/agent data now, like casts.
 //!
-//! `kj context set --model <alias>` and `kj fork --model <alias>` resolve
-//! through `LlmRegistry::resolve_alias`, which reads the snapshot this verb
-//! rebuilds — so an alias change is live on the next turn.
+//! `LlmRegistry::resolve_alias` reads the snapshot this verb rebuilds, so an
+//! alias change is live on the next lookup (`kj price`).
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;

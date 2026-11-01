@@ -32,7 +32,7 @@ const DEFAULT_MAX_TOKENS: u64 = 16384;
 /// One backend row, and the model the kernel defaults to on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendChoice {
-    /// The backend row's name, which is also what `kj model` prints.
+    /// The backend row's name, as `kj backend list` prints it.
     pub name: String,
     /// The wire dialect (`kj backend set --kind`).
     pub kind: String,

@@ -737,6 +737,18 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj character set: {e}")),
                 }
             }
+            if root {
+                match db.get_character_model(row.principal_id) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        return KjResult::Err(format!(
+                            "kj character set: {name} has a model, and a root runs no model; \
+                             `kj character model unset {name}` first"
+                        ));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj character set: {e}")),
+                }
+            }
             if let Err(e) = db.update_character_root(row.principal_id, root) {
                 return KjResult::Err(format!("kj character set: {e}"));
             }

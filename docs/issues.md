@@ -20,6 +20,37 @@ design in `docs/senpai-kohai.md`, "MCP sessions", removes this registration's as
 so retiring a root leaves its hub live (`contexts_played_by` skips it). Archive the hub with its root, and decide
 whether the hub's live `mcp` sessions go with it. See `docs/senpai-kohai.md`, "MCP sessions".
 
+## kaibo review of the character-model and MCP-hub work: what is open (2026-11-01)
+
+Default-cast kaibo review of 2f38f7ca, f40f4dd5, 90813b33. Fixed in the follow-up commit: `kj character set
+--root` refused a model only after flipping the flag; stale `kj model`/delegation/cast text. Open, each verified
+against the code unless marked:
+
+- **A `judge` slot with no `max_tokens` breaks `kj context list|log|info`.** `model_resolution::context_model`
+  (~203) calls a missing `max_tokens` corrupt for any role, but a council slot needs none, and a judge shadow
+  (type `judge`) reads its `judge` slot. `kj context list` propagates the error with `?` (kj/context.rs ~443).
+  Latent while the council is off; turning it on with a documented `kj character slot set <c> judge` trips it.
+- `kj context move` refuses on any pending ask in the subtree, not only one whose reviewer would change
+  (kj/context.rs ~3128), against `docs/senpai-kohai.md`, "Creating, forking, rotating". Blocks the rotate handoff.
+- `kj context create --senpai` does not refuse an archived senpai; `kj context move` does (kj/context.rs ~1487).
+- `kj context demote` twice archives a root console, and `kj character retire` of a root archives its console,
+  leaving `characters.root_ctx` on an archived row (kernel_db.rs ~5770).
+- The kernel lets `--as <root>` create a context the root performs; only the client refuses. A test blesses it
+  (`a_root_character_can_be_cast_as_a_performer`, kj/context.rs ~3929).
+- Two meanings of "root console": `ContextRow::is_root_console` (type `console`, label `ROOT`) vs
+  `KernelDb::is_root_console` (`characters.root_ctx`). The drift hold uses the first (kj/drift.rs ~344), so a
+  drift into a human root's console is not held.
+- `context_character_migration_report` has a writer and no reader; `kj context info` reads the older
+  `senpai_migration_report`, as `kj senpai show` did.
+- `kj ledger list --reviewer` and the director `rotate` rc lifecycle are documented in docs/senpai-kohai.md and
+  not built (`VERB_ROTATE` fires only from the beat scheduler).
+- The builtin `kj context create --type mcp` allow cannot see the caller, so `--as` may name a character with a
+  model and its `distill` slot is copied. Small: an mcp seat already holds `config-write`.
+- `ensure_mcp_hub` seeds the BlockStore and drift router after the row commits; a failure there is repaired at
+  the next boot, not within the process. `kj character create --backend` writes the character and its model as
+  two statements.
+- Tests still say "cast" for assigning a performer (kj/context.rs ~4629-4682).
+
 ## Token and cost accounting: what is open (2026-10-29)
 
 Prices (`kj price`, `model_prices`), cache writes split by TTL, the cost

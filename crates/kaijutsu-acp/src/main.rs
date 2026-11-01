@@ -69,8 +69,8 @@ struct Cli {
 
     /// Character that performs work in each new ACP context.
     ///
-    /// The connected character becomes the context's director. The reviewer
-    /// follows explicit assignment, delegation, or the walk up `forked_from`.
+    /// The connected character requests the context and this one performs
+    /// it. The reviewer is the character of the new context's senpai.
     /// The named character must already exist and be live.
     #[arg(long)]
     character: Option<String>,
