@@ -15,7 +15,7 @@ pub(super) fn into_pre_context_character(db: &KernelDb) {
         ("contexts", "model", "TEXT"),
         ("presets", "cast_id", "BLOB REFERENCES casts(cast_id) ON DELETE SET NULL"),
         ("presets", "system_prompt", "TEXT"),
-    ].into_iter().chain(PRE_CONTEXT_CHARACTER_COLUMNS) {
+    ].into_iter().chain(super::migrate_senpai::PRE_CONTEXT_CHARACTER_COLUMNS) {
         if !KernelDb::has_column(c, table, column).unwrap() {
             c.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), []).unwrap();
         }
