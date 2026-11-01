@@ -393,8 +393,8 @@ character" (78 sites in 16 files). Two predicates also call different contexts t
   keys on type `console`; bootstrap labels the console `console`; the migration on a copy of a pre-fold database
   keeps every senpai, gives the characterless contexts one, and relabels `ROOT`.
 
-Order: after the `kernel_db.rs` split (`docs/kernel-db-split.md`), so the split and this change do not fight over
-one file.
+The `kernel_db.rs` split this waited on has landed; the context-character storage is `kernel_db/context_characters.rs`
+and `kernel_db/contexts.rs`.
 
 ## Removed (hard cut)
 

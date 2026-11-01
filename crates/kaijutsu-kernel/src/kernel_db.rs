@@ -5,16 +5,21 @@
 //!
 //! All timestamps are Unix milliseconds (matching `now_millis()`).
 //!
-//! ## Known shape, deferred on purpose
+//! ## Layout
 //!
-//! This file is large (~20 tables, many methods) and the live handle is a single
-//! `Arc<Mutex<KernelDb>>`, so every write serializes on one lock. That is a
-//! recognized "god-table + single-mutex" smell — and we are **deliberately not
-//! splitting it yet**. The pressure that would justify the churn (measured
-//! write-contention under concurrent contexts) is not expected any time soon;
-//! revisit only when it's an actual, observed problem. See
-//! `docs/architecture/kernel.md` for the connection-pool angle. Don't
-//! pre-emptively refactor.
+//! This file holds the handle (`KernelDb`, its error type, open, transactions,
+//! maintenance), the id readers and row mappers several tables share, and the
+//! module list. Each table group lives in its own child module as an
+//! `impl KernelDb` block, with its tests in `<module>/tests.rs`: `contexts`,
+//! `context_ring`, `context_fork`, `context_characters`, `review`, `approvals`,
+//! `documents`, `lineage`, `llm_backends`, `llm_characters`, `usage`, and the
+//! rest below. `schema` holds the DDL; `migrate`, `migrate_senpai` and
+//! `migrate_cast` hold the migration ladder. Shared test fixtures live in
+//! `test_support`.
+//!
+//! The live handle is a single `Arc<Mutex<KernelDb>>`, so every write
+//! serializes on one lock. See `docs/architecture/kernel.md` for the
+//! connection-pool angle; revisit it when write contention is measured.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -43,8 +48,6 @@ macro_rules! performer_sql {
 
 mod context_characters;
 mod model_prices;
-#[cfg(test)]
-mod test_support;
 mod kernel_meta;
 mod presets;
 mod hooks;
@@ -72,6 +75,8 @@ mod schema;
 mod migrate_senpai;
 mod migrate_cast;
 mod migrate;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 use test_support::*;
 pub use model_prices::{CostGroup, ModelPriceRow, NewModelPrice};
@@ -162,14 +167,6 @@ pub enum KernelDbError {
 }
 
 pub type KernelDbResult<T> = Result<T, KernelDbError>;
-
-// ============================================================================
-// Row types
-// ============================================================================
-
-// ============================================================================
-// Schema
-// ============================================================================
 
 // ============================================================================
 // BLOB helpers
@@ -470,7 +467,7 @@ pub struct KernelDb {
 
 impl KernelDb {
     // ========================================================================
-    // Quiesce
+    // Connection and open
     // ========================================================================
 
     pub(crate) fn conn_for_ledger(&self) -> &Connection {
@@ -558,19 +555,7 @@ impl KernelDb {
     }
 
     // ========================================================================
-    // Kernel identity
-    // ========================================================================
-
-    // ========================================================================
-    // Auto-Workspaces
-    // ========================================================================
-
-    // ========================================================================
-    // Document CRUD
-    // ========================================================================
-
-    // ========================================================================
-    // Op-Log Persistence
+    // Transactions and maintenance
     // ========================================================================
 
     /// Run `f` as one SQLite transaction on this connection. Commits when
@@ -636,39 +621,7 @@ impl KernelDb {
     }
 
     // ========================================================================
-    // Context CRUD
-    // ========================================================================
-
-    // ========================================================================
-    // Context Edges
-    // ========================================================================
-
-    // ========================================================================
-    // Presets
-    // ========================================================================
-
-    // ========================================================================
-    // Workspaces
-    // ========================================================================
-
-    // ========================================================================
-    // Workspace Paths
-    // ========================================================================
-
-    // ========================================================================
-    // Context Shell Configuration
-    // ========================================================================
-
-    // ========================================================================
-    // Context Token Usage (token-usage gauge)
-    // ========================================================================
-
-    // ========================================================================
-    // Turns (per-turn provenance and spend)
-    // ========================================================================
-
-    // ========================================================================
-    // Context Tool Bindings (Phase 5, D-54)
+    // Test hooks
     // ========================================================================
 
     /// Force every subsequent write on this connection to fail with
@@ -682,65 +635,10 @@ impl KernelDb {
         Ok(())
     }
 
-    // ========================================================================
-    // Hook Persistence
-    // ========================================================================
-
-    // ========================================================================
-    // Hook scripts (kernel-global shared kaish bodies)
-    // ========================================================================
-
-    // ========================================================================
-    // Context Environment Variables
-    // ========================================================================
-
-    // ========================================================================
-    // Context egress (docs/egress.md)
-    // ========================================================================
-
-    // ========================================================================
-    // Claude cache breakpoints (per-context policy)
-    // ========================================================================
-
-}
-
-impl KernelDb {
-    // ========================================================================
-    // Tracks (clock domains — docs/tracks.md Stage 1)
-    // ========================================================================
-
-    // ========================================================================
-    // Attachments (context → track binding — docs/tracks.md §2+3)
-    // ========================================================================
-
-    // ========================================================================
-    // Context Config Fork + Workspace Query
-    // ========================================================================
-
-    // ========================================================================
-    // Workspace Permission Checking
-    // ========================================================================
-
-    // ========================================================================
-    // Phase 4A: Additional methods for kj commands
-    // ========================================================================
-
-    // ========================================================================
-    // Well-Known Context Registry (docs/drifting-dead-letters.md, slice 1)
-    // ========================================================================
-
-    // ========================================================================
-    // Client Views (docs/shared-state.md "Retiring KV")
-    // ========================================================================
-
-    // ========================================================================
-    // Dirty File Buffers (docs/file-buffers.md — swap-file marker)
-    // ========================================================================
-
 }
 
 // ============================================================================
-// LLM configuration (backends / models / casts / aliases / defaults)
+// LLM configuration helpers shared by llm_backends and llm_characters
 // ============================================================================
 //
 // SQL is the source of truth for model configuration — there is no TOML in
@@ -760,24 +658,6 @@ fn read_backend_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<BackendI
             )),
         )
     })
-}
-
-
-impl KernelDb {
-    // ── backends ────────────────────────────────────────────────────────
-
-    // ── backend_models ──────────────────────────────────────────────────
-
-    // ── character slots ─────────────────────────────────────────────────
-
-    // ── character models ────────────────────────────────────────────────
-
-    // ── characters ──────────────────────────────────────────────────────
-
-    // ── model_aliases ───────────────────────────────────────────────────
-
-    // ── embedding_config ────────────────────────────────────────────────
-
 }
 
 /// The `thinking_style` tokens the providers accept; `llm/claude/build.rs`
@@ -930,13 +810,6 @@ fn row_to_workspace_row(row: &rusqlite::Row<'_>) -> SqliteResult<WorkspaceRow> {
         created_by: read_principal_id(row, 4)?,
         archived_at: row.get(5)?,
     })
-}
-
-// ============================================================================
-// Roster (crate::roster) — storage half; types/invariants live in roster.rs
-// ============================================================================
-
-impl KernelDb {
 }
 
 // ============================================================================
