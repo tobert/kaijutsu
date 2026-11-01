@@ -3613,3 +3613,20 @@ since no caller waits to retry. Every drift kind holds except
 `Notification`, and only in ROOT. A drift ask learns no rule: `--remember`
 is refused and the ask stays open. Amy's idea for later is to divert a
 remembered drift allow to the judge model's context, which can wait.
+
+## A context ready to roll (November 1)
+
+Bringing up a clean senpai and kohai on zorak took a stuck approval and a slot
+per role, and Amy asked "why is it so much work?" The contributing factors were
+separate: an agent key's MCP registration ran `kj context create` in Amy's root
+console and waited on her; the cast melt left characters with no slots and one
+`slot set` per role to fill; embeddings had no verb. Amy chose to design for a
+new install first. A character now has one model (`kj character create <name>
+--backend <b> --model <m>`), and a role slot exists only where a role differs;
+the model fills the context's type and `distill`, never the council roles or an
+`mcp` context. An MCP client brings its own model, so its session is a
+model-less `mcp` context under a per-root hub, `mcp/<root>`, created with no
+ask, archived by its own character. And "senpai should not be a kj verb!": its
+subcommands moved to `kj context info|kohai|move` and `kj drift report`. The
+pair now takes four commands. Cleaning zorak also found 217 old contexts with
+no context character that nobody could archive; a live root may now.

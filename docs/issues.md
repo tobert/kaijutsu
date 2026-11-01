@@ -50,6 +50,10 @@ against the code unless marked:
   the next boot, not within the process. `kj character create --backend` writes the character and its model as
   two statements.
 - Tests still say "cast" for assigning a performer (kj/context.rs ~4629-4682).
+- Found deploying: `kj whoami` (not a verb) from an MCP seat raised an ask ("no layer covers statement #0")
+  instead of failing as unknown; an unknown `kj` verb should refuse before the gate. Amy's `amy` root console
+  still reports `alibaba/qwen3.8-flash` (a migrated slot; a root runs no model). `kj context info` prints
+  `Fork: <id> ()` with an empty label.
 
 ## Token and cost accounting: what is open (2026-10-29)
 
