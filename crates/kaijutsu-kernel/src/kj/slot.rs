@@ -389,7 +389,7 @@ impl KjDispatcher {
                             b.backend_id,
                             max_tokens,
                             thinking_budget,
-                            !matches!(role.as_str(), "gate" | "judge"),
+                            !crate::model_resolution::names_council_server(&role),
                         ));
                         KjResult::ok(msg)
                     }

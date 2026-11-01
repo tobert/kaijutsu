@@ -20,6 +20,13 @@ pub const RESERVED_ROLES: &[&str] = &[crate::council::gate::GATE, crate::council
 /// The slot role a fork's distillation runs on.
 pub const DISTILL: &str = "distill";
 
+/// Roles whose slot names a council server. The served model carries no
+/// `max_tokens`, so these slots may leave it unset, and a context of such a
+/// type (a judge shadow) has no chat model.
+pub fn names_council_server(role: &str) -> bool {
+    matches!(role, crate::council::gate::GATE | crate::council::shadow::JUDGE)
+}
+
 /// Refuses `context_type` when it names a reserved slot role.
 pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
     if !RESERVED_ROLES.contains(&context_type) {
@@ -52,6 +59,9 @@ pub enum NoModelReason {
     NoContextCharacter,
     /// The context's slots have none for the role.
     NoSlot,
+    /// The context's type is a council role: its slot names a council
+    /// server, not a chat model.
+    CouncilServer,
 }
 
 /// A context, or a role of it, that has no model.
@@ -80,6 +90,10 @@ impl NoModel {
             NoModelReason::NoContextCharacter => {
                 format!("{} has no context character, so it runs no model", self.context)
             }
+            NoModelReason::CouncilServer => format!(
+                "{} runs on a council server, not a chat model: its {} slot names the server",
+                self.context, self.role
+            ),
             NoModelReason::NoSlot => format!(
                 "{} has no model for {}: {} has no model and no {} slot",
                 self.context,
@@ -106,6 +120,10 @@ impl NoModel {
                 "{} has no context character, so it {what}. Start one: \
                  `kj context create <character> [--name <label>] [--type <type>]`",
                 self.context
+            ),
+            NoModelReason::CouncilServer => format!(
+                "{} {what}: its type {} names a council server, not a chat model",
+                self.context, self.role
             ),
             NoModelReason::NoSlot => format!(
                 "{} {what}: character {character} has no {} slot and no model. Fix: `kj character model set`, \
@@ -192,7 +210,8 @@ fn non_negative(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
 
-/// The model context `context_id` runs, from its slot. `Err` is a fault
+/// The model context `context_id` runs, from its slot. A context whose type
+/// is a council role (a judge shadow) has no chat model. `Err` is a fault
 /// reading the slot, or a chat slot with no `max_tokens` (which a context
 /// character write refuses).
 pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<ContextModelLookup> {
@@ -202,6 +221,12 @@ pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<Con
         .context_type;
     match role_slot(db, context_id, &context_type)? {
         RoleSlot::None(none) => Ok(ContextModelLookup::None(none)),
+        RoleSlot::Slot(bound) if names_council_server(&context_type) => Ok(ContextModelLookup::None(NoModel {
+            context: bound.context,
+            character: Some(bound.character),
+            role: context_type,
+            reason: NoModelReason::CouncilServer,
+        })),
         RoleSlot::Slot(bound) => {
             let slot = &bound.slot;
             let max_tokens = non_negative(slot.max_tokens).filter(|m| *m > 0).ok_or_else(|| {

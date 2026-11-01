@@ -26,10 +26,6 @@ Default-cast kaibo review of 2f38f7ca, f40f4dd5, 90813b33. Fixed in the follow-u
 --root` refused a model only after flipping the flag; stale `kj model`/delegation/cast text. Open, each verified
 against the code unless marked:
 
-- **A `judge` slot with no `max_tokens` breaks `kj context list|log|info`.** `model_resolution::context_model`
-  (~203) calls a missing `max_tokens` corrupt for any role, but a council slot needs none, and a judge shadow
-  (type `judge`) reads its `judge` slot. `kj context list` propagates the error with `?` (kj/context.rs ~443).
-  Latent while the council is off; turning it on with a documented `kj character slot set <c> judge` trips it.
 - `kj context move` refuses on any pending ask in the subtree, not only one whose reviewer would change
   (kj/context.rs ~3128), against `docs/senpai-kohai.md`, "Creating, forking, rotating". Blocks the rotate handoff.
 - `kj context create --senpai` does not refuse an archived senpai; `kj context move` does (kj/context.rs ~1487).

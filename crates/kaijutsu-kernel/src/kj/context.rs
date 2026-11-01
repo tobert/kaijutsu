@@ -452,25 +452,26 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
 }
 
 /// The model of each listed context, read once for the whole listing from
-/// the context slots and nothing else.
+/// the context slots and nothing else. A context whose binding cannot be
+/// read is logged and listed with the error in its model column, so one
+/// corrupt slot hides no other context.
 fn context_bindings<'a>(
     db: &KernelDb,
     rows: impl Iterator<Item = &'a ContextRow>,
-) -> KernelDbResult<std::collections::HashMap<ContextId, ContextBound>> {
+) -> std::collections::HashMap<ContextId, ContextBound> {
     let mut bound = std::collections::HashMap::new();
     for row in rows {
-        let found = crate::model_resolution::context_model(db, row.context_id)?;
-        bound.insert(
-            row.context_id,
-            ContextBound {
-                model: match &found {
-                    crate::model_resolution::ContextModelLookup::Model(m) => Some(format!("{}/{}", m.backend, m.model)),
-                    crate::model_resolution::ContextModelLookup::None(_) => None,
-                },
-            },
-        );
+        let model = match crate::model_resolution::context_model(db, row.context_id) {
+            Ok(crate::model_resolution::ContextModelLookup::Model(m)) => Some(format!("{}/{}", m.backend, m.model)),
+            Ok(crate::model_resolution::ContextModelLookup::None(_)) => None,
+            Err(e) => {
+                tracing::error!("model binding of {} unreadable: {e}", row.context_id.short());
+                Some(format!("(model unreadable: {e})"))
+            }
+        };
+        bound.insert(row.context_id, ContextBound { model });
     }
-    Ok(bound)
+    bound
 }
 
 impl KjDispatcher {
@@ -725,10 +726,7 @@ impl KjDispatcher {
         if tree {
             match db.context_dag() {
                 Ok(dag) => {
-                    let bound = match context_bindings(&db, dag.iter().map(|(row, _)| row)) {
-                        Ok(bound) => bound,
-                        Err(e) => return KjResult::Err(format!("kj context list: {e}")),
-                    };
+                    let bound = context_bindings(&db, dag.iter().map(|(row, _)| row));
                     let text = format_context_tree(&dag, caller.context_id, &bound);
                     let ids = context_handles(dag.iter().map(|(row, _)| row));
                     KjResult::ok_with_data(text, ids)
@@ -738,10 +736,7 @@ impl KjDispatcher {
         } else {
             match db.list_active_contexts() {
                 Ok(contexts) => {
-                    let bound = match context_bindings(&db, contexts.iter()) {
-                        Ok(bound) => bound,
-                        Err(e) => return KjResult::Err(format!("kj context list: {e}")),
-                    };
+                    let bound = context_bindings(&db, contexts.iter());
                     let text = format_context_table(&contexts, caller.context_id, &bound);
                     let ids = context_handles(contexts.iter());
                     KjResult::ok_with_data(text, ids)
@@ -2251,10 +2246,7 @@ impl KjDispatcher {
 
         match db.fork_lineage(target_id) {
             Ok(lineage) => {
-                let bound = match context_bindings(&db, lineage.iter().map(|(row, _)| row)) {
-                    Ok(bound) => bound,
-                    Err(e) => return KjResult::Err(format!("kj context log: {e}")),
-                };
+                let bound = context_bindings(&db, lineage.iter().map(|(row, _)| row));
                 let text = format_fork_lineage(&lineage, caller.context_id, &bound);
                 let handles = context_handles(lineage.iter().map(|(row, _)| row));
                 KjResult::ok_with_data(text, handles)
@@ -3598,6 +3590,104 @@ mod tests {
         let error = d.apply_context_config(context, &cfg).await.unwrap_err();
         assert!(error.contains("authority changed"), "{error}");
         assert!(d.kernel_db().lock().list_context_egress(context).unwrap().is_empty());
+    }
+
+    /// A seat whose character has a `judge` slot on a council (mk) backend and no
+    /// `max_tokens`, with its judge shadow. Returns the dispatcher, the seat and the shadow.
+    async fn judge_shadow_fixture(judge_max_tokens: Option<i64>) -> (crate::kj::KjDispatcher, ContextId, ContextId) {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let banto = PrincipalId::new();
+        let db = d.kernel_db().lock();
+        db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            principal_id: banto, name: s("banto"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        db.seed_test_slots(banto, "mock", "mock-banto", &["default"]).unwrap();
+        let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
+            backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("mk"),
+            base_url: Some(s("http://zorak:8090")), api_key_env: None, api_key_file: None, key_optional: true,
+            request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
+            created_by: PrincipalId::system(),
+        }).unwrap();
+        db.set_character_slot(&crate::kernel_db::CharacterSlotRow {
+            principal_id: banto, role: s("judge"), backend_id: mk.backend_id, model: s("judge-model"),
+            max_tokens: judge_max_tokens, temperature: None, top_p: None, effort: None,
+            thinking_budget: None, thinking_style: None,
+        }).unwrap();
+        drop(db);
+        let seat = crate::kj::test_helpers::register_rooted_context(&d, Some("banto-seat"), banto);
+        let shadow = register_context(&d, Some("judge-banto-seat"), Some(seat), amy);
+        let db = d.kernel_db().lock();
+        db.update_played_by(seat, Some(banto)).unwrap();
+        db.update_context_type(shadow, "judge").unwrap();
+        db.copy_context_character(seat, shadow).unwrap();
+        drop(db);
+        (d, seat, shadow)
+    }
+
+    /// Corrupt every `default` slot: no `max_tokens`, which the write path refuses.
+    fn clear_default_max_tokens(d: &crate::kj::KjDispatcher) {
+        let mut db = d.kernel_db().lock();
+        let conn = db.conn_for_test_mut();
+        conn.execute_batch("DROP TRIGGER context_slots_never_changed_u").unwrap();
+        conn.execute("UPDATE context_slots SET max_tokens = NULL WHERE role = 'default'", []).unwrap();
+    }
+
+    /// A judge shadow's `judge` slot names a council server and carries no
+    /// `max_tokens`. The shadow has no chat model, which is not corruption,
+    /// and `kj context list|log|info` show it.
+    #[tokio::test]
+    async fn a_judge_shadow_with_a_council_slot_and_no_max_tokens_lists() {
+        let (d, seat, shadow) = judge_shadow_fixture(None).await;
+        {
+            let db = d.kernel_db().lock();
+            assert!(db.context_slot(shadow, "judge").unwrap().unwrap().max_tokens.is_none());
+            match crate::model_resolution::context_model(&db, shadow).unwrap() {
+                crate::model_resolution::ContextModelLookup::None(none) => {
+                    assert!(none.line().contains("council server"), "{}", none.line());
+                }
+                other => panic!("a judge shadow runs no chat model: {other:?}"),
+            }
+        }
+        let caller = test_caller();
+        for argv in [vec![s("context"), s("list")], vec![s("context"), s("list"), s("--tree")]] {
+            let r = d.dispatch(&argv, &caller).await;
+            assert!(r.is_ok(), "{argv:?}: {}", r.message());
+            assert!(r.message().contains("judge-banto-seat"), "{}", r.message());
+        }
+        let r = d.dispatch(&[s("context"), s("log"), shadow.to_hex()], &caller).await;
+        assert!(r.is_ok(), "{}", r.message());
+        let r = d.dispatch(&[s("context"), s("info"), shadow.to_hex()], &caller).await;
+        assert!(r.is_ok(), "{}", r.message());
+        assert!(r.message().contains("council server"), "{}", r.message());
+        let r = d.dispatch(&[s("context"), s("info"), seat.to_hex()], &caller).await;
+        assert!(r.is_ok(), "{}", r.message());
+    }
+
+    /// A council role is exempt only by its role: a slot for any other context
+    /// type with no `max_tokens` is still corrupt.
+    #[tokio::test]
+    async fn a_chat_slot_with_no_max_tokens_is_still_corrupt() {
+        let (d, seat, _shadow) = judge_shadow_fixture(None).await;
+        clear_default_max_tokens(&d);
+        let db = d.kernel_db().lock();
+        let err = crate::model_resolution::context_model(&db, seat).unwrap_err();
+        assert!(err.to_string().contains("no max_tokens"), "{err}");
+    }
+
+    /// One context whose model cannot be read does not stop the listing: its
+    /// row says so, naming the error, and the others list.
+    #[tokio::test]
+    async fn a_listing_shows_one_unreadable_model_and_lists_the_rest() {
+        let (d, seat, _shadow) = judge_shadow_fixture(None).await;
+        clear_default_max_tokens(&d);
+        let r = d.dispatch(&[s("context"), s("list")], &test_caller()).await;
+        assert!(r.is_ok(), "{}", r.message());
+        assert!(r.message().contains("banto-seat"), "{}", r.message());
+        assert!(r.message().contains("judge-banto-seat"), "{}", r.message());
+        assert!(r.message().contains("unreadable"), "{}", r.message());
+        assert!(r.message().contains("no max_tokens"), "{}", r.message());
+        let _ = seat;
     }
 
     /// Fixture for the authority rule: amy's console → banto's seat → a lane

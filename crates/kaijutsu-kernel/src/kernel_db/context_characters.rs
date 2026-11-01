@@ -59,11 +59,7 @@ pub struct ContextCharacterMigrationNote {
 /// `llm_defaults` all left it unset (`LlmRegistry::max_output_tokens`).
 const UNSET_MAX_TOKENS: i64 = 64_000;
 
-/// Roles whose slot names a council server. The served model carries no
-/// `max_tokens`, so these slots may leave it unset.
-fn names_council_server(role: &str) -> bool {
-    matches!(role, "gate" | "judge")
-}
+use crate::model_resolution::names_council_server;
 
 /// `own` over `floor`, field by field.
 fn over(own: &ModelTunablesRow, floor: &ModelTunablesRow) -> ModelTunablesRow {
