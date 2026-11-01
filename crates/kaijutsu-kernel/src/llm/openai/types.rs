@@ -253,7 +253,6 @@ pub struct ToolFunction {
 /// `tool_choice` — defaults to `auto` server-side; only set to override.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // variants reserved for forced-tool paths
 pub enum ToolChoice {
     Auto,
     None,

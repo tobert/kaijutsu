@@ -8058,7 +8058,7 @@ mod lifetime_tests {
                 played_by: None,
             }).unwrap();
             db.update_played_by(senpai, Some(reviewer)).unwrap();
-            // The performer's cast gives its context a `default` slot only
+            // The performer's slots give its context a `default` slot only
             // when a mock provider is wanted; without one the binding has
             // no model.
             if mock.is_some() {
@@ -8799,7 +8799,7 @@ mod lifetime_tests {
         {
             let db = kernel.kernel_db().lock();
             let performer = db.get_context(context).unwrap().unwrap().played_by.unwrap();
-            // A cast that holds a slot for another type, copied after the fact.
+            // A character that holds a slot for another type, copied after the fact.
             db.seed_test_slots(performer, "mock", "mock-model", &["musician"]).unwrap();
             let ws = db.get_or_create_default_workspace(performer).unwrap();
             db.insert_context_with_document(&crate::ContextRow {

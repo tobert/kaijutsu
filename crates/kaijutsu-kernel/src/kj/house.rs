@@ -19,7 +19,7 @@ pub(crate) const HOUSE_VERBS: &[&str] = &[
 
 /// Top-level verbs a worker seat keeps. Read by the classification test,
 /// which is what makes a new verb choose a table.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) const WORKER_VERBS: &[&str] = &[
     "block", "cache", "cas", "context", "diff", "drift", "fork", "stage", "handoff",
     "kaish", "models", "search", "synth", "vfs", "vi", "wait", "workspace",

@@ -37,7 +37,6 @@ pub struct ShellSubmission {
 #[derive(Clone)]
 struct RpcSystemGuard(#[allow(dead_code)] std::rc::Rc<RpcSystemGuardInner>);
 
-#[allow(dead_code)]
 struct RpcSystemGuardInner(tokio::task::AbortHandle);
 
 impl Drop for RpcSystemGuardInner {
@@ -213,7 +212,6 @@ pub struct RpcClient {
     _rpc_guard: RpcSystemGuard,
     /// Retained SSH session for clean disconnect and keepalive.
     /// Without this, no SSH_MSG_DISCONNECT can be sent on shutdown.
-    #[allow(dead_code)]
     ssh_session: Option<std::rc::Rc<std::cell::RefCell<crate::ssh::SshClient>>>,
 }
 

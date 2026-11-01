@@ -1047,6 +1047,18 @@ impl KjDispatcher {
                 info.push_str(&format!("\nMigration note: {note}"));
             }
         }
+        // What the context-character migration did not carry over for this
+        // context. Unlike the senpai note, nothing clears these.
+        let character_notes: Vec<(String, String)> = match self.kernel_db().lock().context_character_migration_report() {
+            Ok(notes) => notes.into_iter()
+                .filter(|n| n.context_id == Some(row.context_id))
+                .map(|n| (n.kind, n.note))
+                .collect(),
+            Err(error) => return KjResult::Err(format!("kj context info: migration notes: {error}")),
+        };
+        for (kind, note) in &character_notes {
+            info.push_str(&format!("\nCharacter migration note ({kind}): {note}"));
+        }
 
         // Structured record: full ids and the same fields the text view
         // surfaces, so `kaish-last` round-trips and per-field jq queries work.
@@ -1143,6 +1155,9 @@ impl KjDispatcher {
             record["lineage_root"] = serde_json::json!(root.map(|(id, name)| serde_json::json!({ "id": id.to_hex(), "name": name })));
             record["lineage_root_error"] = serde_json::json!(edge.as_ref().and_then(|(_, root, _)| root.as_ref().err()));
             record["migration_note"] = serde_json::json!(edge.as_ref().and_then(|(_, _, note)| note.as_ref()));
+            record["character_migration_notes"] = serde_json::json!(
+                character_notes.iter().map(|(kind, note)| serde_json::json!({ "kind": kind, "note": note })).collect::<Vec<_>>()
+            );
         }
 
         KjResult::ok_with_data(info, record)
@@ -3230,7 +3245,6 @@ fn describe_cost(cost: &crate::pricing::ContextCost) -> String {
 #[cfg(test)]
 mod tests {
     use super::{insert_new_context_checked, ContextConfig, EgressAssignment, CharacterPlacement};
-    #[allow(unused_imports)]
     use crate::kj::KjResult;
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{ContextId, ContextState, PrincipalId};
@@ -4055,10 +4069,10 @@ mod tests {
         assert_eq!(d.kernel_db().lock().list_context_egress(context).unwrap(), vec!["crates.io".to_string()]);
     }
 
-    /// A root character is a model context: a senpai can cast it as the
-    /// character of a kohai it creates, and the instance records it.
+    /// A root character is a model context: a senpai can assign it as the
+    /// performer of a kohai it creates, and the instance records it.
     #[tokio::test]
-    async fn a_root_character_can_be_cast_as_a_performer() {
+    async fn a_root_character_can_be_assigned_as_a_performer() {
         let d = test_dispatcher().await;
         let banto = PrincipalId::new();
         let sovereign = PrincipalId::new();
@@ -4075,7 +4089,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
         let refused = d.dispatch(&[s("context"), s("create"), s("sovereign"), s("--name"), s("sovereign-lane"), s("--type"), s("default")], &banto_caller).await;
-        assert!(refused.is_ok(), "a root can be cast: {}", refused.message());
+        assert!(refused.is_ok(), "a root can be assigned: {}", refused.message());
         let lane = d.kernel_db().lock().find_context_by_label("sovereign-lane").unwrap()
             .expect("the kohai exists");
         assert_eq!(
@@ -4762,7 +4776,7 @@ mod tests {
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: coder, name: s("coder"), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        crate::kj::test_helpers::register_rooted_context(&d, Some("cast-parent"), amy);
+        crate::kj::test_helpers::register_rooted_context(&d, Some("assign-parent"), amy);
         // A caller context with no binding row holds no capability.
         let bare = ContextId::new();
         {
@@ -4777,18 +4791,18 @@ mod tests {
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
-        let refused = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("cast-lane"), s("--parent"), s("cast-parent"), s("--type"), s("default")], &caller).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("assign-lane"), s("--parent"), s("assign-parent"), s("--type"), s("default")], &caller).await;
         assert!(!refused.is_ok(), "{}", refused.message());
         assert!(refused.message().contains("operator"), "{}", refused.message());
-        assert!(d.kernel_db().lock().resolve_context("cast-lane").is_err(), "a refusal creates nothing");
-        let plain = d.dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("plain-lane"), s("--parent"), s("cast-parent")], &caller).await;
+        assert!(d.kernel_db().lock().resolve_context("assign-lane").is_err(), "a refusal creates nothing");
+        let plain = d.dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("plain-lane"), s("--parent"), s("assign-parent")], &caller).await;
         assert!(!plain.is_ok(), "creating needs operator with no performer too (`docs/senpai-kohai.md`)");
         assert!(plain.message().contains("operator"), "{}", plain.message());
         assert!(d.kernel_db().lock().resolve_context("plain-lane").is_err());
     }
 
-    /// Casting makes the cast character accountable to the caller, who
-    /// directs the new context, so only a live character may cast.
+    /// Assigning a performer makes that character accountable to the caller, who
+    /// directs the new context, so only a live character may assign one.
     #[tokio::test]
     async fn context_create_as_requires_a_live_character_caller() {
         let d = test_dispatcher().await;
@@ -4798,7 +4812,7 @@ mod tests {
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: coder, name: s("coder"), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        let parent = crate::kj::test_helpers::register_rooted_context(&d, Some("cast-parent"), amy);
+        let parent = crate::kj::test_helpers::register_rooted_context(&d, Some("assign-parent"), amy);
         // A senpai must be held by someone; amy performs the parent.
         d.kernel_db().lock().update_played_by(parent, Some(amy)).unwrap();
         let mut caller = test_caller();
@@ -4814,8 +4828,8 @@ mod tests {
         assert!(!retired.is_ok() && retired.message().contains("retired"), "{}", retired.message());
         assert!(d.kernel_db().lock().resolve_context("ghost-lane").is_err(), "a refusal creates nothing");
 
-        let cast = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("amy-lane"), s("--type"), s("default")], &caller.with_actor(amy, None)).await;
-        assert!(cast.is_ok(), "a live character directs what it casts: {}", cast.message());
+        let assigned = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("amy-lane"), s("--type"), s("default")], &caller.with_actor(amy, None)).await;
+        assert!(assigned.is_ok(), "a live character directs what it assigns: {}", assigned.message());
     }
 
     #[tokio::test]
@@ -7112,7 +7126,7 @@ mod tests {
         }
     }
 
-    // ── Track D: cast-on-context ─────────────────────────────────────────
+    // ── Track D: slots on the context ──────────────────────────────────
 
     #[tokio::test]
     async fn context_info_and_list_surface_the_model() {
@@ -7244,11 +7258,11 @@ mod tests {
     #[tokio::test]
     async fn context_create_says_when_the_character_has_no_slot() {
         let d = test_dispatcher().await;
-        let parent = register_context(&d, Some("castless-parent"), None, PrincipalId::new());
+        let parent = register_context(&d, Some("slotless-parent"), None, PrincipalId::new());
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         let create = d
-            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("castless-child")], &c)
+            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("slotless-child")], &c)
             .await;
         assert!(create.is_ok(), "create failed: {}", create.message());
         assert!(
@@ -7259,7 +7273,7 @@ mod tests {
 
     /// `--model`, `-m` and `--cast` are gone from `kj context create`, and
     /// `--model`, `--cast` from `kj context set` and `unset`: a model comes
-    /// from the character's cast, copied when its context character is written.
+    /// from the character's slots, copied when its context character is written.
     #[tokio::test]
     async fn the_model_and_cast_flags_are_gone_from_create_set_and_unset() {
         let d = test_dispatcher().await;

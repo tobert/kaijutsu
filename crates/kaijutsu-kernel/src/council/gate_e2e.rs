@@ -389,7 +389,7 @@ enum Base {
     Url(String),
 }
 
-/// One council slot of a seat's cast: `model` on a backend named `backend` of
+/// One council slot of a seat's character: `model` on a backend named `backend` of
 /// `kind`, at `base`.
 #[derive(Clone)]
 struct SlotSpec {
@@ -509,7 +509,7 @@ struct Rig {
     gate_server: String,
 }
 
-/// Bind `character` to a cast with the council slots a seat needs, so an
+/// Give `character` the council slots a seat needs, so an
 /// instance started for it afterwards runs on them: a `gate` slot (the
 /// default one at `gate_server` unless `gate` replaces it), a `judge` slot
 /// when `judge` is given, and a `default` model slot when `chat` is set. The
@@ -707,7 +707,7 @@ impl Rig {
         self.other_seat_on(label, true).await
     }
 
-    /// [`Self::other_seat`] whose cast has a `gate` slot at the rig's server
+    /// [`Self::other_seat`] whose character has a `gate` slot at the rig's server
     /// only when `gate` is set. A seat with no `gate` slot has no council.
     async fn other_seat_on(&self, label: &str, gate: bool) -> CallContext {
         let actor = PrincipalId::new();
@@ -1821,7 +1821,7 @@ async fn one_deadline_bounds_prepare_and_the_decision_together() {
     }
 }
 
-/// A model seat on a tool rig: the performer's cast gives its context a
+/// A model seat on a tool rig: the performer's slots give its context a
 /// `default` slot on the mock model, which records each request,
 /// and `/scratch` is a host directory the commands leave markers in.
 struct Seat {
@@ -3209,7 +3209,7 @@ fn dialogue(rig: &Rig, shadow: kaijutsu_types::ContextId) -> Vec<(kaijutsu_types
     blocks.into_iter().filter(|b| b.role != kaijutsu_types::Role::System).map(|b| (b.role, b.content)).collect()
 }
 
-/// A seat whose cast has a `judge` slot gets one judge shadow, a fork child
+/// A seat whose character has a `judge` slot gets one judge shadow, a fork child
 /// created on the first call the gate evaluates. Each call is a user turn
 /// and what the gate did is the model turn after it, whether a static rule
 /// or the council decided.
@@ -3272,7 +3272,7 @@ async fn a_bump_is_recorded_in_the_shadow_with_its_flavor() {
     rig.finish().await;
 }
 
-/// A seat whose cast has no `judge` slot, or that has no cast, gets no
+/// A seat whose character has no `judge` slot, or that has no character, gets no
 /// shadow.
 #[tokio::test]
 async fn a_seat_without_a_judge_slot_gets_no_shadow() {
@@ -3412,7 +3412,7 @@ fn decisions_in(rig: &Rig, ctx: &CallContext) -> Vec<CouncilDecision> {
 /// that made it.
 ///
 /// Falsified by deciding every seat on one server (server B gets no
-/// decision), or by letting one seat's cast move another seat's decisions.
+/// decision), or by letting one seat's slots move another seat's decisions.
 #[tokio::test]
 async fn a_seat_whose_gate_slot_names_a_council_server_decides_there() {
     for via in BOTH {
@@ -3508,7 +3508,7 @@ async fn a_gate_slot_naming_a_model_the_server_lacks_is_a_miss_naming_it() {
     }
 }
 
-/// A seat whose cast names a council server sends every decision on a
+/// A seat whose character names a council server sends every decision on a
 /// submission there, and the reviewer contexts' observing reads after it:
 /// the shell decision, each program decision, and banto's observation.
 ///

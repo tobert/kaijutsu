@@ -18,7 +18,7 @@ pub const ROOT_CONTEXT_TYPE: &str = "root";
 pub const CONSOLE_CONTEXT_TYPE: &str = "console";
 
 /// The context type of a shell context: a REPL whose draft runs as shell
-/// whatever mode the client sent, with no model and no cast. It is the child
+/// whatever mode the client sent, with no model and no slots. It is the child
 /// of a root context, opened from the client (`docs/character.md`).
 pub const SHELL_CONTEXT_TYPE: &str = "shell";
 

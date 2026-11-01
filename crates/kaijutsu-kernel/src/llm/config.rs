@@ -1,8 +1,7 @@
 //! LLM backend configuration — the in-memory shapes the DB rows resolve into.
 //!
 //! Model configuration is **SQL-native**: `backends` / `backend_models` /
-//! `casts` / `cast_slots` / `model_aliases` /
-//! `embedding_config` in `kernel_db.rs` are the source of truth. There is no
+//! `model_aliases` / `embedding_config` in `kernel_db.rs` are the source of truth. There is no
 //! TOML anywhere in this path (`models.toml` was demolished, along with the
 //! config document that carried it). These types are what a row *becomes* once read,
 //! and what the registry is built from.
@@ -369,7 +368,7 @@ impl BackendConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Aliases, tunables, casts
+// Aliases, tunables, slots
 // ---------------------------------------------------------------------------
 
 /// A model alias maps a short name to a specific backend + model.
@@ -380,8 +379,8 @@ pub struct ModelAlias {
     pub model: String,
 }
 
-/// The request parameters of a model: a `backend_models` row's, a cast
-/// slot's, or a binding slot's.
+/// The request parameters of a model: a `backend_models` row's, a
+/// character slot's, or a binding slot's.
 ///
 /// `None` means the request omits the parameter, which is a real answer, not
 /// a missing one: kaijutsu supplies no value of its own.

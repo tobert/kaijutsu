@@ -263,7 +263,7 @@ impl Palette {
 pub struct BlockView<'a> {
     /// Who is speaking, for the role divider — a principal's display name,
     /// the model, or the tool. Resolved by the caller, which is the only
-    /// side that knows the identity and the cast.
+    /// side that knows the identity and the performer.
     pub speaker: &'a str,
     /// The context's rc bucket, for the role divider.
     pub context_type: &'a str,
@@ -744,7 +744,7 @@ struct Entry {
 /// The block's own version is not enough: the divider carries the speaker,
 /// the context type, the stamp and a tool call's argument, an `Error` block's
 /// provenance line reads the lineage, and a result's body reads `output`,
-/// `stderr` and `style_spans`. A cast rename or a rehydrate moves those with
+/// `stderr` and `style_spans`. A performer rename or a rehydrate moves those with
 /// the block's own fields untouched, and a key that missed them would serve
 /// the stale render for the life of the block.
 ///
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     /// The key covers everything [`render_block`] reads, not the block's own
-    /// fields alone: a cast change renames the speaker with the block
+    /// fields alone: a performer change renames the speaker with the block
     /// untouched, and a rehydrate can flip the divider and the lineage the
     /// same way. A cache that missed those served a stale render forever.
     #[test]

@@ -412,7 +412,7 @@ Step 5 (context characters):
   after the first build); `characters.root_ctx` stays, as the root console's pointer;
   `presets.cast_id` and `presets.system_prompt`; tables `casts`, `cast_slots` and `llm_defaults`; and the
   unreleased `turns.cast_label` and `turns.model_source`, which never reached a deployed database. The
-  `senpai_migration_report` table stays: `kj senpai show` prints a context's notes until its senpai is set again.
+  `senpai_migration_report` table stays: `kj context info` prints a context's notes until its senpai is set again.
 - `kj cast` (every subcommand; `kj character slot set|unset|list` replaces `kj cast slot`) and
   `kj character set --cast`.
 - `kj context set --as|--model|--cast` and `kj context unset --model|--cast`; `kj context create --cast`;
@@ -454,7 +454,7 @@ Presets keep only their fork filters (`kj fork --preset full|window|spawn`).
 The migration runs once, in one transaction, after the context character migration, which reads the casts the
 migration then drops. It records every value it drops and every context
 it cannot map in `context_character_migration_report` (kinds: `dropped`, `unmapped`, `no_slot`, `no_gate_slot`,
-`no_distill_slot`, `no_character_slot`), which `kj senpai show` reads. `character-slots-v1` logs a character that
+`no_distill_slot`, `no_character_slot`), which `kj context info` prints for the context. `character-slots-v1` logs a character that
 plays live contexts and has no slot after the move, rather than writing the report. It never invents a value: each row it
 writes records an answer the old code would have given. The one exception is a judge shadow's character, which
 the old row did not have; the new model requires it, and it is the character of the context the shadow judges.

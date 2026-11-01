@@ -1712,8 +1712,8 @@ pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
 }
 
 /// The backend and model of the `role` slot of `seat`. `None` when the seat
-/// has no context character or no `role` slot: the cast the slots were
-/// copied from is not read again.
+/// has no context character or no `role` slot: the character the slots
+/// were copied from is not read again.
 pub(crate) fn seat_slot_backend(
     db: &crate::kernel_db::KernelDb,
     seat: ContextId,

@@ -1425,13 +1425,6 @@ async fn resource_updated_threads_child_block_and_llm_sees_it() {
     );
 }
 
-// Silence unused-import / Duration warnings if future edits remove the
-// timeout-style test.
-#[allow(dead_code)]
-fn _touch() -> Duration {
-    Duration::from_secs(0)
-}
-
 // ============================================================================
 // Phase 5 M5 — end-to-end binding management scenarios
 // ============================================================================

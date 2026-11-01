@@ -595,7 +595,7 @@ impl MountTable {
 
             for entry in entries {
                 let reserved = budget
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
                     .is_ok();
                 if !reserved {
                     node.truncated_here = true;

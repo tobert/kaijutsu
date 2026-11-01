@@ -40,8 +40,8 @@
 //!   lane's ask resolves to `banto` as the character responsible for the
 //!   seat that forked it — see the assertions below and
 //!   `docs/character.md`, "Roots and rotation".
-//! - **Each lane runs its coder's cast.** A lane is `kj context create <coder>
-//!   --name <lane> --type coder`, so its slots are copied from the cast its
+//! - **Each lane runs its coder's slots.** A lane is `kj context create <coder>
+//!   --name <lane> --type coder`, so its slots are copied from the slots its
 //!   coder character names (`kj character slot set <coder>`), and its
 //!   `coder` slot gives it `mock-coder-a` or `mock-coder-b`.
 //! - **banto starts its own lanes.** `kj context create <coder> --name <lane>`
@@ -138,7 +138,7 @@ struct Scenario {
     amy: KernelHandle,
     amy_principal: PrincipalId,
     kernel: SharedKernel,
-    /// Amy's own out-of-band context: character/cast setup, rotation, and
+    /// Amy's own out-of-band context: character/slot setup, rotation, and
     /// ledger answers all run here, never inside banto's context — so none
     /// of it can be caught by a hook scoped to banto's context id.
     amy_home: ContextId,
@@ -187,7 +187,7 @@ impl Drop for MockScriptDirGuard {
 
 /// Boot a server with `KJ_MOCK_SCRIPT_DIR` pointed at this crate's
 /// `tests/mock_scripts/` fixtures, a mock backend seeded (the scenario's
-/// contexts run the models their characters' casts give them), and one real SSH credential bound to a
+/// contexts run the models their characters' slots give them), and one real SSH credential bound to a
 /// character named `amy`, whose context banto's seat is created from
 /// (`docs/approval-identity.md`).
 async fn boot() -> Scenario {
@@ -262,7 +262,7 @@ async fn boot() -> Scenario {
 
     let amy_client = connect_with_key(addr, amy_key, "amy").await;
     let (amy, _) = amy_client.bind_kernel().await.expect("bind_kernel");
-    // `director` rc grants `config-write` (character/cast administration)
+    // `director` rc grants `config-write` (character/slot administration)
     // and the `drive`/`fork`/`drift` verb authorities — amy's own admin
     // seat needs the same loadout banto's seat gets, not the bare "default"
     // type's narrower grant (`assets/defaults/rc/director/create/S10-binding.kai`).
@@ -333,7 +333,7 @@ fn kaijutsu_session_scenario() {
         let s = boot().await;
 
         // ------------------------------------------------------------
-        // Setup: characters, cast, banto's seat.
+        // Setup: characters, slots, banto's seat.
         // ------------------------------------------------------------
         s.kj("kj character create banto").await;
         s.kj("kj character create coder-a").await;

@@ -36,8 +36,6 @@ against the code unless marked:
 - Two meanings of "root console": `ContextRow::is_root_console` (type `console`, label `ROOT`) vs
   `KernelDb::is_root_console` (`characters.root_ctx`). The drift hold uses the first (kj/drift.rs ~344), so a
   drift into a human root's console is not held.
-- `context_character_migration_report` has a writer and no reader; `kj context info` reads the older
-  `senpai_migration_report`, as `kj senpai show` did.
 - `kj ledger list --reviewer` and the director `rotate` rc lifecycle are documented in docs/senpai-kohai.md and
   not built (`VERB_ROTATE` fires only from the beat scheduler).
 - The builtin `kj context create --type mcp` allow cannot see the caller, so the character it names may be one with a
@@ -123,7 +121,6 @@ TUI entries below). Open:
     `kj kohai` key kept apart. No shipped file does this.
   - `ensure_legacy_cast_tables` and the pre-character columns commit before the migrations that read them can
     refuse, so a refused open leaves two empty cast tables behind.
-  - `context_character_migration_report()` has no production reader.
 - Load-dependent flakes seen in full-suite runs and green alone, at
   `bd1dc251` plus the review fixes: `council::gate_e2e::a_council_miss_asks_and_records_its_cause`,
   `a_contained_model_commits_with_real_git`, and `a_learned_allow_beats_a_config_deny_added_later`.

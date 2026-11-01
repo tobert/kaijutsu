@@ -18,8 +18,7 @@ use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
 
 use crate::kj::{KjCaller, KjDispatcher, KjResult};
-#[allow(unused_imports)]
-use kaijutsu_types::{ContentType, ContextId, PrincipalId, SessionId};
+use kaijutsu_types::{ContentType, ContextId};
 
 use super::context_engine::{SessionContextExt, SessionContextMap};
 use super::context_shell::ShellIdentity;
@@ -735,7 +734,7 @@ mod tests {
     use crate::kj::test_helpers::{register_context, test_dispatcher, test_dispatcher_rc};
     use crate::runtime::context_engine::session_context_map;
     use crate::runtime::embedded_kaish::EmbeddedKaish;
-    use kaijutsu_types::SessionId;
+    use kaijutsu_types::{PrincipalId, SessionId};
     use kaish_kernel::ast::Value;
     use kaish_kernel::ExecuteOptions;
 

@@ -998,10 +998,9 @@ fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<St
 /// Initialize a kernel's LLM registry from the kernel database.
 ///
 /// Model configuration is SQL-native (`backends` / `backend_models` /
-/// `casts` / `cast_slots` / `model_aliases` /
-/// `embedding_config`). There is no `models.toml`, no kernel config document, and no
+/// `model_aliases` / `embedding_config`). There is no `models.toml`, no kernel config document, and no
 /// host file in this path. A kernel ships no backends: until an operator runs
-/// `kj backend set` and gives a cast a slot on it, the registry is empty and a
+/// `kj backend set` and gives a character a slot on it, the registry is empty and a
 /// model turn fails with how to configure one.
 ///
 /// Returns the embedding config if one is set and enabled.
@@ -1038,7 +1037,7 @@ async fn initialize_kernel_models(
     if registry.list().is_empty() {
         log::warn!(
             "No LLM backend is registered, so model turns fail until an operator runs \
-             `kj backend set` and gives a cast a slot on it"
+             `kj backend set` and gives a character a slot on it"
         );
     }
     *kernel.llm().write().await = registry;
@@ -3592,7 +3591,7 @@ impl kernel::Server for KernelImpl {
                     }
                 };
 
-                // Context → the model its binding gives its type, and the cast
+                // Context → the model its binding gives its type, and the character
                 // the binding was written from. Resolved ONCE for the whole
                 // listing, never per row, from the binding and nothing else.
                 let bound_by_ctx: HashMap<ContextId, kaijutsu_kernel::ContextModelLookup> = {

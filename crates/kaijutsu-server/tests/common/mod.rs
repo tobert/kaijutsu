@@ -15,6 +15,7 @@ use kaijutsu_server::{SshServer, SshServerConfig};
 use kaijutsu_types::{BlockId, BlockKind, BlockQuery, ContextId, Status};
 
 /// Run async test code on a single-threaded runtime with LocalSet (capnp-rpc requirement).
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -103,7 +104,7 @@ pub async fn start_server_with_host_exec() -> SocketAddr {
 }
 
 /// Seed a `mock`-kind backend into the kernel DB at `data_dir`, and a `mock`
-/// cast that runs it for every context type a test creates, which the
+/// slot set that runs it for every context type a test creates, which the
 /// ephemeral performer plays, so `initialize_kernel_models()` brings up a
 /// registry a test can drive without a live provider and a context made as
 /// [`PERFORMER`] binds a model.
@@ -190,13 +191,13 @@ pub async fn bootstrap_mock(config: &SshServerConfig, model: &str) {
         console_performer: "root".to_string(),
     };
     kaijutsu_server::bootstrap::bootstrap(config, &opts).await.expect("bootstrap the test kernel");
-    // A test's contexts are made by the ephemeral performer, whose cast runs
+    // A test's contexts are made by the ephemeral performer, whose slots run
     // the mock model for every context type.
     seed_mock_backend_with_model(data_dir, model);
 }
 
 /// Start a server whose ephemeral kernel DB carries a mock LLM backend and a
-/// cast the ephemeral performer plays.
+/// slot set the ephemeral performer plays.
 ///
 /// This makes `initialize_kernel_models()` register a "mock" backend so that
 /// model turns and other LLM-dependent paths work in tests.
@@ -275,7 +276,7 @@ pub fn seed_turn_identity(
     performer.principal_id
 }
 
-/// Like `start_server_with_mock_llm`, but the cast's model is caller-chosen
+/// Like `start_server_with_mock_llm`, but the slots' model is caller-chosen
 /// instead of hardcoded to `"mock-model"`.
 ///
 /// The model must be in place before any context is created — a context binds
@@ -532,7 +533,7 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
         .expect("RPC client init failed")
 }
 
-/// The live, non-root character `create_context` casts: the ephemeral
+/// The live, non-root character `create_context` assigns: the ephemeral
 /// kernel's own (`SshServerConfig::EPHEMERAL_PERFORMER`), since its root
 /// performs only its root console.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.

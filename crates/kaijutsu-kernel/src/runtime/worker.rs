@@ -285,8 +285,7 @@ pub(crate) struct RuntimePool {
     /// Kept alive so `admission`'s reservations never see the channel as
     /// closed. Never read: nothing is ever sent, so there is nothing to
     /// receive.
-    #[allow(dead_code)]
-    admission_receiver: tokio::sync::mpsc::Receiver<()>,
+    _admission_receiver: tokio::sync::mpsc::Receiver<()>,
     admission_capacity: usize,
     shutdown: CancellationToken,
     worker_threads: usize,
@@ -328,7 +327,7 @@ impl RuntimePool {
             tokio::task::spawn_blocking(move || supervisor.join().map_err(|_| "runtime worker supervisor panicked".to_string())?)
                 .await.map_err(|error| format!("runtime worker join failed: {error}"))?
         }.boxed().shared();
-        Ok(Self { queue, admission, admission_receiver, admission_capacity, shutdown, worker_threads: threads, threads: ids, joined })
+        Ok(Self { queue, admission, _admission_receiver: admission_receiver, admission_capacity, shutdown, worker_threads: threads, threads: ids, joined })
     }
 
     pub(crate) fn worker_threads(&self) -> usize { self.worker_threads }

@@ -127,7 +127,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         privileged: false,
         cancel: tokio_util::sync::CancellationToken::new(),
     };
-    // The context is an instance of a live, non-root character; a root cannot be cast.
+    // The context is an instance of a live, non-root character; a root cannot be assigned as a performer.
     {
         let db = h.db.lock();
         if db.get_character_by_name("performer").unwrap().is_none() {

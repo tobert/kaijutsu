@@ -218,7 +218,6 @@ pub struct RequestTool {
 /// disable tools for a turn).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)] // variants reserved for Phase 2.5+
 pub enum ToolChoice {
     Auto,
     Any,
@@ -273,7 +272,6 @@ pub struct BlockBinding {
 /// after it, and the request goes on; `"error"` fails it with a 400.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Error is the API's other value; we always send DropBlock
 pub enum PrefixMismatchBehavior {
     DropBlock,
     Error,
@@ -291,7 +289,6 @@ pub struct OutputConfig {
 /// Visibility of thinking text in responses (`thinking.display`).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Omitted reserved for explicit override
 pub enum ThinkingDisplay {
     Summarized,
     Omitted,

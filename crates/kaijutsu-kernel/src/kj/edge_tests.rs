@@ -181,6 +181,43 @@ async fn context_info_prints_the_migration_note_until_the_senpai_is_set_again() 
     assert!(self::data(&shown)["migration_note"].is_null());
 }
 
+/// The context-character migration's notes for a context print with the
+/// senpai migration's, and only that context's.
+#[tokio::test]
+async fn context_info_prints_the_context_character_migration_notes() {
+    let d = test_dispatcher().await;
+    let h = house(&d);
+    {
+        let db = d.kernel_db().lock();
+        for (kind, context, note) in [
+            ("no_slot", Some(h.lane), "has no slot for its type"),
+            ("dropped", Some(h.lane), "dropped a model override"),
+            ("unmapped", Some(h.seat), "belongs to another context"),
+            ("dropped", None, "belongs to no context"),
+        ] {
+            db.conn_for_ledger().execute(
+                "INSERT INTO context_character_migration_report (kind, context_id, note, recorded_at) VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![kind, context.map(|c| c.as_bytes().to_vec()), note],
+            ).unwrap();
+        }
+    }
+    let shown = d.dispatch(&[s("context"), s("info"), h.lane.to_hex()], &caller(h.amy, h.root)).await;
+    assert!(shown.is_ok(), "{}", shown.message());
+    let text = shown.message();
+    assert!(text.contains("Character migration note (no_slot): has no slot for its type"), "{text}");
+    assert!(text.contains("Character migration note (dropped): dropped a model override"), "{text}");
+    assert!(!text.contains("another context") && !text.contains("no context"), "{text}");
+    let notes = self::data(&shown)["character_migration_notes"].clone();
+    assert_eq!(notes, serde_json::json!([
+        { "kind": "no_slot", "note": "has no slot for its type" },
+        { "kind": "dropped", "note": "dropped a model override" },
+    ]));
+    assert!(self::data(&shown)["migration_note"].is_null(), "the senpai note is its own key");
+
+    let other = d.dispatch(&[s("context"), s("info"), h.root.to_hex()], &caller(h.amy, h.root)).await;
+    assert_eq!(self::data(&other)["character_migration_notes"], serde_json::json!([]));
+}
+
 #[tokio::test]
 async fn kohai_list_lists_the_live_kohai_with_type_and_performer() {
     let d = test_dispatcher().await;

@@ -653,7 +653,7 @@ pub async fn known_context_types(vfs: &crate::vfs::MountTable) -> Result<Vec<Str
 }
 
 /// Refuse a `context_type` with no rc bucket to create a context from, and
-/// a reserved cast role (`model_resolution::RESERVED_ROLES`) always.
+/// a reserved slot role (`model_resolution::RESERVED_ROLES`) always.
 ///
 /// When the rc tree lists no types at all — nothing mounted, or an empty
 /// tree — every type is accepted: there is nothing to validate against, and

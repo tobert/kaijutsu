@@ -1439,7 +1439,7 @@ pub(crate) mod test_helpers {
         *REVIEWER.get_or_init(PrincipalId::new)
     }
 
-    /// The live, non-root character `kj context create` casts in tests; its type is `default`.
+    /// The live, non-root character `kj context create` assigns in tests; its type is `default`.
     pub const TEST_PERFORMER: &str = "kohai-tester";
 
     /// Insert [`TEST_PERFORMER`] unless it exists.

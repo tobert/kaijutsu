@@ -111,7 +111,6 @@ struct ClientHandler {
     host: String,
     port: u16,
     insecure: bool,
-    #[allow(dead_code)]
     server_key: Option<PublicKey>,
 }
 

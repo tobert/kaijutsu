@@ -1098,7 +1098,7 @@ impl BlockStore {
         record: impl FnOnce(&KernelDb, &T) -> crate::kernel_db::KernelDbResult<()>,
     ) -> BlockStoreResult<T> {
         #[cfg(test)]
-        if self.fail_accept_countdown.fetch_update(
+        if self.fail_accept_countdown.try_update(
             std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
             |remaining| remaining.checked_sub(1),
         ) == Ok(1) {

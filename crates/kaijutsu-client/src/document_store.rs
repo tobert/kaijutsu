@@ -39,7 +39,6 @@ use crate::{ContextMirror, FeedEvent, MirrorError};
 /// A cached document for a single context: its change-feed mirror, the live
 /// feed receiver that keeps it current, and the bookkeeping the store needs
 /// to pick eviction victims.
-#[allow(dead_code)]
 pub struct DocumentEntry {
     /// The context's projected block state, maintained from the change feed
     /// (docs/change-feed.md). No text engine lives here.
@@ -176,7 +175,6 @@ pub enum FeedSignal {
 // together in kaijutsu-client. App, TUI, and ACP still coordinate them separately.
 // Keep each client's retry/release presentation policy at its call site.
 // See docs/issues.md, "Shared client recovery".
-#[allow(dead_code)]
 pub struct DocumentStore {
     /// Map from context_id → cached document state.
     documents: HashMap<ContextId, DocumentEntry>,
@@ -199,7 +197,6 @@ impl Default for DocumentStore {
     }
 }
 
-#[allow(dead_code)]
 impl DocumentStore {
     /// Get the active context ID.
     pub fn active_id(&self) -> Option<ContextId> {

@@ -1,6 +1,5 @@
 /// Make `name` a live root character in `data_dir`'s `kernel.db`, the way
 /// `kaijutsu-server init` does, so `create_shared_kernel` will start.
-#[allow(dead_code)]
 pub fn init_root(data_dir: &std::path::Path, name: &str) -> kaijutsu_types::PrincipalId {
     let principal_id = kaijutsu_types::PrincipalId::new();
     let db = kaijutsu_kernel::KernelDb::open(data_dir.join("kernel.db")).unwrap();

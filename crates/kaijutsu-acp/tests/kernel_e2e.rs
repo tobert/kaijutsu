@@ -192,9 +192,9 @@ async fn serve_kernel(
         })
         .expect("create the performer");
         // A session's model is the slot for its context type in its character's
-        // cast: `mcp` is the type the bridge registers.
+        // slots: `mcp` is the type the bridge registers.
         db.seed_test_slot_entries(performer, &[("coder", "mock", "mock-model"), ("mcp", "mock", "mock-model")])
-            .expect("give the performer a cast");
+            .expect("give the performer slots");
     }
     let mock = MockClient::new("").with_scripted_stream(script);
     shared.kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));

@@ -11,7 +11,7 @@ use kaijutsu_types::ContextId;
 use crate::kernel_db::{ContextSlotRow, KernelDb, KernelDbError, KernelDbResult};
 use crate::llm::SlotTunables;
 
-/// Cast slot roles that are not context types. The `gate` slot names the
+/// Slot roles that are not context types. The `gate` slot names the
 /// council server for gate decisions, `judge` the server for the judge
 /// shadow, and `distill` the model that summarizes a fork. No context takes a
 /// chat model from them, and no context may have one as its type.

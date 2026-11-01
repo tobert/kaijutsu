@@ -715,7 +715,7 @@ fn test_rpc_created_context_runs_rc_create() {
 ///
 /// Worth having beyond "it emits a block": `assistant` is a brand-new rc
 /// bucket, and nothing registers context types anywhere — a bucket is just a
-/// directory name, and model resolution falls through when no cast claims the
+/// directory name, and model resolution falls through when no slot claims the
 /// role. So the only thing standing between "the seat works" and "the seat
 /// silently does nothing" is that the directory is spelled right and seeded.
 /// This is the test that fails if the bucket is renamed or dropped from the

@@ -10,7 +10,7 @@
 //! The kernel ships **no aliases**. The old shipped set (`fast`/`smart`/
 //! `best`/`ds-*`/`local`/…) encoded guesses about which model deserves which
 //! adjective, and they went stale — `default` pointed at a retired model id
-//! for a while. Aliases are operator/agent data now, like casts.
+//! for a while. Aliases are operator/agent data now, like character slots.
 //!
 //! `LlmRegistry::resolve_alias` reads the snapshot this verb rebuilds, so an
 //! alias change is live on the next lookup (`kj price`).

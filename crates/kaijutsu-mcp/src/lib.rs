@@ -2077,7 +2077,7 @@ impl KaijutsuMcp {
 
     /// Choose the parent for a new session context and the performer to
     /// record. The performer is this connection's character. A root has no
-    /// model and cannot be cast, so a root connection refuses. An `mcp`
+    /// model and cannot be assigned as a performer, so a root connection refuses. An `mcp`
     /// session created from a root console lands under that root's MCP hub.
     async fn prepare_session_create(
         &self,
