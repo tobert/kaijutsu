@@ -131,7 +131,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
     {
         let db = h.db.lock();
         if db.get_character_by_name("performer").unwrap().is_none() {
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: "performer".to_string(),
                 created_at: 0,
@@ -143,7 +143,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
             .unwrap();
         }
     }
-    let argv: Vec<String> = ["context", "create", "--as", "performer", label, "--type", context_type]
+    let argv: Vec<String> = ["context", "create", "performer", "--name", label, "--type", context_type]
         .iter()
         .map(|s| s.to_string())
         .collect();

@@ -21,7 +21,7 @@ pub(crate) const HUMAN_ROOT_REFUSAL: &str = "The human root runs no model turns.
 /// about the reviewer, which is not the repair the caller needs.
 pub(crate) fn require_performer(actor: Option<PrincipalId>) -> Result<PrincipalId, String> {
     actor.ok_or_else(||
-        "No performer assigned: this context has no context character. A context gets its character when it is made, with 'kj context create --as <character>'.".to_string()
+        "No performer assigned: this context has no context character. A context gets its character when it is made, with 'kj context create <character>'.".to_string()
     )
 }
 
@@ -50,7 +50,7 @@ mod tests {
 
     fn character(db: &KernelDb, name: &str) -> PrincipalId {
         let principal_id = PrincipalId::new();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id, name: name.into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();

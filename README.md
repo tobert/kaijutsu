@@ -112,7 +112,7 @@ client's shell:
 kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY --api-key-file ~/.deepseek-key
 kj backend model set deepseek deepseek-flash --context-window 1000000 --max-tokens 65536 --effort high
 kj character slot set <character> coder --backend deepseek --model deepseek-flash
-kj context create <label> --as <character> --type coder
+kj context create <character> --name <label> --type coder
 
 # Anthropic
 kj backend set anthropic --kind anthropic --api-key-env ANTHROPIC_API_KEY --api-key-file ~/.anthropic-key.txt

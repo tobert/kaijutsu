@@ -68,7 +68,7 @@ fn a_non_root_registration_lands_under_the_hub_and_archives_itself_with_no_ask()
         });
         let kernel = kernel_rx.await.unwrap();
         for (name, principal_id, _) in &keys {
-            kernel.kernel_db.lock().insert_character(&CharacterRow {
+            kernel.kernel_db.lock().insert_character(&CharacterRow { context_type: None,
                 principal_id: *principal_id, name: (*name).into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();

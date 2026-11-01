@@ -242,7 +242,7 @@ allow = [
 
 [context_type.director]
 allow = [
-  "kj context create",     # a director creates its kohai lanes, `--type coder --as coder`
+  "kj context create",     # a director creates its kohai lanes, `kj context create coder --name <lane>`
   "kj fork",             # a fork copies this seat's own performer and type
   "kj drive",            # runs a turn on a lane this seat directs
 ]

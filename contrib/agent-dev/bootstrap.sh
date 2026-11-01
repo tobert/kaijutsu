@@ -130,11 +130,11 @@ python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel
 
 # The kernel passes only HOME, PATH and context exports to the programs a context runs, so set the locale at create.
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
-kj context create "$project-banto" --type director --as banto --cwd "$repo" --env LANG=C.UTF-8
+kj context create banto --name "$project-banto" --type director --cwd "$repo" --env LANG=C.UTF-8
 # The coder is a character instance that answers to banto's instance (its senpai), so banto's character reviews its
 # asks, and a drift either way between their conversations, or a `kj drift report`, needs no ask. Banto starts the
 # coder's turns with `kj drive`.
-kj context create "$project-coder" --type coder --as "$project-coder" --senpai "$project-banto" --cwd /workspace --env LANG=C.UTF-8
+kj context create "$project-coder" --type coder --senpai "$project-banto" --cwd /workspace --env LANG=C.UTF-8
 kj context list
 
 echo

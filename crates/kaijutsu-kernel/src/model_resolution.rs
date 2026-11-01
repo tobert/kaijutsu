@@ -104,7 +104,7 @@ impl NoModel {
         match &self.reason {
             NoModelReason::NoContextCharacter => format!(
                 "{} has no context character, so it {what}. Start one: \
-                 `kj context create <label> --as <character> --type <type>`",
+                 `kj context create <character> [--name <label>] [--type <type>]`",
                 self.context
             ),
             NoModelReason::NoSlot => format!(

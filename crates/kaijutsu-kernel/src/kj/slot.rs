@@ -673,7 +673,7 @@ mod tests {
 
         d.kernel_db()
             .lock()
-            .insert_character(&crate::kernel_db::CharacterRow {
+            .insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: "boss".into(),
                 created_at: 0,

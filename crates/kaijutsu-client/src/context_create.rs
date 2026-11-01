@@ -122,11 +122,11 @@ pub fn context_create_argv_under(
 ) -> Vec<String> {
     let mut argv = vec![
         "context".to_string(), "create".to_string(),
+        performer.to_string(),
+        "--name".to_string(),
         label.to_string(),
         "--type".to_string(),
         context_type.to_string(),
-        "--as".to_string(),
-        performer.to_string(),
     ];
     if let Some(cwd) = cwd {
         argv.push("--cwd".to_string());
@@ -470,11 +470,11 @@ mod tests {
     fn argv_always_names_the_performer_and_names_the_cwd_only_when_given() {
         assert_eq!(
             context_create_argv("lane", "coder", "coder", None),
-            ["context", "create", "lane", "--type", "coder", "--as", "coder"]
+            ["context", "create", "coder", "--name", "lane", "--type", "coder"]
         );
         assert_eq!(
             context_create_argv("lane", "coder", "coder", Some("/app")),
-            ["context", "create", "lane", "--type", "coder", "--as", "coder", "--cwd", "/app"]
+            ["context", "create", "coder", "--name", "lane", "--type", "coder", "--cwd", "/app"]
         );
     }
 
@@ -508,7 +508,7 @@ mod tests {
     fn argv_names_the_forked_from_context_only_when_given() {
         assert_eq!(
             context_create_argv_under("s", "mcp", "claude", Some("/app"), Some("mcp/amy")),
-            ["context", "create", "s", "--type", "mcp", "--as", "claude", "--cwd", "/app", "--parent", "mcp/amy"]
+            ["context", "create", "claude", "--name", "s", "--type", "mcp", "--cwd", "/app", "--parent", "mcp/amy"]
         );
         assert_eq!(
             context_create_argv_under("s", "mcp", "claude", None, None),

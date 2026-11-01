@@ -8031,7 +8031,7 @@ mod lifetime_tests {
         {
             let db = kernel.kernel_db().lock();
             for (id, name) in [(actor, "performer"), (reviewer, "reviewer")] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();

@@ -59,8 +59,8 @@ pub fn extract_all_named_args(argv: &[String], names: &[&str]) -> Vec<String> {
 /// Rewrite a trailing bare `help` token to `--help` so clap renders the leaf
 /// subcommand's help instead of binding `help` as a positional value.
 ///
-/// Guards the footgun where `kj context create help` silently mints a context
-/// labelled "help" (the verb's positional `label` swallows the bare token,
+/// Guards the footgun where `kj context create help` is read as the character
+/// named "help" (the verb's positional `character` swallows the bare token,
 /// since the clap structs `disable_help_subcommand`). We only touch a `help`
 /// that is **last** and **not the value of a preceding flag** — so
 /// `kj context create --name help` (a deliberate "help" label via `--name`)
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn normalize_trailing_help_rewrites_bare_positional() {
         // The footgun: `kj context create help` — without rewrite, `help` is the
-        // positional label and a context named "help" is born.
+        // positional character.
         let argv = vec![s("context"), s("create"), s("help")];
         assert_eq!(
             normalize_trailing_help(&argv),

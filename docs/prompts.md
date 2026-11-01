@@ -200,9 +200,9 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 
-`kj context create banto --type director --as banto` starts a character
-instance of banto, while `created_by` remains the requester. `--as` is
-required; the character must exist and be live, and unknown or retired names
+`kj context create banto --type director` starts a character
+instance of banto, while `created_by` remains the requester. The character is
+the positional and is required; it must exist and be live, and unknown or retired names
 fail before creating a context. The caller's instance becomes its senpai, and
 the reviewer follows that edge
 (`docs/approval-identity.md`). Model output and tools use the performer;
@@ -515,7 +515,7 @@ player was looking at an older point in the conversation than the log tail. See 
 
 ## Migration and comparison
 
-Deploy the `--as` implementation and metadata-reading director/handoff scripts
+Deploy the character-positional implementation and metadata-reading director/handoff scripts
 together, and the `kj context create` verbs with the rc and contrib scripts that call them. A kernel that lacks the flag cannot create the intended performer
 relationship. Replace contexts using the old `KJ_CHARACTER` bridge with verified
 successors as described above; changing the seed does not rewrite their stored

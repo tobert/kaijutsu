@@ -28,7 +28,7 @@ fn house(d: &KjDispatcher) -> House {
     let amy = test_reviewer_principal();
     let [banto, coder, sibling, judge] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
     for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
     }
@@ -208,7 +208,7 @@ async fn kohai_list_lists_the_live_kohai_with_type_and_performer() {
 async fn context_create_makes_a_context_character_under_the_callers_context() {
     let d = test_dispatcher().await;
     let h = house(&d);
-    let made = d.dispatch(&[s("context"), s("create"), s("--as"), s("coder"), s("fresh")], &caller(h.banto, h.seat)).await;
+    let made = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("fresh"), s("--type"), s("default")], &caller(h.banto, h.seat)).await;
     assert!(made.is_ok(), "{}", made.message());
 
     let db = d.kernel_db().lock();
@@ -230,7 +230,7 @@ async fn context_create_senpai_needs_the_caller_to_hold_it_or_be_its_root() {
     let d = test_dispatcher().await;
     let h = house(&d);
     let create = |label: &str, extra: &[&str]| {
-        let mut argv = vec![s("context"), s("create"), s("--as"), s("kohai-tester"), s(label)];
+        let mut argv = vec![s("context"), s("create"), s("kohai-tester"), s("--name"), s(label)];
         argv.extend(extra.iter().map(|a| s(a)));
         argv
     };
@@ -299,11 +299,11 @@ async fn drift_report_drifts_the_text_to_the_senpai_and_needs_no_id() {
 async fn context_create_needs_a_live_character_caller() {
     let d = test_dispatcher().await;
     let h = house(&d);
-    let nobody = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(PrincipalId::new(), h.root)).await;
+    let nobody = d.dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("orphan")], &caller(PrincipalId::new(), h.root)).await;
     assert!(!nobody.is_ok());
     assert!(nobody.message().contains("no character sheet"), "{}", nobody.message());
     d.kernel_db().lock().retire_character(h.sibling, 1).unwrap();
-    let retired = d.dispatch(&[s("context"), s("create"), s("--as"), s("kohai-tester"), s("orphan")], &caller(h.sibling, h.other)).await;
+    let retired = d.dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("orphan")], &caller(h.sibling, h.other)).await;
     assert!(!retired.is_ok() && retired.message().contains("is retired"), "{}", retired.message());
     assert!(d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none());
 }

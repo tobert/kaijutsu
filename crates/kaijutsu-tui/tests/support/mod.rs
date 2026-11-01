@@ -162,7 +162,8 @@ pub fn kernel_drafts(server: &EphemeralServer) -> Vec<String> {
     })
 }
 
-/// Check that every context but the root seat has a performer, so a submit
+/// Check that every context but the root seat and its model-less MCP hub
+/// has a performer, so a submit
 /// is accepted rather than refused before it commits. The client under test
 /// creates its contexts as the ephemeral kernel's performer character
 /// (`--character`), so they have one. The ephemeral kernel has no model, so
@@ -171,7 +172,10 @@ pub fn cast_a_performer(server: &EphemeralServer) {
     with_kernel(server, async |kernel| {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
-        for info in contexts.iter().filter(|info| info.id != root) {
+        let played = contexts
+            .iter()
+            .filter(|info| info.id != root && info.context_type != kaijutsu_types::MCP_HUB_CONTEXT_TYPE);
+        for info in played {
             let result = kernel
                 .execute_kj_quiet(root, &["context".to_string(), "info".to_string(), info.id.to_hex()])
                 .await
@@ -211,7 +215,7 @@ pub fn drift_into_a_root_console(server: &EphemeralServer, text: &str) {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
         for argv in [
-            vec!["context", "create", "ROOT", "--type", "console", "--as", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER],
+            vec!["context", "create", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER, "--name", "ROOT", "--type", "console"],
             vec!["drift", "push", "ROOT", text],
         ] {
             let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();

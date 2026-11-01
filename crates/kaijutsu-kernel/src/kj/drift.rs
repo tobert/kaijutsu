@@ -448,7 +448,7 @@ impl KjDispatcher {
             .map_err(|e| format!("could not read the console's character: {e}"))?
             .ok_or_else(|| format!(
                 "ROOT has no context character, so nobody answers for it and a drift into it has no reviewer; \
-                 `kj context create ROOT --type console --as <character>` makes one"
+                 `kj context create <character> --name ROOT --type console` makes one"
             ))?
             .principal_id;
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(target_ctx, performer))
@@ -1480,7 +1480,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(amy, "house-amy", true), (rootbot, "house-rootbot", false), (coder, "house-coder", false)] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
                 }).unwrap();
             }

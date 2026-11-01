@@ -4,7 +4,7 @@
 #
 # Read the performer's handoff log when `played_by` names a character.
 # Without a performer, read the caller's own log. Requester and performer
-# can differ when a person creates a model context with `--as`.
+# can differ when a person creates a context of a character.
 #
 # This injects what the last session left: what I was doing and what is
 # waiting.

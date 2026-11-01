@@ -10796,7 +10796,7 @@ mod tests {
         let db = db.lock();
         match db.get_character(ctx.actor_id).unwrap() {
             Some(_) => db.update_character_root(ctx.actor_id, true).unwrap(),
-            None => db.insert_character(&crate::kernel_db::CharacterRow {
+            None => db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: ctx.actor_id, name: format!("root-{}", ctx.actor_id), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
             }).unwrap(),
@@ -11592,7 +11592,7 @@ mod tests {
         let context_id = crate::kj::test_helpers::register_context(kj, Some(label), None, actor);
         let db = kj.kernel_db();
         let db = db.lock();
-        db.insert_character(&crate::kernel_db::CharacterRow {
+        db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();

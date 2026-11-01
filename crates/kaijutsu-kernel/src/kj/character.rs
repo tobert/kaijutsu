@@ -59,6 +59,11 @@ enum CharacterCommand {
         /// Omit to read it from the model's `kj backend model set` row.
         #[arg(long = "max-tokens", requires = "model")]
         max_tokens: Option<u64>,
+        /// The context type this character usually plays, such as `coder`.
+        /// `kj context create <name>` uses it when `--type` is absent. Default:
+        /// none, and then every create names `--type`. A root has none.
+        #[arg(long = "type", value_name = "CONTEXT_TYPE")]
+        context_type: Option<String>,
     },
     /// List the live (non-retired) characters.
     #[command(alias = "ls")]
@@ -76,7 +81,8 @@ enum CharacterCommand {
         /// The character's name.
         name: String,
     },
-    /// Update a character's sheet: whether it is a root.
+    /// Update a character's sheet: whether it is a root, and the context type
+    /// it usually plays. Name at least one option.
     Set {
         /// The character to update.
         name: String,
@@ -87,6 +93,14 @@ enum CharacterCommand {
         /// Make this character an ordinary one that a model can play.
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
+        /// The context type this character usually plays, such as `coder`.
+        /// `kj context create <name>` uses it when `--type` is absent. A root
+        /// has none.
+        #[arg(long = "type", value_name = "CONTEXT_TYPE", conflicts_with = "no_type")]
+        context_type: Option<String>,
+        /// Clear the character's context type; every create then names `--type`.
+        #[arg(long = "no-type", conflicts_with = "context_type")]
+        no_type: bool,
     },
     /// The model a character runs. A context copies it when it is made, so a
     /// change reaches a running context at `kj context rotate`.
@@ -161,16 +175,16 @@ impl KjDispatcher {
         }
 
         match parsed.command {
-            CharacterCommand::Create { name, root, backend, model, max_tokens } => {
-                self.character_create(&name, root, backend.zip(model), max_tokens, caller).await
+            CharacterCommand::Create { name, root, backend, model, max_tokens, context_type } => {
+                self.character_create(&name, root, backend.zip(model), max_tokens, context_type.as_deref(), caller).await
             }
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Set { name, root, no_root } => {
-                if !root && !no_root {
-                    return KjResult::Err("kj character set: specify --root or --no-root".to_string());
+            CharacterCommand::Set { name, root, no_root, context_type, no_type } => {
+                if !root && !no_root && context_type.is_none() && !no_type {
+                    return KjResult::Err("kj character set: specify --root, --no-root, --type <type> or --no-type".to_string());
                 }
-                self.character_set(&name, root, no_root, caller).await
+                self.character_set(&name, root, no_root, context_type.as_deref(), no_type, caller).await
             }
             CharacterCommand::Model(cmd) => self.character_model(cmd),
             CharacterCommand::Slot(cmd) => self.character_slot(cmd),
@@ -183,14 +197,42 @@ impl KjDispatcher {
     /// hazard `add-key` avoids by binding instead of minting
     /// (`docs/character.md`, "Adding a key binds; it never mints") applies
     /// just as much to a repeated `create`.
+    /// A character's type must be one `kj context create` accepts: a known,
+    /// non-reserved type whose rc create bucket has a script.
+    async fn check_character_type(&self, context_type: &str) -> Result<(), String> {
+        super::rc::check_context_type(self.kernel().vfs(), context_type).await.map_err(|e| e.to_string())?;
+        match crate::rc::create_bucket_has_candidates(self, context_type).await? {
+            true => Ok(()),
+            false => Err(format!(
+                "context type '{context_type}' has no rc create scripts at {}, so no context of it can be made",
+                kaijutsu_types::paths::rc_dir(context_type, crate::rc::VERB_CREATE),
+            )),
+        }
+    }
+
     async fn character_create(
         &self,
         name: &str,
         root: bool,
         model: Option<(String, String)>,
         max_tokens: Option<u64>,
+        context_type: Option<&str>,
         caller: &KjCaller,
     ) -> KjResult {
+        if root && context_type.is_some() {
+            return KjResult::Err(
+                "kj character create: a root has no context type; drop --type, or drop --root".to_string(),
+            );
+        }
+        // An existing name returns unchanged below, so its --type is not
+        // checked; a new character's type must be one a context can be made of.
+        let exists = matches!(self.kernel_db().lock().get_character_by_name(name), Ok(Some(_)));
+        if let Some(context_type) = context_type
+            && !exists
+            && let Err(e) = self.check_character_type(context_type).await
+        {
+            return KjResult::Err(format!("kj character create: --type: {e}"));
+        }
         if root && model.is_some() {
             return KjResult::Err(
                 "kj character create: a root runs no model; drop --backend and --model, or drop --root".to_string(),
@@ -200,11 +242,14 @@ impl KjDispatcher {
             let db = self.kernel_db().lock();
             match db.get_character_by_name(name) {
                 Ok(Some(existing)) => {
-                    let note = if model.is_some() {
+                    let mut note = if model.is_some() {
                         format!("; its model is unchanged (`kj character model set {name} --backend B --model M` changes it)")
                     } else {
                         String::new()
                     };
+                    if context_type.is_some() {
+                        note.push_str(&format!("; its type is unchanged (`kj character set {name} --type T` changes it)"));
+                    }
                     return KjResult::ok_with_data(
                         format!("{name} already exists ({}){note}", existing.principal_id.short()),
                         character_to_json(&existing),
@@ -240,6 +285,7 @@ impl KjDispatcher {
                 retired_at: None,
                 handoff_ctx: None, root_ctx: None,
                 root,
+                context_type: context_type.map(str::to_string),
             };
             if let Err(e) = db.insert_character(&row) {
                 return KjResult::Err(format!("kj character create: {e}"));
@@ -669,10 +715,11 @@ impl KjDispatcher {
                 let context_names: Vec<String> = contexts.iter().map(|c| db.context_name(*c)).collect();
                 let mut text = format!(
                     "Character:       {}\nID:              {}\nRoot:            {}\n\
-                     Model:           {}\nSlots:           {}\nCreated:         {}\nRetired:         {}",
+                     Type:            {}\nModel:           {}\nSlots:           {}\nCreated:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
+                    row.context_type.as_deref().unwrap_or("-"),
                     model.as_ref().map_or_else(|| "-".to_string(), |m| super::slot::model_summary(m, &backends)),
                     if slot_names.is_empty() { "-".to_string() } else { slot_names.join(", ") },
                     super::format::format_timestamp(row.created_at),
@@ -707,9 +754,25 @@ impl KjDispatcher {
     /// Set or clear `root`. A root is a model context like any other: a
     /// model plays it, and its `kj` requests always need approval
     /// (`docs/character.md`, "Roots and rotation").
-    async fn character_set(&self, name: &str, root: bool, no_root: bool, caller: &KjCaller) -> KjResult {
-        if !root && !no_root {
-            return KjResult::Err("kj character set: specify --root or --no-root".to_string());
+    async fn character_set(
+        &self,
+        name: &str,
+        root: bool,
+        no_root: bool,
+        context_type: Option<&str>,
+        no_type: bool,
+        caller: &KjCaller,
+    ) -> KjResult {
+        if !root && !no_root && context_type.is_none() && !no_type {
+            return KjResult::Err("kj character set: specify --root, --no-root, --type <type> or --no-type".to_string());
+        }
+        if root && context_type.is_some() {
+            return KjResult::Err("kj character set: a root has no context type; drop --type, or drop --root".to_string());
+        }
+        if let Some(context_type) = context_type
+            && let Err(e) = self.check_character_type(context_type).await
+        {
+            return KjResult::Err(format!("kj character set: --type: {e}"));
         }
         let principal_id = {
             let db = self.kernel_db().lock();
@@ -737,6 +800,18 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj character set: {e}")),
                 }
             }
+            if context_type.is_some() && row.root && !no_root {
+                return KjResult::Err(format!(
+                    "kj character set: {name} is a root, and a root has no context type; \
+                     `kj character set {name} --no-root --type <type>` makes it an ordinary character first"
+                ));
+            }
+            if root && row.context_type.is_some() {
+                return KjResult::Err(format!(
+                    "kj character set: {name} has a context type, and a root has none; \
+                     `kj character set {name} --no-type` first"
+                ));
+            }
             if root {
                 match db.get_character_model(row.principal_id) {
                     Ok(None) => {}
@@ -749,7 +824,12 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj character set: {e}")),
                 }
             }
-            if let Err(e) = db.update_character_root(row.principal_id, root) {
+            if (root || no_root) && let Err(e) = db.update_character_root(row.principal_id, root) {
+                return KjResult::Err(format!("kj character set: {e}"));
+            }
+            if (context_type.is_some() || no_type)
+                && let Err(e) = db.update_character_context_type(row.principal_id, context_type)
+            {
                 return KjResult::Err(format!("kj character set: {e}"));
             }
             row.principal_id
@@ -782,11 +862,18 @@ impl KjDispatcher {
             Ok(None) => return KjResult::Err(format!("kj character set: {name} vanished")),
             Err(e) => return KjResult::Err(format!("kj character set: {e}")),
         };
-        let msg = if root {
-            format!("{name} is now a root")
-        } else {
-            format!("{name} is no longer a root")
-        };
+        let mut changes = Vec::new();
+        if root {
+            changes.push("is now a root".to_string());
+        } else if no_root {
+            changes.push("is no longer a root".to_string());
+        }
+        if let Some(context_type) = context_type {
+            changes.push(format!("usually plays {context_type}"));
+        } else if no_type {
+            changes.push("has no context type".to_string());
+        }
+        let msg = format!("{name} {}", changes.join(" and "));
         KjResult::ok_with_data(msg, character_to_json(&updated))
     }
 
@@ -889,6 +976,7 @@ fn character_to_json(row: &CharacterRow) -> serde_json::Value {
         "retired_at": row.retired_at,
         "root": row.root,
         "root_ctx": row.root_ctx.map(|ctx| ctx.to_hex()),
+        "context_type": row.context_type,
     })
 }
 
@@ -1014,6 +1102,102 @@ mod tests {
 
         let all = d.kernel_db().lock().list_characters(true).unwrap();
         assert_eq!(all.iter().filter(|sheet| sheet.name == "hajime").count(), 1, "only one row must exist for the name");
+    }
+
+    /// `--type` on create and set stores the type; show prints it and carries
+    /// it in `.data.context_type`; `--no-type` clears it.
+    ///
+    /// Falsified by dropping the column from the read, or by ignoring `--no-type`.
+    #[tokio::test]
+    async fn the_context_type_is_set_shown_and_cleared() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        let made = d.dispatch(&[s("character"), s("create"), s("worker"), s("--type"), s("coder")], &caller).await;
+        assert!(made.is_ok(), "{}", made.message());
+        assert_eq!(d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().context_type.as_deref(), Some("coder"));
+
+        let shown = d.dispatch(&[s("character"), s("show"), s("worker")], &caller).await;
+        let KjResult::Ok { message, data: Some(data), .. } = shown else { panic!("expected Ok, got {shown:?}") };
+        assert!(message.contains("Type:") && message.contains("coder"), "{message}");
+        assert_eq!(data["context_type"], "coder");
+
+        let set = d.dispatch(&[s("character"), s("set"), s("worker"), s("--type"), s("default")], &caller).await;
+        assert!(set.is_ok(), "{}", set.message());
+        assert_eq!(d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().context_type.as_deref(), Some("default"));
+
+        let cleared = d.dispatch(&[s("character"), s("set"), s("worker"), s("--no-type")], &caller).await;
+        assert!(cleared.is_ok(), "{}", cleared.message());
+        let shown = d.dispatch(&[s("character"), s("show"), s("worker")], &caller).await;
+        let KjResult::Ok { message, data: Some(data), .. } = shown else { panic!("expected Ok, got {shown:?}") };
+        assert!(message.contains("Type:") && !message.contains("default"), "{message}");
+        assert!(data["context_type"].is_null());
+    }
+
+    /// An unknown type or a reserved role is refused as `kj context create
+    /// --type` refuses it, and nothing is stored.
+    #[tokio::test]
+    async fn a_reserved_or_unknown_context_type_is_refused() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        for reserved in ["distill", "gate", "judge"] {
+            let made = d.dispatch(&[s("character"), s("create"), s("worker"), s("--type"), s(reserved)], &caller).await;
+            assert!(!made.is_ok() && made.message().contains("slot role"), "{}", made.message());
+        }
+        assert!(d.kernel_db().lock().get_character_by_name("worker").unwrap().is_none(), "a refused create leaves no character");
+        let typo = d.dispatch(&[s("character"), s("create"), s("worker"), s("--type"), s("codr")], &caller).await;
+        assert!(!typo.is_ok() && typo.message().contains("codr"), "{}", typo.message());
+        d.dispatch(&[s("character"), s("create"), s("worker")], &caller).await;
+        let set = d.dispatch(&[s("character"), s("set"), s("worker"), s("--type"), s("gate")], &caller).await;
+        assert!(!set.is_ok() && set.message().contains("slot role"), "{}", set.message());
+        assert_eq!(d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().context_type, None);
+        // Creating an existing name stays idempotent, whatever its --type says.
+        let again = d.dispatch(&[s("character"), s("create"), s("worker"), s("--type"), s("codr")], &caller).await;
+        assert!(again.is_ok() && again.message().contains("already exists"), "{}", again.message());
+    }
+
+    /// A root has no type, at create, at set --type, and at set --root.
+    #[tokio::test]
+    async fn a_root_character_refuses_a_context_type() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        let made = d.dispatch(&[s("character"), s("create"), s("boss"), s("--root"), s("--type"), s("coder")], &caller).await;
+        assert!(!made.is_ok() && made.message().contains("root"), "{}", made.message());
+        assert!(d.kernel_db().lock().get_character_by_name("boss").unwrap().is_none(), "nothing was created");
+
+        d.dispatch(&[s("character"), s("create"), s("typed"), s("--type"), s("coder")], &caller).await;
+        let to_root = d.dispatch(&[s("character"), s("set"), s("typed"), s("--root")], &caller).await;
+        assert!(!to_root.is_ok() && to_root.message().contains("--no-type"), "{}", to_root.message());
+        assert!(!d.kernel_db().lock().get_character_by_name("typed").unwrap().unwrap().root);
+
+        d.dispatch(&[s("character"), s("create"), s("plain")], &caller).await;
+        d.dispatch(&[s("character"), s("set"), s("plain"), s("--root")], &caller).await;
+        let typed_root = d.dispatch(&[s("character"), s("set"), s("plain"), s("--type"), s("coder")], &caller).await;
+        assert!(!typed_root.is_ok() && typed_root.message().contains("root"), "{}", typed_root.message());
+    }
+
+    /// `set` names the options it takes when given none.
+    #[tokio::test]
+    async fn set_with_no_option_names_all_of_them() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("worker")], &caller).await;
+        let result = d.dispatch(&[s("character"), s("set"), s("worker")], &caller).await;
+        let KjResult::Err(message) = result else { panic!("expected a refusal, got {result:?}") };
+        assert!(message.contains("--root") && message.contains("--type") && message.contains("--no-type"), "{message}");
+    }
+
+    /// The published help gives the type's default and effect.
+    #[tokio::test]
+    async fn character_help_describes_the_type() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        for verb in ["create", "set"] {
+            let help = d.dispatch(&[s("character"), s(verb), s("--help")], &caller).await;
+            assert!(help.is_ok(), "{}", help.message());
+            println!("{}", help.message());
+            assert!(help.message().contains("--type <CONTEXT_TYPE>"), "{}", help.message());
+            assert!(help.message().contains("kj context create"), "{}", help.message());
+        }
     }
 
     /// `list` surfaces only live characters by default, as a full-id array.
@@ -1146,7 +1330,7 @@ mod tests {
         let caller = test_caller();
         let [lead, coder] = [PrincipalId::new(), PrincipalId::new()];
         for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
@@ -1176,7 +1360,7 @@ mod tests {
     async fn show_lists_the_characters_live_contexts() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let live = register_context(&d, Some("lane-live"), None, coder);
@@ -1375,7 +1559,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at,
                     handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
@@ -1466,7 +1650,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at,
                     handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
@@ -1505,7 +1689,7 @@ mod tests {
         let character = PrincipalId::new();
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
+            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: character, name: "keeper".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: true,
             }).unwrap();

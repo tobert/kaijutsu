@@ -32,7 +32,7 @@ makes a local/tenchi coder viable).
 ## The chain to walk once by hand, then script
 1. `kj character slot list <coder-char>` — confirm the coder character runs the fast model (ds4/deepseek or qwen-flash).
 2. Give the coder character a slot on the fast model (`kj character slot set <coder-char> coder --backend B --model M`),
-   then create it from Amy's console: `kj context create --as <coder-char>`
+   then create it from Amy's console: `kj context create <coder-char>`
    (check `kj context create --help` for the cwd / context-type flags; scope cwd
    to demo/). Performer = coder, senpai = Amy's console, so Amy reviews → the
    sheet's decision keys are LIVE for Amy (unlike a self-performed ask).
@@ -48,7 +48,7 @@ makes a local/tenchi coder viable).
   → room pull-back. Log `date +%T.%N` per beat for the cut.
 
 ## Open/unverified (find during the manual walk, don't fake)
-- Does `kj context create --as` on a cloud model start a coder that runs a turn
+- Does `kj context create <character>` on a cloud model start a coder that runs a turn
   from an app prompt? (creation path exists; end-to-end unrun here)
 - Does the coder's gated rm actually raise an ask with performer=coder? (should)
 - Does the result drift back automatically, or need `kj drift push`? (drift-ux.md)

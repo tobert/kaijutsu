@@ -13,12 +13,12 @@ an instruction to use nonexistent features.
 
 | Part | Contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, and `root_ctx`; `kj character create [--root]\|list\|show\|set --root\|--no-root\|retire` |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, and the `context_type` it usually plays (none for a root); `kj character create [--root] [--type <t>]\|list\|show\|set --root\|--no-root\|--type <t>\|--no-type\|retire` |
 | Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give `ROOT` a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
 | Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live. Beside it each live root has an MCP hub, labeled `mcp/<name>`, of type `mcp-hub`, with no context character: the parent of the root's MCP sessions, made at the same three points |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Context character | One character in one context (`docs/senpai-kohai.md`). `kj context create <label> --as <character> --type <t>` needs the Operator capability and a live character caller, requires `--as`, refuses an unknown or retired character and one that would review itself, and preserves the requester's `created_by`. It writes the context character with slots copied from the character's own. A fork continues its source's performance; a rotation writes a successor with the same character and fresh slots. The performer of a context is its context character's character, which never changes; to put another character on the work, start a context of it |
-| Client creation | There is no create RPC. A client runs `kj context create --as <character>` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses. An `mcp` session created from a root console passes `--parent mcp/<root name>`, so the root's MCP hub is its `forked_from` and the gate raises no ask (`kaijutsu_client::mcp_hub_label`; `docs/senpai-kohai.md`, "MCP sessions") |
+| Context character | One character in one context (`docs/senpai-kohai.md`). `kj context create <character> [--name <label>] [--type <t>]` needs the Operator capability and a live character caller, requires the character, takes the label from `--name` or the character's name (`<name>-2`, `-3` while a live context holds it) and the type from `--type` or the character's `context_type` (refusing when neither names one), refuses an unknown or retired character and one that would review itself, and preserves the requester's `created_by`. It writes the context character with slots copied from the character's own. A fork continues its source's performance; a rotation writes a successor with the same character and fresh slots. The performer of a context is its context character's character, which never changes; to put another character on the work, start a context of it |
+| Client creation | There is no create RPC. A client runs `kj context create <character>` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses. An `mcp` session created from a root console passes `--parent mcp/<root name>`, so the root's MCP hub is its `forked_from` and the gate raises no ask (`kaijutsu_client::mcp_hub_label`; `docs/senpai-kohai.md`, "MCP sessions") |
 | Senpai edge | Every working context answers to one senpai context (`context_characters.senpai_ctx`); the senpai's character reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
 | Model | A character has one model (`character_models`), set with `kj character create <name> --backend <b> --model <m>` or `kj character model set\|unset\|show`; a root runs none. It may also hold role slots (`character_slots`, `kj character slot set\|unset\|list`) where a role differs. A context copies them into `context_slots` when it is made: every role slot, then the model under the context's own type and under `distill` where the character has no slot for that role. The model never fills `gate`, `judge` or the type of an `mcp` context. Unset parameters come from `backend_models`. Every model call reads the context's own slot for its type. No default stands in; a context with no slot for its type gives no model, and a turn refuses naming the fix (`kj character model set`, then `kj context rotate`). The judge and the gate use the context's `judge` and `gate` slots, and distillation its `distill` slot |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
@@ -38,7 +38,7 @@ Sources: `kernel_db.rs::CharacterRow`, `kernel_db/context_characters.rs`, `model
 
 Banto is a character that plays the `director` context type. It does not need a new
 type to have its own identity and handoff. Its context is created with
-`kj context create <label> --type director --as banto`; director instructions read
+`kj context create banto --type director`; director instructions read
 the performer from context metadata.
 
 Still planned: character rc composition (slice 5), which would also grant
@@ -254,11 +254,11 @@ Two things follow, and they are the ones to check a change against:
   default and no override. See `docs/approval-identity.md`, "Routing".
 - **A context's character never changes.** The senpai's
   character, or the lineage root, starts another context of the character that
-  should do the work (`kj context create --as`). Roots cannot be cast, since
+  should do the work (`kj context create <character>`). Roots cannot be cast, since
   they have no model.
 - **A model rotates itself with `kj context rotate`.** Amy, 2026-09-17:
   the performer may rotate its own context, so no ask is needed.
-  `kj context create --as` follows the same shape: Operator and a live
+  `kj context create <character>` follows the same shape: Operator and a live
   character caller, with no ask.
 
 ### A session, inside kaijutsu
@@ -270,7 +270,7 @@ prompts, banto supervises lanes, and the lanes are contexts.
    hand. She attaches the tui to `banto` and types; the draft is hers, submit
    authors a user block as amy, and the turn runs with banto as actor and amy
    as reviewer.
-2. banto creates lanes with `kj context create --type coder --as coder`,
+2. banto creates lanes with `kj context create coder --name <lane>`,
    each with a label, a territory, and a worktree under `~/src/wt/`.
 3. Lanes run as driven turns. banto drives and waits. A lane's gated
    statement goes to banto, its senpai's character; banto's own, such as a
@@ -622,7 +622,7 @@ So the server CLI is four verbs: `init`, `add-key --as`, `list-keys`, and
 ALTER TABLE contexts ADD COLUMN played_by BLOB;  -- principal_id; NULL = nobody (score ctx, file doc)
 ```
 
-Set explicitly with `kj context create --as <character>`; omitting it leaves
+Set explicitly with `kj context create <character>`; omitting it leaves
 `played_by` unset on the kj path. Fork copies it. Server client creation
 defaults to the creating principal's character, when present. Automatic
 inheritance from a calling model context remains a design question.

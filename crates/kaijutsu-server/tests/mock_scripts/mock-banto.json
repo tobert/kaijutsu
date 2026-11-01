@@ -1,6 +1,6 @@
 [
   [
-    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj context create lane-a --type coder --as coder-a && kj context create lane-b --type coder --as coder-b", "run_in_background": false}}},
+    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj context create coder-a --name lane-a --type coder && kj context create coder-b --name lane-b --type coder", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [

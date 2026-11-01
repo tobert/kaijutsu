@@ -181,7 +181,7 @@ async fn serve_kernel(
     {
         let performer = PrincipalId::new();
         let db = shared.kernel_db.lock();
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
             principal_id: performer,
             name: PERFORMER.into(),
             created_at: kaijutsu_types::now_millis() as i64,

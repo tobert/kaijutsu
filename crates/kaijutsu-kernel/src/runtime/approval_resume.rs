@@ -2175,7 +2175,7 @@ mod answerer_tests {
     fn answerer_name_prefers_the_character_sheet_then_short_id() {
         let kdb = KernelDb::temporary().unwrap();
         let amy = PrincipalId::new();
-        kdb.insert_character(&crate::kernel_db::CharacterRow {
+        kdb.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: amy,
             name: "amy".to_string(),
             created_at: 1000,

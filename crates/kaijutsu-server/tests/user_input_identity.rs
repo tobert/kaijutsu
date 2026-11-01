@@ -84,7 +84,7 @@ async fn connect_with_key(addr: std::net::SocketAddr, key: PrivateKey, username:
 }
 
 fn character(principal_id: PrincipalId, name: &str) -> CharacterRow {
-    CharacterRow {
+    CharacterRow { context_type: None,
         principal_id,
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,

@@ -1433,7 +1433,7 @@ mod tests {
         let context = register_context(&d, Some("trace-context"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
+            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
@@ -1681,7 +1681,7 @@ mod tests {
         let context = register_context(&d, Some("lead-coder-gate"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
+            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(coder), Some(lead)).unwrap();
@@ -1833,7 +1833,7 @@ mod tests {
         direct.reviewer_id = None;
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
+            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: judge,
                 name: "judge".into(),
                 created_at: 0,
@@ -2967,7 +2967,7 @@ mod tests {
             "[global]\nallow = [\"kj context create\"]\n[context_type.explorer]\ndeny = [\"kj context create\"]\n",
         );
 
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x --as coder").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create coder --name x --type default").unwrap();
         let outcome =
             run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
@@ -2975,7 +2975,7 @@ mod tests {
 
         // Another context of no particular type gets the global allow.
         let other = registered_caller(&d);
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x --as coder").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create coder --name x --type default").unwrap();
         let outcome =
             run_gate(d.kernel(), &other, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);

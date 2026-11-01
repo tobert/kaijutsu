@@ -7,8 +7,8 @@ self-confirmation at a root console, which nobody else may answer. The design an
 reviewer, no per-context override, and no grant that moves review from one character to another.
 
 ```sh
-kj character create coder
-kj context create repair --type coder --as coder
+kj character create coder --type coder
+kj context create coder --name repair
 kj context info repair
 ```
 
@@ -79,7 +79,7 @@ judge shadows.
 A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root (<root>) may <act>". Also true:
 
 - A root character never performs an instance other than its root console.
-- `kj context create --as` needs the Operator capability and a live character caller, and raises no ask. The new
+- `kj context create <character>` needs the Operator capability and a live character caller, and raises no ask. The new
   instance's senpai is the caller's instance, or the `--senpai <ctx>` instance the caller has authority over.
 - A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own
   senpai (`docs/egress.md`).
@@ -88,7 +88,7 @@ A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root
 
 Create sets the edge, and nothing else moves it but `kj context move`: `kj fork` joins the forking context's
 instance, and `kj context rotate` starts a new conversation in the same instance, so neither touches the senpai or
-the kohai. Every client creation names its performer with `--as`.
+the kohai. Every client creation names its performer as the positional character.
 
 Ring placement and conclusion do not follow the lineage. `kj context
 promote`, `demote`, and `conclude` need the operator capability, except

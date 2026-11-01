@@ -969,7 +969,7 @@ mod tests {
         );
         let res = kaish
             .execute_with_options(
-                "kj context create rcdepth-e2e --as kohai-tester --type rdtest",
+                "kj context create kohai-tester --name rcdepth-e2e --type rdtest",
                 ExecuteOptions::new().with_vars(vars),
             )
             .await
@@ -1036,14 +1036,14 @@ mod tests {
         install_rc_script_file(
             &dispatcher,
             "/config/rc/chaintest/create/S00-recreate.kai",
-            "kj context create \"chain-d$KJ_RC_DEPTH\" --as kohai-tester --type chaintest\n",
+            "kj context create kohai-tester --name \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
         )
         .await;
 
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
         let res = kaish
             .execute_with_options(
-                "kj context create chain-d0 --as kohai-tester --type chaintest",
+                "kj context create kohai-tester --name chain-d0 --type chaintest",
                 ExecuteOptions::default(),
             )
             .await
@@ -1417,7 +1417,7 @@ mod tests {
         // Space form.
         let res = kaish
             .execute_with_options(
-                "kj context create exp --as kohai-tester --type toolie",
+                "kj context create kohai-tester --name exp --type toolie",
                 ExecuteOptions::default(),
             )
             .await
@@ -1427,7 +1427,7 @@ mod tests {
         // Equals form (control).
         let res2 = kaish
             .execute_with_options(
-                "kj context create exp2 --as kohai-tester --type=toolie",
+                "kj context create kohai-tester --name exp2 --type=toolie",
                 ExecuteOptions::default(),
             )
             .await
@@ -2276,8 +2276,8 @@ mod tests {
 
         // Leaf help reached: clap's create-subcommand usage + its positional.
         assert!(
-            out.contains("Usage: create [OPTIONS] --as <CHARACTER> [LABEL]")
-                && out.contains("Label (positional form"),
+            out.contains("Usage: create [OPTIONS] <CHARACTER>")
+                && out.contains("The live character that performs the new context"),
             "`kj context create --help` must render the leaf's clap help; got:\n{out}"
         );
         // NOT intercepted by the outer router (which would emit the whole-tool

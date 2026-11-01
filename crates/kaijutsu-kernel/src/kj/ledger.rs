@@ -2399,7 +2399,7 @@ mod tests {
         let context = register_context(&d, Some("decision-context"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
+            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
@@ -3396,7 +3396,7 @@ mod tests {
         let root = register_root_context(d);
         let character = |name: &str| {
             let id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -3505,7 +3505,7 @@ mod tests {
         use crate::kj::gate::GateVerdict::{Allowed, Pending};
         let d = test_dispatcher().await;
         let house = character_house(&d);
-        let first = gate_once(&d, &house.banto, planned_shell_spec("kj context create c1 --type coder --as coder")).await;
+        let first = gate_once(&d, &house.banto, planned_shell_spec("kj context create coder --name c1 --type coder")).await;
         assert_eq!(first.verdict, Pending, "{}", first.reason);
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
         let learned = d
@@ -3518,11 +3518,11 @@ mod tests {
         assert!(d.kernel_db().lock().redeem_ask(&request_id).unwrap());
 
         for (source, expected) in [
-            ("kj context create c2 --type coder --as coder", Allowed),
-            ("kj context create c3 --as coder --senpai banto-seat", Allowed),
-            ("kj context create c4 --as coder --parent amy-lane", Allowed),
-            ("kj context create c5 --as coder --senpai amy-lane", Pending),
-            ("kj context create c6 --as coder --senpai lane-b", Pending),
+            ("kj context create coder --name c2 --type coder", Allowed),
+            ("kj context create coder --name c3 --senpai banto-seat --type default", Allowed),
+            ("kj context create coder --name c4 --parent amy-lane --type default", Allowed),
+            ("kj context create coder --name c5 --senpai amy-lane --type default", Pending),
+            ("kj context create coder --name c6 --senpai lane-b --type default", Pending),
         ] {
             let outcome = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
             assert_eq!(outcome.verdict, expected, "{source}: {}", outcome.reason);
@@ -4440,7 +4440,7 @@ mod tests {
     fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = kaijutsu_types::PrincipalId::new();
         // A person at a console is a live character, which `kj context create` needs.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -4487,7 +4487,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
+                &[s("context"), s("create"), s("kohai-tester"), s("--name"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
                 &c,
             )
             .await;
@@ -4520,11 +4520,7 @@ mod tests {
         let created = d
             .dispatch(
                 &[
-                    s("context"), s("create"), s("--as"), s("kohai-tester"),
-                    s("ledger-run-show-ctx"),
-                    s("--type"),
-                    s("ledgertest2"),
-                ],
+                    s("context"), s("create"), s("kohai-tester"), s("--name"), s("ledger-run-show-ctx"), s("--type"), s("ledgertest2")],
                 &c,
             )
             .await;
@@ -4566,7 +4562,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("context"), s("create"), s("--as"), s("kohai-tester"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
+                &[s("context"), s("create"), s("kohai-tester"), s("--name"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
                 &c,
             )
             .await;
@@ -5116,7 +5112,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.update_played_by(seat, Some(banto)).unwrap();
             db.update_played_by(lane, Some(coder)).unwrap();
@@ -5160,7 +5156,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(lead, "lead", false), (bob, "bob", true)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
         }
@@ -5187,7 +5183,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
@@ -5222,7 +5218,7 @@ mod tests {
         caller.context_id = Some(lane);
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow {
+            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_played_by(root, Some(amy)).unwrap();

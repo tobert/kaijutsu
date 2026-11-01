@@ -1567,7 +1567,10 @@ CREATE TABLE IF NOT EXISTS characters (
     -- A root character's console: the one context of it with no senpai
     -- (docs/senpai-kohai.md, "The model"). A rotation of the console moves the
     -- pointer in the commit, as it moves `handoff_ctx`.
-    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
+    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
+    -- The context type this character usually plays; `kj context create
+    -- <character>` takes it when `--type` is absent. NULL = none; a root has none.
+    context_type     TEXT
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -3092,6 +3095,7 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
+            "ALTER TABLE characters ADD COLUMN context_type TEXT",
             "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
             "ALTER TABLE backend_models ADD COLUMN temperature REAL \
                  CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
@@ -3808,7 +3812,7 @@ impl KernelDb {
         };
         let characters: HashMap<PrincipalId, CharacterRow> = {
             let mut stmt = tx.prepare(
-                "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx FROM characters",
+                "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, NULL FROM characters",
             )?;
             stmt.query_map([], row_to_character_row)?
                 .map(|r| r.map(|c| (c.principal_id, c)))
@@ -8514,6 +8518,10 @@ pub struct CharacterRow {
     /// kj requests always need approval (`docs/character.md`, "Roots and
     /// rotation").
     pub root: bool,
+    /// The context type this character usually plays, which `kj context
+    /// create <character>` takes when `--type` is absent. `None` for no
+    /// type, and always for a root.
+    pub context_type: Option<String>,
 }
 
 impl CharacterRow {
@@ -9043,8 +9051,8 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
@@ -9053,6 +9061,7 @@ impl KernelDb {
                     row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                     row.root,
                     row.root_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
+                    row.context_type,
                 ],
             )
             .map_err(|e| {
@@ -9064,7 +9073,7 @@ impl KernelDb {
     /// Fetch a character by its kernel-owned name.
     pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type
              FROM characters WHERE name = ?1",
         )?;
         Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
@@ -9075,7 +9084,7 @@ impl KernelDb {
     /// `played_by` (e.g. resolving the name to display in `kj context info`).
     pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type
              FROM characters WHERE principal_id = ?1",
         )?;
         Ok(stmt
@@ -9088,10 +9097,10 @@ impl KernelDb {
     /// ones by default.
     pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
         let sql = if include_retired {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type \
              FROM characters ORDER BY name"
         } else {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type \
              FROM characters WHERE retired_at IS NULL ORDER BY name"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -9134,6 +9143,18 @@ impl KernelDb {
         let updated = self.conn.execute(
             "UPDATE characters SET root = ?1 WHERE principal_id = ?2",
             params![root, blob_param(principal_id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("character {}", principal_id.short())));
+        }
+        Ok(())
+    }
+
+    /// Set or clear the context type a character usually plays.
+    pub fn update_character_context_type(&self, principal_id: PrincipalId, context_type: Option<&str>) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE characters SET context_type = ?1 WHERE principal_id = ?2",
+            params![context_type, blob_param(principal_id.as_bytes())],
         )?;
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("character {}", principal_id.short())));
@@ -9409,6 +9430,7 @@ fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
         handoff_ctx: read_opt_context_id(row, 4)?,
         root: row.get(5)?,
         root_ctx: read_opt_context_id(row, 6)?,
+        context_type: row.get(7)?,
     })
 }
 
@@ -12167,7 +12189,7 @@ mod tests {
     fn character_crud_roundtrip() {
         let db = KernelDb::temporary().unwrap();
         let principal = PrincipalId::new();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id: principal,
             name: "hajime".to_string(),
             created_at: 1000,
@@ -12205,7 +12227,7 @@ mod tests {
     #[test]
     fn character_duplicate_name_is_rejected() {
         let db = KernelDb::temporary().unwrap();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id: PrincipalId::new(),
             name: "hajime".to_string(),
             created_at: 1000,
@@ -12214,7 +12236,7 @@ mod tests {
         })
         .unwrap();
         let err = db
-            .insert_character(&CharacterRow {
+            .insert_character(&CharacterRow { context_type: None,
                 principal_id: PrincipalId::new(),
                 name: "hajime".to_string(),
                 created_at: 2000,
@@ -12270,6 +12292,8 @@ mod tests {
         let row = db.get_character(principal).unwrap().unwrap();
         assert_eq!(row.name, "pre-existing", "an existing row must survive the migration");
         assert!(!row.root, "a pre-migration row is not a root");
+        assert!(has("context_type"), "the guarded ALTER must add context_type");
+        assert_eq!(row.context_type, None, "a pre-migration row has no context type");
 
         // A second pass over the already-migrated database is a no-op.
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
@@ -12284,11 +12308,11 @@ mod tests {
         let db = KernelDb::temporary().unwrap();
         let amy = PrincipalId::new();
         let coder = PrincipalId::new();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id: amy, name: "amy".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id: coder, name: "coder".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -12310,7 +12334,7 @@ mod tests {
     fn seed_characters(db: &KernelDb, names: &[&str]) -> Vec<PrincipalId> {
         names.iter().map(|name| {
             let principal_id = PrincipalId::new();
-            db.insert_character(&CharacterRow {
+            db.insert_character(&CharacterRow { context_type: None,
                 principal_id, name: (*name).to_string(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -13382,7 +13406,7 @@ mod tests {
         assert_eq!(db.name_for(PrincipalId::beat()), "beat");
 
         let character = PrincipalId::new();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id: character,
             name: "hajime".to_string(),
             created_at: 1000,
@@ -13412,7 +13436,7 @@ mod tests {
         let character = PrincipalId::new();
         {
             let db = KernelDb::open(&path).unwrap();
-            db.insert_character(&CharacterRow {
+            db.insert_character(&CharacterRow { context_type: None,
                 principal_id: character,
                 name: "hajime".to_string(),
                 created_at: 1000,
@@ -13429,7 +13453,7 @@ mod tests {
         // A write attempt through the read-only connection must fail loudly
         // rather than silently succeeding — the whole point of the mode.
         let err = ro
-            .insert_character(&CharacterRow {
+            .insert_character(&CharacterRow { context_type: None,
                 principal_id: PrincipalId::new(),
                 name: "intruder".to_string(),
                 created_at: 2000,

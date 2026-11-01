@@ -10472,7 +10472,7 @@ mod semantic_search_tests {
             // themself") — seed one directly, the way `kaijutsu-server init`
             // would, since this test drives create_shared_kernel straight
             // off a hand-built kernel.db.
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
                 principal_id: PrincipalId::new(),
                 name: "tester".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,

@@ -936,7 +936,7 @@ mod tests {
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ledger-shw"), None, principal);
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().assign_test_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
@@ -2123,7 +2123,7 @@ mod tests {
                 let reviewer = PrincipalId::new();
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("tool-review"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
-                d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id: reviewer, name: "tool-reviewer".into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -2409,7 +2409,7 @@ mod tests {
         let reviewer = PrincipalId::new();
         let context = register_context(&d, Some("async-pending"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
             principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().assign_test_review(context, Some(principal), Some(reviewer)).unwrap();

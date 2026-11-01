@@ -91,8 +91,8 @@ Two layers. Static settings are edited in place. A context character is written 
 its `senpai_ctx` changes after that, through `kj context move`.
 
 ```
-static     characters           principal_id, name, root, created_at, retired_at, handoff_ctx, root_ctx,
-                                persona (step 6)
+static     characters           principal_id, name, root, context_type, created_at, retired_at, handoff_ctx,
+                                root_ctx, persona (step 6)
            character_models     principal_id, backend_id, model, max_tokens, temperature, top_p, effort,
                                 thinking_budget, thinking_style
            character_slots      principal_id, role, backend_id, model, max_tokens, temperature, top_p, effort,
@@ -545,8 +545,8 @@ sections above win.
   no output budget.
 - **Creating a context from a root's session.** A root character performs only its root console, so a root's
   `kaijutsu-tui` or `kaijutsu-mcp` session names the character that plays what it creates: `--character <name>`
-  on both, and `KAIJUTSU_CHARACTER` for MCP (the flag wins). The name goes to `kj context create --as`; there is
-  no new wire method. Without it the session's own character plays, and a root refuses with an error that
+  on both, and `KAIJUTSU_CHARACTER` for MCP (the flag wins). The name is the positional of `kj context create`;
+  there is no new wire method. Without it the session's own character plays, and a root refuses with an error that
   names the option. Both clients ask `ActorHandle::performer_for_new_contexts`, so the refusal reads the same.
 
 

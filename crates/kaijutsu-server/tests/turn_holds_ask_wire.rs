@@ -112,7 +112,7 @@ impl Held {
         {
             let db = server.kernel_db.lock();
             for (principal_id, name) in [(performer, "held-performer"), (reviewer, "held-reviewer")] {
-                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
                     principal_id, name: name.into(), created_at: kaijutsu_types::now_millis() as i64,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();

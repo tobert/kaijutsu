@@ -83,7 +83,7 @@ impl World {
     fn character(&self, name: &str) -> PrincipalId {
         let principal_id = PrincipalId::new();
         self.db
-            .insert_character(&CharacterRow {
+            .insert_character(&CharacterRow { context_type: None,
                 principal_id,
                 name: name.into(),
                 created_at: 0,

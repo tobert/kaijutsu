@@ -179,9 +179,10 @@ cmd_start() {
   local abc=$'X:1\nT:Headless\nM:4/4\nL:1/8\nK:C\nCDEF GABc|c2 G2 E2 C2|'
   local md=$'## Harness\n\n- **Compositor**: labwc on the wlroots headless backend.\n- **Kernel**: a throwaway kaijutsu-server on its own port.\n- **App**: kaijutsu-app with BRP enabled.\n\n```rust\nfn main() { println!("hello"); }\n```'
   kjmcp \
-    "kj context create alpha-notes" \
-    "kj context create beta-review" \
-    "kj context create gamma-scratch" \
+    "kj character create headless-kohai --type default" \
+    "kj context create headless-kohai --name alpha-notes" \
+    "kj context create headless-kohai --name beta-review" \
+    "kj context create headless-kohai --name gamma-scratch" \
     "kj block create -c alpha-notes --role user --kind text --content 'Summarize the headless harness in three bullets.'" \
     "kj block create -c alpha-notes --role model --kind thinking --content 'The harness has three parts: a compositor, a kernel, and the app.'" \
     "kj block create -c alpha-notes --role model --kind text --content-type text/markdown --content '$md'" \

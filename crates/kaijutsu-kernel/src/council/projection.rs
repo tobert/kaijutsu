@@ -356,7 +356,7 @@ pub(super) mod fixtures {
         kernel
             .kernel_db()
             .lock()
-            .insert_character(&crate::kernel_db::CharacterRow {
+            .insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id,
                 name: name.to_string(),
                 created_at: 0,

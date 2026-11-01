@@ -119,7 +119,7 @@ fn character_create_then_json_list_prints_data_not_the_message() {
     assert_ne!(stdout(&json), stdout(&table), "--json must print the data, not the plain message");
 }
 
-/// `kj -- context create lane --type coder --as bob` runs from the caller's
+/// `kj -- context create bob --name lane --type coder` runs from the caller's
 /// root context (the sole live root, joined with no `--context` needed) and
 /// creates a context played by `bob`; `kj -- context info lane` then names
 /// bob as its performer.
@@ -131,7 +131,7 @@ fn context_create_and_info_name_the_performer() {
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
 
-    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    let create = home.run(&["kj", "--", "context", "create", "bob", "--name", "lane", "--type", "coder"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 
     let info = home.run(&["kj", "--", "context", "info", "lane"]);
@@ -201,9 +201,9 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     // from a director context, as a person would.
     let banto = home.run(&["kj", "--", "character", "create", "banto"]);
     assert!(banto.status.success(), "{}", stderr(&banto));
-    let boss = home.run(&["kj", "--", "context", "create", "boss", "--type", "director", "--as", "banto"]);
+    let boss = home.run(&["kj", "--", "context", "create", "banto", "--name", "boss", "--type", "director"]);
     assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
-    let create = home.run(&["kj", "--context", "boss", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    let create = home.run(&["kj", "--context", "boss", "--", "context", "create", "bob", "--name", "lane", "--type", "coder"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 
     let drive = home.run(&["kj", "--context", "boss", "--", "drive", "lane", "--prompt", "hi"]);
@@ -246,9 +246,9 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     // The human root refuses `drive`; see the test above.
     let banto = home.run(&["kj", "--", "character", "create", "banto"]);
     assert!(banto.status.success(), "{}", stderr(&banto));
-    let boss = home.run(&["kj", "--", "context", "create", "boss", "--type", "director", "--as", "banto"]);
+    let boss = home.run(&["kj", "--", "context", "create", "banto", "--name", "boss", "--type", "director"]);
     assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
-    let create = home.run(&["kj", "--context", "boss", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    let create = home.run(&["kj", "--context", "boss", "--", "context", "create", "bob", "--name", "lane", "--type", "coder"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 
     let drive = Command::new(server_bin())
@@ -366,7 +366,7 @@ fn a_destroy_verb_without_confirm_exits_2() {
     home.bootstrap("amy");
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
-    let create = home.run(&["kj", "--", "context", "create", "--as", "bob", "lane", "--type", "coder"]);
+    let create = home.run(&["kj", "--", "context", "create", "bob", "--name", "lane", "--type", "coder"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 
     let archive = home.run(&["kj", "--", "context", "archive", "lane"]);

@@ -529,7 +529,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(amy, "drive-amy"), (banto, "drive-banto"), (coder, "drive-coder"), (judge, "drive-judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                     principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }

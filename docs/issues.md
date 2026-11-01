@@ -35,7 +35,7 @@ against the code unless marked:
 - `kj context create --senpai` does not refuse an archived senpai; `kj context move` does (kj/context.rs ~1487).
 - `kj context demote` twice archives a root console, and `kj character retire` of a root archives its console,
   leaving `characters.root_ctx` on an archived row (kernel_db.rs ~5770).
-- The kernel lets `--as <root>` create a context the root performs; only the client refuses. A test blesses it
+- The kernel lets `kj context create <root>` create a context the root performs; only the client refuses. A test blesses it
   (`a_root_character_can_be_cast_as_a_performer`, kj/context.rs ~3929).
 - Two meanings of "root console": `ContextRow::is_root_console` (type `console`, label `ROOT`) vs
   `KernelDb::is_root_console` (`characters.root_ctx`). The drift hold uses the first (kj/drift.rs ~344), so a
@@ -44,12 +44,14 @@ against the code unless marked:
   `senpai_migration_report`, as `kj senpai show` did.
 - `kj ledger list --reviewer` and the director `rotate` rc lifecycle are documented in docs/senpai-kohai.md and
   not built (`VERB_ROTATE` fires only from the beat scheduler).
-- The builtin `kj context create --type mcp` allow cannot see the caller, so `--as` may name a character with a
+- The builtin `kj context create --type mcp` allow cannot see the caller, so the character it names may be one with a
   model and its `distill` slot is copied. Small: an mcp seat already holds `config-write`.
 - `ensure_mcp_hub` seeds the BlockStore and drift router after the row commits; a failure there is repaired at
   the next boot, not within the process. `kj character create --backend` writes the character and its model as
   two statements.
 - Tests still say "cast" for assigning a performer (kj/context.rs ~4629-4682).
+- `kj context set --type` refuses only reserved roles (kj/context.rs `resolve_context_config`), so it commits a
+  typo or a type with no create scripts, where `kj context create --type` and `kj character set --type` refuse.
 - Found deploying: `kj whoami` (not a verb) from an MCP seat raised an ask ("no layer covers statement #0")
   instead of failing as unknown; an unknown `kj` verb should refuse before the gate. Amy's `amy` root console
   still reports `alibaba/qwen3.8-flash` (a migrated slot; a root runs no model). `kj context info` prints
@@ -123,8 +125,6 @@ TUI entries below). Open:
     the backup while a live server holds the file, and a busy database reads as a failed copy.
   - A hand-written `allow = ["kj context"]` (the verb family) now covers `kj context create`, which the old
     `kj kohai` key kept apart. No shipped file does this.
-  - `contrib/council/seed-council-contexts.kai` and `contrib/headless-app.sh` create contexts with no `--as`,
-    which `kj context create` requires; they were stale before the rename.
   - `ensure_legacy_cast_tables` and the pre-character columns commit before the migrations that read them can
     refuse, so a refused open leaves two empty cast tables behind.
   - `context_character_migration_report()` has no production reader.
@@ -722,7 +722,7 @@ Partly superseded by docs/senpai-kohai.md (branch feat/senpai-kohai): a drift al
 senpai edge needs no ask, and the verb is now `kj context create`. The rest stays open.
 
 A `director` seat played by banto on moltar (`banto-shadow`) raised about
-17 asks to Amy in two small tasks: `kj context create ... --as coder`,
+17 asks to Amy in two small tasks: `kj context create coder ...`,
 `kj drive <child>`, `kj context archive <child> --confirm`, and read-only
 checks such as `cd /tmp/x && git log` and `python3 -m unittest`. Amy,
 2026-10-10: "there should be fewer asks on a banto operating on
@@ -2505,7 +2505,7 @@ app is refused for the same reason (self-approval is barred by the
 2026-09-12 approval-identity work). The ask is then stuck pending until it
 expires. So the app's own shell cannot run any gated command today. The fix
 is an identity decision, not app UI: the app should attach as a distinct
-performer character (`kj context create --as`, or a dedicated app
+performer character (`kj context create <character>`, or a dedicated app
 character) with Amy as the reviewer, or a non-Amy reviewer must be
 configured for the app's context. Coordinate with the approval-identity
 work (commits dcb5fc8b, fd27b822). Probe ask `01a096d2-358d-…` was left
@@ -3106,7 +3106,7 @@ still missing:
   does not say "this turn is waiting on an ask", only the hints line's `!n`
   and the sheet do.
 - **Context creation and senpai assignment have no app UI.** Use
-  `kj context create --as` so the performer exists before rc. The new context's
+  `kj context create <character>` so the performer exists before rc. The new context's
   senpai is the caller's context; there is no reviewer assignment to make.
 - **The PLAN block renders a flat statement list**, which is all
   the ledger's `AskSummary` carries. A plan tree and per-statement verdicts would

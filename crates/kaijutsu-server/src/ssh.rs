@@ -294,7 +294,7 @@ impl SshServerConfig {
 
     /// The name of the live, non-root character `ephemeral()` also creates. A
     /// root performs only its root console, so a test that makes a context
-    /// with `kj context create --as` names this one.
+    /// with `kj context create <character>` names this one.
     pub const EPHEMERAL_PERFORMER: &'static str = "performer";
 
     /// Create [`Self::EPHEMERAL_PERFORMER`] in `kernel_db` unless it exists.
@@ -307,7 +307,7 @@ impl SshServerConfig {
             return;
         }
         kernel_db
-            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
                 principal_id: PrincipalId::new(),
                 name: Self::EPHEMERAL_PERFORMER.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -1373,7 +1373,7 @@ mod tests {
                 use kaijutsu_kernel::mcp::{CallContext, Capability, ContextToolBinding, InstanceId, KernelCallParams};
                 let principal = PrincipalId::new();
                 let db = kaijutsu_kernel::KernelDb::open(dir.join("kernel.db")).unwrap();
-                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
                     principal_id: principal, name: "signal-test".into(), created_at: 1,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();

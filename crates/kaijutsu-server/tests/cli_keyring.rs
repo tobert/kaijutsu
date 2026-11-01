@@ -34,7 +34,7 @@ impl Fixture {
             .join(".local/share/kaijutsu/kernel/kernel.db");
         let db = KernelDb::open(&kernel_db_path).unwrap();
         let character = PrincipalId::new();
-        db.insert_character(&CharacterRow {
+        db.insert_character(&CharacterRow { context_type: None,
             principal_id: character,
             name: character_name.to_string(),
             created_at: 1,
@@ -121,7 +121,7 @@ fn re_adding_a_bound_key_refuses_and_names_the_binding_then_rebind_moves_it() {
     let kernel_db_path = fx.home_path().join(".local/share/kaijutsu/kernel/kernel.db");
     let db = KernelDb::open(&kernel_db_path).unwrap();
     let amy = PrincipalId::new();
-    db.insert_character(&CharacterRow {
+    db.insert_character(&CharacterRow { context_type: None,
         principal_id: amy,
         name: "amy".to_string(),
         created_at: 2,

@@ -93,7 +93,7 @@ fn a_held_create_drops_a_directory_the_kernel_cannot_see_when_it_runs() {
             kaijutsu_server::SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
         });
         let kernel = kernel_rx.await.unwrap();
-        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
             principal_id: claude, name: "claude".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();

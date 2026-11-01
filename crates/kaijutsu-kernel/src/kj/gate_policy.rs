@@ -1975,10 +1975,11 @@ mod tests {
         assert_eq!(target("context archive lane"), Context(Some("lane".into())));
         assert_eq!(target("--confirm context archive"), Context(None));
         assert_eq!(target("context archive --children lane"), Unread);
-        assert_eq!(target("context create child --type coder --as coder"), NewChild);
-        assert_eq!(target("context create child --as coder --parent lane"), NewChild, "--parent is provenance only");
-        assert_eq!(target("context create child --as coder --senpai lane"), NewUnder("lane".into()));
-        assert_eq!(target("context create child"), Unread, "--as is required, so a bare create does not parse");
+        assert_eq!(target("context create coder --name child --type coder"), NewChild);
+        assert_eq!(target("context create coder --name child --parent lane --type default"), NewChild, "--parent is provenance only");
+        assert_eq!(target("context create coder --name child --senpai lane --type default"), NewUnder("lane".into()));
+        assert_eq!(target("context create"), Unread, "the character is required, so a bare create does not parse");
+        assert_eq!(target("context create coder"), NewChild, "the character alone parses");
         assert_eq!(target("context set lane --model m"), Unread);
         assert_eq!(target("fork"), Unread);
         assert_eq!(target("drive --no-such-flag"), Unread);
@@ -1992,7 +1993,7 @@ mod tests {
     fn a_character_allow_is_refused_where_the_target_cannot_be_read() {
         let refusal = |source: &str| character_rule_refusal(&plan(source));
         assert_eq!(refusal("kj drive lane --prompt go && git log"), None);
-        assert_eq!(refusal("kj context create child --type coder --as coder"), None);
+        assert_eq!(refusal("kj context create coder --name child --type coder"), None);
         assert!(refusal("for x in lane-a; do kj drive $x; done").is_some(), "a loop variable is not a literal target");
         assert!(refusal("kj drive ${LANE}").is_some());
         assert!(refusal("./kj drive amy-lane").is_some());
@@ -2024,7 +2025,7 @@ mod tests {
     fn env_argument_keeps_the_context_type_allow() {
         let cfg = config("[context_type.mcp]\nallow = [\"kj context create\"]\n");
         let v = first_verdict(
-            "kj context create banto-probe --as banto --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
+            "kj context create banto --name banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
             &cfg,
             Some("mcp"),
         );
@@ -2085,22 +2086,22 @@ mod tests {
     #[test]
     fn creating_an_mcp_context_is_builtin_allowed() {
         for source in [
-            "kj context create sess --as claude --type mcp",
-            "kj context create sess --as claude --type=mcp --parent mcp/amy",
-            "kj ctx create sess --as claude --cwd /tmp --cwd-optional --type mcp",
-            "kj --json context create sess --as claude --type mcp",
+            "kj context create claude --name sess --type mcp",
+            "kj context create claude --name sess --type=mcp --parent mcp/amy",
+            "kj ctx create claude --name sess --cwd /tmp --cwd-optional --type mcp",
+            "kj --json context create claude --name sess --type mcp",
         ] {
             let e = unconfigured(source);
             assert_eq!(builtin_key_of(&e.per_statement[0]), "kj context create --type mcp", "{source}");
             assert_eq!(e.verdict(), AskVerdict::Allow, "{source}");
         }
         for source in [
-            "kj context create sess --as claude --type coder",
-            "kj context create sess --as claude --type=mcp-hub",
-            "kj context create sess --as claude",
-            "kj context create sess --as claude --env NOTE=mcp --type default",
-            "kj context create sess --as claude --type mcp > /tmp/x",
-            "kj context create sess --as claude --type $(cat /tmp/t)",
+            "kj context create claude --name sess --type coder",
+            "kj context create claude --name sess --type=mcp-hub",
+            "kj context create claude --name sess",
+            "kj context create claude --name sess --env NOTE=mcp --type default",
+            "kj context create claude --name sess --type mcp > /tmp/x",
+            "kj context create claude --name sess --type $(cat /tmp/t)",
             "kj context create --type mcp",
             "kj context fork sess --type mcp",
         ] {
@@ -2114,7 +2115,7 @@ mod tests {
     /// Falsified by checking the builtin layer ahead of the config tables.
     #[test]
     fn a_config_key_on_context_create_still_asks_for_an_mcp_create() {
-        let source = "kj context create sess --as claude --type mcp";
+        let source = "kj context create claude --name sess --type mcp";
         let ask = config("[global]\nask = [\"kj context create\"]\n");
         assert!(matches!(first_verdict(source, &ask, Some("root")), PolicyVerdict::Ask(_)));
         let typed = config("[context_type.root]\nask = [\"kj context create\"]\n");
@@ -2154,7 +2155,7 @@ mod tests {
             assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, context_type)), "kj context --help",
                 "{context_type:?}");
         }
-        assert_eq!(first_verdict("kj context create x --as coder > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
+        assert_eq!(first_verdict("kj context create coder --name x --type default > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
             "a redirect still keeps the allow from covering, and no builtin covers it");
         let asks = config("[global]\nask = [\"kj context create\"]\n");
         assert!(matches!(first_verdict("kj context create --help", &asks, None), PolicyVerdict::Ask(_)),
@@ -2478,16 +2479,16 @@ deny = ["kj context create"]
              [context_type.explorer]\nallow = [\"kj context create\"]\n",
         );
         // Within global: the specific deny beats the general allow.
-        assert!(matches!(first_verdict("kj context create x --as coder", &cfg, None), PolicyVerdict::Deny(_)));
+        assert!(matches!(first_verdict("kj context create coder --name x --type default", &cfg, None), PolicyVerdict::Deny(_)));
         assert!(matches!(first_verdict("kj context list", &cfg, None), PolicyVerdict::Allow(_)));
         // The context_type layer sits above global.
-        let v = first_verdict("kj context create x --as coder", &cfg, Some("explorer"));
+        let v = first_verdict("kj context create coder --name x --type default", &cfg, Some("explorer"));
         assert_eq!(
             allow_keys(&v),
             vec![(Layer::ContextTypeConfig("explorer".into()), "kj context create".to_string())]
         );
         assert!(matches!(
-            first_verdict("kj context create x --as coder", &cfg, Some("coder")),
+            first_verdict("kj context create coder --name x --type default", &cfg, Some("coder")),
             PolicyVerdict::Deny(_)
         ));
     }
@@ -2667,7 +2668,7 @@ uncovered = "allow"
     fn the_shipped_default_lets_a_director_create_and_drive_a_lane() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         for source in [
-            "kj context create count-kj-rs --type coder --as coder",
+            "kj context create coder --name count-kj-rs --type coder",
             "kj fork --name lane --prompt \"count the files\"",
             "kj drive count-kj-rs --prompt \"count the files\"",
         ] {

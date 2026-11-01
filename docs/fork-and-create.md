@@ -12,14 +12,16 @@ Two verbs mint context rows, and each means one thing.
   senpai. Fork never changes who plays or what type the seat is; that is
   what `--compact`, `--include`, `--exclude`, and `--preset` are for:
   rotation, KV reuse, a windowed continuation.
-- **`kj context create` begins a new performance.** It takes `--type`, a
-  character `--as`, `--cwd`, `--env`, `--parent` and `--senpai`, and
-  carries no history. Without `--cwd` it starts in the current context's cwd,
+- **`kj context create` begins a new performance.** It takes the
+  character that performs, then `--name`, `--type`, `--cwd`, `--env`,
+  `--parent` and `--senpai`, and carries no history. The label defaults to
+  the character's name (`<name>-2` when a live context holds it), and the
+  type to the character's own. Without `--cwd` it starts in the current context's cwd,
   as fork does; a current cwd that no longer resolves refuses the create and
   names `--cwd`. A lane gets its brief from the prompt it is driven with. This
-  is how a director makes a coder: `kj context create <label> --type coder --as coder`.
+  is how a director makes a coder: `kj context create coder --name <label>`.
 
-`--as` therefore means one thing across `kj`: the character who performs.
+The positional of `kj context create` is the character who performs.
 
 ## Where a created context sits
 
