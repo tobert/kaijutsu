@@ -1520,6 +1520,25 @@ CREATE TABLE IF NOT EXISTS character_slots (
 );
 CREATE INDEX IF NOT EXISTS idx_character_slots_backend ON character_slots(backend_id);
 
+-- ── Character models ──────────────────────────────────────────
+-- The one model a character runs wherever no role slot says otherwise. A
+-- context character copies it under the context's own type and under
+-- `distill`, for each of the two that the character has no slot for. A NULL
+-- tunable takes the model's `backend_models` value at that copy
+-- (docs/senpai-kohai.md, "Where a model comes from").
+CREATE TABLE IF NOT EXISTS character_models (
+    principal_id    BLOB NOT NULL PRIMARY KEY REFERENCES characters(principal_id),
+    backend_id      BLOB NOT NULL REFERENCES backends(backend_id),
+    model           TEXT NOT NULL CHECK (model != ''),
+    max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+    temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+    top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+    effort          TEXT,
+    thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+    thinking_style  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_character_models_backend ON character_models(backend_id);
+
 -- ── Characters (principal + sheet) ──────────────────────────────
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
@@ -8511,6 +8530,20 @@ pub struct CharacterSlotRow {
     pub thinking_style: Option<String>,
 }
 
+/// A character's one model. A NULL tunable takes the model's `backend_models` value when a context character copies it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CharacterModelRow {
+    pub principal_id: PrincipalId,
+    pub backend_id: BackendId,
+    pub model: String,
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub effort: Option<String>,
+    pub thinking_budget: Option<i64>,
+    pub thinking_style: Option<String>,
+}
+
 /// A `--model` shorthand: alias → (backend, model).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelAliasRow {
@@ -8593,6 +8626,23 @@ fn row_to_character_slot(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterSlotR
         effort: row.get(7)?,
         thinking_budget: row.get(8)?,
         thinking_style: row.get(9)?,
+    })
+}
+
+const CHARACTER_MODEL_COLS: &str = "principal_id, backend_id, model, max_tokens, temperature, \
+                                    top_p, effort, thinking_budget, thinking_style";
+
+fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterModelRow> {
+    Ok(CharacterModelRow {
+        principal_id: read_principal_id(row, 0)?,
+        backend_id: read_backend_id(row, 1)?,
+        model: row.get(2)?,
+        max_tokens: row.get(3)?,
+        temperature: row.get(4)?,
+        top_p: row.get(5)?,
+        effort: row.get(6)?,
+        thinking_budget: row.get(7)?,
+        thinking_style: row.get(8)?,
     })
 }
 
@@ -8691,6 +8741,15 @@ impl KernelDb {
             stmt.query_map(params![id], |r| r.get::<_, String>(0))?
                 .collect::<SqliteResult<Vec<_>>>()?
         };
+        let models: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT c.name FROM character_models m
+                 JOIN characters c ON c.principal_id = m.principal_id
+                 WHERE m.backend_id = ?1 ORDER BY 1",
+            )?;
+            stmt.query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
         let bindings: Vec<String> = {
             let mut stmt = self.conn.prepare(
                 "SELECT DISTINCT cc.context_id FROM context_slots cs
@@ -8707,10 +8766,13 @@ impl KernelDb {
             stmt.query_map(params![id], |r| r.get::<_, String>(0))?
                 .collect::<SqliteResult<Vec<_>>>()?
         };
-        if !slots.is_empty() || !aliases.is_empty() || !bindings.is_empty() {
+        if !slots.is_empty() || !models.is_empty() || !aliases.is_empty() || !bindings.is_empty() {
             let mut parts = Vec::new();
             if !slots.is_empty() {
-                parts.push(format!("cast slots [{}]", slots.join(", ")));
+                parts.push(format!("character slots [{}]", slots.join(", ")));
+            }
+            if !models.is_empty() {
+                parts.push(format!("the models of characters [{}]", models.join(", ")));
             }
             if !bindings.is_empty() {
                 parts.push(format!("context slots of [{}]", bindings.join(", ")));
@@ -8888,6 +8950,77 @@ impl KernelDb {
         let mut stmt = self.conn.prepare(&sql)?;
         Ok(stmt
             .query_row(params![blob_param(principal_id.as_bytes()), role], row_to_character_slot)
+            .optional()?)
+    }
+
+    // ── character models ────────────────────────────────────────────────
+
+    /// Insert or replace a character's model. A root character runs no model,
+    /// so it is refused.
+    pub fn set_character_model(&self, row: &CharacterModelRow) -> KernelDbResult<()> {
+        let Some(sheet) = self.get_character(row.principal_id)? else {
+            return Err(KernelDbError::NotFound(format!("character {}", row.principal_id.short())));
+        };
+        if sheet.root {
+            return Err(KernelDbError::Validation(format!(
+                "{} is a root character, and a root runs no model",
+                sheet.name
+            )));
+        }
+        if row.model.trim().is_empty() {
+            return Err(KernelDbError::Validation("model must not be empty".into()));
+        }
+        validate_tunables(
+            row.max_tokens,
+            row.temperature,
+            row.top_p,
+            row.thinking_budget,
+            row.thinking_style.as_deref(),
+        )?;
+        self.conn.execute(
+            &format!(
+                "INSERT INTO character_models ({CHARACTER_MODEL_COLS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(principal_id) DO UPDATE SET
+                     backend_id = excluded.backend_id,
+                     model = excluded.model,
+                     max_tokens = excluded.max_tokens,
+                     temperature = excluded.temperature,
+                     top_p = excluded.top_p,
+                     effort = excluded.effort,
+                     thinking_budget = excluded.thinking_budget,
+                     thinking_style = excluded.thinking_style"
+            ),
+            params![
+                blob_param(row.principal_id.as_bytes()),
+                blob_param(row.backend_id.as_bytes()),
+                row.model,
+                row.max_tokens,
+                row.temperature,
+                row.top_p,
+                row.effort,
+                row.thinking_budget,
+                row.thinking_style,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a character's model. Returns whether a row went.
+    pub fn delete_character_model(&self, principal_id: PrincipalId) -> KernelDbResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM character_models WHERE principal_id = ?1",
+            params![blob_param(principal_id.as_bytes())],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// A character's model, if it has one.
+    pub fn get_character_model(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterModelRow>> {
+        let sql = format!("SELECT {CHARACTER_MODEL_COLS} FROM character_models WHERE principal_id = ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_row(params![blob_param(principal_id.as_bytes())], row_to_character_model)
             .optional()?)
     }
 

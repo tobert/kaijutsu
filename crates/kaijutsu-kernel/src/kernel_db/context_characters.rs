@@ -241,57 +241,90 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Copy the slots of `principal_id` into `context_id`. A parameter the slot leaves
-    /// unset takes the model's `backend_models` value; nothing else supplies
-    /// one. A slot with no `max_tokens` in either place refuses, and so does
+    /// Copy the model and slots of `principal_id` into `context_id`: every
+    /// role slot under its own role; then the character's model under the
+    /// context's type and under `distill`, each only where the character has
+    /// no slot for that role. The model never fills `gate`, `judge` or the
+    /// type of an `mcp` context. A parameter left unset takes the model's
+    /// `backend_models` value; nothing else supplies one. A model request with
+    /// no `max_tokens` in either place refuses, and so does
     /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`.
     fn copy_character_slots(&self, context_id: ContextId, principal_id: PrincipalId) -> KernelDbResult<()> {
         let who = self.name_for(principal_id);
-        for slot in self.list_character_slots(principal_id)? {
-            let model_row = self
-                .list_backend_models(slot.backend_id)?
-                .into_iter()
-                .find(|m| m.model_id == slot.model);
-            let tunables = over(
-                &slot_tunables(&slot),
-                &model_row.as_ref().map(|m| m.tunables.clone()).unwrap_or_default(),
-            );
-            let max_tokens = tunables.max_tokens;
-            if max_tokens.is_none() && !names_council_server(&slot.role) {
-                return Err(KernelDbError::Validation(format!(
-                    "slot {} of character {who} runs model {}, which has no max_tokens in the slot or in its \
-                     backend_models row; every request carries max_tokens, so set it on one of them",
-                    slot.role, slot.model
-                )));
+        let slots = self.list_character_slots(principal_id)?;
+        for slot in &slots {
+            let subject = format!("slot {} of character {who}", slot.role);
+            self.copy_one_slot(context_id, &slot.role, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
+        }
+        let Some(model) = self.get_character_model(principal_id)? else {
+            return Ok(());
+        };
+        let context_type = self
+            .get_context(context_id)?
+            .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context_id.short())))?
+            .context_type;
+        let mut roles = vec!["distill"];
+        if context_type != "mcp" && !names_council_server(&context_type) && context_type != "distill" {
+            roles.insert(0, context_type.as_str());
+        }
+        let subject = format!("the model of character {who}");
+        let tunables = ModelTunablesRow {
+            max_tokens: model.max_tokens,
+            temperature: model.temperature,
+            top_p: model.top_p,
+            effort: model.effort.clone(),
+            thinking_budget: model.thinking_budget,
+            thinking_style: model.thinking_style.clone(),
+        };
+        for role in roles {
+            if slots.iter().any(|slot| slot.role == role) {
+                continue;
             }
-            if !names_council_server(&slot.role) && tunables.thinking_style.as_deref() == Some("budget") {
-                let Some(budget) = tunables.thinking_budget else {
-                    return Err(KernelDbError::Validation(format!(
-                        "slot {} of character {who} runs model {} with thinking_style=budget and no \
-                         thinking_budget in the slot or in its backend_models row; set one of them",
-                        slot.role, slot.model
-                    )));
-                };
-                if let Some(max) = max_tokens
-                    && budget >= max
-                {
-                    return Err(KernelDbError::Validation(format!(
-                        "slot {} of character {who} runs model {} with thinking_budget ({budget}) not below \
-                         max_tokens ({max}); lower the budget or raise max_tokens",
-                        slot.role, slot.model
-                    )));
-                }
-            }
-            let values = SlotValues::new(
-                slot.backend_id,
-                &slot.model,
-                tunables,
-                max_tokens,
-                model_row.and_then(|m| m.context_window),
-            );
-            insert_slot(&self.conn, context_id, &slot.role, &values)?;
+            self.copy_one_slot(context_id, role, &subject, model.backend_id, &model.model, tunables.clone())?;
         }
         Ok(())
+    }
+
+    /// Write one context slot for `role` from a backend, a model and the
+    /// tunables its source sets, filling the rest from the model's row.
+    /// `subject` names the source in a refusal.
+    fn copy_one_slot(
+        &self,
+        context_id: ContextId,
+        role: &str,
+        subject: &str,
+        backend_id: BackendId,
+        model: &str,
+        own: ModelTunablesRow,
+    ) -> KernelDbResult<()> {
+        let model_row = self.list_backend_models(backend_id)?.into_iter().find(|m| m.model_id == model);
+        let tunables = over(&own, &model_row.as_ref().map(|m| m.tunables.clone()).unwrap_or_default());
+        let max_tokens = tunables.max_tokens;
+        if max_tokens.is_none() && !names_council_server(role) {
+            return Err(KernelDbError::Validation(format!(
+                "{subject} runs model {model}, which has no max_tokens in the {} or in its \
+                 backend_models row; every request carries max_tokens, so set it on one of them",
+                if subject.starts_with("slot") { "slot" } else { "model" }
+            )));
+        }
+        if !names_council_server(role) && tunables.thinking_style.as_deref() == Some("budget") {
+            let Some(budget) = tunables.thinking_budget else {
+                return Err(KernelDbError::Validation(format!(
+                    "{subject} runs model {model} with thinking_style=budget and no \
+                     thinking_budget in its own settings or in its backend_models row; set one of them"
+                )));
+            };
+            if let Some(max) = max_tokens
+                && budget >= max
+            {
+                return Err(KernelDbError::Validation(format!(
+                    "{subject} runs model {model} with thinking_budget ({budget}) not below \
+                     max_tokens ({max}); lower the budget or raise max_tokens"
+                )));
+            }
+        }
+        let values = SlotValues::new(backend_id, model, tunables, max_tokens, model_row.and_then(|m| m.context_window));
+        insert_slot(&self.conn, context_id, role, &values)
     }
 
     /// Run `f` atomically: its own transaction when none is open, else a

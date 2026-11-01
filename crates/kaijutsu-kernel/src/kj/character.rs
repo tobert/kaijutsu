@@ -4,8 +4,9 @@
 //! `retire` stamps `retired_at` and, in the same act, concludes and
 //! archives every live context the character performs.
 //!
-//! `slot set|unset|list` (`kj/slot.rs`) holds the model each of a
-//! character's roles runs. `unset` and `list` work on a retired character
+//! `model set|unset|show` and `slot set|unset|list` (`kj/slot.rs`) hold the
+//! model a character runs and the model each of its roles runs where that
+//! differs. `unset` and `list` work on a retired character
 //! too, so its slots can be tidied; `set` refuses one.
 
 use clap::{Parser, Subcommand};
@@ -42,6 +43,17 @@ enum CharacterCommand {
         /// context of its own. Its `kj` requests always need approval.
         #[arg(long)]
         root: bool,
+        /// Backend of the character's model. Needs --model; a root runs no
+        /// model.
+        #[arg(long, requires = "model")]
+        backend: Option<String>,
+        /// Model id of the character's model. Needs --backend.
+        #[arg(long, requires = "backend")]
+        model: Option<String>,
+        /// Maximum RESPONSE tokens of the character's model. Needs --model.
+        /// Omit to read it from the model's `kj backend model set` row.
+        #[arg(long = "max-tokens", requires = "model")]
+        max_tokens: Option<u64>,
     },
     /// List the live (non-retired) characters.
     #[command(alias = "ls")]
@@ -71,9 +83,13 @@ enum CharacterCommand {
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
     },
-    /// The model each of a character's roles runs. A context copies the
-    /// slots when it is made, so a change reaches a running context at
-    /// `kj context rotate`.
+    /// The model a character runs. A context copies it when it is made, so a
+    /// change reaches a running context at `kj context rotate`.
+    #[command(subcommand)]
+    Model(super::slot::CharacterModelCommand),
+    /// The model one role of a character runs, where that differs from its
+    /// model. A context copies the slots when it is made, so a change reaches
+    /// a running context at `kj context rotate`.
     #[command(subcommand)]
     Slot(super::slot::CharacterSlotCommand),
     /// Retire a character and conclude and archive every live context it plays.
@@ -127,6 +143,8 @@ impl KjDispatcher {
             CharacterCommand::Create { .. }
                 | CharacterCommand::Set { .. }
                 | CharacterCommand::Retire { .. }
+                | CharacterCommand::Model(super::slot::CharacterModelCommand::Set { .. })
+                | CharacterCommand::Model(super::slot::CharacterModelCommand::Unset { .. })
                 | CharacterCommand::Slot(super::slot::CharacterSlotCommand::Set { .. })
                 | CharacterCommand::Slot(super::slot::CharacterSlotCommand::Unset { .. })
         );
@@ -138,7 +156,9 @@ impl KjDispatcher {
         }
 
         match parsed.command {
-            CharacterCommand::Create { name, root } => self.character_create(&name, root, caller).await,
+            CharacterCommand::Create { name, root, backend, model, max_tokens } => {
+                self.character_create(&name, root, backend.zip(model), max_tokens, caller).await
+            }
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
             CharacterCommand::Set { name, root, no_root } => {
@@ -147,6 +167,7 @@ impl KjDispatcher {
                 }
                 self.character_set(&name, root, no_root, caller).await
             }
+            CharacterCommand::Model(cmd) => self.character_model(cmd),
             CharacterCommand::Slot(cmd) => self.character_slot(cmd),
             CharacterCommand::Retire { name } => self.character_retire(&name, caller).await,
         }
@@ -157,19 +178,55 @@ impl KjDispatcher {
     /// hazard `add-key` avoids by binding instead of minting
     /// (`docs/character.md`, "Adding a key binds; it never mints") applies
     /// just as much to a repeated `create`.
-    async fn character_create(&self, name: &str, root: bool, caller: &KjCaller) -> KjResult {
+    async fn character_create(
+        &self,
+        name: &str,
+        root: bool,
+        model: Option<(String, String)>,
+        max_tokens: Option<u64>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        if root && model.is_some() {
+            return KjResult::Err(
+                "kj character create: a root runs no model; drop --backend and --model, or drop --root".to_string(),
+            );
+        }
         let row = {
             let db = self.kernel_db().lock();
             match db.get_character_by_name(name) {
                 Ok(Some(existing)) => {
+                    let note = if model.is_some() {
+                        format!("; its model is unchanged (`kj character model set {name} --backend B --model M` changes it)")
+                    } else {
+                        String::new()
+                    };
                     return KjResult::ok_with_data(
-                        format!("{name} already exists ({})", existing.principal_id.short()),
+                        format!("{name} already exists ({}){note}", existing.principal_id.short()),
                         character_to_json(&existing),
                     );
                 }
                 Ok(None) => {}
                 Err(e) => return KjResult::Err(format!("kj character create: {e}")),
             }
+            // Resolve the model before the character exists, so a bad backend
+            // name leaves no character behind.
+            let model_row = match &model {
+                None => None,
+                Some((backend, model_id)) => {
+                    if model_id.trim().is_empty() {
+                        return KjResult::Err("kj character create: --model must not be empty".to_string());
+                    }
+                    match db.get_backend_by_name(backend) {
+                        Ok(Some(b)) => Some((b.backend_id, model_id.clone())),
+                        Ok(None) => {
+                            return KjResult::Err(format!(
+                                "kj character create: backend '{backend}' not found; nothing was created"
+                            ));
+                        }
+                        Err(e) => return KjResult::Err(format!("kj character create: {e}")),
+                    }
+                }
+            };
 
             let row = CharacterRow {
                 principal_id: PrincipalId::new(),
@@ -182,11 +239,34 @@ impl KjDispatcher {
             if let Err(e) = db.insert_character(&row) {
                 return KjResult::Err(format!("kj character create: {e}"));
             }
+            if let Some((backend_id, model_id)) = model_row
+                && let Err(e) = db.set_character_model(&crate::kernel_db::CharacterModelRow {
+                    principal_id: row.principal_id,
+                    backend_id,
+                    model: model_id,
+                    max_tokens: max_tokens.map(|v| v as i64),
+                    temperature: None,
+                    top_p: None,
+                    effort: None,
+                    thinking_budget: None,
+                    thinking_style: None,
+                })
+            {
+                return KjResult::Err(format!(
+                    "kj character create: created {name} ({}) but could not set its model: {e}; \
+                     `kj character model set {name} --backend B --model M` sets it",
+                    row.principal_id.short()
+                ));
+            }
             row
         };
         if !root {
+            let with_model = match &model {
+                Some((backend, model_id)) => format!(" with model {backend}/{model_id}"),
+                None => String::new(),
+            };
             return KjResult::ok_with_data(
-                format!("created {name} ({})", row.principal_id.short()),
+                format!("created {name} ({}){with_model}", row.principal_id.short()),
                 character_to_json(&row),
             );
         }
@@ -476,6 +556,10 @@ impl KjDispatcher {
                     Ok(b) => b.into_iter().map(|b| (b.backend_id, b.name)).collect(),
                     Err(e) => return KjResult::Err(format!("kj character show: {e}")),
                 };
+                let model = match db.get_character_model(row.principal_id) {
+                    Ok(m) => m,
+                    Err(e) => return KjResult::Err(format!("kj character show: {e}")),
+                };
                 let slot_names: Vec<String> = slots
                     .iter()
                     .map(|s| format!("{} → {}/{}", s.role, backends.get(&s.backend_id).map_or("(missing backend)", String::as_str), s.model))
@@ -487,10 +571,11 @@ impl KjDispatcher {
                 let context_names: Vec<String> = contexts.iter().map(|c| db.context_name(*c)).collect();
                 let mut text = format!(
                     "Character:       {}\nID:              {}\nRoot:            {}\n\
-                     Slots:           {}\nCreated:         {}\nRetired:         {}",
+                     Model:           {}\nSlots:           {}\nCreated:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
+                    model.as_ref().map_or_else(|| "-".to_string(), |m| super::slot::model_summary(m, &backends)),
                     if slot_names.is_empty() { "-".to_string() } else { slot_names.join(", ") },
                     super::format::format_timestamp(row.created_at),
                     row.retired_at
@@ -499,6 +584,7 @@ impl KjDispatcher {
                 );
                 text.push_str(&format!("\nLive contexts:   {}", if context_names.is_empty() { "-".to_string() } else { context_names.join(", ") }));
                 let mut data = character_to_json(&row);
+                data["model"] = super::slot::model_data(model.as_ref(), &backends);
                 data["slots"] = super::slot::slot_data(&slots, &backends);
                 data["contexts"] = serde_json::Value::Array(
                     contexts.iter().map(|c| serde_json::json!({
@@ -708,6 +794,7 @@ impl Classify for CharacterCommand {
             Self::List { .. } | Self::Show { .. } => Effect::Read,
             Self::Create { .. } | Self::Set { .. } => Effect::Write,
             Self::Retire { .. } => Effect::Destroy,
+            Self::Model(cmd) => cmd.effect(),
             Self::Slot(cmd) => cmd.effect(),
         }
     }

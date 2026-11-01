@@ -21,10 +21,16 @@
 //! operator or agent decision, and shipping one would be the kernel guessing.
 //! A turn reads its model from the context's own slots
 //! (`model_resolution::context_model`), never from the character's.
+//!
+//! `kj character model set|unset|show` holds the character's **one model**:
+//! the model it runs wherever no role slot says otherwise. A context copies
+//! it under its own type and under `distill` for each of the two the
+//! character has no slot for; it never fills `gate`, `judge` or the type of an
+//! `mcp` context. A root character runs no model.
 
 use clap::Subcommand;
 
-use crate::kernel_db::CharacterSlotRow;
+use crate::kernel_db::{CharacterModelRow, CharacterSlotRow};
 
 use super::{KjDispatcher, KjResult};
 
@@ -82,6 +88,250 @@ pub(super) enum CharacterSlotCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub(super) enum CharacterModelCommand {
+    /// Set the character's model, replacing the one it has. A context copies
+    /// the model when it is made, so a change reaches a running context at
+    /// `kj context rotate`. A root character refuses it.
+    Set {
+        /// The character's name
+        character: String,
+        /// Backend name
+        #[arg(long)]
+        backend: String,
+        /// Model id
+        #[arg(long)]
+        model: String,
+        /// Maximum RESPONSE tokens. Omit to read it from the model's
+        /// `kj backend model set` row when a context is made; making a
+        /// context refuses a model with neither
+        #[arg(long = "max-tokens")]
+        max_tokens: Option<u64>,
+        /// Sampling temperature, 0.0..=2.0
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Nucleus sampling, (0.0, 1.0]
+        #[arg(long = "top-p")]
+        top_p: Option<f64>,
+        /// Provider effort ladder token (e.g. low, high, max)
+        #[arg(long)]
+        effort: Option<String>,
+        /// Extended-thinking token budget
+        #[arg(long = "thinking-budget")]
+        thinking_budget: Option<u64>,
+        /// Extended-thinking style: budget needs --thinking-budget below max tokens
+        #[arg(long = "thinking-style", value_parser = ["off", "auto", "adaptive", "budget"])]
+        thinking_style: Option<String>,
+    },
+    /// Remove the character's model. Role slots stay. Contexts keep the
+    /// slots they copied until they are rotated.
+    #[command(alias = "rm")]
+    Unset {
+        /// The character's name
+        character: String,
+    },
+    /// Show the character's model.
+    Show {
+        /// The character's name
+        character: String,
+    },
+}
+
+/// The structured form of a character's model, or null.
+pub(super) fn model_data(
+    model: Option<&CharacterModelRow>,
+    backends: &std::collections::HashMap<kaijutsu_types::BackendId, String>,
+) -> serde_json::Value {
+    let Some(m) = model else { return serde_json::Value::Null };
+    serde_json::json!({
+        "backend": backends.get(&m.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string()),
+        "model": m.model,
+        "max_tokens": m.max_tokens,
+        "temperature": m.temperature,
+        "top_p": m.top_p,
+        "effort": m.effort,
+        "thinking_budget": m.thinking_budget,
+        "thinking_style": m.thinking_style,
+    })
+}
+
+/// `backend/model [knobs]` for a character's model.
+pub(super) fn model_summary(
+    m: &CharacterModelRow,
+    backends: &std::collections::HashMap<kaijutsu_types::BackendId, String>,
+) -> String {
+    let backend = backends.get(&m.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
+    let knobs = knob_list(m.max_tokens, m.temperature, m.top_p, m.effort.as_deref(), m.thinking_budget, m.thinking_style.as_deref());
+    if knobs.is_empty() {
+        format!("{backend}/{} (no parameters set)", m.model)
+    } else {
+        format!("{backend}/{} [{}]", m.model, knobs.join(", "))
+    }
+}
+
+fn knob_list(
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    effort: Option<&str>,
+    thinking_budget: Option<i64>,
+    thinking_style: Option<&str>,
+) -> Vec<String> {
+    let mut knobs = Vec::new();
+    if let Some(v) = max_tokens {
+        knobs.push(format!("max_tokens={v}"));
+    }
+    if let Some(v) = temperature {
+        knobs.push(format!("temperature={v}"));
+    }
+    if let Some(v) = top_p {
+        knobs.push(format!("top_p={v}"));
+    }
+    if let Some(v) = effort {
+        knobs.push(format!("effort={v}"));
+    }
+    if let Some(v) = thinking_budget {
+        knobs.push(format!("thinking_budget={v}"));
+    }
+    if let Some(v) = thinking_style {
+        knobs.push(format!("thinking_style={v}"));
+    }
+    knobs
+}
+
+impl KjDispatcher {
+    pub(super) fn character_model(&self, cmd: CharacterModelCommand) -> KjResult {
+        let db = self.kernel_db().lock();
+        match cmd {
+            CharacterModelCommand::Set {
+                character,
+                backend,
+                model,
+                max_tokens,
+                temperature,
+                top_p,
+                effort,
+                thinking_budget,
+                thinking_style,
+            } => {
+                let sheet = match db.get_character_by_name(&character) {
+                    Ok(Some(sheet)) if sheet.retired_at.is_none() => sheet,
+                    Ok(Some(_)) => {
+                        return KjResult::Err(format!("kj character model set: '{character}' is retired"));
+                    }
+                    Ok(None) => {
+                        return KjResult::Err(format!(
+                            "kj character model set: character '{character}' not found (`kj character create {character}` first)"
+                        ));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj character model set: {e}")),
+                };
+                let b = match db.get_backend_by_name(&backend) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        return KjResult::Err(format!("kj character model set: backend '{backend}' not found"));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj character model set: {e}")),
+                };
+                if let Err(e) = db.set_character_model(&CharacterModelRow {
+                    principal_id: sheet.principal_id,
+                    backend_id: b.backend_id,
+                    model: model.clone(),
+                    max_tokens: max_tokens.map(|v| v as i64),
+                    temperature,
+                    top_p,
+                    effort,
+                    thinking_budget: thinking_budget.map(|v| v as i64),
+                    thinking_style,
+                }) {
+                    return KjResult::Err(format!("kj character model set: {e}"));
+                }
+                let mut msg = format!("set the model of {character} → {backend}/{model}");
+                msg.push_str(&max_tokens_warnings(&db, &character, &backend, &model, b.backend_id, max_tokens, thinking_budget, true));
+                KjResult::ok(msg)
+            }
+            CharacterModelCommand::Unset { character } => {
+                let sheet = match db.get_character_by_name(&character) {
+                    Ok(Some(sheet)) => sheet,
+                    Ok(None) => {
+                        return KjResult::Err(format!("kj character model unset: character '{character}' not found"));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj character model unset: {e}")),
+                };
+                match db.delete_character_model(sheet.principal_id) {
+                    Ok(true) => KjResult::ok(format!("removed the model of {character}")),
+                    Ok(false) => KjResult::Err(format!("kj character model unset: {character} has no model")),
+                    Err(e) => KjResult::Err(format!("kj character model unset: {e}")),
+                }
+            }
+            CharacterModelCommand::Show { character } => {
+                let sheet = match db.get_character_by_name(&character) {
+                    Ok(Some(sheet)) => sheet,
+                    Ok(None) => {
+                        return KjResult::Err(format!("kj character model show: character '{character}' not found"));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj character model show: {e}")),
+                };
+                let model = match db.get_character_model(sheet.principal_id) {
+                    Ok(m) => m,
+                    Err(e) => return KjResult::Err(format!("kj character model show: {e}")),
+                };
+                let backends: std::collections::HashMap<_, _> = match db.list_backends() {
+                    Ok(b) => b.into_iter().map(|b| (b.backend_id, b.name)).collect(),
+                    Err(e) => return KjResult::Err(format!("kj character model show: {e}")),
+                };
+                let text = match &model {
+                    Some(m) => format!("{character}: {}", model_summary(m, &backends)),
+                    None => format!(
+                        "{character} has no model (`kj character model set {character} --backend B --model M`)"
+                    ),
+                };
+                KjResult::ok_with_data(text, model_data(model.as_ref(), &backends))
+            }
+        }
+    }
+}
+
+/// Write-time warnings against the values a context would copy: the
+/// source's own, else the model's row. Warn, not error: the write lands
+/// either way, since pinning `max_tokens` on the model row right after can
+/// make it valid. `needs_max_tokens` is false for a council role.
+#[allow(clippy::too_many_arguments)]
+fn max_tokens_warnings(
+    db: &crate::kernel_db::KernelDb,
+    character: &str,
+    backend: &str,
+    model: &str,
+    backend_id: kaijutsu_types::BackendId,
+    max_tokens: Option<u64>,
+    thinking_budget: Option<u64>,
+    needs_max_tokens: bool,
+) -> String {
+    let row_max_tokens = db
+        .list_backend_models(backend_id)
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r.model_id == model))
+        .and_then(|r| r.tunables.max_tokens)
+        .and_then(|v| u64::try_from(v).ok());
+    match max_tokens.or(row_max_tokens) {
+        None if needs_max_tokens => format!(
+            " — WARN: no max_tokens in the settings or in the model's row, and every \
+             request carries max_tokens; making a context for {character} will \
+             refuse until one is set (`--max-tokens` here, or `kj backend model \
+             set {backend} {model} --max-tokens N`)"
+        ),
+        Some(effective) => match thinking_budget {
+            Some(tb) if tb >= effective => format!(
+                " — WARN: thinking_budget ({tb}) >= effective max_tokens \
+                 ({effective}) after the settings and model cascade; requests \
+                 will fail at build time until one is raised or the other lowered"
+            ),
+            _ => String::new(),
+        },
+        None => String::new(),
+    }
+}
+
 impl KjDispatcher {
     pub(super) fn character_slot(&self, cmd: CharacterSlotCommand) -> KjResult {
         let db = self.kernel_db().lock();
@@ -131,39 +381,16 @@ impl KjDispatcher {
                 }) {
                     Ok(()) => {
                         let mut msg = format!("set {character}/{role} → {backend}/{model}");
-                        // Write-time checks against the values a context
-                        // character would copy: the slot's, else the model's
-                        // row. Warn, not error: the write lands either way,
-                        // since pinning `max_tokens` on the model row right
-                        // after can make the slot valid.
-                        let row_max_tokens = db
-                            .list_backend_models(b.backend_id)
-                            .ok()
-                            .and_then(|rows| rows.into_iter().find(|r| r.model_id == model))
-                            .and_then(|r| r.tunables.max_tokens)
-                            .and_then(|v| u64::try_from(v).ok());
-                        let effective_max_tokens = max_tokens.or(row_max_tokens);
-                        match effective_max_tokens {
-                            None if !matches!(role.as_str(), "gate" | "judge") => msg.push_str(&format!(
-                                " — WARN: no max_tokens in the slot or in the model's row, and every \
-                                 request carries max_tokens; making a context for {character} will \
-                                 refuse until one is set (`--max-tokens` here, or `kj backend model \
-                                 set {backend} {model} --max-tokens N`)"
-                            )),
-                            Some(effective) => {
-                                if let Some(tb) = thinking_budget
-                                    && tb >= effective
-                                {
-                                    msg.push_str(&format!(
-                                        " — WARN: thinking_budget ({tb}) >= effective max_tokens \
-                                         ({effective}) after the slot and model cascade; requests \
-                                         on this slot will fail at build time until one is \
-                                         raised or the other lowered"
-                                    ));
-                                }
-                            }
-                            None => {}
-                        }
+                        msg.push_str(&max_tokens_warnings(
+                            &db,
+                            &character,
+                            &backend,
+                            &model,
+                            b.backend_id,
+                            max_tokens,
+                            thinking_budget,
+                            !matches!(role.as_str(), "gate" | "judge"),
+                        ));
                         KjResult::ok(msg)
                     }
                     Err(e) => KjResult::Err(format!("kj character slot set: {e}")),
@@ -244,25 +471,7 @@ fn slot_listing(
     }
     for s in slots {
         let backend = backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
-        let mut knobs = Vec::new();
-        if let Some(v) = s.max_tokens {
-            knobs.push(format!("max_tokens={v}"));
-        }
-        if let Some(v) = s.temperature {
-            knobs.push(format!("temperature={v}"));
-        }
-        if let Some(v) = s.top_p {
-            knobs.push(format!("top_p={v}"));
-        }
-        if let Some(v) = &s.effort {
-            knobs.push(format!("effort={v}"));
-        }
-        if let Some(v) = s.thinking_budget {
-            knobs.push(format!("thinking_budget={v}"));
-        }
-        if let Some(v) = &s.thinking_style {
-            knobs.push(format!("thinking_style={v}"));
-        }
+        let knobs = knob_list(s.max_tokens, s.temperature, s.top_p, s.effort.as_deref(), s.thinking_budget, s.thinking_style.as_deref());
         // Only the slot's own values are shown; the rest are read from the
         // model's row when a context's slots are copied, and printing them
         // here would read as a per-slot decision nobody made.
@@ -284,6 +493,15 @@ impl Classify for CharacterSlotCommand {
         match self {
             Self::Set { .. } | Self::Unset { .. } => Effect::Write,
             Self::List { .. } => Effect::Read,
+        }
+    }
+}
+
+impl Classify for CharacterModelCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::Set { .. } | Self::Unset { .. } => Effect::Write,
+            Self::Show { .. } => Effect::Read,
         }
     }
 }
@@ -393,6 +611,136 @@ mod tests {
             KjResult::Err(msg) => assert!(msg.contains("character 'ghost' not found"), "{msg}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `model set` writes the model and invents no value; `show` reads it
+    /// back, structured; `unset` removes it and the second `unset` says there
+    /// is none.
+    #[tokio::test]
+    async fn model_set_show_and_unset_round_trip() {
+        let d = seeded().await;
+        let c = test_caller();
+        let none = d.dispatch(&argv(&["character", "model", "show", "house"]), &c).await;
+        assert!(none.message().contains("has no model"), "{}", none.message());
+        let KjResult::Ok { data: Some(v), .. } = &none else { panic!("{none:?}") };
+        assert!(v.is_null(), "no model is null: {v}");
+
+        let set = d
+            .dispatch(
+                &argv(&[
+                    "character", "model", "set", "house", "--backend", "anthropic", "--model", "claude-opus-5",
+                    "--temperature", "0.3",
+                ]),
+                &c,
+            )
+            .await;
+        assert!(set.is_ok(), "{}", set.message());
+        assert!(set.message().contains("WARN") && set.message().contains("no max_tokens"), "{}", set.message());
+        let shown = d.dispatch(&argv(&["character", "model", "show", "house"]), &c).await;
+        let KjResult::Ok { data: Some(v), .. } = &shown else { panic!("{shown:?}") };
+        assert_eq!((v["backend"].as_str(), v["model"].as_str()), (Some("anthropic"), Some("claude-opus-5")));
+        assert_eq!(v["temperature"], 0.3);
+        assert!(v["max_tokens"].is_null(), "an unset parameter stays unset: {v}");
+
+        assert!(d.dispatch(&argv(&["character", "model", "unset", "house"]), &c).await.is_ok());
+        let again = d.dispatch(&argv(&["character", "model", "unset", "house"]), &c).await;
+        assert!(matches!(&again, KjResult::Err(m) if m.contains("has no model")), "{again:?}");
+    }
+
+    /// `model set` shares `slot set`'s range checks and refuses an unknown
+    /// backend, an unknown character, and a root.
+    #[tokio::test]
+    async fn model_set_refuses_bad_input_and_a_root() {
+        let d = seeded().await;
+        let c = test_caller();
+        let bad_backend = d
+            .dispatch(&argv(&["character", "model", "set", "house", "--backend", "nope", "--model", "m"]), &c)
+            .await;
+        assert!(matches!(&bad_backend, KjResult::Err(m) if m.contains("backend 'nope' not found")), "{bad_backend:?}");
+        let ghost = d
+            .dispatch(&argv(&["character", "model", "set", "ghost", "--backend", "anthropic", "--model", "m"]), &c)
+            .await;
+        assert!(matches!(&ghost, KjResult::Err(m) if m.contains("character 'ghost' not found")), "{ghost:?}");
+        let hot = d
+            .dispatch(
+                &argv(&[
+                    "character", "model", "set", "house", "--backend", "anthropic", "--model", "m", "--temperature", "9",
+                ]),
+                &c,
+            )
+            .await;
+        assert!(matches!(&hot, KjResult::Err(m) if m.contains("temperature")), "{hot:?}");
+
+        d.kernel_db()
+            .lock()
+            .insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: kaijutsu_types::PrincipalId::new(),
+                name: "boss".into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: true,
+            })
+            .unwrap();
+        let refused = d
+            .dispatch(&argv(&["character", "model", "set", "boss", "--backend", "anthropic", "--model", "m"]), &c)
+            .await;
+        assert!(matches!(&refused, KjResult::Err(m) if m.contains("a root runs no model")), "{refused:?}");
+    }
+
+    /// `create --backend --model` writes the character and its model; a bad
+    /// backend leaves no character; the flags come as a pair; a root refuses
+    /// them.
+    #[tokio::test]
+    async fn create_with_a_model_is_all_or_nothing() {
+        let d = seeded().await;
+        let c = test_caller();
+        let made = d
+            .dispatch(&argv(&["character", "create", "worker", "--backend", "anthropic", "--model", "claude-opus-5"]), &c)
+            .await;
+        assert!(made.is_ok(), "{}", made.message());
+        {
+            let db = d.kernel_db().lock();
+            let worker = db.get_character_by_name("worker").unwrap().unwrap();
+            assert_eq!(db.get_character_model(worker.principal_id).unwrap().unwrap().model, "claude-opus-5");
+        }
+
+        let bad = d
+            .dispatch(&argv(&["character", "create", "ghost", "--backend", "nope", "--model", "m"]), &c)
+            .await;
+        assert!(matches!(&bad, KjResult::Err(m) if m.contains("backend 'nope' not found")), "{bad:?}");
+        assert!(d.kernel_db().lock().get_character_by_name("ghost").unwrap().is_none(), "a bad backend leaves no character");
+
+        let half = d.dispatch(&argv(&["character", "create", "half", "--backend", "anthropic"]), &c).await;
+        assert!(matches!(&half, KjResult::Err(m) if m.contains("--model")), "both or neither: {half:?}");
+        assert!(d.kernel_db().lock().get_character_by_name("half").unwrap().is_none());
+
+        let root = d
+            .dispatch(&argv(&["character", "create", "boss", "--root", "--backend", "anthropic", "--model", "m"]), &c)
+            .await;
+        assert!(matches!(&root, KjResult::Err(m) if m.contains("a root runs no model")), "{root:?}");
+        assert!(d.kernel_db().lock().get_character_by_name("boss").unwrap().is_none());
+    }
+
+    /// `kj character show` reports the model and keeps the slots apart as
+    /// overrides; its data carries `model` as an object or null.
+    #[tokio::test]
+    async fn show_reports_the_model_and_the_slots() {
+        let d = seeded().await;
+        let c = test_caller();
+        let bare = d.dispatch(&argv(&["character", "show", "house"]), &c).await;
+        let KjResult::Ok { data: Some(v), .. } = &bare else { panic!("{bare:?}") };
+        assert!(v["model"].is_null(), "{v}");
+
+        d.dispatch(&argv(&["character", "model", "set", "house", "--backend", "anthropic", "--model", "claude-opus-5"]), &c).await;
+        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "--backend", "anthropic", "--model", "g"]), &c).await;
+        let shown = d.dispatch(&argv(&["character", "show", "house"]), &c).await;
+        let KjResult::Ok { data: Some(v), message, .. } = &shown else { panic!("{shown:?}") };
+        assert_eq!(v["model"]["model"], "claude-opus-5");
+        assert_eq!(v["slots"][0]["role"], "gate");
+        assert!(message.contains("Model:") && message.contains("anthropic/claude-opus-5"), "{message}");
+        assert!(message.contains("gate"), "{message}");
     }
 
     /// A retired character takes no new slots: nothing will make a context

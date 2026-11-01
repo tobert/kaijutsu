@@ -19,10 +19,13 @@ use crate::ssh::SshServerConfig;
 
 /// The label of the model console.
 const ROOT_LABEL: &str = "ROOT";
-/// The slots bootstrap gives ROOT's performer: the console's own model and
-/// the one that distills its forks and pulls.
-const PERFORMER_ROLES: &[&str] = &["console", "distill"];
-/// The response budget bootstrap gives each slot.
+/// The role of ROOT's own model slot. A context copies its character's model
+/// under its type, and under `distill` for its forks and pulls.
+const CONSOLE_ROLE: &str = "console";
+/// The slots that already give ROOT's performer a model for the console and
+/// for distillation.
+const PERFORMER_ROLES: &[&str] = &[CONSOLE_ROLE, "distill"];
+/// The response budget bootstrap gives the performer's model.
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 
 
@@ -281,8 +284,20 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     }
 
     let performer = &opts.console_performer;
+    // A new performer is created with its model. An existing one with neither
+    // a model nor a slot gets the model; one that has either is left alone.
+    let first = opts.backends.first();
     match read(shared, |db| db.get_character_by_name(performer))? {
-        None => dispatch(shared, caller, words(&["character", "create", performer]), &mut report).await?,
+        None => {
+            let mut argv = words(&["character", "create", performer]);
+            if let Some(backend) = first {
+                argv.extend(words(&[
+                    "--backend", &backend.name, "--model", &backend.model, "--max-tokens",
+                    &DEFAULT_MAX_TOKENS.to_string(),
+                ]));
+            }
+            dispatch(shared, caller, argv, &mut report).await?;
+        }
         Some(row) if row.retired_at.is_some() => {
             return Err(format!("'{performer}' is retired; name ROOT's performer with --console-as"));
         }
@@ -291,40 +306,37 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                 "'{performer}' is a root character and cannot play ROOT; name ROOT's performer with --console-as"
             ));
         }
-        Some(_) => {}
-    }
-
-    // A context copies its character's slots when it is made. The first
-    // backend's model fills the slots ROOT and its forks need, where the
-    // performer has none for the role.
-    let mut has_model = false;
-    match opts.backends.first() {
-        Some(backend) => {
-            let played = read(shared, |db| db.get_character_by_name(performer))?
-                .ok_or_else(|| format!("no '{performer}' character row after creating it"))?;
-            for role in PERFORMER_ROLES {
-                if read(shared, |db| db.get_character_slot(played.principal_id, role))?.is_some() {
-                    continue;
-                }
+        Some(row) => {
+            let has_model = read(shared, |db| db.get_character_model(row.principal_id))?.is_some();
+            let has_slots = read(shared, |db| {
+                PERFORMER_ROLES.iter().try_fold(false, |any, role| Ok(any || db.get_character_slot(row.principal_id, role)?.is_some()))
+            })?;
+            if has_model || has_slots {
+                report.notes.push(format!(
+                    "{performer} already has {}; `kj character model set` changes its model",
+                    if has_model { "a model" } else { "role slots" }
+                ));
+            } else if let Some(backend) = first {
                 dispatch(
                     shared,
                     caller,
                     words(&[
-                        "character", "slot", "set", performer, role, "--backend", &backend.name, "--model",
+                        "character", "model", "set", performer, "--backend", &backend.name, "--model",
                         &backend.model, "--max-tokens", &DEFAULT_MAX_TOKENS.to_string(),
                     ]),
                     &mut report,
                 )
                 .await?;
             }
-            has_model = true;
         }
-        None => report.notes.push(
+    }
+    if first.is_none() {
+        report.notes.push(
             "ROOT has no model yet. Give the kernel a key and run bootstrap again, or set one \
              from your root: `kj backend set anthropic --kind anthropic --api-key-file \
-             ~/.anthropic-key.txt`, then give the character slots with `kj character slot set`"
+             ~/.anthropic-key.txt`, then give the character a model with `kj character model set`"
                 .to_string(),
-        ),
+        );
     }
 
     let played_id = read(shared, |db| db.get_character_by_name(performer))?
@@ -355,10 +367,10 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                  bootstrap again to create it as {performer}"
             ))
         }
-        // A context copies its character's slots when it is written, so a
-        // ROOT made before its character had a slot takes the model on rotation.
-        Some(row) if has_model && read(shared, |db| {
-            PERFORMER_ROLES.iter().try_fold(false, |lacking, role| Ok(lacking || db.context_slot(row.context_id, role)?.is_none()))
+        // A context copies its character's model when it is written, so a
+        // ROOT made before its character had a model takes it on rotation.
+        Some(row) if read(shared, |db| {
+            Ok(db.get_character_model(played_id)?.is_some() && db.context_slot(row.context_id, CONSOLE_ROLE)?.is_none())
         })? => {
             dispatch(shared, caller, words(&["context", "rotate", ROOT_LABEL]), &mut report).await?;
         }

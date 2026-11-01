@@ -50,14 +50,14 @@ result is missing:
    kernel finds the key wherever it runs.
 2. `kj backend model set` with the context window of a model it knows. For
    a model it does not know, the report names the model and this verb.
-3. `kj character create root`, the model character that plays `ROOT`
-   (`--console-as` names another).
-4. `kj character slot set root console` and `kj character slot set root
-   distill` on the first provider's model, for each slot the character does
-   not already hold. A slot the character has is left alone.
-5. `kj context create ROOT --type console --as root`, a kohai of the root
-   character's own context. When ROOT exists but lacks a slot its character now
-   holds, bootstrap runs `kj context rotate ROOT`. When ROOT is played by
+3. `kj character create root --backend <b> --model <m> --max-tokens 16384` on the first provider's model, for
+   the model character that plays `ROOT` (`--console-as` names another). A character that exists and has
+   no model and no `console` or `distill` slot gets `kj character model set root ...` instead. A character that
+   already has a model or either slot is left alone, and the report says so.
+4. `kj context create ROOT --type console --as root`, a kohai of the root
+   character's own context. The context copies the character's model under `console` and under `distill`.
+   When ROOT exists but has no `console` slot and its character now has a model, bootstrap runs
+   `kj context rotate ROOT`. When ROOT is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.
 

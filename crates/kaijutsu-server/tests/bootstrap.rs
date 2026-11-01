@@ -52,8 +52,12 @@ fn a_bootstrapped_kernel_answers_in_root() {
             assert_eq!(row.context_type, "console");
             let performer = db.get_character_by_name("root").unwrap().expect("the console performer exists");
             assert_eq!(row.played_by, Some(performer.principal_id), "ROOT is played by its model character");
-            let slot = db.get_character_slot(performer.principal_id, "console").unwrap().expect("the performer holds a console slot");
+            let model = db.get_character_model(performer.principal_id).unwrap().expect("the performer holds a model");
+            assert_eq!(model.model, "mock-model");
+            assert!(db.list_character_slots(performer.principal_id).unwrap().is_empty(), "a model, not role slots");
+            let slot = db.context_slot(row.context_id, "console").unwrap().expect("ROOT copied the model under its type");
             assert_eq!(slot.model, "mock-model");
+            assert!(db.context_slot(row.context_id, "distill").unwrap().is_some(), "and under distill");
             row.context_id
         };
 
@@ -120,6 +124,7 @@ fn without_a_backend_root_waits_for_one() {
             assert!(db.find_context_by_label("ROOT").unwrap().is_some(), "ROOT exists without a model");
             let root = db.get_character_by_name("root").unwrap().expect("the console performer exists");
             assert!(db.list_character_slots(root.principal_id).unwrap().is_empty(), "no slot without a backend");
+            assert!(db.get_character_model(root.principal_id).unwrap().is_none(), "no model without a backend");
         }
 
         let filled = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
@@ -129,12 +134,40 @@ fn without_a_backend_root_waits_for_one() {
             filled.ran,
             [
                 "kj backend set mock --kind mock --key-optional",
-                "kj character slot set root console --backend mock --model mock-model --max-tokens 16384",
-                "kj character slot set root distill --backend mock --model mock-model --max-tokens 16384",
+                "kj character model set root --backend mock --model mock-model --max-tokens 16384",
                 "kj context rotate ROOT",
             ],
-            "the backend, the performer's slots, and a rotated ROOT that takes them"
+            "the backend, the performer's model, and a rotated ROOT that takes it"
         );
+        let again = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
+            .await
+            .expect("bootstrap again");
+        assert!(again.ran.is_empty(), "a second run changes nothing: {again:?}");
+    });
+}
+
+/// A performer that already holds role slots is left alone: bootstrap gives it
+/// no model and rotates nothing.
+#[test]
+fn a_performer_with_slots_keeps_them_and_gets_no_model() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
+        {
+            let db = kernel_db(&config);
+            let root = db.get_character_by_name("root").unwrap().unwrap();
+            db.seed_test_slot_entries(root.principal_id, &[("console", "mock", "mock-model")]).unwrap();
+        }
+        let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
+            .await
+            .expect("bootstrap with a backend");
+        assert!(
+            !report.ran.iter().any(|line| line.contains("character model set") || line.contains("character create")),
+            "{report:?}"
+        );
+        let db = kernel_db(&config);
+        let root = db.get_character_by_name("root").unwrap().unwrap();
+        assert!(db.get_character_model(root.principal_id).unwrap().is_none());
     });
 }
 

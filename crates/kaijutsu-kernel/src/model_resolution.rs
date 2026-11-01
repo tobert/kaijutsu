@@ -66,13 +66,22 @@ pub struct NoModel {
 
 impl NoModel {
     /// One line for `kj context create`, `kj context rotate` and `kj context info`.
+    /// `None` for an `mcp` context, whose client brings its own model.
+    pub fn notice(&self) -> Option<String> {
+        if self.role == "mcp" && self.reason == NoModelReason::NoSlot {
+            return None;
+        }
+        Some(self.line())
+    }
+
+    /// The line itself, whatever the type.
     pub fn line(&self) -> String {
         match &self.reason {
             NoModelReason::NoContextCharacter => {
                 format!("{} has no context character, so it runs no model", self.context)
             }
             NoModelReason::NoSlot => format!(
-                "{} has no model for {}: {} has no {} slot",
+                "{} has no model for {}: {} has no model and no {} slot",
                 self.context,
                 self.role,
                 self.character.as_deref().unwrap_or("its character"),
@@ -99,9 +108,9 @@ impl NoModel {
                 self.context
             ),
             NoModelReason::NoSlot => format!(
-                "{} {what}: character {character} has no {} slot. Fix: give the character a {} slot with `kj character slot set`, \
+                "{} {what}: character {character} has no {} slot and no model. Fix: `kj character model set`, \
                  then `kj context rotate`",
-                self.context, self.role, self.role
+                self.context, self.role
             ),
         }
     }

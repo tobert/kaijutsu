@@ -231,9 +231,9 @@ fn model_summary(m: &BackendModelRow) -> String {
 /// How to configure a backend, for a kernel that has none. A kernel ships no
 /// backends; README.md, "Quick Start" has more examples.
 pub(crate) const NO_BACKEND_HINT: &str = "No LLM backend is configured: add one with \
-     `kj backend set`, then give a character a slot on it with `kj character slot set`. For example, \
+     `kj backend set`, then give a character a model on it with `kj character model set`. For example, \
      `kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY`, then \
-     `kj character slot set coder coder --backend deepseek --model deepseek-flash --max-tokens 65536`.";
+     `kj character model set coder --backend deepseek --model deepseek-flash --max-tokens 65536`.";
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_backend(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -743,7 +743,7 @@ mod tests {
         let c = test_caller();
         let list = d.dispatch(&argv(&["backend", "list"]), &c).await;
         assert!(list.is_ok(), "{}", list.message());
-        for verb in ["kj backend set", "kj character slot set"] {
+        for verb in ["kj backend set", "kj character model set"] {
             assert!(list.message().contains(verb), "{}", list.message());
         }
         assert!(!list.message().contains("default"), "no default backend is advertised: {}", list.message());
