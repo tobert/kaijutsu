@@ -44,10 +44,14 @@ async fn start_creates_the_root_context_once() {
 
     let shared = start(tmp.path()).await.expect("a kernel with a root character starts");
     let contexts = shared.kernel_db.lock().list_active_contexts().unwrap();
-    assert_eq!(contexts.len(), 1, "start creates exactly the root context");
-    let root = &contexts[0];
+    assert_eq!(contexts.len(), 2, "start creates the root context and its MCP hub");
+    let root = contexts.iter().find(|c| c.context_type == "root").expect("the root context");
+    let hub = contexts.iter().find(|c| c.context_type == "mcp-hub").expect("the root's MCP hub");
+    assert_eq!(hub.label.as_deref(), Some("mcp/amy"));
+    assert_eq!(hub.created_by, amy, "the root creates its own hub");
+    assert_eq!(hub.forked_from, None);
+    assert!(shared.documents.contains(hub.context_id), "the hub must have its conversation document");
     assert_eq!(root.label.as_deref(), Some("amy"));
-    assert_eq!(root.context_type, "root");
     assert_eq!(root.played_by, Some(amy));
     assert_eq!(root.forked_from, None);
     assert_eq!(root.created_by, PrincipalId::system(), "the kernel creates it at start");
@@ -65,7 +69,7 @@ async fn start_creates_the_root_context_once() {
 
     let restarted = start(tmp.path()).await.expect("restart");
     let contexts = restarted.kernel_db.lock().list_active_contexts().unwrap();
-    assert_eq!(contexts.len(), 1, "a restart creates no second root context");
+    assert_eq!(contexts.len(), 2, "a restart creates no second root context and no second hub");
 }
 
 /// A kernel ships no backends: a new kernel starts with no backend, model,

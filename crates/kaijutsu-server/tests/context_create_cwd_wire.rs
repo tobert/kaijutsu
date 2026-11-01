@@ -123,7 +123,7 @@ fn a_held_create_drops_a_directory_the_kernel_cannot_see_when_it_runs() {
         let elsewhere = elsewhere.to_str().unwrap();
 
         let held = claude_actor
-            .create_context_in_client_cwd(parent.context_id, "held", "mcp", "claude", Some(elsewhere))
+            .create_context_in_client_cwd(parent.context_id, "held", "default", "claude", Some(elsewhere))
             .await
             .expect_err("Amy's root context holds a model's create for her");
         let ask_id = match &held {

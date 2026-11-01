@@ -14,6 +14,12 @@ the ask was swept when the probe process exited, or it routed to a reviewer othe
 caller. Reproduce with a registration that the gate holds and `kj ledger list --reviewer amy`. The MCP-session
 design in `docs/senpai-kohai.md`, "MCP sessions", removes this registration's ask, but not the bug.
 
+## A root's MCP hub outlives the root (2026-11-01)
+
+`kj character retire` archives the contexts a character plays, and the `mcp/<root>` hub has no context character,
+so retiring a root leaves its hub live (`contexts_played_by` skips it). Archive the hub with its root, and decide
+whether the hub's live `mcp` sessions go with it. See `docs/senpai-kohai.md`, "MCP sessions".
+
 ## Token and cost accounting: what is open (2026-10-29)
 
 Prices (`kj price`, `model_prices`), cache writes split by TTL, the cost

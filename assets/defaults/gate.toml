@@ -103,6 +103,7 @@ deny = [
 allow = [
   "kj context create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
+  "kj context archive",  # a session ends itself; recoverable: `kj context promote`
 ]
 
 [context_type.director]

@@ -18,6 +18,11 @@ use crate::kernel_db::{CharacterRow, ContextRow};
 /// The rc bundle a root context runs.
 pub use kaijutsu_types::ROOT_CONTEXT_TYPE;
 
+use kaijutsu_types::MCP_HUB_CONTEXT_TYPE;
+
+/// The label of a root's MCP hub is this prefix and the root's name.
+pub const MCP_HUB_LABEL_PREFIX: &str = "mcp/";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "character",
@@ -295,11 +300,19 @@ impl KjDispatcher {
             }
         };
         let row = CharacterRow { root_ctx: Some(root_ctx), ..row };
+        let hub = match self.ensure_mcp_hub(row.principal_id) {
+            Ok(hub) => hub,
+            Err(e) => return KjResult::Err(format!(
+                "kj character create: created {name} as a root with root context {}, but not its MCP hub: {e}",
+                root_ctx.short()
+            )),
+        };
         KjResult::ok_with_data(
             format!(
-                "created {name} ({}) as a root, with root context '{name}' ({})",
+                "created {name} ({}) as a root, with root context '{name}' ({}) and MCP hub 'mcp/{name}' ({})",
                 row.principal_id.short(),
-                root_ctx.short()
+                root_ctx.short(),
+                hub.short()
             ),
             character_to_json(&row),
         )
@@ -312,7 +325,8 @@ impl KjDispatcher {
     /// deadlocks the whole tree beneath it: rebind needs a shell, a shell
     /// needs a loadout. The kernel calls this at start; a character it
     /// cannot repair fails boot rather than serve from a deadlock. Returns
-    /// the contexts it created (not the ones it rebound).
+    /// the contexts it created (not the ones it rebound). It also gives each
+    /// live root its MCP hub ([`Self::ensure_mcp_hub`]).
     pub async fn ensure_root_contexts(&self, requester: PrincipalId) -> Result<Vec<ContextId>, String> {
         let live_roots: Vec<CharacterRow> = self
             .kernel_db()
@@ -338,6 +352,16 @@ impl KjDispatcher {
             match row.root_ctx {
                 None => created.push(self.ensure_root_context(row.principal_id, &startup_caller).await?),
                 Some(ctx) => self.rebind_root_context_if_unbound(&row, ctx, &startup_caller).await?,
+            }
+            // The hub is a view of the root's sessions: a label held by
+            // another context, or a failed create, is reported and does not
+            // stop boot.
+            if let Err(e) = self.ensure_mcp_hub(row.principal_id) {
+                tracing::error!(
+                    character = %row.name,
+                    character_id = %row.principal_id.short(),
+                    "root character has no MCP hub: {e}",
+                );
             }
         }
         Ok(created)
@@ -409,6 +433,80 @@ impl KjDispatcher {
             character.name,
             ctx.short()
         ))
+    }
+
+    /// Return a live root character's MCP hub, creating it when no live
+    /// context holds the label `mcp/<name>`: type `mcp-hub`, created by the
+    /// root, with no parent and no context character. It runs no turns and
+    /// routes nothing; it is the `forked_from` of the root's MCP sessions
+    /// (`docs/senpai-kohai.md`, "MCP sessions"). A live context of another
+    /// type on the label is an error naming it.
+    ///
+    /// The lookup and the insert run under one `KernelDb` lock, so two
+    /// callers cannot each make one.
+    pub(crate) fn ensure_mcp_hub(&self, character: PrincipalId) -> Result<ContextId, String> {
+        let new_id = ContextId::new();
+        let (name, label) = {
+            let db = self.kernel_db().lock();
+            let sheet = db
+                .get_character(character)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("character {} has no sheet", character.short()))?;
+            if !sheet.root {
+                return Err(format!("{} is not a root character", sheet.name));
+            }
+            if sheet.retired_at.is_some() {
+                return Err(format!("{} is retired", sheet.name));
+            }
+            let label = format!("{MCP_HUB_LABEL_PREFIX}{}", sheet.name);
+            if let Some(held) = db.find_context_by_label(&label).map_err(|e| e.to_string())? {
+                if held.context_type == MCP_HUB_CONTEXT_TYPE {
+                    return Ok(held.context_id);
+                }
+                return Err(format!(
+                    "{} (type '{}') holds the label '{label}', which {}'s MCP hub needs; rename or archive it",
+                    held.context_id.short(), held.context_type, sheet.name
+                ));
+            }
+            let default_ws = db.get_or_create_default_workspace(character).map_err(|e| e.to_string())?;
+            let row = ContextRow {
+                context_id: new_id,
+                label: Some(label.clone()),
+                system_prompt: None,
+                context_state: ContextState::Live,
+                context_type: MCP_HUB_CONTEXT_TYPE.to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: character,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+                origin_host: None,
+                played_by: None,
+            };
+            db.insert_context_with_document(&row, default_ws)
+                .map_err(|e| format!("could not create the MCP hub '{label}': {e}"))?;
+            (sheet.name, label)
+        };
+
+        // `insert_context_with_document` commits the KernelDb document row
+        // but does not seed the in-memory BlockStore. `DocumentAlreadyExists`
+        // means another path already seeded it.
+        match self.block_store().create_document(new_id, kaijutsu_types::DocKind::Conversation, None) {
+            Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
+            Err(e) => return Err(format!("failed to seed the document of MCP hub '{label}': {e}")),
+        }
+        self.drift_router()
+            .write()
+            .register(new_id, Some(&label), None, character)
+            .map_err(|e| format!("could not register MCP hub '{label}' for {name}: {e}"))?;
+        Ok(new_id)
     }
 
     /// Return a live root character's root context, creating it when the
@@ -663,6 +761,9 @@ impl KjDispatcher {
                     "kj character set: {name} is now a root, but has no root context: {e}"
                 ),
             });
+        }
+        if root && let Err(e) = self.ensure_mcp_hub(principal_id) {
+            return KjResult::Err(format!("kj character set: {name} is now a root, but has no MCP hub: {e}"));
         }
         let updated = match self.kernel_db().lock().get_character(principal_id) {
             Ok(Some(r)) => r,
@@ -1193,6 +1294,122 @@ mod tests {
         let live_roots = d.kernel_db().lock().list_all_contexts().unwrap()
             .into_iter().filter(|c| c.context_type == "root" && c.archived_at.is_none()).count();
         assert_eq!(live_roots, 1, "a repeated create must not make a second root context");
+    }
+
+    /// The MCP hub of `name`: its live context labeled `mcp/<name>`.
+    fn hub_of(d: &super::super::KjDispatcher, name: &str) -> Option<crate::kernel_db::ContextRow> {
+        d.kernel_db().lock().find_context_by_label(&format!("mcp/{name}")).unwrap()
+    }
+
+    /// `create --root` makes the root's MCP hub beside its console: type
+    /// `mcp-hub`, created by the root, no parent, no context character, and
+    /// registered with the drift router. Repeating the create makes no second.
+    ///
+    /// Falsified by dropping the hub from the create path.
+    #[tokio::test]
+    async fn create_root_makes_its_mcp_hub() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
+        assert!(matches!(created, KjResult::Ok { .. }), "{created:?}");
+
+        let sheet = d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap();
+        let hub = hub_of(&d, "sovereign").expect("a root character has an MCP hub");
+        assert_eq!(hub.context_type, "mcp-hub");
+        assert_eq!(hub.created_by, sheet.principal_id, "the root creates its own hub");
+        assert_eq!(hub.forked_from, None);
+        assert!(hub.archived_at.is_none());
+        assert!(d.kernel_db().lock().context_character(hub.context_id).unwrap().is_none(), "a hub has no context character");
+        assert!(d.drift_router().read().get(hub.context_id).is_some(), "the hub is registered with the drift router");
+        assert_ne!(Some(hub.context_id), sheet.root_ctx);
+
+        let again = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
+        assert!(matches!(again, KjResult::Ok { .. }), "{again:?}");
+        let hubs = d.kernel_db().lock().list_all_contexts().unwrap()
+            .into_iter().filter(|c| c.context_type == "mcp-hub" && c.archived_at.is_none()).count();
+        assert_eq!(hubs, 1, "a repeated create must not make a second hub");
+    }
+
+    /// An ordinary character gets no hub.
+    #[tokio::test]
+    async fn ordinary_create_makes_no_mcp_hub() {
+        let d = rc_capable_dispatcher().await;
+        d.dispatch(&[s("character"), s("create"), s("worker")], &test_caller()).await;
+        assert!(hub_of(&d, "worker").is_none());
+    }
+
+    /// `create --root` refuses, naming the context, when a live context of
+    /// another type holds the hub's label.
+    #[tokio::test]
+    async fn create_root_refuses_when_another_context_holds_the_hub_label() {
+        let d = rc_capable_dispatcher().await;
+        let squatter = super::super::test_helpers::register_context(&d, Some("mcp/sovereign"), None, PrincipalId::new());
+        let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
+        let KjResult::Err(message) = created else { panic!("expected a refusal, got {created:?}") };
+        assert!(message.contains("mcp/sovereign") && message.contains(&squatter.short()), "{message}");
+        assert!(hub_of(&d, "sovereign").is_some_and(|row| row.context_id == squatter), "the squatter is left alone");
+    }
+
+    /// At start every live root gets a hub, including one whose console
+    /// already exists; a second start makes no second hub; a retired root
+    /// gets none.
+    ///
+    /// Falsified by dropping the hub from `ensure_root_contexts`.
+    #[tokio::test]
+    async fn ensure_root_contexts_makes_each_live_root_one_hub() {
+        let d = rc_capable_dispatcher().await;
+        let keeper = PrincipalId::new();
+        let retired = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id, name: name.into(), created_at: 0, retired_at,
+                    handoff_ctx: None, root_ctx: None, root: true,
+                }).unwrap();
+            }
+        }
+        d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        let amy_name = d.kernel_db().lock().get_character(super::super::test_helpers::test_reviewer_principal()).unwrap().unwrap().name;
+        let hubs: Vec<_> = [amy_name.as_str(), "keeper"].map(|n| hub_of(&d, n).unwrap_or_else(|| panic!("{n} has a hub"))).into();
+        assert!(hubs.iter().all(|h| h.context_type == "mcp-hub" && h.forked_from.is_none()));
+        assert!(hub_of(&d, "old").is_none(), "a retired root gets no hub");
+
+        d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        let live_hubs = d.kernel_db().lock().list_all_contexts().unwrap()
+            .into_iter().filter(|c| c.context_type == "mcp-hub" && c.archived_at.is_none()).count();
+        assert_eq!(live_hubs, 2, "a second start makes no second hub");
+        assert_eq!(hub_of(&d, "keeper").unwrap().context_id, hubs[1].context_id, "the hub is reused");
+    }
+
+    /// A root whose console exists but has no hub (a kernel from before the
+    /// hub) gets one at start.
+    #[tokio::test]
+    async fn start_makes_the_hub_for_a_root_whose_console_exists() {
+        let d = rc_capable_dispatcher().await;
+        d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
+        let hub = hub_of(&d, "sovereign").unwrap();
+        {
+            let db = d.kernel_db().lock();
+            db.archive_context(hub.context_id).unwrap();
+        }
+        assert!(hub_of(&d, "sovereign").is_none(), "precondition: no live hub");
+        d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        let made = hub_of(&d, "sovereign").expect("start makes the missing hub");
+        assert_ne!(made.context_id, hub.context_id);
+    }
+
+    /// At start a live context of another type on the hub's label is
+    /// logged and left alone; boot continues and the other roots still get
+    /// their hubs.
+    #[tokio::test]
+    async fn start_continues_when_another_context_holds_the_hub_label() {
+        let d = rc_capable_dispatcher().await;
+        let amy = super::super::test_helpers::test_reviewer_principal();
+        let amy_name = d.kernel_db().lock().get_character(amy).unwrap().unwrap().name;
+        let squatter = super::super::test_helpers::register_context(&d, Some(&format!("mcp/{amy_name}")), None, PrincipalId::new());
+        d.ensure_root_contexts(PrincipalId::system()).await.expect("a held hub label must not stop boot");
+        assert_eq!(hub_of(&d, &amy_name).unwrap().context_id, squatter);
     }
 
     /// An ordinary character gets no context at create.

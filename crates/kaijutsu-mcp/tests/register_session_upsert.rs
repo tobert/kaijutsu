@@ -136,6 +136,32 @@ fn a_new_session_is_created_under_the_only_root_context() {
     });
 }
 
+/// A session created from a root console is forked from that root's MCP hub,
+/// not from the console, and its reply still names the console as the parent
+/// it was created from.
+///
+/// Falsified by registering without the hub.
+#[test]
+fn a_new_session_is_forked_from_the_roots_mcp_hub() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let reg = register_with_retry(&mcp, "hub-test").await;
+        assert!(reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg}");
+        let Backend::Remote(remote) = mcp.backend() else { panic!("expected Remote backend") };
+        let contexts = remote.actor.list_contexts().await.unwrap();
+        let hub_label = format!("mcp/{}", SshServerConfig::EPHEMERAL_ROOT);
+        let hub = contexts
+            .iter()
+            .find(|c| c.label == hub_label)
+            .unwrap_or_else(|| panic!("the root has an MCP hub '{hub_label}'"));
+        assert_eq!(hub.context_type, "mcp-hub");
+        let session = contexts.iter().find(|c| c.id.to_hex() == reg["context_id"].as_str().unwrap()).unwrap();
+        assert_eq!(session.forked_from, Some(hub.id), "{reg}");
+        assert_ne!(reg["parent"]["context_id"].as_str(), Some(hub.id.to_hex().as_str()), "the reply names the console: {reg}");
+    });
+}
+
 /// A root connection with no `--character` has nobody to play the context,
 /// so registration refuses and names the option and its variable.
 #[test]
@@ -282,12 +308,16 @@ fn a_manual_register_racing_startup_registration_joins_once() {
     });
 }
 
-/// A model's session created in Amy's root context waits for her approval.
+/// A non-root character's `mcp` session registers with no ask and lands
+/// under its root's hub with the root console as senpai; a session of any
+/// other type created in Amy's root context still waits for her approval.
 /// The reply says the session is not joined and how to join, and once Amy
 /// allows the create, registering again with the same label joins the
 /// context the approved create made.
+///
+/// Falsified by dropping the builtin allow of `kj context create --type mcp`.
 #[test]
-fn a_held_create_says_how_to_join_and_joins_after_approval() {
+fn an_mcp_session_raises_no_ask_and_another_type_is_held_until_approval() {
     run_local(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -322,10 +352,25 @@ fn a_held_create_says_how_to_join_and_joins_after_approval() {
 
         let mcp = connect("claude", claude_key.clone());
         wait_connected(&mcp).await;
+        let registered = register_with_retry(&mcp, "no-ask-session").await;
+        assert_eq!(registered["success"].as_bool(), Some(true), "{registered}");
+        assert!(kernel.kernel_db.lock().list_pending_asks().unwrap().is_empty(), "an mcp registration raises no ask");
+        {
+            let db = kernel.kernel_db.lock();
+            let session = kaijutsu_types::ContextId::parse(registered["context_id"].as_str().unwrap()).unwrap();
+            let hub = db.find_context_by_label("mcp/amy").unwrap().expect("amy has an MCP hub");
+            let console = db.find_context_by_label("amy").unwrap().expect("amy has a console");
+            assert_eq!(db.get_context(session).unwrap().unwrap().forked_from, Some(hub.context_id));
+            assert_eq!(db.context_character(session).unwrap().unwrap().senpai_ctx, Some(console.context_id));
+        }
+
+        // A second process: the first is already joined to its session.
+        let mcp = connect("claude", claude_key.clone());
+        wait_connected(&mcp).await;
         let held = mcp
-            .register_session(Parameters(RegisterSessionRequest { label: Some("held-seat".into()), context_type: None }))
+            .register_session(Parameters(RegisterSessionRequest { label: Some("held-seat".into()), context_type: Some("default".into()) }))
             .await;
-        let ask = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().expect("the create waits for Amy");
+        let ask = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap_or_else(|| panic!("the create waits for Amy: {held}"));
         assert!(held.contains(&ask.request_id), "the reply names the ask: {held}");
         assert!(held.contains("not joined") && held.contains("register_session again"), "the reply says how to join: {held}");
 

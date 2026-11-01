@@ -103,6 +103,8 @@ struct ServeArgs {
     /// under. Falls back to `KAIJUTSU_PARENT`; a flag wins over its
     /// variable. Default: the kernel's only live root context. With several
     /// root contexts and no parent named, registration fails and lists them.
+    /// Under a root context, a session lands in that root's MCP hub
+    /// (`mcp/<root name>`), and the root context is its senpai.
     #[arg(long)]
     parent: Option<String>,
 

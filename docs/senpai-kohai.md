@@ -317,20 +317,30 @@ An MCP client (Claude Code, Codex) brings its own model. It needs a context to a
 asks, and no model.
 
 - **The hub.** Each live root character has one MCP hub: a context labeled `mcp/<root name>`, of type `mcp-hub`,
-  with no context character. The kernel makes it beside the root console, at `kj character create --root` and at
-  start for a root that has none. Like a handoff log, it runs no turns and routes nothing. It exists so
+  with no context character, created by the root. The kernel makes it beside the root console, at
+  `kj character create --root` and `set --root`, and at start for every live root that has none. Making it is
+  idempotent: a live context with that label and type is reused. A live context of another type on the label
+  refuses `create --root` and `set --root`, naming it, and at start is logged as an error and left alone, since the
+  hub is a view and must not stop boot. Like a handoff log, the hub runs no turns and routes nothing. It exists so
   `kj context list --tree` shows every session of that root in one place.
-- **Registration.** With no `--parent` named, the client runs, from the root console:
+- **Registration.** When the parent is a root console (none named and the kernel has one root, or an explicit
+  parent that is a root console), the client runs, from the root console:
   `kj context create <label> --type mcp --as <character> --parent mcp/<root name>`. The root console is the
-  session's senpai, so its asks go to the root character. The hub is its `forked_from`. `<character>` is the
-  connection's own character, or the one `--character` (`KAIJUTSU_CHARACTER`) names for a root connection. A
-  client that names `--parent` (`KAIJUTSU_PARENT`) creates under that context instead, as before.
-- **No ask.** The gate's builtin layer allows `kj context create` with `--type mcp`: the context runs no model and
-  holds no slot for its type, so making one spends nothing. A `gate.toml` key on `kj context create` still wins.
+  session's senpai, so its asks go to the root character. The hub is its `forked_from` (`--parent` sets nothing
+  else, and takes a label with `/`). `<character>` is the connection's own character, or the one `--character`
+  (`KAIJUTSU_CHARACTER`) names for a root connection. A client that names a `--parent` (`KAIJUTSU_PARENT`) that is
+  not a root console creates under that context instead, as before. A root console with no live hub refuses
+  registration, naming the hub. Other context types requested through `register_session` keep the old placement
+  and the gate's ask.
+- **No ask.** The gate's builtin layer allows `kj context create` with `--type mcp` (either `--type mcp` or
+  `--type=mcp`), keyed `kj context create --type mcp`: the context runs no model and holds no slot for its type, so
+  making one spends nothing. A `gate.toml` ask or deny key on `kj context create`, for the calling type or global,
+  still wins.
 - **No model.** The character's model never fills the `mcp` slot. A `distill` slot is copied as for any context,
   so `kj fork --compact` and `kj drift pull|merge` work from a session.
-- **Session end.** The client archives its session context from that context: a character may archive an `mcp`
-  context it plays (Authority).
+- **Session end.** The client runs `kj context archive <id> --confirm` from the session context itself, which its
+  character may archive (Authority). The gate would ask for it from an `mcp` context, so `gate.toml` ships `kj
+  context archive` in `[context_type.mcp] allow`; a session can only archive what the authority rule lets it.
 
 ## Removed (hard cut)
 

@@ -166,7 +166,7 @@ pub use block::{
 pub use error_block::IntoErrorPayload;
 pub use summary::summarize_thinking;
 pub use cost::format_micro_dollars;
-pub use context::{CONSOLE_CONTEXT_TYPE, Context, ROOT_CONTEXT_TYPE, RING_SLOTS, SHELL_CONTEXT_TYPE, fork_lineage};
+pub use context::{CONSOLE_CONTEXT_TYPE, Context, MCP_HUB_CONTEXT_TYPE, ROOT_CONTEXT_TYPE, RING_SLOTS, SHELL_CONTEXT_TYPE, fork_lineage};
 pub use dag::ConversationDAG;
 pub use enums::{ContextState, DocKind, ForkKind};
 pub use ids::{

@@ -398,6 +398,10 @@ struct SessionCreate {
     /// This process's working directory, the host agent's project. The
     /// kernel may run on another host and refuse it.
     cwd: Option<String>,
+    /// The MCP hub the new context is `forked_from`, named by label. Set for
+    /// an `mcp` session created from a root console; the root console stays
+    /// its senpai.
+    hub: Option<String>,
 }
 
 /// This process's working directory as a `--cwd` value. `None` when it is
@@ -2040,8 +2044,9 @@ impl KaijutsuMcp {
         for attempt in 1..=MAX_RETRIES {
             let candidate = Self::find_available_suffixed_label(actor, base_label).await?;
             match actor
-                .create_context_in_client_cwd(
+                .create_context_in_client_cwd_under(
                     create.parent.context_id, &candidate, context_type, &create.performer, create.cwd.as_deref(),
+                    create.hub.as_deref(),
                 )
                 .await
             {
@@ -2072,8 +2077,13 @@ impl KaijutsuMcp {
 
     /// Choose the parent for a new session context and the performer to
     /// record. The performer is this connection's character. A root has no
-    /// model and cannot be cast, so a root connection refuses.
-    async fn prepare_session_create(&self, actor: &ActorHandle) -> Result<SessionCreate, RegisterFailure> {
+    /// model and cannot be cast, so a root connection refuses. An `mcp`
+    /// session created from a root console lands under that root's MCP hub.
+    async fn prepare_session_create(
+        &self,
+        actor: &ActorHandle,
+        context_type: &str,
+    ) -> Result<SessionCreate, RegisterFailure> {
         let contexts = actor
             .list_contexts()
             .await
@@ -2094,7 +2104,12 @@ impl KaijutsuMcp {
             )
             .await
             .map_err(|e| RegisterFailure::create(e.to_string(), &e))?;
-        Ok(SessionCreate { parent, performer, cwd: client_cwd() })
+        let hub = if context_type == "mcp" {
+            kaijutsu_client::mcp_hub_label(parent.context_id, &contexts).map_err(RegisterFailure::Verdict)?
+        } else {
+            None
+        };
+        Ok(SessionCreate { parent, performer, cwd: client_cwd(), hub })
     }
 
     async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
@@ -2257,7 +2272,7 @@ impl KaijutsuMcp {
                 (ctx.id, requested_label.clone())
             }
             Some(ctx) => {
-                let create = match self.prepare_session_create(&remote.actor).await {
+                let create = match self.prepare_session_create(&remote.actor, &context_type).await {
                     Ok(create) => create,
                     Err(e) => return Err(e.doing("Error choosing where to create the session context")),
                 };
@@ -2306,18 +2321,19 @@ impl KaijutsuMcp {
                 (new_id, fresh_label)
             }
             None => {
-                let create = match self.prepare_session_create(&remote.actor).await {
+                let create = match self.prepare_session_create(&remote.actor, &context_type).await {
                     Ok(create) => create,
                     Err(e) => return Err(e.doing("Error choosing where to create the session context")),
                 };
                 let new_id = match remote
                     .actor
-                    .create_context_in_client_cwd(
+                    .create_context_in_client_cwd_under(
                         create.parent.context_id,
                         &requested_label,
                         &context_type,
                         &create.performer,
                         create.cwd.as_deref(),
+                        create.hub.as_deref(),
                     )
                     .await
                 {

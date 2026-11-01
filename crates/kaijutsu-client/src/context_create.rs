@@ -1,13 +1,16 @@
 //! Create a context through `kj context create`.
 //!
 //! The kernel has no RPC for creating a context. A client runs `kj context
-//! create` from an existing context, which becomes the new context's parent,
-//! so every context has a root above it (`docs/character.md`, "Bootstrap:
-//! the person creates themself"). The kernel never chooses that parent; a
-//! client that has no context yet chooses one with [`choose_parent`].
+//! create` from an existing context, which becomes the new context's senpai
+//! and, unless `--parent` names another, its `forked_from`, so every context
+//! has a root above it (`docs/character.md`, "Bootstrap: the person creates
+//! themself"). The kernel never chooses that context; a client that has no
+//! context yet chooses one with [`choose_parent`]. An `mcp` session created
+//! from a root console takes the root's MCP hub as `forked_from`
+//! ([`mcp_hub_label`]).
 //!
 //! A client that has decided to archive a context it created runs `kj
-//! context archive <id> --confirm` from that same parent
+//! context archive <id> --confirm` from [`archive_runs_from`]
 //! ([`ActorHandle::archive_context_from_parent`]).
 
 use kaijutsu_types::ContextId;
@@ -77,10 +80,46 @@ pub fn choose_parent(explicit: Option<&str>, contexts: &[ContextInfo]) -> Result
     }
 }
 
+/// The label of the MCP hub a session created from `parent` lands under:
+/// `Some` when `parent` is a root console (the hub is the new context's
+/// `forked_from`, the root console its senpai), `None` for any other parent.
+/// A root console with no live `mcp-hub` context labeled `mcp/<its label>`
+/// is an error.
+pub fn mcp_hub_label(parent: ContextId, contexts: &[ContextInfo]) -> Result<Option<String>, String> {
+    let Some(root) = contexts.iter().find(|context| context.id == parent) else {
+        return Err(format!("no such context: {}", parent.short()));
+    };
+    if !is_root_context(root) {
+        return Ok(None);
+    }
+    let label = format!("mcp/{}", root.label);
+    if contexts.iter().any(|context| is_live(context) && context.context_type == "mcp-hub" && context.label == label) {
+        return Ok(Some(label));
+    }
+    Err(format!(
+        "root console '{}' has no live MCP hub '{label}': the kernel makes one at start and at \
+         `kj character create --root`; restart the kernel, or name a parent with --parent <label>",
+        root.label
+    ))
+}
+
 /// The `kj` argv that creates `label` of `context_type`, run by the live,
 /// non-root character `performer`, with its shell in `cwd` when one is given.
 /// The create lifecycle runs in that cwd.
 pub fn context_create_argv(label: &str, context_type: &str, performer: &str, cwd: Option<&str>) -> Vec<String> {
+    context_create_argv_under(label, context_type, performer, cwd, None)
+}
+
+/// [`context_create_argv`] with `--parent <forked_from>` when one is given:
+/// the new context's `forked_from`, which is not its senpai (the context the
+/// create runs from). `forked_from` may be a label containing `/`.
+pub fn context_create_argv_under(
+    label: &str,
+    context_type: &str,
+    performer: &str,
+    cwd: Option<&str>,
+    forked_from: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "context".to_string(), "create".to_string(),
         label.to_string(),
@@ -93,6 +132,10 @@ pub fn context_create_argv(label: &str, context_type: &str, performer: &str, cwd
         argv.push("--cwd".to_string());
         argv.push(cwd.to_string());
     }
+    if let Some(forked_from) = forked_from {
+        argv.push("--parent".to_string());
+        argv.push(forked_from.to_string());
+    }
     argv
 }
 
@@ -104,12 +147,17 @@ pub fn context_archive_argv(context_id: ContextId) -> Vec<String> {
 
 /// The context that runs the archive of `context_id`: its parent, the
 /// context it was created from, which holds the `operator` capability a
-/// seat such as a coder lacks. A context with no parent runs it itself.
+/// seat such as a coder lacks. A context with no parent runs it itself, and
+/// so does an `mcp` context: its parent may be a hub with no loadout, and
+/// its own character may archive it.
 pub fn archive_runs_from(context_id: ContextId, contexts: &[ContextInfo]) -> Result<ContextId, String> {
     let context = contexts
         .iter()
         .find(|context| context.id == context_id)
         .ok_or_else(|| format!("no such context: {}", context_id.short()))?;
+    if context.context_type == "mcp" {
+        return Ok(context_id);
+    }
     Ok(context.forked_from.unwrap_or(context_id))
 }
 
@@ -261,7 +309,23 @@ impl ActorHandle {
         performer: &str,
         cwd: Option<&str>,
     ) -> Result<CreatedContext, CreateContextError> {
-        let mut argv = context_create_argv(label, context_type, performer, cwd);
+        self.create_context_in_client_cwd_under(parent, label, context_type, performer, cwd, None).await
+    }
+
+    /// [`Self::create_context_in_client_cwd`] with `--parent <forked_from>`
+    /// when one is given, as [`context_create_argv_under`] states it. A
+    /// session under a root console names the root's MCP hub
+    /// ([`mcp_hub_label`]).
+    pub async fn create_context_in_client_cwd_under(
+        &self,
+        parent: ContextId,
+        label: &str,
+        context_type: &str,
+        performer: &str,
+        cwd: Option<&str>,
+        forked_from: Option<&str>,
+    ) -> Result<CreatedContext, CreateContextError> {
+        let mut argv = context_create_argv_under(label, context_type, performer, cwd, forked_from);
         if cwd.is_some() {
             argv.push("--cwd-optional".to_string());
         }
@@ -412,6 +476,52 @@ mod tests {
             context_create_argv("lane", "coder", "coder", Some("/app")),
             ["context", "create", "lane", "--type", "coder", "--as", "coder", "--cwd", "/app"]
         );
+    }
+
+    /// A session created from a root console lands under that root's MCP
+    /// hub; from any other context it does not.
+    ///
+    /// Falsified by returning the hub for a parent that is not a root console.
+    #[test]
+    fn a_root_console_parent_names_its_mcp_hub() {
+        let amy = ctx("amy", "root", None);
+        let hub = ctx("mcp/amy", "mcp-hub", None);
+        let banto = ctx("banto", "director", Some(amy.id));
+        let contexts = [amy.clone(), hub, banto.clone()];
+        assert_eq!(mcp_hub_label(amy.id, &contexts), Ok(Some("mcp/amy".to_string())));
+        assert_eq!(mcp_hub_label(banto.id, &contexts), Ok(None), "a named non-root parent behaves as before");
+    }
+
+    #[test]
+    fn a_root_console_with_no_live_hub_refuses_and_says_why() {
+        let amy = ctx("amy", "root", None);
+        let mut archived = ctx("mcp/amy", "mcp-hub", None);
+        archived.archived = true;
+        let squatter = ctx("mcp/amy", "coder", None);
+        for contexts in [vec![amy.clone()], vec![amy.clone(), archived], vec![amy.clone(), squatter]] {
+            let error = mcp_hub_label(amy.id, &contexts).unwrap_err();
+            assert!(error.contains("mcp/amy") && error.contains("amy"), "{error}");
+        }
+    }
+
+    #[test]
+    fn argv_names_the_forked_from_context_only_when_given() {
+        assert_eq!(
+            context_create_argv_under("s", "mcp", "claude", Some("/app"), Some("mcp/amy")),
+            ["context", "create", "s", "--type", "mcp", "--as", "claude", "--cwd", "/app", "--parent", "mcp/amy"]
+        );
+        assert_eq!(
+            context_create_argv_under("s", "mcp", "claude", None, None),
+            context_create_argv("s", "mcp", "claude", None)
+        );
+    }
+
+    #[test]
+    fn an_mcp_session_archives_itself() {
+        let hub = ctx("mcp/amy", "mcp-hub", None);
+        let session = ctx("session", "mcp", Some(hub.id));
+        let contexts = vec![hub.clone(), session.clone()];
+        assert_eq!(archive_runs_from(session.id, &contexts), Ok(session.id));
     }
 
     fn result(exit_code: i32, stderr: &str, data: Option<serde_json::Value>) -> KjExecutionResult {

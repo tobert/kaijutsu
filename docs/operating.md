@@ -105,7 +105,12 @@ then `/mcp`.
 There is no standalone `kj` binary. Drive `kaijutsu-mcp --connect` over
 stdio: `initialize`, `initialized`, `register_session`, then `tools/call`.
 A `register_session` with a label another live session holds conflicts;
-pick a fresh label.
+pick a fresh label. Registration raises no ask: the gate allows `kj context
+create --type mcp`, and the session lands under its root's MCP hub
+(`mcp/<root name>`), with the root console as its senpai. `kj context list
+--tree` shows every session of a root under its hub. A session archives
+itself at its end (`kj context archive`, from the session); `kj context
+promote` restores it.
 
 The gate asks before a `kj` write from an MCP seat that no `gate.toml` key
 covers (rename, retag, resume, rebind). An approval executes: `kj ledger allow <id>` runs the stored command in the

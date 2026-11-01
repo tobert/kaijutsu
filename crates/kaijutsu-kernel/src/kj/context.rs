@@ -231,7 +231,8 @@ enum ContextCommand {
     /// operator capability, or a person's live root character acting from
     /// any context. Children keep their parent edge and state. Reports to an
     /// archived context and `kj context move` onto it refuse, and its forks and
-    /// kohai stay live. Restore with `kj context promote <id>`.
+    /// kohai stay live. Restore with `kj context promote <id>`. A character
+    /// may also archive an `mcp` context it plays.
     /// The context's `archive` rc lifecycle runs first, while it is still
     /// live; a failing script is recorded and the archive still commits.
     Archive {
@@ -1948,6 +1949,22 @@ impl KjDispatcher {
         }
     }
 
+    /// Whether `target` is an `mcp` context whose character is the caller's
+    /// actor. A character may archive such a context beside the authority
+    /// rule, so an MCP client ends its own session
+    /// (`docs/senpai-kohai.md`, "MCP sessions").
+    fn plays_mcp_context(&self, target: ContextId, caller: &KjCaller) -> Result<bool, String> {
+        let db = self.kernel_db().lock();
+        let checked = (|| -> crate::kernel_db::KernelDbResult<bool> {
+            let Some(row) = db.get_context(target)? else { return Ok(false) };
+            if row.context_type != "mcp" {
+                return Ok(false);
+            }
+            Ok(db.context_character(target)?.is_some_and(|c| c.principal_id == caller.actor_id))
+        })();
+        checked.map_err(|e| format!("could not check authority to archive it: {e}"))
+    }
+
     /// The authority rule for a verb nested in an rc lifecycle, with the
     /// context whose lifecycle runs as the actor: passes only when the
     /// target's senpai is that context (its kohai, such as a judge shadow).
@@ -2252,7 +2269,13 @@ impl KjDispatcher {
         let authority = if in_rc_lifecycle {
             self.require_lifecycle_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
         } else {
-            self.require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive).map(|_| ())
+            match self.plays_mcp_context(target_id, caller) {
+                Ok(true) => Ok(()),
+                Ok(false) => self
+                    .require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
+                    .map(|_| ()),
+                Err(e) => Err(e),
+            }
         };
         if let Err(refusal) = authority {
             return KjResult::Err(format!("kj context archive: {refusal}"));
@@ -3611,6 +3634,36 @@ mod tests {
         assert!(!d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
         let archive = d.dispatch(&[s("context"), s("archive"), lane.to_hex()], &confirmed(banto)).await;
         assert!(archive.is_ok(), "{}", archive.message());
+        assert!(d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
+    }
+
+    /// A character may archive an `mcp` context it plays, and only that one:
+    /// not a context of another type it plays, and not another character's
+    /// `mcp` context.
+    ///
+    /// Falsified by dropping the `mcp` arm from `context_archive`.
+    #[tokio::test]
+    async fn a_character_archives_its_own_mcp_context_and_no_other() {
+        let d = test_dispatcher().await;
+        let (lane, [_amy, _banto, coder, sibling], caller) = authority_fixture(&d);
+        let confirmed = |actor| crate::kj::KjCaller { confirmed: true, ..caller(actor) };
+        let archive = |target: ContextId, actor| {
+            let d = &d;
+            let call = confirmed(actor);
+            async move { d.dispatch(&[s("context"), s("archive"), target.to_hex()], &call).await }
+        };
+
+        let refused = archive(lane, coder).await;
+        assert!(!refused.is_ok(), "a lane of another type stays the senpai's to archive");
+        d.kernel_db().lock().update_context_type(lane, "mcp").unwrap();
+
+        let other = archive(lane, sibling).await;
+        assert!(!other.is_ok(), "another character's mcp context is not archived by a character that does not play it");
+        assert!(other.message().contains("may archive it"), "{}", other.message());
+        assert!(!d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
+
+        let own = archive(lane, coder).await;
+        assert!(own.is_ok(), "{}", own.message());
         assert!(d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
     }
 

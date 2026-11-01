@@ -1865,6 +1865,9 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
             _ => "kj --help".to_string(),
         });
     }
+    if is_mcp_context_create(&args) {
+        return Some(MCP_CREATE_KEY.to_string());
+    }
     if !readonly::is_gate_exempt_kj(cmd) {
         return None;
     }
@@ -1880,6 +1883,25 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
         key.push_str(sub.get_name());
     }
     Some(key)
+}
+
+/// The builtin key of `kj context create --type mcp`.
+const MCP_CREATE_KEY: &str = "kj context create --type mcp";
+
+/// Whether `args` (the argv after `kj`, from [`readonly::resolved_kj_args`])
+/// parse as `kj context create` with `--type mcp`, in either flag spelling.
+/// The new context runs no model and holds no slot for its type, so making
+/// one spends nothing (`docs/senpai-kohai.md`, "MCP sessions"). An argv that
+/// does not parse is not one.
+fn is_mcp_context_create(args: &[String]) -> bool {
+    let mut args = args.to_vec();
+    super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
+    let Ok(matches) = super::effect::cached_kj_args_command().try_get_matches_from(args) else {
+        return false;
+    };
+    let Some(("context", context)) = matches.subcommand() else { return false };
+    let Some(("create", create)) = context.subcommand() else { return false };
+    create.try_get_one::<String>("type_").ok().flatten().is_some_and(|t| t == "mcp")
 }
 
 /// One command as a human would read it in a refusal: the name and its
@@ -2053,6 +2075,54 @@ mod tests {
         let e = unconfigured("kj context archive 01a0-abc");
         assert_eq!(e.per_statement[0], PolicyVerdict::Uncovered);
         assert_eq!(e.verdict(), AskVerdict::Escalate);
+    }
+
+    /// `kj context create --type mcp` runs no model and holds no slot for
+    /// its type, so the builtin layer allows it. Both flag spellings count;
+    /// any other type, a redirect and a substituted argument do not.
+    ///
+    /// Falsified by dropping the `--type mcp` arm from `builtin_key`.
+    #[test]
+    fn creating_an_mcp_context_is_builtin_allowed() {
+        for source in [
+            "kj context create sess --as claude --type mcp",
+            "kj context create sess --as claude --type=mcp --parent mcp/amy",
+            "kj ctx create sess --as claude --cwd /tmp --cwd-optional --type mcp",
+            "kj --json context create sess --as claude --type mcp",
+        ] {
+            let e = unconfigured(source);
+            assert_eq!(builtin_key_of(&e.per_statement[0]), "kj context create --type mcp", "{source}");
+            assert_eq!(e.verdict(), AskVerdict::Allow, "{source}");
+        }
+        for source in [
+            "kj context create sess --as claude --type coder",
+            "kj context create sess --as claude --type=mcp-hub",
+            "kj context create sess --as claude",
+            "kj context create sess --as claude --env NOTE=mcp --type default",
+            "kj context create sess --as claude --type mcp > /tmp/x",
+            "kj context create sess --as claude --type $(cat /tmp/t)",
+            "kj context create --type mcp",
+            "kj context fork sess --type mcp",
+        ] {
+            assert_eq!(unconfigured(source).per_statement[0], PolicyVerdict::Uncovered, "{source}");
+        }
+    }
+
+    /// A `gate.toml` key on `kj context create` still decides before the
+    /// builtin allow, for the calling type and for the global table.
+    ///
+    /// Falsified by checking the builtin layer ahead of the config tables.
+    #[test]
+    fn a_config_key_on_context_create_still_asks_for_an_mcp_create() {
+        let source = "kj context create sess --as claude --type mcp";
+        let ask = config("[global]\nask = [\"kj context create\"]\n");
+        assert!(matches!(first_verdict(source, &ask, Some("root")), PolicyVerdict::Ask(_)));
+        let typed = config("[context_type.root]\nask = [\"kj context create\"]\n");
+        assert!(matches!(first_verdict(source, &typed, Some("root")), PolicyVerdict::Ask(_)));
+        assert_eq!(builtin_key_of(&first_verdict(source, &typed, Some("coder"))), "kj context create --type mcp",
+            "a key for another type does not reach this one");
+        let deny = config("[context_type.root]\ndeny = [\"kj context create\"]\n");
+        assert!(matches!(first_verdict(source, &deny, Some("root")), PolicyVerdict::Deny(_)));
     }
 
     #[test]
