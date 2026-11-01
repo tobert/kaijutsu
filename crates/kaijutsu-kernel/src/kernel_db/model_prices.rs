@@ -192,3 +192,5 @@ impl KernelDb {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
+#[cfg(test)]
+mod tests;
