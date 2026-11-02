@@ -80,10 +80,12 @@ impl KernelDb {
     /// senpai and is not a root console gets one: the only live root's console
     /// when the kernel has exactly one live root, else the console of the live
     /// root at the top of the senpai chain above its nearest `forked_from`
-    /// ancestor. A live context with neither refuses the whole migration,
-    /// naming it. An archived context may keep a NULL senpai: it answers no
-    /// asks, the database trigger only fires on an update to NULL, and each
-    /// such context is listed in `context_character_migration_report`. Then
+    /// ancestor, for an archived context as for a live one. A live context
+    /// with neither refuses the whole migration, naming it. An archived one
+    /// with neither keeps a NULL senpai and never refuses: it answers no asks,
+    /// the database trigger only fires on an update to NULL, and each is
+    /// listed in `context_character_migration_report` as `archived_no_senpai`.
+    /// Each assignment is listed as `senpai_assigned`. Then
     /// `context_slots` is rebuilt to reference `contexts` and
     /// `context_characters` is dropped. The presence of the table is the whole
     /// state of the migration.
@@ -177,14 +179,12 @@ impl KernelDb {
         let mut refused: Vec<String> = Vec::new();
         let mut archived_bare: Vec<ContextId> = Vec::new();
         for c in contexts.iter().filter(|c| c.senpai.is_none() && !console_ids.contains(&c.id)) {
-            if c.archived {
-                archived_bare.push(c.id);
-                continue;
-            }
             if let [only] = live_roots.as_slice() {
                 assigned.push((c.id, *only, "the console of the only live root"));
             } else if let Some(console) = lineage_console(c) {
                 assigned.push((c.id, console, "the console of the live root at the top of its forked_from lineage"));
+            } else if c.archived {
+                archived_bare.push(c.id);
             } else {
                 refused.push(format!(
                     "{}: it has no senpai, the kernel has {} live roots, and no forked_from ancestor reaches a live root console",
@@ -240,6 +240,16 @@ impl KernelDb {
             tx.execute_batch(CONTEXT_SLOTS_FOLDED)?;
         }
         tx.execute("DROP TABLE context_characters", [])?;
+        {
+            let mut stmt = tx.prepare("PRAGMA foreign_key_check")?;
+            let mut rows = stmt.query([])?;
+            if let Some(row) = rows.next()? {
+                let table: String = row.get(0)?;
+                return Err(KernelDbError::Validation(format!(
+                    "the context fold left a dangling foreign key on {table}; refusing to commit it, nothing was changed"
+                )));
+            }
+        }
         tx.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [Self::CONTEXT_FOLD_MIGRATION])?;
         tx.commit()?;
         info!(

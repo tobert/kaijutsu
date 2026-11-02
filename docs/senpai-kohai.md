@@ -269,9 +269,13 @@ The kernel does not move kohai on rotation. The rotating character knows its koh
    and their reports refuse, naming the archived senpai.
 
 A rotation that fails before the commit leaves the predecessor live and labeled, with its kohai, and the
-successor unlabeled; the error names the successor, and rotate archives it before returning. A rotate rc that
+successor live and unlabeled; the error names the successor, which `kj context archive` retires. A rotate rc that
 fails after the commit undoes nothing: the rotation stands, the error names the kohai not yet taken, and
 `kj context kohai` of the predecessor shows them.
+
+The successor of a root console has no senpai until the commit moves `root_ctx` to it. A root-console rotation
+that fails before the commit archives the successor and says so, and boot archives any live `root` context with no
+senpai that no `root_ctx` names. At the commit the archived console takes the successor as its senpai.
 
 ## Reports and drift
 
@@ -371,9 +375,10 @@ context it cannot map in `context_character_migration_report`, which `kj context
 4. **`context-fold-v1`**: copies each context character row into `contexts.performer`, `senpai_ctx` and
    `persona`, rebuilds `context_slots` to reference `contexts`, and drops `context_characters`. Every live
    context with no senpai that is not a root console gets one: the console of the only live root, else the root
-   console at the top of the senpai chain above its nearest `forked_from` ancestor (kind `senpai_assigned`). A live
-   context with neither refuses the whole migration, naming it. An archived context may keep a NULL senpai (kind
-   `archived_no_senpai`). It does not check that an existing senpai is live.
+   console at the top of the senpai chain above its nearest `forked_from` ancestor (kind `senpai_assigned`), an
+   archived context by the same rule as a live one. A live context with neither refuses the whole migration, naming
+   it. An archived context with neither keeps a NULL senpai and never refuses (kind `archived_no_senpai`). It does
+   not check that an existing senpai is live. `kj context move` clears a context's senpai notes.
 5. **`console-label-v1`**: the live context of type `console` labeled `ROOT` is relabeled `console`. When another
    live context already holds `console`, the migration refuses, naming both. A live `ROOT` of any other type keeps
    its label and is listed (kind `root_label_kept`).

@@ -959,6 +959,37 @@ fn root_ctx_moves_at_commit_rotation() {
     assert_eq!(w.db.root_console(amy).unwrap(), Some(successor.context_id), "the commit moves the console");
     assert_eq!(w.db.root_console(bob).unwrap(), Some(bob_console.context_id), "another root's console stays");
     assert!(w.db.get_context(old.context_id).unwrap().unwrap().is_archived());
+    assert_eq!(w.db.senpai_of(old.context_id).unwrap(), Some(successor.context_id), "the archived console answers to its successor, so promote and move can repair it");
+    assert_eq!(w.db.senpai_of(bob_console.context_id).unwrap(), None, "another root's console stays a top");
+    assert_eq!(w.db.senpai_of(successor.context_id).unwrap(), None, "the successor is the top");
+}
+
+/// A live `root` context with no senpai that no character's `root_ctx` names
+/// is a rotation's successor that never committed. Boot archives it and
+/// leaves a console, a root context with a senpai, and archived rows alone.
+#[test]
+fn an_uncommitted_root_successor_is_archived_and_nothing_else() {
+    let w = world();
+    let amy = w.character("amy");
+    w.db.update_character_root(amy, true).unwrap();
+    let console = w.ctx("amy-console", "root", None, None);
+    w.db.write_context_character(console.context_id, amy, None, None).unwrap();
+    w.db.set_character_root_ctx(amy, Some(console.context_id)).unwrap();
+    let stray = w.ctx("stray-successor", "root", None, None);
+    let placed = w.ctx("placed-root", "root", None, None);
+    w.db.set_context_senpai(placed.context_id, Some(console.context_id)).unwrap();
+    let archived_stray = w.ctx("old-stray", "root", None, None);
+    w.archive(&archived_stray);
+    let other_type = w.ctx("scratch", "default", None, None);
+
+    let archived = w.db.archive_uncommitted_root_successors().unwrap();
+
+    assert_eq!(archived, vec![stray.context_id]);
+    let live = |ctx: &ContextRow| w.db.get_context(ctx.context_id).unwrap().unwrap().archived_at.is_none();
+    assert!(!live(&stray));
+    assert!(live(&console) && live(&placed) && live(&other_type), "only the stray goes");
+    assert_eq!(w.db.root_console(amy).unwrap(), Some(console.context_id));
+    assert!(w.db.archive_uncommitted_root_successors().unwrap().is_empty(), "a second pass finds none");
 }
 
 #[test]

@@ -108,8 +108,8 @@ fn the_fold_keeps_every_performer_senpai_and_slot_and_drops_the_table() {
     assert_eq!(r.db.context_character_migration_report().unwrap().len(), report_len, "a second open changes nothing");
 }
 
-/// A live context with no senpai that is not a root console gets one: the
-/// only live root's console. It is reported, and an archived context keeps NULL.
+/// A context with no senpai that is not a root console gets one, live or
+/// archived: the only live root's console. Each is reported.
 #[test]
 fn a_live_context_with_no_senpai_gets_the_only_live_roots_console() {
     let r = rig();
@@ -129,16 +129,56 @@ fn a_live_context_with_no_senpai_gets_the_only_live_roots_console() {
     }
     let mut assigned = r.notes("senpai_assigned");
     assigned.sort();
-    let mut expected = vec![scratch.context_id, hub.context_id, log.context_id];
+    let mut expected = vec![scratch.context_id, hub.context_id, log.context_id, dead.context_id];
     expected.sort();
     assert_eq!(assigned, expected);
-    assert_eq!(r.db.senpai_of(dead.context_id).unwrap(), None, "an archived context keeps NULL");
-    assert_eq!(r.notes("archived_no_senpai"), vec![dead.context_id]);
+    assert_eq!(r.db.senpai_of(dead.context_id).unwrap(), Some(r.console.context_id), "an archived context gets one too");
+    assert_eq!(r.notes("archived_no_senpai"), vec![], "none is left without");
     assert_eq!(r.db.senpai_of(r.console.context_id).unwrap(), None);
     assert_eq!(r.db.route_review(ReviewQuery::ask(log.context_id, r.coder)).unwrap().reviewer(), r.amy);
-    // An archived context with no senpai is not touched by the guard.
+}
+
+/// An archived context that no rule can place keeps NULL, is reported as
+/// `archived_no_senpai`, never refuses the migration, and can be given a
+/// senpai later.
+#[test]
+fn an_archived_context_no_rule_can_place_keeps_null_and_never_refuses() {
+    let r = rig();
+    let dead = r.context("dead", None, None, None);
+    r.db.archive_context(dead.context_id).unwrap();
+    assert!(r.db.retire_character(r.amy, 1).unwrap());
+    into_pre_fold(&r.db);
+
+    r.fold().unwrap();
+
+    assert_eq!(r.db.senpai_of(dead.context_id).unwrap(), None);
+    assert_eq!(r.notes("archived_no_senpai"), vec![dead.context_id]);
+    assert_eq!(r.notes("senpai_assigned"), vec![]);
     r.db.update_label(dead.context_id, Some("dead-renamed")).unwrap();
     r.db.set_context_senpai(dead.context_id, Some(r.console.context_id)).unwrap();
+}
+
+/// With several live roots an archived context takes the console its
+/// `forked_from` lineage reaches, like a live one.
+#[test]
+fn an_archived_context_takes_the_lineage_console_when_several_roots_are_live() {
+    let r = rig();
+    let [bob] = seed_characters(&r.db, &["bob"])[..] else { unreachable!() };
+    r.db.update_character_root(bob, true).unwrap();
+    let bob_console = senpai_ctx_row(&r.db, r.ws, "bob", None, Some(bob));
+    let lane = r.context("bob-lane", None, Some(&bob_console), Some(r.coder));
+    let dead = r.context("dead-child", Some(&lane), None, None);
+    r.db.archive_context(dead.context_id).unwrap();
+    let lost = r.context("dead-orphan", None, None, None);
+    r.db.archive_context(lost.context_id).unwrap();
+    into_pre_fold(&r.db);
+
+    r.fold().unwrap();
+
+    assert_eq!(r.db.senpai_of(dead.context_id).unwrap(), Some(bob_console.context_id));
+    assert_eq!(r.notes("senpai_assigned"), vec![dead.context_id]);
+    assert_eq!(r.db.senpai_of(lost.context_id).unwrap(), None, "no rule reaches it");
+    assert_eq!(r.notes("archived_no_senpai"), vec![lost.context_id]);
 }
 
 /// With several live roots a context takes the console of the root at the
@@ -231,4 +271,102 @@ fn the_database_is_copied_aside_before_the_fold() {
     let error = KernelDb::back_up_before_context_fold(&pre.conn, unwritable).unwrap_err().to_string();
     assert!(error.contains("kernel.db.pre-context-fold") && error.contains("could not be made"), "{error}");
     KernelDb::back_up_before_context_fold(&db.conn, unwritable).expect("a folded database needs no copy");
+}
+
+/// A database from before context characters, with a performer-less context
+/// that has a senpai, folds with that senpai kept.
+#[test]
+fn a_pre_context_character_database_keeps_the_senpai_of_a_performer_less_context() {
+    let r = rig();
+    let lane = r.context("lane", None, Some(&r.console), Some(r.coder));
+    let bare = r.context("bare", None, Some(&lane), None);
+    assert_eq!(r.db.get_context(bare.context_id).unwrap().unwrap().performer, None);
+    into_pre_context_character(&r.db);
+    // A database this old has neither guard.
+    r.db.conn.execute_batch("DROP TRIGGER IF EXISTS contexts_performer_fixed; DROP TRIGGER IF EXISTS contexts_senpai_required;").unwrap();
+    // It ran `senpai-edges-v1` and set `senpai_ctx`; `context-characters-v1` and the fold are ahead.
+    r.db.conn
+        .execute(
+            "DELETE FROM kernel_migrations WHERE name IN (?1, ?2)",
+            params![KernelDb::CONTEXT_CHARACTERS_MIGRATION, KernelDb::CONTEXT_FOLD_MIGRATION],
+        )
+        .unwrap();
+    r.db.conn
+        .execute("INSERT OR IGNORE INTO kernel_migrations (name) VALUES (?1)", [KernelDb::SENPAI_MIGRATION])
+        .unwrap();
+
+    r.fold().unwrap();
+
+    assert!(r.migrated());
+    let after = r.db.get_context(bare.context_id).unwrap().unwrap();
+    assert_eq!((after.performer, after.senpai_ctx), (None, Some(lane.context_id)), "the senpai survives the whole chain");
+    assert_eq!(r.notes("senpai_assigned"), vec![], "the fold had nothing to assign");
+}
+
+/// A dangling foreign key anywhere in the database refuses the fold and
+/// leaves the old shape in place.
+#[test]
+fn a_dangling_foreign_key_refuses_the_fold_and_changes_nothing() {
+    let r = rig();
+    let bare = r.context("bare", None, Some(&r.console), None);
+    into_pre_fold(&r.db);
+    r.db.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    r.db.conn
+        .execute(
+            "INSERT INTO context_edges (edge_id, source_id, target_id, created_at) VALUES (?1, ?2, ?3, 0)",
+            params![
+                uuid::Uuid::now_v7().as_bytes().as_slice(),
+                blob_param(bare.context_id.as_bytes()),
+                blob_param(ContextId::new().as_bytes())
+            ],
+        )
+        .unwrap();
+    r.db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+    let error = KernelDb::migrate_context_fold(&r.db.conn).unwrap_err().to_string();
+    assert!(error.contains("context fold left a dangling foreign key on context_edges"), "{error}");
+    assert!(KernelDb::has_table(&r.db.conn, "context_characters").unwrap(), "the table is still there");
+    assert!(!r.migrated());
+}
+
+/// Setting a senpai again clears the notes that describe the old one and keeps
+/// the rest, for that context only.
+#[test]
+fn setting_a_senpai_clears_the_notes_about_it_and_keeps_the_others() {
+    let r = rig();
+    let scratch = r.context("scratch", None, None, None);
+    let other = r.context("other", None, None, None);
+    let dead = r.context("dead", None, None, None);
+    r.db.archive_context(dead.context_id).unwrap();
+    into_pre_fold(&r.db);
+    r.fold().unwrap();
+    let add = |kind: &str, ctx: &ContextRow, note: &str| {
+        r.db.conn
+            .execute(
+                "INSERT INTO context_character_migration_report (kind, context_id, note, recorded_at) VALUES (?1, ?2, ?3, 1)",
+                params![kind, blob_param(ctx.context_id.as_bytes()), note],
+            )
+            .unwrap();
+    };
+    add("archived_no_senpai", &scratch, "archived with no senpai");
+    add("dropped", &scratch, "a root console has no senpai: senpai_ctx x is not carried");
+    add("unmapped", &scratch, "no performer: its senpai_ctx x is kept");
+    add("dropped", &scratch, "has no context character, so its cast and model override run nothing");
+    add("root_label_kept", &scratch, "the label stays");
+    add("dropped", &other, "senpai_ctx y has no context character");
+    assert_eq!(r.notes("senpai_assigned").len(), 3);
+
+    r.db.set_context_senpai(scratch.context_id, Some(r.console.context_id)).unwrap();
+
+    let left: Vec<(String, Option<ContextId>)> = r
+        .db
+        .context_character_migration_report()
+        .unwrap()
+        .into_iter()
+        .map(|n| (n.kind, n.context_id))
+        .collect();
+    let mine: Vec<&str> = left.iter().filter(|(_, c)| *c == Some(scratch.context_id)).map(|(k, _)| k.as_str()).collect();
+    assert_eq!(mine, vec!["dropped", "root_label_kept"], "only the cast note and the label note stay: {left:?}");
+    assert!(left.contains(&("senpai_assigned".to_string(), Some(other.context_id))), "another context keeps its notes");
+    assert!(left.contains(&("dropped".to_string(), Some(other.context_id))));
 }

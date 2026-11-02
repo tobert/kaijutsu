@@ -370,10 +370,21 @@ impl KjDispatcher {
     /// existed. Every new context parents under a root, so an inert root
     /// deadlocks the whole tree beneath it: rebind needs a shell, a shell
     /// needs a loadout. The kernel calls this at start; a character it
-    /// cannot repair fails boot rather than serve from a deadlock. Returns
+    /// cannot repair fails boot rather than serve from a deadlock. It first
+    /// archives any root context a rotation left uncommitted. Returns
     /// the contexts it created (not the ones it rebound). It also gives each
     /// live root its MCP hub ([`Self::ensure_mcp_hub`]).
     pub async fn ensure_root_contexts(&self, requester: PrincipalId) -> Result<Vec<ContextId>, String> {
+        // A root-console rotation that never committed leaves its successor
+        // live with no senpai; the predecessor is still the console.
+        let abandoned = self.kernel_db().lock().archive_uncommitted_root_successors().map_err(|e| e.to_string())?;
+        for successor in abandoned {
+            let _ = self.drift_router().write().set_state(successor, ContextState::Archived);
+            tracing::warn!(
+                context = %successor.short(),
+                "archived a root context left by a root-console rotation that never committed; the previous console stays",
+            );
+        }
         let live_roots: Vec<CharacterRow> = self
             .kernel_db()
             .lock()
@@ -602,6 +613,9 @@ impl KjDispatcher {
             };
             db.in_transaction(|db| {
                 let default_ws = db.get_or_create_default_workspace(requester)?;
+                // A root console is the one context with no senpai; the performer
+                // is written after the row, so check the edge with it named.
+                db.check_senpai_edge(new_id, ROOT_CONTEXT_TYPE, Some(character), None)?;
                 db.insert_context_with_document(&row, default_ws)?;
                 db.write_context_character(new_id, character, None, None)?;
                 db.set_character_root_ctx(character, Some(new_id))?;
@@ -1681,6 +1695,26 @@ mod tests {
         // A second pass finds every live root already bound — nothing to
         // create, nothing to rebind.
         assert!(d.ensure_root_contexts(PrincipalId::system()).await.unwrap().is_empty());
+    }
+
+    /// A root-console rotation that stopped before its commit left a live
+    /// `root` context with no senpai. Boot archives it and keeps the console.
+    #[tokio::test]
+    async fn boot_archives_an_uncommitted_root_console_successor() {
+        let d = rc_capable_dispatcher().await;
+        d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        let amy = super::super::test_helpers::test_reviewer_principal();
+        let console = d.kernel_db().lock().get_character(amy).unwrap().unwrap().root_ctx.expect("console");
+        let stray = super::super::test_helpers::register_context(&d, Some("amy-next"), None, amy);
+        d.kernel_db().lock().update_context_type(stray, super::ROOT_CONTEXT_TYPE).unwrap();
+        assert_eq!(d.kernel_db().lock().senpai_of(stray).unwrap(), None, "precondition: no senpai");
+
+        d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(stray).unwrap().unwrap().archived_at.is_some(), "the stray is archived");
+        assert!(db.get_context(console).unwrap().unwrap().archived_at.is_none());
+        assert_eq!(db.root_console(amy).unwrap(), Some(console));
     }
 
     /// The morning's live scenario: a root character's root context already

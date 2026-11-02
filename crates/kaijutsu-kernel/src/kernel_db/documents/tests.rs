@@ -5,7 +5,11 @@ fn failed_well_known_publication_leaves_only_a_discardable_document() {
     for role in [WellKnownRole::DriftQueue, WellKnownRole::LostFound] {
         let db = KernelDb::temporary().unwrap();
         let workspace = setup_test_db(&db);
-        let row = make_context_row(Some("unpublished"));
+        let [amy] = seed_characters(&db, &["amy"])[..] else { unreachable!() };
+        db.update_character_root(amy, true).unwrap();
+        let console = senpai_ctx_row(&db, workspace, "console", None, Some(amy));
+        let mut row = make_context_row(Some("unpublished"));
+        row.senpai_ctx = Some(console.context_id);
         db.insert_document(&DocumentRow {
             document_id: row.context_id, workspace_id: workspace,
             doc_kind: DocKind::Conversation, language: None, path: None,

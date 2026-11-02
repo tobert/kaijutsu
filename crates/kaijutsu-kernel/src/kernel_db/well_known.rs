@@ -49,7 +49,7 @@ impl KernelDb {
         role: WellKnownRole,
     ) -> KernelDbResult<()> {
         let tx = self.conn.unchecked_transaction()?;
-        self.insert_context_with_document(row, workspace)?;
+        self.insert_placed_context(row, workspace)?;
         self.set_well_known_context(role, row.context_id)?;
         tx.commit()?;
         Ok(())

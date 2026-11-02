@@ -1003,7 +1003,13 @@ impl KjDispatcher {
         if let Some(ref name) = performer_name {
             info.push_str(&format!("\nPerformer: {name}"));
         }
-        let (effective_review, reviewer_error) = match self.kernel().resolve_context_review(row.context_id).await {
+        // A context with no performer still routes its asks: the gate climbs
+        // the senpai chain with the caller as the actor, so route for nobody in particular.
+        let review = match row.performer {
+            Some(_) => self.kernel().resolve_context_review(row.context_id).await,
+            None => self.kernel().resolve_context_review_for(row.context_id, PrincipalId::system()).await,
+        };
+        let (effective_review, reviewer_error) = match review {
             Ok(review) => (Some(review), None),
             Err(error) => {
                 info.push_str(&format!("\nReviewer error: {error}"));
@@ -1050,7 +1056,7 @@ impl KjDispatcher {
             }
         }
         // What the context-character migration did not carry over for this
-        // context. Unlike the senpai note, nothing clears these.
+        // context. Setting the senpai again clears the ones about the senpai.
         let character_notes: Vec<(String, String)> = match self.kernel_db().lock().context_character_migration_report() {
             Ok(notes) => notes.into_iter()
                 .filter(|n| n.context_id == Some(row.context_id))
@@ -2477,6 +2483,12 @@ impl KjDispatcher {
             )),
         };
         let is_handoff_log = matches!(placement, CharacterPlacement::Senpai(_));
+        // The successor of a root console has no senpai until `commit_rotation`
+        // moves `root_ctx` to it, so a rotation that stops before then archives it.
+        let root_console = match self.kernel_db().lock().is_root_console(predecessor.context_id) {
+            Ok(root) => root,
+            Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
+        };
 
         let successor_id = ContextId::new();
         let parent = predecessor.forked_from;
@@ -2520,7 +2532,9 @@ impl KjDispatcher {
         {
             let mut drift = self.drift_router().write();
             if let Err(e) = drift.register(successor_id, None, parent, caller.principal_id) {
-                return KjResult::Err(format!("kj context rotate: {e}"));
+                drop(drift);
+                let successor = self.successor_fate(root_console, successor_id);
+                return KjResult::Err(format!("kj context rotate: {successor}{e}"));
             }
         }
 
@@ -2531,50 +2545,73 @@ impl KjDispatcher {
         )
         .await;
         if caller.cancel.is_cancelled() {
+            let successor = self.successor_fate(root_console, successor_id);
             return KjResult::Err(format!(
-                "kj context rotate: owner cancelled after creating successor {successor_id}; \
-                 {name} stays live"
+                "kj context rotate: owner cancelled after creating successor {successor_id}; {successor}{name} stays live"
             ));
         }
         if let Err(e) = lifecycle {
+            let successor = self.successor_fate(root_console, successor_id);
             return KjResult::Err(format!(
-                "kj context rotate: successor {successor_id} was created, but its rc create lifecycle could not settle; {name} stays live: {e}"
+                "kj context rotate: successor {successor_id} was created, but its rc create lifecycle could not settle; {successor}{name} stays live: {e}"
             ));
         }
         // A handoff log runs no tools, so it has no loadout to check.
         if !is_handoff_log {
             match self.has_usable_loadout(successor_id) {
                 Ok(true) => {}
-                Ok(false) => return KjResult::Err(format!(
-                    "kj context rotate: the successor {successor_id} has no loadout after its create lifecycle, so {name} stays live. \
-                     Read the successor's Error blocks, then archive it with `kj context archive {successor_id}`"
-                )),
-                Err(e) => return KjResult::Err(format!(
-                    "kj context rotate: could not read the successor's loadout, so {name} stays live: {e}"
-                )),
+                Ok(false) => {
+                    let next = if self.successor_fate(root_console, successor_id).is_empty() {
+                        format!("Read the successor's Error blocks, then archive it with `kj context archive {successor_id}`")
+                    } else {
+                        "The successor was archived; read its Error blocks".to_string()
+                    };
+                    return KjResult::Err(format!(
+                        "kj context rotate: the successor {successor_id} has no loadout after its create lifecycle, so {name} stays live. {next}"
+                    ));
+                }
+                Err(e) => {
+                    let successor = self.successor_fate(root_console, successor_id);
+                    return KjResult::Err(format!(
+                        "kj context rotate: could not read the successor's loadout, so {successor}{name} stays live: {e}"
+                    ));
+                }
             }
         }
 
         // The predecessor's archive lifecycle runs while it is still live,
         // as `kj context archive` runs it; the rotation commits after it.
         if let Err(e) = self.run_archive_lifecycle(predecessor.context_id, caller).await {
+            let successor = if self.successor_fate(root_console, successor_id).is_empty() {
+                "is unlabeled".to_string()
+            } else {
+                "was archived".to_string()
+            };
             return KjResult::Err(format!(
-                "kj context rotate: {name} stays live and the successor {successor_id} is unlabeled: {e}. \
+                "kj context rotate: {name} stays live and the successor {successor_id} {successor}: {e}. \
                  Scripts its archive lifecycle already ran keep their effects, and a retry runs it again"
             ));
         }
         if caller.cancel.is_cancelled() {
+            let successor = self.successor_fate(root_console, successor_id);
             return KjResult::Err(format!(
                 "kj context rotate: owner cancelled before committing successor {successor_id}; \
-                 {name} stays live, and its archive lifecycle already ran"
+                 {successor}{name} stays live, and its archive lifecycle already ran"
             ));
         }
         let moved = match self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id) {
             Ok(moved) => moved,
-            Err(e) => return KjResult::Err(format!(
-                "kj context rotate: {e}; the successor {successor_id} is unlabeled, and {name}'s \
-                 archive lifecycle already ran"
-            )),
+            Err(e) => {
+                let successor = if self.successor_fate(root_console, successor_id).is_empty() {
+                    "is unlabeled"
+                } else {
+                    "was archived"
+                };
+                return KjResult::Err(format!(
+                    "kj context rotate: {e}; the successor {successor_id} {successor}, and {name}'s \
+                     archive lifecycle already ran"
+                ));
+            }
         };
         {
             let mut drift = self.drift_router().write();
@@ -2611,6 +2648,26 @@ impl KjDispatcher {
             "rotated_from": predecessor.context_id.to_hex(),
             "no_model": no_model,
         }))
+    }
+
+    /// Settle the successor of a rotation that stopped before its commit. A
+    /// root console's successor has no senpai and no `root_ctx` names it, so it
+    /// is archived and the returned text says so (ending in a space, for the
+    /// caller's message); any other successor stays live and the text is empty.
+    fn successor_fate(&self, root_console: bool, successor: ContextId) -> &'static str {
+        if !root_console {
+            return "";
+        }
+        match self.kernel_db().lock().archive_context(successor) {
+            Ok(_) => {
+                let _ = self.drift_router().write().set_state(successor, ContextState::Archived);
+                "archived the successor because a root console's successor has no senpai until the rotation commits; "
+            }
+            Err(e) => {
+                tracing::error!(successor = %successor.short(), "could not archive the abandoned root-console successor: {e}");
+                ""
+            }
+        }
     }
 
     /// Whether the caller's actor is a live root character: a person's
@@ -3459,6 +3516,28 @@ mod tests {
             assert!(!result.is_ok(), "{flag:?}");
             assert!(result.message().contains("unexpected argument"), "{flag:?}: {}", result.message());
         }
+    }
+
+    /// A context with no performer (a hub, a handoff log) routes its asks to
+    /// the holder of its senpai; `kj context info` shows that reviewer, not an error.
+    #[tokio::test]
+    async fn context_info_shows_the_reviewer_of_a_context_with_no_performer() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let bare = register_context(&d, Some("no-performer"), Some(root), amy);
+        d.kernel_db().lock().set_context_senpai(bare, Some(root)).unwrap();
+        assert_eq!(d.kernel_db().lock().get_context(bare).unwrap().unwrap().performer, None, "precondition");
+        let caller = crate::kj::test_helpers::caller_with_context(bare);
+
+        let result = d.dispatch(&[s("context"), s("info"), s(".")], &caller).await;
+
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(!result.message().contains("Reviewer error"), "{}", result.message());
+        assert!(result.message().contains("Reviewer: amy (senpai)"), "{}", result.message());
+        let KjResult::Ok { data: Some(data), .. } = result else { panic!("context info has data") };
+        assert_eq!(data["reviewer_name"], "amy");
+        assert_eq!(data["reviewer_error"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -4423,6 +4502,37 @@ mod tests {
         let db = f.d.kernel_db().lock();
         assert!(db.get_context(f.seat).unwrap().unwrap().archived_at.is_none());
         assert_eq!(db.resolve_context("banto").unwrap(), f.seat);
+    }
+
+    /// A root console's rotation that fails before the commit archives its
+    /// successor: that row has no senpai and no `root_ctx` naming it, so a
+    /// live one could never be promoted or moved. The console stays.
+    #[tokio::test]
+    async fn rc_admission_fault_in_a_root_rotation_archives_the_successor() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let f = rotation_fixture().await;
+        let caller = rotation_caller(f.root, f.amy);
+        f.d.kernel_db().lock().conn_for_test_mut().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+        let result = f.d.dispatch(&[s("context"), s("rotate"), s("amy")], &caller).await;
+        f.d.kernel_db().lock().conn_for_test_mut().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        assert!(!result.is_ok(), "{}", result.message());
+        assert!(result.message().contains("archived the successor") && result.message().contains("stays live"), "{}", result.message());
+        let db = f.d.kernel_db().lock();
+        assert!(db.get_context(f.root).unwrap().unwrap().archived_at.is_none(), "the console stays live");
+        assert_eq!(db.root_console(f.amy).unwrap(), Some(f.root));
+        let strays: Vec<_> = db
+            .list_all_contexts()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE && row.context_id != f.root)
+            .collect();
+        assert_eq!(strays.len(), 1, "the successor row exists for diagnosis");
+        assert!(strays[0].archived_at.is_some(), "and it is archived, not live with no senpai");
     }
 
     /// A character's handoff log has no performer. Rotating it points

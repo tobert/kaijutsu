@@ -12,6 +12,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   Decide whether to backfill sheets (or null the column) and add the key.
 - A handoff log created outside any root's lineage refuses when the kernel has several live roots: there is no
   owner-character rule to pick its root console (`KernelDb::default_console_for`).
+- `KernelDb::default_console_for(None)` refuses on a kernel with several live roots, so once a second root exists
+  these fail: arming a beat track (the score context, `ensure_score_context` in `kaijutsu-server/src/beat.rs`,
+  fatal for the arm), dead-lettering a drift (the lost+found context, `drift.rs` ~1334) and queueing one (the drift
+  queue, `drift.rs` ~1444), and the cold-start bootstrap of an orphan document (`bootstrap_discovered_context` in
+  `kaijutsu-server/src/rpc.rs` ~1277, whose refusal at ~1963 stops the boot). A designated kernel root, or another
+  rule for a context with no creating context, is Amy's decision.
 - A live context may answer to an archived senpai, as zorak's old `ROOT` does. The fold does not check senpai
   liveness for rows that already name one; `kj context kohai` of the archived senpai lists them.
 
@@ -2723,21 +2729,6 @@ files. The restart tests in `context_label_resolve.rs` and
 A fix takes the kernel handle through `run_on_listener_with_kernel_sink`
 and runs the settle steps in `stop()`; the two OS threads still cannot be
 joined in-process. Found by kaibo (DeepSeek) reviewing 730a9ed8, 2026-09-22.
-
-## Parentless contexts outside the root consoles
-
-`kj context create` and `kj fork` always set a senpai (fe187fe5 made them name a parent), but
-these paths still insert `forked_from: None` rows with a null `senpai_ctx`: `kj context scratch`
-(`kj/context.rs`, `context_scratch`), the handoff log (`kj/handoff.rs`,
-already filed under "Handoff logs are parentless"), the beat's score
-context (`kaijutsu-server/src/beat.rs`), the cold-start document bootstrap
-(`kaijutsu-server/src/rpc.rs`, `bootstrap_discovered_context`), the drift
-queue and lost+found (`drift.rs`, `kj/drift.rs`, via
-`insert_well_known_context`). Each is its own tree in the forest with no
-root character above it, so reviewer resolution from inside one refuses at its first step.
-Decide per path: give it a senpai under the caller's lineage root, or state that
-it is a registry-owned well-known context that never hosts a gated turn.
-Found by kaibo (DeepSeek) reviewing fe187fe5, 2026-09-22.
 
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
 

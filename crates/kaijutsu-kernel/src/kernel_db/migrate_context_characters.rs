@@ -500,7 +500,7 @@ impl KernelDb {
                 notes.push(Note {
                     kind: "unmapped",
                     context: Some(c.id),
-                    text: format!("no performer: left without a context character; senpai_ctx {} is not carried", name_of(senpai)),
+                    text: format!("no performer: left without a context character; its senpai_ctx {} is kept", name_of(senpai)),
                 });
             }
             if c.cast_id.is_some() || c.model.is_some() {

@@ -541,6 +541,28 @@ impl KernelDb {
         )?)
     }
 
+    /// Archive each live `root` context that has no senpai and that no
+    /// character's `root_ctx` names, and return them. A root console's
+    /// rotation inserts its successor before `commit_rotation` moves
+    /// `root_ctx`; a rotation that stopped between the two leaves such a row,
+    /// which no verb can place or promote. The predecessor is still the console.
+    pub fn archive_uncommitted_root_successors(&self) -> KernelDbResult<Vec<ContextId>> {
+        let strays: Vec<ContextId> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT context_id FROM contexts
+                 WHERE context_type = ?1 AND senpai_ctx IS NULL AND archived_at IS NULL
+                   AND context_id NOT IN (SELECT root_ctx FROM characters WHERE root_ctx IS NOT NULL)
+                 ORDER BY created_at, context_id",
+            )?;
+            stmt.query_map([kaijutsu_types::ROOT_CONTEXT_TYPE], |r| read_context_id(r, 0))?
+                .collect::<SqliteResult<_>>()?
+        };
+        for stray in &strays {
+            self.archive_context(*stray)?;
+        }
+        Ok(strays)
+    }
+
     /// Point a character's `root_ctx` at its console, or clear it.
     pub fn set_character_root_ctx(&self, principal_id: PrincipalId, ctx: Option<ContextId>) -> KernelDbResult<()> {
         let updated = self.conn.execute(
@@ -584,8 +606,9 @@ impl KernelDb {
     /// `None`. Refuses a senpai with no row, a context that is its own senpai,
     /// a cycle, and a `None` for a context that is not a root console. Who may
     /// move it, and the pending-ask rule, belong to the caller. The edge is the
-    /// one mutable column of the dynamic layer, and the migration's note about
-    /// it stands until it is set again.
+    /// one mutable column of the dynamic layer, and the migration's notes about
+    /// it (`senpai_migration_report`, and the senpai kinds of
+    /// `context_character_migration_report`) stand until it is set again.
     pub fn set_context_senpai(&self, context: ContextId, senpai: Option<ContextId>) -> KernelDbResult<()> {
         let row = self
             .get_context(context)?
@@ -621,6 +644,16 @@ impl KernelDb {
         )?;
         self.conn.execute(
             "DELETE FROM senpai_migration_report WHERE context_id = ?1",
+            params![blob_param(context.as_bytes())],
+        )?;
+        // `senpai_assigned` and `archived_no_senpai` are about the senpai alone;
+        // the older `dropped` and `unmapped` kinds also carry cast and label
+        // notes, so only those that name the senpai go.
+        self.conn.execute(
+            "DELETE FROM context_character_migration_report
+             WHERE context_id = ?1
+               AND (kind IN ('senpai_assigned', 'archived_no_senpai')
+                    OR (kind IN ('dropped', 'unmapped') AND note LIKE '%senpai%'))",
             params![blob_param(context.as_bytes())],
         )?;
         Ok(())

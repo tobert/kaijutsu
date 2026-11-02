@@ -3630,3 +3630,17 @@ ask, archived by its own character. And "senpai should not be a kj verb!": its
 subcommands moved to `kj context info|kohai|move` and `kj drift report`. The
 pair now takes four commands. Cleaning zorak also found 217 old contexts with
 no context character that nobody could archive; a live root may now.
+
+`kj context create` then took the character as its positional argument:
+`kj context create kohai --senpai senpai`, with the label defaulting to the
+name. A debt review found the exceptions piling up around "root": a live root
+archiving characterless contexts, MCP sessions archiving themselves, two
+meanings of "root console", a drift hold keyed on a label. The structural fix
+was one senpai edge on every context. `context_characters` folded into
+`contexts` (`performer`, `senpai_ctx`, `persona`), every context answers to a
+senpai except a person's root console, and one authority rule plus "a
+context's own performer may archive it" replaced the exceptions. The model
+console became `console` (Amy: "oh, I like console"), keyed on its type. The
+fold migration was rehearsed on a copy of zorak's backup before it shipped;
+`kernel_db.rs` was split into 30 modules first, by Haiku lanes working from a
+verified step list, which made the fold reviewable.
