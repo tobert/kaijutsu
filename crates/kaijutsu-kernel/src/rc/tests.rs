@@ -2690,6 +2690,12 @@ esac
         assert!(flat(&child_sections).contains("This context stays on record"), "the child knows it is read later");
         assert!(!flat(&child_sections).contains("a companion, not a worker"),
             "a spawn child does not inherit the main stance: {child_sections}");
+        // The child only observes: the copy of the main seat's writable shell is cleared.
+        let binding = d.dispatch(&argv(&["binding", "show", &first_id.to_hex()]), &console_caller(&d)).await;
+        assert!(binding.is_ok(), "{}", binding.message());
+        assert!(binding.message().contains("facades: shell"), "the read-only shell: {}", binding.message());
+        assert!(binding.message().contains("authorities: (none)"), "no extra authority: {}", binding.message());
+        assert!(!binding.message().contains("shell_write"), "no writable shell: {}", binding.message());
 
         // A second tick sweeps the first child, then forks the next.
         fire_companion_tick(&d, main, 2).await;
@@ -2735,6 +2741,69 @@ esac
             }
             other => panic!("expected the child to detach, got {other:?}"),
         }
+    }
+
+    /// A check-in cannot write, so the next tick reads its report and puts it
+    /// in the main context's log: a FINDING becomes a notification, a QUIET
+    /// report becomes none, and a check-in that reported neither is itself
+    /// reported. (A handoff note needs a character author; the tick is the
+    /// clock, so it leaves none.)
+    #[test]
+    fn companion_tick_puts_each_checkin_report_in_front_of_the_seat() {
+        crate::on_rc_thread(companion_tick_puts_each_checkin_report_in_front_of_the_seat_body);
+    }
+
+    async fn companion_tick_puts_each_checkin_report_in_front_of_the_seat_body() {
+        let (d, main) = companion_fixture().await;
+        // The check-in notices in the main context's log, oldest first.
+        let notes = |d: &std::sync::Arc<KjDispatcher>| {
+            let d = d.clone();
+            async move {
+                d.block_store().block_snapshots(main).unwrap().iter()
+                    .filter(|b| b.kind == BlockKind::Notification && b.content.starts_with("=== Check-in "))
+                    .map(|b| b.content.clone()).collect::<Vec<_>>().join("\n")
+            }
+        };
+        let current_checkin = |d: &KjDispatcher| -> ContextId {
+            let label = d.kernel_db().lock().get_context_env(main).unwrap().into_iter()
+                .find(|e| e.key == "LAST_CHECKIN").expect("the tick records the check-in it forked").value;
+            lookup_context_id(d, &label)
+        };
+        let report = |d: &std::sync::Arc<KjDispatcher>, child: ContextId, text: &str| {
+            let d = d.clone();
+            let text = text.to_string();
+            async move {
+                let reporter = KjCaller { privileged: true, ..caller_with_context(child) };
+                let r = d.dispatch(&argv(&["block", "create", "--role", "model", "--kind", "text", "--content", &text]), &reporter).await;
+                assert!(r.is_ok(), "could not write the report: {}", r.message());
+            }
+        };
+
+        // Tick 1 forks the first check-in, which reports a finding.
+        fire_companion_tick(&d, main, 1).await;
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+        report(&d, current_checkin(&d), "FINDING: the disk on moltar is at 97 percent.").await;
+
+        // Tick 2 puts that finding in the log, then forks the second check-in, which is quiet.
+        fire_companion_tick(&d, main, 2).await;
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+        let after_finding = notes(&d).await;
+        assert!(after_finding.contains("97 percent") && after_finding.contains("reported ==="), "{after_finding}");
+        report(&d, current_checkin(&d), "QUIET: nothing changed.").await;
+
+        // Tick 3 reads the quiet report and writes nothing, then forks a third
+        // check-in that reports neither word.
+        fire_companion_tick(&d, main, 3).await;
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+        assert_eq!(notes(&d).await, after_finding, "a quiet check-in leaves no notice");
+
+        // Tick 4 reports the third check-in as a finding about itself.
+        fire_companion_tick(&d, main, 4).await;
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+        let after_silent = notes(&d).await;
+        assert!(after_silent.contains("left no QUIET: or FINDING: report"), "{after_silent}");
+        assert!(after_silent.contains("97 percent"), "the earlier notice stays: {after_silent}");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
     /// A large main context gets a wrap-up turn, not a check-in. The next tick

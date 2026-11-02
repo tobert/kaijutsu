@@ -17,6 +17,15 @@ after a wrap-up turn.
   time has no verb to say so: `kj context rotate` needs the operator
   capability, which a model's loadout does not carry. A narrow verb or a marker
   the seat can set would let it ask for a wrap-up.
+- **A finding waits for the next tick.** A check-in cannot write, so its report
+  reaches the seat when the next tick reads it, up to an hour later. A report
+  that must interrupt the person has no path yet. Nor is a notification a
+  memory: the seat must fold it into a handoff note, and nothing checks that
+  it did.
+- **The clock cannot author a handoff note.** `kj handoff note` needs a
+  character, by design (`handoff.rs`, `resolve_caller_character`). If the tick
+  should write notes, the character needs a path the clock may use; today the
+  tick uses a log notification instead.
 - **The wrap-up is not checked.** The tick rotates after the wrap-up turn's
   hour whether or not the turn finished or wrote a note. It should read the
   turn's outcome (`kj context turns`) and a note newer than `WRAPUP_AT`, and

@@ -1,6 +1,8 @@
-# companion: a check-in child's loadout. A fork copies its parent's, so this
-# adds the one authority a check-in needs on top: `drift`, to push a finding to
-# its parent. Nothing else is added; a child cannot fork, archive, or change
-# the clock. The tick archives it.
+# companion: a check-in child's loadout. A fork copies its parent's, which
+# carries the writable shell. A check-in only observes, so clear the copy and
+# grant the read-only shell alone. Its report is its last message: the next
+# tick reads that and writes the handoff note, so the child needs no write path.
+# To let a check-in use another tool, add a line here (docs/companion.md).
 set -e
-kj binding allow "drift"
+kj binding reset
+kj binding allow "facade:shell"

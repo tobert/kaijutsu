@@ -2,19 +2,26 @@
 # `wakeup` beats (docs/companion.md, "The clock"). It runs on the kernel
 # runtime and returns as soon as the work it starts is admitted.
 #
-# One of three things happens, in this order:
+# First, on every tick, close out the previous check-in. A check-in has a
+# read-only shell, so it cannot write anything: its last message is its report
+# and begins with QUIET: or FINDING:. This script reads that report and puts a
+# FINDING into this context's log as a notification, where the seat reads it on
+# its next turn and folds what matters into its own handoff notes. (A handoff
+# note is authored by a character, and this script runs as the clock, so it
+# leaves none.) A check-in that left neither word, or no message, is reported
+# the same way as a finding about itself, never skipped. Then it archives the
+# check-ins; the archive keeps every block, so the archived child is the record
+# of what it looked at.
+#
+# Then one of three things happens:
 #
 #  1. A wrap-up was asked for on an earlier tick (WRAPUP_AT is set): rotate this
 #     context now. The seat has had a whole tick to write its handoff notes.
 #  2. This context is large (the last call filled ROTATE_AT_TOKENS or more):
 #     drive a wrap-up turn asking the seat to write its handoff, and mark it.
 #     No check-in this tick; the seat is busy.
-#  3. Otherwise run a check-in: archive the previous check-ins, then fork a
-#     fresh empty child (`spawn` keeps nothing) whose own fork rc builds its
-#     stance and whose seed text drives its turn. The archive keeps each
-#     child's blocks, so an archived child is the record of what it looked at.
-#
-# Archiving before forking also means two check-ins are never live at once.
+#  3. Otherwise fork a fresh empty check-in (`spawn` keeps nothing); its own fork
+#     rc builds its stance and loadout, and the seed text below drives its turn.
 #
 # Set ROTATE_AT_TOKENS below the model's context window. 160000 is about 60
 # percent of a 262144-token window.
@@ -25,6 +32,29 @@ here="$(dirname "$0")"
 info="$(kj context info --json)"
 used="$(echo "$info" | jq -r '.usage.total_tokens // 0')"
 wrapup="$(echo "$info" | jq -r '.env.WRAPUP_AT // empty')"
+last="$(echo "$info" | jq -r '.env.LAST_CHECKIN // empty')"
+
+case "$last" in
+  "") ;;
+  *)
+    report="$(kj wait "$last" --timeout 1 --max-blocks 1 --max-bytes 2000 --include text || true)"
+    case "$report" in
+      *"FINDING:"*)
+        kj block create --role system --kind notification --content "=== Check-in $last reported ===
+$report"
+        ;;
+      *"QUIET:"*)
+        echo "check-in $last: quiet"
+        ;;
+      *)
+        kj block create --role system --kind notification --content "=== Check-in $last left no QUIET: or FINDING: report ===
+It may have failed. Read it with: kj block list -c $last"
+        ;;
+    esac
+    kj context unset --env LAST_CHECKIN
+    ;;
+esac
+kj context archive --children --type companion --confirm
 
 case "$wrapup" in
   "") ;;
@@ -42,6 +72,6 @@ if test "$used" -ge "$ROTATE_AT_TOKENS"; then
   exit 0
 fi
 
-kj context archive --children --type companion --confirm
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 kj fork --preset spawn --name "checkin-$stamp" --prompt "$(cat "$here/S10-checkin.md")"
+kj context set --env "LAST_CHECKIN=checkin-$stamp"

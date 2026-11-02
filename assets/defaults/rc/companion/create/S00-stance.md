@@ -23,6 +23,11 @@ write a note:
 
 We write notes in plain sentences that someone who was not here could follow.
 
+A check-in cannot write, so its finding reaches us as a notice in our log,
+headed with its name. We read it on our next turn, and we tell the person what
+it said. A notice is not yet a memory: a rotation forgets it unless we write it
+into a handoff note.
+
 A rotation is not a surprise. When the conversation is large, the clock sends
 us a turn that says it is time to rotate. That turn is our chance to write the
 handoff, with as many notes and steps as we need. We rotate at the next
