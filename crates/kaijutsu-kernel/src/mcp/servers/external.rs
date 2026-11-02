@@ -378,7 +378,12 @@ pub struct ExternalMcpServer {
     down: AtomicBool,
     /// Populated alongside `down = true`.
     down_reason: PlRwLock<Option<String>>,
+    /// Where this server's images go ([`Self::with_images`]). Without one an
+    /// image is refused, never passed on as base64 text.
+    images: Option<ImageStore>,
 }
+
+use super::block::ImageStore;
 
 impl ExternalMcpServer {
     /// Connect to an external MCP server per the given config. `instance_id`
@@ -459,7 +464,14 @@ impl ExternalMcpServer {
             notif_tx,
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
+            images: None,
         })
+    }
+
+    /// Attach the images this server returns through `images`.
+    pub fn with_images(mut self, images: ImageStore) -> Self {
+        self.images = Some(images);
+        self
     }
 
     fn mark_down(&self, reason: impl Into<String>) {
@@ -663,23 +675,120 @@ fn map_rmcp_service_error(
     }
 }
 
-fn translate_result(result: CallToolResult) -> KernelToolResult {
+/// Translate an MCP tool result for the kernel. An image is handed to
+/// `attach`, which stores it for the model and answers with its CAS hash or
+/// the reason it was refused; the result keeps one short line in its place,
+/// never the base64. An image is an `image` content item, or an embedded
+/// resource whose blob is an image: by its MIME type, or by its bytes when
+/// it has none.
+fn translate_result(
+    result: CallToolResult,
+    mut attach: impl FnMut(&str, &[u8]) -> Result<String, String>,
+) -> KernelToolResult {
     let is_error = result.is_error.unwrap_or(false);
     let content = result
         .content
         .into_iter()
-        .map(|c: ContentBlock| match c.as_text() {
-            Some(text) => ToolContent::Text(text.text.clone()),
-            None => match serde_json::to_value(&c) {
+        .map(|c: ContentBlock| {
+            if let Some(text) = c.as_text() {
+                return ToolContent::Text(text.text.clone());
+            }
+            if let Some(image) = image_in(&c) {
+                return ToolContent::Text(attach_line(image, &mut attach));
+            }
+            match serde_json::to_value(&c) {
                 Ok(v) => ToolContent::Json(v),
                 Err(_) => ToolContent::Text(String::from("<unserializable content>")),
-            },
+            }
         })
         .collect();
     KernelToolResult {
         is_error,
         content,
         structured: result.structured_content,
+    }
+}
+
+/// An image a content item carries: its declared MIME type, its base64
+/// payload, and the resource URI it came under.
+struct ImagePayload<'a> {
+    mime: Option<&'a str>,
+    data: &'a str,
+    uri: Option<&'a str>,
+}
+
+/// The image in `content`, if it carries one. A blob with no MIME type counts
+/// when its bytes are an attachable image; any other blob stays as it is.
+fn image_in(content: &ContentBlock) -> Option<ImagePayload<'_>> {
+    if let Some(image) = content.as_image() {
+        return Some(ImagePayload { mime: Some(&image.mime_type), data: &image.data, uri: None });
+    }
+    let ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } = &content.as_resource()?.resource else {
+        return None;
+    };
+    let is_image = match mime_type.as_deref() {
+        Some(mime) => mime.starts_with("image/"),
+        None => decode_head(blob).is_some_and(|head| sniffed_attachable(&head).is_some()),
+    };
+    is_image.then_some(ImagePayload { mime: mime_type.as_deref(), data: blob, uri: Some(uri) })
+}
+
+/// The MIME type of `bytes` when they are an image a model can be shown.
+fn sniffed_attachable(bytes: &[u8]) -> Option<&'static str> {
+    let mime = crate::kj::cas::sniff_image_format(bytes)?.mime();
+    super::block::ATTACHABLE_IMAGE_TYPES.contains(&mime).then_some(mime)
+}
+
+/// The first bytes of base64 `data`, enough to sniff an image format.
+fn decode_head(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    // 88 characters are 66 bytes, past `kj::cas::SNIFF_LEN`.
+    let head: String = data.chars().filter(|c| !c.is_ascii_whitespace()).take(88).collect();
+    let usable = head.len() / 4 * 4;
+    base64::engine::general_purpose::STANDARD.decode(&head[..usable]).ok()
+}
+
+/// The decoded size of base64 `data`, an upper bound read without decoding.
+fn decoded_size_bound(data: &str) -> usize {
+    data.bytes().filter(|b| !b.is_ascii_whitespace()).count().div_ceil(4) * 3
+}
+
+/// Base64 as MCP carries it; line breaks and other whitespace are ignored.
+fn decode_base64(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(compact)
+}
+
+/// The line a tool result keeps for `image`: where it was attached, or why
+/// it was not.
+fn attach_line(image: ImagePayload<'_>, attach: &mut impl FnMut(&str, &[u8]) -> Result<String, String>) -> String {
+    // The URI is the server's choice: a `data:` URI or a long one would
+    // carry the payload or flood the line, so only a short one is named.
+    let from = image
+        .uri
+        .filter(|uri| uri.len() <= 120 && !uri.starts_with("data:"))
+        .map(|uri| format!(" from {uri}"))
+        .unwrap_or_default();
+    let max = super::block::MAX_ATTACHED_IMAGE_BYTES;
+    let bound = decoded_size_bound(image.data);
+    if bound > max {
+        let mime = image.mime.unwrap_or("image");
+        return format!("[image {mime}{from} not attached: about {bound} bytes is over the {max} byte image limit]");
+    }
+    let bytes = match decode_base64(image.data) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let mime = image.mime.unwrap_or("image");
+            return format!("[image {mime}{from} not attached: its data is not valid base64 ({e})]");
+        }
+    };
+    let Some(mime) = image.mime.or_else(|| sniffed_attachable(&bytes)) else {
+        return format!("[image{from} not attached: its bytes are not a recognized image]");
+    };
+    match attach(mime, &bytes) {
+        Ok(hash) => format!("[image {mime}{from}, {} bytes, attached as {hash}; it follows this result]", bytes.len()),
+        Err(reason) => format!("[image {mime}{from} not attached: {reason}]"),
     }
 }
 
@@ -742,7 +851,10 @@ impl McpServerLike for ExternalMcpServer {
             .await
             .map_err(|e| map_rmcp_service_error(e, &self.instance_id, |m| self.mark_down(m)))?;
 
-        Ok(translate_result(result))
+        Ok(translate_result(result, |mime, bytes| match &self.images {
+            Some(images) => images.attach(ctx.context_id, ctx.actor_id, mime, bytes),
+            None => Err("this server has no image store".to_string()),
+        }))
     }
 
     async fn list_resources(&self, _ctx: &CallContext) -> McpResult<KernelResourceList> {
@@ -944,7 +1056,90 @@ mod tests {
             notif_tx: tx,
             down: AtomicBool::new(false),
             down_reason: PlRwLock::new(None),
+            images: None,
         }
+    }
+
+    const PNG_HEAD: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D];
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn texts(result: &KernelToolResult) -> Vec<String> {
+        result
+            .content
+            .iter()
+            .map(|c| match c {
+                ToolContent::Text(s) => s.clone(),
+                ToolContent::Json(v) => v.to_string(),
+            })
+            .collect()
+    }
+
+    /// Base64 wrapped at 76 columns, as some encoders emit it, decodes.
+    #[test]
+    fn wrapped_base64_attaches_the_same_bytes() {
+        let encoded = b64(PNG_HEAD);
+        let wrapped = format!("{}\n{}", &encoded[..8], &encoded[8..]);
+        let mut got = Vec::new();
+        let result = translate_result(
+            CallToolResult::success(vec![ContentBlock::image(wrapped, "image/png")]),
+            |mime, bytes| {
+                got.push((mime.to_string(), bytes.to_vec()));
+                Ok("abc".into())
+            },
+        );
+        assert_eq!(got, vec![("image/png".to_string(), PNG_HEAD.to_vec())]);
+        assert!(texts(&result)[0].contains("attached as abc"), "{:?}", texts(&result));
+    }
+
+    /// The resource URI is the server's to choose; a `data:` URI or a long
+    /// one would put the payload back in the line, so the line names it only
+    /// when it is short and not inline data.
+    #[test]
+    fn the_line_never_repeats_an_inline_or_long_uri() {
+        let encoded = b64(PNG_HEAD);
+        for uri in [format!("data:image/png;base64,{encoded}"), format!("file:///{}", "x".repeat(400))] {
+            let blob = ContentBlock::resource(ResourceContents::blob(encoded.clone(), uri.clone()).with_mime_type("image/png"));
+            let result = translate_result(CallToolResult::success(vec![blob]), |_, _| Ok("abc".into()));
+            let line = texts(&result).join("\n");
+            assert!(!line.contains(&uri) && line.len() < 300, "{line}");
+            assert!(line.contains("attached as abc"), "{line}");
+        }
+    }
+
+    /// An image whose base64 is longer than the largest attachable image is
+    /// refused before it is decoded.
+    #[test]
+    fn an_oversized_image_is_refused_before_decoding() {
+        let max = super::super::block::MAX_ATTACHED_IMAGE_BYTES;
+        let huge = b64(PNG_HEAD) + &"A".repeat(max / 3 * 4);
+        for content in [
+            ContentBlock::image(huge.clone(), "image/png"),
+            // Untyped: only its leading bytes say it is an image.
+            ContentBlock::resource(ResourceContents::blob(huge.clone(), "file:///big")),
+        ] {
+            let result = translate_result(CallToolResult::success(vec![content]), |_, _| {
+                panic!("an oversized image is never attached")
+            });
+            let line = texts(&result).join("\n");
+            assert!(line.contains("not attached") && line.contains("image limit") && line.len() < 300, "{line}");
+        }
+    }
+
+    /// A blob that is not an image keeps its old shape and reaches no attach.
+    #[test]
+    fn a_blob_that_is_not_an_image_is_left_alone() {
+        let pdf = ContentBlock::resource(
+            ResourceContents::blob(b64(b"%PDF-1.7"), "file:///a.pdf").with_mime_type("application/pdf"),
+        );
+        let untyped_text = ContentBlock::resource(ResourceContents::blob(b64(b"plain words"), "file:///notes"));
+        let result = translate_result(CallToolResult::success(vec![pdf, untyped_text]), |_, _| {
+            panic!("only an image is attached")
+        });
+        assert!(result.content.iter().all(|c| matches!(c, ToolContent::Json(_))), "{:?}", texts(&result));
     }
 
     /// Pins the client half of the 2026-07-28 fix. `ClientConfig::default()`

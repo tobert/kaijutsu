@@ -414,6 +414,7 @@ async fn connect(
         kernel.timeouts().mcp_connect_timeout,
     )
     .await
+    .map(|server| server.with_images(kernel.image_store()))
     .map_err(|e| e.to_string())
 }
 

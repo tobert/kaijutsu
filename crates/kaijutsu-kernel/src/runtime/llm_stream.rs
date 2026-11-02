@@ -9772,6 +9772,69 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
+    /// A tool that attaches an image (`view_image`, an MCP screenshot) puts it
+    /// in the request that follows its round, behind the round's result, and
+    /// the log keeps that order for the next hydration.
+    #[tokio::test]
+    async fn an_image_a_tool_attaches_joins_the_next_request() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R'];
+        use crate::mcp::servers::ImageStore;
+        struct Snap { id: InstanceId, images: ImageStore }
+        #[async_trait::async_trait]
+        impl McpServerLike for Snap {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(vec![KernelTool { instance: self.id.clone(), name: "snap".into(), description: None,
+                    input_schema: serde_json::json!({"type": "object"}) }])
+            }
+            async fn call_tool(&self, _: KernelCallParams, ctx: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                let hash = self.images.attach(ctx.context_id, ctx.actor_id, "image/png", PNG).expect("attach");
+                Ok(KernelToolResult::text(format!("attached {hash}")))
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "snap".into(), input: serde_json::json!({}) },
+                done("tool_use")],
+            text_reply("I see a pixel"),
+        ]).recording_sent_messages();
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let instance = InstanceId::new("snap-test");
+        kernel.broker().register(Arc::new(Snap { id: instance.clone(), images: kernel.image_store() }),
+            InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "look").await;
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let hash = kaijutsu_cas::ContentHash::from_data(PNG).to_string();
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let image_at = sent[1].iter().position(|m| serde_json::to_string(m).unwrap().contains("\"Image\""));
+        let result_at = sent[1].iter().position(|m| mentions(std::slice::from_ref(m), &format!("attached {hash}")));
+        assert!(image_at.is_some() && result_at < image_at,
+            "the image follows the round's result in the next request: {:#?}", sent[1]);
+        // A request carries the image's bytes; a replay of the log carries
+        // its hash until the request resolves it.
+        let mut expected = sent[1].clone();
+        for message in &mut expected {
+            if let crate::llm::MessageContent::Blocks(blocks) = &mut message.content {
+                for block in blocks {
+                    if let crate::llm::ContentBlock::Image { data_base64, .. } = block {
+                        assert!(data_base64.take().is_some(), "the request carried the bytes");
+                    }
+                }
+            }
+        }
+        expected.push(LlmMessage::assistant("I see a pixel"));
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
     /// A drift into an idle context starts no turn, so one that lands during
     /// the final inference does not extend the turn either; the next turn
     /// reads it.

@@ -39,6 +39,10 @@ pub(crate) enum Wake {
     /// A drift arrival rides any delivery but never extends or starts a
     /// turn, just as a drift into an idle context starts none.
     Drift,
+    /// An image a tool attached during the turn (`ImageStore::attach`). It
+    /// joins the request after the tool's round, behind the round's results,
+    /// and like a drift never extends or starts a turn.
+    Attachment,
 }
 
 impl Wake {
@@ -46,7 +50,7 @@ impl Wake {
         match self {
             Self::Submit { .. } => true,
             Self::Completion { resume_allowed, .. } => *resume_allowed,
-            Self::Drift => false,
+            Self::Drift | Self::Attachment => false,
         }
     }
 }
@@ -494,6 +498,7 @@ mod ingress_tests {
         assert!(Wake::Completion { source: source.clone(), resume_allowed: true }.continues_turn());
         assert!(!Wake::Completion { source, resume_allowed: false }.continues_turn());
         assert!(!Wake::Drift.continues_turn());
+        assert!(!Wake::Attachment.continues_turn());
     }
 
     #[test]

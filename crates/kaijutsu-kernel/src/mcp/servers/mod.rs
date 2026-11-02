@@ -29,7 +29,7 @@ pub mod turn;
 
 pub use shell_operations::ShellOperationsServer;
 pub use bindings_builtin::BuiltinBindingsServer;
-pub use block::BlockToolsServer;
+pub use block::{BlockToolsServer, ImageStore};
 pub use external::{ExternalMcpServer, McpServerConfig, McpTransport};
 pub use file::FileToolsServer;
 pub use hooks_builtin::BuiltinHooksServer;

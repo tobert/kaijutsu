@@ -318,7 +318,7 @@ change affects only results sent after it.
 
 Input that arrives while a model turn runs joins that turn; it does not
 wait for the turn to end. The turn holding the context's conversation lock
-opens an ingress (`runtime/turn_state.rs`, `TurnState::offer_input`). Three
+opens an ingress (`runtime/turn_state.rs`, `TurnState::offer_input`). Four
 sources offer their block after it is durable and after their rc lifecycle
 has run, so the lifecycle's output rides with it:
 
@@ -327,6 +327,7 @@ has run, so the lifecycle's output rides with it:
 | A player's submit | `prompt::submit` | yes | starts the next turn (`prompt::follow_up`) |
 | A completion notice | `completion_notice::deliver` | when its notice allows an automatic resume | runs the notice's continuation check (`resume_after_turn`) |
 | A drift arrival | `kj drift push`, `pull`, `merge`, `flush` (`offer_drift`) | no | waits in the log, as a drift into an idle context does |
+| An image a tool attached | `ImageStore::attach` (`view_image`, an external MCP server's image) | no | waits in the log for the next turn |
 
 A running turn accepts input unless an interrupt is pending. A refused
 offer is handled as for an idle context: a submit starts a turn, a

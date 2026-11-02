@@ -6,8 +6,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use kaijutsu_cas::{ContentStore, FileStore};
-use kaijutsu_types::{ContentType, Role};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +16,6 @@ use crate::file_tools::{
     hashline::line_hash,
     vfs_walker::VfsWalkerAdapter,
 };
-use crate::block_store::SharedBlockStore;
 use crate::vfs::{MountTable, VfsOps};
 use crate::execution::{ExecContext, ExecResult};
 
@@ -55,9 +52,6 @@ pub struct ViewImageParams {
     /// against the context cwd.
     pub path: String,
 }
-
-/// Largest image `view_image` attaches. Providers reject larger images.
-const MAX_VIEW_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Parameters for the `edit` tool. Two addressing modes — pass exactly one of
 /// `old_string` (string mode) or `anchor` (hashline mode).
@@ -113,9 +107,8 @@ pub struct FileToolsServer {
     cache: Arc<FileDocumentCache>,
     vfs: Arc<MountTable>,
     guard: Option<WorkspaceGuard>,
-    /// Where `view_image` appends the image block.
-    documents: SharedBlockStore,
-    cas: Arc<FileStore>,
+    /// Where `view_image` attaches its image.
+    images: super::block::ImageStore,
     notif_tx: broadcast::Sender<ServerNotification>,
     /// Runs once between planning an edit and applying it, so a test can
     /// write the file the way a concurrent caller would.
@@ -130,8 +123,7 @@ impl FileToolsServer {
         cache: Arc<FileDocumentCache>,
         vfs: Arc<MountTable>,
         guard: Option<WorkspaceGuard>,
-        documents: SharedBlockStore,
-        cas: Arc<FileStore>,
+        images: super::block::ImageStore,
     ) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
@@ -139,8 +131,7 @@ impl FileToolsServer {
             cache,
             vfs,
             guard,
-            documents,
-            cas,
+            images,
             notif_tx,
             #[cfg(test)]
             after_plan: parking_lot::Mutex::new(None),
@@ -356,7 +347,7 @@ impl FileToolsServer {
     /// Asset block; hydration places it after this call's result.
     async fn view_image(&self, path: &str, tool_ctx: &ExecContext) -> McpResult<ExecResult> {
         let mime = crate::kj::cas::mime_from_extension(path);
-        if !matches!(mime, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+        if !super::block::ATTACHABLE_IMAGE_TYPES.contains(&mime) {
             return Ok(ExecResult::failure(
                 1,
                 format!("{path}: view_image takes png, jpg, webp, or gif files"),
@@ -367,21 +358,18 @@ impl FileToolsServer {
             Ok(attr) => attr.size,
             Err(e) => return Ok(ExecResult::failure(1, format!("{path}: {e}"))),
         };
-        if size > MAX_VIEW_IMAGE_BYTES {
-            return Ok(ExecResult::failure(
-                1,
-                format!("{path}: {size} bytes is over the {MAX_VIEW_IMAGE_BYTES} byte image limit"),
-            ));
+        // Checked before the read, so a huge file is never loaded.
+        let max = super::block::MAX_ATTACHED_IMAGE_BYTES;
+        if size > max as u64 {
+            return Ok(ExecResult::failure(1, format!("{path}: {size} bytes is over the {max} byte image limit")));
         }
         let data = match self.vfs.read_all(target).await {
             Ok(d) => d,
             Err(e) => return Ok(ExecResult::failure(1, format!("{path}: {e}"))),
         };
-        if let Err(e) = crate::kj::cas::validate_image_bytes(mime, &data) {
+        if let Err(e) = self.images.attach(tool_ctx.context_id, tool_ctx.actor_id, mime, &data) {
             return Ok(ExecResult::failure(1, format!("{path}: {e}")));
         }
-        let hash = self.cas.store(&data, mime).map_err(|e| McpError::Protocol(format!("CAS error: {e}")))?;
-        super::block::append_to_context(&self.documents, tool_ctx, Role::Asset, &hash.to_string(), ContentType::Image)?;
         Ok(ExecResult::success(format!(
             "attached {path} ({mime}, {} bytes); the image follows this result",
             data.len()
@@ -1036,8 +1024,11 @@ mod tests {
             cache,
             vfs,
             None,
-            shared_block_store(PrincipalId::system()),
-            Arc::new(FileStore::at_path(cas_dir)),
+            super::super::block::ImageStore {
+                documents: shared_block_store(PrincipalId::system()),
+                cas: Arc::new(FileStore::at_path(cas_dir)),
+                turns: Default::default(),
+            },
         )
     }
 
@@ -2229,7 +2220,12 @@ mod tests {
         let cache = Arc::new(FileDocumentCache::new(blocks.clone(), vfs.clone(), test_kernel_db()));
         let cas_dir = tempfile::tempdir().unwrap().keep();
         let server = Arc::new(FileToolsServer::new(
-            cache, vfs, None, blocks.clone(), Arc::new(FileStore::at_path(cas_dir)),
+            cache, vfs, None,
+            super::super::block::ImageStore {
+                documents: blocks.clone(),
+                cas: Arc::new(FileStore::at_path(cas_dir)),
+                turns: Default::default(),
+            },
         ));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();
@@ -2266,7 +2262,7 @@ mod tests {
     #[tokio::test]
     async fn view_image_refuses_an_image_over_the_size_limit() {
         let mut big = TEST_PNG.to_vec();
-        big.resize(MAX_VIEW_IMAGE_BYTES as usize + 1, 0);
+        big.resize(super::super::block::MAX_ATTACHED_IMAGE_BYTES + 1, 0);
         let (broker, ctx, blocks) = broker_with_image("/tmp/big.png", &big).await;
         let result = call_with_ctx(&broker, "view_image", serde_json::json!({ "path": "big.png" }), &ctx).await;
         assert!(result.is_error);

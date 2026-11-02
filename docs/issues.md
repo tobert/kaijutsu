@@ -3391,15 +3391,28 @@ Re-verified against the tree the same day:
 
 ## `view_image` has no end-to-end run yet
 
-`builtin.file` `view_image` attaches an image through an Asset block, and
+`builtin.file` `view_image`, and an external MCP server's image result
+(`docs/external-mcp.md`, "Images"), attach an image through an Asset block, and
 hydration holds the image until after the call's result so the tool pair stays
 adjacent (`llm/hydrate.rs`, `an_image_appended_during_a_tool_call_follows_its_result`).
-Unit tests cover both halves. Not yet run: a coder context on a vision model
+Unit tests cover both halves, and
+`runtime/llm_stream.rs` `an_image_a_tool_attaches_joins_the_next_request`
+runs a scripted turn through it. Not yet run: a coder context on a vision model
 (`tenchi/qwen3.8-27b` answers image input directly over vLLM) calling the tool
 in a real turn. Still open: no per-model "accepts images" check, so a
 text-only provider gets the image block and drops it (`mk` writes a text
 marker). Also, `mcp/servers/file.rs` tests `broker_with_vfs_file` and
 `broker_with_vfs_files` have no callers.
+
+Also open for images (2026-11-02, from the local model clogging on
+screenshots): an attached image is appended during the tool call, before the
+broker's PostCall phase, so a PostCall hook that denies or replaces the
+result cannot take the image back (Kaibo review). Fixing it means carrying
+the bytes in `KernelToolResult` until the hooks have run. Every image in the
+history is resent on every turn, at full size; nothing downscales or drops old screenshots. An MCP audio item or a
+non-image blob still reaches the model as base64 JSON text. `Kernel`'s tool
+result flattening (`kernel.rs`, `ToolContent` loop) joins content items with
+no separator, so a caption and the image line run together.
 
 ## File buffers: reduce the MCP file tools to kaish (low priority)
 

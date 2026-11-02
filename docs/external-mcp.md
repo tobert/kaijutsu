@@ -146,6 +146,30 @@ per the kernel's `io.kaijutsu.v1.*` namespace, and health flipping to
 automatic (component 4's reload semantics cover the "config changed"
 half; a transport error mid-session is a separate, still-open concern).
 
+## Images
+
+An image in a tool result reaches the model as an image, never as base64
+text. `translate_result` takes an `image` content item, or an embedded
+resource whose blob is an image (by its `mimeType`, or by its bytes when it
+has none), decodes it, and hands it to `block::attach_image`, the path
+`view_image` uses: png, jpeg, webp, or gif up to 5 MiB, bytes that match the
+declared type, stored in the CAS and appended to the calling context as an
+Asset image block, offered to the running turn so the request after the
+tool's round carries it behind the round's results
+(`docs/conversation-session.md`, "Input during a turn"). The tool result
+keeps one line in the image's place:
+`[image image/png, 2048 bytes, attached as <hash>; it follows this result]`,
+or `[image image/svg+xml not attached: <reason>]` for a refused one. The
+line names the resource URI only when it is short and not a `data:` URI. An
+image whose base64 is too long for the limit is refused before it is
+decoded.
+
+Passed through as JSON, an image's base64 would be cut to
+`max_result_bytes` (64 KiB): about 20k to 35k tokens of undecodable text in
+every later request. A server should send an image as typed content. A
+data URL or bare base64 inside a text item is text, and the kernel does not
+guess. Other blobs (audio, a PDF) are still passed through as JSON.
+
 ## Testing
 
 - `crates/kaijutsu-kernel/src/mcp/toml.rs` — loader unit tests (both failure
@@ -157,6 +181,10 @@ half; a transport error mid-session is a separate, still-open concern).
   `crates/kaijutsu-kernel/src/bin/mcp_stub_server.rs` — a minimal real
   MCP-speaking subprocess (never kaibo or bevy_brp themselves) that proves
   the add path lands a genuinely callable instance.
+- `crates/kaijutsu-kernel/tests/external_mcp_images.rs` — the stub with
+  `MCP_STUB_IMAGES` set returns an image in each shape above; an accepted one
+  lands as an image block, a refused one leaves a reason, and neither leaves
+  base64 in the result. Covers both `mcp.toml` and context-declared servers.
 - `crates/kaijutsu-server/tests/mcp_boot.rs` — boot-level: a malformed
   `mcp.toml` must never abort kernel startup, and a configured-but-unreachable
   server must be visibly failed, not silently absent.

@@ -201,7 +201,7 @@ pub struct Kernel {
     shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
     /// Durable rc results and the live owners of post-execution write faults.
     rc_settlements: crate::rc::settlement::RcSettlements,
-    turn_state: crate::runtime::turn_state::TurnState,
+    turn_state: Arc<crate::runtime::turn_state::TurnState>,
     /// Model turns waiting on their own asks (`runtime/held_asks.rs`).
     held_asks: crate::runtime::held_asks::HeldAsks,
     /// The worker pool that runs commands, model turns, rc lifecycle runs and
@@ -471,7 +471,7 @@ impl Kernel {
                 Arc::new(operations)
             },
             rc_settlements,
-            turn_state: crate::runtime::turn_state::TurnState::default(),
+            turn_state: Arc::new(crate::runtime::turn_state::TurnState::default()),
             held_asks: Default::default(),
             runtime_pool,
             approval_delivery: OnceLock::new(),
@@ -966,8 +966,7 @@ impl Kernel {
                     file_cache,
                     self.vfs.clone(),
                     workspace_guard,
-                    documents,
-                    self.cas.clone(),
+                    crate::mcp::servers::ImageStore { documents, cas: self.cas.clone(), turns: self.turn_state.clone() },
                 )),
                 InstancePolicy::for_kernel(self),
             )
@@ -1191,6 +1190,16 @@ impl Kernel {
     /// Get the content-addressed store.
     pub fn cas(&self) -> &Arc<FileStore> {
         &self.cas
+    }
+
+    /// Where an external MCP server attaches the images it returns: this
+    /// kernel's CAS and block store.
+    pub fn image_store(&self) -> crate::mcp::servers::ImageStore {
+        crate::mcp::servers::ImageStore {
+            documents: self.blocks().clone(),
+            cas: self.cas.clone(),
+            turns: self.turn_state.clone(),
+        }
     }
 
     /// The sink-fed MIDI presence store (`docs/midi-next.md` "Presence is

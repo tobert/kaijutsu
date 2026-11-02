@@ -218,6 +218,7 @@ pub async fn reconcile_with_toml(
         .await
         {
             Ok(server) => {
+                let server = server.with_images(kernel.image_store());
                 let policy = policy_for(kernel, cfg);
                 match broker.register_silently(Arc::new(server), policy).await {
                     Ok(()) => {

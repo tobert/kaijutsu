@@ -284,7 +284,65 @@ pub(super) fn append_to_context(
     content: &str,
     content_type: ContentType,
 ) -> McpResult<String> {
-    let context_id = ctx.context_id;
+    append_to(documents, ctx.context_id, ctx.actor_id, role, content, content_type).map(|id| id.to_key())
+}
+
+/// The image types a tool attaches for a model: the raster formats vision
+/// providers take.
+pub(crate) const ATTACHABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Largest image a tool attaches. Providers reject larger images.
+pub(crate) const MAX_ATTACHED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Where a tool attaches images for the model: the CAS for the bytes, the
+/// block store for the Asset image block, and the turns that deliver it
+/// (`Kernel::image_store`).
+#[derive(Clone)]
+pub struct ImageStore {
+    pub documents: SharedBlockStore,
+    pub cas: Arc<FileStore>,
+    pub turns: Arc<crate::runtime::turn_state::TurnState>,
+}
+
+impl ImageStore {
+    /// Attach `data`, an image of type `mime`, for the model: store it in
+    /// the CAS, append it to `context_id`'s log as an Asset image block
+    /// performed by `actor_id`, and offer the block to the context's running
+    /// turn, which delivers it after the tool's round
+    /// (`docs/conversation-session.md`, "Input during a turn"). With no turn
+    /// running it waits in the log for the next one. Returns the CAS hash.
+    /// `Err` is why the image was refused, worded for the tool result.
+    pub fn attach(
+        &self,
+        context_id: ContextId,
+        actor_id: kaijutsu_types::PrincipalId,
+        mime: &str,
+        data: &[u8],
+    ) -> Result<String, String> {
+        if !ATTACHABLE_IMAGE_TYPES.contains(&mime) {
+            return Err(format!("{mime} is not one of png, jpeg, webp, or gif"));
+        }
+        if data.len() > MAX_ATTACHED_IMAGE_BYTES {
+            return Err(format!("{} bytes is over the {MAX_ATTACHED_IMAGE_BYTES} byte image limit", data.len()));
+        }
+        crate::kj::cas::validate_image_bytes(mime, data)?;
+        let hash = self.cas.store(data, mime).map_err(|e| format!("CAS error: {e}"))?.to_string();
+        let block = append_to(&self.documents, context_id, actor_id, Role::Asset, &hash, ContentType::Image)
+            .map_err(|e| e.to_string())?;
+        let input = crate::runtime::turn_state::LiveInput { block, wake: crate::runtime::turn_state::Wake::Attachment };
+        self.turns.offer_input(context_id, input);
+        Ok(hash)
+    }
+}
+
+fn append_to(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    actor_id: kaijutsu_types::PrincipalId,
+    role: Role,
+    content: &str,
+    content_type: ContentType,
+) -> McpResult<BlockId> {
     if !documents.contains(context_id) {
         return Err(McpError::Protocol(format!("no document for context {}", context_id.short())));
     }
@@ -304,9 +362,8 @@ pub(super) fn append_to_context(
             content,
             Status::Done,
             content_type,
-            Some(ctx.actor_id),
+            Some(actor_id),
         )
-        .map(|id| id.to_key())
         .map_err(|e| McpError::Protocol(e.to_string()))
 }
 
