@@ -37,7 +37,15 @@ last="$(echo "$info" | jq -r '.env.LAST_CHECKIN // empty')"
 case "$last" in
   "") ;;
   *)
-    report="$(kj wait "$last" --timeout 1 --max-blocks 1 --max-bytes 2000 --include text || true)"
+    # `kj wait` shows only the first line of a block, so read the last model
+    # message whole. The verdict is the check-in's final paragraph.
+    # The list opens with a count line; the block is the last line.
+    line="$(kj block list -c "$last" --role model --kind text --tail 1 | tail -n 1 || true)"
+    block="$(echo "$line" | cut -d' ' -f1)"
+    report=""
+    case "$block" in
+      *"#"*) report="$(kj block read -c "$last" "$block" --range 0:60 || true)" ;;
+    esac
     case "$report" in
       *"FINDING:"*)
         kj block create --role system --kind notification --content "=== Check-in $last reported ===

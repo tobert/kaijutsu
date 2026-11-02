@@ -2782,14 +2782,15 @@ esac
         // Tick 1 forks the first check-in, which reports a finding.
         fire_companion_tick(&d, main, 1).await;
         assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
-        report(&d, current_checkin(&d), "FINDING: the disk on moltar is at 97 percent.").await;
+        // A model's message opens with blank lines and ends with its verdict.
+        report(&d, current_checkin(&d), "\n\nI looked at the disks.\n\nFINDING: the disk on moltar is at 97 percent.").await;
 
         // Tick 2 puts that finding in the log, then forks the second check-in, which is quiet.
         fire_companion_tick(&d, main, 2).await;
         assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
         let after_finding = notes(&d).await;
         assert!(after_finding.contains("97 percent") && after_finding.contains("reported ==="), "{after_finding}");
-        report(&d, current_checkin(&d), "QUIET: nothing changed.").await;
+        report(&d, current_checkin(&d), "\n\nI checked the models and the contexts.\n\nQUIET: nothing changed.").await;
 
         // Tick 3 reads the quiet report and writes nothing, then forks a third
         // check-in that reports neither word.

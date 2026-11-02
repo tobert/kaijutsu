@@ -60,10 +60,12 @@ restart the track is stopped and unattached: attach and play again.
 ## One tick
 
 `tick/S10-checkin.kai` first closes out the previous check-in, on every tick.
-It reads the check-in's report (`kj wait`, last text block). A `FINDING:` goes
-into the main context's log as a notification, a `QUIET:` leaves nothing, and a
-check-in that reported neither word, or nothing, is reported the same way as a
-finding about itself. Then it archives the check-ins, which keeps every block.
+It reads the check-in's last model message whole (`kj block list --tail 1`,
+then `kj block read`; `kj wait` shows only a block's first line). A message with
+`FINDING:` anywhere goes into the main context's log as a notification, one with
+only `QUIET:` leaves nothing, and a check-in that reported neither word, or
+nothing, is reported the same way as a finding about itself. The stance asks the
+check-in to end with its verdict. Then it archives the check-ins, which keeps every block.
 Archiving first means two check-ins are never live at once, and a stuck one is
 closed at the next tick.
 
