@@ -86,9 +86,9 @@ struct PathArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Set up a kernel so its ROOT console can answer: the root character
+    /// Set up a kernel so its console can answer: the root character
     /// and its key, a backend for each provider key found, the default
-    /// model, ROOT's performer, and ROOT. Run with the service stopped. A
+    /// model, the console's performer, and the console. Run with the service stopped. A
     /// second run adds only what is missing.
     Bootstrap(BootstrapArgs),
     /// Create the kernel's root character and bind its public key. Run once,
@@ -187,7 +187,7 @@ struct BootstrapArgs {
     #[arg(long, value_name = "FILE", default_value = "~/.ssh/id_ed25519.pub")]
     key: String,
 
-    /// The provider ROOT talks to: anthropic or deepseek. Default: each
+    /// The provider the console talks to: anthropic or deepseek. Default: each
     /// provider whose key is in its environment variable
     /// (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY) or its key file
     /// (~/.anthropic-key.txt, ~/.deepseek-key), the first one found as the
@@ -204,12 +204,12 @@ struct BootstrapArgs {
     #[arg(long, value_name = "FILE", requires = "backend")]
     api_key_file: Option<String>,
 
-    /// Set up ROOT without a model. Add one later from your root with
+    /// Set up the console without a model. Add one later from your root with
     /// `kj backend set`, or ask bootstrap again with a key.
     #[arg(long, conflicts_with_all = ["backend", "model"])]
     no_model: bool,
 
-    /// The model character that plays ROOT.
+    /// The model character that plays the console.
     #[arg(long = "console-as", value_name = "NAME", default_value = "root")]
     console_as: String,
 }
@@ -240,7 +240,7 @@ struct KjCliArgs {
 
 fn main() -> ExitCode {
     // The default `#[tokio::main]` runtime sizes worker threads at 2 MiB,
-    // which is too small for the ROOT genesis `create` rc chain that boot
+    // which is too small for the console genesis `create` rc chain that boot
     // runs on this runtime (`run_server` → `SshServer::run` →
     // `create_shared_kernel`, `rpc.rs`) — the same class of overflow
     // `spawn_kaish_thread`'s dedicated threads exist to avoid. Size every
@@ -786,7 +786,7 @@ fn cmd_migrate_keyring() -> ExitCode {
     }
 }
 
-/// Set up the kernel so `ROOT` can answer (`kaijutsu_server::bootstrap`).
+/// Set up the kernel so the console can answer (`kaijutsu_server::bootstrap`).
 async fn cmd_bootstrap(
     args: BootstrapArgs,
     config_root: Option<PathBuf>,
@@ -818,7 +818,7 @@ async fn cmd_bootstrap(
                     for note in &report.notes {
                         println!("{note}");
                     }
-                    println!("Start the server and connect as {}; ROOT is where to begin.", opts.root);
+                    println!("Start the server and connect as {}; the console is where to begin.", opts.root);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

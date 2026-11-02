@@ -361,14 +361,14 @@ fn roundtrip_create_and_recover() {
     // A fixture's performer is the principal of the context's context
     // character.
     let character = PrincipalId::new();
-    db.update_played_by(child_id, Some(character)).unwrap();
+    db.update_performer(child_id, Some(character)).unwrap();
     let played = db.get_context(child_id).unwrap().unwrap();
     assert_eq!(played.performer, Some(character));
     let context_character = db.context_character(child_id).unwrap().expect("a performed context has a context character");
     assert_eq!(context_character.principal_id, character);
-    db.update_played_by(child_id, Some(character)).unwrap();
+    db.update_performer(child_id, Some(character)).unwrap();
     assert_eq!(db.context_character(child_id).unwrap().unwrap(), context_character, "the same character changes nothing");
-    assert!(db.update_played_by(child_id, None).is_err(), "a performer cannot be cleared");
+    assert!(db.update_performer(child_id, None).is_err(), "a performer cannot be cleared");
     assert_eq!(db.get_context(child_id).unwrap().unwrap().performer, Some(character));
 }
 
@@ -448,16 +448,16 @@ fn list_orders_by_last_activity_over_created_at() {
 fn an_archived_context_keeps_its_label_and_frees_it() {
     let db = KernelDb::temporary().unwrap();
     let ws_id = setup_test_db(&db);
-    let old = make_context_row(Some("ROOT"));
+    let old = make_context_row(Some("console"));
     insert_context_with_doc(&db, &old, ws_id);
     assert!(db.archive_context(old.context_id).unwrap());
 
-    let new = make_context_row(Some("ROOT"));
+    let new = make_context_row(Some("console"));
     insert_context_with_doc(&db, &new, ws_id);
 
     let archived = db.get_context(old.context_id).unwrap().unwrap();
-    assert_eq!(archived.label.as_deref(), Some("ROOT"), "the archived row lost its name");
-    let holder = db.find_context_by_label("ROOT").unwrap().expect("the live holder");
+    assert_eq!(archived.label.as_deref(), Some("console"), "the archived row lost its name");
+    let holder = db.find_context_by_label("console").unwrap().expect("the live holder");
     assert_eq!(holder.context_id, new.context_id);
 }
 
@@ -465,10 +465,10 @@ fn an_archived_context_keeps_its_label_and_frees_it() {
 fn two_live_contexts_still_cannot_share_a_label() {
     let db = KernelDb::temporary().unwrap();
     let ws_id = setup_test_db(&db);
-    insert_context_with_doc(&db, &make_context_row(Some("ROOT")), ws_id);
-    let dup = make_context_row(Some("ROOT"));
+    insert_context_with_doc(&db, &make_context_row(Some("console")), ws_id);
+    let dup = make_context_row(Some("console"));
     let err = db
         .insert_context_with_document(&dup, ws_id)
-        .expect_err("a second live ROOT must be refused");
+        .expect_err("a second live holder of one label must be refused");
     assert!(err.to_string().contains("already in use"), "{err}");
 }

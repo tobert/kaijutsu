@@ -80,10 +80,10 @@ impl ContextRow {
         self.archived_at.is_some() || self.context_state == ContextState::Archived
     }
 
-    /// Whether this is the ROOT console: the `console` context labeled
-    /// `ROOT` (`docs/character.md`, "The root console and its shell").
-    pub fn is_root_console(&self) -> bool {
-        self.context_type == kaijutsu_types::CONSOLE_CONTEXT_TYPE && self.label.as_deref() == Some("ROOT")
+    /// Whether this is a model console (type `console`). Not [`KernelDb::is_root_console`], which asks
+    /// whether a context is a character's root console (type `root`).
+    pub fn is_console(&self) -> bool {
+        self.context_type == kaijutsu_types::CONSOLE_CONTEXT_TYPE
     }
 
     /// Convert to the lightweight `kaijutsu_types::Context`.

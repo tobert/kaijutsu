@@ -753,7 +753,7 @@ CREATE TABLE IF NOT EXISTS backend_models (
 -- role is a `context_type` (coder, musician, mcp, …) or one of the reserved
 -- roles `distill`, `gate` and `judge`. Free-form TEXT with no FK — context
 -- types are an open set defined by the rc tree. A NULL tunable takes the
--- model's `backend_models` value when a context character copies the slot
+-- model's `backend_models` value when a context is made and copies the slot
 -- (docs/senpai-kohai.md, "The model").
 CREATE TABLE IF NOT EXISTS character_slots (
     principal_id    BLOB NOT NULL REFERENCES characters(principal_id),
@@ -772,7 +772,7 @@ CREATE INDEX IF NOT EXISTS idx_character_slots_backend ON character_slots(backen
 
 -- ── Character models ──────────────────────────────────────────
 -- The one model a character runs wherever no role slot says otherwise. A
--- context character copies it under the context's own type and under
+-- context copies it under the context's own type and under
 -- `distill`, for each of the two that the character has no slot for. A NULL
 -- tunable takes the model's `backend_models` value at that copy
 -- (docs/senpai-kohai.md, "Where a model comes from").

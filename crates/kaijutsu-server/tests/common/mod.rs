@@ -169,7 +169,7 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
 }
 
 /// Set up `config`'s kernel the way `kaijutsu-server bootstrap` does, with the
-/// mock backend's `model` as its default: the backend, the defaults, `ROOT`,
+/// mock backend's `model` as its default: the backend, the defaults, the console,
 /// and its performer, all through `kj` as the ephemeral root character. Call
 /// it before the server boots; it holds the kernel lock while it runs.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.

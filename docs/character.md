@@ -14,12 +14,12 @@ an instruction to use nonexistent features.
 | Part | Contract |
 |---|---|
 | Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, and the `context_type` it usually plays (none for a root); `kj character create [--root] [--type <t>]\|list\|show\|set --root\|--no-root\|--type <t>\|--no-type\|retire` |
-| Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give `ROOT` a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
-| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live. Beside it each live root has an MCP hub, labeled `mcp/<name>`, of type `mcp-hub`, with no context character: the parent of the root's MCP sessions, made at the same three points |
+| Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give the console a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
+| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent and no senpai (a root console). `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live. Beside it each live root has an MCP hub, labeled `mcp/<name>`, of type `mcp-hub`, with no performer: the parent of the root's MCP sessions, made at the same three points |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Context character | One character in one context (`docs/senpai-kohai.md`). `kj context create <character> [--name <label>] [--type <t>]` needs the Operator capability and a live character caller, requires the character, takes the label from `--name` or the character's name (`<name>-2`, `-3` while a live context holds it) and the type from `--type` or the character's `context_type` (refusing when neither names one), refuses an unknown or retired character and one that would review itself, and preserves the requester's `created_by`. It writes the context character with slots copied from the character's own. A fork continues its source's performance; a rotation writes a successor with the same character and fresh slots. The performer of a context is its context character's character, which never changes; to put another character on the work, start a context of it |
+| Context | A context carries its performer, senpai and persona (`contexts.performer`, `senpai_ctx`, `persona`) and a copy of the model slots it runs on (`docs/senpai-kohai.md`). `kj context create <character> [--name <label>] [--type <t>]` needs the Operator capability and a live character caller, requires the character, takes the label from `--name` or the character's name (`<name>-2`, `-3` while a live context holds it) and the type from `--type` or the character's `context_type` (refusing when neither names one), refuses an unknown or retired character and one that would review itself, and preserves the requester's `created_by`. It copies the character's slots into the context. A fork continues its source's performance; a rotation writes a successor with the same character and fresh slots. The performer of a context never changes; to put another character on the work, start a context of it |
 | Client creation | There is no create RPC. A client runs `kj context create <character>` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses. An `mcp` session created from a root console passes `--parent mcp/<root name>`, so the root's MCP hub is its `forked_from` and the gate raises no ask (`kaijutsu_client::mcp_hub_label`; `docs/senpai-kohai.md`, "MCP sessions") |
-| Senpai edge | Every working context answers to one senpai context (`context_characters.senpai_ctx`); the senpai's character reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
+| Senpai edge | Every context answers to one senpai context (`contexts.senpai_ctx`), except a root console; the senpai's character reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
 | Model | A character has one model (`character_models`), set with `kj character create <name> --backend <b> --model <m>` or `kj character model set\|unset\|show`; a root runs none. It may also hold role slots (`character_slots`, `kj character slot set\|unset\|list`) where a role differs. A context copies them into `context_slots` when it is made: every role slot, then the model under the context's own type and under `distill` where the character has no slot for that role. The model never fills `gate`, `judge` or the type of an `mcp` context. Unset parameters come from `backend_models`. Every model call reads the context's own slot for its type. No default stands in; a context with no slot for its type gives no model, and a turn refuses naming the fix (`kj character model set`, then `kj context rotate`). The judge and the gate use the context's `judge` and `gate` slots, and distillation its `distill` slot |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation at a root context. See `docs/approval-identity.md` |
@@ -30,7 +30,7 @@ an instruction to use nonexistent features.
 | Rotation | `kj context rotate [<context>]` creates a successor with the same character and the predecessor's senpai, slots read fresh from the character's own, copying env and cwd, setting `ROTATED_FROM` to the predecessor's id, and running `create` rc. Only a successor with a loadout takes over: the predecessor's `archive` rc runs, then one transaction archives the predecessor and moves its label and ring position. The kohai point at the context, so they do not move. Rotating a handoff log points `handoff_ctx` at the successor. The performer, the senpai's character, or the lineage root may rotate. See `docs/prompts.md`, "Rotating a context" |
 | Accountability | The senpai edge, not `forked_from`. `forked_from` is provenance only. The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
 
-Sources: `kernel_db.rs::CharacterRow`, `kernel_db/context_characters.rs`, `model_resolution.rs`, `kj/context.rs`, `kj/character.rs`, `kj/handoff.rs`,
+Sources: `kernel_db.rs::CharacterRow`, `kernel_db/context_characters.rs`, `kernel_db/contexts.rs`, `model_resolution.rs`, `kj/context.rs`, `kj/character.rs`, `kj/handoff.rs`,
 `rc/mod.rs::load_scripts` in `crates/kaijutsu-kernel/src/`;
 `crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
 `assets/defaults/rc/director/create/S00-stance.kai` and
@@ -137,7 +137,7 @@ Two things follow, and they are the ones to check a change against:
 
 - **Accountability is a relation between performances, not between
   sheets.** A context answers to its **senpai**, another context
-  (`context_characters.senpai_ctx`); the senpai's character
+  (`contexts.senpai_ctx`); the senpai's character
   reviews its work. A coder lane banto creates answers to that banto
   context, not to "banto" in general, and two bantos never collide. There is no
   `accountable_to` on the character sheet; Amy: "accountable_to is a
@@ -161,9 +161,9 @@ Two things follow, and they are the ones to check a change against:
   confirmation is the human's act (`kj/context.rs`, `plays_own_root`). A turn
   still refuses a performer that is its own reviewer. A chat submit in the
   human root is refused before the self-review check, with a reason that
-  points to `ROOT` and `Ctrl+Z` (`runtime/turn_identity.rs`).
+  points to the console and `Ctrl+Z` (`runtime/turn_identity.rs`).
   The model console is a `console` context under the human root, labeled
-  `ROOT`. Its performer is a model character (`root`, cast with a fast model;
+  `console`. Its performer is a model character (`root`, cast with a fast model;
   Haiku on this machine, for now). Its stance (`console/create/S00-stance`)
   names its privileged position and asks for care. Its `kj` requests go
   through the regular approval policy, and it refuses every `drive`. Its
@@ -171,8 +171,8 @@ Two things follow, and they are the ones to check a change against:
   root, opens a shell context under it (type `shell`, no model). Its output
   stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
   the shell returns to its parent.
-- **A drift into ROOT waits for the human.** Amy, 2026-10-28. A drift into
-  the ROOT console lands held: a `Drift` block that is `Pending` and
+- **A drift into the console waits for the human.** Amy, 2026-10-28. A drift into
+  the console lands held: a `Drift` block that is `Pending` and
   excluded, so no model reads it, and no running turn is offered it. Every
   drift kind holds except `Notification`. The drift's `rc` scripts run as
   for any drift. An ask with origin `drift` waits in the approval ledger:
@@ -188,34 +188,34 @@ Two things follow, and they are the ones to check a change against:
   no `--remember`: the kernel refuses the answer and the ask stays open
   (`kj/drift.rs`, `settle_drift_answer`; `kj/ledger.rs`, `decide_ask`).
   - Only a human answers it. A drift is refused, before anything is
-    written, when ROOT's reviewer is not a live root character.
+    written, when the console's reviewer is not a live root character.
   - A drift ask survives a restart; every other unresolved ask is retired.
     At start, a held drift with no open or unsettled ask is dismissed
     (`reconcile_root_held_drifts`).
-  - ROOT is not archived, rotated, or demoted past the rim while a drift
+  - The console is not archived, rotated, or demoted past the rim while a drift
     ask is open or its answer is unsettled. Each verb refuses before it
     runs anything, naming the asks.
   - `kj stage include` and `setBlockExcluded` refuse a held drift; only the
     ask's allow includes it. A held `pull` or `merge` tells its caller the
     ask id and shows no preview.
-- **`ROOT` is reserved and single.** One live holder per kernel, played by
-  a root character, claimed the way the drift queue is claimed on the
-  router. The reserved names live in one place: `ROOT`, the drift queue,
-  and the factory preset labels.
-- **ROOT places contexts.** Amy, 2026-10-28: "I think we are simplifying
-  on having ROOT be the privileged context for getting stuff moving. A
+- **The console is a type, not a label.** The drift hold, the placement
+  authority and the client's start choice key on the context type `console`.
+  The label `console` is the name bootstrap gives it; live labels are unique,
+  so one live context holds it.
+- **The console places contexts.** Amy, 2026-10-28: "I think we are simplifying
+  on having the console be the privileged context for getting stuff moving. A
   banto/director should have privileges to drive other contexts, and fall
-  back to the ROOT when it needs to do something on itself. This gives me
+  back to the console when it needs to do something on itself. This gives me
   one place for things to bubble down to me." `kj context promote`,
   `demote`, and `conclude` follow this rule (`kj/context.rs`,
   `require_placement_authority`). Asked where a person's own authority
   comes from, Amy chose "It follows the human": a live root character (a
   sheet with `root` set, not retired) is a human root wherever it acts, so
   its keys work in any client on any card, and it needs no capability. A
-  model seat is ROOT only in the ROOT console (the `console` context
-  labeled `ROOT`), and needs the operator capability there. A call that
+  model seat is the console only in a context of type `console`, and needs
+  the operator capability there. A call that
   runs in a `root` context is a human root too.
-  - ROOT may act on any context, including itself and directors.
+  - The console may act on any context, including itself and directors.
   - Only a human root demotes or concludes a human root or a console.
     Nobody concludes a human root: conclusion has no undo, and a concluded
     context refuses drifts, which is how work reaches the human. A human
@@ -224,9 +224,9 @@ Two things follow, and they are the ones to check a change against:
     context in the house, in any lineage. It may not act on a human root,
     a console, or its own context. Its own context is the one the call
     runs in, or any context its character plays. The refusal says to ask
-    ROOT, for example with `kj drift push ROOT`.
+    the console, for example with `kj drift push console`.
   - A seat without Operator acts on nothing. The refusal names the
-    capability and says to go through its director or ROOT. A `shell`
+    capability and says to go through its director or the console. A `shell`
     context holds no Operator, so it places nothing.
 
   `kj context archive` and `kj context rotate` follow the same principle:
@@ -243,10 +243,9 @@ Two things follow, and they are the ones to check a change against:
   when its history goes stale; a root confirms itself, so no one else is
   asked. The performer, the senpai's character, or the lineage root may
   rotate.
-- **banto starts from `ROOT`.** Its context is created from the root
-  console, so its senpai is Amy's console. It takes the
-  character's name as its label. `ROOT` is Amy's, banto's context is
-  `banto`.
+- **banto starts from the root console.** Its context is created from
+  the root console, so its senpai is Amy's root console. It takes the
+  character's name as its label: banto's context is `banto`.
 - **The reviewer is the senpai's character, climbing past the actor.**
   Resolution takes the actor and the context: the character of the context's
   senpai, or, when that character is the actor, the character of
@@ -266,7 +265,7 @@ Two things follow, and they are the ones to check a change against:
 How a day like 2026-09-15 runs once the pieces above exist. Amy gives
 prompts, banto supervises lanes, and the lanes are contexts.
 
-1. Amy works in banto's conversation, not `ROOT`. `ROOT` is where she runs `kj` by
+1. Amy works in banto's conversation, not the console. The console is where she runs `kj` by
    hand. She attaches the tui to `banto` and types; the draft is hers, submit
    authors a user block as amy, and the turn runs with banto as actor and amy
    as reviewer.

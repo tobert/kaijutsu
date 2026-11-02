@@ -23,7 +23,7 @@ pub enum AskOrigin {
     ShellGate,
     /// A privileged `kj` verb gated itself.
     KjVerb,
-    /// A drift into the ROOT console waits for its human. An allow lets the
+    /// A drift into the console waits for its human. An allow lets the
     /// console's model read it; a deny keeps it out. It never runs source.
     Drift,
 }

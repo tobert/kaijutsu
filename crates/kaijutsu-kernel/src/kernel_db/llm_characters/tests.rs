@@ -102,16 +102,16 @@ fn contexts_played_by_excludes_archived() {
 
     let live = make_context_row(Some("live-ctx"));
     insert_context_with_doc(&db, &live, ws_id);
-    db.update_played_by(live.context_id, Some(character)).unwrap();
+    db.update_performer(live.context_id, Some(character)).unwrap();
 
     let archived = make_context_row(Some("archived-ctx"));
     insert_context_with_doc(&db, &archived, ws_id);
-    db.update_played_by(archived.context_id, Some(character)).unwrap();
+    db.update_performer(archived.context_id, Some(character)).unwrap();
     db.archive_context(archived.context_id).unwrap();
 
     let other = make_context_row(Some("other-ctx"));
     insert_context_with_doc(&db, &other, ws_id);
-    db.update_played_by(other.context_id, Some(PrincipalId::new())).unwrap();
+    db.update_performer(other.context_id, Some(PrincipalId::new())).unwrap();
 
     let played = db.contexts_played_by(character).unwrap();
     assert_eq!(played.len(), 1);

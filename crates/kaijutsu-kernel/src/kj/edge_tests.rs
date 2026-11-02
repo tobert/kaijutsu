@@ -39,7 +39,7 @@ fn house(d: &KjDispatcher) -> House {
     let other = register_context(d, Some("other-lane"), Some(seat), amy);
     let db = d.kernel_db().lock();
     for (ctx, who) in [(seat, banto), (judge_seat, judge), (lane, coder), (other, sibling)] {
-        db.update_played_by(ctx, Some(who)).unwrap();
+        db.update_performer(ctx, Some(who)).unwrap();
     }
     House { root, seat, judge_seat, lane, other, amy, banto, coder, sibling }
 }
@@ -62,7 +62,7 @@ async fn context_info_names_the_senpai_its_holder_the_root_and_the_reviewer() {
     let shown = d.dispatch(&[s("context"), s("info")], &caller(h.coder, h.lane)).await;
     assert!(shown.is_ok(), "{}", shown.message());
     let text = shown.message();
-    assert!(text.contains("Played by: coder"), "{text}");
+    assert!(text.contains("Performer: coder"), "{text}");
     assert!(text.contains(&format!("Senpai: banto-seat ({}), banto", h.seat.short())), "{text}");
     assert!(text.contains("Lineage root: amy"), "{text}");
     assert!(text.contains("Reviewer: banto (senpai)"), "{text}");
@@ -72,7 +72,7 @@ async fn context_info_names_the_senpai_its_holder_the_root_and_the_reviewer() {
     assert_eq!(data["senpai"]["label"], "banto-seat");
     assert_eq!(data["senpai"]["character"], "banto");
     assert_eq!(data["senpai"]["character_id"], h.banto.to_hex());
-    assert_eq!(data["played_by_name"], "coder");
+    assert_eq!(data["performer_name"], "coder");
     assert_eq!(data["lineage_root"]["name"], "amy");
     assert_eq!(data["reviewer_name"], "banto");
     assert_eq!(data["review_source"], "senpai");

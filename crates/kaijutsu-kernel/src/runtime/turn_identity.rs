@@ -14,14 +14,14 @@ pub(crate) struct TurnIdentity {
 /// The human root (`docs/character.md`, "The root console and its shell")
 /// has no model, so it is refused before its performer, who is its own
 /// reviewer, meets the self-review refusal.
-pub(crate) const HUMAN_ROOT_REFUSAL: &str = "The human root runs no model turns. Talk to a model in the ROOT console, or press Ctrl+Z for this root's shell.";
+pub(crate) const HUMAN_ROOT_REFUSAL: &str = "The human root runs no model turns. Talk to a model in the console, or press Ctrl+Z for this root's shell.";
 
 /// The performer is checked before the reviewer resolves: the reviewer walk
 /// starts above the performer, so with none set it fails with a message
 /// about the reviewer, which is not the repair the caller needs.
 pub(crate) fn require_performer(actor: Option<PrincipalId>) -> Result<PrincipalId, String> {
     actor.ok_or_else(||
-        "No performer assigned: this context has no context character. A context gets its character when it is made, with 'kj context create <character>'.".to_string()
+        "No performer assigned: this context has no performer. A context gets its character when it is made, with 'kj context create <character>'.".to_string()
     )
 }
 
@@ -97,7 +97,7 @@ mod tests {
         assert!(refused(KernelDbError::Validation("nobody reviews".into())));
         assert!(refused(KernelDbError::NoReviewerAbove("nobody above".into())));
         assert!(!refused(KernelDbError::Corrupt("a senpai cycle".into())));
-        assert!(!refused(KernelDbError::NotFound("a senpai with no context character".into())));
+        assert!(!refused(KernelDbError::NotFound("a senpai with no performer".into())));
     }
 
     #[test]

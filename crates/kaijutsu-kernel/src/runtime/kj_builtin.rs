@@ -949,7 +949,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("rcdepth-home"), None, principal);
-        dispatcher.kernel_db().lock().update_played_by(home, Some(PrincipalId::system())).unwrap();
+        dispatcher.kernel_db().lock().update_performer(home, Some(PrincipalId::system())).unwrap();
         // Inert banner: proves the lifecycle ran (pre-fix) or was refused (post-fix).
         install_rc_script_file(
             &dispatcher,
@@ -1031,7 +1031,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("chain-home"), None, principal);
-        dispatcher.kernel_db().lock().update_played_by(home, Some(PrincipalId::system())).unwrap();
+        dispatcher.kernel_db().lock().update_performer(home, Some(PrincipalId::system())).unwrap();
         install_rc_script_file(
             &dispatcher,
             "/config/rc/chaintest/create/S00-recreate.kai",
@@ -1278,8 +1278,8 @@ mod tests {
         let target = register_context(&dispatcher, Some("retained"), Some(home), principal);
         // The shell performs as the system principal; it holds `home`, the
         // target's senpai, so the authority rule lets it archive.
-        dispatcher.kernel_db().lock().update_played_by(home, Some(PrincipalId::system())).unwrap();
-        dispatcher.kernel_db().lock().update_played_by(target, Some(principal)).unwrap();
+        dispatcher.kernel_db().lock().update_performer(home, Some(PrincipalId::system())).unwrap();
+        dispatcher.kernel_db().lock().update_performer(target, Some(principal)).unwrap();
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
         let held = kaish.execute_with_options("kj context archive retained", ExecuteOptions::default()).await.unwrap();
         assert_eq!(held.code, 2, "{}", held.err);
@@ -1410,7 +1410,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
         let principal = PrincipalId::system();
         let root = register_context(&dispatcher, Some("root"), None, principal);
-        dispatcher.kernel_db().lock().update_played_by(root, Some(PrincipalId::system())).unwrap();
+        dispatcher.kernel_db().lock().update_performer(root, Some(PrincipalId::system())).unwrap();
         let kaish = embedded_with_kj(dispatcher.clone(), root).await;
 
         // Space form.

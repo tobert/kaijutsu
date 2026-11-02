@@ -40,7 +40,7 @@ fn bootstrap_finds_the_key_and_the_provider_in_home() {
         "ran: kj backend set deepseek --kind deepseek",
         "ran: kj backend model set deepseek deepseek-flash --context-window 1000000 --max-tokens 65536 --effort high",
         "ran: kj character create root --backend deepseek --model deepseek-flash --max-tokens 16384",
-        "ran: kj context create root --name ROOT --type console",
+        "ran: kj context create root --name console --type console",
     ] {
         assert!(first.contains(line), "missing {line:?} in:\n{first}");
     }

@@ -221,7 +221,7 @@ pub(super) fn senpai_ctx_row(
     let mut row = make_context_row(Some(label));
     insert_context_with_doc(db, &row, ws_id);
     if let Some(holder) = holder {
-        db.update_played_by(row.context_id, Some(holder)).unwrap();
+        db.update_performer(row.context_id, Some(holder)).unwrap();
     }
     if let Some(senpai) = senpai {
         db.set_context_senpai(row.context_id, Some(senpai.context_id)).unwrap();

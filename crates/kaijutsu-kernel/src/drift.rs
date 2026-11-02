@@ -2081,15 +2081,15 @@ mod tests {
     fn archived_label_is_free_for_a_live_context() {
         let mut router = DriftRouter::new();
         let old = ContextId::new();
-        router.register(old, Some("ROOT"), None, PrincipalId::system()).unwrap();
+        router.register(old, Some("console"), None, PrincipalId::system()).unwrap();
         router.set_state(old, ContextState::Archived).unwrap();
 
         let new = ContextId::new();
-        router.register(new, Some("ROOT"), None, PrincipalId::system())
+        router.register(new, Some("console"), None, PrincipalId::system())
             .expect("an archived holder must not block the label");
-        assert_eq!(router.get(old).unwrap().label.as_deref(), Some("ROOT"), "the archived handle lost its name");
-        assert_eq!(router.resolve_context("ROOT").unwrap(), new);
-        assert_eq!(router.resolve_context("RO").unwrap(), new, "an archived label must not make a prefix ambiguous");
+        assert_eq!(router.get(old).unwrap().label.as_deref(), Some("console"), "the archived handle lost its name");
+        assert_eq!(router.resolve_context("console").unwrap(), new);
+        assert_eq!(router.resolve_context("con").unwrap(), new, "an archived label must not make a prefix ambiguous");
     }
 
     /// Re-registering an archived row (the post-restart heal) must not
@@ -2098,20 +2098,20 @@ mod tests {
     fn archived_registration_does_not_collide_with_a_live_label() {
         let mut router = DriftRouter::new();
         let live = ContextId::new();
-        router.register(live, Some("ROOT"), None, PrincipalId::system()).unwrap();
+        router.register(live, Some("console"), None, PrincipalId::system()).unwrap();
 
         let archived = ContextId::new();
         router
-            .register_with_state(archived, Some("ROOT"), None, PrincipalId::system(), ContextState::Archived)
+            .register_with_state(archived, Some("console"), None, PrincipalId::system(), ContextState::Archived)
             .expect("an archived registration must not contend for a live label");
-        assert_eq!(router.get(archived).unwrap().label.as_deref(), Some("ROOT"), "the archived handle lost its name");
+        assert_eq!(router.get(archived).unwrap().label.as_deref(), Some("console"), "the archived handle lost its name");
         assert_eq!(router.context_state(archived), Some(ContextState::Archived));
-        assert_eq!(router.resolve_context("ROOT").unwrap(), live, "the live holder must keep the label");
+        assert_eq!(router.resolve_context("console").unwrap(), live, "the live holder must keep the label");
 
         // The other direction still refuses: a live registration over a held label.
         let other = ContextId::new();
         assert!(matches!(
-            router.register_with_state(other, Some("ROOT"), None, PrincipalId::system(), ContextState::Live),
+            router.register_with_state(other, Some("console"), None, PrincipalId::system(), ContextState::Live),
             Err(DriftError::LabelInUse { .. })
         ));
     }

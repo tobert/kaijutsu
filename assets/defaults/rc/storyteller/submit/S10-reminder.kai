@@ -9,7 +9,7 @@
 # message, so only the newest one costs tokens; elsewhere they accumulate,
 # and rotation or a filtered fork sheds them.
 set -e
-who="$(kj context info --json | jq -r '.played_by_name // empty')"
+who="$(kj context info --json | jq -r '.performer_name // empty')"
 reminder="$(dirname "$0")/$(basename "$0" .kai).md"
 case "$who" in
   ""|*/*|.*) ;;

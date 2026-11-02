@@ -315,7 +315,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
         let console = register_context(d, None, None, principal_id);
-        d.kernel_db().lock().update_played_by(console, Some(principal_id)).unwrap();
+        d.kernel_db().lock().update_performer(console, Some(principal_id)).unwrap();
         KjCaller {
             principal_id,
             actor_id: principal_id,
@@ -957,7 +957,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                 .expect("insert live character");
         }
         // Amy performs the console the lead's work is created from.
-        d.kernel_db().lock().update_played_by(caller.context_id.unwrap(), Some(caller.principal_id)).unwrap();
+        d.kernel_db().lock().update_performer(caller.context_id.unwrap(), Some(caller.principal_id)).unwrap();
         caller.actor_id = lead;
         caller.reviewer_id = Some(caller.principal_id);
 
@@ -3433,7 +3433,7 @@ esac
     fn archivable_by(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str, character: PrincipalId) -> ContextId {
         let senpai = parent.unwrap_or_else(|| crate::kj::test_helpers::register_root_context(d));
         let ctx = register_context(d, Some(label), Some(senpai), character);
-        d.kernel_db().lock().update_played_by(ctx, Some(character)).unwrap();
+        d.kernel_db().lock().update_performer(ctx, Some(character)).unwrap();
         set_context_type(d, ctx, context_type);
         d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
         ctx

@@ -2075,12 +2075,12 @@ pub async fn create_shared_kernel_in(
     if abandoned > 0 {
         log::info!("retired {abandoned} unresolved approval ask(s) after restart; source will not be retried");
     }
-    // A drift into ROOT that lost its ask, or whose ask closed unanswered,
+    // A drift into the console that lost its ask, or whose ask closed unanswered,
     // would stay held forever; it is dismissed and kept in the log.
     let dismissed = kaijutsu_kernel::kj::drift::reconcile_root_held_drifts(&kernel_arc)
-        .map_err(|error| capnp::Error::failed(format!("Cannot reconcile ROOT's held drifts: {error}")))?;
+        .map_err(|error| capnp::Error::failed(format!("Cannot reconcile the console's held drifts: {error}")))?;
     if dismissed > 0 {
-        log::info!("dismissed {dismissed} held drift(s) in ROOT with no ask that can release them");
+        log::info!("dismissed {dismissed} held drift(s) in the console with no ask that can release them");
     }
     let swept_blocks = documents.abandon_running_blocks_on_restart(
         "the kernel restarted while this was still in progress; nothing is being retried",
@@ -10455,7 +10455,7 @@ mod rc_thread_stack_tests {
         assert!(
             source.contains(".thread_stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)"),
             "main.rs must size the tokio runtime's worker threads to \
-             KAISH_RC_THREAD_STACK — the ROOT genesis rc chain (create_shared_kernel) \
+             KAISH_RC_THREAD_STACK — the console genesis rc chain (create_shared_kernel) \
              runs on this runtime at boot and overflows the default 2 MiB stack \
              otherwise"
         );

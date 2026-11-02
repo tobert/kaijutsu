@@ -1283,7 +1283,7 @@ mod tests {
         // A live context played by the character, with a block authored by
         // it — the thing retire must leave untouched.
         let ctx = register_context(&d, Some("lead-ctx"), None, principal_id);
-        d.kernel_db().lock().update_played_by(ctx, Some(principal_id)).unwrap();
+        d.kernel_db().lock().update_performer(ctx, Some(principal_id)).unwrap();
         d.block_store()
             .create_document(ctx, kaijutsu_types::DocKind::Conversation, None)
             .unwrap();
@@ -1338,13 +1338,13 @@ mod tests {
             }).unwrap();
         }
         let seat = register_context(&d, Some("lead-seat"), None, lead);
-        d.kernel_db().lock().update_played_by(seat, Some(lead)).unwrap();
+        d.kernel_db().lock().update_performer(seat, Some(lead)).unwrap();
         let fork = register_context(&d, Some("lead-fork"), Some(seat), lead);
         let lane = register_context(&d, Some("coder-lane"), Some(seat), lead);
         {
             let db = d.kernel_db().lock();
             db.copy_context_character(seat, fork).unwrap().expect("the seat has a context character");
-            db.update_played_by(lane, Some(coder)).unwrap();
+            db.update_performer(lane, Some(coder)).unwrap();
         }
         let mut confirmed = caller.clone();
         confirmed.confirmed = true;
@@ -1370,8 +1370,8 @@ mod tests {
         let gone = register_context(&d, Some("lane-gone"), None, coder);
         {
             let db = d.kernel_db().lock();
-            db.update_played_by(live, Some(coder)).unwrap();
-            db.update_played_by(gone, Some(coder)).unwrap();
+            db.update_performer(live, Some(coder)).unwrap();
+            db.update_performer(gone, Some(coder)).unwrap();
             db.archive_context(gone).unwrap();
         }
         let shown = d.dispatch(&[s("character"), s("show"), s("coder")], &test_caller()).await;
@@ -1396,8 +1396,8 @@ mod tests {
         let KjResult::Ok { data: Some(data), .. } = result else {
             panic!("expected Ok, got {result:?}");
         };
-        assert_eq!(data["played_by"], serde_json::Value::Null);
-        assert_eq!(data["played_by_name"], serde_json::Value::Null);
+        assert_eq!(data["performer"], serde_json::Value::Null);
+        assert_eq!(data["performer_name"], serde_json::Value::Null);
     }
 
     /// The emitted help is a product surface: every subcommand and flag
@@ -1703,7 +1703,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
-            db.update_played_by(ctx, Some(character)).expect("update_played_by");
+            db.update_performer(ctx, Some(character)).expect("update_performer");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
         assert_eq!(d.has_usable_loadout(ctx), Ok(false), "precondition: no binding");
@@ -1745,7 +1745,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
-            db.update_played_by(ctx, Some(amy)).expect("update_played_by");
+            db.update_performer(ctx, Some(amy)).expect("update_performer");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
 
@@ -1826,7 +1826,7 @@ mod tests {
             db.get_character_by_name("mentor").unwrap().unwrap().principal_id
         };
         let ctx = register_context(&d, Some("mentor-ctx"), None, mentor_id);
-        d.kernel_db().lock().update_played_by(ctx, Some(mentor_id)).unwrap();
+        d.kernel_db().lock().update_performer(ctx, Some(mentor_id)).unwrap();
 
         let mut confirmed = caller.clone();
         confirmed.confirmed = true;

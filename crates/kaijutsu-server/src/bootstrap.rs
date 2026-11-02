@@ -1,4 +1,4 @@
-//! `kaijutsu-server bootstrap`: set up a kernel so its `ROOT` console can
+//! `kaijutsu-server bootstrap`: set up a kernel so its console can
 //! answer (`docs/server-cli.md`, "bootstrap").
 //!
 //! The root character and its key are written directly, as `init` writes
@@ -18,11 +18,11 @@ use crate::rpc::SharedKernel;
 use crate::ssh::SshServerConfig;
 
 /// The label of the model console.
-const ROOT_LABEL: &str = "ROOT";
-/// The role of ROOT's own model slot. A context copies its character's model
+const CONSOLE_LABEL: &str = "console";
+/// The role of the console's own model slot. A context copies its character's model
 /// under its type, and under `distill` for its forks and pulls.
 const CONSOLE_ROLE: &str = "console";
-/// The slots that already give ROOT's performer a model for the console and
+/// The slots that already give the console's performer a model for the console and
 /// for distillation.
 const PERFORMER_ROLES: &[&str] = &[CONSOLE_ROLE, "distill"];
 /// The response budget bootstrap gives the performer's model.
@@ -173,9 +173,9 @@ pub struct BootstrapOptions {
     pub root_key: PublicKey,
     pub key_comment: Option<String>,
     /// The backends to register. The first becomes the kernel default when
-    /// the kernel has none. Empty leaves `ROOT` waiting for a model.
+    /// the kernel has none. Empty leaves the console waiting for a model.
     pub backends: Vec<BackendChoice>,
-    /// The model character that plays `ROOT`.
+    /// The model character that plays the console.
     pub console_performer: String,
 }
 
@@ -194,7 +194,7 @@ pub struct BootstrapReport {
 pub async fn bootstrap(config: &SshServerConfig, opts: &BootstrapOptions) -> Result<BootstrapReport, String> {
     if opts.console_performer == opts.root {
         return Err(format!(
-            "the root character and ROOT's performer are both '{}'; a model turn needs a performer \
+            "the root character and the console's performer are both '{}'; a model turn needs a performer \
              who is not its own reviewer, so name the performer with --console-as",
             opts.root
         ));
@@ -259,7 +259,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             let Some(known) = known_model(&backend.kind, &backend.model) else {
                 report.notes.push(format!(
                     "bootstrap does not know the context window of {}/{}; `kj backend model set {} {} \
-                     --context-window <tokens>` records it, and `kj context rotate ROOT` gives ROOT the window",
+                     --context-window <tokens>` records it, and `kj context rotate console` gives the console its window",
                     backend.name, backend.model, backend.name, backend.model
                 ));
                 continue;
@@ -299,11 +299,11 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             dispatch(shared, caller, argv, &mut report).await?;
         }
         Some(row) if row.retired_at.is_some() => {
-            return Err(format!("'{performer}' is retired; name ROOT's performer with --console-as"));
+            return Err(format!("'{performer}' is retired; name the console's performer with --console-as"));
         }
         Some(row) if row.root => {
             return Err(format!(
-                "'{performer}' is a root character and cannot play ROOT; name ROOT's performer with --console-as"
+                "'{performer}' is a root character and cannot play the console; name the console's performer with --console-as"
             ));
         }
         Some(row) => {
@@ -332,7 +332,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     }
     if first.is_none() {
         report.notes.push(
-            "ROOT has no model yet. Give the kernel a key and run bootstrap again, or set one \
+            "The console has no model yet. Give the kernel a key and run bootstrap again, or set one \
              from your root: `kj backend set anthropic --kind anthropic --api-key-file \
              ~/.anthropic-key.txt`, then give the character a model with `kj character model set`"
                 .to_string(),
@@ -342,39 +342,39 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     let played_id = read(shared, |db| db.get_character_by_name(performer))?
         .ok_or_else(|| format!("no '{performer}' character row"))?
         .principal_id;
-    match read(shared, |db| db.find_context_by_label(ROOT_LABEL))? {
+    match read(shared, |db| db.find_context_by_label(CONSOLE_LABEL))? {
         None => {
-            // ROOT is a kohai of the human root, the context the root
+            // The console is a kohai of the human root, the context the root
             // character's `root_ctx` names.
             let human_root = read(shared, |db| db.get_character_by_name(&opts.root))?
                 .and_then(|row| row.root_ctx)
-                .ok_or_else(|| format!("'{}' has no root context for ROOT to answer to", opts.root))?
+                .ok_or_else(|| format!("'{}' has no root context for the console to answer to", opts.root))?
                 .to_string();
             let argv = words(&[
-                "context", "create", performer, "--name", ROOT_LABEL, "--type", "console",
+                "context", "create", performer, "--name", CONSOLE_LABEL, "--type", "console",
                 "--parent", &human_root, "--senpai", &human_root,
             ]);
             dispatch(shared, caller, argv, &mut report).await?;
         }
         Some(row) if row.context_type != "console" => report.notes.push(format!(
-            "ROOT is a '{}' context, not the model console; archive it and run bootstrap again \
+            "The console is a '{}' context, not the model console; archive it and run bootstrap again \
              to create the console",
             row.context_type
         )),
         Some(row) if read(shared, |db| db.context_character(row.context_id))?.map(|c| c.principal_id) != Some(played_id) => {
             report.notes.push(format!(
-                "ROOT is not played by {performer}; rotation keeps its character, so archive ROOT and run \
+                "The console is not played by {performer}; rotation keeps its character, so archive the console and run \
                  bootstrap again to create it as {performer}"
             ))
         }
         // A context copies its character's model when it is written, so a
-        // ROOT made before its character had a model takes it on rotation.
+        // The console made before its character had a model takes it on rotation.
         Some(row) if read(shared, |db| {
             Ok(db.get_character_model(played_id)?.is_some() && db.context_slot(row.context_id, CONSOLE_ROLE)?.is_none())
         })? => {
-            dispatch(shared, caller, words(&["context", "rotate", ROOT_LABEL]), &mut report).await?;
+            dispatch(shared, caller, words(&["context", "rotate", CONSOLE_LABEL]), &mut report).await?;
         }
-        Some(_) => report.notes.push("ROOT is already set up".to_string()),
+        Some(_) => report.notes.push("The console is already set up".to_string()),
     }
 
     Ok(report)

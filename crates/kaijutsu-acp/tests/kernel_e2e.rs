@@ -641,7 +641,7 @@ fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
         .expect("seat the shadow under the session");
         let seat_character = db.context_character(seat).expect("read the seat's character").expect("the seat has a character").principal_id;
         db.note_senpai_intent(shadow, Some(seat)).expect("the shadow answers to the session");
-        db.update_played_by(shadow, Some(seat_character)).expect("the seat's character holds the shadow");
+        db.update_performer(shadow, Some(seat_character)).expect("the seat's character holds the shadow");
     }
 
     client

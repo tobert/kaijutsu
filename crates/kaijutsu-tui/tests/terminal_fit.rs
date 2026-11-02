@@ -1381,8 +1381,8 @@ fn ctrl_a_q_demotes_the_context_and_goes_back() {
     assert!(back, "Ctrl+A q did not demote and go back: {}", session.dump("after Ctrl+A q"));
 }
 
-/// A drift into the ROOT console waits for the human as an ask: with
-/// `ROOT` on screen the ask card comes up naming where the drift came
+/// A drift into the console waits for the human as an ask: with
+/// the console on screen the ask card comes up naming where the drift came
 /// from and what it says, typed text does not reach the draft while the
 /// card is up, and `a` releases it (`docs/tui.md`, "Asks").
 #[test]
@@ -1392,7 +1392,7 @@ fn a_drift_into_root_comes_up_as_an_ask_card_and_a_releases_it() {
     wait_for_attach(&session);
 
     drift_into_a_root_console(&server, "zzdriftbody");
-    colon_line(&session, ":kj context switch ROOT");
+    colon_line(&session, ":kj context switch console");
     let carded = session.wait_until(Duration::from_secs(20), |screen| {
         screen_contains_str(screen, "zzdriftbody") && screen_contains_str(screen, "Esc aside")
     });
@@ -1754,7 +1754,7 @@ fn switching_through_the_picker_loads_the_new_contexts_draft() {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The seat digit the status line gives `label` — what `Ctrl+A <digit>`
-/// switches to. The cells read `0 altplace  1 probe*  2 ROOT`
+/// switches to. The cells read `0 altplace  1 probe*  2 console`
 /// (`status::SeatCell::text`), the flags being `*@!`.
 fn seat_digit(status: &str, label: &str) -> Option<usize> {
     let tokens: Vec<&str> = status.split_whitespace().collect();

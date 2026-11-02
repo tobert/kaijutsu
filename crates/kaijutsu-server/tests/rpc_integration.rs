@@ -1423,9 +1423,9 @@ fn test_kj_context_archive_latches_then_archives_over_rpc() {
 }
 
 /// A person's keys on a coder card run the verbs from inside the card, whose
-/// loadout lacks Operator. The connection's root character carries ROOT
+/// loadout lacks Operator. The connection's root character carries the console
 /// privilege there: promote, the demote ladder, and a confirmed archive all
-/// succeed (`docs/character.md`, "ROOT places contexts").
+/// succeed (`docs/character.md`, "The console places contexts").
 #[test]
 fn test_the_human_places_and_archives_a_coder_card_from_inside_it() {
     run_local(async {

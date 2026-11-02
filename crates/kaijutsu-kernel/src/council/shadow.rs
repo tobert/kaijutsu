@@ -470,7 +470,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         // verbatim, answering to the seat.
         if db.context_character(seat)?.is_none() {
             return Err(KernelDbError::Validation(format!(
-                "seat context {seat} has no context character, so its judge shadow has none to copy"
+                "seat context {seat} has no performer, so its judge shadow has none to copy"
             )));
         }
         let row = shadow_row(&seat_row);

@@ -1,6 +1,6 @@
 //! Migration `context-fold-v1`: the `context_characters` table folds into
 //! `contexts` (`performer`, `senpai_ctx`, `persona`), and every live context
-//! gets a senpai (`docs/senpai-kohai.md`, "One senpai edge on every context").
+//! gets a senpai (`docs/senpai-kohai.md`, "Migration").
 
 use super::*;
 

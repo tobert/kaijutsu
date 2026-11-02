@@ -219,7 +219,7 @@ impl KjDispatcher {
                     let ask = self.kernel_db().lock().approval_for_drift_block(&block_id).ok().flatten()
                         .unwrap_or_else(|| "<id>".to_string());
                     return KjResult::Err(format!(
-                        "kj stage include: block {} is a drift held for ROOT's human; release it with \
+                        "kj stage include: block {} is a drift held for the console's human; release it with \
                          `kj ledger allow {ask}`, or dismiss it with `kj ledger deny {ask}`",
                         block_id.to_key()
                     ));

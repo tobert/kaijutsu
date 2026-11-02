@@ -268,7 +268,7 @@ fn route_review_ignores_forked_from_and_the_old_routing_columns() {
     let mut lane = make_context_row(Some("routed-lane"));
     lane.forked_from = Some(seat.context_id);
     insert_context_with_doc(&db, &lane, ws_id);
-    db.update_played_by(lane.context_id, Some(coder)).unwrap();
+    db.update_performer(lane.context_id, Some(coder)).unwrap();
     db.set_context_senpai(lane.context_id, Some(judge_seat.context_id)).unwrap();
 
     assert_eq!(
@@ -365,7 +365,7 @@ fn lineage_root_follows_senpai_not_forked_from() {
     let mut lane = make_context_row(Some("forked-from-amy-answers-to-bob"));
     lane.forked_from = Some(seat.context_id);
     insert_context_with_doc(&db, &lane, ws_id);
-    db.update_played_by(lane.context_id, Some(coder)).unwrap();
+    db.update_performer(lane.context_id, Some(coder)).unwrap();
     db.set_context_senpai(lane.context_id, Some(bob_root.context_id)).unwrap();
 
     assert_eq!(db.lineage_root(lane.context_id).unwrap(), bob);

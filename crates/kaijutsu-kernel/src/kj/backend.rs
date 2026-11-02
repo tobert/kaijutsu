@@ -108,7 +108,7 @@ enum BackendCommand {
 enum BackendModelCommand {
     /// Pin one model's metadata and tunables on a backend. Only the flags you
     /// pass change. A character slot's own value wins; a tunable the slot leaves
-    /// unset is read from here when a context character's slots are
+    /// unset is read from here when a context's slots are
     /// written, so a change reaches contexts after `kj context rotate`.
     Set {
         /// Backend name

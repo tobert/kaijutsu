@@ -368,8 +368,7 @@ impl KernelDb {
     }
 
     /// The root console a new performer-less context answers to when no
-    /// senpai was named (`docs/senpai-kohai.md`, "One senpai edge on every
-    /// context"): the console at the top of `origin`'s senpai chain, when
+    /// senpai was named (`docs/senpai-kohai.md`, "Authority"): the console at the top of `origin`'s senpai chain, when
     /// `origin` is the context the creating act ran in and that console is a
     /// live root's; else the console of the only live root. A kernel with no
     /// live root console, or several and no usable `origin`, refuses.

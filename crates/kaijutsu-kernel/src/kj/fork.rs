@@ -2847,7 +2847,7 @@ mod tests {
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
-        d.kernel_db().lock().update_played_by(source, Some(character_id)).unwrap();
+        d.kernel_db().lock().update_performer(source, Some(character_id)).unwrap();
         let c = caller_with_context(source);
 
         let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
@@ -2875,7 +2875,7 @@ mod tests {
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.seed_test_slots(character_id, "mock", "mock-model", &["distill"]).unwrap();
-            db.update_played_by(source, Some(character_id)).unwrap();
+            db.update_performer(source, Some(character_id)).unwrap();
             db.seed_test_slots(character_id, "mock", "edited-model", &["distill"]).unwrap();
         }
 

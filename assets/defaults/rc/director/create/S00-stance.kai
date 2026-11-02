@@ -1,5 +1,5 @@
 # The director stance. The first block names the system, the character
-# playing the context (`played_by_name` in context metadata), and our senpai:
+# playing the context (`performer_name` in context metadata), and our senpai:
 # the character of the context this context answers to and that context's
 # label, read from `kj context info`. With no performer the context is named
 # generically; a context with no senpai (a root console) names none. The second block is the companion
@@ -7,7 +7,7 @@
 # supplies the kj narrative, and <situation> appends the live model and
 # identities.
 set -e
-who="$(kj context info --json | jq -r '.played_by_name // empty')"
+who="$(kj context info --json | jq -r '.performer_name // empty')"
 senpai="$(kj context info --json | jq -r '.senpai.character // empty')"
 senpai_label="$(kj context info --json | jq -r '.senpai.label // .senpai.context // empty')"
 

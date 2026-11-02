@@ -628,7 +628,7 @@ Rules the figure carries:
    ◐ shell cargo test -p kaijutsu-kernel · 4s   ⏳ shell_write · waiting on ask 01a0686d · 17h
 
   ❯                                                          -- NORMAL --
-  0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   │  -- NORMAL --  17.3/128k  99%  0m
+  0 console  1 cc-exomemory  2 0de73794  3 tui-testing   │  -- NORMAL --  17.3/128k  99%  0m
 ```
 
 One row, always present, directly above the blank row over `❯`: every
@@ -1033,16 +1033,16 @@ again before it lands reports `already being reassigned`. The card stays up; the
 shows the new reviewer on it. A key the viewer does not have posts a notice
 and changes nothing.
 
-**A drift into ROOT is an ask.** A drift sent to the ROOT console waits
+**A drift into the console is an ask.** A drift sent to the console waits
 for the human as an ask with origin `drift` (`docs/character.md`, "A drift
-into ROOT waits for the human"). With `ROOT` on screen its card comes up
+into the console waits for the human"). With the console on screen its card comes up
 like any other: the header names the `drift` tool, and the text under it
 reads `push drift from <context>:` and then the drift's text. `a` releases
 it to the console's model; `d` dismisses it. The card offers no `[A]`,
 `[c]` or `[C]`.
 
 ```text
-  ⚠ ask 01a18378  drift  from ROOT (console)  asker coder  reviewer amy
+  ⚠ ask 01a18378  drift  from console (console)  asker coder  reviewer amy
     push drift from lane (3f2a9c10):
     please archive lane-b
     [a]llow once  [d]eny  [e]scalate  [v]iew ledger  Esc aside
@@ -1099,7 +1099,7 @@ is on screen.
   neither do the asks already open when this client first reads the ledger. Testing note: the ephemeral kernel this
   probes against starts with no reviewer character sheet, so raising an
   ask needs `arrange_a_reviewer` first — `kj binding allow config-write`
-  from ROOT, then `kj character create amy` — before any ask can be
+  from the console, then `kj character create amy` — before any ask can be
   raised at all.
 
 **The assigned reviewer answers in the context on screen.** An ask records

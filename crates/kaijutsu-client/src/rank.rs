@@ -77,17 +77,12 @@ pub fn start_candidate(saved: Option<ContextId>, contexts: &[ContextInfo]) -> Op
     {
         return Some(id);
     }
-    // The reserved `ROOT` label names the console the human works in: the
-    // model console, or a root that has none. Without it, a single live root
-    // is unambiguous; several are not, so no candidate.
-    let roots: Vec<&ContextInfo> = contexts
-        .iter()
-        .filter(live)
-        .filter(|c| c.context_type == ROOT_CONTEXT_TYPE || c.context_type == CONSOLE_CONTEXT_TYPE)
-        .collect();
-    if let Some(reserved) = roots.iter().find(|c| c.label == "ROOT") {
-        return Some(reserved.id);
+    // The console (type `console`) is where the person works. Without one, a
+    // single live root is unambiguous; several are not, so no candidate.
+    if let Some(console) = contexts.iter().filter(live).find(|c| c.context_type == CONSOLE_CONTEXT_TYPE) {
+        return Some(console.id);
     }
+    let roots: Vec<&ContextInfo> = contexts.iter().filter(live).filter(|c| c.context_type == ROOT_CONTEXT_TYPE).collect();
     match roots.as_slice() {
         [only] => Some(only.id),
         _ => None,
@@ -259,7 +254,7 @@ mod start_tests {
 
     #[test]
     fn a_live_saved_context_wins_over_the_root() {
-        let root = ctx("ROOT", ROOT_CONTEXT_TYPE);
+        let root = ctx("amy", ROOT_CONTEXT_TYPE);
         let kaijutsu = ctx("kaijutsu", "coder");
         let saved = kaijutsu.id;
         let contexts = vec![root, kaijutsu];
@@ -268,7 +263,7 @@ mod start_tests {
 
     #[test]
     fn a_saved_context_that_is_archived_or_gone_falls_back_to_the_root() {
-        let root = ctx("ROOT", ROOT_CONTEXT_TYPE);
+        let root = ctx("amy", ROOT_CONTEXT_TYPE);
         let root_id = root.id;
         let mut archived = ctx("old", "coder");
         archived.archived = true;
@@ -279,24 +274,21 @@ mod start_tests {
     }
 
     #[test]
-    fn with_no_saved_context_the_reserved_root_label_wins() {
-        let other_root = ctx("banto", ROOT_CONTEXT_TYPE);
-        let reserved = ctx("ROOT", ROOT_CONTEXT_TYPE);
-        let reserved_id = reserved.id;
-        let contexts = vec![other_root, reserved];
-        assert_eq!(start_candidate(None, &contexts), Some(reserved_id));
+    fn a_root_labeled_console_does_not_win_by_its_label() {
+        let contexts = vec![ctx("banto", ROOT_CONTEXT_TYPE), ctx("console", ROOT_CONTEXT_TYPE)];
+        assert_eq!(start_candidate(None, &contexts), None);
     }
 
     #[test]
-    fn the_reserved_console_is_the_start_candidate_over_the_human_root() {
+    fn the_console_is_the_start_candidate_over_the_human_root() {
         let human = ctx("amy", ROOT_CONTEXT_TYPE);
-        let console = ctx("ROOT", CONSOLE_CONTEXT_TYPE);
+        let console = ctx("console", CONSOLE_CONTEXT_TYPE);
         let console_id = console.id;
         assert_eq!(start_candidate(None, &[human, console]), Some(console_id));
     }
 
     #[test]
-    fn with_several_roots_and_no_reserved_label_there_is_no_candidate() {
+    fn with_several_roots_and_no_console_there_is_no_candidate() {
         let contexts = vec![ctx("amy", ROOT_CONTEXT_TYPE), ctx("bob", ROOT_CONTEXT_TYPE)];
         assert_eq!(start_candidate(None, &contexts), None);
     }

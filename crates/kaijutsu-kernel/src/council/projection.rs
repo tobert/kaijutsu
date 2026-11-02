@@ -274,7 +274,7 @@ pub(super) mod fixtures {
             // A context made under a parent that has one answers to it, as a
             // create would.
             if let Some(performer) = performer {
-                db.update_played_by(id, Some(performer)).expect("give the context its context character");
+                db.update_performer(id, Some(performer)).expect("give the context its context character");
                 if let Some(parent) = row.forked_from
                     && db.context_character(parent).expect("read the parent's context character").is_some()
                 {

@@ -4,7 +4,7 @@
 //! `context_type` (coder, musician, mcp, …), or `gate`, `judge` or
 //! `distill`. A slot names a backend + model and may set any request
 //! parameter. A parameter the slot leaves unset is read from the model's
-//! `backend_models` row when a context character's slots are written; after
+//! `backend_models` row when a context's slots are written; after
 //! that nothing reads the character's slots, so a change reaches a context
 //! when it is rotated.
 //!
@@ -53,7 +53,7 @@ pub(super) enum CharacterSlotCommand {
         model: String,
         /// Maximum RESPONSE tokens. Omit to read it from the model's
         /// `kj backend model set` row when a context's slots are copied; a
-        /// context character write refuses a model request role with neither
+        /// context's slot write refuses a model request role with neither
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0

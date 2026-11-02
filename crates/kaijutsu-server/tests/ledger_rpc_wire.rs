@@ -239,7 +239,7 @@ fn a_takeover_is_a_recorded_reassignment_then_an_answer() {
     });
 }
 
-/// A drift into the ROOT console reaches the human as an ask on the wire,
+/// A drift into the console reaches the human as an ask on the wire,
 /// with origin `Drift` and the drift's text, and lands held in the
 /// console. A standing rule is refused, and the human's `decideAsk` allow
 /// releases the drift: the kernel's approval worker makes the block `Done`
@@ -250,17 +250,17 @@ fn a_drift_into_root_waits_on_the_wire_for_the_humans_allow() {
         let rig = Rig::new().await;
         let rootbot = PrincipalId::new();
         add_character(&rig.kernel, rootbot, "rootbot");
-        let console = common::create_context_typed(&rig.amy_kj, "ROOT", "console").await.unwrap();
+        let console = common::create_context_typed(&rig.amy_kj, "console", "console").await.unwrap();
         rig.kernel.kernel_db.lock().assign_test_review_recasting(console, Some(rootbot), None).unwrap();
         let source = common::create_context_typed(&rig.amy_kj, "drift-source", "default").await.unwrap();
         rig.kernel.kernel_db.lock().assign_test_review_recasting(source, Some(rig.coder), None).unwrap();
 
-        let argv: Vec<String> = ["drift", "push", "ROOT", "please read this first"].map(String::from).to_vec();
+        let argv: Vec<String> = ["drift", "push", "console", "please read this first"].map(String::from).to_vec();
         let pushed = rig.coder_kj.execute_kj_quiet(source, &argv).await.unwrap();
         assert_eq!(pushed.exit_code, 0, "{pushed:?}");
         assert!(pushed.stdout.contains("held"), "{pushed:?}");
         let drift = |kernel: &SharedKernel| kernel.kernel.blocks().block_snapshots(console).unwrap().into_iter()
-            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift).expect("the drift landed in ROOT");
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift).expect("the drift landed in the console");
         let block = drift(&rig.kernel);
         assert!(block.is_held_drift() && block.excluded, "{block:?}");
 

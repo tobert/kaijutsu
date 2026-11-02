@@ -2024,7 +2024,7 @@ mod tests {
     fn env_argument_keeps_the_context_type_allow() {
         let cfg = config("[context_type.mcp]\nallow = [\"kj context create\"]\n");
         let v = first_verdict(
-            "kj context create banto --name banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
+            "kj context create banto --name banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=console",
             &cfg,
             Some("mcp"),
         );

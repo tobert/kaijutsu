@@ -30,8 +30,8 @@ against a live root, so it is not a lockout tool — it takes the same
 
 ## `bootstrap`
 
-`bootstrap` sets up a kernel so its `ROOT` console can answer. A new person
-runs it once and then talks to `ROOT`; the model there helps with the rest
+`bootstrap` sets up a kernel so its console can answer. A new person
+runs it once and then talks to the console; the model there helps with the rest
 of the setup. `kj` is still there for direct changes.
 
 ```sh
@@ -51,19 +51,19 @@ result is missing:
 2. `kj backend model set` with the context window of a model it knows. For
    a model it does not know, the report names the model and this verb.
 3. `kj character create root --backend <b> --model <m> --max-tokens 16384` on the first provider's model, for
-   the model character that plays `ROOT` (`--console-as` names another). A character that exists and has
+   the model character that plays the console (`--console-as` names another). A character that exists and has
    no model and no `console` or `distill` slot gets `kj character model set root ...` instead. A character that
    already has a model or either slot is left alone, and the report says so.
-4. `kj context create root --name ROOT --type console`, a kohai of the root
+4. `kj context create root --name console --type console`, a kohai of the root
    character's own context. The context copies the character's model under `console` and under `distill`.
-   When ROOT exists but has no `console` slot and its character now has a model, bootstrap runs
-   `kj context rotate ROOT`. When ROOT is played by
+   When the console exists but has no `console` slot and its character now has a model, bootstrap runs
+   `kj context rotate console`. When the console is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.
 
 It prints each line it ran. A second run runs nothing once every step is in place, and a kernel set up
 by hand is completed rather than overwritten. With no key found, it still
-creates `ROOT` and prints the two `kj backend` lines that give it a model.
+creates the console and prints the two `kj backend` lines that give it a model.
 
 Run it with the service stopped: it takes the same lock as the service and
 `kj`. The defaults are `--as $USER` and `--key ~/.ssh/id_ed25519.pub`. It

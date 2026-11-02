@@ -1,5 +1,5 @@
-//! `contexts.played_by` at creation (`docs/character.md`, "A context is
-//! played by a character" + slice 4's "`register_session` sets `played_by`").
+//! `contexts.performer` at creation (`docs/character.md`, "A context is
+//! played by a character" + slice 4's "`register_session` sets `performer`").
 //!
 //! `register_session` (kaijutsu-mcp) always reaches a fresh context through
 //! `createContext`, the same RPC every wire client uses — there is no
@@ -8,7 +8,7 @@
 //! `context_origin_host.rs` proves `setContextOriginHost` without an MCP
 //! process in the loop.
 //!
-//! `played_by` never rides the wire yet (no capnp field), so assertions read
+//! `performer` never rides the wire yet (no capnp field), so assertions read
 //! the row straight out of `KernelDb` via the test-only kernel handle
 //! (`start_server_with_kernel_handle`).
 
@@ -74,8 +74,8 @@ fn create_context_records_the_requester_and_the_named_performer() {
 
 /// A principal with no character row (a real, authenticated key bound to its
 /// own principal, not the root character `connect_client` uses) leaves
-/// `played_by` NULL. No character is minted and the request does not fail:
-/// `played_by` is metadata, not authority, and a principal without a sheet
+/// `performer` NULL. No character is minted and the request does not fail:
+/// `performer` is metadata, not authority, and a principal without a sheet
 /// is a legitimate pre-character state.
 #[test]
 fn create_context_refuses_a_characterless_principal() {

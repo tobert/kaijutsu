@@ -19,9 +19,9 @@ authority to anyone beyond what the senpai edge gives.
 
 ## The senpai edge
 
-`context_characters.senpai_ctx` names the senpai context. It is null only for a root console. A context with no
-context character (scratch, the handoff log, the drift queue, lost+found, the beat score) routes nothing. A
-rotation writes the successor with the predecessor's character and senpai, so the edge moves with the seat.
+`contexts.senpai_ctx` names the senpai context. It is null only for a root console. A context with no
+performer (scratch, the handoff log, the drift queue, lost+found, the beat score) runs no turns and has a senpai
+like any other; a climb passes over a senpai with no performer. A rotation writes the successor with the predecessor's character and senpai, so the edge moves with the seat.
 
 - The **character** of a context is fixed when the context is made, and never changes.
 - The **kohai** of a context are the live contexts whose `senpai_ctx` is that context.
@@ -35,12 +35,12 @@ any context of an instance and uses that context's instance.
 
 The reviewer of an ask raised in context K by actor A:
 
-1. A context with no context character refuses, naming K.
-2. Let S be K's `senpai_ctx`. If S is null (K is a root console): when A is K's live root character, the ask is a
+1. Let S be K's `senpai_ctx`. If S is null (K is a root console): when A is K's live root character, the ask is a
    self-confirmation; when A is not a root and K's performer is a live root, that root reviews it; otherwise
    resolution refuses and names A and K.
+2. A senpai with no performer is passed over: the climb continues to its senpai.
 3. The reviewer is S's character when it is live, is not A, and is not K's performer.
-4. When S's character is A or K's performer, climb: K becomes S, and repeat from 2. A fork's performer is its
+4. When S's character is A or K's performer, climb: K becomes S, and repeat from 1. A fork's performer is its
    source's character, so an ask in a fork, by anyone, climbs past that character.
 5. A retired character refuses by name. It never substitutes another character.
 
@@ -92,12 +92,12 @@ the kohai. Every client creation names its performer as the positional character
 
 Ring placement and conclusion do not follow the lineage. `kj context
 promote`, `demote`, and `conclude` need the operator capability, except
-for a live root character: it acts as a human root from any context. ROOT,
-a human root or the ROOT console, may act on any context. Another seat, such
+for a live root character: it acts as a human root from any context. The console
+and a human root may act on any context. Another seat, such
 as a director, may act on any context except a human root, a console, or
-its own; for its own, it asks ROOT. Only a human root demotes or concludes
+its own; for its own, it asks the console. Only a human root demotes or concludes
 a human root or a console, and nobody concludes a human root. See
-`docs/character.md`, "ROOT places contexts".
+`docs/character.md`, "The console places contexts".
 
 ## Three identities
 

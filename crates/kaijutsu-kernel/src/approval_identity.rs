@@ -146,7 +146,7 @@ mod tests {
             origin_host: None, performer: None, senpai_ctx: None, persona: None,
         }, ws).unwrap();
         if let Some(performer) = played_by {
-            db.update_played_by(context_id, Some(performer)).unwrap();
+            db.update_performer(context_id, Some(performer)).unwrap();
         }
         if let Some(senpai) = senpai {
             db.set_context_senpai(context_id, Some(senpai)).unwrap();

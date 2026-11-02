@@ -2,7 +2,7 @@
 //! nothing else answers.
 //!
 //! A model call in context K runs on the `context_slots` row for K's context
-//! type. A context with no context character, or one with no slot for the
+//! type. A context with no performer, or one with no slot for the
 //! type, has no model. No character slot, `backend_models` row or registry default
 //! stands in.
 
@@ -55,7 +55,7 @@ pub struct ContextModel {
 /// Why a context has no model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoModelReason {
-    /// The context has no context character.
+    /// The context has no performer.
     NoContextCharacter,
     /// The context's slots have none for the role.
     NoSlot,
@@ -88,7 +88,7 @@ impl NoModel {
     pub fn line(&self) -> String {
         match &self.reason {
             NoModelReason::NoContextCharacter => {
-                format!("{} has no context character, so it runs no model", self.context)
+                format!("{} has no performer, so it runs no model", self.context)
             }
             NoModelReason::CouncilServer => format!(
                 "{} runs on a council server, not a chat model: its {} slot names the server",
@@ -117,7 +117,7 @@ impl NoModel {
         let character = self.character.as_deref().unwrap_or("(none)");
         match &self.reason {
             NoModelReason::NoContextCharacter => format!(
-                "{} has no context character, so it {what}. Start one: \
+                "{} has no performer, so it {what}. Start one: \
                  `kj context create <character> [--name <label>] [--type <type>]`",
                 self.context
             ),

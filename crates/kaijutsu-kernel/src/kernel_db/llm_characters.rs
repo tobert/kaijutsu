@@ -321,7 +321,7 @@ impl KernelDb {
     /// column was still NULL — see that call site for the race this
     /// guards. `None` is accepted (not just produced) so a future repair
     /// verb can disown a context without a bespoke clear method, mirroring
-    /// `update_played_by`.
+    /// `update_performer`.
     pub fn set_character_handoff_ctx(
         &self,
         principal_id: PrincipalId,

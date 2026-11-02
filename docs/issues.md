@@ -6,6 +6,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Context fold: follow-ups (2026-11-01)
+
+- `contexts.performer` has no foreign key to `characters`: old rows and fixtures name principals with no sheet.
+  Decide whether to backfill sheets (or null the column) and add the key.
+- A handoff log created outside any root's lineage refuses when the kernel has several live roots: there is no
+  owner-character rule to pick its root console (`KernelDb::default_console_for`).
+- A live context may answer to an archived senpai, as zorak's old `ROOT` does. The fold does not check senpai
+  liveness for rows that already name one; `kj context kohai` of the archived senpai lists them.
+
 ## A held MCP registration leaves an ask nobody sees (2026-11-01)
 
 A `kaijutsu-mcp --connect` registration with the `kaijutsu-lead` key refused with "the gate policy is waiting on
@@ -16,7 +25,7 @@ design in `docs/senpai-kohai.md`, "MCP sessions", removes this registration's as
 
 ## A root's MCP hub outlives the root (2026-11-01)
 
-`kj character retire` archives the contexts a character plays, and the `mcp/<root>` hub has no context character,
+`kj character retire` archives the contexts a character plays, and the `mcp/<root>` hub has no performer,
 so retiring a root leaves its hub live (`contexts_played_by` skips it). Archive the hub with its root, and decide
 whether the hub's live `mcp` sessions go with it. See `docs/senpai-kohai.md`, "MCP sessions".
 
@@ -33,9 +42,6 @@ against the code unless marked:
   leaving `characters.root_ctx` on an archived row (kernel_db.rs ~5770).
 - The kernel lets `kj context create <root>` create a context the root performs; only the client refuses. A test blesses it
   (`a_root_character_can_be_cast_as_a_performer`, kj/context.rs ~3929).
-- Two meanings of "root console": `ContextRow::is_root_console` (type `console`, label `ROOT`) vs
-  `KernelDb::is_root_console` (`characters.root_ctx`). The drift hold uses the first (kj/drift.rs ~344), so a
-  drift into a human root's console is not held.
 - `kj ledger list --reviewer` and the director `rotate` rc lifecycle are documented in docs/senpai-kohai.md and
   not built (`VERB_ROTATE` fires only from the beat scheduler).
 - The builtin `kj context create --type mcp` allow cannot see the caller, so the character it names may be one with a
@@ -125,6 +131,9 @@ TUI entries below). Open:
   `bd1dc251` plus the review fixes: `council::gate_e2e::a_council_miss_asks_and_records_its_cause`,
   `a_contained_model_commits_with_real_git`, and `a_learned_allow_beats_a_config_deny_added_later`.
   Causes not found.
+  Seen again 2026-11-01 under build load (load average above 80): `rpc_integration::test_interrupt_cancels_execution`
+  (its 5 s exit-code timeout), `gate_scenarios_wire::an_approved_shell_write_runs_with_the_cwd_and_env_it_showed`,
+  and kaijutsu-acp `kernel_e2e::deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle`.
 - Kernels bootstrapped before the branch have no `house` cast: run
   `kaijutsu-server bootstrap` again.
 - The prose in `docs/approval-identity.md` still says "a root can never be a
@@ -178,8 +187,8 @@ entertainment seat, from a read of SillyTavern's prompt assembly. See
 
 The design is in `docs/character.md`, "The root console and its shell".
 Landed: the human root has no model and refuses `drive`; its model console is
-a `console` context under it, labeled `ROOT`, with the stance; Ctrl-Z toggles
-root, console, and shell; the start choice prefers `ROOT`; a drift into the
+a `console` context under it, labeled `console`, with the stance; Ctrl-Z toggles
+root, console, and shell; the start choice prefers the console; a drift into the
 console waits for the human as a ledger ask. Still open:
 
 - A drift ask takes no `--remember` (Amy, 2026-10-28). An idea for later:
@@ -190,12 +199,10 @@ console waits for the human as a ledger ask. Still open:
   next turn (`llm/mailbox.rs`, `live_tail`). The ask card shows the whole
   drift text, so a long drift makes a tall card.
 - The console and council stances name Amy as fixed text, so another
-  person's `bootstrap` tells their ROOT that Amy is accountable. A small fix:
+  person's `bootstrap` tells their console that Amy is accountable. A small fix:
   rc exposes the reviewer's name and the stance uses it.
 - `kaijutsu-mcp` `prepare_session_create` still records no performer for a
   root (`crates/kaijutsu-mcp/src/lib.rs`, about line 2090).
-- `docs/character.md` says ROOT is played by a root character. The console is
-  played by a model character. The reserved-label rule needs the same edit.
 - The root's shell child has only the `shell` bundle (`exec` and the shell
   facades), so `kj cast` and `kj context create` there are denied for lack of
   `config-write`/`operator`. Admin work runs through the TUI's `:kj` in the

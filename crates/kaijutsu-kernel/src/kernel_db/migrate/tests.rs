@@ -715,10 +715,10 @@ fn the_old_index_shape_is_rebuilt_at_open() {
     KernelDb::apply_additive_migrations(&db.conn).unwrap();
     assert!(index_sql(&db).contains("archived_at IS NULL"));
 
-    let old = make_context_row(Some("ROOT"));
+    let old = make_context_row(Some("console"));
     insert_context_with_doc(&db, &old, ws_id);
     assert!(db.archive_context(old.context_id).unwrap());
-    insert_context_with_doc(&db, &make_context_row(Some("ROOT")), ws_id);
+    insert_context_with_doc(&db, &make_context_row(Some("console")), ws_id);
 
     // A second run is a no-op.
     KernelDb::apply_additive_migrations(&db.conn).unwrap();

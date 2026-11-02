@@ -53,8 +53,8 @@ independently and read-only; do not put them in either directory.
 
 The server refuses to start until a root character exists with a bound key
 (`docs/character.md`, "Bootstrap: the person creates themself").
-`bootstrap` writes them, registers a model backend, and creates the `ROOT`
-console (`docs/server-cli.md`, "bootstrap"). Run it while the server is
+`bootstrap` writes them, registers a model backend, and creates the console
+(`docs/server-cli.md`, "bootstrap"). Run it while the server is
 stopped. The public-key mount need not persist.
 
 In the container, `~` is `/var/lib/kaijutsu`, so bootstrap finds no key file
@@ -77,7 +77,7 @@ The row stores only the key's environment variable name and path, so the
 service needs the same `/run/secrets` mount. To bind more keys later,
 `add-key <pubkey-file> --as <character>` is safe while the server runs:
 `auth.db` is WAL and never cached. `init` remains for the root alone, without
-a backend or `ROOT`.
+a backend or `console`.
 
 ## Devcontainer
 

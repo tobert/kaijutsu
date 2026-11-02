@@ -2,7 +2,7 @@
 # create (docs/character.md, "The handoff is an ordinary context"). One body
 # in lib/, linked into every create bundle that wants it.
 #
-# Read the performer's handoff log when `played_by` names a character.
+# Read the performer's handoff log when `performer` names a character.
 # Without a performer, read the caller's own log. Requester and performer
 # can differ when a person creates a context of a character.
 #
@@ -43,7 +43,7 @@ set -e
 
 window=12
 
-who="$(kj context info --json | jq -r '.played_by_name // empty')"
+who="$(kj context info --json | jq -r '.performer_name // empty')"
 
 # `kj handoff tail` prints "[when] author: text" per note, or a bare
 # "<name> has no handoff notes yet" line. It errors only when the named
@@ -57,7 +57,7 @@ case "$who" in
   *)
     notes="$(kj handoff tail --window "$window" "$who" || true)"
     # Resolve by context so a name is passed as a value, never shell source.
-    note_cmd="kj handoff note --for \"\$(kj context info $KJ_CONTEXT --json | jq -r .played_by_name)\" 'what you did, what is next'"
+    note_cmd="kj handoff note --for \"\$(kj context info $KJ_CONTEXT --json | jq -r .performer_name)\" 'what you did, what is next'"
     ;;
 esac
 

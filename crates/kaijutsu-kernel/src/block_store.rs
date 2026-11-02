@@ -2151,7 +2151,7 @@ impl BlockStore {
             // read it unanswered.
             if !excluded && entry.doc.get_block_snapshot(block_id).is_some_and(|b| b.is_held_drift()) {
                 return Err(BlockStoreError::Validation(format!(
-                    "block {} is a drift held for ROOT's human; `kj ledger allow` on its ask releases it",
+                    "block {} is a drift held for the console's human; `kj ledger allow` on its ask releases it",
                     block_id.to_key()
                 )));
             }

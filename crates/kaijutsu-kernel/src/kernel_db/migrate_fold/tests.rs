@@ -27,7 +27,7 @@ impl Rig {
         row.forked_from = parent.map(|p| p.context_id);
         insert_context_with_doc(&self.db, &row, self.ws);
         if let Some(performer) = performer {
-            self.db.update_played_by(row.context_id, Some(performer)).unwrap();
+            self.db.update_performer(row.context_id, Some(performer)).unwrap();
         }
         if let Some(senpai) = senpai {
             self.db.set_context_senpai(row.context_id, Some(senpai.context_id)).unwrap();

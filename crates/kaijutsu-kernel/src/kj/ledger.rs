@@ -120,7 +120,7 @@ enum OriginArg {
     ShellGate,
     /// A privileged `kj` verb gated itself.
     KjVerb,
-    /// A drift into the ROOT console waits for its human.
+    /// A drift into the console waits for its human.
     Drift,
 }
 
@@ -3410,7 +3410,7 @@ mod tests {
         let worker = character("worker");
         let context = |label: &str, parent, played_by: Option<PrincipalId>| {
             let id = register_context(d, Some(label), Some(parent), amy);
-            d.kernel_db().lock().update_played_by(id, Some(played_by.unwrap_or(worker))).unwrap();
+            d.kernel_db().lock().update_performer(id, Some(played_by.unwrap_or(worker))).unwrap();
             id
         };
         let banto_seat = context("banto-seat", root, Some(banto));
@@ -4445,7 +4445,7 @@ mod tests {
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let console = register_context(d, None, None, principal_id);
-        d.kernel_db().lock().update_played_by(console, Some(principal_id)).unwrap();
+        d.kernel_db().lock().update_performer(console, Some(principal_id)).unwrap();
         KjCaller {
             principal_id,
             actor_id: principal_id,
@@ -5114,8 +5114,8 @@ mod tests {
             for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
                 db.insert_character(&crate::kernel_db::CharacterRow { context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
-            db.update_played_by(seat, Some(banto)).unwrap();
-            db.update_played_by(lane, Some(coder)).unwrap();
+            db.update_performer(seat, Some(banto)).unwrap();
+            db.update_performer(lane, Some(coder)).unwrap();
         }
         let mut caller = crate::kj::test_helpers::test_caller();
         caller.context_id = Some(lane);
@@ -5221,7 +5221,7 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
                 principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.update_played_by(root, Some(amy)).unwrap();
+            db.update_performer(root, Some(amy)).unwrap();
             db.assign_test_review(lane, None, Some(banto)).unwrap();
         }
         let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();

@@ -181,9 +181,9 @@ pub fn cast_a_performer(server: &EphemeralServer) {
                 .await
                 .expect("run kj context info");
             assert_eq!(result.exit_code, 0, "kj context info: {}", result.stderr);
-            let played_by = result.data.as_ref().and_then(|data| data.get("played_by_name")).and_then(|name| name.as_str());
+            let performer = result.data.as_ref().and_then(|data| data.get("performer_name")).and_then(|name| name.as_str());
             assert_eq!(
-                played_by,
+                performer,
                 Some(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER),
                 "context {} should be performed by the character the client created it as",
                 info.label
@@ -206,7 +206,7 @@ pub fn grant_operator(server: &EphemeralServer, label: &str) {
     })
 }
 
-/// Make a `ROOT` console played by the ephemeral kernel's performer, then
+/// Make a console played by the ephemeral kernel's performer, then
 /// push `text` into it from the root seat. The drift lands held, with an
 /// ask for the root principal the client under test also uses.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
@@ -215,8 +215,8 @@ pub fn drift_into_a_root_console(server: &EphemeralServer, text: &str) {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
         for argv in [
-            vec!["context", "create", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER, "--name", "ROOT", "--type", "console"],
-            vec!["drift", "push", "ROOT", text],
+            vec!["context", "create", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER, "--name", "console", "--type", "console"],
+            vec!["drift", "push", "console", text],
         ] {
             let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
             let result = kernel.execute_kj_quiet(root, &argv).await.expect("run kj");

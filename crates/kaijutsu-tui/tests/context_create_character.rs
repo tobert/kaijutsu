@@ -61,7 +61,7 @@ fn a_root_session_with_a_character_creates_a_context_it_plays() {
             .await
             .expect("run kj context info");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
-        result.data.as_ref().and_then(|d| d.get("played_by_name")).and_then(|n| n.as_str()).map(String::from)
+        result.data.as_ref().and_then(|d| d.get("performer_name")).and_then(|n| n.as_str()).map(String::from)
     });
     assert_eq!(info.as_deref(), Some(SshServerConfig::EPHEMERAL_PERFORMER));
 }

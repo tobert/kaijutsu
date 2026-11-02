@@ -703,7 +703,7 @@ pub(super) async fn spawn_admitted_turn(
         Ok(facts) => facts,
         Err(e) => {
             tracing::error!("character fact read failed for context {context_id}: {e}");
-            return Err(format!("Could not read this context's context character: {e}. The turn was stopped."));
+            return Err(format!("Could not read this context's performer: {e}. The turn was stopped."));
         }
     };
     let situational = crate::SituationalContext {
@@ -8057,14 +8057,14 @@ mod lifetime_tests {
                 demoted_at: None, paused_at: None, origin_host: None,
                 performer: None, senpai_ctx: None, persona: None,
             }).unwrap();
-            db.update_played_by(senpai, Some(reviewer)).unwrap();
+            db.update_performer(senpai, Some(reviewer)).unwrap();
             // The performer's slots give its context a `default` slot only
             // when a mock provider is wanted; without one the binding has
             // no model.
             if mock.is_some() {
                 db.seed_test_slots(actor, "mock", "mock-model", &["default"]).unwrap();
             }
-            db.update_played_by(context, Some(actor)).unwrap();
+            db.update_performer(context, Some(actor)).unwrap();
             db.set_context_senpai(context, Some(senpai)).unwrap();
         }
         if let Some(mock) = mock {

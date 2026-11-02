@@ -1763,7 +1763,7 @@ mod tests {
         direct.actor_id = actor;
         direct.principal_id = actor;
         let context = register_context(&d, Some("root-direct-gate"), None, direct.principal_id);
-        d.kernel_db.lock().update_played_by(context, Some(actor)).unwrap();
+        d.kernel_db.lock().update_performer(context, Some(actor)).unwrap();
         direct.context_id = Some(context);
         direct.reviewer_id = None;
 

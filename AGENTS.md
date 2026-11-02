@@ -78,22 +78,24 @@ own character names. `kj character` manages sheets, and `kj handoff
 note|tail` accesses their logs. Retirement archives the contexts the
 character plays.
 
-A **context character** is one character in one context: `kj context create
-<label> --as <character> --type <t>` makes the context with it, and its
-character never changes. The character holds **slots**, one per role (a
-context type, or `distill`, `gate`, `judge`), set with `kj character slot
-set`. A context copies its character's slots when it is made; every model
-call reads the context's own slot for its type and nothing else, so editing a
-character's slots moves no running context until `kj context rotate`. A fork
-continues its source's performance; rotation starts a new conversation with
-slots read fresh. Every working context answers to one **senpai** context
-(`kj senpai show`): its asks, reports and escalations go to the senpai's
-character, and the senpai's character or the lineage root moves, rotates and
-archives it.
+A context carries its **performer**, the character that plays it, and its
+**senpai**: `kj context create <character> [--name] [--type] [--senpai]` makes
+the context, and its performer never changes. The character holds **slots**,
+one per role (a context type, or `distill`, `gate`, `judge`), set with `kj
+character slot set`. A context copies its character's slots when it is made;
+every model call reads the context's own slot for its type and nothing else,
+so editing a character's slots moves no running context until `kj context
+rotate`. A fork continues its source's performance; rotation starts a new
+conversation with slots read fresh. Every context answers to one **senpai**
+context, except a root console: asks, reports and escalations go to the
+senpai's performer, and the senpai's performer or the lineage root moves,
+rotates and archives it (a context's own performer may also archive it).
+`kj context info` shows the senpai. The person's root console and **the
+console**, the model console (type `console`), are two different contexts.
 
 We keep requester, performer, and context type distinct. `created_by`
 names the requester who created a context; the performer is the character
-of its context character. A `context_type` selects the context's rc bundle, gate tier and
+that plays it. A `context_type` selects the context's rc bundle, gate tier and
 slot. Model turns require a live performer and a distinct reviewer.
 Provider output and tools carry the performer; the connection keeps its own
 identity. `forked_from` is provenance only. See `docs/senpai-kohai.md` and
@@ -104,7 +106,7 @@ senpai/kohai stack (step 6); see `docs/character.md`, "Current implementation"
 and "Rollout, smallest first".
 
 Banto is a character that plays the `director` type, which is reworked in that
-stack. Its context is created with `--as banto`; director instructions and handoff
+stack. Its context is created with `kj context create banto`; director instructions and handoff
 injection read the performer metadata. The old `KJ_CHARACTER` environment
 bridge did not set identity and is no longer read by the shipped scripts.
 `kj context rotate` replaces a conversation and sets `ROTATED_FROM`, which loads

@@ -1,8 +1,8 @@
-//! e2e: `kaijutsu-server bootstrap` leaves a kernel whose `ROOT` console
+//! e2e: `kaijutsu-server bootstrap` leaves a kernel whose console
 //! answers its first prompt (`docs/server-cli.md`, "bootstrap").
 //!
 //! Bootstrap runs against the same paths a serving kernel uses, then the
-//! server boots on them and the root character types into `ROOT` over the
+//! server boots on them and the root character types into the console over the
 //! wire. The mock backend's canned reply is the answer.
 
 mod common;
@@ -31,7 +31,7 @@ fn kernel_db(config: &SshServerConfig) -> KernelDb {
         .expect("open kernel.db")
 }
 
-/// A fresh kernel, bootstrapped with a backend, answers in `ROOT`. A second
+/// A fresh kernel, bootstrapped with a backend, answers in the console. A second
 /// bootstrap finds nothing to do.
 #[test]
 fn a_bootstrapped_kernel_answers_in_root() {
@@ -48,14 +48,14 @@ fn a_bootstrapped_kernel_answers_in_root() {
 
         let root_ctx = {
             let db = kernel_db(&config);
-            let row = db.find_context_by_label("ROOT").unwrap().expect("bootstrap creates ROOT");
+            let row = db.find_context_by_label("console").unwrap().expect("bootstrap creates the console");
             assert_eq!(row.context_type, "console");
             let performer = db.get_character_by_name("root").unwrap().expect("the console performer exists");
-            assert_eq!(row.performer, Some(performer.principal_id), "ROOT is played by its model character");
+            assert_eq!(row.performer, Some(performer.principal_id), "the console is played by its model character");
             let model = db.get_character_model(performer.principal_id).unwrap().expect("the performer holds a model");
             assert_eq!(model.model, "mock-model");
             assert!(db.list_character_slots(performer.principal_id).unwrap().is_empty(), "a model, not role slots");
-            let slot = db.context_slot(row.context_id, "console").unwrap().expect("ROOT copied the model under its type");
+            let slot = db.context_slot(row.context_id, "console").unwrap().expect("the console copied the model under its type");
             assert_eq!(slot.model, "mock-model");
             assert!(db.context_slot(row.context_id, "distill").unwrap().is_some(), "and under distill");
             row.context_id
@@ -82,7 +82,7 @@ fn a_bootstrapped_kernel_answers_in_root() {
 
         let (callback, mut turns) = turn_events_channel(16);
         amy.subscribe_turn_events(callback).await.expect("subscribe_turn_events");
-        amy.join_context(root_ctx, "amy-in-root").await.expect("join ROOT");
+        amy.join_context(root_ctx, "amy-in-root").await.expect("join the console");
         amy.edit_input(root_ctx, 0, "hello", 0).await.expect("edit_input");
         amy.submit_input(root_ctx, false).await.expect("submit_input");
 
@@ -90,11 +90,11 @@ fn a_bootstrapped_kernel_answers_in_root() {
             match tokio::time::timeout(Duration::from_secs(30), turns.recv()).await {
                 Ok(Ok(ServerEvent::TurnCompleted { context_id, .. })) if context_id == root_ctx => break,
                 Ok(Ok(ServerEvent::TurnFailed { context_id, error, .. })) if context_id == root_ctx => {
-                    panic!("ROOT's turn failed: {error}")
+                    panic!("the console's turn failed: {error}")
                 }
                 Ok(Ok(_)) => continue,
                 Ok(Err(e)) => panic!("turn push channel error: {e}"),
-                Err(_) => panic!("timed out waiting for ROOT to answer"),
+                Err(_) => panic!("timed out waiting for the console to answer"),
             }
         }
         let blocks = amy.get_blocks(root_ctx, &BlockQuery::All).await.expect("get_blocks");
@@ -102,12 +102,12 @@ fn a_bootstrapped_kernel_answers_in_root() {
             blocks
                 .iter()
                 .any(|b| b.kind == BlockKind::Text && b.role == Role::Model && b.content.contains("Mock summary")),
-            "ROOT answered with the mock's reply"
+            "the console answered with the mock's reply"
         );
     });
 }
 
-/// With no backend, bootstrap still creates `ROOT` and says how to give it a
+/// With no backend, bootstrap still creates the console and says how to give it a
 /// model. A later bootstrap with a backend adds only the backend.
 #[test]
 fn without_a_backend_root_waits_for_one() {
@@ -121,7 +121,7 @@ fn without_a_backend_root_waits_for_one() {
         );
         {
             let db = kernel_db(&config);
-            assert!(db.find_context_by_label("ROOT").unwrap().is_some(), "ROOT exists without a model");
+            assert!(db.find_context_by_label("console").unwrap().is_some(), "the console exists without a model");
             let root = db.get_character_by_name("root").unwrap().expect("the console performer exists");
             assert!(db.list_character_slots(root.principal_id).unwrap().is_empty(), "no slot without a backend");
             assert!(db.get_character_model(root.principal_id).unwrap().is_none(), "no model without a backend");
@@ -135,9 +135,9 @@ fn without_a_backend_root_waits_for_one() {
             [
                 "kj backend set mock --kind mock --key-optional",
                 "kj character model set root --backend mock --model mock-model --max-tokens 16384",
-                "kj context rotate ROOT",
+                "kj context rotate console",
             ],
-            "the backend, the performer's model, and a rotated ROOT that takes it"
+            "the backend, the performer's model, and a rotated the console that takes it"
         );
         let again = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
             .await
@@ -187,7 +187,7 @@ fn an_unknown_model_is_named_in_the_report() {
     });
 }
 
-/// ROOT's performer must be someone other than the root character, who
+/// the console's performer must be someone other than the root character, who
 /// reviews it. Naming the root is refused, and nothing is made.
 #[test]
 fn the_root_cannot_play_root() {
@@ -195,14 +195,14 @@ fn the_root_cannot_play_root() {
         let config = SshServerConfig::ephemeral_with_root(0, "amy");
         let mut opts = options(&config, None);
         opts.console_performer = "amy".to_string();
-        let err = bootstrap(&config, &opts).await.expect_err("the root cannot perform ROOT");
+        let err = bootstrap(&config, &opts).await.expect_err("the root cannot perform the console");
         assert!(err.contains("--console-as"), "{err}");
-        assert!(kernel_db(&config).find_context_by_label("ROOT").unwrap().is_none(), "nothing was made");
+        assert!(kernel_db(&config).find_context_by_label("console").unwrap().is_none(), "nothing was made");
     });
 }
 
 /// Rotation keeps a context's character, so a re-run naming another performer
-/// cannot move ROOT to it: the report says to archive ROOT, and ROOT is not
+/// cannot move console to it: the report says to archive console, and the console is not
 /// rotated for nothing.
 #[test]
 fn a_different_console_performer_is_reported_and_root_is_left_alone() {
@@ -213,9 +213,9 @@ fn a_different_console_performer_is_reported_and_root_is_left_alone() {
         opts.console_performer = "other".to_string();
         let again = bootstrap(&config, &opts).await.expect("bootstrap as another performer");
         assert!(
-            again.notes.iter().any(|note| note.contains("ROOT is not played by other")),
+            again.notes.iter().any(|note| note.contains("The console is not played by other")),
             "the report names the mismatch: {again:?}"
         );
-        assert!(!again.ran.iter().any(|line| line.contains("context rotate")), "ROOT was not rotated: {again:?}");
+        assert!(!again.ran.iter().any(|line| line.contains("context rotate")), "the console was not rotated: {again:?}");
     });
 }

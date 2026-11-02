@@ -205,8 +205,8 @@ fn a_root_session_with_a_character_creates_a_context_that_character_plays() {
             .await
             .expect("run kj context info");
         assert_eq!(info.exit_code, 0, "{}", info.stderr);
-        let played_by = info.data.as_ref().and_then(|d| d.get("played_by_name")).and_then(|n| n.as_str());
-        assert_eq!(played_by, Some(SshServerConfig::EPHEMERAL_PERFORMER));
+        let performer = info.data.as_ref().and_then(|d| d.get("performer_name")).and_then(|n| n.as_str());
+        assert_eq!(performer, Some(SshServerConfig::EPHEMERAL_PERFORMER));
     });
 }
 

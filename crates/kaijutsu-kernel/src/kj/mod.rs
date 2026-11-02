@@ -1563,7 +1563,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Give `caller`'s actor a live character sheet if it has none, so it may
-    /// `kj context create` (`docs/senpai-kohai.md`, "Creating and moving").
+    /// `kj context create` (`docs/senpai-kohai.md`, "Creating, forking, rotating").
     ///
     /// A caller's registered context that has no context character gets one
     /// of the actor, so the caller's `kj context create` has a context to answer
@@ -1595,7 +1595,7 @@ pub(crate) mod test_helpers {
             principal_id: caller.actor_id, name: format!("holder-{}", caller.actor_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        db.update_played_by(context, Some(caller.actor_id)).unwrap();
+        db.update_performer(context, Some(caller.actor_id)).unwrap();
         // Contexts registered under `context` are its kohai, each run by a
         // stand-in character.
         let children: Vec<ContextId> = db.list_all_contexts().unwrap().into_iter()

@@ -6,7 +6,7 @@
 # Character names are not validated, so a name that could leave the cards
 # directory is refused before it reaches a path.
 set -e
-who="$(kj context info --json | jq -r '.played_by_name // empty')"
+who="$(kj context info --json | jq -r '.performer_name // empty')"
 case "$who" in
   "")
     echo "card: no performer"

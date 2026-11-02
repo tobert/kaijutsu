@@ -135,13 +135,13 @@ fn a_performer_that_cannot_change_keeps_the_continuation() {
     insert_context_with_doc(&db, &row, ws_id);
     let actor = PrincipalId::new();
     let other = PrincipalId::new();
-    db.update_played_by(row.context_id, Some(actor)).unwrap();
+    db.update_performer(row.context_id, Some(actor)).unwrap();
     let origin = db.begin_continuation(row.context_id, 1_000).unwrap();
     db.record_continuation_request(row.context_id, origin.epoch, 1_100).unwrap();
     db.record_continuation_yield(row.context_id, origin.epoch, 1_200).unwrap();
-    db.update_played_by(row.context_id, Some(actor)).unwrap();
+    db.update_performer(row.context_id, Some(actor)).unwrap();
     assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
-    assert!(db.update_played_by(row.context_id, Some(other)).is_err());
+    assert!(db.update_performer(row.context_id, Some(other)).is_err());
     assert_eq!(db.get_context(row.context_id).unwrap().unwrap().performer, Some(actor));
     assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
 }

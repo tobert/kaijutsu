@@ -51,8 +51,8 @@ archives; a cancelled or unsettled lifecycle refuses either and leaves the
 context live. That demote step needs `--confirm`, as archive does.
 `kj context conclude`, `promote`, `demote`, and `archive` need the operator
 capability unless a live root character runs them. For the first three, no
-seat but ROOT acts on its own context, a human root, or a console
-(`docs/character.md`, "ROOT places contexts").
+seat but the console acts on its own context, a human root, or a console
+(`docs/character.md`, "The console places contexts").
 `kj context archive --children [--type <type>]` archives a context's live
 children, each through its own lifecycle.
 Already accepted commands retain their settlement destination across archive.

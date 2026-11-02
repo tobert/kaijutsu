@@ -162,12 +162,12 @@ mod tests {
     /// one Ctrl+Z goes to, so the console and the root toggle the same way.
     #[test]
     fn a_console_toggles_to_its_shell_child_and_creates_one_when_missing() {
-        let console = ctx("ROOT", CONSOLE_CONTEXT_TYPE, None);
-        let child = shell_of(&console, "ROOT-shell");
+        let console = ctx("console", CONSOLE_CONTEXT_TYPE, None);
+        let child = shell_of(&console, "console-shell");
         assert_eq!(toggle(&console, &[console.clone(), child.clone()]), Toggle::Switch(child.id));
         assert_eq!(
             toggle(&console, &[console.clone()]),
-            Toggle::Create { parent: console.id, label: "ROOT-shell".into() },
+            Toggle::Create { parent: console.id, label: "console-shell".into() },
         );
     }
 

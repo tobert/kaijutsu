@@ -95,7 +95,7 @@ Each slice stands alone and leaves the tree green. Do not combine 1 and 3.
 ### 1. A well-known context registry
 
 A `role → context_id` mapping in `KernelDb`. Roles are a fixed enum, not
-arbitrary keys: lost+found, the drift queue, ROOT/director, and whatever later
+arbitrary keys: lost+found, the drift queue, console/director, and whatever later
 earns a slot.
 
 **This is not the kernel KV returning.** That was built and demolished on

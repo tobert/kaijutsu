@@ -864,7 +864,7 @@ fn refused_shell_submit_keeps_its_draft() {
 }
 
 /// Typing in the human root is refused as a refusal, not a fault: the human
-/// root runs no model turns, and the reason points to `ROOT` and `Ctrl+Z`
+/// root runs no model turns, and the reason points to the console and `Ctrl+Z`
 /// instead of asking for a reviewer. The draft stays as typed.
 #[test]
 fn a_chat_submit_in_the_human_root_says_it_runs_no_model_turns() {
@@ -885,7 +885,7 @@ fn a_chat_submit_in_the_human_root_says_it_runs_no_model_turns() {
             panic!("expected a refusal, not a fault: {error:?}");
         };
         assert!(refusal.reason.contains("human root runs no model turns"), "{refusal:?}");
-        assert!(refusal.reason.contains("ROOT") && refusal.reason.contains("Ctrl+Z"), "{refusal:?}");
+        assert!(refusal.reason.contains("console") && refusal.reason.contains("Ctrl+Z"), "{refusal:?}");
         assert!(!refusal.reason.contains("review"), "{refusal:?}");
         let after = draft(&kernel, root).await.expect("refusal preserves the draft");
         assert_eq!(after.id, before.id);

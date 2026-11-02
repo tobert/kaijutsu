@@ -68,6 +68,7 @@ mod schema;
 mod migrate_senpai;
 mod migrate_context_characters;
 mod migrate_fold;
+mod migrate_console;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]

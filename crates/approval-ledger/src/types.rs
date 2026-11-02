@@ -75,7 +75,7 @@ pub enum Origin {
     ShellGate,
     /// A privileged `kj` verb (e.g. `context archive`) gated itself.
     KjVerb,
-    /// A drift into the ROOT console waits for its human; approval releases
+    /// A drift into the console waits for its human; approval releases
     /// the held drift block and never executes source.
     Drift,
 }

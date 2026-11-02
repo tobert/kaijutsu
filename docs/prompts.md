@@ -209,7 +209,7 @@ the reviewer follows that edge
 the model turn refuses missing or self-reviewing identities. This does not
 load a character rc bundle. See `docs/character.md`, "Current implementation".
 
-Director's stance and the shared `S16-handoff.kai` read `played_by_name` from
+Director's stance and the shared `S16-handoff.kai` read `performer_name` from
 context metadata. The handoff script reads that character's log, or the caller's
 log when no performer is recorded. `KJ_CHARACTER` was an environment bridge;
 new create instructions no longer use it. Existing stored instructions are
@@ -485,7 +485,7 @@ A submit either commits or is refused with nothing changed
 (`prompt::submit`). A context with no performer or no reviewer is refused
 before the draft commits, so the draft stays as typed. The human root runs
 no model turns, so a chat submit there is refused with a reason that points
-to the `ROOT` console and `Ctrl+Z`. Turn identity refusals reach the client
+to the console and `Ctrl+Z`. Turn identity refusals reach the client
 as `submitInput`'s refused outcome, not as an RPC failure. Once the input
 commits, `submitInput` returns its block at once, and the `submit` scripts
 and turn startup run after the reply. A turn that then fails to start is

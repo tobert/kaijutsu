@@ -40,7 +40,7 @@ impl KernelDb {
     }
 
     /// Test fixture: record that `context` should answer to `senpai`.
-    /// [`Self::update_played_by`] gives the context character this senpai when
+    /// [`Self::update_performer`] gives the context character this senpai when
     /// it writes it, and a context that already has one is moved at once, so a
     /// fixture may build a chain in either order. The note lives in a
     /// temporary table of this connection.
@@ -96,7 +96,7 @@ impl KernelDb {
     /// alone; a different character rewrites it (see
     /// [`Self::recast_test_character`]) and `None` refuses.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn update_played_by(
+    pub fn update_performer(
         &self,
         id: ContextId,
         played_by: Option<PrincipalId>,
@@ -213,7 +213,7 @@ impl KernelDb {
     }
 
     /// Test fixture: give `id` a stand-in context character of `played_by`,
-    /// which a later [`Self::update_played_by`] or [`Self::assign_test_review`]
+    /// which a later [`Self::update_performer`] or [`Self::assign_test_review`]
     /// naming another character replaces. For helpers that register a context
     /// before a test says who runs it.
     #[cfg(any(test, feature = "test-util"))]
