@@ -833,7 +833,7 @@ pub(crate) async fn plan_context_seats(
         .map_err(|e| format!("context {} cannot be read: {e}", context.short()))?
         .ok_or_else(|| format!("context {} has no row", context.short()))?;
     let Some(council) = config.council_for(Some(&row.context_type)) else { return Ok((Vec::new(), None)) };
-    let (routed, chain) = match super::gate::seat_route(&db, council, context, row.played_by)? {
+    let (routed, chain) = match super::gate::seat_route(&db, council, context, row.performer)? {
         super::gate::SeatRoute::NoCouncil => return Ok((Vec::new(), None)),
         super::gate::SeatRoute::Council(routed, chain) => (routed, chain),
     };

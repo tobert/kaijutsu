@@ -412,15 +412,14 @@ impl KernelDb {
     /// `kj character retire` archives.
     pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label,
+            "SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at,
-             origin_host, ", performer_sql!("contexts"), " AS played_by
+             origin_host, performer, senpai_ctx, persona
              FROM contexts
-             WHERE context_id IN (SELECT context_id FROM context_characters WHERE principal_id = ?1)
-               AND archived_at IS NULL"),
+             WHERE performer = ?1 AND archived_at IS NULL",
         )?;
         let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_context_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)

@@ -3,7 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, PrincipalId};
 
-use crate::kernel_db::{ContextCharacterRow, ContextRow, ContextShellRow, DemoteOutcome, GovernedAct, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
+use crate::kernel_db::{ContextRow, ContextShellRow, DemoteOutcome, GovernedAct, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
 use super::format::{
     ContextBound, format_context_info, format_context_table, format_context_tree, format_fork_lineage,
@@ -357,8 +357,9 @@ struct EgressAssignment {
 /// (`docs/senpai-kohai.md`, "Creating, forking, rotating").
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CharacterPlacement {
-    /// The context has no context character (a handoff log, scratch).
-    None,
+    /// The context has no performer (a handoff log, scratch) and answers to
+    /// `senpai`.
+    Senpai(ContextId),
     /// The context is a new context character of `performer`, under
     /// `senpai`, with the character's model and slots copied fresh.
     Start { performer: kaijutsu_types::PrincipalId, senpai: Option<ContextId> },
@@ -420,16 +421,21 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             live_character(performer)?;
             Some(performer)
         }
-        CharacterPlacement::None | CharacterPlacement::Fork { .. } => None,
+        CharacterPlacement::Senpai(_) | CharacterPlacement::Fork { .. } => None,
     };
     db.insert_context_with_document(row, default_ws)?;
     match placement {
-        CharacterPlacement::None => {}
+        CharacterPlacement::Senpai(senpai) => {
+            db.check_senpai_edge(row.context_id, &row.context_type, None, Some(senpai))?;
+            db.set_context_senpai(row.context_id, Some(senpai))?;
+        }
         CharacterPlacement::Start { performer, senpai } => {
             db.write_context_character(row.context_id, performer, senpai, None)?;
         }
         CharacterPlacement::Rotate { predecessor } => {
             let predecessor = db.require_context_character(predecessor)?;
+            // Only a root console rotates into a context with no senpai.
+            db.check_senpai_edge(row.context_id, &row.context_type, Some(predecessor.principal_id), predecessor.senpai_ctx)?;
             db.write_context_character(row.context_id, predecessor.principal_id, predecessor.senpai_ctx, predecessor.persona.as_deref())?;
         }
         CharacterPlacement::Fork { source } => {
@@ -846,7 +852,7 @@ impl KjDispatcher {
             // Resolve the performer's name for live and archived contexts.
             // Retirement preserves both the sheet and this relationship.
             let played_by_name = row
-                .played_by
+                .performer
                 .and_then(|pid| db.get_character(pid).ok().flatten())
                 .map(|c| c.name);
 
@@ -1008,18 +1014,14 @@ impl KjDispatcher {
         if let Some(review) = effective_review.as_ref() {
             info.push_str(&format!("\nReviewer: {} ({})", review.reviewer.name, review.source.as_str()));
         }
-        // The context this one answers to, with its character. A context with
-        // no context character has none; a root console has a character but
-        // no senpai.
+        // The context this one answers to, with its character. Only a root
+        // console has no senpai.
         let edge = {
             let db = self.kernel_db().lock();
             let found = (|| -> Result<_, String> {
-                let Some(character) = db.context_character(row.context_id).map_err(|e| e.to_string())? else {
-                    return Ok(None);
-                };
-                let senpai = match character.senpai_ctx {
-                    Some(id) => Some(db.context_character(id).map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("senpai {} has no context character", db.context_name(id)))?),
+                let senpai = match row.senpai_ctx {
+                    Some(id) => Some(db.get_context(id).map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("senpai {} has no row", id.short()))?),
                     None => None,
                 };
                 let root = db.lineage_root(row.context_id).map(|root| (root, db.name_for(root))).map_err(|e| e.to_string());
@@ -1085,8 +1087,8 @@ impl KjDispatcher {
             // The character whose performance this context is, and its
             // kernel-owned name — `null` together when nobody plays it (a
             // score context, a file document, a pre-character row). See
-            // `ContextRow::played_by`'s doc comment.
-            "played_by": row.played_by.map(|id| id.to_hex()),
+            // `ContextRow::performer`'s doc comment.
+            "played_by": row.performer.map(|id| id.to_hex()),
             "played_by_name": played_by_name,
             // The model the context's slot gives its type. Both
             // `resolved_backend` and `resolved_model` are `null` together
@@ -1278,7 +1280,7 @@ impl KjDispatcher {
                 }
                 Ok(crate::llm::CharacterIdentity { principal_id, name: sheet.name })
             };
-            let performer = match row.played_by.map(character).transpose() {
+            let performer = match row.performer.map(character).transpose() {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -1542,15 +1544,6 @@ impl KjDispatcher {
                     ),
                 },
             };
-            match db.context_character(context) {
-                Ok(Some(_)) => {}
-                Ok(None) => return KjResult::Err(format!(
-                    "kj context create: context {} has no context character, so nothing can answer to it; \
-                     name a context that has one with --senpai",
-                    db.context_name(context)
-                )),
-                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
-            }
             // By default, anyone may start a kohai in a root's own console
             // (the gate's ask to the root is the control there), and a
             // context's own rc lifecycle may start one under itself, as it
@@ -1689,7 +1682,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             };
             let db = self.kernel_db().lock();
             let mut row = row;
@@ -1949,6 +1942,12 @@ impl KjDispatcher {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context scratch: {e}")),
             };
+            // Scratch answers to the root console above the context that
+            // asked for it, else the only live root's.
+            let senpai = match db.default_console_for(caller.context_id) {
+                Ok(console) => console,
+                Err(e) => return KjResult::Err(format!("kj context scratch: {e}")),
+            };
             let row = ContextRow {
                 context_id: new_id,
                 label: Some(SCRATCH_LABEL.to_string()),
@@ -1968,9 +1967,9 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: Some(senpai), persona: None,
             };
-            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+            if let Err(e) = db.insert_placed_context(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
             }
         }
@@ -2001,22 +2000,6 @@ impl KjDispatcher {
         }
     }
 
-    /// Whether `target` is an `mcp` context whose character is the caller's
-    /// actor. A character may archive such a context beside the authority
-    /// rule, so an MCP client ends its own session
-    /// (`docs/senpai-kohai.md`, "MCP sessions").
-    fn plays_mcp_context(&self, target: ContextId, caller: &KjCaller) -> Result<bool, String> {
-        let db = self.kernel_db().lock();
-        let checked = (|| -> crate::kernel_db::KernelDbResult<bool> {
-            let Some(row) = db.get_context(target)? else { return Ok(false) };
-            if row.context_type != "mcp" {
-                return Ok(false);
-            }
-            Ok(db.context_character(target)?.is_some_and(|c| c.principal_id == caller.actor_id))
-        })();
-        checked.map_err(|e| format!("could not check authority to archive it: {e}"))
-    }
-
     /// The authority rule for a verb nested in an rc lifecycle, with the
     /// context whose lifecycle runs as the actor: passes only when the
     /// target's senpai is that context (its kohai, such as a judge shadow).
@@ -2036,7 +2019,7 @@ impl KjDispatcher {
             let row = db.get_context(target)?.ok_or_else(|| crate::kernel_db::KernelDbError::NotFound(format!(
                 "context {} has no row to check authority over", target.short()
             )))?;
-            if db.context_character(target)?.is_some_and(|character| character.senpai_ctx == Some(seat)) {
+            if row.senpai_ctx == Some(seat) {
                 return Ok(Ok(()));
             }
             let seat_label = db.get_context(seat)?.and_then(|r| r.label).unwrap_or_else(|| seat.short());
@@ -2318,13 +2301,7 @@ impl KjDispatcher {
         let authority = if in_rc_lifecycle {
             self.require_lifecycle_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
         } else {
-            match self.plays_mcp_context(target_id, caller) {
-                Ok(true) => Ok(()),
-                Ok(false) => self
-                    .require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
-                    .map(|_| ()),
-                Err(e) => Err(e),
-            }
+            self.require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive).map(|_| ())
         };
         if let Err(refusal) = authority {
             return KjResult::Err(format!("kj context archive: {refusal}"));
@@ -2427,9 +2404,9 @@ impl KjDispatcher {
     /// inspection. The hydration window is not copied: its marker names a
     /// block in the predecessor.
     ///
-    /// A character's handoff log has no context character: its rotation
+    /// A character's handoff log has no performer: its rotation
     /// points `characters.handoff_ctx` at the successor and checks no loadout.
-    /// Any other context with no context character refuses.
+    /// Any other context with no performer refuses.
     async fn context_rotate(&self, ctx_ref: Option<&str>, caller: &KjCaller) -> KjResult {
         let (predecessor, character, handoff_owner) = {
             let db = self.kernel_db().lock();
@@ -2486,14 +2463,20 @@ impl KjDispatcher {
                         Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
                     }
                 }
-                CharacterPlacement::None
+                match predecessor.senpai_ctx {
+                    Some(senpai) => CharacterPlacement::Senpai(senpai),
+                    None => return KjResult::Err(format!(
+                        "kj context rotate: {name} has no senpai for its successor to answer to; \
+                         `kj context move` gives it one"
+                    )),
+                }
             }
             (None, None) => return KjResult::Err(format!(
-                "kj context rotate: {name} has no context character and is no character's handoff log, \
+                "kj context rotate: {name} has no performer and is no character's handoff log, \
                  so there is no character to give a successor to"
             )),
         };
-        let is_handoff_log = matches!(placement, CharacterPlacement::None);
+        let is_handoff_log = matches!(placement, CharacterPlacement::Senpai(_));
 
         let successor_id = ContextId::new();
         let parent = predecessor.forked_from;
@@ -2510,7 +2493,7 @@ impl KjDispatcher {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
             ..predecessor.clone()
         };
         let admission = {
@@ -2684,7 +2667,7 @@ impl KjDispatcher {
                     row.context_type
                 ));
             }
-            if caller.context_id == Some(target_id) || row.played_by == Some(caller.actor_id) {
+            if caller.context_id == Some(target_id) || row.performer == Some(caller.actor_id) {
                 return refuse(format!(
                     "{name} is this seat's own context, and no seat may {verb} itself. \
                      To have it done, ask ROOT, for example: kj drift push ROOT \"please {verb} {name}\""
@@ -3034,31 +3017,30 @@ where
     )
 }
 
-/// The context a verb argument names, with its context character.
+/// The context a verb argument names, with its row.
 pub(super) fn resolve_character_arg(
     arg: Option<&str>,
     caller: &KjCaller,
     db: &KernelDb,
-) -> Result<(ContextId, ContextCharacterRow), String> {
+) -> Result<(ContextId, ContextRow), String> {
     let context = super::refs::resolve_context_arg(arg, caller, db)?;
-    let character = db.context_character(context).map_err(|e| e.to_string())?.ok_or_else(|| {
-        format!("{} has no context character, so it has no senpai and no kohai", db.context_name(context))
+    let row = db.get_context(context).map_err(|e| e.to_string())?.ok_or_else(|| {
+        format!("context {} has no row", context.short())
     })?;
-    Ok((context, character))
+    Ok((context, row))
 }
 
-/// `label (short-id), character` of the context.
-pub(super) fn context_line(db: &KernelDb, character: &ContextCharacterRow) -> String {
-    format!("{}, {}", db.context_name(character.context_id), db.name_for(character.principal_id))
+/// `label (short-id), character` of the context; `-` for a context with no performer.
+pub(super) fn context_line(db: &KernelDb, row: &ContextRow) -> String {
+    format!("{}, {}", db.context_name(row.context_id), row.performer.map_or_else(|| "-".to_string(), |p| db.name_for(p)))
 }
 
-pub(super) fn context_json(db: &KernelDb, character: &ContextCharacterRow) -> serde_json::Value {
-    let label = db.get_context(character.context_id).ok().flatten().and_then(|row| row.label);
+pub(super) fn context_json(db: &KernelDb, row: &ContextRow) -> serde_json::Value {
     serde_json::json!({
-        "context": character.context_id.to_hex(),
-        "label": label,
-        "character": db.name_for(character.principal_id),
-        "character_id": character.principal_id.to_hex(),
+        "context": row.context_id.to_hex(),
+        "label": row.label,
+        "character": row.performer.map(|p| db.name_for(p)),
+        "character_id": row.performer.map(|p| p.to_hex()),
     })
 }
 
@@ -3067,7 +3049,7 @@ impl KjDispatcher {
     /// under one lock and one transaction.
     fn context_move(&self, context: &str, senpai: &str, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let moved = (|| -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
+        let moved = (|| -> Result<(ContextRow, ContextRow), String> {
             let (target, _) = resolve_character_arg(Some(context), caller, &db)?;
             let (senpai, _) = resolve_character_arg(Some(senpai), caller, &db)?;
             db.in_transaction(|db| Ok(move_kohai(db, target, senpai, caller)))
@@ -3085,7 +3067,7 @@ impl KjDispatcher {
     /// `kj context kohai [<ctx>]`.
     fn context_kohai(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let listed = (|| -> Result<(ContextCharacterRow, Vec<ContextRow>), String> {
+        let listed = (|| -> Result<(ContextRow, Vec<ContextRow>), String> {
             let (context, row) = resolve_character_arg(context, caller, &db)?;
             Ok((row, db.list_kohai(context).map_err(|e| e.to_string())?))
         })();
@@ -3093,7 +3075,7 @@ impl KjDispatcher {
             Ok(listed) => listed,
             Err(e) => return KjResult::Err(format!("kj context kohai: {e}")),
         };
-        let character = |k: &ContextRow| k.played_by.map(|p| db.name_for(p));
+        let character = |k: &ContextRow| k.performer.map(|p| db.name_for(p));
         let mut lines = Vec::with_capacity(kohai.len() + 1);
         if kohai.is_empty() {
             lines.push(format!("{} has no live kohai", db.context_name(row.context_id)));
@@ -3122,9 +3104,9 @@ fn move_kohai(
     target: ContextId,
     senpai: ContextId,
     caller: &KjCaller,
-) -> Result<(ContextCharacterRow, ContextCharacterRow), String> {
-    let row = db.context_character(target).map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{} has no context character", db.context_name(target)))?;
+) -> Result<(ContextRow, ContextRow), String> {
+    let row = db.get_context(target).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("context {} has no row", target.short()))?;
     if db.is_root_console(target).map_err(|e| e.to_string())? {
         return Err(format!(
             "{} is a root console, the top of its lineage, and has no senpai to move to; `kj context rotate` replaces it",
@@ -3138,27 +3120,28 @@ fn move_kohai(
             db.context_name(target)
         ));
     }
-    let senpai_row = db.context_character(senpai).map_err(|e| e.to_string())?.ok_or_else(|| {
-        format!(
-            "{} has no context character, so nobody would answer for {}",
-            db.context_name(senpai), db.context_name(target)
-        )
-    })?;
+    let senpai_row = db.get_context(senpai).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("senpai {} has no row", senpai.short()))?;
     db.context_authority(target, caller.actor_id, GovernedAct::Move).map_err(|e| e.to_string())??;
     db.may_place_under(senpai, caller.actor_id).map_err(|e| e.to_string())??;
-    let archived = db.get_context(senpai).map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("senpai {} has no row", senpai.short()))?
-        .is_archived();
-    if archived {
+    if senpai_row.is_archived() {
         return Err(format!(
             "{} is archived; a context answers to a live senpai, or `kj context promote` it first",
             db.context_name(senpai)
         ));
     }
-    let live = db.get_character(senpai_row.principal_id).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none());
+    // The holder is the senpai's performer, or the nearest performer above it.
+    let holder = match senpai_row.performer {
+        Some(performer) => Some(performer),
+        None => db.senpai_holder(senpai).map_err(|e| e.to_string())?.map(|(_, performer)| performer),
+    };
+    let live = match holder {
+        Some(holder) => db.get_character(holder).map_err(|e| e.to_string())?.is_some_and(|c| c.retired_at.is_none()),
+        None => false,
+    };
     if !live {
         return Err(format!(
-            "{} has no live holder: its character is retired, so nobody would answer for {}",
+            "{} has no live holder: its character is retired or it has none, so nobody would answer for {}",
             db.context_name(senpai), db.context_name(target)
         ));
     }
@@ -3179,7 +3162,7 @@ fn move_kohai(
         return Err(format!("settle or cancel the pending asks of {} before moving it", db.context_name(target)));
     }
     db.set_context_senpai(target, Some(senpai)).map_err(|e| e.to_string())?;
-    let moved = db.context_character(target).map_err(|e| e.to_string())?.unwrap_or(row);
+    let moved = db.get_context(target).map_err(|e| e.to_string())?.unwrap_or(row);
     Ok((moved, senpai_row))
 }
 
@@ -3365,6 +3348,7 @@ mod tests {
         // context the first time and is a read on subsequent calls.
         let d = test_dispatcher().await;
         let c = test_caller();
+        let (_, console) = d.kernel_db().lock().seed_test_root_console().unwrap();
 
         let first = d.dispatch(&[s("context"), s("scratch")], &c).await;
         assert!(first.is_ok(), "first call failed: {}", first.message());
@@ -3384,7 +3368,7 @@ mod tests {
             second.message()
         );
         let scratch = d.kernel_db().lock().find_context_by_label("scratch").unwrap().unwrap();
-        assert_eq!(d.kernel_db().lock().senpai_of(scratch.context_id).unwrap(), None, "scratch is a system context with no parent and no senpai");
+        assert_eq!(d.kernel_db().lock().senpai_of(scratch.context_id).unwrap(), Some(console), "scratch answers to the only live root's console");
     }
 
     #[tokio::test]
@@ -3751,7 +3735,7 @@ mod tests {
             }
         }
         let row = d.kernel_db().lock().get_context(lane).unwrap().unwrap();
-        assert_eq!(row.played_by, Some(coder));
+        assert_eq!(row.performer, Some(coder));
         assert!(d.kernel_db().lock().list_context_egress(lane).unwrap().is_empty());
 
         for (allowed, host) in [(banto, "crates.io"), (amy, "example.org")] {
@@ -3761,8 +3745,9 @@ mod tests {
         assert_eq!(d.kernel_db().lock().list_context_egress(lane).unwrap(), vec!["crates.io".to_string(), "example.org".to_string()]);
     }
 
-    /// Rotate and archive follow the same rule. A sibling may do neither;
-    /// the lane's own performer may not archive it; the senpai's holder may.
+    /// Rotate and archive follow the same rule. A sibling may do neither; the
+    /// senpai's holder may do both, and the lane's own performer archives it
+    /// too (`a_performer_archives_its_own_context_of_any_type`).
     #[tokio::test]
     async fn rotate_and_archive_follow_the_one_authority_rule() {
         let d = test_dispatcher().await;
@@ -3772,24 +3757,25 @@ mod tests {
         let rotate = d.dispatch(&[s("context"), s("rotate"), lane.to_hex()], &caller(sibling)).await;
         assert!(!rotate.is_ok());
         assert_eq!(rotate.message(), format!("kj context rotate: {}; its performer may also rotate it", rule("rotate it")));
-        for refused in [sibling, coder] {
-            let archive = d.dispatch(&[s("context"), s("archive"), lane.to_hex()], &confirmed(refused)).await;
-            assert!(!archive.is_ok());
-            assert_eq!(archive.message(), format!("kj context archive: {}", rule("archive it")));
-        }
+        let _ = coder;
+        let archive = d.dispatch(&[s("context"), s("archive"), lane.to_hex()], &confirmed(sibling)).await;
+        assert!(!archive.is_ok());
+        assert_eq!(archive.message(), format!(
+            "kj context archive: only lane ({})'s senpai (banto), its own performer (coder), or its lineage root (amy) may archive it",
+            lane.short()
+        ));
         assert!(!d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
         let archive = d.dispatch(&[s("context"), s("archive"), lane.to_hex()], &confirmed(banto)).await;
         assert!(archive.is_ok(), "{}", archive.message());
         assert!(d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
     }
 
-    /// A character may archive an `mcp` context it plays, and only that one:
-    /// not a context of another type it plays, and not another character's
-    /// `mcp` context.
+    /// A context's own performer archives it, whatever its type (an MCP
+    /// client ends its own session this way); another character does not.
     ///
-    /// Falsified by dropping the `mcp` arm from `context_archive`.
+    /// Falsified by dropping the `OwnPerformer` arm from `context_authority`.
     #[tokio::test]
-    async fn a_character_archives_its_own_mcp_context_and_no_other() {
+    async fn a_performer_archives_its_own_context_of_any_type() {
         let d = test_dispatcher().await;
         let (lane, [_amy, _banto, coder, sibling], caller) = authority_fixture(&d);
         let confirmed = |actor| crate::kj::KjCaller { confirmed: true, ..caller(actor) };
@@ -3799,15 +3785,13 @@ mod tests {
             async move { d.dispatch(&[s("context"), s("archive"), target.to_hex()], &call).await }
         };
 
-        let refused = archive(lane, coder).await;
-        assert!(!refused.is_ok(), "a lane of another type stays the senpai's to archive");
-        d.kernel_db().lock().update_context_type(lane, "mcp").unwrap();
-
-        let other = archive(lane, sibling).await;
-        assert!(!other.is_ok(), "another character's mcp context is not archived by a character that does not play it");
-        assert!(other.message().contains("may archive it"), "{}", other.message());
-        assert!(!d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
-
+        for context_type in ["mcp", "coder"] {
+            d.kernel_db().lock().update_context_type(lane, context_type).unwrap();
+            let other = archive(lane, sibling).await;
+            assert!(!other.is_ok(), "{context_type}: another character does not archive it");
+            assert!(other.message().contains("may archive it"), "{}", other.message());
+            assert!(!d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
+        }
         let own = archive(lane, coder).await;
         assert!(own.is_ok(), "{}", own.message());
         assert!(d.kernel_db().lock().get_context(lane).unwrap().unwrap().is_archived());
@@ -4041,7 +4025,7 @@ mod tests {
         assert!(refused.message().contains("unexpected argument"), "{}", refused.message());
         let help = d.dispatch(&[s("context"), s("set"), s("--help")], &caller).await;
         assert!(!help.message().contains("--as"), "{}", help.message());
-        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().played_by, Some(coder));
+        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().performer, Some(coder));
     }
 
     /// Another live root, outside the target's lineage, has no authority
@@ -4243,6 +4227,7 @@ mod tests {
         let seat = register_context(&d, Some("banto"), Some(root), amy);
         let db = d.kernel_db().lock();
         db.update_played_by(root, Some(amy)).unwrap();
+        db.update_context_type(root, kaijutsu_types::ROOT_CONTEXT_TYPE).unwrap();
         db.seed_test_slots(banto, "mock", "mock-banto", &["default"]).unwrap();
         db.update_played_by(seat, Some(banto)).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
@@ -4290,7 +4275,7 @@ mod tests {
         assert!(new.promoted_at.is_some(), "the successor takes the ring seat");
         assert_eq!(new.forked_from, Some(f.root), "created from the predecessor's own parent");
         assert_eq!(new.context_type, before.context_type);
-        assert_eq!(new.played_by, before.played_by);
+        assert_eq!(new.performer, before.performer);
         assert_eq!(db.senpai_of(successor).unwrap(), db.senpai_of(before.context_id).unwrap());
         assert_eq!(new.system_prompt.as_deref(), Some("seat prompt"));
         assert_eq!(new.workspace_id, before.workspace_id);
@@ -4378,7 +4363,7 @@ mod tests {
         let successor = db.get_character(f.amy).unwrap().unwrap().root_ctx.unwrap();
         assert_ne!(successor, f.root);
         let row = db.get_context(successor).unwrap().unwrap();
-        assert_eq!((row.forked_from, row.label.as_deref(), row.played_by), (None, Some("amy"), Some(f.amy)));
+        assert_eq!((row.forked_from, row.label.as_deref(), row.performer), (None, Some("amy"), Some(f.amy)));
         assert_eq!(db.lineage_root(f.seat).unwrap(), f.amy, "children of the archived root keep their lineage root");
     }
 
@@ -4456,7 +4441,7 @@ mod tests {
         let bare = register_context(&f.d, Some("bare-no-context-character"), None, f.amy);
         let refused = f.d.dispatch(&[s("context"), s("rotate"), bare.to_hex()], &rotation_caller(f.root, f.banto)).await;
         assert!(!refused.is_ok(), "{}", refused.message());
-        assert!(refused.message().contains("has no context character") && refused.message().contains("handoff log"), "{}", refused.message());
+        assert!(refused.message().contains("has no performer") && refused.message().contains("handoff log"), "{}", refused.message());
         assert!(f.d.kernel_db().lock().get_context(bare).unwrap().unwrap().archived_at.is_none());
 
         let rotated = f.d.dispatch(&[s("context"), s("rotate"), log.to_hex()], &rotation_caller(f.root, f.banto)).await;
@@ -4648,6 +4633,7 @@ mod tests {
         }).unwrap();
         let parent = register_context(&d, Some("parent-operator"), None, caller.principal_id);
         d.kernel_db().lock().update_played_by(parent, Some(caller.principal_id)).unwrap();
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         caller.context_id = Some(parent);
         let note = d.dispatch(
             &[s("handoff"), s("note"), s("--for"), s("banto"), s("remember-the-operator-task")],
@@ -4675,7 +4661,7 @@ mod tests {
             let id = db.resolve_context("operator").unwrap();
             let row = db.get_context(id).unwrap().unwrap();
             assert_eq!(row.created_by, caller.principal_id);
-            assert_eq!(row.played_by, Some(actor));
+            assert_eq!(row.performer, Some(actor));
             assert_eq!(row.context_type, "director");
             id
         };
@@ -4787,7 +4773,7 @@ mod tests {
                 context_state: ContextState::Live, context_type: s("default"), created_at: 1, created_by: amy,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
                 concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                origin_host: None, played_by: None,
+                origin_host: None, performer: None, senpai_ctx: None, persona: None,
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
@@ -4890,7 +4876,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         };
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("performer must name a live character"), "{error}");
@@ -4934,7 +4920,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         };
         let top = register_context(&d, Some("held-by-performer"), None, amy);
         d.kernel_db().lock().assign_stand_in_character(top, performer).unwrap();
@@ -4982,7 +4968,7 @@ mod tests {
             context_id, label: Some(s("topless-start")), system_prompt: None, context_state: ContextState::Live,
             context_type: s("default"), created_at: 1, created_by: test_reviewer_principal(), forked_from: None,
             fork_kind: None, archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
-            last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None, origin_host: None, played_by: None,
+            last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
         };
         let error = insert_new_context_checked(&d.kernel_db().lock(), &row, CharacterPlacement::Start { performer, senpai: None }).unwrap_err();
         assert!(error.to_string().contains("root console"), "{error}");
@@ -5001,14 +4987,14 @@ mod tests {
             context_id: ContextId::new(), label: Some(label.to_string()), system_prompt: None, context_state: ContextState::Live,
             context_type: s("default"), created_at: 1, created_by: amy, forked_from: None, fork_kind: None, archived_at: None,
             workspace_id: None, preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
-            demoted_at: None, paused_at: None, origin_host: None, played_by: None,
+            demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
         };
         let kohai = row("root-kohai");
         let error = insert_new_context_checked(&d.kernel_db().lock(), &kohai, CharacterPlacement::Start { performer: amy, senpai: Some(root) }).unwrap_err();
         assert!(error.to_string().contains("cannot review its own work"), "{error}");
         assert!(d.kernel_db().lock().get_context(kohai.context_id).unwrap().is_none(), "nothing was inserted");
 
-        let successor = row("root-successor");
+        let successor = crate::kernel_db::ContextRow { context_type: s(kaijutsu_types::ROOT_CONTEXT_TYPE), ..row("root-successor") };
         insert_new_context_checked(&d.kernel_db().lock(), &successor, CharacterPlacement::Rotate { predecessor: root })
             .expect("a root rotates its own console");
     }

@@ -329,7 +329,7 @@ impl KernelDb {
     }
 
     /// Drop what context characters replaced (`docs/senpai-kohai.md`,
-    /// "Removed"), in one transaction: `contexts.{senpai_ctx, played_by,
+    /// "Removed"), in one transaction: `contexts.{played_by,
     /// cast_id, provider, model}`, `presets.{cast_id, system_prompt}` and the
     /// table `llm_defaults`; and rename `characters.default_cast_id` to
     /// `characters.cast_id`. Runs only once
@@ -366,7 +366,6 @@ impl KernelDb {
         }
         let mut dropped = Vec::new();
         for (table, column) in [
-            ("contexts", "senpai_ctx"),
             ("contexts", "played_by"),
             ("contexts", "cast_id"),
             ("contexts", "provider"),

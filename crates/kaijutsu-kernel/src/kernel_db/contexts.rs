@@ -55,11 +55,15 @@ pub struct ContextRow {
     /// `kj context list`).
     pub origin_host: Option<String>,
     /// The character whose performance this context is, or `None` for a
-    /// context with no context character (a score context, a file document,
-    /// the handoff log). Read from the context's context character; no
-    /// column stores it, and `write_context` refuses a row that sets it. See
+    /// context that runs no turns (a score context, a file document, the
+    /// handoff log, the MCP hub). Fixed once set. See
     /// `docs/senpai-kohai.md`, "The model".
-    pub played_by: Option<PrincipalId>,
+    pub performer: Option<PrincipalId>,
+    /// The context this one answers to. `None` only for a character's root
+    /// console (`docs/senpai-kohai.md`, "The model").
+    pub senpai_ctx: Option<ContextId>,
+    /// The performer's persona for this context; `None` until characters have one.
+    pub persona: Option<String>,
 }
 
 impl ContextRow {
@@ -117,6 +121,18 @@ impl KernelDb {
         self.insert_context(row)
     }
 
+    /// [`Self::insert_context_with_document`] for a creator that places the
+    /// context as it is made: the row carries its `senpai_ctx`, and a row with
+    /// none is refused unless its performer is a root character (a root
+    /// console; `characters.root_ctx` is pointed at it after the insert).
+    /// Every production creator of a context goes through this check or
+    /// through `insert_new_context_rows`, which applies it too
+    /// ([`Self::check_senpai_edge`]).
+    pub fn insert_placed_context(&self, row: &ContextRow, default_workspace_id: WorkspaceId) -> KernelDbResult<()> {
+        self.check_senpai_edge(row.context_id, &row.context_type, row.performer, row.senpai_ctx)?;
+        self.insert_context_with_document(row, default_workspace_id)
+    }
+
     /// Insert a new context.
     ///
     /// The corresponding document row must already exist (FK enforced).
@@ -131,13 +147,6 @@ impl KernelDb {
         if let Some(ref label) = row.label {
             validate_label(label)?;
         }
-        if row.played_by.is_some() {
-            return Err(KernelDbError::Validation(format!(
-                "context {} sets played_by, which is read from its context character; write the context character instead",
-                row.context_id.short()
-            )));
-        }
-
         conn.execute(
                 "INSERT INTO contexts (
                 context_id, label,
@@ -145,14 +154,14 @@ impl KernelDb {
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at,
-                origin_host
+                origin_host, performer, senpai_ctx, persona
             ) VALUES (
                 ?1, ?2,
                 ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17,
-                ?18
+                ?18, ?19, ?20, ?21
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -173,6 +182,9 @@ impl KernelDb {
                     row.demoted_at,
                     row.paused_at,
                     row.origin_host,
+                    row.performer.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.senpai_ctx.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.persona,
                 ],
             )
             .map_err(|e| {
@@ -188,12 +200,12 @@ impl KernelDb {
     /// Get a context by ID.
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label,
+            "SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
-             FROM contexts WHERE context_id = ?1"),
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
+             FROM contexts WHERE context_id = ?1",
         )?;
 
         let mut rows = stmt.query(params![blob_param(id.as_bytes())])?;
@@ -320,14 +332,14 @@ impl KernelDb {
     /// List active (non-archived) contexts.
     pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label,
+            "SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
              FROM contexts
              WHERE archived_at IS NULL
-             ORDER BY COALESCE(last_activity_at, created_at)"),
+             ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
 
         let rows = stmt.query_map([], row_to_context_row)?;
@@ -337,13 +349,13 @@ impl KernelDb {
     /// List all contexts (including archived).
     pub fn list_all_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label,
+            "SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
              FROM contexts
-             ORDER BY COALESCE(last_activity_at, created_at)"),
+             ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
 
         let rows = stmt.query_map([], row_to_context_row)?;
@@ -390,12 +402,12 @@ impl KernelDb {
     /// archived rows carry it, so the label is free to give again.
     pub fn find_context_by_label(&self, label: &str) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT context_id, label,
+            "SELECT context_id, label,
                     system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, ", performer_sql!("contexts"), " AS played_by
-             FROM contexts WHERE label = ?1 AND archived_at IS NULL"),
+                    last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
+             FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
         let mut rows = stmt.query(params![label])?;

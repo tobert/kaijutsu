@@ -49,9 +49,8 @@ pub enum Authority {
     SenpaiHolder,
     /// The actor is the context's lineage root.
     LineageRoot,
-    /// The actor is a live root character archiving a context with no
-    /// context character, which has no senpai and no lineage root.
-    LiveRoot,
+    /// The actor performs the context and archives it.
+    OwnPerformer,
 }
 
 /// One request to [`KernelDb::route_review`].
@@ -122,9 +121,8 @@ impl EffectiveReviewer {
 }
 
 impl KernelDb {
-    /// The character that answers for `context`: the principal of its
-    /// context character (`docs/senpai-kohai.md`, "The model"). `None` when
-    /// the context has none.
+    /// The character that answers for `context`: its performer
+    /// (`docs/senpai-kohai.md`, "The model"). `None` when the context has none.
     pub fn context_holder(&self, context: ContextId) -> KernelDbResult<Option<PrincipalId>> {
         Ok(self.context_character(context)?.map(|cc| cc.principal_id))
     }
@@ -137,10 +135,43 @@ impl KernelDb {
         }
     }
 
-    /// The senpai context of `context`, or `None` for a top or a context with
-    /// no context character.
+    /// The senpai context of `context`, or `None` for a root console (or a
+    /// context with no row).
     pub fn senpai_of(&self, context: ContextId) -> KernelDbResult<Option<ContextId>> {
-        Ok(self.context_character(context)?.and_then(|cc| cc.senpai_ctx))
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT senpai_ctx FROM contexts WHERE context_id = ?1",
+                params![blob_param(context.as_bytes())],
+                |r| read_opt_context_id(r, 0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// The nearest performer on the senpai chain strictly above `context`,
+    /// climbing past senpais with no performer: the context that holds it and
+    /// the performer. `None` when the chain ends without one. A senpai cycle is
+    /// corruption and refuses.
+    pub fn senpai_holder(&self, context: ContextId) -> KernelDbResult<Option<(ContextId, PrincipalId)>> {
+        let mut visited = HashSet::from([context]);
+        let mut at = self.senpai_of(context)?;
+        while let Some(senpai) = at {
+            if !visited.insert(senpai) {
+                return Err(KernelDbError::Corrupt(format!(
+                    "context {} is its own senpai ancestor; the senpai chain has a cycle",
+                    self.context_name(senpai)
+                )));
+            }
+            let row = self
+                .get_context(senpai)?
+                .ok_or_else(|| KernelDbError::NotFound(format!("senpai context {}", senpai.short())))?;
+            if let Some(performer) = row.performer {
+                return Ok(Some((senpai, performer)));
+            }
+            at = row.senpai_ctx;
+        }
+        Ok(None)
     }
 
     /// The live kohai of `context`: the contexts whose senpai it is, oldest
@@ -158,36 +189,33 @@ impl KernelDb {
     /// Route a review: the one resolver behind every reviewer decision
     /// (`docs/senpai-kohai.md`, "Routing").
     ///
-    /// Let K be the ask's context. The reviewer is the character of K's
+    /// Let K be the ask's context. The reviewer is the performer of K's
     /// senpai context when it is live and is neither the actor nor the
     /// reviewer `past`; a character that is, is climbed past to its own
-    /// senpai. A retired character refuses by name: the climb never
-    /// substitutes another. At a context with no senpai (a root console)
-    /// the live root character that holds it confirms its own statement
-    /// when `confirm_at_top`; otherwise the climb refuses, naming the actor
-    /// and the context. A context with no context character refuses.
+    /// senpai, and so is a senpai with no performer. A retired character
+    /// refuses by name: the climb never substitutes another. At a context with
+    /// no senpai (a root console) the live root character that performs it
+    /// confirms its own statement when `confirm_at_top`; otherwise the climb
+    /// refuses, naming the actor and the context.
     ///
-    /// A missing context, a senpai with no context character and a senpai
-    /// cycle are corruption and are errors, never an exhausted climb.
+    /// A missing context, a senpai with no row and a senpai cycle are
+    /// corruption and are errors, never an exhausted climb.
     pub fn route_review(&self, query: ReviewQuery) -> KernelDbResult<EffectiveReviewer> {
         let ReviewQuery { from, actor, past, confirm_at_top } = query;
         let mut passed = past.is_none();
-        let (origin, mut below, mut senpai): (Option<ContextId>, Option<ContextCharacterRow>, Option<ContextId>) = match from {
+        let (origin, mut below, mut senpai): (Option<ContextId>, Option<ContextRow>, Option<ContextId>) = match from {
             ReviewFrom::Context(context) => {
-                if self.get_context(context)?.is_none() {
-                    return Err(KernelDbError::NotFound(format!(
-                        "context {} has no row to resolve a reviewer from", context.short()
-                    )));
-                }
-                let character = self.require_context_character(context)?;
-                let senpai = character.senpai_ctx;
-                (Some(context), Some(character), senpai)
+                let row = self.get_context(context)?.ok_or_else(|| {
+                    KernelDbError::NotFound(format!("context {} has no row to resolve a reviewer from", context.short()))
+                })?;
+                let senpai = row.senpai_ctx;
+                (Some(context), Some(row), senpai)
             }
             ReviewFrom::Senpai(context) => (None, None, Some(context)),
         };
         // The performer of the context the ask is raised in never reviews it,
         // whoever the actor is: a fork's performer is its source's holder.
-        let performer = below.as_ref().map(|row| row.principal_id);
+        let performer = below.as_ref().and_then(|row| row.performer);
         let mut visited = HashSet::new();
         if let Some(row) = &below {
             visited.insert(row.context_id);
@@ -210,11 +238,15 @@ impl KernelDb {
                     self.context_name(senpai_id)
                 )));
             }
-            let above = self.context_character(senpai_id)?.ok_or_else(|| KernelDbError::NotFound(format!(
-                "senpai {} has no context character, so the climb cannot continue", self.context_name(senpai_id)
-            )))?;
+            let above = self.get_context(senpai_id)?.ok_or_else(|| {
+                KernelDbError::NotFound(format!("senpai context {} has no row, so the climb cannot continue", senpai_id.short()))
+            })?;
             let under = below.as_ref().map_or_else(|| "the new context".to_string(), |b| self.context_name(b.context_id));
-            let holder = above.principal_id;
+            let Some(holder) = above.performer else {
+                senpai = above.senpai_ctx;
+                below = Some(above);
+                continue;
+            };
             if !passed {
                 // Still climbing to the context the current reviewer holds.
                 passed = Some(holder) == past;
@@ -244,7 +276,7 @@ impl KernelDb {
 
     /// The climb reached `at`, a context with no senpai. `origin` is the
     /// context the ask was raised in, when there is one.
-    pub(super) fn at_top(&self, at: &ContextCharacterRow, origin: Option<ContextId>, actor: PrincipalId, confirm_at_top: bool) -> KernelDbResult<EffectiveReviewer> {
+    pub(super) fn at_top(&self, at: &ContextRow, origin: Option<ContextId>, actor: PrincipalId, confirm_at_top: bool) -> KernelDbResult<EffectiveReviewer> {
         let name = origin.map_or_else(|| self.context_name(at.context_id), |context| self.context_name(context));
         if !confirm_at_top {
             return Err(KernelDbError::NoReviewerAbove(format!(
@@ -253,33 +285,43 @@ impl KernelDb {
             )));
         }
         match self.get_character(actor)? {
-            Some(sheet) if sheet.root && sheet.retired_at.is_none() && at.principal_id == actor => {
+            Some(sheet) if sheet.root && sheet.retired_at.is_none() && at.performer == Some(actor) => {
                 Ok(EffectiveReviewer::SelfConfirmation(actor))
             }
-            Some(sheet) if !sheet.root
-                && self.get_character(at.principal_id)?.is_some_and(|holder| holder.root && holder.retired_at.is_none()) =>
-            {
-                Ok(EffectiveReviewer::TopHolder(at.principal_id))
+            Some(sheet) if !sheet.root => {
+                let holder = match at.performer {
+                    Some(performer) => self.get_character(performer)?.filter(|holder| holder.root && holder.retired_at.is_none()),
+                    None => None,
+                };
+                match holder {
+                    Some(holder) => Ok(EffectiveReviewer::TopHolder(holder.principal_id)),
+                    None => Err(self.nobody_reviews(Some(sheet.name), actor, &name, at)),
+                }
             }
-            sheet => {
-                let who = sheet.map_or_else(|| actor.short(), |sheet| sheet.name);
-                Err(KernelDbError::Validation(format!(
-                    "nobody reviews {who} in context {name}: {} has no senpai above it, and only the live \
-                     root character holding a root console confirms its own statements; give the context a senpai \
-                     with `kj context move`",
-                    self.context_name(at.context_id)
-                )))
-            }
+            sheet => Err(self.nobody_reviews(sheet.map(|sheet| sheet.name), actor, &name, at)),
         }
     }
 
+    fn nobody_reviews(&self, who: Option<String>, actor: PrincipalId, name: &str, at: &ContextRow) -> KernelDbError {
+        let who = who.unwrap_or_else(|| actor.short());
+        KernelDbError::Validation(format!(
+            "nobody reviews {who} in context {name}: {} has no senpai above it, and only the live \
+             root character holding a root console confirms its own statements; give the context a senpai \
+             with `kj context move`",
+            self.context_name(at.context_id)
+        ))
+    }
+
     /// The root character at the top of `context_id`'s senpai chain: the
-    /// character of the context the chain ends at. The inner `Err` says why
+    /// performer of the context the chain ends at. The inner `Err` says why
     /// the lineage has no live root; the outer `Err` is a fault.
     pub(super) fn lineage_root_of_context(&self, context_id: ContextId) -> KernelDbResult<Result<PrincipalId, String>> {
-        let top = self.lineage_top(context_id)?;
-        let top_name = self.context_name(top.context_id);
-        Ok(match self.get_character(top.principal_id)? {
+        let (top, performer) = self.lineage_top(context_id)?;
+        let top_name = self.context_name(top);
+        let Some(performer) = performer else {
+            return Ok(Err(format!("the senpai chain ends at {top_name}, which is not a root console")));
+        };
+        Ok(match self.get_character(performer)? {
             Some(sheet) if !sheet.root => Err(format!(
                 "{} holds {top_name} at the top of this senpai chain and is not a root character",
                 sheet.name
@@ -288,7 +330,7 @@ impl KernelDb {
                 "root character {} is retired, so {top_name} has no lineage root",
                 sheet.name
             )),
-            Some(_) => Ok(top.principal_id),
+            Some(_) => Ok(performer),
             None => Err(format!("the character of {top_name} has no character sheet")),
         })
     }
@@ -298,20 +340,13 @@ impl KernelDb {
         if self.get_context(context_id)?.is_none() {
             return Err(KernelDbError::NotFound(format!("context {}", context_id.short())));
         }
-        match self.context_character(context_id)? {
-            Some(_) => self.lineage_root_of_context(context_id),
-            None => Ok(Err(format!(
-                "context {} has no context character",
-                self.context_name(context_id)
-            ))),
-        }
+        self.lineage_root_of_context(context_id)
     }
 
     /// The root character at the top of `context_id`'s senpai chain. It
     /// holds routing authority over every context in that lineage
     /// (`docs/approval-identity.md`). A top held by a non-root or a retired
-    /// root, a context with no context character, and a broken chain all
-    /// refuse.
+    /// root, a top with no performer, and a broken chain all refuse.
     pub fn lineage_root(&self, context_id: ContextId) -> KernelDbResult<PrincipalId> {
         match self.lineage_root_or_reason(context_id)? {
             Ok(root) => Ok(root),
@@ -320,8 +355,8 @@ impl KernelDb {
     }
 
     /// The lineage root, or `None` when the lineage legitimately has no live
-    /// root: the context has no context character, the top is not a root, is
-    /// retired, or has no sheet, and when `context_id` itself has no row
+    /// root: the top is not a root console, is not a root, is retired, or has
+    /// no sheet, and when `context_id` itself has no row
     /// (`approvals.context_id` has no foreign key, so an ask may outlive its
     /// context). A fault (a missing ancestor, a senpai cycle, a database
     /// error) is an `Err`, never `None`.
@@ -332,12 +367,51 @@ impl KernelDb {
         Ok(self.lineage_root_or_reason(context_id)?.ok())
     }
 
+    /// The root console a new performer-less context answers to when no
+    /// senpai was named (`docs/senpai-kohai.md`, "One senpai edge on every
+    /// context"): the console at the top of `origin`'s senpai chain, when
+    /// `origin` is the context the creating act ran in and that console is a
+    /// live root's; else the console of the only live root. A kernel with no
+    /// live root console, or several and no usable `origin`, refuses.
+    pub fn default_console_for(&self, origin: Option<ContextId>) -> KernelDbResult<ContextId> {
+        if let Some(origin) = origin
+            && self.get_context(origin)?.is_some()
+        {
+            let (top, performer) = self.lineage_top(origin)?;
+            if let Some(performer) = performer
+                && self.is_root_console(top)?
+                && self.get_character(performer)?.is_some_and(|sheet| sheet.root && sheet.retired_at.is_none())
+            {
+                return Ok(top);
+            }
+        }
+        let consoles: Vec<ContextId> = self
+            .list_characters(false)?
+            .into_iter()
+            .filter(|sheet| sheet.root)
+            .filter_map(|sheet| sheet.root_ctx)
+            .collect();
+        match consoles.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(KernelDbError::Validation(
+                "the kernel has no live root character with a console, so a new context has no senpai to answer to".into(),
+            )),
+            _ => Err(KernelDbError::Validation(format!(
+                "the kernel has {} live roots and the context it was made from reaches none of their consoles, \
+                 so a new context has no senpai to answer to; run it from a context under a root console",
+                consoles.len()
+            ))),
+        }
+    }
+
     /// The one authority rule (`docs/senpai-kohai.md`, "Authority"): the
-    /// character of `target`'s senpai, or the lineage root, may perform `act`
-    /// on it. The inner `Err` is the refusal, naming the rule, the senpai's
-    /// character and the root; the outer `Err` is a fault (a missing row, a
-    /// senpai cycle). The context's own character is refused here for every
-    /// act; `kj context rotate` admits it before this check.
+    /// performer of `target`'s senpai (climbing past senpais with no
+    /// performer), or the lineage root, may perform `act` on it. The context's
+    /// own performer may also archive it. The inner `Err` is the refusal,
+    /// naming the rule, the senpai's character and the root; the outer `Err` is
+    /// a fault (a missing row, a senpai cycle). The context's own performer is
+    /// refused for every other act; `kj context rotate` admits it before this
+    /// check.
     pub fn context_authority(
         &self,
         target: ContextId,
@@ -347,26 +421,12 @@ impl KernelDb {
         let row = self.get_context(target)?.ok_or_else(|| KernelDbError::NotFound(format!(
             "context {} has no row to check authority over", target.short()
         )))?;
-        let Some(character) = self.context_character(target)? else {
-            if act == GovernedAct::Archive
-                && self.get_character(actor)?.is_some_and(|sheet| sheet.root && sheet.retired_at.is_none())
-            {
-                return Ok(Ok(Authority::LiveRoot));
-            }
-            let only_root = if act == GovernedAct::Archive { "; only a live root character may archive it" } else { "" };
-            return Ok(Err(format!(
-                "{} has no context character, so it has no senpai or lineage root to {}{only_root}",
-                Self::context_display(&row), act.as_str()
-            )));
-        };
-        let holder = match character.senpai_ctx {
-            Some(senpai) => Some(self.context_character(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
-                "senpai {} has no context character", self.context_name(senpai)
-            )))?.principal_id),
-            None => None,
-        };
+        let holder = self.senpai_holder(target)?.map(|(_, performer)| performer);
         if holder == Some(actor) {
             return Ok(Ok(Authority::SenpaiHolder));
+        }
+        if act == GovernedAct::Archive && row.performer == Some(actor) {
+            return Ok(Ok(Authority::OwnPerformer));
         }
         let root = self.lineage_root_of_context(target)?;
         if root.as_ref() == Ok(&actor) {
@@ -377,28 +437,36 @@ impl KernelDb {
             Ok(root) => self.name_for(root),
             Err(reason) => format!("none: {reason}"),
         };
+        let own = match (act, row.performer) {
+            (GovernedAct::Archive, Some(performer)) => format!(", its own performer ({}),", self.name_for(performer)),
+            _ => String::new(),
+        };
         Ok(Err(format!(
-            "only {}'s senpai ({holder_name}) or its lineage root ({root_name}) may {}",
+            "only {}'s senpai ({holder_name}){own} or its lineage root ({root_name}) may {}",
             self.context_name(target), act.as_str()
         )))
     }
 
-    /// Whether `actor` may place a context under `senpai`: it is the
-    /// character of `senpai`, or `senpai`'s lineage root
-    /// (`docs/senpai-kohai.md`, "Creating, forking, rotating"). The inner
+    /// Whether `actor` may place a context under `senpai`: it performs
+    /// `senpai` (or the nearest performer above it), or is `senpai`'s lineage
+    /// root (`docs/senpai-kohai.md`, "Creating, forking, rotating"). The inner
     /// `Err` is the refusal.
     pub fn may_place_under(&self, senpai: ContextId, actor: PrincipalId) -> KernelDbResult<Result<Authority, String>> {
-        let row = self.context_character(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
-            "senpai {} has no context character", self.context_name(senpai)
+        let row = self.get_context(senpai)?.ok_or_else(|| KernelDbError::NotFound(format!(
+            "senpai context {}", senpai.short()
         )))?;
-        if row.principal_id == actor {
+        let holder = match row.performer {
+            Some(performer) => Some(performer),
+            None => self.senpai_holder(senpai)?.map(|(_, performer)| performer),
+        };
+        if holder == Some(actor) {
             return Ok(Ok(Authority::SenpaiHolder));
         }
         let root = self.lineage_root_of_context(senpai)?;
         if root.as_ref() == Ok(&actor) {
             return Ok(Ok(Authority::LineageRoot));
         }
-        let holder_name = self.name_for(row.principal_id);
+        let holder_name = holder.map_or_else(|| "none".to_string(), |h| self.name_for(h));
         let root_name = match root {
             Ok(root) => self.name_for(root),
             Err(reason) => format!("none: {reason}"),

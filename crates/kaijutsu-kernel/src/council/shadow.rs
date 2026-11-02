@@ -559,7 +559,7 @@ fn shadow_row(seat: &ContextRow) -> ContextRow {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     }
 }
 

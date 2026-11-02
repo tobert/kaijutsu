@@ -259,11 +259,11 @@ pub(super) mod fixtures {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         };
         edit(&mut row);
         // The performer is not a column: it becomes the context's character.
-        let performer = row.played_by.take();
+        let performer = row.performer.take();
         {
             let db = kernel.kernel_db().lock();
             let ws = db

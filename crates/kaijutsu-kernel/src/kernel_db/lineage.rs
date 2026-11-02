@@ -16,14 +16,14 @@ impl KernelDb {
     /// Get the live children of a context: the contexts forked from it.
     pub fn fork_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            concat!("SELECT c.context_id, c.label,
+            "SELECT c.context_id, c.label,
                     c.system_prompt, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.origin_host, ", performer_sql!("c"), " AS played_by
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.origin_host, c.performer, c.senpai_ctx, c.persona
              FROM contexts c
              WHERE c.forked_from = ?1 AND c.archived_at IS NULL
-             ORDER BY c.created_at, c.context_id"),
+             ORDER BY c.created_at, c.context_id",
         )?;
 
         let rows = stmt.query_map(params![blob_param(id.as_bytes())], |row| {
@@ -77,7 +77,7 @@ impl KernelDb {
     /// Returns `(ContextRow, depth)` where depth 0 = the starting context.
     pub fn fork_lineage(&self, context_id: ContextId) -> KernelDbResult<Vec<(ContextRow, i64)>> {
         let mut stmt = self.conn.prepare(
-            concat!("WITH RECURSIVE lineage(ctx_id, depth) AS (
+            "WITH RECURSIVE lineage(ctx_id, depth) AS (
                 SELECT ?1, 0
                 UNION ALL
                 SELECT c.forked_from, lineage.depth + 1
@@ -90,15 +90,15 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.origin_host, ", performer_sql!("c"), " AS played_by, lineage.depth
+                   c.origin_host, c.performer, c.senpai_ctx, c.persona, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
-            ORDER BY lineage.depth"),
+            ORDER BY lineage.depth",
         )?;
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(19)?;
+            let depth: i64 = row.get(21)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)

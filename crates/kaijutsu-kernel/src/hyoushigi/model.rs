@@ -160,7 +160,7 @@ pub(crate) fn admit(
     let context = lease.context();
     let performer = kernel.kernel_db().lock().get_context(context)
         .map_err(|error| format!("read score performer: {error}"))?
-        .and_then(|row| row.played_by).ok_or_else(|| "score turn needs an assigned performer".to_string())?;
+        .and_then(|row| row.performer).ok_or_else(|| "score turn needs an assigned performer".to_string())?;
     let seed_block = kernel.blocks().get_block_snapshot(context, &seed)
         .map_err(|error| format!("read score seed: {error}"))?
         .ok_or_else(|| "score seed is missing".to_string())?;

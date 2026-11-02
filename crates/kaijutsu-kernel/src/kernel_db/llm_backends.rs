@@ -194,8 +194,7 @@ impl KernelDb {
         };
         let bindings: Vec<String> = {
             let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT cc.context_id FROM context_slots cs
-                 JOIN context_characters cc ON cc.context_id = cs.context_id
+                "SELECT DISTINCT cs.context_id FROM context_slots cs
                  WHERE cs.backend_id = ?1 ORDER BY 1",
             )?;
             stmt.query_map(params![id], |r| Ok(read_context_id(r, 0)?.short()))?

@@ -35,7 +35,7 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
         assert_eq!(kernel.kernel_db.lock().senpai_of(lane).unwrap(), Some(parent.context_id), "the context it was created from is its senpai");
         assert_eq!(row.context_type, "coder");
         let performer = kernel.kernel_db.lock().get_character_by_name(PERFORMER).unwrap().unwrap();
-        assert_eq!(row.played_by, Some(performer.principal_id), "the context is performed by the named character");
+        assert_eq!(row.performer, Some(performer.principal_id), "the context is performed by the named character");
         let db = kernel.kernel_db.lock();
         let character = db.context_character(lane).unwrap().expect("the new context has a context character");
         assert_eq!(character.principal_id, performer.principal_id);

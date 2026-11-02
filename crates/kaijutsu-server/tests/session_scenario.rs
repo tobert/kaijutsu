@@ -383,7 +383,7 @@ fn kaijutsu_session_scenario() {
 
         expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 1a (fork)");
         assert_eq!(
-            s.kernel.kernel_db.lock().get_context(banto_ctx).unwrap().unwrap().played_by,
+            s.kernel.kernel_db.lock().get_context(banto_ctx).unwrap().unwrap().performer,
             Some(banto_principal),
             "banto's seat is played by banto"
         );
@@ -435,7 +435,7 @@ fn kaijutsu_session_scenario() {
                 "{label}'s structural parent must be banto's seat"
             );
             assert_eq!(
-                row.played_by,
+                row.performer,
                 Some(performer),
                 "{label} must be played by its assigned coder character"
             );
@@ -650,7 +650,7 @@ fn kaijutsu_session_scenario() {
             let db = s.kernel.kernel_db.lock();
             assert!(db.get_context(banto_ctx).unwrap().unwrap().archived_at.is_some(), "the predecessor is archived");
             let successor = db.get_context(banto_next_ctx).unwrap().unwrap();
-            assert_eq!(successor.played_by, Some(banto_principal));
+            assert_eq!(successor.performer, Some(banto_principal));
             assert_eq!(successor.context_type, "director");
         }
 

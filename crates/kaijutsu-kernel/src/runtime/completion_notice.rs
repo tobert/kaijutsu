@@ -66,7 +66,7 @@ pub(crate) fn recipient_disposition(db: &KernelDb, notice: &Notice) -> KernelDbR
     Ok(match db.get_context(notice.context)? {
         None => Some("completion context no longer exists"),
         Some(row) if row.is_archived() || row.context_state != kaijutsu_types::ContextState::Live => Some("completion context is no longer live"),
-        Some(row) if row.played_by != Some(notice.performer) => Some("completion context has a different performer"),
+        Some(row) if row.performer != Some(notice.performer) => Some("completion context has a different performer"),
         _ => None,
     })
 }
@@ -225,7 +225,7 @@ async fn resume(
     let allowed = {
         let db = kernel.kernel_db().lock();
         let row = db.get_context(notice.context).map_err(|e| e.to_string())?.ok_or("completion context disappeared")?;
-        row.context_state == kaijutsu_types::ContextState::Live && !row.is_archived() && row.played_by == Some(notice.performer)
+        row.context_state == kaijutsu_types::ContextState::Live && !row.is_archived() && row.performer == Some(notice.performer)
             && db.automatic_resume_allowed(notice.context, epoch, kaijutsu_types::now_millis() as i64, window_ms).map_err(|e| e.to_string())?
     };
     if allowed {

@@ -1,5 +1,13 @@
 use super::*;
 
+/// Insert `row` answering to the kernel's root console, as every live
+/// context but a root console does.
+fn insert_kohai_with_doc(db: &KernelDb, row: &ContextRow, ws_id: WorkspaceId) {
+    insert_context_with_doc(db, row, ws_id);
+    let (_, console) = db.seed_test_root_console().unwrap();
+    db.set_context_senpai(row.context_id, Some(console)).unwrap();
+}
+
 #[test]
 fn conclude_context_sets_state_timestamp_and_is_idempotent() {
     let db = KernelDb::temporary().unwrap();
@@ -229,7 +237,7 @@ fn promote_resurrects_an_archived_context() {
     let ws_id = setup_test_db(&db);
     let row = make_context_row(Some("lazarus"));
     let cid = row.context_id;
-    insert_context_with_doc(&db, &row, ws_id);
+    insert_kohai_with_doc(&db, &row, ws_id);
 
     assert!(db.archive_context(cid).unwrap());
 
@@ -254,7 +262,7 @@ fn promote_resurrects_a_concluded_context_without_unconcluding() {
     let ws_id = setup_test_db(&db);
     let row = make_context_row(Some("done-but-back"));
     let cid = row.context_id;
-    insert_context_with_doc(&db, &row, ws_id);
+    insert_kohai_with_doc(&db, &row, ws_id);
 
     assert!(db.conclude_context(cid).unwrap());
     let concluded_stamp = db.get_context(cid).unwrap().unwrap().concluded_at.unwrap();
@@ -305,7 +313,7 @@ fn resurrection_stamps_a_fresh_promoted_at() {
     let ws_id = setup_test_db(&db);
     let row = make_context_row(Some("stale-seat"));
     let cid = row.context_id;
-    insert_context_with_doc(&db, &row, ws_id);
+    insert_kohai_with_doc(&db, &row, ws_id);
 
     // Defensive shape `archive_context` can't produce (it clears
     // promoted_at): an archived row still carrying an old seat stamp.
@@ -444,7 +452,7 @@ fn resurrecting_restores_live_or_concluded_from_the_timestamps() {
     let ws_id = setup_test_db(&db);
 
     let plain = make_context_row(Some("plain"));
-    insert_context_with_doc(&db, &plain, ws_id);
+    insert_kohai_with_doc(&db, &plain, ws_id);
     db.archive_context(plain.context_id).unwrap();
     db.promote_context(plain.context_id).unwrap();
     let loaded = db.get_context(plain.context_id).unwrap().unwrap();
@@ -453,7 +461,7 @@ fn resurrecting_restores_live_or_concluded_from_the_timestamps() {
     assert!(!loaded.is_archived());
 
     let done = make_context_row(Some("done"));
-    insert_context_with_doc(&db, &done, ws_id);
+    insert_kohai_with_doc(&db, &done, ws_id);
     db.conclude_context(done.context_id).unwrap();
     db.archive_context(done.context_id).unwrap();
     assert_eq!(
@@ -468,4 +476,23 @@ fn resurrecting_restores_live_or_concluded_from_the_timestamps() {
         ContextState::Concluded,
         "concluded_at survived the archive, so the restored state is concluded"
     );
+}
+
+/// An archived context with no senpai stays archived: promoting it would make
+/// a live context that answers to no one. A root console resurrects.
+#[test]
+fn promoting_an_archived_context_with_no_senpai_refuses() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let (_, console) = db.seed_test_root_console().unwrap();
+    let bare = make_context_row(Some("bare"));
+    insert_context_with_doc(&db, &bare, ws_id);
+    db.archive_context(bare.context_id).unwrap();
+
+    let error = db.promote_context(bare.context_id).unwrap_err().to_string();
+    assert!(error.contains("has no senpai"), "{error}");
+    assert!(db.get_context(bare.context_id).unwrap().unwrap().is_archived(), "it stays archived");
+
+    db.archive_context(console).unwrap();
+    assert!(matches!(db.promote_context(console).unwrap(), PromoteOutcome::Resurrected { .. }));
 }

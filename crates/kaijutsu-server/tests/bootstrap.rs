@@ -51,7 +51,7 @@ fn a_bootstrapped_kernel_answers_in_root() {
             let row = db.find_context_by_label("ROOT").unwrap().expect("bootstrap creates ROOT");
             assert_eq!(row.context_type, "console");
             let performer = db.get_character_by_name("root").unwrap().expect("the console performer exists");
-            assert_eq!(row.played_by, Some(performer.principal_id), "ROOT is played by its model character");
+            assert_eq!(row.performer, Some(performer.principal_id), "ROOT is played by its model character");
             let model = db.get_character_model(performer.principal_id).unwrap().expect("the performer holds a model");
             assert_eq!(model.model, "mock-model");
             assert!(db.list_character_slots(performer.principal_id).unwrap().is_empty(), "a model, not role slots");

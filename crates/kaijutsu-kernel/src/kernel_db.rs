@@ -13,8 +13,9 @@
 //! `impl KernelDb` block, with its tests in `<module>/tests.rs`: `contexts`,
 //! `context_ring`, `context_fork`, `context_characters`, `review`, `approvals`,
 //! `documents`, `lineage`, `llm_backends`, `llm_characters`, `usage`, and the
-//! rest below. `schema` holds the DDL; `migrate`, `migrate_senpai` and
-//! `migrate_cast` hold the migration ladder. Shared test fixtures live in
+//! rest below. `schema` holds the DDL; `migrate`, `migrate_senpai`,
+//! `migrate_cast`, `migrate_context_characters` and `migrate_fold` hold the
+//! migration ladder. Shared test fixtures live in
 //! `test_support`.
 //!
 //! The live handle is a single `Arc<Mutex<KernelDb>>`, so every write
@@ -37,14 +38,6 @@ use crate::llm::stream::{CacheTarget, CacheTtl};
 use crate::mcp::binding::ContextToolBinding;
 use crate::mcp::types::InstanceId;
 use crate::roster::{Availability, LivenessKind, PresenceSnapshotRow, RosterEntity, RosterRow};
-
-/// SQL for the performer of the `contexts` row aliased `$t`: the principal of
-/// its context character, `NULL` for a context with none.
-macro_rules! performer_sql {
-    ($t:literal) => {
-        concat!("(SELECT cc.principal_id FROM context_characters cc WHERE cc.context_id = ", $t, ".context_id)")
-    };
-}
 
 mod context_characters;
 mod model_prices;
@@ -73,6 +66,8 @@ mod fixtures;
 mod context_fork;
 mod schema;
 mod migrate_senpai;
+mod migrate_context_characters;
+mod migrate_fold;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]
@@ -500,6 +495,7 @@ impl KernelDb {
         let conn = Connection::open(path)?;
         Self::init_connection(&conn)?;
         Self::back_up_before_character_slots(&conn, path)?;
+        Self::back_up_before_context_fold(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
         Self::migrate_ledger(&conn)?;
@@ -753,7 +749,9 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         demoted_at: row.get(15)?,
         paused_at: row.get(16)?,
         origin_host: row.get(17)?,
-        played_by: read_opt_principal_id(row, 18)?,
+        performer: read_opt_principal_id(row, 18)?,
+        senpai_ctx: read_opt_context_id(row, 19)?,
+        persona: row.get(20)?,
     })
 }
 

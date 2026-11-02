@@ -1530,8 +1530,7 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
         CharacterTarget::Context(target) => {
             super::refs::resolve_context_arg_from(target.as_deref(), caller.context_id, db)
                 .ok()
-                .and_then(|id| db.context_character(id).ok().flatten())
-                .and_then(|character| character.senpai_ctx)
+                .and_then(|id| db.senpai_of(id).ok().flatten())
                 .and_then(|senpai| db.context_holder(senpai).ok().flatten())
                 .is_some_and(|holder| holder == caller.actor_id)
         }
@@ -1582,10 +1581,10 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
                 if target == here {
                     return None;
                 }
-                let target_row = db.context_character(target).ok()??;
+                let target_row = db.get_context(target).ok()??;
                 if here_row.senpai_ctx == Some(target) {
                     // A fork made by someone other than its character keeps the gate.
-                    let fork = target_row.principal_id == here_row.principal_id;
+                    let fork = target_row.performer == Some(here_row.principal_id);
                     let own = db.get_context(here).ok()??.created_by == here_row.principal_id;
                     if fork && !own {
                         return None;

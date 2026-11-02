@@ -1,6 +1,6 @@
 use rusqlite::params;
 
-use kaijutsu_types::{DocKind, PresetId, TurnId, WorkspaceId};
+use kaijutsu_types::{CastId, DocKind, PresetId, TurnId, WorkspaceId};
 
 use super::*;
 use crate::kernel_db::{
@@ -241,7 +241,7 @@ impl World {
         if played_by.is_some() {
             set_stored_played_by(&self.db, row.context_id, played_by);
         }
-        row.played_by = played_by;
+        row.performer = played_by;
         row
     }
 
@@ -291,7 +291,22 @@ impl World {
         KernelDb::migrate_context_characters(&self.db.conn)
     }
 
+    /// The context character of `ctx`: the `context_characters` row in a
+    /// legacy world, where `context-characters-v1` writes it, else the
+    /// performer columns of the context.
     fn cc(&self, ctx: &ContextRow) -> Option<ContextCharacterRow> {
+        if self.legacy {
+            return self
+                .db
+                .conn
+                .query_row(
+                    "SELECT context_id, principal_id, senpai_ctx, persona, created_at FROM context_characters WHERE context_id = ?1",
+                    params![blob_param(ctx.context_id.as_bytes())],
+                    row_to_character,
+                )
+                .optional()
+                .unwrap();
+        }
         self.db.context_character(ctx.context_id).unwrap()
     }
 
@@ -299,8 +314,15 @@ impl World {
         self.db.list_context_slots(ctx.context_id).unwrap()
     }
 
+    /// Rows in `table`. `context_characters` counts the performed contexts
+    /// of a current-schema world, where no such table exists.
     fn count(&self, table: &str) -> i64 {
-        self.db.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+        let sql = if table == "context_characters" && !self.legacy {
+            "SELECT COUNT(*) FROM contexts WHERE performer IS NOT NULL".to_string()
+        } else {
+            format!("SELECT COUNT(*) FROM {table}")
+        };
+        self.db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
     }
 
     fn notes(&self, kind: &str) -> Vec<ContextCharacterMigrationNote> {
@@ -746,9 +768,10 @@ fn slots_principal_and_persona_are_never_changed_but_the_senpai_moves() {
     for (sql, what) in [
         ("UPDATE context_slots SET max_tokens = 1", "slot update"),
         ("DELETE FROM context_slots", "slot delete"),
-        ("UPDATE context_characters SET principal_id = x'00000000000000000000000000000001'", "principal update"),
-        ("UPDATE context_characters SET persona = 'x'", "persona update"),
-        ("UPDATE context_characters SET persona = NULL", "persona clear"),
+        ("UPDATE contexts SET performer = x'00000000000000000000000000000001'", "performer update"),
+        ("UPDATE contexts SET performer = NULL", "performer clear"),
+        ("UPDATE contexts SET persona = 'x'", "persona update"),
+        ("UPDATE contexts SET persona = NULL", "persona clear"),
     ] {
         let error = w.db.conn.execute(sql, []).unwrap_err().to_string();
         assert!(error.contains("never changed"), "{what}: {error}");
@@ -769,7 +792,7 @@ fn the_performer_and_the_root_console_are_read_from_the_context_character() {
     let w = world();
     let who = w.character("coder");
     let conv = w.ctx("conv", "coder", None, None);
-    assert_eq!(w.db.get_context(conv.context_id).unwrap().unwrap().played_by, None, "a context with none performs nothing");
+    assert_eq!(w.db.get_context(conv.context_id).unwrap().unwrap().performer, None, "a context with none performs nothing");
     w.db.write_context_character(conv.context_id, who, None, None).unwrap();
     for read in [
         w.db.get_context(conv.context_id).unwrap().unwrap(),
@@ -778,7 +801,7 @@ fn the_performer_and_the_root_console_are_read_from_the_context_character() {
         w.db.list_all_contexts().unwrap().into_iter().find(|r| r.context_id == conv.context_id).unwrap(),
         w.db.fork_lineage(conv.context_id).unwrap().remove(0).0,
     ] {
-        assert_eq!(read.played_by, Some(who), "the context character's principal");
+        assert_eq!(read.performer, Some(who), "the context character's principal");
     }
     assert_eq!(w.db.contexts_played_by(who).unwrap().len(), 1);
 
@@ -799,13 +822,17 @@ fn the_performer_and_the_root_console_are_read_from_the_context_character() {
     assert_eq!(w.db.root_console(who).unwrap(), None, "only a root character has a console");
 }
 
-/// A row that sets `played_by` is refused: the performer is the context
-/// character's principal, and no column stores it.
+/// A context row carries its performer, senpai and persona: they are
+/// columns of the row, written with it and read back.
 #[test]
-fn a_context_row_that_sets_the_performer_is_refused() {
+fn a_context_row_stores_its_performer_senpai_and_persona() {
     let w = world();
     let who = w.character("coder");
-    let mut row = make_context_row(Some("sets-played-by"));
+    let senpai = w.ctx("senpai", "coder", None, None);
+    let mut row = make_context_row(Some("stores-columns"));
+    row.performer = Some(who);
+    row.senpai_ctx = Some(senpai.context_id);
+    row.persona = Some("persona".to_string());
     w.db.insert_document(&DocumentRow {
         document_id: row.context_id,
         workspace_id: w.ws,
@@ -815,12 +842,11 @@ fn a_context_row_that_sets_the_performer_is_refused() {
         created_at: row.created_at,
         created_by: row.created_by,
     }).unwrap();
-    row.played_by = Some(who);
-    let error = w.db.insert_context(&row).unwrap_err().to_string();
-    assert!(error.contains("played_by") && error.contains("context character"), "{error}");
-    assert!(w.db.get_context(row.context_id).unwrap().is_none());
-    row.played_by = None;
-    w.db.insert_context(&row).expect("the same row without a performer is accepted");
+    w.db.insert_context(&row).unwrap();
+    let read = w.db.get_context(row.context_id).unwrap().unwrap();
+    assert_eq!((read.performer, read.senpai_ctx, read.persona.as_deref()), (Some(who), Some(senpai.context_id), Some("persona")));
+    let character = w.db.context_character(row.context_id).unwrap().unwrap();
+    assert_eq!((character.principal_id, character.senpai_ctx), (who, Some(senpai.context_id)));
 }
 
 #[test]
@@ -868,7 +894,7 @@ fn a_fork_copies_the_slots_verbatim_and_takes_the_forker_as_senpai() {
     assert_eq!(copy.senpai_ctx, Some(source.context_id), "the forker, not the forker's senpai");
     assert_eq!(content(w.db.list_context_slots(child.context_id).unwrap()), content(w.slots(&source)), "slots are copied verbatim");
     assert_eq!(w.db.context_slot(child.context_id, "coder").unwrap().unwrap().model, "ds-flash", "not the edited cast");
-    assert_eq!(w.db.get_context(child.context_id).unwrap().unwrap().played_by, Some(who));
+    assert_eq!(w.db.get_context(child.context_id).unwrap().unwrap().performer, Some(who));
 
     let bare = w.ctx("bare", "coder", None, None);
     let mut bare_child = make_context_row(Some("bare-child"));
@@ -1352,8 +1378,7 @@ fn the_migration_runs_once() {
 
 /// Every column and table the context character replaced, as `(table,
 /// column)`; a column of `None` is the whole table.
-const DROPPED: [(&str, Option<&str>); 8] = [
-    ("contexts", Some("senpai_ctx")),
+const DROPPED: [(&str, Option<&str>); 7] = [
     ("contexts", Some("played_by")),
     ("contexts", Some("cast_id")),
     ("contexts", Some("provider")),
@@ -1425,7 +1450,7 @@ fn an_open_carries_the_old_columns_into_context_characters_then_drops_them() {
     assert!(!KernelDb::has_table(&w.db.conn, "casts").unwrap() && !KernelDb::has_table(&w.db.conn, "cast_slots").unwrap(), "the casts are dropped");
     assert!(!KernelDb::has_column(&w.db.conn, "characters", "cast_id").unwrap());
     assert_eq!(w.db.root_console(amy).unwrap(), Some(console.context_id));
-    assert_eq!(w.db.get_context(seat.context_id).unwrap().unwrap().played_by, Some(lead), "the performer was carried before the column went");
+    assert_eq!(w.db.get_context(seat.context_id).unwrap().unwrap().performer, Some(lead), "the performer was carried before the column went");
     let slot = w.db.context_slot(overridden.context_id, "coder").unwrap().expect("the override's slot");
     assert_eq!((slot.backend_id, slot.model.as_str()), (w.anthropic, "claude-x"), "the override was carried into the slots");
     assert_eq!(w.db.senpai_of(overridden.context_id).unwrap(), Some(seat.context_id), "the senpai edge was carried");

@@ -202,7 +202,7 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
         }
         let context = create_context_as(&kj, "requester-performer", "distinct-performer").await.unwrap();
         let requester = kernel.kernel_db.lock().get_context(context).unwrap().unwrap().created_by;
-        assert_eq!(kernel.kernel_db.lock().get_context(context).unwrap().unwrap().played_by, Some(performer));
+        assert_eq!(kernel.kernel_db.lock().get_context(context).unwrap().unwrap().performer, Some(performer));
         assert_ne!(requester, performer);
         kj.join_context(context, "requester-performer").await.unwrap();
         let submission = kj.shell_submit("echo who-ran-this", context, false).await.unwrap();

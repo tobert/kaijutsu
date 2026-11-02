@@ -627,7 +627,7 @@ fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
         row.context_id = shadow;
         row.label = Some("judge-shadow".into());
         row.context_type = "judge".into();
-        row.played_by = None;
+        row.performer = None;
         row.forked_from = Some(seat);
         let workspace = db.get_or_create_default_workspace(row.created_by).expect("default workspace");
         db.insert_context_with_document(&row, workspace).expect("insert the shadow");

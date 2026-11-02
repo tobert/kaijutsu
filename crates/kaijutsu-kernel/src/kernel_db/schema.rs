@@ -149,7 +149,17 @@ CREATE TABLE IF NOT EXISTS contexts (
     paused_at    INTEGER,
     -- Advisory hostname the registering client self-reported at creation
     -- (NULL = unknown). See `ContextRow::origin_host`'s doc comment.
-    origin_host  TEXT
+    origin_host  TEXT,
+    -- The character performing this context (docs/senpai-kohai.md, "The
+    -- model"); NULL for a context that runs no turns (the handoff log, the MCP
+    -- hub, a score). A bare id like `created_by`: the kernel never reads
+    -- `auth.db`. Triggers refuse a change once set.
+    performer    BLOB,
+    -- The context this one answers to. NULL only for a character's root
+    -- console (`characters.root_ctx`); a trigger refuses any other change to
+    -- NULL. `kj context move` is the one writer after creation.
+    senpai_ctx   BLOB REFERENCES contexts(context_id),
+    persona      TEXT
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -169,32 +179,14 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
     recorded_at  INTEGER NOT NULL
 );
 
--- ── Context characters (docs/senpai-kohai.md, "The model") ────────
--- One row per context that has a character: the character in this context,
--- the context it answers to, and the persona. A context with no row (scratch,
--- the handoff log, system contexts) runs no turns and routes nothing.
--- `principal_id` is a bare id like `contexts.created_by`: the kernel never
--- reads `auth.db`. `senpai_ctx` is the one column that changes after the
--- context is made (`kj context move`); triggers refuse a change to the rest.
-CREATE TABLE IF NOT EXISTS context_characters (
-    context_id   BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id),
-    principal_id BLOB    NOT NULL,
-    senpai_ctx   BLOB    REFERENCES contexts(context_id),
-    persona      TEXT,
-    created_at   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_context_characters_principal
-    ON context_characters(principal_id);
-CREATE INDEX IF NOT EXISTS idx_context_characters_senpai
-    ON context_characters(senpai_ctx) WHERE senpai_ctx IS NOT NULL;
-
+-- ── Context slots (docs/senpai-kohai.md, "The model") ────────────
 -- A copy of one character slot, with every unset parameter filled from the
 -- model's `backend_models` row. `max_tokens` is required: every provider
 -- request carries it, except a `gate` or `judge` slot, which names a council
 -- server. NULL optional parameters are left out of the request. A trigger
 -- refuses an UPDATE or DELETE.
 CREATE TABLE IF NOT EXISTS context_slots (
-    context_id      BLOB    NOT NULL REFERENCES context_characters(context_id),
+    context_id      BLOB    NOT NULL REFERENCES contexts(context_id),
     role            TEXT    NOT NULL,
     backend_id      BLOB    NOT NULL REFERENCES backends(backend_id),
     model           TEXT    NOT NULL CHECK (model != ''),
@@ -208,9 +200,10 @@ CREATE TABLE IF NOT EXISTS context_slots (
     PRIMARY KEY (context_id, role)
 );
 
--- What `context-characters-v1` did not carry over or could not resolve, by
--- kind: dropped, unmapped, no_slot, no_gate_slot, no_distill_slot,
--- no_character_slot.
+-- What `context-characters-v1` did not carry over or could not resolve, and
+-- what `context-fold-v1` decided, by kind: dropped, unmapped, no_slot,
+-- no_gate_slot, no_distill_slot, no_character_slot, senpai_assigned,
+-- archived_no_senpai.
 CREATE TABLE IF NOT EXISTS context_character_migration_report (
     report_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT    NOT NULL,

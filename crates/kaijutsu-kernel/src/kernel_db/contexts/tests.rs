@@ -268,7 +268,7 @@ fn context_row_to_context() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     };
 
     let ctx = row.to_context();
@@ -306,7 +306,7 @@ fn roundtrip_create_and_recover() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     };
     insert_context_with_doc(&db, &parent, ws_id);
 
@@ -331,7 +331,7 @@ fn roundtrip_create_and_recover() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     };
     insert_context_with_doc(&db, &child, ws_id);
 
@@ -347,7 +347,7 @@ fn roundtrip_create_and_recover() {
     assert!(recovered.archived_at.is_none());
     assert!(recovered.workspace_id.is_none());
     assert!(recovered.preset_id.is_none());
-    assert_eq!(recovered.played_by, None, "NULL played_by preserves today's behavior");
+    assert_eq!(recovered.performer, None, "NULL played_by preserves today's behavior");
 
     // Verify list_active_contexts returns both
     let active = db.list_active_contexts().unwrap();
@@ -363,13 +363,13 @@ fn roundtrip_create_and_recover() {
     let character = PrincipalId::new();
     db.update_played_by(child_id, Some(character)).unwrap();
     let played = db.get_context(child_id).unwrap().unwrap();
-    assert_eq!(played.played_by, Some(character));
+    assert_eq!(played.performer, Some(character));
     let context_character = db.context_character(child_id).unwrap().expect("a performed context has a context character");
     assert_eq!(context_character.principal_id, character);
     db.update_played_by(child_id, Some(character)).unwrap();
     assert_eq!(db.context_character(child_id).unwrap().unwrap(), context_character, "the same character changes nothing");
     assert!(db.update_played_by(child_id, None).is_err(), "a performer cannot be cleared");
-    assert_eq!(db.get_context(child_id).unwrap().unwrap().played_by, Some(character));
+    assert_eq!(db.get_context(child_id).unwrap().unwrap().performer, Some(character));
 }
 
 #[test]

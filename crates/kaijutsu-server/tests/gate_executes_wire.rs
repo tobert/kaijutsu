@@ -206,7 +206,7 @@ impl Seats {
         params: serde_json::Value,
     ) -> Result<kaijutsu_kernel::ExecResult, kaijutsu_kernel::mcp::McpError> {
         let row = self.kernel.kernel_db.lock().get_context(context).unwrap().unwrap();
-        let actor = row.played_by.expect("native tool fixture assigns a performer");
+        let actor = row.performer.expect("native tool fixture assigns a performer");
         let exec = kaijutsu_kernel::ExecContext::new_without_cwd(
             row.created_by,
             context,
@@ -798,7 +798,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         let (original_performer, reviewer) = {
             let db = s.kernel.kernel_db.lock();
             let row = db.get_context(s.worker).unwrap().expect("worker context");
-            let performer = row.played_by.expect("worker performer");
+            let performer = row.performer.expect("worker performer");
             let reviewer = db
                 .route_review(kaijutsu_kernel::kernel_db::ReviewQuery::ask(s.worker, performer))
                 .expect("worker reviewer")
@@ -1296,7 +1296,7 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
             .lock()
             .get_context(s.worker)
             .unwrap()
-            .and_then(|row| row.played_by)
+            .and_then(|row| row.performer)
             .expect("worker has its explicit performer");
         let reviewer = s
             .kernel

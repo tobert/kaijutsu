@@ -220,6 +220,13 @@ impl KernelDb {
         }
 
         if archived_at.is_some() {
+            if self.senpai_of(id)?.is_none() && !self.is_root_console(id)? {
+                return Err(KernelDbError::Validation(format!(
+                    "context {} has no senpai, and a live context answers to one; \
+                     give it one with `kj context move` before promoting it",
+                    self.context_name(id)
+                )));
+            }
             // Resurrection: unarchive + a FRESH promoted_at in one write.
             // `archive_context` clears promoted_at, so an archived row
             // shouldn't still carry one — but stamp unconditionally anyway:

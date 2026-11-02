@@ -1330,6 +1330,9 @@ pub fn ensure_lost_found_context(
                 db.get_or_create_default_workspace(system)
                     .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
                     .and_then(|ws| {
+                        let senpai = db
+                            .default_console_for(None)
+                            .map_err(|e| format!("lost+found has no senpai: {e}"))?;
                         let row = ContextRow {
                             context_id: id,
                             label: Some(label.clone()),
@@ -1349,7 +1352,7 @@ pub fn ensure_lost_found_context(
                             demoted_at: None,
                             paused_at: None,
                             origin_host: None,
-                            played_by: None,
+                            performer: None, senpai_ctx: Some(senpai), persona: None,
                         };
                         db.insert_well_known_context(&row, ws, WellKnownRole::LostFound)
                             .map_err(|e| format!("failed to publish lost+found context: {e}"))
@@ -1437,6 +1440,9 @@ pub fn ensure_drift_queue_context(
         db.get_or_create_default_workspace(system)
             .map_err(|e| format!("failed to resolve workspace for drift-queue: {e}"))
             .and_then(|ws| {
+                let senpai = db
+                    .default_console_for(None)
+                    .map_err(|e| format!("drift-queue has no senpai: {e}"))?;
                 let row = ContextRow {
                     context_id: id,
                     label: Some("drift-queue".to_string()),
@@ -1456,7 +1462,7 @@ pub fn ensure_drift_queue_context(
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    played_by: None,
+                    performer: None, senpai_ctx: Some(senpai), persona: None,
                 };
                 db.insert_well_known_context(&row, ws, WellKnownRole::DriftQueue)
                     .map_err(|e| format!("failed to publish drift-queue context: {e}"))
@@ -3874,6 +3880,7 @@ mod tests {
                     .lock()
                     .get_or_create_default_workspace(PrincipalId::system())
                     .unwrap();
+                db.lock().seed_test_root_console().unwrap();
                 let blocks = shared_block_store_with_db(db.clone(), ws, PrincipalId::system());
                 let router = shared_drift_router();
 

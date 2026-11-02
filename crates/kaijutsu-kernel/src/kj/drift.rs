@@ -275,17 +275,14 @@ impl KjDispatcher {
         };
         let senpai = {
             let db = self.kernel_db().lock();
-            let found = (|| -> Result<crate::kernel_db::ContextCharacterRow, String> {
+            let found = (|| -> Result<crate::kernel_db::ContextRow, String> {
                 let (_, row) = super::context::resolve_character_arg(Some(&here.to_hex()), caller, &db)?;
                 let senpai_id = row.senpai_ctx.ok_or_else(|| {
                     format!("{} has no senpai, so there is nobody to report to", db.context_name(row.context_id))
                 })?;
-                let senpai = db.context_character(senpai_id).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("senpai {} has no context character", db.context_name(senpai_id)))?;
-                let archived = db.get_context(senpai_id).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("senpai {} has no row", senpai_id.short()))?
-                    .is_archived();
-                if archived {
+                let senpai = db.get_context(senpai_id).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai {} has no row", senpai_id.short()))?;
+                if senpai.is_archived() {
                     return Err(format!(
                         "{} is archived; `kj context promote` it to reach it again, or move this context with `kj context move`",
                         db.context_name(senpai_id)
@@ -2642,6 +2639,7 @@ mod tests {
         // item AND one dead letter in the same flush. (The dead-letters-only
         // case is `drift_flush_drains_dead_letters_with_nothing_staged`.)
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
         let dst = register_context(&d, Some("dst"), None, principal);
@@ -2701,6 +2699,7 @@ mod tests {
         // answered "nothing to flush" and the dead letters sat there forever,
         // with lost+found never written.
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
         let dst = register_context(&d, Some("dst"), None, principal);

@@ -155,7 +155,7 @@ pub(crate) async fn resolve_for_context(
     if row.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE {
         return Err(IdentityError::Refused(HUMAN_ROOT_REFUSAL.to_string()));
     }
-    let actor = row.played_by;
+    let actor = row.performer;
     let performer = require_performer(actor).map_err(IdentityError::Refused)?;
     let sheet = kernel.kernel_db().lock().get_character(performer)
         .map_err(|e| IdentityError::Failed(format!("Could not resolve performer: {e}")))?;

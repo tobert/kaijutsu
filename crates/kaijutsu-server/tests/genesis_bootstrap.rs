@@ -52,7 +52,7 @@ async fn start_creates_the_root_context_once() {
     assert_eq!(hub.forked_from, None);
     assert!(shared.documents.contains(hub.context_id), "the hub must have its conversation document");
     assert_eq!(root.label.as_deref(), Some("amy"));
-    assert_eq!(root.played_by, Some(amy));
+    assert_eq!(root.performer, Some(amy));
     assert_eq!(root.forked_from, None);
     assert_eq!(root.created_by, PrincipalId::system(), "the kernel creates it at start");
     assert!(

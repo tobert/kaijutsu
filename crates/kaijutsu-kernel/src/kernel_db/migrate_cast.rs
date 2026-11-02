@@ -105,13 +105,20 @@ impl KernelDb {
             // A character that plays a live context with nothing to copy now
             // has no slots; the first create or rotate for it will refuse
             // naming the role, so say so here, where the deploy happens.
-            let mut stmt = tx.prepare(
+            // The performers are in `context_characters` until
+            // `context-fold-v1` moves them onto `contexts`.
+            let performs = if Self::has_table(&tx, "context_characters")? {
+                "JOIN context_characters cc ON cc.principal_id = ch.principal_id
+                 JOIN contexts c ON c.context_id = cc.context_id AND c.archived_at IS NULL"
+            } else {
+                "JOIN contexts c ON c.performer = ch.principal_id AND c.archived_at IS NULL"
+            };
+            let mut stmt = tx.prepare(&format!(
                 "SELECT DISTINCT ch.name FROM characters ch
-                 JOIN context_characters cc ON cc.principal_id = ch.principal_id
-                 JOIN contexts c ON c.context_id = cc.context_id AND c.archived_at IS NULL
+                 {performs}
                  WHERE NOT EXISTS (SELECT 1 FROM character_slots s WHERE s.principal_id = ch.principal_id)
-                 ORDER BY ch.name",
-            )?;
+                 ORDER BY ch.name"
+            ))?;
             let bare: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<SqliteResult<_>>()?;
             drop(stmt);
             for name in bare {
@@ -200,19 +207,30 @@ impl KernelDb {
         if !Self::has_table(conn, "casts")? && !Self::has_table(conn, "cast_slots")? {
             return Ok(());
         }
-        let backup = Self::pre_character_slots_backup_path(path);
+        Self::back_up_aside(
+            conn,
+            &Self::pre_character_slots_backup_path(path),
+            "the casts become character slots",
+        )
+    }
+
+    /// Copy the database to `backup` (`VACUUM INTO`, a consistent snapshot)
+    /// before a migration that drops data runs. A copy that already exists is
+    /// the state before an earlier attempt and stays as it is. When the copy
+    /// cannot be made the open fails and says why, and nothing is migrated.
+    pub(super) fn back_up_aside(conn: &Connection, backup: &Path, because: &str) -> KernelDbResult<()> {
         if backup.exists() {
-            info!(backup = %backup.display(), "a pre-character-slots backup already exists; keeping it");
+            info!(backup = %backup.display(), "a pre-migration backup already exists; keeping it");
             return Ok(());
         }
         conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()]).map_err(|e| {
             KernelDbError::Validation(format!(
-                "the casts become character slots on this open, and the copy of the database at {} could not be made: {e}; \
+                "{because} on this open, and the copy of the database at {} could not be made: {e}; \
                  free the space or the path, or stop the server that holds the database, and start again",
                 backup.display()
             ))
         })?;
-        info!(backup = %backup.display(), "copied the database aside before the casts become character slots");
+        info!(backup = %backup.display(), "copied the database aside before {because}");
         Ok(())
     }
 }

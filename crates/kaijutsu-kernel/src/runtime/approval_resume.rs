@@ -530,7 +530,7 @@ async fn act_on_executable_answer(
                         }
                     };
                     let performer_changed = linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn)
-                        && row.played_by != Some(ask.actor);
+                        && row.performer != Some(ask.actor);
                     let claim = db.in_transaction(|db| {
                         if !db.redeem_ask(&answer.request_id)? { return Ok(false); }
                         let suppression = match linked {

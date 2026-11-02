@@ -163,14 +163,14 @@ case = "shell"
         let amy = character(&kernel, "amy", true);
         let banto = character(&kernel, "banto", false);
         let coder = character(&kernel, "coder", false);
-        let root = live_context_with(&kernel, "amy", |r| r.played_by = Some(amy));
+        let root = live_context_with(&kernel, "amy", |r| r.performer = Some(amy));
         let seat = live_context_with(&kernel, "banto", |r| {
             r.forked_from = Some(root);
-            r.played_by = Some(banto);
+            r.performer = Some(banto);
         });
         let lane = live_context_with(&kernel, "lane-a", |r| {
             r.forked_from = Some(seat);
-            r.played_by = Some(coder);
+            r.performer = Some(coder);
         });
         Forest { kernel, amy, banto, coder, root, lane }
     }
@@ -228,12 +228,12 @@ case = "shell"
         let lead = character(&f.kernel, "lead", false);
         let sub = live_context_with(&f.kernel, "lead-seat", |r| {
             r.forked_from = Some(f.lane);
-            r.played_by = Some(lead);
+            r.performer = Some(lead);
         });
         let worker = character(&f.kernel, "worker", false);
         let leaf = live_context_with(&f.kernel, "leaf", |r| {
             r.forked_from = Some(sub);
-            r.played_by = Some(worker);
+            r.performer = Some(worker);
         });
         for label in ["council-amy", "council-banto", "council-lead", "council-coder"] {
             live_context(&f.kernel, label);
@@ -267,8 +267,8 @@ case = "shell"
     async fn a_character_named_system_fails_loudly() {
         let f = forest().await;
         let system = character(&f.kernel, "system", false);
-        let system_seat = live_context_with(&f.kernel, "system-seat", |r| r.played_by = Some(system));
-        let ctx = live_context_with(&f.kernel, "odd", |r| r.played_by = Some(f.coder));
+        let system_seat = live_context_with(&f.kernel, "system-seat", |r| r.performer = Some(system));
+        let ctx = live_context_with(&f.kernel, "odd", |r| r.performer = Some(f.coder));
         f.kernel.kernel_db().lock().set_context_senpai(ctx, Some(system_seat)).unwrap();
         let error = f.chain(REVIEWER_CONTEXTS_ON, ctx, f.coder).unwrap_err();
         assert!(error.contains("council-system"), "{error}");

@@ -1827,7 +1827,7 @@ fn session_remember_applies(
         Ok(None) => return Err(cannot(format!("context {} is missing", ask_ctx.short()))),
         Err(e) => return Err(cannot(format!("read context {}: {e}", ask_ctx.short()))),
     };
-    if current.played_by.unwrap_or(requester) != ask_actor {
+    if current.performer.unwrap_or(requester) != ask_actor {
         return Err(cannot("the context performer changed after this ask was raised".into()));
     }
     Ok(())
@@ -2682,7 +2682,7 @@ mod tests {
             let db = d.kernel_db().lock();
             let root = db.senpai_of(ctx).unwrap().expect("the caller's context has a senpai");
             db.conn_for_ledger().execute(
-                "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+                "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
                 rusqlite::params![ctx.as_bytes().as_slice(), root.as_bytes().as_slice()],
             ).unwrap();
             let error = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap_err();

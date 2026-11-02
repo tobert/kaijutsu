@@ -46,7 +46,7 @@ impl Kernel {
         let row = self.kernel_db().lock().get_context(context_id)
             .map_err(|error| format!("could not read context review assignment: {error}"))?
             .ok_or_else(|| format!("no such context: {context_id}"))?;
-        let Some(performer) = row.played_by else {
+        let Some(performer) = row.performer else {
             return Err(format!(
                 "no reviewer: context {} has no performer, so there is no actor to route for",
                 context_id.short()
@@ -143,16 +143,12 @@ mod tests {
             created_at: kaijutsu_types::now_millis() as i64, created_by: PrincipalId::system(),
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None, preset_id: None,
             concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-            origin_host: None, played_by: None,
+            origin_host: None, performer: None, senpai_ctx: None, persona: None,
         }, ws).unwrap();
         if let Some(performer) = played_by {
             db.update_played_by(context_id, Some(performer)).unwrap();
         }
-        // A context with no context character has no edge, and is not a senpai.
-        if let Some(senpai) = senpai
-            && played_by.is_some()
-            && db.context_character(senpai).unwrap().is_some()
-        {
+        if let Some(senpai) = senpai {
             db.set_context_senpai(context_id, Some(senpai)).unwrap();
         }
         context_id
@@ -175,7 +171,7 @@ mod tests {
         let error = kernel.resolve_context_review(bare).await.unwrap_err();
         assert!(error.contains("no performer"), "a context nobody plays has no actor to route for: {error}");
         let error = kernel.resolve_context_review_for(bare, ids[0]).await.unwrap_err();
-        assert!(error.contains("bare") && error.contains("no context character"), "a context with no context character routes nothing, even for a root: {error}");
+        assert!(error.contains("bare") && error.contains("no senpai"), "a top that is no root console has nobody above it, even for a root: {error}");
     }
 
     #[tokio::test]
@@ -197,12 +193,12 @@ mod tests {
         let error = kernel.resolve_context_review(lane).await.unwrap_err();
         assert!(error.contains("lead") && error.contains("retired"), "{error}");
 
-        // A context with no context character is not a senpai: the child below it is a
-        // top of its own, held by a non-root, and nobody reviews it.
+        // A senpai with no performer is climbed past: the child below it
+        // answers to the performer above it.
         let unheld = context(&kernel, "unheld", Some(root), None);
         let child = context(&kernel, "child-of-unheld", Some(unheld), Some(*coder));
-        let error = kernel.resolve_context_review(child).await.unwrap_err();
-        assert!(error.contains("child-of-unheld") && error.contains("no senpai"), "{error}");
+        let review = kernel.resolve_context_review(child).await.unwrap();
+        assert_eq!((review.reviewer.principal_id, review.source), (*amy, ReviewSource::Senpai));
     }
 
     #[tokio::test]

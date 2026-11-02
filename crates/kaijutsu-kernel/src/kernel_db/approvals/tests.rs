@@ -142,7 +142,7 @@ fn a_performer_that_cannot_change_keeps_the_continuation() {
     db.update_played_by(row.context_id, Some(actor)).unwrap();
     assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
     assert!(db.update_played_by(row.context_id, Some(other)).is_err());
-    assert_eq!(db.get_context(row.context_id).unwrap().unwrap().played_by, Some(actor));
+    assert_eq!(db.get_context(row.context_id).unwrap().unwrap().performer, Some(actor));
     assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
 }
 

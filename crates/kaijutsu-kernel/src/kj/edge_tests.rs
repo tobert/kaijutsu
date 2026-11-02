@@ -141,15 +141,16 @@ async fn context_move_refuses_the_rule_a_cycle_a_holderless_senpai_and_pending_a
     let cycle = d.dispatch(&set(h.seat, h.lane), &caller(h.amy, h.root)).await;
     assert!(!cycle.is_ok() && cycle.message().contains("cycle"), "{}", cycle.message());
 
-    // A context with no context character has nobody to answer for the kohai.
+    // A context with no performer and no senpai has nobody to answer for the kohai.
     let empty = register_context(&d, Some("nobody-holds"), Some(h.root), h.amy);
-    d.kernel_db().lock().conn_for_ledger().execute(
-        "DELETE FROM context_characters WHERE context_id = ?1",
-        rusqlite::params![empty.as_bytes().as_slice()],
-    ).unwrap();
+    d.kernel_db().lock().conn_for_ledger().execute_batch(&format!(
+        "DROP TRIGGER contexts_performer_fixed; DROP TRIGGER contexts_senpai_required;
+         UPDATE contexts SET performer = NULL, senpai_ctx = NULL WHERE context_id = x'{}';",
+        empty.to_hex()
+    )).unwrap();
     let holderless = d.dispatch(&set(h.lane, empty), &caller(h.amy, h.root)).await;
     assert!(
-        !holderless.is_ok() && holderless.message().contains("has no context character"),
+        !holderless.is_ok() && holderless.message().contains("nobody-holds"),
         "{}", holderless.message()
     );
 
@@ -255,7 +256,7 @@ async fn context_create_makes_a_context_character_under_the_callers_context() {
     assert_eq!(fresh.created_by, h.banto, "the requester made it");
     assert_eq!(character.senpai_ctx, Some(h.seat), "its senpai is the caller's context");
     assert!(db.list_context_slots(fresh.context_id).unwrap().is_empty(), "the character has no slot to copy");
-    assert_eq!(fresh.played_by, Some(h.coder));
+    assert_eq!(fresh.performer, Some(h.coder));
     drop(db);
     assert_eq!(d.kernel().resolve_context_review(fresh.context_id).await.unwrap().reviewer.name, "banto");
 }

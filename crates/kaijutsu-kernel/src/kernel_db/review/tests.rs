@@ -172,21 +172,37 @@ fn route_review_retired_holder_refuses_by_name() {
     assert!(!error.contains("amy"), "never substitutes the next holder up: {error}");
 }
 
-/// A context with no context character routes nothing: it refuses,
-/// naming the context; a context with no senpai has nobody above it.
+/// A context with no performer routes like any other: an ask raised in it
+/// climbs to the performer of its senpai, past senpais with no performer.
 #[test]
-fn route_review_refuses_a_context_with_no_context_character() {
+fn route_review_in_a_context_with_no_performer_climbs_past_performer_less_senpais() {
     let db = KernelDb::temporary().unwrap();
     let ws_id = setup_test_db(&db);
-    let [coder] = seed_characters(&db, &["coder"])[..] else { unreachable!() };
-    let bare = senpai_ctx_row(&db, ws_id, "no-context-character", None, None);
-    let error = db.route_review(ReviewQuery::ask(bare.context_id, coder)).unwrap_err();
-    assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
-    let text = error.to_string();
-    assert!(text.contains("no-context-character") && text.contains("no context character"), "{text}");
-    let lane = senpai_ctx_row(&db, ws_id, "under-bare", None, Some(coder));
-    let text = db.route_review(ReviewQuery::ask(lane.context_id, coder)).unwrap_err().to_string();
-    assert!(text.contains("has no senpai above it") || text.contains("nobody reviews"), "a context with no senpai has nobody above it: {text}");
+    let [coder, amy] = seed_characters(&db, &["coder", "amy"])[..] else { unreachable!() };
+    db.update_character_root(amy, true).unwrap();
+    let console = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
+    let hub = senpai_ctx_row(&db, ws_id, "hub", Some(&console), None);
+    let log = senpai_ctx_row(&db, ws_id, "log", Some(&hub), None);
+    assert_eq!(
+        db.route_review(ReviewQuery::ask(log.context_id, coder)).unwrap(),
+        EffectiveReviewer::Assigned(amy),
+        "the log answers to the hub, which has no performer, so the ask reaches the console's performer",
+    );
+    assert_eq!(
+        db.route_review(ReviewQuery::ask(hub.context_id, coder)).unwrap(),
+        EffectiveReviewer::Assigned(amy),
+    );
+    assert_eq!(
+        db.route_review(ReviewQuery::ask(log.context_id, amy)).unwrap(),
+        EffectiveReviewer::SelfConfirmation(amy),
+        "the root's own statement in a performer-less context under its console confirms itself",
+    );
+    assert_eq!(db.senpai_holder(log.context_id).unwrap(), Some((console.context_id, amy)));
+    assert_eq!(db.lineage_root(log.context_id).unwrap(), amy);
+    // A top with no performer and no senpai has nobody above it.
+    let bare = senpai_ctx_row(&db, ws_id, "bare", None, None);
+    let text = db.route_review(ReviewQuery::ask(bare.context_id, coder)).unwrap_err().to_string();
+    assert!(text.contains("has no senpai above it") || text.contains("nobody reviews"), "{text}");
 }
 
 /// An archived senpai is climbed through (it still answers for what was
@@ -208,7 +224,7 @@ fn route_review_walks_through_archived_and_refuses_a_missing_senpai() {
     let orphan_senpai = ContextId::new();
     db.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
     db.conn.execute(
-        "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+        "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
         params![blob_param(orphan_senpai.as_bytes()), blob_param(lane.context_id.as_bytes())],
     ).unwrap();
     db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
@@ -229,7 +245,7 @@ fn route_review_refuses_a_senpai_cycle() {
     let a = senpai_ctx_row(&db, ws_id, "cycle-a", None, Some(coder));
     let b = senpai_ctx_row(&db, ws_id, "cycle-b", Some(&a), Some(coder));
     db.conn.execute(
-        "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+        "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
         params![blob_param(b.context_id.as_bytes()), blob_param(a.context_id.as_bytes())],
     ).unwrap();
     let error = db.route_review(ReviewQuery::ask(a.context_id, coder)).unwrap_err();
@@ -325,7 +341,7 @@ fn lineage_root_requires_a_live_root_character_at_the_top() {
     assert!(error.to_string().contains("not a root"), "{error}");
 
     let bare = senpai_ctx_row(&db, ws_id, "nobody-top", None, None);
-    assert!(db.lineage_root(bare.context_id).unwrap_err().to_string().contains("no context character"));
+    assert!(db.lineage_root(bare.context_id).unwrap_err().to_string().contains("not a root console"));
 
     db.update_character_root(amy, true).unwrap();
     let root = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
@@ -353,7 +369,7 @@ fn lineage_root_follows_senpai_not_forked_from() {
     db.set_context_senpai(lane.context_id, Some(bob_root.context_id)).unwrap();
 
     assert_eq!(db.lineage_root(lane.context_id).unwrap(), bob);
-    assert_eq!(db.lineage_top(lane.context_id).unwrap().context_id, bob_root.context_id);
+    assert_eq!(db.lineage_top(lane.context_id).unwrap().0, bob_root.context_id);
     assert_eq!(db.lineage_root(seat.context_id).unwrap(), amy);
 }
 
@@ -368,9 +384,9 @@ fn lineage_top_names_the_top_regardless_of_its_character() {
     let seat = senpai_ctx_row(&db, ws_id, "unrooted-seat", None, Some(banto));
     let lane = senpai_ctx_row(&db, ws_id, "unrooted-lane", Some(&seat), Some(coder));
     assert!(db.lineage_root(lane.context_id).is_err());
-    assert_eq!(db.lineage_top(lane.context_id).unwrap().context_id, seat.context_id);
-    assert_eq!(db.lineage_top(seat.context_id).unwrap().context_id, seat.context_id, "a top names itself");
-    assert!(matches!(db.lineage_top(ContextId::new()).unwrap_err(), KernelDbError::Validation(_)));
+    assert_eq!(db.lineage_top(lane.context_id).unwrap().0, seat.context_id);
+    assert_eq!(db.lineage_top(seat.context_id).unwrap().0, seat.context_id, "a top names itself");
+    assert!(matches!(db.lineage_top(ContextId::new()).unwrap_err(), KernelDbError::NotFound(_)), "a context with no row has no lineage");
 }
 
 /// A senpai cycle is corruption; the lineage walk stops with a named
@@ -383,7 +399,7 @@ fn lineage_root_refuses_a_senpai_cycle() {
     let a = senpai_ctx_row(&db, ws_id, "cycle-a", None, Some(filler));
     let b = senpai_ctx_row(&db, ws_id, "cycle-b", Some(&a), Some(filler));
     db.conn.execute(
-        "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+        "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
         params![blob_param(b.context_id.as_bytes()), blob_param(a.context_id.as_bytes())],
     ).unwrap();
     for error in [
@@ -425,7 +441,7 @@ fn lineage_top_refuses_a_dangling_senpai() {
     let lane = senpai_ctx_row(&db, ws_id, "dangling-lane", None, Some(filler));
     db.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
     db.conn.execute(
-        "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+        "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
         params![blob_param(ContextId::new().as_bytes()), blob_param(lane.context_id.as_bytes())],
     ).unwrap();
     db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
@@ -465,8 +481,8 @@ fn set_context_senpai_moves_a_kohai_and_refuses_cycles_and_missing_rows() {
     let no_row = db.set_context_senpai(ContextId::new(), Some(a.context_id)).unwrap_err();
     assert!(matches!(no_row, KernelDbError::NotFound(_)), "{no_row}");
     let bare = senpai_ctx_row(&db, ws_id, "mv-bare", None, None);
-    let bare_error = db.set_context_senpai(bare.context_id, Some(a.context_id)).unwrap_err();
-    assert!(bare_error.to_string().contains("no context character"), "{bare_error}");
+    db.set_context_senpai(bare.context_id, Some(a.context_id)).expect("a context with no performer answers to a senpai too");
+    assert_eq!(edge(&bare), Some(a.context_id));
 }
 
 /// A rotation moves no kohai: they keep pointing at the archived
@@ -518,10 +534,13 @@ fn authority_rule_allows_the_senpai_holder_and_the_lineage_root_only() {
     for act in GovernedAct::ALL {
         assert_eq!(db.context_authority(lane.context_id, banto, act).unwrap(), Ok(Authority::SenpaiHolder), "{act:?}");
         assert_eq!(db.context_authority(lane.context_id, amy, act).unwrap(), Ok(Authority::LineageRoot), "{act:?}");
-        for refused in [sibling, coder] {
+        // The lane's own performer archives it (`a_contexts_own_performer_may_archive_it_and_nothing_else`).
+        let refused_actors: Vec<PrincipalId> = if act == GovernedAct::Archive { vec![sibling] } else { vec![sibling, coder] };
+        for refused in refused_actors {
             let why = db.context_authority(lane.context_id, refused, act).unwrap().unwrap_err();
+            let own = if act == GovernedAct::Archive { ", its own performer (coder)," } else { "" };
             assert_eq!(why, format!(
-                "only lane ({})'s senpai (banto) or its lineage root (amy) may {}",
+                "only lane ({})'s senpai (banto){own} or its lineage root (amy) may {}",
                 lane.context_id.short(), act.as_str()
             ));
         }
@@ -531,26 +550,82 @@ fn authority_rule_allows_the_senpai_holder_and_the_lineage_root_only() {
     assert!(db.context_authority(seat.context_id, banto, GovernedAct::Move).unwrap().is_err(), "a seat has no authority over itself");
 }
 
-/// A context with no context character has no senpai and no lineage
-/// root, so a live root character may archive it; nobody else may, and
-/// no other act is opened.
+/// A context with no performer answers to a senpai like any other: the
+/// performer of its senpai (past senpais with no performer) or the lineage
+/// root archives it by the one rule, and nobody else does.
 #[test]
-fn a_live_root_archives_a_context_with_no_context_character() {
+fn a_context_with_no_performer_is_archived_by_its_senpai_or_the_lineage_root() {
     let db = KernelDb::temporary().unwrap();
     let ws_id = setup_test_db(&db);
-    let [amy, coder, old_root] = seed_characters(&db, &["amy", "coder", "old-root"])[..] else { unreachable!() };
+    let [amy, banto, coder] = seed_characters(&db, &["amy", "banto", "coder"])[..] else { unreachable!() };
     db.update_character_root(amy, true).unwrap();
-    db.update_character_root(old_root, true).unwrap();
-    db.retire_character(old_root, 1).unwrap();
-    let orphan = senpai_ctx_row(&db, ws_id, "orphan", None, None);
-    assert_eq!(db.context_authority(orphan.context_id, amy, GovernedAct::Archive).unwrap(), Ok(Authority::LiveRoot));
-    for refused in [coder, old_root] {
-        let why = db.context_authority(orphan.context_id, refused, GovernedAct::Archive).unwrap().unwrap_err();
-        assert!(why.contains("has no context character") && why.contains("a live root character"), "{why}");
+    let console = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
+    let seat = senpai_ctx_row(&db, ws_id, "seat", Some(&console), Some(banto));
+    let hub = senpai_ctx_row(&db, ws_id, "hub", Some(&seat), None);
+    let log = senpai_ctx_row(&db, ws_id, "log", Some(&hub), None);
+    for act in GovernedAct::ALL {
+        assert_eq!(db.context_authority(log.context_id, banto, act).unwrap(), Ok(Authority::SenpaiHolder), "{act:?}: climbs past the hub to banto");
+        assert_eq!(db.context_authority(log.context_id, amy, act).unwrap(), Ok(Authority::LineageRoot), "{act:?}");
+        assert!(db.context_authority(log.context_id, coder, act).unwrap().is_err(), "{act:?}");
     }
+}
+
+/// A context's own performer archives it, and no other governed act is
+/// open to it; the senpai's performer and the lineage root keep every act.
+#[test]
+fn a_contexts_own_performer_may_archive_it_and_nothing_else() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let [amy, coder, sibling] = seed_characters(&db, &["amy", "coder", "sibling"])[..] else { unreachable!() };
+    db.update_character_root(amy, true).unwrap();
+    let console = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
+    let lane = senpai_ctx_row(&db, ws_id, "lane", Some(&console), Some(coder));
+    assert_eq!(db.context_authority(lane.context_id, coder, GovernedAct::Archive).unwrap(), Ok(Authority::OwnPerformer));
     for act in GovernedAct::ALL.into_iter().filter(|act| *act != GovernedAct::Archive) {
-        assert!(db.context_authority(orphan.context_id, amy, act).unwrap().is_err(), "{act:?}");
+        assert!(db.context_authority(lane.context_id, coder, act).unwrap().is_err(), "{act:?}");
     }
+    assert!(db.context_authority(lane.context_id, sibling, GovernedAct::Archive).unwrap().is_err());
+}
+
+/// A senpai is written through one check: a NULL outside a root console is
+/// refused by the Rust guard and, past it, by the database.
+#[test]
+fn a_null_senpai_outside_a_root_console_is_refused() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let [amy, coder] = seed_characters(&db, &["amy", "coder"])[..] else { unreachable!() };
+    db.update_character_root(amy, true).unwrap();
+    let console = senpai_ctx_row(&db, ws_id, "amy", None, Some(amy));
+    db.set_character_root_ctx(amy, Some(console.context_id)).unwrap();
+    let lane = senpai_ctx_row(&db, ws_id, "lane", Some(&console), Some(coder));
+
+    // The Rust guard.
+    let error = db.set_context_senpai(lane.context_id, None).unwrap_err().to_string();
+    assert!(error.contains("only a root console has no senpai"), "{error}");
+    let error = db.check_senpai_edge(lane.context_id, "coder", Some(coder), None).unwrap_err().to_string();
+    assert!(error.contains("needs a senpai"), "{error}");
+    assert!(
+        db.check_senpai_edge(console.context_id, kaijutsu_types::ROOT_CONTEXT_TYPE, Some(amy), None).is_ok(),
+        "a root's console has none"
+    );
+    let error = db.check_senpai_edge(lane.context_id, "coder", Some(amy), None).unwrap_err().to_string();
+    assert!(error.contains("needs a senpai"), "a root character's other contexts have one: {error}");
+    let mut bare = make_context_row(Some("bare"));
+    bare.performer = Some(coder);
+    let error = db.insert_placed_context(&bare, ws_id).unwrap_err().to_string();
+    assert!(error.contains("needs a senpai"), "{error}");
+    // The trigger, under the guard.
+    let error = db
+        .conn
+        .execute("UPDATE contexts SET senpai_ctx = NULL WHERE context_id = ?1", params![blob_param(lane.context_id.as_bytes())])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only a root console has no senpai"), "{error}");
+    assert_eq!(db.senpai_of(lane.context_id).unwrap(), Some(console.context_id), "the refusals changed nothing");
+    // The console itself may be written to NULL again.
+    db.conn
+        .execute("UPDATE contexts SET senpai_ctx = NULL WHERE context_id = ?1", params![blob_param(console.context_id.as_bytes())])
+        .unwrap();
 }
 
 /// A context with no senpai and a lineage with no live root still answer
@@ -564,7 +639,10 @@ fn authority_rule_names_a_missing_senpai_and_a_missing_root() {
     let lane = senpai_ctx_row(&db, ws_id, "lane", Some(&top), Some(coder));
 
     let why = db.context_authority(top.context_id, coder, GovernedAct::Archive).unwrap().unwrap_err();
-    assert!(why.starts_with(&format!("only top ({})'s senpai (none) or its lineage root (none:", top.context_id.short())), "{why}");
+    assert!(
+        why.starts_with(&format!("only top ({})'s senpai (none), its own performer (banto), or its lineage root (none:", top.context_id.short())),
+        "{why}"
+    );
     assert!(why.ends_with("may archive it"), "{why}");
     assert_eq!(db.context_authority(lane.context_id, banto, GovernedAct::Archive).unwrap(), Ok(Authority::SenpaiHolder),
         "holding the senpai is enough when the lineage has no root");

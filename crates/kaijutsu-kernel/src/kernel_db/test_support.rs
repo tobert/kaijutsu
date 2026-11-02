@@ -3,12 +3,14 @@
 use super::*;
 
 /// Give a fresh database the schema one written before context characters
-/// had: the columns and table `drop_pre_context_character_columns` removes.
+/// had: the columns and table `drop_pre_context_character_columns` removes,
+/// and the `context_characters` table `context-fold-v1` folds away.
 /// Idempotent. Rows in those columns are written with raw SQL, since no
 /// `KernelDb` method writes them.
 #[cfg(test)]
 pub(super) fn into_pre_context_character(db: &KernelDb) {
     let c = &db.conn;
+    KernelDb::ensure_legacy_context_characters(c).unwrap();
     KernelDb::ensure_legacy_cast_tables(c).unwrap();
     for (table, column, definition) in [
         ("contexts", "provider", "TEXT"),
@@ -32,6 +34,50 @@ pub(super) fn into_pre_context_character(db: &KernelDb) {
             thinking_budget  INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
             thinking_style   TEXT
         );",
+    ).unwrap();
+}
+
+/// Put a database built through the current API back on the shape before
+/// `context-fold-v1`: the performer, senpai and persona of each performed
+/// context move into a `context_characters` table, `context_slots` references
+/// it, and `contexts` loses the three columns. A performer-less context loses
+/// its senpai with them, as it had none then. The next
+/// `apply_additive_migrations` is the fold.
+#[cfg(test)]
+pub(super) fn into_pre_fold(db: &KernelDb) {
+    let c = &db.conn;
+    KernelDb::ensure_legacy_context_characters(c).unwrap();
+    c.execute_batch(
+        "INSERT INTO context_characters (context_id, principal_id, senpai_ctx, persona, created_at)
+             SELECT context_id, performer, senpai_ctx, persona, created_at FROM contexts WHERE performer IS NOT NULL;
+         DROP TRIGGER IF EXISTS contexts_performer_fixed;
+         DROP TRIGGER IF EXISTS contexts_senpai_required;
+         DROP INDEX IF EXISTS idx_contexts_performer;
+         DROP INDEX IF EXISTS idx_contexts_senpai;
+         PRAGMA foreign_keys = OFF;
+         CREATE TABLE context_slots_old (
+             context_id      BLOB    NOT NULL REFERENCES context_characters(context_id),
+             role            TEXT    NOT NULL,
+             backend_id      BLOB    NOT NULL REFERENCES backends(backend_id),
+             model           TEXT    NOT NULL CHECK (model != ''),
+             max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+             context_window  INTEGER CHECK (context_window IS NULL OR context_window > 0),
+             temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+             top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+             effort          TEXT,
+             thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+             thinking_style  TEXT,
+             PRIMARY KEY (context_id, role)
+         );
+         INSERT INTO context_slots_old SELECT context_id, role, backend_id, model, max_tokens, context_window,
+             temperature, top_p, effort, thinking_budget, thinking_style FROM context_slots;
+         DROP TABLE context_slots;
+         ALTER TABLE context_slots_old RENAME TO context_slots;
+         ALTER TABLE contexts DROP COLUMN performer;
+         ALTER TABLE contexts DROP COLUMN senpai_ctx;
+         ALTER TABLE contexts DROP COLUMN persona;
+         PRAGMA foreign_keys = ON;
+         DELETE FROM kernel_migrations WHERE name = 'context-fold-v1';",
     ).unwrap();
 }
 
@@ -74,7 +120,7 @@ pub(super) fn make_context_row(label: Option<&str>) -> ContextRow {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     }
 }
 
@@ -180,14 +226,27 @@ pub(super) fn senpai_ctx_row(
     if let Some(senpai) = senpai {
         db.set_context_senpai(row.context_id, Some(senpai.context_id)).unwrap();
     }
-    row.played_by = holder;
+    row.performer = holder;
     row
 }
 
-/// Run `context-characters-v1` over the rows a test wrote with the old columns.
+/// Run `context-characters-v1` over the rows a test wrote with the old columns,
+/// then read its `context_characters` rows through the `contexts` columns the
+/// API reads (what `context-fold-v1` copies, without its senpai assignment
+/// or its drop of the table).
 pub(super) fn run_context_character_migration(db: &KernelDb) -> KernelDbResult<()> {
     db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::CONTEXT_CHARACTERS_MIGRATION]).unwrap();
-    KernelDb::migrate_context_characters(&db.conn)
+    KernelDb::migrate_context_characters(&db.conn)?;
+    db.conn.execute_batch(
+        "DROP TRIGGER IF EXISTS contexts_performer_fixed;
+         DROP TRIGGER IF EXISTS contexts_senpai_required;
+         UPDATE contexts SET
+             performer  = (SELECT cc.principal_id FROM context_characters cc WHERE cc.context_id = contexts.context_id),
+             senpai_ctx = (SELECT cc.senpai_ctx   FROM context_characters cc WHERE cc.context_id = contexts.context_id),
+             persona    = (SELECT cc.persona      FROM context_characters cc WHERE cc.context_id = contexts.context_id)
+         WHERE context_id IN (SELECT context_id FROM context_characters);",
+    )?;
+    KernelDb::ensure_context_guards(&db.conn)
 }
 
 pub(super) fn turn_start(ctx: ContextId) -> TurnStart {

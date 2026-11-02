@@ -172,7 +172,7 @@ impl KjDispatcher {
             ));
         }
 
-        let ctx = match self.get_or_create_handoff_ctx(&target) {
+        let ctx = match self.get_or_create_handoff_ctx(&target, caller) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj handoff note: {e}")),
         };
@@ -329,7 +329,7 @@ impl KjDispatcher {
     /// `handoff_ctx = None` and mint two contexts for one sheet row — the
     /// `target` passed in may be stale (read before this call took the
     /// lock), so the row is re-read fresh once the lock is held.
-    fn get_or_create_handoff_ctx(&self, target: &CharacterRow) -> Result<ContextId, String> {
+    fn get_or_create_handoff_ctx(&self, target: &CharacterRow, caller: &KjCaller) -> Result<ContextId, String> {
         if let Some(ctx) = target.handoff_ctx {
             return Ok(ctx);
         }
@@ -355,6 +355,11 @@ impl KjDispatcher {
             .get_or_create_default_workspace(target.principal_id)
             .map_err(|e| e.to_string())?;
         let label = format!("handoff/{}", target.name);
+        // The log answers to the root console of the lineage root of the
+        // context the note ran in, else of the only live root.
+        let senpai = db.default_console_for(caller.context_id).map_err(|e| {
+            format!("could not place {}'s handoff log under a root console: {e}", target.name)
+        })?;
         let row = ContextRow {
             context_id: new_id,
             label: Some(label.clone()),
@@ -374,15 +379,15 @@ impl KjDispatcher {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: Some(senpai), persona: None,
         };
-        db.insert_context_with_document(&row, default_ws)
+        db.insert_placed_context(&row, default_ws)
             .map_err(|e| e.to_string())?;
         db.set_character_handoff_ctx(target.principal_id, Some(new_id))
             .map_err(|e| e.to_string())?;
         drop(db);
 
-        // `insert_context_with_document` commits the KernelDb document row
+        // `insert_placed_context` commits the KernelDb document row
         // but doesn't seed the in-memory BlockStore — the same gap
         // `rc/mod.rs`'s rc runner papers over before its first block
         // write. `DocumentAlreadyExists` means another path already seeded
@@ -475,6 +480,7 @@ mod tests {
     #[tokio::test]
     async fn note_without_for_files_under_the_actor_not_the_requester() {
         let d = super::super::test_helpers::test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let amy = create_and_play(&d, "amy").await;
         let banto = create_and_play(&d, "banto").await;
         let turn = amy.clone().with_actor(banto.principal_id, Some(amy.principal_id));
@@ -500,6 +506,7 @@ mod tests {
     #[tokio::test]
     async fn note_then_tail_round_trips_text() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let caller = create_and_play(&d, "hajime").await;
 
         let noted = d
@@ -523,6 +530,7 @@ mod tests {
     #[tokio::test]
     async fn note_from_an_unmapped_principal_fails_loudly() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let caller = caller_as(PrincipalId::new());
         let result = d.dispatch(&[s("handoff"), s("note"), s("hello")], &caller).await;
         let KjResult::Err(msg) = result else {
@@ -539,6 +547,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_context_is_created_exactly_once() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let caller = create_and_play(&d, "hajime").await;
 
         d.dispatch(&[s("handoff"), s("note"), s("first")], &caller).await;
@@ -570,6 +579,7 @@ mod tests {
     #[tokio::test]
     async fn note_for_another_character_is_authored_by_the_caller() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let writer = create_and_play(&d, "amy").await;
         let reader = create_and_play(&d, "kaijutsu-lead").await;
 
@@ -606,6 +616,7 @@ mod tests {
     #[tokio::test]
     async fn tail_window_caps_the_result() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let caller = create_and_play(&d, "hajime").await;
         for i in 0..5 {
             d.dispatch(&[s("handoff"), s("note"), format!("note {i}")], &caller).await;
@@ -626,6 +637,7 @@ mod tests {
     #[tokio::test]
     async fn note_to_a_retired_character_refuses() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let target = create_and_play(&d, "hajime").await;
         // Retire directly through KernelDb — `kj character retire` lives in
         // a different file this slice doesn't touch, and the sheet-level
@@ -651,6 +663,7 @@ mod tests {
     #[tokio::test]
     async fn tail_reads_a_retired_characters_log() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let target = create_and_play(&d, "hajime").await;
         d.dispatch(&[s("handoff"), s("note"), s("before"), s("retiring")], &target).await;
         d.kernel_db()
@@ -674,6 +687,7 @@ mod tests {
     #[tokio::test]
     async fn tail_with_explicit_target_does_not_require_the_caller_to_have_a_character() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let hajime = create_and_play(&d, "hajime").await;
         let noted = d
             .dispatch(&[s("handoff"), s("note"), s("green"), s("on"), s("arrival")], &hajime)
@@ -692,6 +706,7 @@ mod tests {
     #[tokio::test]
     async fn signoff_leaves_a_note_and_closes_the_current_epoch() {
         let d = test_dispatcher().await;
+        d.kernel_db().lock().seed_test_root_console().unwrap();
         let mut caller = create_and_play(&d, "hajime").await;
         let context = register_context(&d, Some("work"), None, caller.principal_id);
         caller.context_id = Some(context);
@@ -726,5 +741,23 @@ mod tests {
             panic!("expected handoff note, got {tailed:?}");
         };
         assert!(message.contains("leave this for tomorrow"), "{message}");
+    }
+
+    /// A handoff log answers to a root console, like every context with no
+    /// performer: the console of the only live root, or of the lineage root
+    /// of the context the note ran in.
+    #[tokio::test]
+    async fn a_handoff_log_answers_to_a_root_console() {
+        let d = test_dispatcher().await;
+        let (root, console) = d.kernel_db().lock().seed_test_root_console().unwrap();
+        let caller = create_and_play(&d, "banto").await;
+        let noted = d.dispatch(&[s("handoff"), s("note"), s("first")], &caller).await;
+        assert!(noted.is_ok(), "{}", noted.message());
+        let db = d.kernel_db().lock();
+        let sheet = db.list_characters(false).unwrap().into_iter().find(|c| c.name == "banto").unwrap();
+        let log = sheet.handoff_ctx.expect("the note minted the log");
+        assert_eq!(db.context_character(log).unwrap(), None, "a log has no performer");
+        assert_eq!(db.senpai_of(log).unwrap(), Some(console), "and answers to the root console");
+        assert_eq!(db.lineage_root(log).unwrap(), root);
     }
 }

@@ -34,7 +34,7 @@ pub struct SenpaiFact {
 }
 
 /// The character fact and the senpai fact for `context_id`, read from its
-/// context character. A context with no context character has neither; a
+/// row. A context with no performer has neither; a
 /// context with no senpai (a root console) has no senpai fact. A missing row
 /// is an error, never an absent fact.
 pub(crate) fn character_facts(
@@ -46,14 +46,18 @@ pub(crate) fn character_facts(
     };
     let senpai = match row.senpai_ctx {
         Some(senpai) => {
-            let senpai_row = db.context_character(senpai).map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("senpai {} has no context character", senpai.short()))?;
             let context = db.get_context(senpai).map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("senpai context {} has no row", senpai.short()))?;
+            // A senpai with no performer is answered for by the performer above it.
+            let holder = match context.performer {
+                Some(performer) => performer,
+                None => db.senpai_holder(senpai).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("senpai {} has no performer on its senpai chain", senpai.short()))?.1,
+            };
             Some(SenpaiFact {
                 id: senpai.short(),
                 context: context.label,
-                character: db.name_for(senpai_row.principal_id),
+                character: db.name_for(holder),
             })
         }
         None => None,

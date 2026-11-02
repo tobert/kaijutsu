@@ -193,7 +193,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         };
         let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(&row, ws_id).unwrap();
@@ -246,7 +246,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             },
             ws_id,
         )
@@ -273,7 +273,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             },
             ws_id,
         )
@@ -300,7 +300,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             },
             ws_id,
         )

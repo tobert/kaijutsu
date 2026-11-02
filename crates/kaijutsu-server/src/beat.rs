@@ -421,6 +421,10 @@ impl BeatScheduler {
             let ws = db.get_or_create_default_workspace(system).map_err(|e| {
                 format!("beat: score context workspace for {}: {e}", track_id.as_str())
             })?;
+            // The score answers to the console of the only live root.
+            let senpai = db.default_console_for(None).map_err(|e| {
+                format!("beat: score context for {} has no senpai: {e}", track_id.as_str())
+            })?;
             let row = ContextRow {
                 context_id: score_ctx,
                 label: Some(label.clone()),
@@ -440,9 +444,9 @@ impl BeatScheduler {
                 workspace_id: None,
                 preset_id: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: Some(senpai), persona: None,
             };
-            db.insert_context_with_document(&row, ws).map_err(|e| {
+            db.insert_placed_context(&row, ws).map_err(|e| {
                 format!("beat: creating score context for {}: {e}", track_id.as_str())
             })?;
         }
@@ -1486,7 +1490,7 @@ impl BeatScheduler {
         let mut matches = Vec::new();
         for context in track.attached.keys() {
             match db.get_context(*context) {
-                Ok(Some(row)) if row.played_by == Some(played_by) => matches.push(*context),
+                Ok(Some(row)) if row.performer == Some(played_by) => matches.push(*context),
                 Err(error) => log::error!("beat: could not read producer {context}: {error}"),
                 _ => {}
             }
@@ -2635,6 +2639,8 @@ mod tests {
 
     async fn fresh_kernel_and_docs() -> (Arc<Kernel>, SharedBlockStore) {
         let kernel = Arc::new(Kernel::new_ephemeral("test").await);
+        // lost+found and score contexts answer to the only live root's console.
+        kernel.kernel_db().lock().seed_test_root_console().unwrap();
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore =
             Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
@@ -4061,6 +4067,8 @@ mod tests {
         let ctx = ContextId::new();
         let ws_id = {
             let g = db.lock();
+            // The score context answers to the only live root's console.
+            g.seed_test_root_console().unwrap();
             let ws = g.get_or_create_default_workspace(principal).unwrap();
             // beat_state FKs to contexts(context_id): the row must exist first.
             g.insert_context_with_document(
@@ -4083,7 +4091,7 @@ mod tests {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    played_by: None,
+                    performer: None, senpai_ctx: None, persona: None,
                 },
                 ws,
             )
@@ -4132,7 +4140,7 @@ mod tests {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    played_by: None,
+                    performer: None, senpai_ctx: None, persona: None,
                 },
                 workspace,
             )
@@ -5081,7 +5089,7 @@ mod tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             }, workspace).unwrap();
             db.update_played_by(context, Some(performer)).unwrap();
         }
@@ -5620,7 +5628,7 @@ mod tests {
                     demoted_at: None,
                     paused_at: None,
                     origin_host: None,
-                    played_by: None,
+                    performer: None, senpai_ctx: None, persona: None,
                 },
                 ws,
             )

@@ -68,7 +68,7 @@ fn insert_context_row(
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     })
     .unwrap();
 }
@@ -1482,7 +1482,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         })
         .unwrap();
     }

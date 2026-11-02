@@ -1669,7 +1669,7 @@ pub(crate) mod test_helpers {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
                 // A context registered under a parent answers to it, as a create or a fork would.
             };
             db.insert_context(&row).unwrap();

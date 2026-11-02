@@ -182,12 +182,13 @@ impl KernelDb {
             Self::drop_old_routing(conn)?;
         }
         Self::drop_structural_edges(conn)?;
-        Self::ensure_context_character_guards(conn)?;
         if pre_context_character {
             Self::migrate_context_characters(conn)?;
             Self::drop_pre_context_character_columns(conn)?;
         }
         Self::migrate_character_slots(conn)?;
+        Self::migrate_context_fold(conn)?;
+        Self::ensure_context_guards(conn)?;
         Ok(())
     }
 

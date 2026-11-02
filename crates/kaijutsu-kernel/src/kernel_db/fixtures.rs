@@ -3,6 +3,42 @@
 use super::*;
 
 impl KernelDb {
+    /// Test fixture: a live root character with a root console, made once.
+    /// For tests that create a context with no performer (a handoff log,
+    /// scratch, lost+found), which answers to the only live root's console.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn seed_test_root_console(&self) -> KernelDbResult<(PrincipalId, ContextId)> {
+        if let Some(sheet) = self.list_characters(false)?.into_iter().find(|sheet| sheet.root && sheet.root_ctx.is_some()) {
+            return Ok((sheet.principal_id, sheet.root_ctx.expect("filtered on root_ctx")));
+        }
+        let principal_id = PrincipalId::new();
+        self.insert_character(&CharacterRow {
+            principal_id,
+            name: format!("root-fixture-{}", principal_id.short()),
+            created_at: 0,
+            retired_at: None,
+            handoff_ctx: None,
+            root: true,
+            root_ctx: None,
+            context_type: None,
+        })?;
+        let workspace = self.get_or_create_default_workspace(principal_id)?;
+        let console = ContextId::new();
+        self.insert_context_with_document(
+            &ContextRow {
+                context_id: console, label: Some(format!("root-fixture-{}", console.short())), system_prompt: None,
+                context_state: ContextState::Live, context_type: kaijutsu_types::ROOT_CONTEXT_TYPE.into(), created_at: now_millis(),
+                created_by: principal_id, forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None,
+                paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
+            },
+            workspace,
+        )?;
+        self.write_context_character(console, principal_id, None, None)?;
+        self.set_character_root_ctx(principal_id, Some(console))?;
+        Ok((principal_id, console))
+    }
+
     /// Test fixture: record that `context` should answer to `senpai`.
     /// [`Self::update_played_by`] gives the context character this senpai when
     /// it writes it, and a context that already has one is moved at once, so a
@@ -18,10 +54,15 @@ impl KernelDb {
             params![blob_param(context.as_bytes()), senpai.as_ref().map(|id| id.as_bytes().to_vec())],
         )?;
         if self.context_character(context)?.is_some() {
-            self.conn.execute(
-                "UPDATE context_characters SET senpai_ctx = ?1 WHERE context_id = ?2",
+            // A `None` makes a top that is no root console, which the guard
+            // refuses; a fixture builds one by lifting the guard for the write.
+            self.conn.execute_batch("DROP TRIGGER IF EXISTS contexts_senpai_required")?;
+            let written = self.conn.execute(
+                "UPDATE contexts SET senpai_ctx = ?1 WHERE context_id = ?2",
                 params![senpai.as_ref().map(|id| id.as_bytes().to_vec()), blob_param(context.as_bytes())],
-            )?;
+            );
+            Self::ensure_context_guards(&self.conn)?;
+            written?;
         }
         Ok(())
     }
@@ -73,17 +114,17 @@ impl KernelDb {
     /// `played_by`. No kernel path does this: a context's character never
     /// changes. For wire tests that make a context through `kj context create`
     /// and then need another character to perform it. The trigger that fixes
-    /// the principal is dropped for the update and put back.
+    /// the performer is dropped for the update and put back.
     #[cfg(any(test, feature = "test-util"))]
     pub fn recast_test_character(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<()> {
         self.context_character(id)?
             .ok_or_else(|| KernelDbError::Validation(format!("context {} has no context character to recast", id.short())))?;
-        self.conn.execute_batch("DROP TRIGGER IF EXISTS context_characters_fixed")?;
+        self.conn.execute_batch("DROP TRIGGER IF EXISTS contexts_performer_fixed")?;
         let updated = self.conn.execute(
-            "UPDATE context_characters SET principal_id = ?1 WHERE context_id = ?2",
+            "UPDATE contexts SET performer = ?1 WHERE context_id = ?2",
             params![blob_param(played_by.as_bytes()), blob_param(id.as_bytes())],
         );
-        Self::ensure_context_character_guards(&self.conn)?;
+        Self::ensure_context_guards(&self.conn)?;
         updated?;
         Ok(())
     }
@@ -277,7 +318,7 @@ impl KernelDb {
                     created_at: now_millis(), created_by: reviewer, forked_from: None, fork_kind: None,
                     archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
                     last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,
-                    origin_host: None, played_by: None,
+                    origin_host: None, performer: None, senpai_ctx: None, persona: None,
                 };
                 // The reviewer's own senpai is where the context answered
                 // before, so the climb continues where the old walk did.

@@ -1273,6 +1273,8 @@ fn bootstrap_discovered_context(
         });
     }
 
+    // A discovered conversation answers to the only live root's console.
+    let senpai = db.default_console_for(None)?;
     let row = ContextRow {
         context_id,
         label: None,
@@ -1292,13 +1294,13 @@ fn bootstrap_discovered_context(
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: Some(senpai), persona: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
     // into an illegible FK violation on the next statement.
     let default_ws = db.get_or_create_default_workspace(row.created_by)?;
-    match db.insert_context_with_document(&row, default_ws) {
+    match db.insert_placed_context(&row, default_ws) {
         Ok(()) => Ok(ContextBootstrapOutcome::Inserted),
         Err(e) => match db.get_context(context_id)? {
             // Someone inserted between our read and our write. The row we
@@ -1326,7 +1328,10 @@ mod context_bootstrap_tests {
     use super::*;
 
     fn db() -> KernelDb {
-        KernelDb::temporary().expect("temporary KernelDb")
+        let db = KernelDb::temporary().expect("temporary KernelDb");
+        // A discovered conversation answers to the only live root's console.
+        db.seed_test_root_console().expect("root console");
+        db
     }
 
     /// A context the way a real one looks on disk: a human label, a real
@@ -1354,7 +1359,7 @@ mod context_bootstrap_tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)

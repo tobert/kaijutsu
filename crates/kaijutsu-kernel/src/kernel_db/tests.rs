@@ -344,7 +344,7 @@ fn fk_violation_is_validation_error() {
         demoted_at: None,
         paused_at: None,
         origin_host: None,
-        played_by: None,
+        performer: None, senpai_ctx: None, persona: None,
     };
     let err = db.insert_context(&row).unwrap_err();
     assert!(

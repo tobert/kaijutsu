@@ -483,8 +483,8 @@ impl KjDispatcher {
 
     /// Return a live root character's MCP hub, creating it when no live
     /// context holds the label `mcp/<name>`: type `mcp-hub`, created by the
-    /// root, with no parent and no context character. It runs no turns and
-    /// routes nothing; it is the `forked_from` of the root's MCP sessions
+    /// root, with no parent and no performer, answering to the root's console.
+    /// It runs no turns; it is the `forked_from` of the root's MCP sessions
     /// (`docs/senpai-kohai.md`, "MCP sessions"). A live context of another
     /// type on the label is an error naming it.
     ///
@@ -515,6 +515,9 @@ impl KjDispatcher {
                 ));
             }
             let default_ws = db.get_or_create_default_workspace(character).map_err(|e| e.to_string())?;
+            let console = sheet.root_ctx.ok_or_else(|| {
+                format!("{} has no root console for its MCP hub to answer to", sheet.name)
+            })?;
             let row = ContextRow {
                 context_id: new_id,
                 label: Some(label.clone()),
@@ -534,9 +537,9 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: Some(console), persona: None,
             };
-            db.insert_context_with_document(&row, default_ws)
+            db.insert_placed_context(&row, default_ws)
                 .map_err(|e| format!("could not create the MCP hub '{label}': {e}"))?;
             (sheet.name, label)
         };
@@ -595,7 +598,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             };
             db.in_transaction(|db| {
                 let default_ws = db.get_or_create_default_workspace(requester)?;
@@ -1468,7 +1471,7 @@ mod tests {
         let row = d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap();
         assert_eq!(row.label.as_deref(), Some("sovereign"));
         assert_eq!(row.context_type, "root");
-        assert_eq!(row.played_by, Some(sheet.principal_id));
+        assert_eq!(row.performer, Some(sheet.principal_id));
         assert_eq!(row.forked_from, None);
         assert_eq!(row.created_by, caller.principal_id, "the requester stays the creator");
         assert!(row.archived_at.is_none());
@@ -1515,7 +1518,9 @@ mod tests {
         assert_eq!(hub.created_by, sheet.principal_id, "the root creates its own hub");
         assert_eq!(hub.forked_from, None);
         assert!(hub.archived_at.is_none());
-        assert!(d.kernel_db().lock().context_character(hub.context_id).unwrap().is_none(), "a hub has no context character");
+        assert!(d.kernel_db().lock().context_character(hub.context_id).unwrap().is_none(), "a hub has no performer");
+        assert_eq!(hub.senpai_ctx, sheet.root_ctx, "a hub answers to its root's console");
+        assert_eq!(d.kernel_db().lock().lineage_root(hub.context_id).unwrap(), sheet.principal_id);
         assert!(d.drift_router().read().get(hub.context_id).is_some(), "the hub is registered with the drift router");
         assert_ne!(Some(hub.context_id), sheet.root_ctx);
 

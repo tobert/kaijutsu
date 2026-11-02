@@ -6129,7 +6129,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             })
             .unwrap();
 
@@ -7658,7 +7658,7 @@ mod tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             })
             .unwrap();
 

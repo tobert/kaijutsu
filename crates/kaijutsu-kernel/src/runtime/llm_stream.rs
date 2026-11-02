@@ -6758,7 +6758,7 @@ mod usage_tests {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             })
             .unwrap();
             for bp in breakpoints {
@@ -8046,7 +8046,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             }, ws).unwrap();
             db.insert_context(&crate::ContextRow {
                 context_id: context, label: None, system_prompt: None,
@@ -8055,7 +8055,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             }).unwrap();
             db.update_played_by(senpai, Some(reviewer)).unwrap();
             // The performer's slots give its context a `default` slot only
@@ -8090,7 +8090,7 @@ mod lifetime_tests {
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
             preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
             demoted_at: None, paused_at: None, origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         }, ws).unwrap();
         context
     }
@@ -8147,7 +8147,7 @@ mod lifetime_tests {
         ]).await;
         let db = kernel.kernel_db().lock();
         let turn = db.get_turn(turn_id).unwrap().expect("the turn left a row");
-        let performer = db.get_context(context).unwrap().unwrap().played_by.unwrap();
+        let performer = db.get_context(context).unwrap().unwrap().performer.unwrap();
         assert_eq!(turn.start.context_id, context);
         assert_eq!(turn.start.performer, performer);
         assert_eq!(turn.start.role, "default");
@@ -8198,7 +8198,7 @@ mod lifetime_tests {
     async fn a_turn_whose_record_cannot_start_is_refused() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("unused").with_scripted_stream(vec![]))).await;
         let lease = kernel.turns().begin(context);
-        let performer = kernel.kernel_db().lock().get_context(context).unwrap().unwrap().played_by.unwrap();
+        let performer = kernel.kernel_db().lock().get_context(context).unwrap().unwrap().performer.unwrap();
         kernel.kernel_db().lock().begin_turn(&crate::TurnStart {
             turn_id: lease.id(), context_id: context, performer, role: "default".into(),
             provider: "mock".into(), model: "mock-model".into(), started_at: 1,
@@ -8798,7 +8798,7 @@ mod lifetime_tests {
         kernel.blocks().create_document(successor, DocumentKind::Conversation, None).unwrap();
         {
             let db = kernel.kernel_db().lock();
-            let performer = db.get_context(context).unwrap().unwrap().played_by.unwrap();
+            let performer = db.get_context(context).unwrap().unwrap().performer.unwrap();
             // A character that holds a slot for another type, copied after the fact.
             db.seed_test_slots(performer, "mock", "mock-model", &["musician"]).unwrap();
             let ws = db.get_or_create_default_workspace(performer).unwrap();
@@ -8808,7 +8808,7 @@ mod lifetime_tests {
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             }, ws).unwrap();
             let senpai = db.senpai_of(context).unwrap();
             db.write_context_character(successor, performer, senpai, None).unwrap();

@@ -248,7 +248,7 @@ fn old_context(
     row.created_at = created_at;
     insert_context_with_doc(db, &row, ws_id);
     set_stored_played_by(db, row.context_id, played_by);
-    row.played_by = played_by;
+    row.performer = played_by;
     row
 }
 

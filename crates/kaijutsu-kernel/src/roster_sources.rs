@@ -248,7 +248,7 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            played_by: None,
+            performer: None, senpai_ctx: None, persona: None,
         };
         db.insert_context_with_document(&row, ws).expect("create context");
         (Arc::new(parking_lot::Mutex::new(db)), ctx_id)

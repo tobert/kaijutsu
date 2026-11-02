@@ -597,7 +597,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -912,7 +912,7 @@ impl KjDispatcher {
                 demoted_at: None,
                 paused_at: None,
                 origin_host: None,
-                played_by: None,
+                performer: None, senpai_ctx: None, persona: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -2855,7 +2855,7 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
-        assert_eq!(child.played_by, Some(character_id));
+        assert_eq!(child.performer, Some(character_id));
         assert_eq!(db.senpai_of(child.context_id).unwrap(), Some(source), "a fork answers to the context it forked from");
     }
 
@@ -2906,8 +2906,8 @@ mod tests {
         max_tokens: Option<i64>,
     }
 
-    /// A source with no context character forks a child with none: no
-    /// performer is invented.
+    /// A source with no performer forks a child with none (no performer is
+    /// invented), and the child still answers to its source.
     #[tokio::test]
     async fn fork_of_unplayed_source_leaves_child_unplayed() {
         let d = test_dispatcher().await;
@@ -2923,8 +2923,9 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
-        assert_eq!(child.played_by, None);
+        assert_eq!(child.performer, None);
         assert_eq!(db.context_character(child.context_id).unwrap(), None);
+        assert_eq!(child.senpai_ctx, Some(source), "every context answers to a senpai");
     }
 
     // ====================================================================
