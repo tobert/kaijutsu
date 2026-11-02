@@ -1,0 +1,47 @@
+# companion: the hourly tick. The beat fires this for the main context every
+# `wakeup` beats (docs/companion.md, "The clock"). It runs on the kernel
+# runtime and returns as soon as the work it starts is admitted.
+#
+# One of three things happens, in this order:
+#
+#  1. A wrap-up was asked for on an earlier tick (WRAPUP_AT is set): rotate this
+#     context now. The seat has had a whole tick to write its handoff notes.
+#  2. This context is large (the last call filled ROTATE_AT_TOKENS or more):
+#     drive a wrap-up turn asking the seat to write its handoff, and mark it.
+#     No check-in this tick; the seat is busy.
+#  3. Otherwise run a check-in: archive the previous check-ins, then fork a
+#     fresh empty child (`spawn` keeps nothing) whose own fork rc builds its
+#     stance and whose seed text drives its turn. The archive keeps each
+#     child's blocks, so an archived child is the record of what it looked at.
+#
+# Archiving before forking also means two check-ins are never live at once.
+#
+# Set ROTATE_AT_TOKENS below the model's context window. 160000 is about 60
+# percent of a 262144-token window.
+set -e
+ROTATE_AT_TOKENS=160000
+
+here="$(dirname "$0")"
+info="$(kj context info --json)"
+used="$(echo "$info" | jq -r '.usage.total_tokens // 0')"
+wrapup="$(echo "$info" | jq -r '.env.WRAPUP_AT // empty')"
+
+case "$wrapup" in
+  "") ;;
+  *)
+    # The marker is cleared first: the successor copies this context's env.
+    kj context unset --env WRAPUP_AT
+    kj context rotate
+    exit 0
+    ;;
+esac
+
+if test "$used" -ge "$ROTATE_AT_TOKENS"; then
+  kj drive --prompt "$(cat "$here/S10-wrapup.md")"
+  kj context set --env "WRAPUP_AT=$(date -u +%Y%m%dT%H%M%S)"
+  exit 0
+fi
+
+kj context archive --children --type companion --confirm
+stamp="$(date -u +%Y%m%d-%H%M%S)"
+kj fork --preset spawn --name "checkin-$stamp" --prompt "$(cat "$here/S10-checkin.md")"

@@ -495,7 +495,7 @@ mod tests {
         assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
         assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
-        for context_type in ["coder", "default", "director", "council", "judge", "storyteller"] {
+        for context_type in ["coder", "default", "director", "council", "judge", "storyteller", "companion"] {
             let path = format!("/config/rc/{context_type}/create/S00-stance.md");
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -522,6 +522,10 @@ mod tests {
             "/config/rc/judge/create/S00-stance.md",
             "/config/rc/storyteller/create/S00-stance.md",
             "/config/rc/storyteller/submit/S10-reminder.md",
+            "/config/rc/companion/create/S00-stance.md",
+            "/config/rc/companion/fork/S20-stance.md",
+            "/config/rc/companion/tick/S10-checkin.md",
+            "/config/rc/companion/tick/S10-wrapup.md",
             "/config/rc/director/create/S00-stance.kai",
             "/config/rc/assistant/create/S00-stance.kai",
             "/config/rc/director/create/S06-kj-help.md",

@@ -1,0 +1,25 @@
+# companion: when the person writes, show the seat what the check-ins left.
+# The recent notes ride behind the person's message as a notification that
+# serves only this turn, so each turn pays for one copy.
+#
+# Nothing to show is nothing to say: no block when the log is empty. A failing
+# `kj handoff tail` (no character sheet) is not an error condition for a submit.
+set -e
+window=8
+who="$(kj context info --json | jq -r '.performer_name // empty')"
+notes=""
+case "$who" in
+  "") ;;
+  *) notes="$(kj handoff tail --window "$window" "$who" || true)" ;;
+esac
+case "$notes" in
+  ""|*"has no handoff notes yet"*)
+    echo "handoff: none for the submit"
+    exit 0
+    ;;
+esac
+kj block create --role system --kind notification --turn-scoped --content "=== Handoff notes: the last $window on our log ===
+Check-ins and earlier sessions left these while the person was away.
+
+$notes"
+echo "handoff: shown window=$window"

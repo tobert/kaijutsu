@@ -1,0 +1,16 @@
+# companion: a rotation copies the beat attachment to the successor (the same
+# way a fork does) but only the successor can announce itself to the clock.
+# When this context replaces another, rejoin the predecessor's track. A context
+# that was never rotated is attached once by hand (docs/companion.md, "The
+# clock").
+#
+# A predecessor that was on no track leaves nothing to rejoin; that is reported.
+set -e
+prev="$(kj context info --json | jq -r '.env.ROTATED_FROM // empty')"
+case "$prev" in
+  "")
+    echo "attach: not a rotation, so no track to rejoin"
+    exit 0
+    ;;
+esac
+kj transport attach || echo "attach: the predecessor $prev was on no track"

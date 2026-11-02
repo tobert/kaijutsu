@@ -1,0 +1,8 @@
+# companion: a fork copies its parent's beat attachment. A check-in child that
+# kept it would wake on the next hourly beat and fork a check-in of its own.
+# Leave the track first, so a child is never a beat participant.
+#
+# A parent that was never attached (a hand-driven test) has nothing to leave;
+# that is reported, not hidden.
+set -e
+kj transport detach || echo "detach: this fork had no beat attachment to leave"

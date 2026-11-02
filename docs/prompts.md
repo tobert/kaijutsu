@@ -327,8 +327,10 @@ transaction archives the predecessor and gives the
 successor its label and ring position. When
 it has none, the predecessor stays live, and the error names the unlabeled
 successor so you can read its Error blocks and remove it. The character that
-plays the context, its senpai's character, or its lineage root may rotate it. A root console rotates
-the same way. Rotating a character's handoff log points `characters.handoff_ctx` at
+plays the context, its senpai's character, or its lineage root may rotate it. An rc lifecycle may rotate
+the context whose lifecycle it is (a companion's `tick` does), and no other. The successor receives a
+copy of the predecessor's beat attachments, as a fork's child does, and announces itself to the clock
+from its own `create` rc. A root console rotates the same way. Rotating a character's handoff log points `characters.handoff_ctx` at
 the successor.
 
 A context's model is the slot for its type in its instance's binding. A

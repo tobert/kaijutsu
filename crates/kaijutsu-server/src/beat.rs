@@ -4105,7 +4105,15 @@ mod tests {
         (kernel, documents, db, ctx)
     }
 
-    async fn lifecycle_scheduler(verb: &str, body: &str) -> (BeatScheduler, Arc<Kernel>, ContextId) {
+    /// A scheduler and one live context of `context_type`, with `body` mounted
+    /// as the only rc script at `/<context_type>/<verb>/`. A caller that passes
+    /// a type other than the musician shows the beat's rc lookup is not
+    /// musician-specific.
+    async fn lifecycle_scheduler(
+        context_type: &str,
+        verb: &str,
+        body: &str,
+    ) -> (BeatScheduler, Arc<Kernel>, ContextId) {
         use kaijutsu_kernel::kernel_db::ContextRow;
         use kaijutsu_kernel::vfs::{MemoryBackend, VfsOps};
         use kaijutsu_kernel::KjDispatcher;
@@ -4126,7 +4134,7 @@ mod tests {
                     label: Some("archived-tick".to_string()),
                     system_prompt: None,
                     context_state: ContextState::Live,
-                    context_type: "musician".to_string(),
+                    context_type: context_type.to_string(),
                     created_at: 0,
                     created_by: principal,
                     forked_from: None,
@@ -4148,10 +4156,10 @@ mod tests {
         }
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
         let rc = MemoryBackend::new();
-        rc.mkdir(Path::new("/musician"), 0o755).await.unwrap();
-        rc.mkdir(Path::new(&format!("/musician/{verb}")), 0o755).await.unwrap();
+        rc.mkdir(Path::new(&format!("/{context_type}")), 0o755).await.unwrap();
+        rc.mkdir(Path::new(&format!("/{context_type}/{verb}")), 0o755).await.unwrap();
         rc.write_all(
-            Path::new(&format!("/musician/{verb}/S00-marker.kai")),
+            Path::new(&format!("/{context_type}/{verb}/S00-marker.kai")),
             body.as_bytes(),
         )
         .await
@@ -4193,7 +4201,7 @@ mod tests {
     #[test]
     fn archived_context_does_not_fire_tick_lifecycle() {
         run_lifecycle_test(|| async {
-            let (scheduler, kernel, ctx) = lifecycle_scheduler("tick",
+            let (scheduler, kernel, ctx) = lifecycle_scheduler("musician", "tick",
                 "kj block create --role system --kind text --content tick-must-not-run").await;
             kernel.kernel_db().lock().archive_context(ctx).unwrap();
             scheduler.fire_tick(ctx);
@@ -4211,13 +4219,32 @@ mod tests {
     fn fire_tick_and_fire_rotate_run_their_own_verbs() {
         run_lifecycle_test(|| async {
             for verb in ["tick", "rotate"] {
-                let (scheduler, kernel, ctx) = lifecycle_scheduler(verb,
+                let (scheduler, kernel, ctx) = lifecycle_scheduler("musician", verb,
                     &format!("kj block create --role system --kind text --content {verb}-fired")).await;
                 match verb {
                     "tick" => scheduler.fire_tick(ctx),
                     _ => scheduler.fire_rotate(ctx),
                 }
                 wait_for_lifecycle_marker(&kernel, ctx, &format!("{verb}-fired")).await;
+                kernel.shutdown_runtime_worker().await.unwrap();
+            }
+        });
+    }
+
+    /// A context type other than the musician gets its own `tick` and
+    /// `rotate` rc: a `companion` runs `/companion/tick/`, and the musician's
+    /// scripts stay out of its way.
+    #[test]
+    fn companion_type_runs_its_own_tick_and_rotate_rc() {
+        run_lifecycle_test(|| async {
+            for verb in ["tick", "rotate"] {
+                let (scheduler, kernel, ctx) = lifecycle_scheduler("companion", verb,
+                    &format!("kj block create --role system --kind text --content companion-{verb}-fired")).await;
+                match verb {
+                    "tick" => scheduler.fire_tick(ctx),
+                    _ => scheduler.fire_rotate(ctx),
+                }
+                wait_for_lifecycle_marker(&kernel, ctx, &format!("companion-{verb}-fired")).await;
                 kernel.shutdown_runtime_worker().await.unwrap();
             }
         });
@@ -4231,7 +4258,7 @@ mod tests {
     #[test]
     fn fire_lifecycle_returns_while_the_worker_pool_is_full() {
         run_lifecycle_test(|| async {
-            let (scheduler, kernel, ctx) = lifecycle_scheduler("tick",
+            let (scheduler, kernel, ctx) = lifecycle_scheduler("musician", "tick",
                 "kj block create --role system --kind text --content must-not-run-pool-full").await;
             let before = kernel.blocks().block_snapshots(ctx).unwrap().len();
             let releases = kernel.fill_runtime_pool_for_test().await;
@@ -4250,7 +4277,7 @@ mod tests {
     fn shutdown_joins_active_tick_and_rotate_lifecycles() {
         run_lifecycle_test(|| async {
             for verb in ["tick", "rotate"] {
-                let (scheduler, kernel, ctx) = lifecycle_scheduler(verb,
+                let (scheduler, kernel, ctx) = lifecycle_scheduler("musician", verb,
                     "kj block create --role system --kind text --content lifecycle-entered\nsleep 60\n").await;
                 use kaijutsu_kernel::vfs::VfsOps;
                 kernel.vfs().write_all(std::path::Path::new(&format!("/config/rc/musician/{verb}/S10-later.kai")),
@@ -4272,7 +4299,7 @@ mod tests {
     fn admitted_tick_and_rotate_lifecycles_survive_archive() {
         run_lifecycle_test(|| async {
             for verb in ["tick", "rotate"] {
-                let (scheduler, kernel, ctx) = lifecycle_scheduler(verb,
+                let (scheduler, kernel, ctx) = lifecycle_scheduler("musician", verb,
                     "kj block create --role system --kind text --content lifecycle-entered\nwhile test ! -e /config/rc/release; do sleep 0.01; done\nkj block create --role system --kind text --content lifecycle-finished").await;
                 scheduler.fire_lifecycle(ctx, verb);
                 wait_for_lifecycle_marker(&kernel, ctx, "lifecycle-entered").await;

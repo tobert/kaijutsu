@@ -1,0 +1,66 @@
+# The shell-escape guard. A `shell_write` command that hands text to a second shell --
+# `sh -c`, `bash -c`, or any wrapper (`sudo`, `env`, `xargs`, ...) that ends
+# up invoking one -- is opaque to the shell gate: `kj/shell_gate.rs`'s own
+# module docs name this exact gap, and a text-pattern match on the raw
+# command is bypassable by quoting, wrapping, or nesting the shape inside an
+# `if`/`for` (falsified against the live kernel -- `if sh -c ...; then ...`,
+# `sudo sh -c ...`, `busybox sh -c ...`, `ksh -c ...`, `sh --command=...`
+# all slipped a regex-based guard, and a jq lookup miss on top of it read as
+# an ALLOW rather than a deny).
+#
+# This hook scores KJ_TOOL_PLAN instead of the raw text -- the broker's own
+# kaish parse of the command, which descends into `if`/`for`/`$(...)`
+# bodies and reports each command's real, unquoted `name` and `args`. It
+# checks `commands[].name`, never rendered text, so quoting a shell
+# interpreter's name cannot hide it and a comment or a `grep` pattern that
+# merely mentions "sh -c" cannot trip it. Shell interpreters (sh, bash, zsh,
+# dash, ksh, fish, busybox) deny outright by name: there is no legitimate
+# reason a `shell_write` call needs a second shell instead of running the
+# command as kaish directly, and busybox's own applet name lives in its args
+# rather than its own name, so it cannot be told apart from any other
+# invocation without denying the binary itself. Scripting interpreters
+# (python, python3, perl, ruby, node) deny only when an inline-code flag
+# (`-c`, `-e`, `--eval`) is also present -- running a script FILE through
+# them is ordinary, auditable work, while inline code on the command line is
+# exactly as opaque as `sh -c`. Wrapper commands (sudo, env, nice, timeout,
+# nohup, stdbuf, xargs, exec) are transparent: the real command lives in
+# their OWN args rather than their name, so their args get the same two
+# checks the top-level command does.
+#
+# KJ_TOOL_PLAN absent, empty, or unparseable is itself a deny: a guard that
+# cannot see the command has not cleared it. There is no implicit-allow path
+# -- every branch in the hook body ends in an explicit `exit 0` or `exit 1`.
+#
+# Hard `exit 1` deny, not an `Ask` escalation (exit 3): this ships as a plain
+# deny; a conditional Ask outcome for this guard is future work.
+#
+# `kj hook add` is idempotent on a stable `hook_id` (kj/hook.rs) -- same
+# id + same shape is a no-op -- so running this on every context create
+# keeps exactly ONE global hook row
+# rather than one per context, the same way S05/S10/S20/S25 in this
+# directory compose once and are symlinked, not copied, into each context
+# type. This script itself is symlinked (not copied) into the create/
+# lifecycle of every context type that holds `Capability::Exec` -- see
+# lib/create/S10-binding.kai's own "exec" grant and this repo's
+# coder/director/default/mcp/root `create/S10-binding.kai` seeds -- because
+# a context that never holds Exec never reaches a HOT shell in the first
+# place (`toolie`/`musician` get the read-only, `ExternalExec::Deny` `shell`
+# only, which cannot invoke `sh -c` at all). `seed_scripts.rs`,
+# `exactly_the_exec_granting_seats_ship_the_shell_guard`, holds that rule.
+#
+# The hook body lives at `/config/rc/lib/hooks/shell-guard.kai`, outside any
+# verb directory so the rc lifecycle never runs it as a script.
+# `HookBody::KaishPath` reads it fresh from the VFS at every pre_call fire,
+# so editing that file reaches the running hook with no reinstall
+# (docs/rc-on-disk.md).
+
+set -e
+
+mt="shell_write"
+hid="shell-escape-guard"
+t="kaish_path"
+p="/config/rc/lib/hooks/shell-guard.kai"
+match_json="$(jq -cn --arg mt $mt --arg hid $hid '{match_tool: $mt, hook_id: $hid}')"
+action_json="$(jq -cn --arg t $t --arg p $p '{type: $t, path: $p}')"
+
+kj hook add pre_call "$match_json" "$action_json"

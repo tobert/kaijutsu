@@ -118,3 +118,11 @@ allow = [
 allow = [
   "kj price set",        # appends a price row; a correction is a later row
 ]
+
+# A companion runs unattended (docs/companion.md). Its shell and its notes
+# stay quiet; anything else it tries asks the person.
+[context_type.companion]
+allow = [
+  "shell_write",         # the statement; the tool's own gate still judges the command it carries
+  "kj drift push",       # a check-in tells its parent; the text lands in a log, no turn starts
+]

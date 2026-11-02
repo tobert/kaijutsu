@@ -1,0 +1,6 @@
+# companion: a check-in child's loadout. A fork copies its parent's, so this
+# adds the one authority a check-in needs on top: `drift`, to push a finding to
+# its parent. Nothing else is added; a child cannot fork, archive, or change
+# the clock. The tick archives it.
+set -e
+kj binding allow "drift"

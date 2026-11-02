@@ -487,6 +487,12 @@ impl KernelDb {
         Ok(deleted as u64)
     }
 
+    /// Copy a context's attachments to another context on the same tracks,
+    /// inside the caller's transaction (a rotation's successor).
+    pub(crate) fn copy_attachments(&self, source: ContextId, successor: ContextId) -> KernelDbResult<()> {
+        Self::copy_attachments_for_fork(&self.conn, source, successor)
+    }
+
     /// Copy all attachments from `source` context to `child` context, keyed on
     /// the SAME `track_id`. Called inside the `insert_forked_context` transaction
     /// so the attachment inheritance is atomic with the context-row write.

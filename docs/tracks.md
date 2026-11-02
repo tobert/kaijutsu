@@ -118,6 +118,11 @@ detaches. The clock and score never pause. Lifecycle knowledge stays on the
 context side (where `fork` already lives); the track stays a passive clock +
 score.
 
+`kj context rotate` copies the attachment rows to the successor the same way,
+and the successor's `create` rc runs `kj transport attach` (no flags) to
+announce itself. The predecessor's `archive` rc detaches it. The `companion`
+context type does this (`docs/companion.md`).
+
 ### 5. Non-rotating attachments are first-class
 
 A context can attach with `rotate: None` — an **interactive / user-driven**

@@ -433,6 +433,8 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             db.write_context_character(row.context_id, performer, senpai, None)?;
         }
         CharacterPlacement::Rotate { predecessor } => {
+            // The successor rides the predecessor's beat tracks, as a fork does.
+            db.copy_attachments(predecessor, row.context_id)?;
             let predecessor = db.require_context_character(predecessor)?;
             // Only a root console rotates into a context with no senpai.
             db.check_senpai_edge(row.context_id, &row.context_type, Some(predecessor.principal_id), predecessor.senpai_ctx)?;
@@ -2022,6 +2024,11 @@ impl KjDispatcher {
             let Some(seat) = caller.context_id else {
                 return Ok(Err(format!("an rc lifecycle with no context may not {}", act.as_str())));
             };
+            // A context's performer may rotate it, and its lifecycle acts as
+            // the context: the beat's `rotate` rc rotates its own seat.
+            if target == seat && act == crate::kernel_db::GovernedAct::Rotate {
+                return Ok(Ok(()));
+            }
             let row = db.get_context(target)?.ok_or_else(|| crate::kernel_db::KernelDbError::NotFound(format!(
                 "context {} has no row to check authority over", target.short()
             )))?;
@@ -2450,10 +2457,18 @@ impl KjDispatcher {
             (Some(character), _) => {
                 // The one authority rule, and the context's own character
                 // (`docs/senpai-kohai.md`, "Authority").
-                if character.principal_id != caller.actor_id
-                    && let Err(refusal) = self.require_authority(predecessor.context_id, caller, crate::kernel_db::GovernedAct::Rotate)
-                {
-                    return KjResult::Err(format!("kj context rotate: {refusal}; its performer may also rotate it"));
+                if character.principal_id != caller.actor_id {
+                    // A rotation from an rc lifecycle is checked with the seat
+                    // whose lifecycle runs as the actor, as archive is.
+                    let in_rc_lifecycle = caller.privileged && caller.rc_depth > 0;
+                    let authority = if in_rc_lifecycle {
+                        self.require_lifecycle_authority(predecessor.context_id, caller, crate::kernel_db::GovernedAct::Rotate)
+                    } else {
+                        self.require_authority(predecessor.context_id, caller, crate::kernel_db::GovernedAct::Rotate).map(|_| ())
+                    };
+                    if let Err(refusal) = authority {
+                        return KjResult::Err(format!("kj context rotate: {refusal}; its performer may also rotate it"));
+                    }
                 }
                 CharacterPlacement::Rotate { predecessor: predecessor.context_id }
             }
@@ -4620,6 +4635,72 @@ mod tests {
     #[test]
     fn rotate_authority_and_liveness() {
         crate::on_rc_thread(rotate_authority_and_liveness_body);
+    }
+
+    /// An rc lifecycle rotates the context whose lifecycle it is, and no
+    /// other: a context's performer may rotate it, and a lifecycle has no
+    /// more power than its context. The beat's `rotate` rc runs as the
+    /// system principal, so this is the only way a clock rotates a seat.
+    #[test]
+    fn a_lifecycle_rotates_its_own_context_and_no_other() {
+        crate::on_rc_thread(a_lifecycle_rotates_its_own_context_and_no_other_body);
+    }
+
+    async fn a_lifecycle_rotates_its_own_context_and_no_other_body() {
+        let f = rotation_fixture().await;
+        let system = PrincipalId::system();
+        let lifecycle_of = |seat: ContextId| crate::kj::KjCaller {
+            rc_depth: 1, ..rotation_caller(seat, system)
+        };
+
+        // Another seat's lifecycle may not rotate banto.
+        let stranger = register_context(&f.d, Some("stranger"), None, f.amy);
+        let refused = f.d.dispatch(&[s("context"), s("rotate"), s("banto")], &lifecycle_of(stranger)).await;
+        assert!(!refused.is_ok(), "a lifecycle may not rotate another context");
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_none());
+
+        // Its own lifecycle may.
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &lifecycle_of(f.seat)).await;
+        assert!(rotated.is_ok(), "a lifecycle rotates its own context: {}", rotated.message());
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_some());
+    }
+
+    /// `kj fork` copies a context's beat attachments to the child; rotation
+    /// copies them to the successor too, or a rotated context drops off its
+    /// clock. Both rows stay: the predecessor's detach is its own archive
+    /// lifecycle's business.
+    #[test]
+    fn rotation_copies_the_beat_attachment_to_the_successor() {
+        crate::on_rc_thread(rotation_copies_the_beat_attachment_to_the_successor_body);
+    }
+
+    async fn rotation_copies_the_beat_attachment_to_the_successor_body() {
+        use crate::kernel_db::{PersistedAttachment, PersistedTrack};
+        let f = rotation_fixture().await;
+        {
+            let db = f.d.kernel_db().lock();
+            db.upsert_track(&PersistedTrack {
+                track_id: s("kaiten"), period_ms: 1000, beats_per_phrase: 32,
+                playhead_tick: None, playing: false, score_context_id: None, clock_kind: s("system"),
+            }).unwrap();
+            db.upsert_attachment(&PersistedAttachment {
+                track_id: s("kaiten"), context_id: f.seat, wakeup_every: 3600,
+                rotate_every_phrases: Some(2700), ooda_armed: true,
+            }).unwrap();
+        }
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
+        let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+
+        let db = f.d.kernel_db().lock();
+        let copied = db.list_attachments_for_context(successor).unwrap();
+        assert_eq!(copied.len(), 1, "the successor joins the predecessor's track: {copied:?}");
+        assert_eq!(copied[0].track_id, "kaiten");
+        assert_eq!(copied[0].wakeup_every, 3600);
+        assert_eq!(copied[0].rotate_every_phrases, Some(2700));
+        assert_eq!(db.list_attachments_for_context(f.seat).unwrap().len(), 1,
+            "the predecessor keeps its row for its own detach");
     }
 
     /// The successor keeps the predecessor's senpai. The kernel moves no

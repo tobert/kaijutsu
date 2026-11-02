@@ -1,0 +1,5 @@
+# companion: an archived context leaves the clock. Rotation by hand leaves the
+# predecessor on its track until this runs; a check-in child is already off it
+# and leaves nothing to do.
+set -e
+kj transport detach || echo "detach: this context was on no track"

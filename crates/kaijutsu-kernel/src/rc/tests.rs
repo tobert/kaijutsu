@@ -2552,6 +2552,293 @@ esac
         assert!(!sections.contains(reminder), "a reminder must stay out of the cached system text");
     }
 
+    /// A kernel with the production rc stack and a `kaiten` character playing a
+    /// `companion` context labeled `main`, ready to tick. Returns the
+    /// dispatcher and the main context.
+    async fn companion_fixture() -> (std::sync::Arc<KjDispatcher>, ContextId) {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        // A rotation reads its successor's loadout back from the database.
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        let caller = console_caller(&d);
+        let kaiten = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            for (id, name) in [(caller.principal_id, "amy"), (kaiten, "kaiten")] {
+                if db.get_character(id).unwrap().is_some() { continue; }
+                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                    principal_id: id, name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            db.assign_test_review(caller.context_id.unwrap(), Some(caller.principal_id), None).unwrap();
+            db.seed_test_slot_entries(kaiten, &[("companion", "mock", "mock-model")]).unwrap();
+        }
+        // The server seeds the factory fork presets at boot; the tick forks with `spawn`.
+        crate::seed_presets::ensure_factory_presets(&mut d.kernel_db().lock(), PrincipalId::system()).unwrap();
+        let r = d.dispatch(&argv(&["context", "create", "kaiten", "--name", "main", "--type", "companion"]), &caller).await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+        let main = lookup_context_id(&d, "main");
+        d.kernel_db().lock().assign_test_review(main, Some(kaiten), Some(caller.principal_id)).unwrap();
+        (d, main)
+    }
+
+    /// A stand-in beat scheduler: it records each command and acknowledges it.
+    fn beat_stand_in(d: &KjDispatcher) -> tokio::sync::mpsc::UnboundedReceiver<crate::hyoushigi::BeatCommand> {
+        use crate::hyoushigi::{BeatCommand, BeatRequest};
+        let (tx, mut ingress) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let (cmd_tx, commands) = tokio::sync::mpsc::unbounded_channel::<BeatCommand>();
+        tokio::spawn(async move {
+            while let Some(request) = ingress.recv().await {
+                match request {
+                    BeatRequest::Command { command, reply } => {
+                        let _ = cmd_tx.send(command);
+                        if let Some(reply) = reply { let _ = reply.send(Ok(None)); }
+                    }
+                    BeatRequest::Snapshot { reply } => { let _ = reply.send(Vec::new()); }
+                    _ => {}
+                }
+            }
+        });
+        commands
+    }
+
+    /// Put `context` on a track the way `kj transport attach` leaves it.
+    fn seat_on_track(d: &KjDispatcher, context: ContextId) {
+        use crate::kernel_db::{PersistedAttachment, PersistedTrack};
+        let db = d.kernel_db().lock();
+        db.upsert_track(&PersistedTrack {
+            track_id: "kaiten".into(), period_ms: 1000, beats_per_phrase: 32,
+            playhead_tick: None, playing: false, score_context_id: None, clock_kind: "system".into(),
+        }).unwrap();
+        db.upsert_attachment(&PersistedAttachment {
+            track_id: "kaiten".into(), context_id: context, wakeup_every: 3600,
+            rotate_every_phrases: None, ooda_armed: true,
+        }).unwrap();
+    }
+
+    /// Fire `context`'s `tick` rc the way the scheduler does and wait until
+    /// `finished` runs of it have ended.
+    async fn fire_companion_tick(d: &std::sync::Arc<KjDispatcher>, context: ContextId, finished: usize) {
+        let kernel = d.kernel();
+        let admission = kernel.admit_context(context).unwrap();
+        let slot = kernel.reserve_runtime_slot().unwrap();
+        crate::runtime::rc_lifecycle::submit(d.clone(), admission, slot, "tick", Default::default()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let done = run_rows_for_verb(d, "tick").iter()
+                    .filter(|r| r.context_id == context.as_bytes() && r.outcome.is_some()).count();
+                if done >= finished { return; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("tick {finished} did not finish"));
+    }
+
+    /// The rc scripts' own failures on `context`, for an assertion message. A
+    /// driven turn that cannot start (the test kernel has no model backend)
+    /// is a different Error block and is not counted.
+    fn rc_errors(d: &KjDispatcher, context: ContextId) -> Vec<String> {
+        d.block_store().block_snapshots(context).unwrap().iter()
+            .filter(|b| b.kind == BlockKind::Error && b.content.starts_with("rc "))
+            .map(|b| b.content.clone()).collect()
+    }
+
+    /// The check-ins forked from `main`, live or archived.
+    fn checkins_of(d: &KjDispatcher, main: ContextId) -> Vec<crate::kernel_db::ContextRow> {
+        d.kernel_db().lock().list_all_contexts().unwrap().into_iter()
+            .filter(|c| c.forked_from == Some(main)
+                && c.label.as_deref().is_some_and(|l| l.starts_with("checkin-")))
+            .collect()
+    }
+
+    /// Record that the last call on `context` filled `tokens` of its window.
+    fn fill_context(d: &KjDispatcher, context: ContextId, tokens: i64) {
+        d.kernel_db().lock().set_context_usage(&crate::kernel_db::ContextUsageRow {
+            context_id: context, provider: "mock".into(), model: "mock-model".into(),
+            input_tokens: tokens, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+            reasoning_tokens: 0, cache_ttl_secs: 0, updated_at: 1,
+        }).unwrap();
+    }
+
+    /// A companion's tick archives its last check-in and forks a fresh one,
+    /// so one check-in is live at a time and the archived ones stay on record.
+    /// A check-in is rebuilt by its own fork rc: it carries the check-in
+    /// stance and not the main seat's.
+    #[test]
+    fn companion_tick_keeps_one_checkin_live_and_archives_the_rest() {
+        crate::on_rc_thread(companion_tick_keeps_one_checkin_live_and_archives_the_rest_body);
+    }
+
+    async fn companion_tick_keeps_one_checkin_live_and_archives_the_rest_body() {
+        use kaijutsu_types::ContextState;
+        let (d, main) = companion_fixture().await;
+        let blocks = d.block_store().block_snapshots(main).unwrap();
+        let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat(&sections).contains("a companion, not a worker"), "the main stance is installed: {sections}");
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+
+        fire_companion_tick(&d, main, 1).await;
+        let first = checkins_of(&d, main);
+        assert_eq!(first.len(), 1, "the first tick forks one check-in; its errors on main: {:?}", rc_errors(&d, main));
+        let first_id = first[0].context_id;
+        let child_blocks = d.block_store().block_snapshots(first_id).unwrap();
+        let child_sections = crate::extract_system_prompt_sections(&child_blocks).join("\n");
+        assert!(flat(&child_sections).contains("This seat is a check-in"), "the child has its own stance: {child_sections}");
+        assert!(flat(&child_sections).contains("This context stays on record"), "the child knows it is read later");
+        assert!(!flat(&child_sections).contains("a companion, not a worker"),
+            "a spawn child does not inherit the main stance: {child_sections}");
+
+        // A second tick sweeps the first child, then forks the next.
+        fire_companion_tick(&d, main, 2).await;
+        let all = checkins_of(&d, main);
+        assert_eq!(all.len(), 2, "the archived check-in stays on record: {all:?}");
+        let live: Vec<_> = all.iter().filter(|c| c.context_state == ContextState::Live).collect();
+        assert_eq!(live.len(), 1, "exactly one check-in is live: {all:?}");
+        assert_ne!(live[0].context_id, first_id, "the live one is the new check-in");
+        assert!(all.iter().any(|c| c.context_id == first_id && c.context_state != ContextState::Live),
+            "the first check-in was archived: {all:?}");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A fork copies its parent's beat attachment, so a check-in child that
+    /// kept it would wake on the next beat and fork a check-in of its own. The
+    /// companion's fork rc has the child leave the track it inherited.
+    #[test]
+    fn companion_checkin_child_leaves_the_track_it_inherited() {
+        crate::on_rc_thread(companion_checkin_child_leaves_the_track_it_inherited_body);
+    }
+
+    async fn companion_checkin_child_leaves_the_track_it_inherited_body() {
+        use crate::hyoushigi::BeatCommand;
+        use kaijutsu_types::TrackId;
+        let (d, main) = companion_fixture().await;
+        seat_on_track(&d, main);
+        let mut commands = beat_stand_in(&d);
+
+        let fork_caller = KjCaller { privileged: true, ..caller_with_context(main) };
+        let r = d.dispatch(&argv(&["fork", "--preset", "spawn", "--name", "child"]), &fork_caller).await;
+        assert!(r.is_ok(), "fork failed: {}", r.message());
+        let child = lookup_context_id(&d, "child");
+        assert_eq!(
+            d.kernel_db().lock().list_attachments_for_context(child).unwrap().len(), 1,
+            "the fork inherited the parent's attachment, which is the hazard this rc answers",
+        );
+        let command = tokio::time::timeout(std::time::Duration::from_secs(5), commands.recv())
+            .await.expect("the fork rc sends a beat command").expect("the stand-in scheduler is alive");
+        match command {
+            BeatCommand::Detach { track, context_id } => {
+                assert_eq!(track, TrackId::new("kaiten").unwrap());
+                assert_eq!(context_id, child, "the child leaves, never the parent");
+            }
+            other => panic!("expected the child to detach, got {other:?}"),
+        }
+    }
+
+    /// A large main context gets a wrap-up turn, not a check-in. The next tick
+    /// rotates it: the successor takes the label, rejoins the track the
+    /// predecessor was on, and the predecessor leaves it. The marker does not
+    /// carry to the successor.
+    #[test]
+    fn companion_tick_asks_for_a_handoff_then_rotates_and_keeps_the_clock() {
+        crate::on_rc_thread(companion_tick_asks_for_a_handoff_then_rotates_and_keeps_the_clock_body);
+    }
+
+    async fn companion_tick_asks_for_a_handoff_then_rotates_and_keeps_the_clock_body() {
+        use crate::hyoushigi::BeatCommand;
+        use kaijutsu_types::{ContextState, TrackId};
+        let (d, main) = companion_fixture().await;
+        seat_on_track(&d, main);
+        let mut commands = beat_stand_in(&d);
+        fill_context(&d, main, 200_000);
+
+        // Tick 1: the seat is asked to write its handoff; no check-in runs.
+        fire_companion_tick(&d, main, 1).await;
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+        assert!(checkins_of(&d, main).is_empty(), "no check-in while the seat wraps up");
+        let blocks = d.block_store().block_snapshots(main).unwrap();
+        assert!(blocks.iter().any(|b| b.role == Role::User && b.content.contains("Write the handoff now")),
+            "the wrap-up turn was driven: {:?}", block_contents_in(&d, main));
+        let env = |ctx| d.kernel_db().lock().get_context_env(ctx).unwrap().into_iter()
+            .map(|e| (e.key, e.value)).collect::<std::collections::HashMap<_, _>>();
+        assert!(env(main).contains_key("WRAPUP_AT"), "the wrap-up is marked");
+        assert_eq!(d.kernel_db().lock().get_context(main).unwrap().unwrap().archived_at, None, "not rotated yet");
+
+        // Tick 2: the marker means the handoff had its tick; rotate.
+        fire_companion_tick(&d, main, 2).await;
+        assert!(rc_errors(&d, main).is_empty(), "{:?}", rc_errors(&d, main));
+        let successor = lookup_context_id(&d, "main");
+        assert_ne!(successor, main, "the label moved to the successor");
+        let old = d.kernel_db().lock().get_context(main).unwrap().unwrap();
+        assert_ne!(old.context_state, ContextState::Live, "the predecessor was archived");
+        let env = env(successor);
+        assert_eq!(env.get("ROTATED_FROM"), Some(&main.to_hex()));
+        assert!(!env.contains_key("WRAPUP_AT"), "the marker stays with the predecessor");
+
+        let mut seen = Vec::new();
+        while let Ok(Some(command)) = tokio::time::timeout(std::time::Duration::from_millis(500), commands.recv()).await {
+            seen.push(command);
+        }
+        assert!(seen.iter().any(|c| matches!(c,
+            BeatCommand::Attach { track, context_id, attachment, .. }
+                if *track == TrackId::new("kaiten").unwrap() && *context_id == successor && attachment.wakeup.every == 3600)),
+            "the successor rejoins the track with the same wakeup: {seen:?}");
+        assert!(seen.iter().any(|c| matches!(c,
+            BeatCommand::Detach { track, context_id }
+                if *track == TrackId::new("kaiten").unwrap() && *context_id == main)),
+            "the predecessor leaves the track: {seen:?}");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// When the person writes, the submit rc shows the seat the recent handoff
+    /// notes as a notification that serves only that turn, and says nothing
+    /// when the log is empty.
+    #[test]
+    fn companion_submit_shows_handoff_notes_for_one_turn_only() {
+        crate::on_rc_thread(companion_submit_shows_handoff_notes_for_one_turn_only_body);
+    }
+
+    async fn companion_submit_shows_handoff_notes_for_one_turn_only_body() {
+        let (d, main) = companion_fixture().await;
+        let person = d.kernel_db().lock().get_context(main).unwrap().unwrap().created_by;
+        let notes = |d: &KjDispatcher| -> Vec<kaijutsu_types::BlockSnapshot> {
+            d.block_store().block_snapshots(main).unwrap().into_iter()
+                .filter(|b| b.kind == BlockKind::Notification && b.content.contains("Handoff notes: the last"))
+                .collect()
+        };
+        let submit = |text: &'static str| {
+            let d = d.clone();
+            async move {
+                let mut failed = d.kernel().turn_flows().subscribe("turn.failed");
+                d.block_store().edit_draft(main, person, 0, text, 0).unwrap();
+                crate::runtime::prompt::submit(
+                    d.kernel(), main, person, kaijutsu_types::SessionId::new(),
+                    crate::runtime::prompt::PromptSource::Draft { edge: None },
+                ).await.expect("the submit commits");
+                // No provider is configured, so the turn fails after its submit rc ran.
+                tokio::time::timeout(std::time::Duration::from_secs(5), failed.recv())
+                    .await.expect("the submitted turn reports its failed startup");
+            }
+        };
+
+        submit("Good morning.").await;
+        assert!(notes(&d).is_empty(), "an empty log shows nothing: {:?}", block_contents_in(&d, main));
+
+        // A check-in writes the note as the character that plays the seat.
+        let kaiten = d.kernel_db().lock().get_context(main).unwrap().unwrap().performer.expect("main has a performer");
+        let writer = KjCaller { principal_id: kaiten, actor_id: kaiten, ..caller_with_context(main) };
+        let r = d.dispatch(&argv(&["handoff", "note", "The disk on moltar is at 97 percent."]), &writer).await;
+        assert!(r.is_ok(), "note failed: {}", r.message());
+
+        submit("Anything new?").await;
+        let shown = notes(&d);
+        assert_eq!(shown.len(), 1, "one copy after the note: {:?}", block_contents_in(&d, main));
+        assert!(shown[0].content.contains("97 percent"), "{}", shown[0].content);
+        assert!(shown[0].turn_scoped, "the notes serve only the turn they precede");
+    }
+
     /// Fork re-seeds: the child gets its own fresh datetime note on top of
     /// whatever it inherited from the parent (the parent's create-time note
     /// copies over too — fork copies the whole log — so the count grows by

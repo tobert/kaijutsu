@@ -6,6 +6,35 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Companion: what the first build leaves open (2026-11-02)
+
+The `companion` type (`docs/companion.md`) runs an hourly check-in as a fork of
+its main context, archives each at the next tick, and rotates the main context
+after a wrap-up turn.
+
+- **The seat cannot choose to rotate.** Rotation starts from a token threshold
+  in the tick (`ROTATE_AT_TOKENS`) or from the person. A seat that decides it is
+  time has no verb to say so: `kj context rotate` needs the operator
+  capability, which a model's loadout does not carry. A narrow verb or a marker
+  the seat can set would let it ask for a wrap-up.
+- **The wrap-up is not checked.** The tick rotates after the wrap-up turn's
+  hour whether or not the turn finished or wrote a note. It should read the
+  turn's outcome (`kj context turns`) and a note newer than `WRAPUP_AT`, and
+  report a failed wrap-up instead of rotating over it.
+- **Detach leaves the attachment row.** `detach` removes the context from the
+  live track and keeps its persisted row on purpose. Check-in children, and
+  archived mains, therefore keep rows. The cold-start re-attach sweep, still
+  unwritten, must skip archived contexts, and `disarm-on-archive` should
+  delete the row.
+- **Mostly cold contexts at scale.** One check-in per hour is about 24 archived
+  contexts a day, kept forever (`kj context archive` retains everything and
+  there is no removal command). Listing, indexing, and the roster need a
+  design for thousands of cold contexts, and archived check-ins may need
+  summarizing or cold storage.
+- **A kernel restart leaves the track unattached.** Re-attaching and `play`
+  are manual after a restart (`docs/hyoushigi.md`, "As landed").
+- **A finished check-in stays live until the next tick,** up to an hour.
+
 ## Context fold: follow-ups (2026-11-01)
 
 - `contexts.performer` has no foreign key to `characters`: old rows and fixtures name principals with no sheet.

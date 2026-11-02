@@ -179,7 +179,7 @@ past senpais with no performer), or its lineage root**, may:
 
 - move it to another senpai (`kj context move`);
 - escalate its asks;
-- rotate it (its own performer may also rotate it);
+- rotate it (its own performer may also rotate it, and so may an rc lifecycle running for that context);
 - archive it (its own performer may also archive it, so an MCP client archives its own session when the session
   ends);
 - change its egress (`kj context set --egress-allow|--egress-deny`).
