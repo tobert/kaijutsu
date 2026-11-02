@@ -13,7 +13,8 @@ subsystem, and it is **not** a Bevy frontend — see "Roads not taken" for both.
 `--context <label>` joins that context or creates it, as a child of `--parent` or of the kernel's only live
 root context. A context is played by a character. The default is the session's own character; a root character
 performs only its root console, so a root's session names another with `--character <name>`, and without it the
-create refuses with an error that names the option.
+create refuses with an error that names the option. The `Ctrl+Z` shell child is the exception: the human at the
+seat performs it.
 
 ```text
 terminal (wezterm, Blink, a plain xterm)
@@ -771,8 +772,8 @@ learning space"). `:kj` and `:!` both always act on the context on screen, so
 the bar draws no context label at all. `Ctrl+Z` now moves the screen between a
 root context and its shell child (`crate::ctrl_z`): from a root it switches to
 the root's live child of type `shell`, labelled `<root-label>-shell`, and
-creates that child under the root the first time; from a shell it switches to
-its parent; from any other context it does nothing and says so on the status
+creates that child under the root the first time, performed by the human at
+the seat; from a shell it switches to its parent; from any other context it does nothing and says so on the status
 line. It goes through the seat switch, so the draft and the place in the
 transcript travel with the context.
 

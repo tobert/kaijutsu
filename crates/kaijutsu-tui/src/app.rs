@@ -680,20 +680,25 @@ impl App {
     /// separate fetch. There is at most one per (context, principal), so the
     /// first match is the only one.
     pub fn current_draft(&self) -> Option<(String, u64)> {
-        let context_id = self.current?;
-        let principal = self.principal?;
-        let view = self.views.get(&context_id)?;
-        let text = view
-            .mirror
-            .blocks()
-            .iter()
-            .find(|b| {
-                b.status == Status::Draft
-                    && b.id.principal_id == principal
-                    && Some(b.id) != self.submitted_draft
-            })
-            .map(|b| b.content.clone())?;
+        let view = self.views.get(&self.current?)?;
+        let text = self.current_draft_block()?.content.clone();
         Some((text, view.mirror.version()))
+    }
+
+    /// The id of [`Self::current_draft`]'s block. A submit records this id:
+    /// a prompt submit promotes it in place and answers with the same id, but
+    /// a shell context's submit deletes it and answers with the command
+    /// block's id.
+    pub fn current_draft_id(&self) -> Option<BlockId> {
+        self.current_draft_block().map(|b| b.id)
+    }
+
+    fn current_draft_block(&self) -> Option<&BlockSnapshot> {
+        let principal = self.principal?;
+        let view = self.views.get(&self.current?)?;
+        view.mirror.blocks().iter().find(|b| {
+            b.status == Status::Draft && b.id.principal_id == principal && Some(b.id) != self.submitted_draft
+        })
     }
 
     /// Record that `block_id` was just submitted, so a stale echo of it is

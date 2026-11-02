@@ -168,9 +168,12 @@ Two things follow, and they are the ones to check a change against:
   names its privileged position and asks for care. Its `kj` requests go
   through the regular approval policy, and it refuses every `drive`. Its
   reviewer is the human root above it. Ctrl-Z in the console, or in the human
-  root, opens a shell context under it (type `shell`, no model). Its output
-  stays in its own log and reaches the model only by fork or drift. Ctrl-Z in
-  the shell returns to its parent.
+  root, opens a shell context under it (type `shell`, no model). The human
+  who pressed it performs it, root or not, and confirms their own commands
+  there as in their root: a shell context starts no model turn, so the
+  create's self-review check does not apply (`kj/context.rs`,
+  `runs_no_model`). Its output stays in its own log and reaches the model
+  only by fork or drift. Ctrl-Z in the shell returns to its parent.
 - **A drift into the console waits for the human.** Amy, 2026-10-28. A drift into
   the console lands held: a `Drift` block that is `Pending` and
   excluded, so no model reads it, and no running turn is offered it. Every

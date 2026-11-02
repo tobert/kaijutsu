@@ -84,10 +84,13 @@ async fn toggle_on_kernel(
             let cwd = std::env::current_dir()
                 .ok()
                 .and_then(|dir| dir.into_os_string().into_string().ok());
+            // The human at this seat performs the shell child, root or not:
+            // it runs no model, and the person typing there is the one acting.
             let performer = handle
-                .performer_for_new_contexts(parent, None, "--character <name>")
+                .whoami()
                 .await
-                .map_err(|e| format!("cannot create {label}: {e}"))?;
+                .map_err(|e| format!("cannot create {label}: {e}"))?
+                .username;
             let created = handle
                 .create_context_in_client_cwd(parent, &label, SHELL_CONTEXT_TYPE, &performer, cwd.as_deref())
                 .await

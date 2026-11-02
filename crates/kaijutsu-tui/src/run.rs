@@ -1770,12 +1770,19 @@ async fn toggle_shell(bridge: &KernelBridge, app: &mut App, feeds: &mut Feeds) {
             return;
         }
         Toggle::Create { parent, label } => {
-            match bridge.create_child(parent, &label, SHELL_CONTEXT_TYPE).await {
+            match bridge.create_shell_child(parent, &label).await {
                 Ok((info, cwd_refused)) => {
                     if let Some(refused) = cwd_refused {
                         tracing::warn!(%refused, "the shell took the parent's cwd; the kernel refused this one");
                     }
-                    info.id
+                    // The app's listing predates the create; the screen,
+                    // the submit and the next Ctrl+Z read the new context's
+                    // type from it before the next refresh lands.
+                    let id = info.id;
+                    let mut contexts = contexts;
+                    contexts.push(info);
+                    app.set_contexts(contexts);
+                    id
                 }
                 Err(e) => {
                     app.note(format!("cannot create {label}: {e:#}"));
@@ -1901,18 +1908,23 @@ async fn compose_key(
         // view after the kernel has already moved it (`docs/prompts.md`,
         // "The submit verb").
         let edge = app.views.get(&ctx).and_then(|view| view.edge());
+        let draft_id = app.current_draft_id();
+        let is_shell = app.current_info().is_some_and(|info| info.context_type == SHELL_CONTEXT_TYPE);
         // The kernel snapshots its own copy of the draft, so the submit queues
         // behind every keystroke still on the wire.
         match app.drafts.submit(ctx, edge).await {
             Ok(block_id) => {
-                app.mark_submitted(block_id);
+                app.mark_submitted(draft_id.unwrap_or(block_id));
                 app.compose.reset();
                 app.clear_notice();
                 // The partial turn-liveness signal (`docs/tui.md`, "Ctrl+C
                 // reclaimed"): our own submit is one of the two ways this
                 // client learns a turn started, the other being
-                // `ServerEvent::TurnStarted` (`mark_turn_liveness`).
-                app.mark_turn_running(ctx);
+                // `ServerEvent::TurnStarted` (`mark_turn_liveness`). A shell
+                // context's submit runs as shell and starts no turn.
+                if !is_shell {
+                    app.mark_turn_running(ctx);
+                }
             }
             Err(e) => {
                 tracing::warn!(context = %ctx.short(), error = %format!("{e:#}"), "submit failed");

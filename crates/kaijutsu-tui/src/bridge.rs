@@ -16,6 +16,7 @@ use kaijutsu_client::{
 use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use crate::ctrl_z::SHELL_CONTEXT_TYPE;
 
 /// Per-process subscription identity.
 ///
@@ -203,15 +204,13 @@ impl KernelBridge {
     /// Create `label` of `context_type` under `parent`, in this process's
     /// working directory, and join it. Returns the new context and, when the
     /// kernel refused the directory, its refusal (the context then takes the
-    /// parent's cwd). Used by `open` before the screen is taken, and by
-    /// `Ctrl+Z` mid-session, where the caller must not print.
+    /// parent's cwd). Used by `open` before the screen is taken.
     pub async fn create_child(
         &self,
         parent: ContextId,
         label: &str,
         context_type: &str,
     ) -> Result<(ContextInfo, Option<String>)> {
-        let cwd = client_cwd();
         // A context is an instance of a character: the one named with
         // `--character`, else this seat's own, which must not be a root.
         let performer = self
@@ -219,9 +218,29 @@ impl KernelBridge {
             .performer_for_new_contexts(parent, self.character.as_deref(), "--character <name>")
             .await
             .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
+        self.create_child_as(parent, label, context_type, &performer).await
+    }
+
+    /// Create the `Ctrl+Z` shell child `label` under `parent` and join it.
+    /// The human at this seat performs it, root or not, and `--character`
+    /// does not apply: a shell child runs no model, and the person typing
+    /// in it is the one acting there. The caller must not print.
+    pub async fn create_shell_child(&self, parent: ContextId, label: &str) -> Result<(ContextInfo, Option<String>)> {
+        let me = self.actor.whoami().await.map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
+        self.create_child_as(parent, label, SHELL_CONTEXT_TYPE, &me.username).await
+    }
+
+    async fn create_child_as(
+        &self,
+        parent: ContextId,
+        label: &str,
+        context_type: &str,
+        performer: &str,
+    ) -> Result<(ContextInfo, Option<String>)> {
+        let cwd = client_cwd();
         let created = self
             .actor
-            .create_context_in_client_cwd(parent, label, context_type, &performer, cwd.as_deref())
+            .create_context_in_client_cwd(parent, label, context_type, performer, cwd.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
         let id = created.id;

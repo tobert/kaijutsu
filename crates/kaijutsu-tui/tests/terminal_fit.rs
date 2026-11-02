@@ -25,7 +25,7 @@ mod support;
 use std::time::Duration;
 
 use support::{
-    EphemeralServer, TuiSession, drift_into_a_root_console, marked_rows, reader_rows, serial, write_ephemeral_key,
+    EphemeralServer, TuiSession, contexts_and_performers, drift_into_a_root_console, marked_rows, reader_rows, serial, write_ephemeral_key,
 };
 
 /// How long to wait for the client to connect and render its first frame.
@@ -1662,6 +1662,66 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// l2. `Ctrl+Z` from a root's own console makes the shell child the human plays
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A root session with no `--character`, the way a person starts the client
+/// on a new install. `Ctrl+Z` in the root's console creates
+/// `<root-label>-shell`, performed by the human who pressed it: a shell child
+/// runs no model, so the rule that a root performs only its root console
+/// does not apply to it.
+#[test]
+fn ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
+    let key_path = write_ephemeral_key(&server, key_dir.path());
+    let mut session = TuiSession::spawn_as_root(server.addr, &key_path, 24, 120);
+    wait_for_attach(&session);
+
+    session.send("\x1a");
+    let root = kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT;
+    let shell = format!("{root}-shell");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut contexts = contexts_and_performers(&server);
+    while !contexts.iter().any(|(label, _, _)| *label == shell) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        contexts = contexts_and_performers(&server);
+    }
+    let created = contexts.iter().find(|(label, _, _)| *label == shell).unwrap_or_else(|| {
+        panic!("Ctrl+Z created no {shell}; contexts {contexts:?}: {}", session.dump("after Ctrl+Z"))
+    });
+    assert_eq!(created.1, "shell", "{shell} has the wrong type: {contexts:?}");
+    assert_eq!(created.2.as_deref(), Some(root), "the human plays the shell child: {contexts:?}");
+
+    // The shell child runs the human's command; no model turn and no ask.
+    // Enter submits from normal mode; `Esc` goes on its own.
+    session.send("iecho \"shell-child-$((40 + 2))\"");
+    let typed = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "shell-child-$"));
+    assert!(typed, "{}", session.dump("typing"));
+    session.send("\x1b");
+    let normal = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "-- NORMAL --"));
+    assert!(normal, "{}", session.dump("after Esc"));
+    session.send("\r");
+    let ran = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "shell-child-42"));
+    assert!(ran, "the shell child did not run the command: {}", session.dump("after submit"));
+    let cleared = session.wait_until(Duration::from_secs(10), |screen| {
+        screen.rows(0, screen.size().1).any(|line| line.trim_end() == "\u{276f}")
+    });
+    assert!(cleared, "the draft stayed after the submit: {}", session.dump("draft after submit"));
+
+    // Ctrl+Z from the shell goes back to the root.
+    std::thread::sleep(Duration::from_millis(600));
+    session.send("\x1a");
+    let back = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, &format!("0 {root}*")));
+    assert!(back, "Ctrl+Z did not return to the root: {}", session.dump("toggle back"));
+
+    // Past the double-tap window, so `:q` is not read as a second press.
+    std::thread::sleep(Duration::from_millis(600));
+    quit(&mut session);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // j. A context switch takes the new context's draft with it
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -2461,5 +2521,6 @@ fn a_lone_escape_leaves_insert_mode_under_the_kitty_protocol() {
 
     quit(&mut session);
 }
+
 
 

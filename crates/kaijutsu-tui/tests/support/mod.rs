@@ -192,6 +192,32 @@ pub fn cast_a_performer(server: &EphemeralServer) {
     })
 }
 
+/// Every live context as `(label, context_type, performer_name)`, read
+/// from the kernel with `kj context info`.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
+pub fn contexts_and_performers(server: &EphemeralServer) -> Vec<(String, String, Option<String>)> {
+    with_kernel(server, async |kernel| {
+        let contexts = kernel.list_contexts().await.expect("list contexts");
+        let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
+        let mut out = Vec::new();
+        for info in contexts.iter().filter(|info| !info.archived) {
+            let result = kernel
+                .execute_kj_quiet(root, &["context".to_string(), "info".to_string(), info.id.to_hex()])
+                .await
+                .expect("run kj context info");
+            assert_eq!(result.exit_code, 0, "kj context info: {}", result.stderr);
+            let performer = result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("performer_name"))
+                .and_then(|name| name.as_str())
+                .map(str::to_string);
+            out.push((info.label.clone(), info.context_type.clone(), performer));
+        }
+        out
+    })
+}
+
 /// Grant the `operator` capability to the context labelled `label`, from the
 /// root seat. `kj context create` needs it, and a coder seat holds none.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
@@ -295,6 +321,14 @@ impl TuiSession {
         Self::spawn_with(server, key_path, rows, cols, 0, &[], &[])
     }
 
+    /// Like [`spawn`](Self::spawn), as the root character itself: no
+    /// `--character` and no `--context`, so the client opens the root's own
+    /// console, the way a person starts it on a new install.
+    #[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
+    pub fn spawn_as_root(server: SocketAddr, key_path: &Path, rows: u16, cols: u16) -> Self {
+        Self::spawn_seat(server, key_path, rows, cols, 0, &[], &[], false)
+    }
+
     /// Like [`spawn`](Self::spawn), with extra environment for the binary —
     /// the probe hooks `run.rs` reads at startup (`KAIJUTSU_TUI_PROBE_PANIC`)
     /// and `RUST_LOG`, which raises what reaches [`Self::log_path`].
@@ -339,6 +373,22 @@ impl TuiSession {
         env: &[(&str, &str)],
         args: &[&str],
     ) -> Self {
+        Self::spawn_seat(server, key_path, rows, cols, newlines, env, args, true)
+    }
+
+    /// `as_performer`: open `probe` as [`kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER`];
+    /// otherwise open the root's own console with no `--character`.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_seat(
+        server: SocketAddr,
+        key_path: &Path,
+        rows: u16,
+        cols: u16,
+        newlines: u16,
+        env: &[(&str, &str)],
+        args: &[&str],
+        as_performer: bool,
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -361,13 +411,17 @@ impl TuiSession {
         cmd.arg(server.port().to_string());
         cmd.arg("--user");
         cmd.arg("test_user");
-        cmd.arg("--character");
-        cmd.arg(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER);
+        if as_performer {
+            cmd.arg("--character");
+            cmd.arg(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER);
+        }
         cmd.arg("--insecure");
         cmd.arg("--key-file");
         cmd.arg(key_path);
-        cmd.arg("--context");
-        cmd.arg("probe");
+        if as_performer {
+            cmd.arg("--context");
+            cmd.arg("probe");
+        }
         cmd.arg("--connect-timeout");
         cmd.arg("30");
         // The log goes beside the key rather than into the state directory

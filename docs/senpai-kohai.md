@@ -224,9 +224,10 @@ its own work; a model turn refuses to start when its performer would review itse
   - **Slots** are copied from the character, with unset parameters filled from each model's `backend_models`
     row. There is no per-create model option: to run another model, start a context of a character whose slot
     has it. The create needs the Operator capability and a live character caller.
-  - A root character performs only its root console, so a root's `kaijutsu-tui` or `kaijutsu-mcp` session names
-    the character that plays what it creates: `--character <name>` on both, and `KAIJUTSU_CHARACTER` for MCP (the
-    flag wins). Without it a root refuses, with an error that names the option.
+  - A root character performs only its root console and its `shell` contexts, so a root's `kaijutsu-tui` or
+    `kaijutsu-mcp` session names the character that plays what it creates: `--character <name>` on both, and
+    `KAIJUTSU_CHARACTER` for MCP (the flag wins). Without it a root refuses, with an error that names the option.
+    The shell child `Ctrl+Z` makes is performed by the human at the seat, whatever `--character` says.
 - `kj fork`: the child copies the forking context's performer, persona and slots, with the forking context as its
   senpai. Asks from a fork climb past its performer to the forking context's senpai (Routing, step 4). A root
   console cannot be forked.

@@ -265,8 +265,12 @@ console waits for the human as a ledger ask. Still open:
   Probably right, since ACP must run in its directory.
 - `submitInput` still reports reviewer-walk errors (such as "no reviewer")
   as Cap'n Proto faults, not refusals (`runtime/turn_identity.rs`).
-- Live checks: the Ctrl-Z toggle creating a shell child against the kernel; the
-  TUI double Ctrl-Z suspend and `fg` resume; the app's Ctrl-Z.
+- Live checks: the TUI double Ctrl-Z suspend and `fg` resume; the app's
+  Ctrl-Z. The TUI toggle creating a shell child from a root seat with no
+  `--character`, a command in it, and the toggle back are covered by
+  `terminal_fit::ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs`.
+  The app's Ctrl-Z creates as the human too, but whether its listing and
+  draft settle after a shell submit, as the TUI's did not, is unchecked.
 - Pipe a shell snippet back to the model's draft. Later, after the above.
 - Typed shell-return rendering: `ls` looks bad in the TUI. Start with a live
   block dump to see whether `output` is missing on the wire.

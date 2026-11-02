@@ -394,10 +394,19 @@ fn first_free_label(db: &KernelDb, name: &str) -> KernelDbResult<String> {
     }
 }
 
+/// A context of this type never starts a model turn: a `shell` context's
+/// submit runs as shell. Its performer is the human typing there and may
+/// confirm their own commands, as in their root. A model turn still refuses
+/// a performer who is its own reviewer (`runtime/turn_identity.rs`).
+fn runs_no_model(context_type: &str) -> bool {
+    context_type == kaijutsu_types::SHELL_CONTEXT_TYPE
+}
+
 /// The body of [`insert_new_context_checked`], for a caller that already
 /// holds a transaction and writes more rows in it. A context that starts or
 /// continues a character must be reviewed by someone other than that
-/// character, except when a root rotates its own console.
+/// character, except when a root rotates its own console or the context runs
+/// no model ([`runs_no_model`]).
 pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement: CharacterPlacement) -> KernelDbResult<()> {
     let default_ws = db.get_or_create_default_workspace(row.created_by)?;
     let live_character = |performer: kaijutsu_types::PrincipalId| -> KernelDbResult<()> {
@@ -452,7 +461,7 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             _ => false,
         };
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(row.context_id, performer))?.reviewer();
-        if !rotates_root_console && performer == reviewer {
+        if !rotates_root_console && !runs_no_model(&row.context_type) && performer == reviewer {
             return Err(KernelDbError::Validation("the performer cannot review its own work".into()));
         }
     }
@@ -1667,8 +1676,11 @@ impl KjDispatcher {
         // invoking performer.
         let admission = {
             // The context does not exist yet, so routing starts at the senpai
-            // it will name.
-            if let Err(error) = self.kernel().validate_model_review_assignment(crate::kernel_db::ReviewFrom::Senpai(senpai_ctx), performer).await {
+            // it will name. A shell context runs no model turn, so it has no
+            // model performer to review ([`runs_no_model`]).
+            if !runs_no_model(&context_type)
+                && let Err(error) = self.kernel().validate_model_review_assignment(crate::kernel_db::ReviewFrom::Senpai(senpai_ctx), performer).await
+            {
                 return KjResult::Err(format!("kj context create: {error}"));
             }
             let row = ContextRow {
@@ -4200,6 +4212,34 @@ mod tests {
         assert!(!refused.is_ok(), "a root would review its own work");
         assert!(refused.message().contains("cannot review its own work"), "{}", refused.message());
         assert!(d.kernel_db().lock().find_context_by_label("owner-lane").unwrap().is_none(), "nothing was written");
+    }
+
+    /// A shell context runs no model turn, so the human who opens one under
+    /// their own root performs it and confirms their own commands there, as
+    /// in the root itself. Any other type keeps the refusal above.
+    #[tokio::test]
+    async fn a_root_character_performs_a_shell_child_under_its_own_root() {
+        let d = test_dispatcher().await;
+        let amy = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            principal_id: amy, name: "owner".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        d.kernel_db().lock().update_character_root(amy, true).unwrap();
+        let context = register_context(&d, Some("owner-root"), None, amy);
+        d.kernel_db().lock().update_performer(context, Some(amy)).unwrap();
+        let caller = crate::kj::KjCaller {
+            principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let created = d.dispatch(
+            &[s("context"), s("create"), s("owner"), s("--name"), s("owner-root-shell"), s("--type"), s(kaijutsu_types::SHELL_CONTEXT_TYPE)],
+            &caller,
+        ).await;
+        assert!(created.is_ok(), "a root performs its own shell child: {}", created.message());
+        let shell = d.kernel_db().lock().find_context_by_label("owner-root-shell").unwrap().expect("the shell exists");
+        assert_eq!(shell.context_type, kaijutsu_types::SHELL_CONTEXT_TYPE);
+        assert_eq!(d.kernel_db().lock().context_character(shell.context_id).unwrap().unwrap().principal_id, amy);
     }
 
     #[tokio::test]
