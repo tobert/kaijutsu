@@ -814,15 +814,21 @@ answers its turns. A context with no performer runs no rc and no turns.
 - **A character's sheet**: name, the `root` flag, `rc_dir`, its model, its `distill` and `gate` slots, and pointers:
   `root_ctx`, `console_ctx`, `mcp_hub_ctx` (root characters) and `handoff_ctx`.
 - **`rc_dir`** names the directory under `/config/rc/` whose lifecycle scripts the character's contexts run. It
-  defaults to the character's name. `kj character create <name> --rc <dir>` points it at another directory, so two
+  defaults to the character's name, and a root character's to `person`. `kj character create <name> --rc <dir>`
+  and `kj character set <name> --rc <dir>` point it at another directory, so two
   characters can share one: a second coder on another model is `kj character create coder-opus --rc coder --model
   anthropic/claude-opus-5-5`. A create whose directory has no runnable `create` script refuses, naming the
   directory. `lib/` is reserved.
 - **The model** is the character's one model. `kj character create <name> --model <backend>/<model>` and `kj
-  character model set <name> <backend>/<model>` take it as one value, the way `kj character show` prints it.
+  character model set <name> <backend>/<model>` take it as one value, the way `kj character show` prints it. The
+  value splits at its first `/`, so a model id may hold more (`openrouter/deepseek/deepseek-chat`), and a backend
+  name may not hold one. A root character has no model; this replaces "A root character can have a model" under
+  "Roots and rotation".
 - **Slot roles** are `distill` (a cheaper model for `kj fork --compact` and `kj drift pull|merge`) and `gate` (the
   council server that judges the gate). A context copies the character's model under role `model`, and each slot
-  under its role, when it is made. A model turn reads the context's `model` slot.
+  under its role, when it is made. A model turn reads the context's `model` slot, and the durable turn row records
+  role `model`. A slot whose backend is a council server (kind `mk`) needs no `max_tokens` and is never a chat
+  model; that is decided by the backend's kind, not by the role's name.
 
 #### A person, the console, MCP sessions, the judge
 
@@ -832,20 +838,24 @@ answers its turns. A context with no performer runs no rc and no turns.
   create <person>`, answering to the context it was opened from. A person may confirm their own commands in a
   context they perform. A context with no senpai must be performed by a root character, and it is that
   character's root console once the same transaction sets `root_ctx`.
-- **Human-root authority** (concluding, promoting, demoting and archiving a root console or the console) belongs
-  to a caller whose context a root character performs. A context that a root character does not perform grants
-  none, whatever its label.
+- **Human-root authority** follows the human, as "Roots and rotation" records: a caller whose character is a live
+  root character has it from any context. A context no longer grants it because of what it is; the rule reads the
+  caller's character only.
 - **The console** is the context `characters.console_ctx` names on the person's sheet. banto performs it, and it
-  answers to the person's root console. `kaijutsu-server bootstrap` creates banto and the console. Rotating the
-  console moves the pointer at the commit, as rotation moves `root_ctx` and `handoff_ctx`. Only the person
-  concludes, demotes or archives their console.
-- **An MCP session** is performed by a character with no model whose rc is the MCP bundle (`mcp/`). The client
-  brings its own model. Its contexts answer to the person's root console and their parent is the person's MCP hub, the
-  performer-less context `characters.mcp_hub_ctx` names.
+  answers to the person's root console. `kaijutsu-server bootstrap` creates banto and the console, and `kj
+  character set <person> --console <ctx>` points at another. Rotating the console moves the pointer at the
+  commit, as rotation moves `root_ctx` and `handoff_ctx`; archiving it clears the pointer in the same transaction.
+  Only the person concludes, demotes or archives their console. A drift into the console waits for the person.
+- **An MCP session** is performed by the connection's own character, as today (`kaijutsu-lead`, or the one
+  `--character` names): a character with no model whose rc directory is `mcp/`. The client brings its own model.
+  The session answers to the person's root console, and its parent is the person's MCP hub, the performer-less
+  context `characters.mcp_hub_ctx` names; archiving the hub clears the pointer. A session is a context whose
+  parent is an MCP hub. Creating one under the caller's own hub needs no ask, as `--type mcp` did.
 - **The judge** is a character, `judge`, whose model is a council server (a backend of kind `mk`). The judge
-  shadow of a context K is a fork of K performed by the judge character named in K's gate layer
-  (`[character.<name>.council] judge = "judge"`), answering to K. The shadow is found as the live fork of K
-  performed by that character, and the council server is that character's model.
+  shadow of a context K is a context performed by the judge character named in K's gate layer
+  (`[character.<name>.council] judge = "judge"`), with `forked_from` K and K as its senpai, and slots copied from
+  the judge character. It is found as the live child of K performed by that character, and the council server is
+  its `model` slot. Archived shadows from before the melt stay archived as ordinary forks.
 - **A context with no performer** (the handoff log, the MCP hub, a score, the drift queue, lost+found, cold-start
   discovery) runs no rc and no turns. Pointers find the ones the kernel needs: `handoff_ctx`, `mcp_hub_ctx`.
 
@@ -857,6 +867,13 @@ gone. Shared fragments stay in `lib/` and are linked into a directory, as today.
 a context's children names them by performer: `kj context archive --children --performer judge --confirm` (the
 coder's archive) and `--performer "$KJ_CHARACTER"` (the companion's tick) replace `--children --type`.
 
+The merged directories take these bodies. `person/` takes the root console's bindings, so a person's Ctrl+Z
+contexts carry the person's whole loadout ("your contexts are all alike": yes, 2026-11-04); capabilities narrow
+focus, and a person narrows nothing for themself. `banto/` takes the director's lifecycle and stance, and the
+console's stance text joins the director's in one `S00-stance.md`. A directory whose characters fork or drift
+links the `lib/` cache scripts into its `fork/` and `drift/` buckets, as `default/` did; `person/` runs no model
+and needs none.
+
 Shipped directories in `assets/defaults/rc/`:
 
 | Directory | From | Played by |
@@ -865,7 +882,7 @@ Shipped directories in `assets/defaults/rc/`:
 | `banto/` | `director/` and `console/` | banto |
 | `coder/`, `companion/`, `musician/`, `storyteller/`, `toolie/`, `assistant/`, `council/` | the type of the same name | the character of the same name |
 | `judge/` | `judge/` | judge |
-| `mcp/` | `mcp/` | the MCP session character |
+| `mcp/` | `mcp/` | each MCP connection's character |
 
 `default/`, `director/`, `console/`, `root/` and `shell/` are retired; `kaijutsu-server rc reseed` names them and
 `--force` removes them.
@@ -878,13 +895,13 @@ reads does. A council block moves with its layer: `[character.coder.council]`. A
 no character on the sheet, live or retired, is logged as a warning at every load and listed by `kj ledger rules` as
 applying to nobody. It does not fail the load: a failed load refuses every gated statement, including the
 `kj character create` that would fix it. The council's case carries the performer's name where it carried the
-type.
+type, and the council contexts a context consults are composed from its performer's layer. The shipped
+`assets/defaults/gate.toml` and the embedded default change in the same slice.
 
 #### Shipped characters
 
 `kaijutsu-server bootstrap` creates each shipped character that does not exist, with its directory and the model
-it was given: banto, coder, companion, musician, storyteller, toolie, assistant, council, and the MCP session
-character. judge is created with no model; `kj character model set judge <council-backend>/<model>` gives it one
+it was given: banto, coder, companion, musician, storyteller, toolie, assistant and council. judge is created with no model; `kj character model set judge <council-backend>/<model>` gives it one
 before the council is enabled. An existing character is left alone and named in the report, as `rc reseed` names a
 file it leaves alone. Bootstrap is idempotent, so running it on an existing kernel creates only what is missing.
 
@@ -910,22 +927,28 @@ shell-draft handling and the MCP self-archive read these facts. Displays that sh
 picker and ask cards, the time well's card accent, `kj system ps`, `whoami`, `kj ledger runs`) show the performer.
 An ACP or tui session names its character with `--character`, as MCP does.
 
-#### Migration (`type-melt-v1`)
+#### Migrations
 
-One boot migration, after a copy aside (`kernel.db.pre-type-melt`):
+The backfills run where the slice that reads them lands, so each slice is green on an existing database. Each
+boot migration copies the database aside first and records itself, as the fold did.
 
-1. `characters.rc_dir`: a root character gets `person`; a character whose `context_type` is `director` gets
-   `banto`; any other `context_type` maps to the directory of the same name; a character with no type and a
-   directory of its own name gets that; the MCP session character gets `mcp`. A live character none of these
-   covers fails the migration, naming it. The migration rehearses on a copy first, and we retire stale characters
-   by hand before it runs.
-2. `characters.console_ctx` and `mcp_hub_ctx` are set from each root's live `console` and `mcp-hub` contexts.
-3. `context_slots`: the row whose role is the context's type becomes role `model`; `judge` rows and other
-   type-keyed rows are dropped. `character_slots` keeps only `distill` and `gate` rows; the others are dropped and
-   named in the migration report.
-4. Live judge shadows are archived; the next gate call makes a new one performed by judge.
-5. `contexts.context_type` and `characters.context_type` are dropped. The approval ledger's `rc_runs.context_type`
-   is renamed `rc_dir`; an old row's value is the directory it ran, so it stays true.
+1. **M2, `rc_dir` backfill.** A root character gets `root` (renamed `person` in M6). A character with a
+   `context_type` gets that directory. A character with neither gets the type most of its live contexts have, which
+   gives an MCP lead `mcp` and a hand-made directory such as `bassist` the character that plays it. A character
+   with no type and no live context keeps NULL, and a create for it refuses, naming `kj character set <name>
+   --rc <dir>`. Boot never fails for this. The same pass sets `console_ctx` from a root's one live `console` context
+   that answers to its root console, and leaves it NULL, with a warning naming them, when there are several.
+2. **M3, slot roles.** In each `context_slots` row the role that is the context's type becomes `model`; `judge` and
+   other type-keyed rows are dropped. `character_slots` keeps `distill` and `gate`. The migration drops and
+   recreates the never-changed triggers inside its own transaction; no verb changes a slot. Live judge shadows are
+   archived, and the next gate call makes one performed by judge.
+3. **M6, `type-melt-v1`.** `rc_dir` values move to the renamed directories (`director` and `console` to `banto`,
+   `root` and `shell` to `person`, `default` to `coder`). `contexts.context_type` and `characters.context_type`
+   are dropped, with their schema defaults, so a fresh database never creates them. The approval ledger's
+   `rc_runs.context_type` is renamed `rc_dir`; an old row keeps the name the directory had when it ran.
+
+Earlier migrations that read `context_type` still run on an old database before these, and a fresh database
+never needs them; both paths are tested.
 
 Earlier migrations that read `context_type` still run on an old database before this one, and a fresh database
 never needs them; both paths are tested.
@@ -936,21 +959,24 @@ The host `gate.toml` is rewritten by hand at the deploy, with a backup beside it
 
 Each slice leaves the tree green and is reviewed before the next starts. Nothing deploys until the last.
 
-- **M1. The sheet.** `characters.rc_dir`, `console_ctx` and `mcp_hub_ctx`; `kj character create --rc`; `--model
-  <backend>/<model>` on `create` and `model set`; `kj character show` prints the directory and pointers;
-  bootstrap and `ensure_mcp_hub` set the pointers.
-- **M2. rc follows the performer.** `load_scripts(rc_dir, verb)`, `KJ_CHARACTER` and `KJ_RC_DIR`; the shipped
-  directories are renamed and retired as above; `kj context create` takes no `--type`; `--children --performer`;
-  `kj rc list --dir`; `rc_runs.rc_dir`.
-- **M3. One model.** Slot role `model`; roles `distill` and `gate`; the judge character, its shadow lookup and its
-  server; bootstrap gives the console's performer its model, not a `console` slot.
-- **M4. Gate layers by character.** `[character.<name>]`, `[root]`, the council block and case, the warning for a
-  section that applies to nobody, `kj ledger rules`.
+- **M1. The sheet.** `characters.rc_dir`, `console_ctx` and `mcp_hub_ctx`; `kj character create|set --rc`;
+  `kj character set --console`; `--model <backend>/<model>` on `create`, `model set` and `slot set`; `kj character
+  show` prints the directory and pointers; bootstrap and `ensure_mcp_hub` set the pointers.
+- **M2. rc follows the performer.** The `rc_dir` backfill; `load_scripts(rc_dir, verb)`, `KJ_CHARACTER` and
+  `KJ_RC_DIR`; a context with no performer runs no rc; `--children --performer`; `kj rc list --dir`. The
+  directories keep their names, and `contexts.context_type` stays, so the gate, slots and clients still work.
+- **M3. One model.** The slot-role migration; role `model`; council-server slots by backend kind; the judge
+  character, its shadow and its server; bootstrap gives the console's performer its model, not a `console` slot.
+- **M4. Gate layers by character.** `[character.<name>]`, `[root]`, the council block, case and seat composition,
+  the warning for a section that applies to nobody, `kj ledger rules`, the MCP session create rule, and the
+  shipped and embedded `gate.toml`.
 - **M5. Persons and pointers.** The person rule (draft as shell, self-confirmation, no turns, the senpai-edge
-  check, human-root authority), the console and hub pointers, the wire facts, and every client and display.
-- **M6. The type goes.** `type-melt-v1`, dropping both columns and the constants; bootstrap creates the shipped
-  characters; `lib/recipes/pair.kai`; `docs/prompts.md`, `docs/senpai-kohai.md`, the Terms table and the Current
-  implementation table.
+  check, human-root authority), the console and hub pointers and their clearing on archive, the wire facts, every
+  client and display, and `kj context create` without `--type` (clients and server in the same slice).
+- **M6. The type goes.** The directory renames and merges and their `rc_dir` move; `type-melt-v1`, dropping both
+  columns, their defaults and the constants (scratch, fork and cold-start writers included); bootstrap creates the
+  shipped characters; `lib/recipes/pair.kai`; `docs/prompts.md`, `docs/senpai-kohai.md`, the Terms table and the
+  Current implementation table.
 - **M7. zorak.** Retire stale characters by hand, rehearse `type-melt-v1` on a copy, rewrite the host `gate.toml`,
   deploy, and check every shipped character and the console live.
 
