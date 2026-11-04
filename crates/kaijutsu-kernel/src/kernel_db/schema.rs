@@ -180,11 +180,12 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
 );
 
 -- ── Context slots (docs/senpai-kohai.md, "The model") ────────────
--- A copy of one character slot, with every unset parameter filled from the
--- model's `backend_models` row. `max_tokens` is required: every provider
--- request carries it, except a `gate` or `judge` slot, which names a council
--- server. NULL optional parameters are left out of the request. A trigger
--- refuses an UPDATE or DELETE.
+-- A copy of the character's model (role `model`) or of one character slot
+-- (`distill`, `gate`), with every unset parameter filled from the model's
+-- `backend_models` row. `max_tokens` is required: every provider request
+-- carries it, except on a council server (a backend of kind `mk`). NULL
+-- optional parameters are left out of the request. A trigger refuses an
+-- UPDATE or DELETE.
 CREATE TABLE IF NOT EXISTS context_slots (
     context_id      BLOB    NOT NULL REFERENCES contexts(context_id),
     role            TEXT    NOT NULL,
@@ -201,10 +202,11 @@ CREATE TABLE IF NOT EXISTS context_slots (
 );
 
 -- What `context-characters-v1` did not carry over or could not resolve, and
--- what `context-fold-v1` and `rc-dir-backfill-v1` decided, by kind: dropped,
--- unmapped, no_slot, no_gate_slot, no_distill_slot, no_character_slot,
--- senpai_assigned, archived_no_senpai, rc_dir_unset (no context_id; the
--- principal_id names the character), console_ambiguous.
+-- what `context-fold-v1`, `rc-dir-backfill-v1` and `slot-roles-v1` decided,
+-- by kind: dropped, unmapped, no_slot, no_gate_slot, no_distill_slot,
+-- no_character_slot, senpai_assigned, archived_no_senpai, rc_dir_unset and
+-- slot_dropped (no context_id; the principal_id names the character),
+-- console_ambiguous.
 CREATE TABLE IF NOT EXISTS context_character_migration_report (
     report_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT    NOT NULL,
@@ -751,12 +753,11 @@ CREATE TABLE IF NOT EXISTS backend_models (
 );
 
 -- ── Character slots ───────────────────────────────────────────
--- The model each of a character's roles runs: one slot per role, where a
--- role is a `context_type` (coder, musician, mcp, …) or one of the reserved
--- roles `distill`, `gate` and `judge`. Free-form TEXT with no FK — context
--- types are an open set defined by the rc tree. A NULL tunable takes the
--- model's `backend_models` value when a context is made and copies the slot
--- (docs/senpai-kohai.md, "The model").
+-- A character's models for its two roles besides its chat model: `distill`
+-- (the model that summarizes for forks and pulls) and `gate` (the council
+-- server, a backend of kind `mk`, that judges the gate). A NULL tunable takes
+-- the model's `backend_models` value when a context is made and copies the
+-- slot (docs/senpai-kohai.md, "The model").
 CREATE TABLE IF NOT EXISTS character_slots (
     principal_id    BLOB NOT NULL REFERENCES characters(principal_id),
     role            TEXT NOT NULL,
@@ -773,11 +774,10 @@ CREATE TABLE IF NOT EXISTS character_slots (
 CREATE INDEX IF NOT EXISTS idx_character_slots_backend ON character_slots(backend_id);
 
 -- ── Character models ──────────────────────────────────────────
--- The one model a character runs wherever no role slot says otherwise. A
--- context copies it under the context's own type and under
--- `distill`, for each of the two that the character has no slot for. A NULL
--- tunable takes the model's `backend_models` value at that copy
--- (docs/senpai-kohai.md, "Where a model comes from").
+-- The one model a character runs. A context copies it under role `model`,
+-- and under `distill` when the character has no `distill` slot and the model
+-- is no council server. A NULL tunable takes the model's `backend_models`
+-- value at that copy (docs/senpai-kohai.md, "Where a model comes from").
 CREATE TABLE IF NOT EXISTS character_models (
     principal_id    BLOB NOT NULL PRIMARY KEY REFERENCES characters(principal_id),
     backend_id      BLOB NOT NULL REFERENCES backends(backend_id),

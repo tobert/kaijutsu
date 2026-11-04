@@ -6,10 +6,10 @@ use kaijutsu_types::ContextId;
 
 use crate::kernel_db::ContextRow;
 
-/// What a context list shows of a context's slots: the model its type runs.
+/// What a context list shows of a context's slots: the model it runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextBound {
-    /// `backend/model`, or `None` when the context has no slot for its type.
+    /// `backend/model`, or `None` when the context has no `model` slot.
     pub model: Option<String>,
 }
 

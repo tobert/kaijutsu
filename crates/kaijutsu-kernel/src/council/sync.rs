@@ -811,8 +811,8 @@ impl SeatBuild {
 /// along the reviewer chain of its performer and the house rules of its
 /// workspace, routed to the server its context's `gate` slot names; each
 /// observing reviewer context alone under `direction-check`; and, when its
-/// binding has an `mk` judge, the judge read's labels and house rules on the
-/// judge's server. Empty when its type has no council or its context has no
+/// council names a judge whose model is on an `mk` backend, the judge read's
+/// labels and house rules on the judge's server. Empty when its type has no council or its context has no
 /// `gate` slot. Waits on no server.
 ///
 /// The second value says why the reviewer chain is left out: a context
@@ -866,8 +866,8 @@ pub(crate) async fn plan_context_seats(
             added: Vec::new(),
         });
     }
-    let judge = super::shadow::judge_server(&db, context)
-        .map_err(|e| format!("the judge slot of context {} cannot be read: {e}", context.short()))?;
+    let judge = super::shadow::judge_server(&db, council, context)
+        .map_err(|e| format!("the judge of context {} cannot be read: {e}", context.short()))?;
     if let (Some(judge), Some(spec)) = (judge, shell) {
         let seat_name = row.label.clone().unwrap_or_else(|| context.short());
         builds.push(SeatBuild {
@@ -1266,6 +1266,7 @@ mod tests {
             escalate: None,
             specs: vec![spec.clone()],
             thresholds: vec![],
+            judge: None,
         };
         Rig { kernel, mock, council, spec, reviewer, config }
     }

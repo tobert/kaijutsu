@@ -3139,7 +3139,7 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context_with_model(&d, Some("source"), None, PrincipalId::new(), &["distill"]);
-        let dest = register_context_with_model(&d, Some("dest"), None, principal, &["default"]);
+        let dest = register_context_with_model(&d, Some("dest"), None, principal, &[]);
         for ctx in [source, dest] {
             d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
         }
@@ -3179,7 +3179,7 @@ mod tests {
         let principal = PrincipalId::new();
         let source = register_context_with_models(
             &d, Some("source"), None, principal,
-            &[("default", "chatbackend", "chat-model"), ("distill", "distillbackend", "distill-model")],
+            &[("model", "chatbackend", "chat-model"), ("distill", "distillbackend", "distill-model")],
         );
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         d.block_store()

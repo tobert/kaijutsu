@@ -57,8 +57,6 @@ pub struct ContextCharacterMigrationNote {
     pub note: String,
 }
 
-use crate::model_resolution::names_council_server;
-
 /// `own` over `floor`, field by field.
 pub(super) fn over(own: &ModelTunablesRow, floor: &ModelTunablesRow) -> ModelTunablesRow {
     ModelTunablesRow {
@@ -225,6 +223,17 @@ pub(super) fn copy_character_into(conn: &Connection, source: ContextId, child: C
     Ok(true)
 }
 
+/// The triggers that refuse an update or a delete of a context slot. A
+/// migration that rewrites slots drops them and runs this inside its own
+/// transaction.
+pub(super) const CONTEXT_SLOTS_NEVER_CHANGED: &str = "
+    CREATE TRIGGER IF NOT EXISTS context_slots_never_changed_u
+        BEFORE UPDATE ON context_slots
+        BEGIN SELECT RAISE(ABORT, 'context_slots rows are never changed'); END;
+    CREATE TRIGGER IF NOT EXISTS context_slots_never_changed_d
+        BEFORE DELETE ON context_slots
+        BEGIN SELECT RAISE(ABORT, 'context_slots rows are never changed'); END;";
+
 impl KernelDb {
     /// Indexes and triggers that keep the dynamic layer fixed, created on
     /// every open once the `contexts` columns exist.
@@ -238,17 +247,12 @@ impl KernelDb {
     ///
     /// `senpai_ctx` stays updatable (`kj context set --senpai`).
     pub(super) fn ensure_context_guards(conn: &Connection) -> KernelDbResult<()> {
+        conn.execute_batch(CONTEXT_SLOTS_NEVER_CHANGED)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_contexts_performer
                  ON contexts(performer) WHERE performer IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_contexts_senpai
                  ON contexts(senpai_ctx) WHERE senpai_ctx IS NOT NULL;
-             CREATE TRIGGER IF NOT EXISTS context_slots_never_changed_u
-                 BEFORE UPDATE ON context_slots
-                 BEGIN SELECT RAISE(ABORT, 'context_slots rows are never changed'); END;
-             CREATE TRIGGER IF NOT EXISTS context_slots_never_changed_d
-                 BEFORE DELETE ON context_slots
-                 BEGIN SELECT RAISE(ABORT, 'context_slots rows are never changed'); END;
              CREATE TRIGGER IF NOT EXISTS contexts_performer_fixed
                  BEFORE UPDATE OF performer, persona ON contexts
                  WHEN OLD.performer IS NOT NULL
@@ -300,46 +304,46 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Copy the model and slots of `principal_id` into `context_id`: every
-    /// role slot under its own role; then the character's model under the
-    /// context's type and under `distill`, each only where the character has
-    /// no slot for that role. The model never fills `gate`, `judge` or the
-    /// type of an `mcp` context. A parameter left unset takes the model's
-    /// `backend_models` value; nothing else supplies one. A model request with
+    /// Copy the model and slots of `principal_id` into `context_id`: the
+    /// character's model under `model`, and under `distill` when the
+    /// character has no `distill` slot and the model is no council server;
+    /// then its `distill` and `gate` slots under their roles. A character
+    /// with no model gives the context no `model` slot. A parameter left unset takes the model's
+    /// `backend_models` value; nothing else supplies one. A chat model with
     /// no `max_tokens` in either place refuses, and so does
-    /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`.
+    /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`;
+    /// a council server (a backend of kind `mk`) is exempt from both. A
+    /// character slot of any other role is corruption and refuses.
     fn copy_character_slots(&self, context_id: ContextId, principal_id: PrincipalId) -> KernelDbResult<()> {
+        use crate::model_resolution::{CHARACTER_SLOT_ROLES, DISTILL, MODEL};
         let who = self.name_for(principal_id);
         let slots = self.list_character_slots(principal_id)?;
+        if let Some(stray) = slots.iter().find(|slot| !CHARACTER_SLOT_ROLES.contains(&slot.role.as_str())) {
+            return Err(KernelDbError::Validation(format!(
+                "character {who} holds a `{}` slot, and a character's slots are `distill` and `gate`; \
+                 `kj character slot unset {who} {}` removes it",
+                stray.role, stray.role
+            )));
+        }
+        if let Some(model) = self.get_character_model(principal_id)? {
+            let subject = format!("the model of character {who}");
+            let tunables = ModelTunablesRow {
+                max_tokens: model.max_tokens,
+                temperature: model.temperature,
+                top_p: model.top_p,
+                effort: model.effort.clone(),
+                thinking_budget: model.thinking_budget,
+                thinking_style: model.thinking_style.clone(),
+            };
+            self.copy_one_slot(context_id, MODEL, &subject, model.backend_id, &model.model, tunables.clone())?;
+            // A council server is never a chat model, so it distills nothing.
+            if !slots.iter().any(|slot| slot.role == DISTILL) && !self.backend_is_council_server(model.backend_id)? {
+                self.copy_one_slot(context_id, DISTILL, &subject, model.backend_id, &model.model, tunables)?;
+            }
+        }
         for slot in &slots {
             let subject = format!("slot {} of character {who}", slot.role);
             self.copy_one_slot(context_id, &slot.role, &subject, slot.backend_id, &slot.model, slot_tunables(slot))?;
-        }
-        let Some(model) = self.get_character_model(principal_id)? else {
-            return Ok(());
-        };
-        let context_type = self
-            .get_context(context_id)?
-            .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context_id.short())))?
-            .context_type;
-        let mut roles = vec!["distill"];
-        if context_type != "mcp" && !names_council_server(&context_type) && context_type != "distill" {
-            roles.insert(0, context_type.as_str());
-        }
-        let subject = format!("the model of character {who}");
-        let tunables = ModelTunablesRow {
-            max_tokens: model.max_tokens,
-            temperature: model.temperature,
-            top_p: model.top_p,
-            effort: model.effort.clone(),
-            thinking_budget: model.thinking_budget,
-            thinking_style: model.thinking_style.clone(),
-        };
-        for role in roles {
-            if slots.iter().any(|slot| slot.role == role) {
-                continue;
-            }
-            self.copy_one_slot(context_id, role, &subject, model.backend_id, &model.model, tunables.clone())?;
         }
         Ok(())
     }
@@ -359,14 +363,15 @@ impl KernelDb {
         let model_row = self.list_backend_models(backend_id)?.into_iter().find(|m| m.model_id == model);
         let tunables = over(&own, &model_row.as_ref().map(|m| m.tunables.clone()).unwrap_or_default());
         let max_tokens = tunables.max_tokens;
-        if max_tokens.is_none() && !names_council_server(role) {
+        let council_server = self.backend_is_council_server(backend_id)?;
+        if max_tokens.is_none() && !council_server {
             return Err(KernelDbError::Validation(format!(
                 "{subject} runs model {model}, which has no max_tokens in the {} or in its \
                  backend_models row; every request carries max_tokens, so set it on one of them",
                 if subject.starts_with("slot") { "slot" } else { "model" }
             )));
         }
-        if !names_council_server(role) && tunables.thinking_style.as_deref() == Some("budget") {
+        if !council_server && tunables.thinking_style.as_deref() == Some("budget") {
             let Some(budget) = tunables.thinking_budget else {
                 return Err(KernelDbError::Validation(format!(
                     "{subject} runs model {model} with thinking_style=budget and no \
@@ -455,9 +460,11 @@ impl KernelDb {
         })
     }
 
-    /// Give `child` a copy of `source`'s performance: same performer and
-    /// persona, slots verbatim, `source` as senpai. `None` when `source` has
-    /// no performer, which gives the child the senpai edge alone.
+    /// Test fixture: give `child` a copy of `source`'s performance, as a
+    /// fork does: same performer and persona, slots verbatim, `source` as
+    /// senpai. `None` when `source` has no performer, which gives the child
+    /// the senpai edge alone.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn copy_context_character(&self, source: ContextId, child: ContextId) -> KernelDbResult<Option<ContextCharacterRow>> {
         self.atomically(|db| {
             if db.context_character(child)?.is_some() {
@@ -561,6 +568,17 @@ impl KernelDb {
     pub fn is_root_console(&self, context: ContextId) -> KernelDbResult<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM characters WHERE root_ctx = ?1)",
+            params![blob_param(context.as_bytes())],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether `context` is an MCP session: its parent (`forked_from`) is
+    /// the MCP hub some character's `mcp_hub_ctx` names.
+    pub fn is_mcp_session(&self, context: ContextId) -> KernelDbResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contexts x JOIN characters c ON c.mcp_hub_ctx = x.forked_from
+                           WHERE x.context_id = ?1)",
             params![blob_param(context.as_bytes())],
             |r| r.get(0),
         )?)

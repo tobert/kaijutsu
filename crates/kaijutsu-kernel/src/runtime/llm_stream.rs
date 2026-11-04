@@ -644,16 +644,14 @@ pub(super) async fn spawn_admitted_turn(
         }
     };
 
-    // The model comes from the slot of the context's context character
-    // and nowhere else. A context whose binding has no slot for its type
-    // refuses here, before any provider work.
+    // The model comes from the context's `model` slot and nowhere else. A
+    // context with no `model` slot refuses here, before any provider work.
     let bound = {
         let db = kernel_db.lock();
         crate::model_resolution::context_model(&db, context_id)
             .map_err(|e| format!("Could not read this context's model binding: {e}"))?
             .into_model()?
     };
-    let context_type = bound.context_type.clone();
     let max_output_tokens = bound.max_tokens;
     let context_window = bound.context_window;
     let tunables = bound.tunables.clone();
@@ -765,7 +763,7 @@ pub(super) async fn spawn_admitted_turn(
         turn_id,
         context_id,
         performer: performer.principal_id,
-        role: context_type.clone(),
+        role: crate::model_resolution::MODEL.to_string(),
         provider: backend_name,
         model: model_name.clone(),
         started_at: kaijutsu_types::now_millis() as i64,
@@ -8062,7 +8060,7 @@ mod lifetime_tests {
             // when a mock provider is wanted; without one the binding has
             // no model.
             if mock.is_some() {
-                db.seed_test_slots(actor, "mock", "mock-model", &["default"]).unwrap();
+                db.seed_test_slots(actor, "mock", "mock-model", &["model"]).unwrap();
             }
             db.update_performer(context, Some(actor)).unwrap();
             db.set_context_senpai(context, Some(senpai)).unwrap();
@@ -8150,7 +8148,7 @@ mod lifetime_tests {
         let performer = db.get_context(context).unwrap().unwrap().performer.unwrap();
         assert_eq!(turn.start.context_id, context);
         assert_eq!(turn.start.performer, performer);
-        assert_eq!(turn.start.role, "default");
+        assert_eq!(turn.start.role, "model", "the turn ran on the context's model slot");
         assert_eq!((turn.start.provider.as_str(), turn.start.model.as_str()), ("mock", "mock-model"));
         assert!(turn.ended_at.is_some_and(|ended| ended >= turn.start.started_at));
         assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"));
@@ -8785,13 +8783,14 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
-    /// A context with no slot for its type has no model. The turn refuses
-    /// before any provider work, naming the character, the type and the fix,
-    /// even with a provider registered.
+    /// A context with no `model` slot has no model. The turn refuses before
+    /// any provider work, naming the character and the fix, even with a
+    /// provider registered and a `distill` slot that could answer.
     ///
-    /// Falsified by a turn that falls back to any registered provider.
+    /// Falsified by a turn that falls back to any registered provider or to
+    /// another slot.
     #[tokio::test]
-    async fn a_turn_whose_context_has_no_slot_for_its_type_refuses_naming_the_fix() {
+    async fn a_turn_whose_context_has_no_model_slot_refuses_naming_the_fix() {
         let (kernel, context, _after, call) = fixture(None).await;
         kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(MockClient::new("unused"))));
         let successor = ContextId::new();
@@ -8799,8 +8798,8 @@ mod lifetime_tests {
         {
             let db = kernel.kernel_db().lock();
             let performer = db.get_context(context).unwrap().unwrap().performer.unwrap();
-            // A character that holds a slot for another type, copied after the fact.
-            db.seed_test_slots(performer, "mock", "mock-model", &["musician"]).unwrap();
+            // A character with a distill slot and no model.
+            db.seed_test_slots(performer, "mock", "mock-model", &["distill"]).unwrap();
             let ws = db.get_or_create_default_workspace(performer).unwrap();
             db.insert_context_with_document(&crate::ContextRow {
                 context_id: successor, label: None, system_prompt: None,
@@ -8818,8 +8817,8 @@ mod lifetime_tests {
         let error = start_fixture_turn(&kernel, kernel.admit_context(successor).unwrap(), &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("performer"), "names the character: {error}");
-        assert!(error.contains("has no default slot and no model"), "names the type: {error}");
-        assert!(error.contains("kj character model set") && error.contains("kj context rotate"), "names the fix: {error}");
+        assert!(error.contains("has no model"), "says what is missing: {error}");
+        assert!(error.contains("kj character model set") && error.contains("<backend>/<model>") && error.contains("kj context rotate"), "names the fix: {error}");
         assert!(kernel.kernel_db().lock().list_turns(successor, 5).unwrap().is_empty(), "no turn was recorded");
     }
 

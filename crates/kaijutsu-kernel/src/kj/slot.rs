@@ -1,32 +1,26 @@
-//! `kj character slot` — the model each of a character's roles runs.
+//! `kj character slot` and `kj character model` — the models a character
+//! runs.
 //!
-//! A character holds one **slot** per *role*, where a role is a
-//! `context_type` (coder, musician, mcp, …), or `gate`, `judge` or
-//! `distill`. A slot names a backend + model and may set any request
-//! parameter. A parameter the slot leaves unset is read from the model's
-//! `backend_models` row when a context's slots are written; after
-//! that nothing reads the character's slots, so a change reaches a context
-//! when it is rotated.
+//! `kj character model set|unset|show` holds the character's **one model**.
+//! A context copies it under role `model`, which its turns run on, and under
+//! `distill` when the character has no `distill` slot. A root character runs
+//! no model.
 //!
-//! The `gate` and `judge` roles are not context types: they name the council
-//! server for gate decisions and for the judge shadow
-//! (`docs/council.md`, "Configuration"). `distill` names the model that
-//! summarizes for `kj fork --compact` and `kj drift pull|merge`.
+//! A character also holds up to two **slots**: `distill`, a cheaper model
+//! that summarizes for `kj fork --compact` and `kj drift pull|merge`, and
+//! `gate`, the council server (a backend of kind `mk`) that judges the gate
+//! (`docs/council.md`, "Configuration"). No other role exists: the judge is
+//! a character of its own, whose model is its council server.
 //!
-//! Roles are free-form TEXT with **no FK**: context types are an open set
-//! defined by the rc tree, and a slot that names a role nobody has created
-//! yet is a legitimate forward declaration, not an error.
+//! A slot names a backend + model and may set any request parameter. A
+//! parameter the slot leaves unset is read from the model's `backend_models`
+//! row when a context's slots are written; after that nothing reads the
+//! character's slots, so a change reaches a context when it is rotated.
 //!
 //! The kernel ships **no factory slots**: which model plays which seat is an
 //! operator or agent decision, and shipping one would be the kernel guessing.
 //! A turn reads its model from the context's own slots
 //! (`model_resolution::context_model`), never from the character's.
-//!
-//! `kj character model set|unset|show` holds the character's **one model**:
-//! the model it runs wherever no role slot says otherwise. A context copies
-//! it under its own type and under `distill` for each of the two the
-//! character has no slot for; it never fills `gate`, `judge` or the type of an
-//! `mcp` context. A root character runs no model.
 
 use clap::Subcommand;
 
@@ -40,10 +34,10 @@ pub(super) enum CharacterSlotCommand {
     Set {
         /// The character's name
         character: String,
-        /// Role: a context_type (coder, musician, mcp, …); `gate` or `judge`
-        /// for the council server (an mk backend) of the gate or the judge
-        /// shadow; or `distill` for the model that summarizes for `kj fork
-        /// --compact` and `kj drift pull|merge`
+        /// Role: `distill` for the model that summarizes for `kj fork
+        /// --compact` and `kj drift pull|merge`, or `gate` for the council
+        /// server (an mk backend) that judges the gate. The character's chat
+        /// model is `kj character model set`
         role: String,
         /// The model as `<backend>/<model>`, split at the first `/`, as `kj
         /// character show` prints it (for example `deepseek/deepseek-flash`).
@@ -51,8 +45,9 @@ pub(super) enum CharacterSlotCommand {
         #[arg(value_name = "BACKEND/MODEL")]
         model: String,
         /// Maximum RESPONSE tokens. Omit to read it from the model's
-        /// `kj backend model set` row when a context's slots are copied; a
-        /// context's slot write refuses a model request role with neither
+        /// `kj backend model set` row when a context's slots are copied;
+        /// making a context refuses a `distill` slot with neither. A council
+        /// server needs none
         #[arg(long = "max-tokens")]
         max_tokens: Option<u64>,
         /// Sampling temperature, 0.0..=2.0
@@ -76,7 +71,7 @@ pub(super) enum CharacterSlotCommand {
     Unset {
         /// The character's name
         character: String,
-        /// Role
+        /// Role: `distill` or `gate`
         role: String,
     },
     /// List a character's slots.
@@ -90,8 +85,10 @@ pub(super) enum CharacterSlotCommand {
 #[derive(Subcommand, Debug)]
 pub(super) enum CharacterModelCommand {
     /// Set the character's model, replacing the one it has. A context copies
-    /// the model when it is made, so a change reaches a running context at
-    /// `kj context rotate`. A root character refuses it.
+    /// it under role `model`, which its turns run on, and under `distill`
+    /// when the character has no `distill` slot. The copy is made when the
+    /// context is, so a change reaches a running context at `kj context
+    /// rotate`. A root character refuses it.
     Set {
         /// The character's name
         character: String,
@@ -263,7 +260,7 @@ impl KjDispatcher {
                     return KjResult::Err(format!("kj character model set: {e}"));
                 }
                 let mut msg = format!("set the model of {character} → {backend}/{model}");
-                msg.push_str(&max_tokens_warnings(&db, &character, &backend, &model, b.backend_id, max_tokens, thinking_budget, true));
+                msg.push_str(&max_tokens_warnings(&db, &character, &backend, &model, b.backend_id, max_tokens, thinking_budget, !crate::model_resolution::is_council_kind(&b.kind)));
                 KjResult::ok(msg)
             }
             CharacterModelCommand::Unset { character } => {
@@ -311,7 +308,7 @@ impl KjDispatcher {
 /// Write-time warnings against the values a context would copy: the
 /// source's own, else the model's row. Warn, not error: the write lands
 /// either way, since pinning `max_tokens` on the model row right after can
-/// make it valid. `needs_max_tokens` is false for a council role.
+/// make it valid. `needs_max_tokens` is false for a council server.
 #[allow(clippy::too_many_arguments)]
 fn max_tokens_warnings(
     db: &crate::kernel_db::KernelDb,
@@ -363,6 +360,9 @@ impl KjDispatcher {
                 thinking_budget,
                 thinking_style,
             } => {
+                if let Err(e) = crate::model_resolution::refuse_character_slot_role(&role, &character) {
+                    return KjResult::Err(format!("kj character slot set: {e}"));
+                }
                 let (backend, model) = match split_backend_model(&model) {
                     Ok(pair) => pair,
                     Err(e) => return KjResult::Err(format!("kj character slot set: {e}")),
@@ -408,7 +408,7 @@ impl KjDispatcher {
                             b.backend_id,
                             max_tokens,
                             thinking_budget,
-                            !crate::model_resolution::names_council_server(&role),
+                            !crate::model_resolution::is_council_kind(&b.kind),
                         ));
                         KjResult::ok(msg)
                     }
@@ -416,6 +416,9 @@ impl KjDispatcher {
                 }
             }
             CharacterSlotCommand::Unset { character, role } => {
+                if let Err(e) = crate::model_resolution::refuse_character_slot_role(&role, &character) {
+                    return KjResult::Err(format!("kj character slot unset: {e}"));
+                }
                 let sheet = match db.get_character_by_name(&character) {
                     Ok(Some(sheet)) => sheet,
                     Ok(None) => {
@@ -486,7 +489,7 @@ fn slot_listing(
 ) -> KjResult {
     let mut lines = Vec::new();
     if slots.is_empty() {
-        lines.push(format!("{character} has no slots (`kj character slot set {character} <role> BACKEND/MODEL`)"));
+        lines.push(format!("{character} has no slots (`kj character slot set {character} distill|gate BACKEND/MODEL`)"));
     }
     for s in slots {
         let backend = backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
@@ -551,6 +554,8 @@ mod tests {
         d.reload_llm_registry().await.unwrap();
         let r = d.dispatch(&argv(&["character", "create", "house", "--rc", "default"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
+        let r = d.dispatch(&argv(&["backend", "set", "mk-zorak", "--kind", "mk", "--base-url", "http://zorak:8090", "--key-optional"]), &test_caller()).await;
+        assert!(r.is_ok(), "{}", r.message());
         d
     }
 
@@ -575,7 +580,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--temperature", "0.3",
+                    "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--temperature", "0.3",
                 ]),
                 &test_caller(),
             )
@@ -584,7 +589,7 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
-        let slot = db.get_character_slot(house.principal_id, "coder").unwrap().expect("written");
+        let slot = db.get_character_slot(house.principal_id, "distill").unwrap().expect("written");
         assert_eq!(slot.model, "claude-opus-5");
         assert_eq!(slot.temperature, Some(0.3));
         assert_eq!(slot.max_tokens, None, "an unset slot parameter stays unset");
@@ -603,14 +608,16 @@ mod tests {
             v.extend_from_slice(extra);
             argv(&v)
         };
-        let bare = d.dispatch(&set("coder", &[]), &c).await;
+        let bare = d.dispatch(&set("distill", &[]), &c).await;
         assert!(bare.message().contains("WARN") && bare.message().contains("no max_tokens"), "{}", bare.message());
         assert!(bare.message().contains("kj backend model set anthropic claude-opus-5"), "{}", bare.message());
-        let sized = d.dispatch(&set("coder", &["--max-tokens", "4096"]), &c).await;
+        let sized = d.dispatch(&set("distill", &["--max-tokens", "4096"]), &c).await;
         assert!(!sized.message().contains("WARN"), "{}", sized.message());
-        // A council role needs no max_tokens.
-        let gate = d.dispatch(&set("gate", &[]), &c).await;
-        assert!(!gate.message().contains("WARN"), "{}", gate.message());
+        // A council server needs no max_tokens, by its backend's kind.
+        let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "mk-zorak/gemma"]), &c).await;
+        assert!(gate.is_ok() && !gate.message().contains("WARN"), "{}", gate.message());
+        let council_model = d.dispatch(&argv(&["character", "model", "set", "house", "mk-zorak/gemma"]), &c).await;
+        assert!(council_model.is_ok() && !council_model.message().contains("WARN"), "{}", council_model.message());
     }
 
     #[tokio::test]
@@ -619,7 +626,7 @@ mod tests {
         let c = test_caller();
         match d
             .dispatch(
-                &argv(&["character", "slot", "set", "house", "coder", "nope/m"]),
+                &argv(&["character", "slot", "set", "house", "distill", "nope/m"]),
                 &c,
             )
             .await
@@ -629,7 +636,7 @@ mod tests {
         }
         match d
             .dispatch(
-                &argv(&["character", "slot", "set", "ghost", "coder", "anthropic/m"]),
+                &argv(&["character", "slot", "set", "ghost", "distill", "anthropic/m"]),
                 &c,
             )
             .await
@@ -778,7 +785,7 @@ mod tests {
         let c = test_caller();
         let set = d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
         assert!(set.is_ok(), "{}", set.message());
-        let slot = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
+        let slot = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "mk-zorak/zai-org/GLM-5.3"]), &c).await;
         assert!(slot.is_ok(), "{}", slot.message());
         let made = d.dispatch(&argv(&["character", "create", "glm", "--rc", "default", "--model", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
         assert!(made.is_ok(), "{}", made.message());
@@ -801,7 +808,7 @@ mod tests {
         for value in ["anthropic", "/claude", "anthropic/"] {
             for verb in [
                 vec!["character", "model", "set", "house", value],
-                vec!["character", "slot", "set", "house", "coder", value],
+                vec!["character", "slot", "set", "house", "distill", value],
                 vec!["character", "create", "fresh", "--rc", "default", "--model", value],
             ] {
                 match d.dispatch(&argv(&verb), &c).await {
@@ -830,7 +837,7 @@ mod tests {
         assert!(v["model"].is_null(), "{v}");
 
         d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/claude-opus-5"]), &c).await;
-        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/g"]), &c).await;
+        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "mk-zorak/g"]), &c).await;
         let shown = d.dispatch(&argv(&["character", "show", "house"]), &c).await;
         let KjResult::Ok { data: Some(v), message, .. } = &shown else { panic!("{shown:?}") };
         assert_eq!(v["model"]["model"], "claude-opus-5");
@@ -850,7 +857,7 @@ mod tests {
         assert!(r.is_ok(), "{}", r.message());
         match d
             .dispatch(
-                &argv(&["character", "slot", "set", "house", "coder", "anthropic/m"]),
+                &argv(&["character", "slot", "set", "house", "distill", "anthropic/m"]),
                 &c,
             )
             .await
@@ -860,21 +867,46 @@ mod tests {
         }
     }
 
+    /// A character's slots are `distill` and `gate`. `slot set` and `slot
+    /// unset` refuse any other role and name the verb that holds it: `kj
+    /// character model set` for a context type, the judge character for
+    /// `judge`. A `gate` slot names a council server, so a backend of
+    /// another kind refuses. Nothing is written.
+    ///
+    /// Falsified by accepting a role as a forward declaration, or a gate on
+    /// a chat backend.
     #[tokio::test]
-    async fn a_role_needs_no_context_type_to_exist() {
-        // Roles are free-form: a character may hold a slot for a
-        // context_type nobody has created yet. That is a forward
-        // declaration, not an error.
+    async fn slot_set_takes_distill_and_gate_only() {
         let d = seeded().await;
-        let r = d
-            .dispatch(
-                &argv(&[
-                    "character", "slot", "set", "house", "choreographer", "deepseek/deepseek-v4-pro",
-                ]),
-                &test_caller(),
-            )
-            .await;
-        assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
+        let c = test_caller();
+        for verb in ["set", "unset"] {
+            for role in ["coder", "choreographer", "model"] {
+                let mut words = vec!["character", "slot", verb, "house", role];
+                if verb == "set" {
+                    words.push("deepseek/deepseek-v4-pro");
+                }
+                let r = d.dispatch(&argv(&words), &c).await;
+                assert!(
+                    matches!(&r, KjResult::Err(m) if m.contains("a character has one model")
+                        && m.contains("kj character model set house <backend>/<model>")),
+                    "{verb} {role}: {r:?}"
+                );
+            }
+            let mut words = vec!["character", "slot", verb, "house", "judge"];
+            if verb == "set" {
+                words.push("mk-zorak/gemma");
+            }
+            let r = d.dispatch(&argv(&words), &c).await;
+            assert!(
+                matches!(&r, KjResult::Err(m) if m.contains("the judge is a character") && m.contains("kj character model set judge")),
+                "{verb} judge: {r:?}"
+            );
+        }
+        let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/claude-opus-5"]), &c).await;
+        assert!(matches!(&gate, KjResult::Err(m) if m.contains("council server") && m.contains("not mk")), "{gate:?}");
+        let db = d.kernel_db().lock();
+        let house = db.get_character_by_name("house").unwrap().unwrap();
+        assert!(db.list_character_slots(house.principal_id).unwrap().is_empty(), "nothing was written");
     }
 
     #[tokio::test]
@@ -883,7 +915,7 @@ mod tests {
         match d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--top-p", "1.5",
+                    "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--top-p", "1.5",
                 ]),
                 &test_caller(),
             )
@@ -905,7 +937,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
+                    "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
                 ]),
                 &test_caller(),
             )
@@ -932,7 +964,7 @@ mod tests {
         let c = test_caller();
         let slot = |budget: &'static str| {
             argv(&[
-                "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--thinking-budget", budget,
+                "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--thinking-budget", budget,
             ])
         };
         let r = d
@@ -961,7 +993,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "1000", "--thinking-budget", "1500",
+                    "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--max-tokens", "1000", "--thinking-budget", "1500",
                 ]),
                 &test_caller(),
             )
@@ -983,14 +1015,14 @@ mod tests {
         let d = seeded().await;
         d.dispatch(
             &argv(&[
-                "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
+                "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
             ]),
             &test_caller(),
         )
         .await;
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
-        let slot = db.get_character_slot(house.principal_id, "coder").unwrap().expect("write must still land");
+        let slot = db.get_character_slot(house.principal_id, "distill").unwrap().expect("write must still land");
         assert_eq!(slot.thinking_budget, Some(20000));
     }
 
@@ -1000,7 +1032,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "4096", "--thinking-budget", "1000",
+                    "character", "slot", "set", "house", "distill", "anthropic/claude-opus-5", "--max-tokens", "4096", "--thinking-budget", "1000",
                 ]),
                 &test_caller(),
             )
@@ -1019,24 +1051,18 @@ mod tests {
     async fn slot_unset_removes_one_role_and_list_shows_the_rest() {
         let d = seeded().await;
         let c = test_caller();
-        for role in ["coder", "distill"] {
+        for (role, model) in [("distill", "anthropic/claude-opus-5"), ("gate", "mk-zorak/gemma")] {
             let r = d
-                .dispatch(
-                    &argv(&[
-                        "character", "slot", "set", "house", role, "anthropic/claude-opus-5",
-                        "--max-tokens", "4096",
-                    ]),
-                    &c,
-                )
+                .dispatch(&argv(&["character", "slot", "set", "house", role, model, "--max-tokens", "4096"]), &c)
                 .await;
             assert!(r.is_ok(), "{}", r.message());
         }
-        let removed = d.dispatch(&argv(&["character", "slot", "unset", "house", "coder"]), &c).await;
+        let removed = d.dispatch(&argv(&["character", "slot", "unset", "house", "distill"]), &c).await;
         assert!(removed.is_ok(), "{}", removed.message());
-        let again = d.dispatch(&argv(&["character", "slot", "unset", "house", "coder"]), &c).await;
-        assert!(!again.is_ok() && again.message().contains("no slot for 'coder'"), "{}", again.message());
+        let again = d.dispatch(&argv(&["character", "slot", "unset", "house", "distill"]), &c).await;
+        assert!(!again.is_ok() && again.message().contains("no slot for 'distill'"), "{}", again.message());
         let listed = d.dispatch(&argv(&["character", "slot", "list", "house"]), &c).await;
-        assert!(listed.message().contains("distill") && !listed.message().contains("coder"), "{}", listed.message());
+        assert!(listed.message().contains("gate") && !listed.message().contains("distill"), "{}", listed.message());
     }
 
     /// The old verb is gone, not aliased.

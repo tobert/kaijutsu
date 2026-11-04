@@ -2257,7 +2257,7 @@ mod tests {
                 principal_id: performer, name: "compactor".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.seed_test_slots(performer, "mock", "mock-model", &["default", "distill"]).unwrap();
+            db.seed_test_slots(performer, "mock", "mock-model", &["model", "distill"]).unwrap();
             db.assign_stand_in_character(source, performer).unwrap();
         }
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
@@ -3319,7 +3319,7 @@ mod tests {
         let principal = PrincipalId::new();
         let source = register_context_with_models(
             &d, Some("source"), None, principal,
-            &[("default", "chatbackend", "chat-model"), ("distill", "distillbackend", "distill-model")],
+            &[("model", "chatbackend", "chat-model"), ("distill", "distillbackend", "distill-model")],
         );
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         insert_text(&d, source, principal, "material to distill");
@@ -3349,7 +3349,7 @@ mod tests {
 
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context_with_model(&d, Some("source"), None, principal, &["default"]);
+        let source = register_context_with_model(&d, Some("source"), None, principal, &[]);
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         insert_text(&d, source, principal, "material to distill");
         d.kernel().llm().write().await.register("mock", Arc::new(Provider::Mock(MockClient::new("MUST-NOT-RUN"))));

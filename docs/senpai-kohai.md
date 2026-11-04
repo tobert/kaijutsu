@@ -75,12 +75,13 @@ turns                           turn_id, context_id, provider, model, raw tokens
   NULL for none) and its handoff log. Editing them changes no context.
   `kj character create <name> --type <t>` and `kj character set <name> --type <t>|--no-type` set the type. A
   root character has none.
-- **A character's model** (`character_models`, at most one row) is the model it runs wherever no role slot says
-  otherwise. `kj character create <name> --model <backend>/<model>` sets it, and `kj character model
-  set|unset` changes it. A root character has none: a root runs no model.
-- **A character slot** is the model a character uses for one role where that role differs from its model. A role
-  is a context type, or `judge`, `gate` or `distill`. A NULL parameter takes the model's `backend_models` value
-  when a context is made. There are no casts: each character holds its own slots.
+- **A character's model** (`character_models`, at most one row) is the one model its contexts' turns run on. `kj
+  character create <name> --model <backend>/<model>` sets it, and `kj character model set|unset` changes it. A
+  root character has none: a root runs no model.
+- **A character slot** is the model a character uses for one of two roles: `distill`, a cheaper model for `kj fork
+  --compact` and `kj drift pull|merge`, and `gate`, the council server that judges the gate. `kj character slot
+  set` refuses any other role, and a `gate` slot on a backend that is not kind `mk`. A NULL parameter takes the
+  model's `backend_models` value when a context is made. There are no casts: each character holds its own slots.
 - **A context's performer** (`contexts.performer`) is the character that plays it. A trigger refuses a change to
   `performer` and `persona` once set, and `context_slots` rows are never changed. `persona` is NULL until
   characters carry a persona. A context with no performer (scratch, the handoff log, the MCP hub, the drift queue,
@@ -110,13 +111,13 @@ What stays as it is:
 ## Where a model comes from
 
 Every model call reads the context's own `context_slots` and nothing else. A model turn in context K runs on K's
-slot for K's context type. A context with no performer runs no model.
+`model` slot, whatever K's type, and the durable turn row records role `model`. A context with no performer runs no
+model.
 
 - Making a context copies everything a call needs into `context_slots`:
-  1. each character slot, under its own role;
-  2. the character's model, under the context's type and under `distill`, for each of the two the character has
-     no slot for. An `mcp` context gets no slot for its type this way, since its client brings its own model
-     ("MCP sessions"). The model never fills `gate` or `judge`, which name a council server.
+  1. the character's model, under `model`, and under `distill` when the character has no `distill` slot and the
+     model is no council server. A character with no model gives the context no `model` slot;
+  2. the character's `distill` and `gate` slots, under their roles.
 
   Each copy takes the backend, model and parameters, and for each parameter left unset, the value in the model's
   `backend_models` row, context window included. After that no call reads `character_models`,
@@ -124,24 +125,27 @@ slot for K's context type. A context with no performer runs no model.
   parameter value of its own.
 - `max_tokens`, which every provider request carries, must come from the character's model or slot, or from the
   model's row. A slot with none refuses when the context is made, naming the character, the role and the model.
-  A `gate` or `judge` slot names a council server and the model it serves, and needs no `max_tokens`. A `judge`
-  or `gate` slot whose backend is not a council server refuses when it is written. `context_window` comes from
-  the slot's model row in `backend_models`, or is unknown. An unset optional parameter (temperature, top_p,
-  effort, thinking) is left out of the request. A context window none holds shows as unknown.
-- A context with no slot for its type has no model. `kj context create` and `kj context rotate` say so in their
-  output ("<context> has no model for <type>: <character> has no model and no <type> slot"), and
-  `kj context info` shows the same line. An `mcp` context prints no such line. A model turn in K refuses before
-  any provider work, naming the character, the type and the fix (`kj character model set`, then
-  `kj context rotate`). A judge shadow, whose type is a council role, has no chat model: `kj context info` says
-  it runs on a council server. A listing shows a context whose slot cannot be read with the error in its model
-  column and lists the rest.
-- The judge shadow runs on its own `judge` slot and the gate on K's `gate` slot. The two are independent: a
-  context with no `gate` slot has no council, and its gate decides without one; a context with a `gate` slot and
-  no `judge` slot runs its council with no judge.
-- A judge shadow belongs to one context. The gate makes it as a fork of that context, so it copies the
-  performer, persona and slots and takes the context as its senpai. `kj context set --senpai` refuses to move a judge
-  shadow. The coder's archive rc archives it when a rotation archives the predecessor, and the successor's first
-  gate call makes a new one.
+  A slot whose backend is a council server (kind `mk`) names a served model, needs no `max_tokens`, and is never
+  a chat model: that is decided by the backend's kind, not by the role's name. A `gate` slot whose backend is not
+  a council server refuses when it is written. `context_window` comes from the slot's model row in
+  `backend_models`, or is unknown. An unset optional parameter (temperature, top_p, effort, thinking) is left out of
+  the request. A context window none holds shows as unknown.
+- A context with no `model` slot has no model. `kj context create` and `kj context rotate` say so in their output
+  ("<context> has no model: <character> has no model; `kj character model set <character> <backend>/<model>`, then
+  `kj context rotate`"), and `kj context info` shows the same line. An MCP session, a context whose parent is an
+  MCP hub, prints no such line: its client brings its own model ("MCP sessions"). A model turn in K refuses before
+  any provider work, naming the character and the same fix. A judge shadow, whose `model` slot is on a council
+  server, has no chat model: `kj context info` says it runs on a council server. A listing shows a context whose
+  slot cannot be read with the error in its model column and lists the rest.
+- The gate runs on K's `gate` slot and the judge on its shadow's `model` slot. The two are independent: a context
+  with no `gate` slot has no council, and its gate decides without one; a council block with no `judge` key runs
+  its council with no judge.
+- A judge shadow belongs to one context. The gate makes it as a context performed by the judge character the
+  council block names, with K as its parent and its senpai, and slots copied from the judge character. It is
+  found as K's live child that character performs. `kj context set --senpai` refuses to move a context performed
+  by a character some council block names as judge whose parent is its senpai. The coder's archive rc archives it
+  (`--children --performer judge`) when a rotation archives the predecessor, and the successor's first gate call
+  makes a new one.
 - A fork's distillation runs on the forking context's `distill` slot, and `kj drift pull|merge` on the caller's
   `distill` slot, so a cheap model can summarize for an expensive conversation. A character with a model and no
   `distill` slot distills on its model. With no `distill` slot in the context, a fork that asks for distillation
@@ -323,8 +327,8 @@ asks, and no model.
   not a root console creates under that context instead. A root console with no live hub refuses registration,
   naming the hub. Other context types requested through `register_session` keep the gate's ask.
 - **No ask.** The gate's builtin layer allows `kj context create` with `--type mcp` (either `--type mcp` or
-  `--type=mcp`), keyed `kj context create --type mcp`: the context runs no model and holds no slot for its type, so
-  making one spends nothing. A `gate.toml` ask or deny key on `kj context create`, for the calling type or global,
+  `--type=mcp`), keyed `kj context create --type mcp`: an MCP connection's character has no model, so the context
+  holds no `model` slot and making one spends nothing. A `gate.toml` ask or deny key on `kj context create`, for the calling type or global,
   still wins.
 - **No model.** The character's model never fills the `mcp` slot. A `distill` slot is copied as for any context,
   so `kj fork --compact` and `kj drift pull|merge` work from a session.
@@ -349,7 +353,7 @@ asks, and no model.
   `kj character set --cast`. `kj models` (discovery) stays.
 - The RPCs `configureLlm`, `setDefaultProvider`, `setDefaultModel` and `getLlmConfig`, the client's
   `set_context_model`, and the MCP `session.start` hook's model write. The wire's `ContextHandleInfo.provider` and
-  `.model` carry the context's slot for its type.
+  `.model` carry the context's `model` slot.
 - The live `GET /v1/models` lookup for a context window, the DriftRouter handle's provider/model copy, and the
   explicit `model` argument of `prompt`.
 - `[council] server` and `[council] model` in `gate.toml`.
@@ -422,11 +426,12 @@ context it cannot map in `context_character_migration_report`, which `kj context
   standing and names the contexts not taken; a rotation that fails before commit leaves the predecessor live,
   labeled and with the contexts that answer to it, and the
   successor archived.
-- A context with no slot for its type: create and rotate say so; a turn refuses and names the character, the
-  type and the fix. A slot with no `max_tokens` anywhere refuses at create.
+- A context with no `model` slot: create and rotate say so, except for an MCP session; a turn refuses and names
+  the character and the fix. A chat slot with no `max_tokens` anywhere refuses at create; a council server's is
+  exempt by its backend's kind.
 - A fork with distillation runs on the `distill` slot, and refuses with no `distill` slot; a context with no
-  `gate` slot runs its gate with no council; a `judge` or `gate` slot on a backend that is not a council server
-  refuses at write.
+  `gate` slot runs its gate with no council; a `gate` slot on a backend that is not a council server refuses at
+  write, and so does a character slot of any role but `distill` and `gate`.
 - A drift along the edge runs with no ask, both ways; up from a fork a person made asks; two hops away asks; a
   drift to a sibling still asks; a `gate.toml` ask key wins.
 - The drift hold keys on type `console`; bootstrap labels the console `console`; a root labeled `console` of
@@ -437,9 +442,13 @@ context it cannot map in `context_character_migration_report`, which `kj context
 - The migrations: the fold keeps every performer, senpai, persona and slot, gives a context with no senpai the
   rule's console, and refuses naming a context it cannot place; `console-label-v1` relabels the console, keeps a
   `ROOT` of another type, and refuses when `console` is taken.
-- A character created with `--model` gives a context of any non-`mcp` type a slot for its type and
-  for `distill`; a role slot wins over the model for its role; the model never fills `gate`, `judge` or `mcp`; a
-  root refuses a model; `kj character model set` moves no context until it rotates; `kj senpai` is unknown.
+- A character created with `--model` gives a context of any type a `model` slot and a `distill` slot; a `distill`
+  slot wins over the model for distillation; the model never fills `gate`, and a council server fills `model`
+  alone; a root refuses a model; `kj character model set` moves no context until it rotates; `kj senpai` is
+  unknown.
+- The judge shadow is performed by the judge character the council block names, under its seat; a block with no
+  `judge` makes none; a judge with no model is a miss naming the fix; `slot-roles-v1` moves type-keyed slots to
+  `model`, drops and reports the rest, and archives live judge shadows.
 - Bootstrap gives the console character a model, not slots, and a second run changes nothing.
 - `kj context create kohai` takes the character's type and the label `kohai`; a second one is `kohai-2`; `--name`
   and `--type` win; a taken `--name` refuses; no type anywhere refuses; `--as` is unknown.

@@ -191,10 +191,9 @@ async fn serve_kernel(
             root: false,
         })
         .expect("create the performer");
-        // A session's model is the slot for its context type in its character's
-        // slots: `mcp` is the type the bridge registers.
-        db.seed_test_slot_entries(performer, &[("coder", "mock", "mock-model"), ("mcp", "mock", "mock-model")])
-            .expect("give the performer slots");
+        // A session runs its character's one model, copied under `model`.
+        db.seed_test_slot_entries(performer, &[("model", "mock", "mock-model")])
+            .expect("give the performer its model");
     }
     let mock = MockClient::new("").with_scripted_stream(script);
     shared.kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));
@@ -609,8 +608,9 @@ fn a_session_at_the_root_opens_with_a_warning() {
 // ---------------------------------------------------------------------------
 
 /// `session/delete` archives the session's context through `kj context
-/// archive`, so the context type's archive rc lifecycle runs: a coder's
-/// judge shadow is archived with its seat. A retried delete succeeds.
+/// archive`, so the performer's archive rc lifecycle runs: a coder's judge
+/// shadow, the child the judge character performs, is archived with its
+/// seat. A retried delete succeeds.
 #[test]
 fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
     let kernel = Kernel::start(Vec::new());
@@ -639,9 +639,14 @@ fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
             created_at: kaijutsu_types::now_millis() as i64,
         })
         .expect("seat the shadow under the session");
-        let seat_character = db.context_character(seat).expect("read the seat's character").expect("the seat has a character").principal_id;
+        let judge = PrincipalId::new();
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None,
+            mcp_hub_ctx: None, context_type: None, principal_id: judge, name: "judge".into(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        })
+        .expect("create the judge character");
         db.note_senpai_intent(shadow, Some(seat)).expect("the shadow answers to the session");
-        db.update_performer(shadow, Some(seat_character)).expect("the seat's character holds the shadow");
+        db.update_performer(shadow, Some(judge)).expect("the judge character performs the shadow");
     }
 
     client

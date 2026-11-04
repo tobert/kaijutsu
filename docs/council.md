@@ -293,8 +293,10 @@ are no server-side context ids, and a seat is sent whole each time.
   finds them held: under the shell and program specs, the voting reviewer
   contexts along its performer's chain and its house rules, routed to the
   server its `gate` slot names; each observing reviewer context under
-  `direction-check`; and, with an `mk` judge slot, the judge read's
-  contexts and house rules on the judge's server. The create and fork
+  `direction-check`; and, when its council names a judge whose model is on
+  an `mk` backend, the judge read's contexts and house rules on the judge's
+  server (the live shadow's `model` slot, or before the shadow is made, the
+  judge character's model, which the shadow will copy). The create and fork
   lifecycles of coder, default, and director run it
   (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
   builds nothing. Root, the owner's privileged space, the console (the model
@@ -397,8 +399,8 @@ grows with the gate.
   less in gate.toml over time and move to more configurable and
   transparent setups with casts and contexts." (Casts have since melted into
   character slots.) A shadow needs no
-  `gate.toml` entry: its context_type's rc says what it does, and the
-  seat's slots say which model plays it.
+  `gate.toml` entry beyond the judge's name: its performer's rc says what
+  it does, and the judge character's model says which model plays it.
 - **Two types: `judge` and `bump`.** A `judge` gives its opinion of each
   command. A `bump` answers proceed or bump, as bumper mode does today,
   with the seat's history. Each type's rc holds its framing and its
@@ -406,25 +408,25 @@ grows with the gate.
   dialogue and the record and changes no decision. Moving bumper mode
   from `[council]` onto a `bump` shadow that acts comes after the
   recordings show the history helps.
-- **One child per type, a fork child of the seat.** A shadow is a
-  kaijutsu context of context_type `judge` or `bump` whose fork parent is
-  the observed seat, so it shows in the seat's tree and archiving the seat
-  archives it. It inherits no blocks and has no performer; the kernel, not
-  a seat turn, asks its model. The kernel finds a shadow by its structural
-  fork edge and its context_type, never by its label. The label is
+- **One child per type, a child of the seat.** A judge shadow is a
+  kaijutsu context performed by the judge character, whose parent is the
+  observed seat and whose senpai is the seat, so it shows in the seat's
+  tree and archiving the seat archives it. It inherits no blocks; the
+  kernel, not a seat turn, asks its model. The kernel finds a shadow as the
+  seat's live child that the judge character performs, never by its label
+  or its type. The gate still writes context_type `judge` on it. The label is
   `<type>-<seat label>`; it does not start with `council-`, so the
   reviewer-chain walk never takes it for a character's council context. Each child
   keeps its own dialogue, so a judge sees only its own earlier opinions.
-- **The binding picks the model.** A context's model is the slot for its
-  context_type in its instance's binding (`model_resolution.rs`), and a
-  shadow joins the seat's instance and binding. A binding with a `judge` slot
-  gives the seat a judge, pointing at the megakernel, lfm2d, or Jev through
-  OpenRouter; a binding with no such slot gives none. "mk bumps", "lfm2d
-  bumps", and "Jev bumps" become character slots. A character holds a
-  `judge` slot (`kj character slot set coder judge mk-zorak/...`),
-  and each context copies the slots when it is made or rotated, so every
-  context a `coder` character plays gets the judge with nothing to turn on per
-  seat; to give a seat another slot, rotate it after the character's slot changes.
+- **The judge is a character.** The council block names it: `judge =
+  "judge"` in `[context_type.<type>.council]`. A block with no `judge` key
+  runs the council with no judge; no default name stands in. The shadow
+  copies its slots from the judge character when it is made, and its
+  `model` slot names the judge's server: the megakernel or lfm2d (a backend
+  of kind `mk`), or a chat model such as Jev through OpenRouter. `kj
+  character model set judge mk-zorak/<served model>` points it. A shadow
+  made before the model changed keeps the model it copied; archiving it
+  lets the next gate call make one with the new model.
 - **Outward actions only.** Council time is limited on our hardware, so a
   shadow records what the seat does to the world, not what it reads. The
   gate already draws that line: the read-only `shell` tool runs no gate,
@@ -479,8 +481,8 @@ Each step lands with its tests, and its line here changes to say what
 shipped. A fresh session resumes at the first step not marked done.
 
 1. **Done: the judge child and its dialogue,** on the `shell_write` tool
-   path. A seat whose character has a `judge` slot gets one `judge` fork child
-   on the first call the gate evaluates; each call is a user turn
+   path. A seat whose council block names a judge character gets one judge
+   shadow, performed by that character, on the first call the gate evaluates; each call is a user turn
    (`shell_write: <command>`, cut at 800 bytes) and the outcome is the
    model turn (`ran`, `asked the reviewer`, `bumped (<flavor>)`,
    `refused`, `not run: the gate was unavailable`). Tests in
@@ -490,18 +492,21 @@ shipped. A fresh session resumes at the first step not marked done.
    run kernel model turns, so their `shell_write` calls are recorded.
    1c. **Done: archive with the seat.** The shipped `coder` archive script
    (`rc/coder/archive/S10-shadows.kai`) runs `kj context archive
-   --children --type judge --confirm`, so a seat's judge shadows are
-   archived with it (`docs/kaish-integration.md`, the `archive` verb).
-   1d. **Done: the stance.** A new shadow runs the `judge` type's `create`
-   lifecycle (`rc/judge/create/S00-stance.md`). Its system instruction
+   --children --performer judge --confirm`, so a seat's judge shadows are
+   archived with it (`docs/kaish-integration.md`, the `archive` verb). The
+   script names the judge character once, and it must match the council
+   block's `judge`.
+   1d. **Done: the stance.** A new shadow runs its performer's `create`
+   lifecycle, `judge/` for the shipped judge character
+   (`rc/judge/create/S00-stance.md`). Its system instruction
    blocks follow the council framing (`assets/defaults/council/framing.md`)
    as the shadow's system message, which names no seat. A shadow with no stance is never sent; priming fails and names
    `rc reseed`. Synthesized 2026-10-09 from the council-shell examples: the
    seat's own earlier work is routine to remove, data it did not create
    is an original, a resend after a bump is a new attempt, and earlier
    answers are not repeated for their own sake.
-2. **Done: priming a council server.** A `judge` slot whose backend has
-   kind `mk` names the server by its `base_url` (the server answers
+2. **Done: priming a council server.** A shadow whose `model` slot is on a
+   backend of kind `mk` names the server by its `base_url` (the server answers
    `/council/v2` at the same address). After each recorded call, a task
    of its own builds the shadow as a seat under the seat's shell spec from
    `gate.toml` (`CouncilSync::prime_shadow`), under its stance (1d); a
@@ -516,16 +521,18 @@ shipped. A fresh session resumes at the first step not marked done.
    with a 30 s deadline (`shadow::spawn_judge`). The shadow counts toward
    the server's `contexts_per_decision`: a judge read over the limit is a
    miss that names the limit and every context, before anything is sent,
-   and the gate's decision on the same contexts is unaffected. A `judge`
-   slot on an `mk` backend with no `base_url` is never primed, and each
-   judge read is a miss that names the backend. Reviewer contexts are not read. The
+   and the gate's decision on the same contexts is unaffected. A judge
+   model on an `mk` backend with no `base_url` is never primed, and each
+   judge read is a miss that names the backend. A shadow with no `model`
+   slot, made while its judge character had no model, is a miss that names
+   the character and `kj character model set`. Reviewer contexts are not read. The
    answer is a `council_observations` row on the decision, with
    `reviewer_label` `judge-<seat>`, and it is added to the call's outcome
    turn as `; judge: <choice> (p=<pooled p>)`. A call a static rule
    decided is recorded but not judged. The judge never changes the
-   decision. The judge reads on its own slot's server, whatever server
+   decision. The judge reads on its own model's server, whatever server
    the gate decides on. Tests: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`,
-   `a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other`,
+   `a_judge_reads_on_its_model_s_server_and_the_gate_decides_on_the_other`,
    `a_judge_read_over_the_context_limit_is_a_miss_naming_it`.
    Still open: whether the judge should read the reviewer contexts.
 4. **Measure on moltar.** Wired 2026-10-09: backend `mk-zorak`, cast
@@ -816,6 +823,7 @@ mass_floor = -0.05             # each read's verdict mass, a log probability
 
 [context_type.coder.council]
 enabled = true
+judge = "judge"                # the character that performs each seat's judge shadow
 
 [context_type.director.council]
 enabled = true
@@ -830,10 +838,10 @@ running context. A context with no `gate` slot has no council: its gate decides 
 enables. A `[council] server` or `[council] model` key is refused as an unknown field. The slot's backend must have
 kind `mk` and a `base_url`; any other backend makes every decision on the submission a miss that names the
 backend, and no other server is asked in its place. The slot's `--model` names the served model; the served
-model's identity is recorded with each decision. The role is `gate`, not `council`, because `council` is a
-context type: a council context whose character holds a `council` slot would take that slot as its chat model.
-`gate`, `judge` and `distill` are reserved roles: no context resolves its chat model from one, and `kj context
-create` and `kj context set` refuse `--type gate` as a slot role, not a context type. The slot chooses only
+model's identity is recorded with each decision. `kj character slot set` refuses a `gate` slot on a backend that is
+not kind `mk`. A character's slots are `distill` and `gate`; its chat model is `kj character model set`, copied
+under role `model`. A slot on an `mk` backend is never a chat model and needs no `max_tokens`. `model`, `gate`,
+`distill` and `judge` are reserved: `kj context create` and `kj context set` refuse them as `--type`. The slot chooses only
 the server and its served model; whether a type gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program decisions included, and the
 observing reviewer contexts read after it go to the binding's server, under that server's endpoint concurrency

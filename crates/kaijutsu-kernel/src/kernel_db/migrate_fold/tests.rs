@@ -14,7 +14,7 @@ fn rig() -> Rig {
     let ws = setup_test_db(&db);
     let [amy, coder] = seed_characters(&db, &["amy", "coder"])[..] else { unreachable!() };
     db.update_character_root(amy, true).unwrap();
-    db.seed_test_slots(coder, "mock", "m", &["coder", "distill"]).unwrap();
+    db.seed_test_slots(coder, "mock", "m", &["model", "distill"]).unwrap();
     let console = senpai_ctx_row(&db, ws, "console", None, Some(amy));
     assert_eq!(db.root_console(amy).unwrap(), Some(console.context_id), "the fixture points the root at its console");
     Rig { db, ws, amy, coder, console }

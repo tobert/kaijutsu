@@ -52,11 +52,12 @@ result is missing:
    a model it does not know, the report names the model and this verb.
 3. `kj character create root --rc console --model <b>/<m> --max-tokens 16384` on the first provider's model, for
    the model character that plays the console (`--console-as` names another), running the `console` rc directory. A character that exists and has
-   no model and no `console` or `distill` slot gets `kj character model set root ...` instead. A character that
-   already has a model or either slot is left alone, and the report says so.
+   no model gets `kj character model set root ...` instead. A character that already has a model is left alone,
+   and the report says so.
 4. `kj context create root --name console --type console`, a kohai of the root
-   character's own context. The context copies the character's model under `console` and under `distill`.
-   When the console exists but has no `console` slot and its character now has a model, bootstrap runs
+   character's own context. The context copies the character's model under `model`, and under `distill` when
+   the character has no `distill` slot.
+   When the console exists but has no `model` slot and its character now has a model, bootstrap runs
    `kj context rotate console`. When the console is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.

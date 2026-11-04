@@ -534,7 +534,7 @@ mod tests {
                 }).unwrap();
             }
         }
-        let lane = register_context_with_model(&d, Some("lane"), None, coder, &["default"]);
+        let lane = register_context_with_model(&d, Some("lane"), None, coder, &["model"]);
         seed_with_block(&d, lane, amy);
         d.kernel_db().lock().assign_test_review(lane, Some(coder), Some(judge)).unwrap();
         let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };

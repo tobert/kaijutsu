@@ -480,6 +480,10 @@ pub(crate) struct CouncilConfig {
     pub(crate) escalate: Option<CouncilEscalate>,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
+    /// `judge = "<character>"` in the type's council block: the character
+    /// that performs each seat's judge shadow (`docs/council.md`, "Shadow
+    /// context"). `None` runs the council with no judge.
+    pub(crate) judge: Option<String>,
 }
 
 /// `[council] escalate = { bumps = N, minutes = M }`.
@@ -606,6 +610,10 @@ struct CouncilSwitchToml {
     enabled: bool,
     #[serde(default)]
     contexts: Option<Vec<String>>,
+    /// The character that performs a seat's judge shadow. None gives the
+    /// council no judge.
+    #[serde(default)]
+    judge: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -701,7 +709,7 @@ impl GateConfig {
             if let Some(switch) = &tier.council {
                 let section = format!("[context_type.{context_type}.council]");
                 let Some(mut council) = config.council.clone() else {
-                    if switch.enabled || switch.contexts.is_some() {
+                    if switch.enabled || switch.contexts.is_some() || switch.judge.is_some() {
                         return Err(GateConfigError::Parse(format!(
                             "{section}: the file has no [council] section to enable or override"
                         )));
@@ -732,6 +740,17 @@ impl GateConfig {
                         }
                     }
                     council.contexts = contexts.clone();
+                }
+                if let Some(judge) = &switch.judge {
+                    if !switch.enabled {
+                        return Err(GateConfigError::Parse(format!(
+                            "{section} judge: the council is enabled = false, so the judge would do nothing; remove it or enable the council"
+                        )));
+                    }
+                    if judge.trim().is_empty() {
+                        return Err(GateConfigError::Parse(format!("{section} judge: name a character")));
+                    }
+                    council.judge = Some(judge.clone());
                 }
                 if switch.enabled {
                     config.council_by_type.insert(context_type.clone(), council);
@@ -937,6 +956,7 @@ impl GateConfig {
             escalate,
             specs,
             thresholds,
+            judge: None,
         })
     }
 
@@ -1885,8 +1905,8 @@ const MCP_CREATE_KEY: &str = "kj context create --type mcp";
 
 /// Whether `args` (the argv after `kj`, from [`readonly::resolved_kj_args`])
 /// parse as `kj context create` with `--type mcp`, in either flag spelling.
-/// The new context runs no model and holds no slot for its type, so making
-/// one spends nothing (`docs/senpai-kohai.md`, "MCP sessions"). An argv that
+/// An MCP connection's character has no model, so the new context holds no
+/// `model` slot and making one spends nothing (`docs/senpai-kohai.md`, "MCP sessions"). An argv that
 /// does not parse is not one.
 fn is_mcp_context_create(args: &[String]) -> bool {
     let mut args = args.to_vec();
@@ -3239,6 +3259,22 @@ enabled = false
     fn a_disabled_type_council_cannot_name_contexts() {
         let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
         assert!(m.contains("[context_type.director.council]") && m.contains("enabled = false"), "{m}");
+    }
+
+    /// A type's council block names its judge character; a block with no
+    /// `judge` runs the council with no judge, and no default name stands in.
+    /// A judge on a disabled council, or an empty name, fails the load.
+    #[test]
+    fn a_type_council_names_its_judge_character() {
+        let cfg = config(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = true\njudge = \"judge\"\n"));
+        assert_eq!(cfg.council_for(Some("director")).unwrap().judge.as_deref(), Some("judge"));
+        assert_eq!(cfg.council_for(Some("coder")).unwrap().judge, None, "no judge key, no judge");
+        let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = false\njudge = \"judge\"\n"));
+        assert!(m.contains("[context_type.director.council] judge") && m.contains("enabled = false"), "{m}");
+        let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = true\njudge = \" \"\n"));
+        assert!(m.contains("judge: name a character"), "{m}");
+        let m = council_err("[context_type.coder.council]\nenabled = false\njudge = \"judge\"\n");
+        assert!(m.contains("no [council] section"), "{m}");
     }
 
     #[test]

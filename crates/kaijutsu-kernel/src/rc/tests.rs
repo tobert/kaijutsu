@@ -766,9 +766,9 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             context_type: None, principal_id: PrincipalId::new(), name: "blank".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         };
-        let error = performer_rc_dir("default", &sheet(Some(""))).unwrap_err();
+        let error = performer_rc_dir(&sheet(Some(""))).unwrap_err();
         assert!(error.contains("kj character set blank --rc <dir>"), "{error}");
-        assert_eq!(performer_rc_dir("default", &sheet(Some("coder"))).unwrap(), "coder");
+        assert_eq!(performer_rc_dir(&sheet(Some("coder"))).unwrap(), "coder");
     }
 
     /// A performer with no rc directory fails the lifecycle loudly: the run
@@ -797,9 +797,12 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         assert_eq!(run.outcome, Some(RcOutcome::Failed));
     }
 
-    /// A judge shadow runs `judge/`, whoever performs it.
+    /// A judge shadow runs its performer's rc directory, as every context
+    /// does: its type names no directory.
+    ///
+    /// Falsified by running `judge/` for a context of type `judge`.
     #[tokio::test]
-    async fn a_judge_shadow_runs_judge_whoever_performs_it() {
+    async fn a_judge_shadow_runs_its_performer_s_rc_directory() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/seat/create/S00-seat.kai", "echo from-the-seat").await;
@@ -812,9 +815,9 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
 
         let contents = block_contents_in(&d, ctx);
-        assert!(contents.iter().any(|c| c.contains("from-the-judge")), "{contents:?}");
-        assert!(!contents.iter().any(|c| c.contains("from-the-seat")), "{contents:?}");
-        assert_eq!(find_run_for_context(&d, ctx, "create").unwrap().context_type, "judge");
+        assert!(contents.iter().any(|c| c.contains("from-the-seat")), "{contents:?}");
+        assert!(!contents.iter().any(|c| c.contains("from-the-judge")), "{contents:?}");
+        assert_eq!(find_run_for_context(&d, ctx, "create").unwrap().context_type, "seat");
     }
 
     /// The RC boot aesthetic (docs/ansi-and-beyond.md): an rc script that
@@ -2601,7 +2604,7 @@ esac
                 }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), Some(caller.principal_id), None).unwrap();
-            db.seed_test_slot_entries(teller, &[("storyteller", "mock", "mock-model")]).unwrap();
+            db.seed_test_slot_entries(teller, &[("model", "mock", "mock-model")]).unwrap();
         }
         let vfs = d.kernel().vfs();
         vfs.write_all(std::path::Path::new("/config/rc/storyteller/cards/kotone.md"),
@@ -2675,7 +2678,7 @@ esac
                 }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), Some(caller.principal_id), None).unwrap();
-            db.seed_test_slot_entries(kaiten, &[("companion", "mock", "mock-model")]).unwrap();
+            db.seed_test_slot_entries(kaiten, &[("model", "mock", "mock-model")]).unwrap();
         }
         // The server seeds the factory fork presets at boot; the tick forks with `spawn`.
         crate::seed_presets::ensure_factory_presets(&mut d.kernel_db().lock(), PrincipalId::system()).unwrap();
@@ -4003,20 +4006,31 @@ esac
     }
 
     /// The shipped coder archive script archives the seat's judge shadows,
-    /// so a shadow does not outlive its seat.
+    /// the children the `judge` character performs, so a shadow does not
+    /// outlive its seat. Another child stays.
+    ///
+    /// Falsified by an archive script that matches the type: the shadow is
+    /// of type `judge-shadow-type-unread` here.
     #[tokio::test]
     async fn archiving_a_coder_archives_its_judge_shadow() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         d.kernel().broker().set_kj_dispatcher(&d).await;
         let seat = archivable(&d, "coder-seat", None, "coder");
-        let judge = archivable(&d, "judge-coder-seat", Some(seat), "judge");
+        let judge_character = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None,
+            mcp_hub_ctx: None, context_type: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let judge = archivable_by(&d, "judge-coder-seat", Some(seat), "judge-shadow-type-unread", judge_character);
+        let other = archivable(&d, "other-child", Some(seat), "judge");
         let caller = root_archiver(&d);
         let r = d.dispatch(&argv(&["context", "archive", "coder-seat"]), &caller).await;
         assert!(r.is_ok(), "archive failed: {}", r.message());
         let db = d.kernel_db().lock();
         assert!(db.get_context(seat).unwrap().unwrap().archived_at.is_some());
         assert!(db.get_context(judge).unwrap().unwrap().archived_at.is_some(), "the shadow is archived with its seat");
+        assert!(db.get_context(other).unwrap().unwrap().archived_at.is_none(), "a child of type judge another character performs stays");
     }
 
     /// A nested `kj context archive` inside an rc lifecycle is checked with

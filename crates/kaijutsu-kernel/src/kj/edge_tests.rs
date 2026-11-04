@@ -107,10 +107,16 @@ async fn context_move_moves_a_kohai_under_the_rule_and_reroutes_its_asks() {
 }
 
 /// A root character's console is the top of its lineage, and a judge
-/// shadow answers to its coder: `kj context set --senpai` moves neither, even for
-/// the lineage root.
+/// shadow answers to the context it shadows: `kj context set --senpai` moves
+/// neither, even for the lineage root. A judge shadow is a context performed
+/// by a character a council block names as judge, whose parent is its senpai;
+/// its type plays no part.
+///
+/// Falsified by telling a shadow by its type: the shadow here is of type
+/// `default`, and a context of type `judge` another character performs moves.
 #[tokio::test]
 async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
+    use crate::vfs::VfsOps;
     let d = test_dispatcher().await;
     let h = house(&d);
     let refused = d.dispatch(&[s("context"), s("set"), h.root.to_hex(), s("--senpai"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
@@ -118,11 +124,23 @@ async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
     assert!(refused.message().contains("root console"), "{}", refused.message());
     assert_eq!(d.kernel_db().lock().senpai_of(h.root).unwrap(), None);
 
-    d.kernel_db().lock().update_context_type(h.other, "judge").unwrap();
-    let refused = d.dispatch(&[s("context"), s("set"), h.other.to_hex(), s("--senpai"), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
-    assert!(!refused.is_ok(), "a judge shadow stays under its coder");
+    let gate = "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"loglinear\", weights = \"mass\" }\ndeadline_ms = 700\n\n\
+                [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
+                [context_type.default.council]\nenabled = true\njudge = \"judge\"\n";
+    let path = kaijutsu_types::paths::config_path(crate::kj::gate_policy::GATE_CONFIG_FILE);
+    d.kernel().vfs().write_all(std::path::Path::new(&path), gate.as_bytes()).await.expect("write gate.toml");
+    let judge = d.kernel_db().lock().get_character_by_name("judge").unwrap().unwrap().principal_id;
+    let shadow = register_context(&d, Some("judge-lane"), Some(h.lane), h.amy);
+    d.kernel_db().lock().update_performer(shadow, Some(judge)).unwrap();
+    assert_eq!(d.kernel_db().lock().senpai_of(shadow).unwrap(), Some(h.lane));
+    let refused = d.dispatch(&[s("context"), s("set"), shadow.to_hex(), s("--senpai"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
+    assert!(!refused.is_ok(), "a judge shadow stays under the context it shadows");
     assert!(refused.message().contains("judge shadow"), "{}", refused.message());
-    assert_eq!(d.kernel_db().lock().senpai_of(h.other).unwrap(), Some(h.seat));
+    assert_eq!(d.kernel_db().lock().senpai_of(shadow).unwrap(), Some(h.lane));
+
+    d.kernel_db().lock().update_context_type(h.other, "judge").unwrap();
+    let moved = d.dispatch(&[s("context"), s("set"), h.other.to_hex(), s("--senpai"), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
+    assert!(moved.is_ok(), "a context of type judge that no judge performs moves: {}", moved.message());
 }
 
 /// `kj context set --senpai` refuses the context itself and a sibling (the rule), a

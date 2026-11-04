@@ -155,6 +155,22 @@ impl KernelDb {
         Ok(stmt.query_row(params![name], row_to_backend).optional()?)
     }
 
+    /// Fetch a backend by its id.
+    pub fn get_backend(&self, backend_id: BackendId) -> KernelDbResult<Option<BackendRow>> {
+        let sql = format!("SELECT {BACKEND_COLS} FROM backends WHERE backend_id = ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt.query_row(params![blob_param(backend_id.as_bytes())], row_to_backend).optional()?)
+    }
+
+    /// Whether `backend_id` names a council server (a backend of kind `mk`).
+    /// A backend that does not exist is an error.
+    pub fn backend_is_council_server(&self, backend_id: BackendId) -> KernelDbResult<bool> {
+        let backend = self
+            .get_backend(backend_id)?
+            .ok_or_else(|| KernelDbError::NotFound(format!("backend {backend_id}")))?;
+        Ok(crate::model_resolution::is_council_kind(&backend.kind))
+    }
+
     /// Every backend, ordered by name.
     pub fn list_backends(&self) -> KernelDbResult<Vec<BackendRow>> {
         let sql = format!("SELECT {BACKEND_COLS} FROM backends ORDER BY name");

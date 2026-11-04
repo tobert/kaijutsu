@@ -40,10 +40,10 @@
 //!   lane's ask resolves to `banto` as the character responsible for the
 //!   seat that forked it — see the assertions below and
 //!   `docs/character.md`, "Roots and rotation".
-//! - **Each lane runs its coder's slots.** A lane is `kj context create <coder>
-//!   --name <lane> --type coder`, so its slots are copied from the slots its
-//!   coder character names (`kj character slot set <coder>`), and its
-//!   `coder` slot gives it `mock-coder-a` or `mock-coder-b`.
+//! - **Each lane runs its coder's model.** A lane is `kj context create <coder>
+//!   --name <lane> --type coder`, so its `model` slot is copied from its
+//!   coder character's model (`kj character model set <coder>`), which gives
+//!   it `mock-coder-a` or `mock-coder-b`.
 //! - **banto starts its own lanes.** `kj context create <coder> --name <lane>`
 //!   makes a context whose senpai is banto's context, so the assignment
 //!   happens inside banto's own scripted turn; amy assigns nothing.
@@ -339,11 +339,11 @@ fn kaijutsu_session_scenario() {
         s.kj("kj character create coder-a --rc coder").await;
         s.kj("kj character create coder-b --rc coder").await;
 
-        // A character's slots are copied when a context is made: banto runs
+        // A character's model is copied when a context is made: banto runs
         // `mock-banto`, and each coder lane runs its own coder's model.
-        s.kj("kj character slot set banto director mock/mock-banto --max-tokens 4096").await;
-        s.kj("kj character slot set coder-a coder mock/mock-coder-a --max-tokens 4096").await;
-        s.kj("kj character slot set coder-b coder mock/mock-coder-b --max-tokens 4096").await;
+        s.kj("kj character model set banto mock/mock-banto --max-tokens 4096").await;
+        s.kj("kj character model set coder-a mock/mock-coder-a --max-tokens 4096").await;
+        s.kj("kj character model set coder-b mock/mock-coder-b --max-tokens 4096").await;
 
         s.kj("kj context create banto --name banto --type director").await;
         let banto_ctx = s.context_by_label("banto");

@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 
 use super::*;
 use super::context_characters::{SlotValues, insert_slot, over};
-use crate::model_resolution::names_council_server;
 
 /// `max_tokens` the old model path sent when the slot, the model row and
 /// `llm_defaults` all left it unset (`LlmRegistry::max_output_tokens`).
@@ -232,7 +231,9 @@ impl Catalog {
         let row = self.models.get(&(backend_id, model.to_string()));
         let tunables = over(&over(own, &row.map(|m| m.tunables.clone()).unwrap_or_default()), &self.floor());
         let max_tokens = match tunables.max_tokens {
-            None if names_council_server(role) => None,
+            // The roles that named a council server in the schema this
+            // migration reads.
+            None if matches!(role, "gate" | "judge") => None,
             Some(n) => Some(n),
             None => {
                 *pinned += 1;

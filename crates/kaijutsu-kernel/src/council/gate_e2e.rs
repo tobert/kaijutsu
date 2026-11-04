@@ -352,10 +352,11 @@ struct Setup {
     /// The seat's `gate` slot instead of the default one (the test model on
     /// an `mk` backend at the mock's address).
     gate_slot: Option<SlotSpec>,
-    /// The seat's `judge` slot; none gives the seat no judge shadow.
+    /// The model of the judge character, `judge`, which the council block
+    /// names; none names no judge, so the seat has no judge shadow.
     judge: Option<SlotSpec>,
-    /// The seat's `default` slot runs `mock-model` on the `mock` backend, so
-    /// a model turn can run on it.
+    /// The seat's character runs `mock-model` on the `mock` backend, so a
+    /// model turn can run on it.
     chat: bool,
     /// `[council] reviewer_contexts`.
     reviewer_contexts: bool,
@@ -462,6 +463,7 @@ mass_floor = -0.05
 {programs}
 [context_type.default.council]
 enabled = {enabled}
+{judge}
 "#,
         global = setup.global,
         contexts = if setup.chain { r#"["council-system"]"# } else { r#"["reviewer", "system-rules"]"# },
@@ -478,10 +480,12 @@ enabled = {enabled}
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
         programs = if setup.programs { PROGRAM_SPEC_TOML } else { "" },
+        judge = if setup.judge.is_some() { format!("judge = \"{}\"", super::shadow::JUDGE) } else { String::new() },
     )
 }
 
-/// The shipped `judge` type's create scripts, which write a shadow's framing.
+/// The shipped `judge` rc directory's create scripts, which write a shadow's
+/// framing.
 const JUDGE_RC: [(&str, &str); 2] = [
     ("/config/rc/judge/create/S00-stance.kai", include_str!("../../../../assets/defaults/rc/judge/create/S00-stance.kai")),
     ("/config/rc/judge/create/S00-stance.md", include_str!("../../../../assets/defaults/rc/judge/create/S00-stance.md")),
@@ -509,61 +513,80 @@ struct Rig {
     gate_server: String,
 }
 
-/// Give `character` the council slots a seat needs, so an
-/// instance started for it afterwards runs on them: a `gate` slot (the
-/// default one at `gate_server` unless `gate` replaces it), a `judge` slot
-/// when `judge` is given, and a `default` model slot when `chat` is set. The
-/// character is created.
+/// The backend row a slot spec names, created when absent.
+fn spec_backend(db: &crate::kernel_db::KernelDb, gate_server: &str, spec: &SlotSpec) -> crate::kernel_db::BackendRow {
+    db.upsert_backend(&crate::kernel_db::BackendRow {
+        backend_id: kaijutsu_types::BackendId::new(),
+        name: spec.backend.into(),
+        kind: spec.kind.into(),
+        base_url: match &spec.base {
+            Base::None => None,
+            Base::Gate => Some(gate_server.to_string()),
+            Base::Url(url) => Some(url.clone()),
+        },
+        api_key_env: None,
+        api_key_file: None,
+        key_optional: true,
+        request_timeout_secs: None,
+        idle_timeout_secs: None,
+        max_concurrent: None,
+        created_at: 0,
+        created_by: PrincipalId::system(),
+    })
+    .unwrap()
+}
+
+/// Give `character` the council slot a seat needs, so an instance started
+/// for it afterwards runs on it: a `gate` slot (the default one at
+/// `gate_server` unless `gate` replaces it), and the model `mock-model` when
+/// `chat` is set. The character is created.
 fn bind_seat(
     db: &crate::kernel_db::KernelDb,
     character: PrincipalId,
     name: &str,
     gate_server: &str,
     gate: Option<&SlotSpec>,
-    judge: Option<&SlotSpec>,
     chat: bool,
 ) {
-    use crate::kernel_db::{BackendRow, CharacterSlotRow};
+    use crate::kernel_db::{CharacterModelRow, CharacterSlotRow};
     db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: character, name: name.into(), created_at: 0, retired_at: None,
         handoff_ctx: None, root_ctx: None, root: false,
     })
     .unwrap();
-    let default_gate = SlotSpec::council("gate-mk", Base::Gate);
-    let mut slots: Vec<(&str, SlotSpec, Option<i64>)> = vec![(super::gate::GATE, gate.cloned().unwrap_or(default_gate), None)];
-    if let Some(judge) = judge {
-        slots.push((super::shadow::JUDGE, judge.clone(), None));
+    let gate = gate.cloned().unwrap_or(SlotSpec::council("gate-mk", Base::Gate));
+    let backend = spec_backend(db, gate_server, &gate);
+    if gate.kind != "mk" {
+        // A gate slot on a chat backend is refused when it is written; one
+        // written before that check is a chat slot, so it carries max_tokens.
+        db.conn_for_ledger()
+            .execute(
+                "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens) VALUES (?1, ?2, ?3, ?4, 4096)",
+                rusqlite::params![character.as_bytes().to_vec(), super::gate::GATE, backend.backend_id.as_bytes().to_vec(), gate.model],
+            )
+            .unwrap();
+    } else {
+    db.set_character_slot(&CharacterSlotRow {
+        principal_id: character,
+        role: super::gate::GATE.into(),
+        backend_id: backend.backend_id,
+        model: gate.model.into(),
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+    })
+    .unwrap();
     }
     if chat {
-        slots.push(("default", SlotSpec { model: "mock-model", backend: "mock", kind: "mock", base: Base::None }, Some(4096)));
-    }
-    for (role, spec, max_tokens) in slots {
-        let backend = db
-            .upsert_backend(&BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(),
-                name: spec.backend.into(),
-                kind: spec.kind.into(),
-                base_url: match &spec.base {
-                    Base::None => None,
-                    Base::Gate => Some(gate_server.to_string()),
-                    Base::Url(url) => Some(url.clone()),
-                },
-                api_key_env: None,
-                api_key_file: None,
-                key_optional: true,
-                request_timeout_secs: None,
-                idle_timeout_secs: None,
-                max_concurrent: None,
-                created_at: 0,
-                created_by: PrincipalId::system(),
-            })
-            .unwrap();
-        db.set_character_slot(&CharacterSlotRow {
+        let mock = spec_backend(db, gate_server, &SlotSpec { model: "mock-model", backend: "mock", kind: "mock", base: Base::None });
+        db.set_character_model(&CharacterModelRow {
             principal_id: character,
-            role: role.into(),
-            backend_id: backend.backend_id,
-            model: spec.model.into(),
-            max_tokens,
+            backend_id: mock.backend_id,
+            model: "mock-model".into(),
+            max_tokens: Some(4096),
             temperature: None,
             top_p: None,
             effort: None,
@@ -572,6 +595,31 @@ fn bind_seat(
         })
         .unwrap();
     }
+}
+
+/// The judge character, `judge`, running `judge/`, whose model is `spec`. A
+/// model on a chat backend carries `max_tokens`; a council server needs none.
+fn bind_judge(db: &crate::kernel_db::KernelDb, gate_server: &str, spec: &SlotSpec) -> PrincipalId {
+    let judge = PrincipalId::new();
+    db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(super::shadow::JUDGE.into()), console_ctx: None,
+        mcp_hub_ctx: None, context_type: None, principal_id: judge, name: super::shadow::JUDGE.into(), created_at: 0,
+        retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+    })
+    .unwrap();
+    let backend = spec_backend(db, gate_server, spec);
+    db.set_character_model(&crate::kernel_db::CharacterModelRow {
+        principal_id: judge,
+        backend_id: backend.backend_id,
+        model: spec.model.into(),
+        max_tokens: (spec.kind != "mk").then_some(4096),
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+    })
+    .unwrap();
+    judge
 }
 
 async fn rig(via: Via, setup: Setup) -> Rig {
@@ -647,7 +695,10 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
     {
         let db = d.kernel_db().lock();
-        bind_seat(&db, actor, "council-seat-performer", &server, setup.gate_slot.as_ref(), setup.judge.as_ref(), setup.chat);
+        bind_seat(&db, actor, "council-seat-performer", &server, setup.gate_slot.as_ref(), setup.chat);
+        if let Some(judge) = &setup.judge {
+            bind_judge(&db, &server, judge);
+        }
         db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();
     }
     let mut binding = ContextToolBinding::new();
@@ -717,7 +768,7 @@ impl Rig {
         {
             let db = self.d.kernel_db().lock();
             if gate {
-                bind_seat(&db, actor, &format!("{label}-performer"), &self.gate_server, None, None, false);
+                bind_seat(&db, actor, &format!("{label}-performer"), &self.gate_server, None, false);
             } else {
                 db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: actor, name: format!("{label}-performer"), created_at: 0, retired_at: None,
@@ -3196,10 +3247,12 @@ async fn without_a_mode_the_gate_is_a_gatekeeper() {
     }
 }
 
-/// The seat's judge shadows: its live children of type `judge`.
+/// The seat's judge shadows: its live children the judge character performs.
 fn judge_shadows(rig: &Rig) -> Vec<crate::kernel_db::ContextRow> {
-    let children = rig.d.kernel_db().lock().fork_children(rig.ctx.context_id).unwrap();
-    children.into_iter().filter(|c| c.context_type == super::shadow::JUDGE).collect()
+    let db = rig.d.kernel_db().lock();
+    let Some(judge) = db.get_character_by_name(super::shadow::JUDGE).unwrap() else { return Vec::new() };
+    let children = db.fork_children(rig.ctx.context_id).unwrap();
+    children.into_iter().filter(|c| c.performer == Some(judge.principal_id)).collect()
 }
 
 /// A shadow's dialogue: each user and model block's role and text, in
@@ -3209,14 +3262,15 @@ fn dialogue(rig: &Rig, shadow: kaijutsu_types::ContextId) -> Vec<(kaijutsu_types
     blocks.into_iter().filter(|b| b.role != kaijutsu_types::Role::System).map(|b| (b.role, b.content)).collect()
 }
 
-/// A seat whose character has a `judge` slot gets one judge shadow, a fork child
-/// created on the first call the gate evaluates. Each call is a user turn
-/// and what the gate did is the model turn after it, whether a static rule
-/// or the council decided.
+/// A seat whose council block names a judge character gets one judge
+/// shadow, created on the first call the gate evaluates: a child of the seat
+/// performed by the judge character, answering to the seat, with the judge
+/// character's slots. Each call is a user turn and what the gate did is the
+/// model turn after it, whether a static rule or the council decided.
 ///
 /// Falsified by recording only council decisions (the static allow is
-/// missing), by creating a shadow per call (two children), or by finding
-/// the shadow by label alone.
+/// missing), by creating a shadow per call (two children), by finding the
+/// shadow by label alone, or by copying the seat's performance.
 #[tokio::test]
 async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     use kaijutsu_types::Role::{Model, User};
@@ -3234,14 +3288,14 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     assert_eq!(shadow.label.as_deref(), Some("judge-council-seat"));
     {
         let db = rig.d.kernel_db().lock();
-        let seat = db.context_character(rig.ctx.context_id).unwrap().expect("the seat has a context character");
+        let judge = db.get_character_by_name(super::shadow::JUDGE).unwrap().unwrap();
         let copy = db.context_character(shadow.context_id).unwrap().expect("the shadow has a context character");
-        assert_eq!(copy.principal_id, seat.principal_id, "a shadow is the seat's character");
+        assert_eq!(copy.principal_id, judge.principal_id, "the judge character performs the shadow");
         assert_eq!(copy.senpai_ctx, Some(rig.ctx.context_id), "a shadow answers to its seat");
         assert_eq!(
             db.list_context_slots(shadow.context_id).unwrap().into_iter().map(|s| (s.role, s.model)).collect::<Vec<_>>(),
-            db.list_context_slots(rig.ctx.context_id).unwrap().into_iter().map(|s| (s.role, s.model)).collect::<Vec<_>>(),
-            "a shadow copies its seat's slots verbatim"
+            [("distill".to_string(), "judge-model".to_string()), ("model".to_string(), "judge-model".to_string())],
+            "a shadow copies the judge character's model, not the seat's slots"
         );
     }
 
@@ -3259,6 +3313,30 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     rig.finish().await;
 }
 
+/// A shadow is found by its performer, not its type: a live child of type
+/// `judge` that the seat's own character performs, as shadows were made
+/// before the judge was a character, is not the judge's shadow, and the
+/// gate makes one the judge character performs.
+///
+/// Falsified by finding the shadow by its type.
+#[tokio::test]
+async fn an_old_shadow_of_type_judge_is_not_the_judge_s() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
+    let old = crate::kj::test_helpers::register_context(&rig.d, Some("judge-council-seat-old"), Some(rig.ctx.context_id), rig.ctx.actor_id);
+    rig.d.block_store().create_document(old, kaijutsu_types::DocKind::Conversation, None).unwrap();
+    {
+        let db = rig.d.kernel_db().lock();
+        db.update_context_type(old, super::shadow::JUDGE).unwrap();
+        db.write_context_character(old, rig.ctx.actor_id, Some(rig.ctx.context_id), None).unwrap();
+    }
+    rig.submit("echo static").await.unwrap();
+    let shadows = judge_shadows(&rig);
+    assert_eq!(shadows.len(), 1, "the judge character's own shadow is made: {shadows:?}");
+    assert_ne!(shadows[0].context_id, old);
+    assert!(dialogue(&rig, old).is_empty(), "the old child records nothing");
+    rig.finish().await;
+}
+
 /// A bump is recorded with its flavor, so a cleanup sent again after it
 /// shows in the history as a second attempt.
 #[tokio::test]
@@ -3272,13 +3350,40 @@ async fn a_bump_is_recorded_in_the_shadow_with_its_flavor() {
     rig.finish().await;
 }
 
-/// A seat whose character has no `judge` slot, or that has no character, gets no
-/// shadow.
+/// A seat whose council block names no judge gets no shadow, even when a
+/// character named `judge` exists: no default name stands in.
+///
+/// Falsified by defaulting the judge to the shipped name.
 #[tokio::test]
-async fn a_seat_without_a_judge_slot_gets_no_shadow() {
+async fn a_council_that_names_no_judge_makes_no_shadow() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    bind_judge(&rig.d.kernel_db().lock(), &rig.gate_server, &SlotSpec::council("judge-mk", Base::Gate));
     rig.submit("echo static").await.unwrap();
     assert!(judge_shadows(&rig).is_empty());
+    assert!(rig.d.kernel_db().lock().fork_children(rig.ctx.context_id).unwrap().is_empty(), "no child at all");
+    rig.finish().await;
+}
+
+/// A council block that names a judge character with no model still makes
+/// the shadow, and each judged decision records a miss that names the judge
+/// character and the verb that gives it a model.
+#[tokio::test]
+async fn a_judge_with_no_model_records_a_miss_naming_the_fix() {
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
+    {
+        let db = rig.d.kernel_db().lock();
+        let judge = db.get_character_by_name(super::shadow::JUDGE).unwrap().unwrap();
+        db.delete_character_model(judge.principal_id).unwrap();
+    }
+    rig.mock.answers(&ALLOW);
+    rig.submit("touch /work/unjudged").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
+    let decision = the_decision(&rig, &rig.only_ask());
+    let rows = rig.observations(&decision.decision_id, 1).await;
+    let o = &rows[0].observation;
+    assert_eq!(o.outcome, CouncilObservationOutcome::Miss, "{o:?}");
+    let cause = o.miss_cause.clone().unwrap();
+    assert!(cause.contains("judge character judge had no model") && cause.contains("kj character model set judge"), "{cause}");
+    assert_eq!(judge_shadows(&rig).len(), 1, "the shadow is made");
     rig.finish().await;
 }
 
@@ -3289,7 +3394,7 @@ async fn a_seat_without_a_judge_slot_gets_no_shadow() {
 ///
 /// Falsified by priming only at decision time (no `PUT` for a static
 /// allow), or by framing the shadow with anything but the council framing
-/// and the `judge` type's stance.
+/// and the `judge` rc directory's stance.
 #[tokio::test]
 async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
@@ -3361,10 +3466,9 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     rig.finish().await;
 }
 
-/// The gate and the judge shadow read the slots the seat's context holds.
-/// Removing the character's slots changes nothing for the
-/// running context: its decisions still go to its gate slot's server,
-/// and its judge shadow is still made.
+/// The gate reads the slots the seat's context holds. Removing the
+/// character's slots changes nothing for the running context: its decisions
+/// still go to its gate slot's server, and its judge shadow is still made.
 ///
 /// Falsified by reading the character's live slots.
 #[tokio::test]
@@ -3379,10 +3483,10 @@ async fn a_slot_change_moves_neither_the_gate_nor_the_judge_of_a_running_context
     rig.mock.answers(&ALLOW);
     rig.submit("touch /work/still-judged").await.unwrap_or_else(|e| panic!("the bound gate slot allows: {e:?}"));
     assert_eq!(rig.mock.decisions().len(), 1, "the decision went to the bound gate slot's server");
-    assert_eq!(judge_shadows(&rig).len(), 1, "the bound judge slot still gives the seat a shadow");
+    assert_eq!(judge_shadows(&rig).len(), 1, "the council's judge still gives the seat a shadow");
     rig.finish().await;
 }
-/// A shadow whose `judge` create lifecycle wrote no stance is never sent:
+/// A shadow whose `create` lifecycle wrote no stance is never sent:
 /// priming fails loudly rather than send a dialogue with no framing.
 #[tokio::test]
 async fn a_shadow_without_its_stance_is_not_primed() {
@@ -3559,14 +3663,14 @@ async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observation
     }
 }
 
-/// A judge reads on its own slot's server while the gate decides on
+/// A judge reads on its own model's server while the gate decides on
 /// `[council] server`: the shadow is primed and read on the judge's server,
 /// and `[council] server` sees only the gate's decision.
 ///
 /// Falsified by reading the judge on `[council] server` (it gets a
 /// three-context read), or priming the shadow there.
 #[tokio::test]
-async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() {
+async fn a_judge_reads_on_its_model_s_server_and_the_gate_decides_on_the_other() {
     let judge_server = serve().await;
     let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
     judge_server.set(allow_each);
@@ -3584,10 +3688,46 @@ async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() 
     assert_eq!(
         judged,
         [[rig.context_of("reviewer"), rig.context_of("system-rules"), "shadow".to_string()]],
-        "the judge reads on its slot's server"
+        "the judge reads on its model's server"
     );
     assert!(!judge_server.builds_for("shadow").is_empty(), "the shadow is primed on the judge's server");
     rig.finish().await;
+}
+
+/// `kj council build` plans the judge read's seats on the judge's server:
+/// before the shadow exists, on the model of the judge character the
+/// council names, which the shadow will copy; after, on the shadow's own
+/// `model` slot. A council that names no judge plans none.
+///
+/// Falsified by planning the judge on the seat's slots, or not at all.
+#[tokio::test]
+async fn council_build_plans_the_judge_on_the_judge_s_server() {
+    let judge_server = serve().await;
+    let judge_builds = |rig: &Rig| {
+        let caller = crate::kj::KjCaller { privileged: true, ..crate::kj::test_helpers::caller_with_context(rig.ctx.context_id) };
+        let d = rig.d.clone();
+        let base = judge_server.base.clone();
+        async move {
+            let r = d.dispatch(&["council".to_string(), "build".to_string()], &caller).await;
+            let crate::kj::KjResult::Ok { data: Some(data), .. } = &r else { panic!("{r:?}") };
+            data.as_array().unwrap().iter().filter(|b| b["server"] == base.as_str()).cloned().collect::<Vec<_>>()
+        }
+    };
+    let judged = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
+    judge_server.set(allow_each);
+    let before = judge_builds(&judged).await;
+    assert_eq!(before.len(), 1, "the judge's seats are planned before its shadow exists: {before:?}");
+    assert_eq!(before[0]["spec"], "shell-gate");
+    judged.submit("echo one").await.unwrap();
+    assert_eq!(judge_shadows(&judged).len(), 1);
+    assert_eq!(judge_builds(&judged).await.len(), 1, "and on the shadow's own slot after");
+    judged.finish().await;
+
+    let unjudged = rig(Via::Tool, Setup::default()).await;
+    bind_judge(&unjudged.d.kernel_db().lock(), &unjudged.gate_server, &SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone())));
+    let none = judge_builds(&unjudged).await;
+    assert!(none.is_empty(), "no judge key, no judge build, though a character named judge exists: {none:?}");
+    unjudged.finish().await;
 }
 
 /// A judge read counts the shadow toward the server's
@@ -3617,13 +3757,13 @@ async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
     rig.finish().await;
 }
 
-/// A judge slot on an mk backend with no address names no council server:
+/// A judge whose model is on an mk backend with no address names no council server:
 /// each judged decision records a judge miss that names the backend, and
 /// the gate's decision stands.
 ///
-/// Falsified by dropping the slot silently: no observation is recorded.
+/// Falsified by dropping the judge silently: no observation is recorded.
 #[tokio::test]
-async fn a_judge_slot_with_no_council_address_records_a_miss_naming_it() {
+async fn a_judge_model_with_no_council_address_records_a_miss_naming_it() {
     let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::None)), ..Setup::default() }).await;
     rig.mock.set(allow_each);
     rig.submit("echo no-address").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));

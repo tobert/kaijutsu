@@ -70,6 +70,7 @@ mod migrate_context_characters;
 mod migrate_fold;
 mod migrate_console;
 mod migrate_rc_dir;
+mod migrate_slot_roles;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]
@@ -499,6 +500,7 @@ impl KernelDb {
         Self::back_up_before_character_slots(&conn, path)?;
         Self::back_up_before_context_fold(&conn, path)?;
         Self::back_up_before_rc_dir_backfill(&conn, path)?;
+        Self::back_up_before_slot_roles(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
         Self::migrate_ledger(&conn)?;

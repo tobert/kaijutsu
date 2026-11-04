@@ -132,8 +132,8 @@ fn the_backfill_gives_each_character_the_directory_its_sheet_or_live_contexts_na
     let _ = (r.amy, ghost);
 }
 
-/// A tie among the live contexts' types is not guessed; judge contexts run
-/// `judge/` whoever performs them, so they do not vote.
+/// A tie among the live contexts' types is not guessed; judge contexts, which
+/// a seat's character performed before `slot-roles-v1`, do not vote.
 #[test]
 fn a_tie_is_left_unset_and_judge_contexts_do_not_vote() {
     let r = rig();

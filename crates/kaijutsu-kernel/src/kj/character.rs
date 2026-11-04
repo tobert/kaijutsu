@@ -5,9 +5,9 @@
 //! archives every live context the character performs.
 //!
 //! `model set|unset|show` and `slot set|unset|list` (`kj/slot.rs`) hold the
-//! model a character runs and the model each of its roles runs where that
-//! differs. `unset` and `list` work on a retired character
-//! too, so its slots can be tidied; `set` refuses one.
+//! one model a character runs and its `distill` and `gate` slots. `unset` and
+//! `list` work on a retired character too, so its slots can be tidied; `set`
+//! refuses one.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState, PrincipalId, SessionId};
@@ -130,9 +130,9 @@ enum CharacterCommand {
     /// change reaches a running context at `kj context rotate`.
     #[command(subcommand)]
     Model(super::slot::CharacterModelCommand),
-    /// The model one role of a character runs, where that differs from its
-    /// model. A context copies the slots when it is made, so a change reaches
-    /// a running context at `kj context rotate`.
+    /// A character's `distill` slot (the model that summarizes) and `gate`
+    /// slot (its council server). A context copies the slots when it is made,
+    /// so a change reaches a running context at `kj context rotate`.
     #[command(subcommand)]
     Slot(super::slot::CharacterSlotCommand),
     /// Retire a character and conclude and archive every live context it plays.
@@ -1378,10 +1378,12 @@ mod tests {
     async fn a_reserved_or_unknown_context_type_is_refused() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let caller = test_caller();
-        for reserved in ["distill", "gate", "judge"] {
+        for reserved in ["distill", "gate", "model"] {
             let made = d.dispatch(&[s("character"), s("create"), s("worker"), s("--rc"), s("default"), s("--type"), s(reserved)], &caller).await;
-            assert!(!made.is_ok() && made.message().contains("slot role"), "{}", made.message());
+            assert!(!made.is_ok() && made.message().contains("slot role"), "{reserved}: {}", made.message());
         }
+        let made = d.dispatch(&[s("character"), s("create"), s("worker"), s("--rc"), s("default"), s("--type"), s("judge")], &caller).await;
+        assert!(!made.is_ok() && made.message().contains("judge shadow"), "{}", made.message());
         assert!(d.kernel_db().lock().get_character_by_name("worker").unwrap().is_none(), "a refused create leaves no character");
         let typo = d.dispatch(&[s("character"), s("create"), s("worker"), s("--rc"), s("default"), s("--type"), s("codr")], &caller).await;
         assert!(!typo.is_ok() && typo.message().contains("codr"), "{}", typo.message());

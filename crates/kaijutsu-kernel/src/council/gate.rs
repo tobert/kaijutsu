@@ -2106,6 +2106,7 @@ mod tests {
                 allow_at,
                 mass_floor,
             }],
+            judge: None,
         }
     }
 

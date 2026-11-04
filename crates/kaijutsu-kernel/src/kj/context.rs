@@ -61,9 +61,9 @@ enum ContextCommand {
     /// Make a new context performed by a character, that answers to this
     /// context: `kj context create coder`. The label is the character's name,
     /// or `<name>-2`, `-3` and so on when a live context holds it; the type is
-    /// the character's own. The new context runs the model in the
-    /// character's slot for its type, copied now; the output says when the
-    /// character has none. Needs the operator capability and a live character
+    /// the character's own. The new context runs the character's model,
+    /// copied now under `model`; the output says when the character has
+    /// none. Needs the operator capability and a live character
     /// caller.
     #[command(alias = "new")]
     Create {
@@ -107,7 +107,7 @@ enum ContextCommand {
         senpai: Option<String>,
     },
     /// Show a context's metadata (default: current), including the model its
-    /// slot for its type gives it, or why it has none. For a context with a
+    /// `model` slot gives it, or why it has none. For a context with a
     /// character it also shows the senpai it answers to, the lineage root,
     /// who reviews an ask its character raises, and any migration note.
     Info {
@@ -368,11 +368,9 @@ pub(crate) enum CharacterPlacement {
     /// `senpai`.
     Senpai(ContextId),
     /// The context is new, performed by `performer`, under
-    /// `senpai`, with the character's model and slots copied fresh.
+    /// `senpai`, with the character's model and slots copied fresh (a
+    /// created context, or a judge shadow under its seat).
     Start { performer: kaijutsu_types::PrincipalId, senpai: Option<ContextId> },
-    /// The context copies `source`'s performer, persona and slots, with `source` as
-    /// its senpai (a judge shadow).
-    Fork { source: ContextId },
     /// The context is the successor of `predecessor`: its character, with
     /// the character's model and slots copied fresh and the predecessor's senpai.
     Rotate { predecessor: ContextId },
@@ -437,7 +435,7 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             live_character(performer)?;
             Some(performer)
         }
-        CharacterPlacement::Senpai(_) | CharacterPlacement::Fork { .. } => None,
+        CharacterPlacement::Senpai(_) => None,
     };
     db.insert_context_with_document(row, default_ws)?;
     match placement {
@@ -455,9 +453,6 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             // Only a root console rotates into a context with no senpai.
             db.check_senpai_edge(row.context_id, &row.context_type, Some(predecessor.principal_id), predecessor.senpai_ctx)?;
             db.write_context_character(row.context_id, predecessor.principal_id, predecessor.senpai_ctx, predecessor.persona.as_deref())?;
-        }
-        CharacterPlacement::Fork { source } => {
-            db.copy_context_character(source, row.context_id)?;
         }
     }
     if let Some(performer) = performer {
@@ -694,7 +689,7 @@ impl KjDispatcher {
                 self.context_rebind(context.as_deref(), caller).await
             }
             ContextCommand::Set { context, senpai: Some(senpai), .. } => {
-                self.context_set_senpai(context.as_deref(), &senpai, caller)
+                self.context_set_senpai(context.as_deref(), &senpai, caller).await
             }
             ContextCommand::Set { context, egress_allow, egress_deny, senpai: None, config } => {
                 self.context_set(context.as_deref(), &egress_allow, &egress_deny, config.into(), caller).await
@@ -1537,7 +1532,7 @@ impl KjDispatcher {
                      or run `kj character set {character} --type <type>`"
                 )),
             };
-            let rc_dir = match crate::rc::performer_rc_dir(&context_type, &sheet) {
+            let rc_dir = match crate::rc::performer_rc_dir(&sheet) {
                 Ok(dir) => dir,
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             };
@@ -3196,13 +3191,19 @@ pub(super) fn context_json(db: &KernelDb, row: &ContextRow) -> serde_json::Value
 
 impl KjDispatcher {
     /// `kj context set [<ctx>] --senpai <senpai-ctx>`: every check and the
-    /// write run under one lock and one transaction.
-    fn context_set_senpai(&self, context: Option<&str>, senpai: &str, caller: &KjCaller) -> KjResult {
+    /// write run under one lock and one transaction. The judge characters
+    /// the council blocks name are read from gate.toml first, to tell a
+    /// judge shadow.
+    async fn context_set_senpai(&self, context: Option<&str>, senpai: &str, caller: &KjCaller) -> KjResult {
+        let judges: Result<Vec<String>, String> = crate::kj::gate_policy::load_config(self.kernel().vfs())
+            .await
+            .map(|config| config.councils().filter_map(|c| c.judge.clone()).collect())
+            .map_err(|e| e.to_string());
         let db = self.kernel_db().lock();
         let moved = (|| -> Result<(ContextRow, ContextRow), String> {
             let (target, _) = resolve_character_arg(context, caller, &db)?;
             let senpai = resolve_senpai_arg(senpai, caller, &db, false)?;
-            db.in_transaction(|db| Ok(set_senpai(db, target, senpai, caller)))
+            db.in_transaction(|db| Ok(set_senpai(db, target, senpai, caller, &judges)))
                 .map_err(|e| e.to_string())?
         })();
         match moved {
@@ -3215,13 +3216,31 @@ impl KjDispatcher {
     }
 }
 
+/// Whether `row` is a judge shadow: a context performed by a character some
+/// council block names as judge (`judges`, or why gate.toml did not load),
+/// whose parent is the context it answers to. A context that could be one
+/// refuses when the names cannot be read.
+fn is_judge_shadow(db: &KernelDb, row: &ContextRow, judges: &Result<Vec<String>, String>) -> Result<bool, String> {
+    let (Some(performer), Some(parent)) = (row.performer, row.forked_from) else { return Ok(false) };
+    if row.senpai_ctx != Some(parent) {
+        return Ok(false);
+    }
+    let judges = judges
+        .as_ref()
+        .map_err(|e| format!("cannot tell whether {} is a judge shadow: {e}", db.context_name(row.context_id)))?;
+    let name = db.get_character(performer).map_err(|e| e.to_string())?.map(|sheet| sheet.name);
+    Ok(name.is_some_and(|name| judges.contains(&name)))
+}
+
 /// The checks and the write behind `kj context set --senpai`, inside the caller's
-/// transaction. The inner `Err` is the refusal.
+/// transaction. The inner `Err` is the refusal. `judges` are the judge
+/// characters the council blocks name.
 fn set_senpai(
     db: &KernelDb,
     target: ContextId,
     senpai: ContextId,
     caller: &KjCaller,
+    judges: &Result<Vec<String>, String>,
 ) -> Result<(ContextRow, ContextRow), String> {
     let row = db.get_context(target).map_err(|e| e.to_string())?
         .ok_or_else(|| format!("context {} has no row", target.short()))?;
@@ -3231,10 +3250,9 @@ fn set_senpai(
             db.context_name(target)
         ));
     }
-    let target_type = db.get_context(target).map_err(|e| e.to_string())?.map(|row| row.context_type);
-    if target_type.as_deref() == Some("judge") {
+    if is_judge_shadow(db, &row, judges)? {
         return Err(format!(
-            "{} is a judge shadow, which answers to the coder it shadows; archive it with the coder instead",
+            "{} is a judge shadow, which answers to the context it shadows; archive it with that context instead",
             db.context_name(target)
         ));
     }
@@ -3731,25 +3749,29 @@ mod tests {
         assert!(d.kernel_db().lock().list_context_egress(context).unwrap().is_empty());
     }
 
-    /// A seat whose character has a `judge` slot on a council (mk) backend and no
-    /// `max_tokens`, with its judge shadow. Returns the dispatcher, the seat and the shadow.
+    /// A seat performed by banto, and its judge shadow performed by the judge
+    /// character, whose model is on a council (mk) backend with
+    /// `judge_max_tokens`. Returns the dispatcher, the seat and the shadow.
     async fn judge_shadow_fixture(judge_max_tokens: Option<i64>) -> (crate::kj::KjDispatcher, ContextId, ContextId) {
         let d = test_dispatcher().await;
         let amy = test_reviewer_principal();
         let banto = PrincipalId::new();
+        let judge = PrincipalId::new();
         let db = d.kernel_db().lock();
-        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("director".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
-            principal_id: banto, name: s("banto"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-        }).unwrap();
-        db.seed_test_slots(banto, "mock", "mock-banto", &["default"]).unwrap();
+        for (principal_id, name, dir) in [(banto, "banto", "director"), (judge, "judge", "judge")] {
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                principal_id, name: s(name), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+        db.seed_test_slots(banto, "mock", "mock-banto", &["model"]).unwrap();
         let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
             backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("mk"),
             base_url: Some(s("http://zorak:8090")), api_key_env: None, api_key_file: None, key_optional: true,
             request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
             created_by: PrincipalId::system(),
         }).unwrap();
-        db.set_character_slot(&crate::kernel_db::CharacterSlotRow {
-            principal_id: banto, role: s("judge"), backend_id: mk.backend_id, model: s("judge-model"),
+        db.set_character_model(&crate::kernel_db::CharacterModelRow {
+            principal_id: judge, backend_id: mk.backend_id, model: s("judge-model"),
             max_tokens: judge_max_tokens, temperature: None, top_p: None, effort: None,
             thinking_budget: None, thinking_style: None,
         }).unwrap();
@@ -3759,28 +3781,32 @@ mod tests {
         let db = d.kernel_db().lock();
         db.update_performer(seat, Some(banto)).unwrap();
         db.update_context_type(shadow, "judge").unwrap();
-        db.copy_context_character(seat, shadow).unwrap();
+        db.write_context_character(shadow, judge, Some(seat), None).unwrap();
         drop(db);
         (d, seat, shadow)
     }
 
-    /// Corrupt every `default` slot: no `max_tokens`, which the write path refuses.
-    fn clear_default_max_tokens(d: &crate::kj::KjDispatcher) {
+    /// Corrupt every `model` slot: no `max_tokens`, which the write path
+    /// refuses for a chat model.
+    fn clear_model_max_tokens(d: &crate::kj::KjDispatcher) {
         let mut db = d.kernel_db().lock();
         let conn = db.conn_for_test_mut();
         conn.execute_batch("DROP TRIGGER context_slots_never_changed_u").unwrap();
-        conn.execute("UPDATE context_slots SET max_tokens = NULL WHERE role = 'default'", []).unwrap();
+        conn.execute("UPDATE context_slots SET max_tokens = NULL WHERE role = 'model'", []).unwrap();
     }
 
-    /// A judge shadow's `judge` slot names a council server and carries no
-    /// `max_tokens`. The shadow has no chat model, which is not corruption,
-    /// and `kj context list|log|info` show it.
+    /// A judge shadow's `model` slot names a council server (a backend of
+    /// kind `mk`) and carries no `max_tokens`. The shadow has no chat model,
+    /// which is not corruption, and `kj context list|log|info` show it.
+    ///
+    /// Falsified by exempting a slot by its role rather than its backend's
+    /// kind: the shadow's slot is role `model`, as a chat model's is.
     #[tokio::test]
     async fn a_judge_shadow_with_a_council_slot_and_no_max_tokens_lists() {
         let (d, seat, shadow) = judge_shadow_fixture(None).await;
         {
             let db = d.kernel_db().lock();
-            assert!(db.context_slot(shadow, "judge").unwrap().unwrap().max_tokens.is_none());
+            assert!(db.context_slot(shadow, "model").unwrap().unwrap().max_tokens.is_none());
             match crate::model_resolution::context_model(&db, shadow).unwrap() {
                 crate::model_resolution::ContextModelLookup::None(none) => {
                     assert!(none.line().contains("council server"), "{}", none.line());
@@ -3803,12 +3829,12 @@ mod tests {
         assert!(r.is_ok(), "{}", r.message());
     }
 
-    /// A council role is exempt only by its role: a slot for any other context
-    /// type with no `max_tokens` is still corrupt.
+    /// A council server is exempt only by its backend's kind: a `model` slot
+    /// on a chat backend with no `max_tokens` is still corrupt.
     #[tokio::test]
     async fn a_chat_slot_with_no_max_tokens_is_still_corrupt() {
         let (d, seat, _shadow) = judge_shadow_fixture(None).await;
-        clear_default_max_tokens(&d);
+        clear_model_max_tokens(&d);
         let db = d.kernel_db().lock();
         let err = crate::model_resolution::context_model(&db, seat).unwrap_err();
         assert!(err.to_string().contains("no max_tokens"), "{err}");
@@ -3819,7 +3845,7 @@ mod tests {
     #[tokio::test]
     async fn a_listing_shows_one_unreadable_model_and_lists_the_rest() {
         let (d, seat, _shadow) = judge_shadow_fixture(None).await;
-        clear_default_max_tokens(&d);
+        clear_model_max_tokens(&d);
         let r = d.dispatch(&[s("context"), s("list")], &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
         assert!(r.message().contains("banto-seat"), "{}", r.message());
@@ -4409,7 +4435,7 @@ mod tests {
         let db = d.kernel_db().lock();
         db.update_performer(root, Some(amy)).unwrap();
         db.update_context_type(root, kaijutsu_types::ROOT_CONTEXT_TYPE).unwrap();
-        db.seed_test_slots(banto, "mock", "mock-banto", &["default"]).unwrap();
+        db.seed_test_slots(banto, "mock", "mock-banto", &["model"]).unwrap();
         db.update_performer(seat, Some(banto)).unwrap();
         db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
@@ -4438,7 +4464,7 @@ mod tests {
         let before = f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap();
         // The character's slots move to another model after the seat was bound:
         // the running seat keeps its slots, the successor copies the new ones.
-        f.d.kernel_db().lock().seed_test_slots(f.banto, "mock", "mock-banto-next", &["default"]).unwrap();
+        f.d.kernel_db().lock().seed_test_slots(f.banto, "mock", "mock-banto-next", &["model"]).unwrap();
         let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
         assert!(rotated.is_ok(), "{}", rotated.message());
         let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
@@ -4689,8 +4715,8 @@ mod tests {
     }
 
     /// A rotation copies the character's model fresh: the seat keeps the
-    /// model it was made with, and the successor takes the new one for its
-    /// type and for `distill`.
+    /// model it was made with, and the successor takes the new one under
+    /// `model` and `distill`.
     ///
     /// Falsified by a rotation that skips the character's model.
     async fn rotate_picks_up_a_changed_character_model_body() {
@@ -4709,8 +4735,8 @@ mod tests {
         let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("{rotated:?}") };
         let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
         let db = f.d.kernel_db().lock();
-        assert_eq!(db.context_slot(f.seat, "default").unwrap().unwrap().model, "mock-banto", "the seat keeps its slots");
-        assert_eq!(db.context_slot(successor, "default").unwrap().unwrap().model, "mock-banto-model");
+        assert_eq!(db.context_slot(f.seat, "model").unwrap().unwrap().model, "mock-banto", "the seat keeps its slots");
+        assert_eq!(db.context_slot(successor, "model").unwrap().unwrap().model, "mock-banto-model");
         assert_eq!(db.context_slot(successor, "distill").unwrap().unwrap().model, "mock-banto-model");
     }
 
@@ -5289,7 +5315,7 @@ mod tests {
                 principal_id, name: name.into(), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
-        d.kernel_db().lock().seed_test_slot_entries(performer, &[("default", "mock", "mock-model")]).unwrap();
+        d.kernel_db().lock().seed_test_slot_entries(performer, &[("model", "mock", "mock-model")]).unwrap();
         let root = register_root_context(&d);
         let seat = register_context(&d, Some("owner-seat"), Some(root), test_reviewer_principal());
         d.kernel_db().lock().update_performer(seat, Some(owner)).unwrap();
@@ -7280,7 +7306,7 @@ mod tests {
         use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context_with_model(&d, Some("resolved-ctx"), None, principal, &["default"]);
+        let ctx = register_context_with_model(&d, Some("resolved-ctx"), None, principal, &["model"]);
 
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("context"), s("info")], &c).await;
@@ -7304,7 +7330,7 @@ mod tests {
         }
     }
 
-    /// A context with no slot for its type reports no model, and says why:
+    /// A context with no `model` slot reports no model, and says why:
     /// the same line `kj context create` and `kj context rotate` print. A
     /// context with no performer says so.
     ///
@@ -7327,12 +7353,13 @@ mod tests {
             other => panic!("expected Ok with data, got {other:?}"),
         }
 
-        let slotless = register_context_with_model(&d, Some("slotless-ctx"), None, PrincipalId::new(), &["musician"]);
+        let slotless = register_context_with_model(&d, Some("slotless-ctx"), None, PrincipalId::new(), &["distill"]);
         let result = d.dispatch(&[s("context"), s("info")], &caller_with_context(slotless)).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 let line = v["model_absent"].as_str().expect("a reason");
-                assert!(line.contains("has no model for default: ") && line.contains(" has no model and no default slot"), "{line}");
+                assert!(line.contains("has no model: ") && line.contains("`kj character model set model-"), "{line}");
+                assert!(line.contains("<backend>/<model>`, then `kj context rotate`"), "{line}");
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
@@ -7363,7 +7390,7 @@ mod tests {
                     principal_id: character, name: format!("windowed-{label}"), created_at: 0,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
-                db.seed_test_slots(character, "mock", "big-model", &["default"]).unwrap();
+                db.seed_test_slots(character, "mock", "big-model", &["model"]).unwrap();
                 let backend = db.get_backend_by_name("mock").unwrap().unwrap();
                 db.set_backend_model(&crate::kernel_db::BackendModelRow {
                     backend_id: backend.backend_id,
@@ -7454,7 +7481,7 @@ mod tests {
     async fn context_info_and_list_surface_the_model() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let target = register_context_with_model(&d, Some("staffed"), None, principal, &["default"]);
+        let target = register_context_with_model(&d, Some("staffed"), None, principal, &["model"]);
         let c = caller_with_context(target);
 
         let info = d.dispatch(&[s("context"), s("info")], &c).await;
@@ -7466,20 +7493,19 @@ mod tests {
         assert!(list.message().contains("mock/mock-model"), "list: {}", list.message());
         assert!(!list.message().contains("[cast:"), "no cast label is shown: {}", list.message());
     }
-    /// `kj context create <character>` copies the character's slots:
-    /// the new context's info reports the model, and a character with no
-    /// slot for the type is told so at create.
+    /// `kj context create <character>` copies the character's model: the
+    /// new context's info reports it, whatever the context's type.
     ///
-    /// Falsified by a create that prints nothing when the context has no slot.
+    /// Falsified by a create that keys the model by the context's type.
     #[tokio::test]
-    async fn context_create_copies_the_slots_and_reports_a_missing_one() {
+    async fn context_create_copies_the_model_for_any_type() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("staffing-parent"), None, principal);
         let c = caller_with_context(parent);
         crate::kj::test_helpers::give_character(&d, &c);
         let performer = d.kernel_db().lock().get_character_by_name("kohai-tester").unwrap().unwrap().principal_id;
-        d.kernel_db().lock().seed_test_slots(performer, "mock", "mock-model", &["default"]).unwrap();
+        d.kernel_db().lock().seed_test_slots(performer, "mock", "mock-model", &["model"]).unwrap();
 
         let create = d
             .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("staffed-child")], &c)
@@ -7493,15 +7519,14 @@ mod tests {
         let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info returns structured data: {info:?}") };
         assert_eq!(data["resolved_model"], "mock-model", "info json: {data}");
 
-        // Another type has no slot on that character.
-        let slotless = d
-            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("slotless-child"), s("--type"), s("coder")], &c)
+        // Another type runs the same model.
+        let coder = d
+            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("coder-child"), s("--type"), s("coder")], &c)
             .await;
-        assert!(slotless.is_ok(), "create failed: {}", slotless.message());
-        assert!(
-            slotless.message().contains("has no model for coder: kohai-tester has no model and no coder slot"),
-            "{}", slotless.message()
-        );
+        assert!(coder.is_ok(), "create failed: {}", coder.message());
+        assert!(!coder.message().contains("has no model"), "{}", coder.message());
+        let child = d.kernel_db().lock().find_context_by_label("coder-child").unwrap().unwrap().context_id;
+        assert_eq!(d.kernel_db().lock().context_slot(child, "model").unwrap().unwrap().model, "mock-model");
     }
 
     /// A character's model gives a new context a model for its type, and a
@@ -7554,29 +7579,45 @@ mod tests {
         assert_eq!(model_of(later), "claude-haiku-4-5", "a context made after the edit copies the new model");
     }
 
-    /// An `mcp` context brings its own model, so create says nothing about a
-    /// missing one.
+    /// An MCP session, a context whose parent is an MCP hub, brings its own
+    /// model, so create and info say nothing about a missing one. A context
+    /// of type `mcp` under another parent is told, as any context is.
     ///
-    /// Falsified by a notice that prints for the `mcp` type.
+    /// Falsified by suppressing the notice by the context's type.
     #[tokio::test]
-    async fn an_mcp_context_with_no_model_prints_no_notice() {
+    async fn an_mcp_session_with_no_model_prints_no_notice() {
         let d = test_dispatcher().await;
-        let parent = register_context(&d, Some("mcp-parent"), None, PrincipalId::new());
-        let c = caller_with_context(parent);
+        let hub = register_context(&d, Some("mcp-hub"), None, PrincipalId::new());
+        let elsewhere = register_context(&d, Some("elsewhere"), None, PrincipalId::new());
+        crate::kj::test_helpers::register_root_context(&d);
+        let amy = test_reviewer_principal();
+        d.kernel_db().lock().set_character_mcp_hub_ctx(amy, Some(hub)).unwrap();
+        let c = caller_with_context(hub);
         crate::kj::test_helpers::give_character(&d, &c);
+        let performer = rc_performer(&d, "mcp");
         let create = d
-            .dispatch(&[s("context"), s("create"), s(&rc_performer(&d, "mcp")), s("--name"), s("session"), s("--type"), s("mcp")], &c)
+            .dispatch(&[s("context"), s("create"), s(&performer), s("--name"), s("session"), s("--type"), s("mcp")], &c)
             .await;
         assert!(create.is_ok(), "{}", create.message());
         assert!(!create.message().contains("has no model"), "{}", create.message());
         let KjResult::Ok { data: Some(data), .. } = &create else { panic!("{create:?}") };
         assert!(data["no_model"].is_null(), "{data}");
         let ctx = d.kernel_db().lock().find_context_by_label("session").unwrap().unwrap().context_id;
+        assert_eq!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().forked_from, Some(hub));
         let info = d.dispatch(&[s("context"), s("info")], &caller_with_context(ctx)).await;
         assert!(!info.message().contains("has no model"), "{}", info.message());
+
+        let stray = d
+            .dispatch(
+                &[s("context"), s("create"), s(&performer), s("--name"), s("stray"), s("--type"), s("mcp"), s("--parent"), elsewhere.to_hex()],
+                &c,
+            )
+            .await;
+        assert!(stray.is_ok(), "{}", stray.message());
+        assert!(stray.message().contains("has no model"), "{}", stray.message());
     }
 
-    /// A character with no slots says so at create.
+    /// A character with no model says so at create, naming the fix.
     #[tokio::test]
     async fn context_create_says_when_the_character_has_no_slot() {
         let d = test_dispatcher().await;
@@ -7588,7 +7629,9 @@ mod tests {
             .await;
         assert!(create.is_ok(), "create failed: {}", create.message());
         assert!(
-            create.message().contains("has no model for default: kohai-tester has no model and no default slot"),
+            create.message().contains(
+                "has no model: kohai-tester has no model; `kj character model set kohai-tester <backend>/<model>`, then `kj context rotate`"
+            ),
             "{}", create.message()
         );
     }

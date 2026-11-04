@@ -80,8 +80,9 @@ impl KernelDb {
     ///
     /// A root character gets `root`. A character with a `context_type` gets
     /// that value. Any other gets the `context_type` most of its live
-    /// contexts have, not counting `judge` contexts, which run `judge/`
-    /// whoever performs them. A character with no live vote takes the vote of
+    /// contexts have, not counting `judge` contexts: before `slot-roles-v1`
+    /// a seat's character performed its judge shadows, which ran `judge/`.
+    /// A character with no live vote takes the vote of
     /// all its contexts, archived included (an MCP lead's sessions archive
     /// when their process ends). A tie or no vote leaves `rc_dir` NULL; each
     /// such character is listed in `context_character_migration_report`
@@ -183,7 +184,7 @@ impl KernelDb {
                         )?;
                         if judges {
                             Err(format!(
-                                "{} has no context type and plays only judge contexts, which run judge/ whoever performs them and cast no vote; \
+                                "{} has no context type and plays only judge contexts, which cast no vote; \
                                  `kj character set {} --rc <dir>` names its rc directory",
                                 c.name, c.name
                             ))

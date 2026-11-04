@@ -194,6 +194,7 @@ impl KernelDb {
         Self::migrate_context_fold(conn)?;
         Self::migrate_console_label(conn)?;
         Self::migrate_rc_dir_backfill(conn)?;
+        Self::migrate_slot_roles(conn)?;
         Self::ensure_context_guards(conn)?;
         Ok(())
     }

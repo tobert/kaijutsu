@@ -69,6 +69,9 @@
 #
 #   [context_type.coder.council]
 #   enabled = true                          # off for every type that does not say so
+#   judge = "judge"                         # the character that performs each seat's judge shadow; its model is
+#                                           # the judge's council server. No judge key, no judge. coder's archive rc
+#                                           # (S10-shadows.kai) names the same character
 #
 #   [context_type.director.council]
 #   enabled = true

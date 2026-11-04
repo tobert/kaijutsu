@@ -123,10 +123,26 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
 }
 
 impl KernelDb {
-    /// Insert or replace one slot of a character.
+    /// Insert or replace one slot of a character. The role is `distill` or
+    /// `gate`, and a `gate` slot names a council server (a backend of kind
+    /// `mk`); anything else refuses, naming the fix.
     pub fn set_character_slot(&self, row: &CharacterSlotRow) -> KernelDbResult<()> {
         if row.role.trim().is_empty() {
             return Err(KernelDbError::Validation("role must not be empty".into()));
+        }
+        crate::model_resolution::refuse_character_slot_role(&row.role, &self.name_for(row.principal_id))
+            .map_err(KernelDbError::Validation)?;
+        if row.role == crate::council::gate::GATE {
+            let backend = self
+                .get_backend(row.backend_id)?
+                .ok_or_else(|| KernelDbError::NotFound(format!("backend {}", row.backend_id)))?;
+            if !crate::model_resolution::is_council_kind(&backend.kind) {
+                return Err(KernelDbError::Validation(format!(
+                    "a `gate` slot names a council server, and backend {} is kind {}, not mk; \
+                     `kj backend list` names the mk backends",
+                    backend.name, backend.kind
+                )));
+            }
         }
         if row.model.trim().is_empty() {
             return Err(KernelDbError::Validation("model must not be empty".into()));

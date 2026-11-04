@@ -378,6 +378,7 @@ mod tests {
             escalate: None,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
             thresholds: vec![],
+            judge: None,
         };
         let decision = insert_council_decision(
             kernel.kernel_db().lock().conn_for_ledger(),

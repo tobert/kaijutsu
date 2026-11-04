@@ -147,7 +147,7 @@ impl KernelDb {
     }
 
     /// Test fixture: make `character` run `model` on `backend` for each of
-    /// `roles`. See [`Self::seed_test_slot_entries`].
+    /// `roles` (`model`, `distill`, `gate`). See [`Self::seed_test_slot_entries`].
     #[cfg(any(test, feature = "test-util"))]
     pub fn seed_test_slots(
         &self,
@@ -160,11 +160,14 @@ impl KernelDb {
         self.seed_test_slot_entries(character, &entries)
     }
 
-    /// Test fixture: give `character` exactly these slots, one per
-    /// `(role, backend, model)`, replacing the slots it had. A backend row is
-    /// created (kind `mock`, no key) when absent, and each slot sets
-    /// `max_tokens`. A context character written after this copies the slots;
-    /// one written before keeps the slots it has.
+    /// Test fixture: give `character` exactly these slots and this model, one
+    /// per `(role, backend, model)`, replacing the slots and the model it
+    /// had. Role [`crate::model_resolution::MODEL`] sets the character's
+    /// model; `distill` and `gate` set slots; no entry for `model` leaves the
+    /// character with none. A backend row is created (kind `mock`, no key)
+    /// when absent, and each entry sets `max_tokens`. A context character
+    /// written after this copies them; one written before keeps the slots it
+    /// has.
     #[cfg(any(test, feature = "test-util"))]
     pub fn seed_test_slot_entries(
         &self,
@@ -174,6 +177,7 @@ impl KernelDb {
         for existing in self.list_character_slots(character)? {
             self.delete_character_slot(character, &existing.role)?;
         }
+        self.delete_character_model(character)?;
         for (role, backend, model) in entries {
             let backend_row = match self.get_backend_by_name(backend)? {
                 Some(row) => row,
@@ -196,6 +200,20 @@ impl KernelDb {
                     row
                 }
             };
+            if *role == crate::model_resolution::MODEL {
+                self.set_character_model(&CharacterModelRow {
+                    principal_id: character,
+                    backend_id: backend_row.backend_id,
+                    model: model.to_string(),
+                    max_tokens: Some(4096),
+                    temperature: None,
+                    top_p: None,
+                    effort: None,
+                    thinking_budget: None,
+                    thinking_style: None,
+                })?;
+                continue;
+            }
             self.set_character_slot(&CharacterSlotRow {
                 principal_id: character,
                 role: role.to_string(),

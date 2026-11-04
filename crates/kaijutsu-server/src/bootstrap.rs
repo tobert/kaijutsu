@@ -19,12 +19,9 @@ use crate::ssh::SshServerConfig;
 
 /// The label of the model console.
 const CONSOLE_LABEL: &str = "console";
-/// The role of the console's own model slot. A context copies its character's model
-/// under its type, and under `distill` for its forks and pulls.
-const CONSOLE_ROLE: &str = "console";
-/// The slots that already give the console's performer a model for the console and
-/// for distillation.
-const PERFORMER_ROLES: &[&str] = &[CONSOLE_ROLE, "distill"];
+/// The role of the console's own model slot: a context copies its character's model
+/// under `model`, which its turns run on.
+const MODEL_ROLE: &str = kaijutsu_kernel::model_resolution::MODEL;
 /// The response budget bootstrap gives the performer's model.
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 
@@ -334,14 +331,8 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                 });
             }
             let has_model = read(shared, |db| db.get_character_model(row.principal_id))?.is_some();
-            let has_slots = read(shared, |db| {
-                PERFORMER_ROLES.iter().try_fold(false, |any, role| Ok(any || db.get_character_slot(row.principal_id, role)?.is_some()))
-            })?;
-            if has_model || has_slots {
-                report.notes.push(format!(
-                    "{performer} already has {}; `kj character model set` changes its model",
-                    if has_model { "a model" } else { "role slots" }
-                ));
+            if has_model {
+                report.notes.push(format!("{performer} already has a model; `kj character model set` changes it"));
             } else if let Some(backend) = first {
                 dispatch(
                     shared,
@@ -396,7 +387,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         // A context copies its character's model when it is written, so a
         // The console made before its character had a model takes it on rotation.
         Some(row) if read(shared, |db| {
-            Ok(db.get_character_model(played_id)?.is_some() && db.context_slot(row.context_id, CONSOLE_ROLE)?.is_none())
+            Ok(db.get_character_model(played_id)?.is_some() && db.context_slot(row.context_id, MODEL_ROLE)?.is_none())
         })? => {
             dispatch(shared, caller, words(&["context", "rotate", CONSOLE_LABEL]), &mut report).await?;
         }

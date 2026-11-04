@@ -34,6 +34,8 @@ struct World {
     ws: WorkspaceId,
     anthropic: BackendId,
     deepseek: BackendId,
+    /// A council server (kind `mk`).
+    mk: BackendId,
     /// Next `created_at` a test context takes, so creation order is explicit.
     clock: std::cell::Cell<i64>,
     /// Whether the database has the columns a migration reads.
@@ -76,7 +78,8 @@ fn build_world(legacy: bool) -> World {
     };
     let anthropic = backend("anthropic", "anthropic");
     let deepseek = backend("deepseek", "deepseek");
-    World { db, casts: Default::default(), ws, anthropic, deepseek, clock: std::cell::Cell::new(1_000), legacy }
+    let mk = backend("mk-zorak", "mk");
+    World { db, casts: Default::default(), ws, anthropic, deepseek, mk, clock: std::cell::Cell::new(1_000), legacy }
 }
 
 impl World {
@@ -176,8 +179,10 @@ impl World {
     }
 
     /// Give `character` the slots of `cast`. A legacy database points
-    /// `characters.default_cast_id` at the cast; the current one writes the
-    /// slots on the character, replacing any it had.
+    /// `characters.default_cast_id` at the cast. The current one writes, in
+    /// place of what the character had, the cast's `distill` and `gate` slots
+    /// on the character and its one chat role as the character's model; a
+    /// `judge` slot has no place on a character and is left out.
     fn default_cast(&self, character: PrincipalId, cast: CastId) {
         if self.legacy {
             self.db
@@ -192,9 +197,28 @@ impl World {
         for existing in self.db.list_character_slots(character).unwrap() {
             self.db.delete_character_slot(character, &existing.role).unwrap();
         }
+        self.db.delete_character_model(character).unwrap();
         let casts = self.casts.borrow();
         let (_, slots) = &casts[&cast];
-        for slot in slots {
+        let chat: Vec<&CastSlotRow> =
+            slots.iter().filter(|slot| !matches!(slot.role.as_str(), "distill" | "gate" | "judge")).collect();
+        assert!(chat.len() <= 1, "a character has one model; the cast has {} chat roles", chat.len());
+        if let Some(slot) = chat.first() {
+            self.db
+                .set_character_model(&CharacterModelRow {
+                    principal_id: character,
+                    backend_id: slot.backend_id,
+                    model: slot.model.clone(),
+                    max_tokens: slot.max_tokens,
+                    temperature: slot.temperature,
+                    top_p: slot.top_p,
+                    effort: slot.effort.clone(),
+                    thinking_budget: slot.thinking_budget,
+                    thinking_style: slot.thinking_style.clone(),
+                })
+                .unwrap();
+        }
+        for slot in slots.iter().filter(|slot| matches!(slot.role.as_str(), "distill" | "gate")) {
             self.db
                 .set_character_slot(&CharacterSlotRow {
                     principal_id: character,
@@ -212,9 +236,10 @@ impl World {
         }
     }
 
-    /// The standard cast: coder, judge and gate slots on deepseek `ds-flash`, whose
-    /// model row carries `max_tokens` 4096 and a 64000 window. The judge slot sets
-    /// its own `max_tokens`.
+    /// The standard cast: coder and judge slots on deepseek `ds-flash`, whose
+    /// model row carries `max_tokens` 4096 and a 64000 window, and a gate slot
+    /// on the council server. The judge slot sets its own `max_tokens`. On the
+    /// current schema the coder slot is the character's model.
     fn house(&self) -> CastId {
         self.model_row(
             self.deepseek,
@@ -225,7 +250,7 @@ impl World {
         let house = self.cast("house");
         self.slot(house, "coder", self.deepseek, "ds-flash", None);
         self.slot(house, "judge", self.deepseek, "ds-flash", Some(2048));
-        self.slot(house, "gate", self.deepseek, "ds-flash", None);
+        self.slot(house, "gate", self.mk, "gemma", None);
         house
     }
 
@@ -345,20 +370,23 @@ fn write_copies_the_cast_and_fills_unset_parameters_from_the_model_row() {
     let mut coder = w.slot(house, "coder", w.deepseek, "ds-flash", None);
     coder.temperature = Some(0.2);
     w.set_cast_slot(&coder);
+    w.slot(house, "distill", w.deepseek, "ds-flash", Some(2048));
     let who = w.character("coder");
     w.default_cast(who, house);
     let conv = w.ctx("conv", "coder", None, None);
 
     let row = w.db.write_context_character(conv.context_id, who, None, Some("be terse")).unwrap();
 
-    let slot = w.db.context_slot(conv.context_id, "coder").unwrap().expect("coder slot");
+    let slot = w.db.context_slot(conv.context_id, "model").unwrap().expect("model slot");
     assert_eq!(slot.max_tokens, Some(4096), "the model row supplies the slot's unset max_tokens");
     assert_eq!(slot.temperature, Some(0.2), "a parameter the slot sets wins");
     assert_eq!(slot.top_p, Some(0.9), "an unset parameter takes the model row's value");
     assert_eq!(slot.context_window, Some(64_000));
     assert_eq!(slot.effort, None, "an unset parameter stays unset: no value of our own");
-    let judge = w.db.context_slot(conv.context_id, "judge").unwrap().unwrap();
-    assert_eq!(judge.max_tokens, Some(2048), "the slot's own max_tokens wins over the model row");
+    let distill = w.db.context_slot(conv.context_id, "distill").unwrap().unwrap();
+    assert_eq!(distill.max_tokens, Some(2048), "the slot's own max_tokens wins over the model row");
+    let gate = w.db.context_slot(conv.context_id, "gate").unwrap().unwrap();
+    assert_eq!((gate.backend_id, gate.max_tokens), (w.mk, None), "a council server needs no max_tokens");
     assert_eq!(row.persona.as_deref(), Some("be terse"));
     assert_eq!((row.principal_id, row.senpai_ctx), (who, None));
     assert_eq!(w.cc(&conv), Some(row));
@@ -384,9 +412,9 @@ fn a_cast_edit_after_create_changes_no_slots_and_a_later_context_copies_it() {
     w.db.write_context_character(second.context_id, who, None, None).unwrap();
 
     assert_eq!(content(w.slots(&first)), before, "the first context's slots are a copy");
-    let old = w.db.context_slot(first.context_id, "coder").unwrap().unwrap();
+    let old = w.db.context_slot(first.context_id, "model").unwrap().unwrap();
     assert_eq!((old.model.as_str(), old.backend_id, old.max_tokens), ("ds-flash", w.deepseek, Some(4096)));
-    let new = w.db.context_slot(second.context_id, "coder").unwrap().unwrap();
+    let new = w.db.context_slot(second.context_id, "model").unwrap().unwrap();
     assert_eq!((new.model.as_str(), new.backend_id, new.max_tokens), ("claude-x", w.anthropic, Some(9000)));
 }
 
@@ -415,13 +443,13 @@ impl World {
     }
 }
 
-/// A character's model fills its context's own type and `distill`, with unset
-/// parameters taken from the model's row.
+/// A character's model fills its context's `model` and `distill`, whatever
+/// the context's type, with unset parameters taken from the model's row.
 ///
-/// Falsified by a copy that skips the model, or one that does not fill the
-/// parameters from `backend_models`.
+/// Falsified by a copy that skips the model, keys it by the context's type,
+/// or does not fill the parameters from `backend_models`.
 #[test]
-fn a_character_model_fills_the_contexts_type_and_distill() {
+fn a_character_model_fills_model_and_distill() {
     let w = world();
     w.house();
     let who = w.character("one-model");
@@ -432,8 +460,8 @@ fn a_character_model_fills_the_contexts_type_and_distill() {
 
     w.db.write_context_character(conv.context_id, who, None, None).unwrap();
 
-    assert_eq!(w.roles(&conv), ["coder", "distill"]);
-    for role in ["coder", "distill"] {
+    assert_eq!(w.roles(&conv), ["distill", "model"]);
+    for role in ["model", "distill"] {
         let slot = w.db.context_slot(conv.context_id, role).unwrap().unwrap();
         assert_eq!((slot.model.as_str(), slot.backend_id), ("ds-flash", w.deepseek), "{role}");
         assert_eq!(slot.max_tokens, Some(4096), "{role}: the model row supplies max_tokens");
@@ -443,9 +471,10 @@ fn a_character_model_fills_the_contexts_type_and_distill() {
     }
 }
 
-/// A role slot wins over the model for its role; the model still fills the other.
+/// A `distill` slot wins over the model for distillation; the model still
+/// fills `model`.
 #[test]
-fn a_role_slot_wins_over_the_model_for_its_role() {
+fn a_distill_slot_wins_over_the_model_for_distill() {
     let w = world();
     w.house();
     w.model_row(w.anthropic, "claude-x", ModelTunablesRow { max_tokens: Some(9000), ..Default::default() }, None);
@@ -453,7 +482,7 @@ fn a_role_slot_wins_over_the_model_for_its_role() {
     w.give_model(who, w.deepseek, "ds-flash", None);
     w.db.set_character_slot(&CharacterSlotRow {
         principal_id: who,
-        role: "coder".into(),
+        role: "distill".into(),
         backend_id: w.anthropic,
         model: "claude-x".into(),
         max_tokens: None,
@@ -468,15 +497,21 @@ fn a_role_slot_wins_over_the_model_for_its_role() {
 
     w.db.write_context_character(conv.context_id, who, None, None).unwrap();
 
-    let coder = w.db.context_slot(conv.context_id, "coder").unwrap().unwrap();
-    assert_eq!(coder.model, "claude-x", "the slot decides its role");
     let distill = w.db.context_slot(conv.context_id, "distill").unwrap().unwrap();
-    assert_eq!(distill.model, "ds-flash", "the model fills the role with no slot");
+    assert_eq!(distill.model, "claude-x", "the slot decides its role");
+    let model = w.db.context_slot(conv.context_id, "model").unwrap().unwrap();
+    assert_eq!(model.model, "ds-flash", "the model fills `model`");
 }
 
-/// The model never fills `gate`, `judge` or the type of an `mcp` context.
+/// The model never fills `gate`; it fills `model` for every context type,
+/// `mcp` included; and a model on a council server fills `model` alone,
+/// since a council server distills nothing. A character with no model
+/// gives a context no `model` slot.
+///
+/// Falsified by keeping the `mcp` carve-out, or by copying a council server
+/// under `distill`.
 #[test]
-fn the_model_never_fills_gate_judge_or_an_mcp_type() {
+fn the_model_fills_model_for_every_type_and_never_gate() {
     let w = world();
     w.house();
     let who = w.character("not-everywhere");
@@ -484,12 +519,51 @@ fn the_model_never_fills_gate_judge_or_an_mcp_type() {
 
     let conv = w.ctx("conv", "coder", None, None);
     w.db.write_context_character(conv.context_id, who, None, None).unwrap();
-    let roles = w.roles(&conv);
-    assert!(!roles.iter().any(|r| r == "gate" || r == "judge"), "{roles:?}");
+    assert_eq!(w.roles(&conv), ["distill", "model"]);
 
     let mcp = w.ctx("session", "mcp", None, None);
     w.db.write_context_character(mcp.context_id, who, None, None).unwrap();
-    assert_eq!(w.roles(&mcp), ["distill"], "an mcp context gets no slot for its type");
+    assert_eq!(w.roles(&mcp), ["distill", "model"], "an mcp context is like any other");
+
+    let judge = w.character("judge");
+    w.give_model(judge, w.mk, "gemma", None);
+    let shadow = w.ctx("shadow", "judge", None, None);
+    w.db.write_context_character(shadow.context_id, judge, None, None).unwrap();
+    assert_eq!(w.roles(&shadow), ["model"], "a council server distills nothing");
+    assert_eq!(w.db.context_slot(shadow.context_id, "model").unwrap().unwrap().max_tokens, None);
+
+    let bare = w.character("bare");
+    let none = w.ctx("none", "coder", None, None);
+    w.db.write_context_character(none.context_id, bare, None, None).unwrap();
+    assert!(w.roles(&none).is_empty(), "no model, no model slot");
+}
+
+/// A character slot of a role other than `distill` and `gate` cannot be
+/// written, and one already in the database refuses the context write,
+/// naming the fix, rather than being skipped.
+#[test]
+fn a_character_slot_of_another_role_refuses() {
+    let w = world();
+    let who = w.character("old-shape");
+    let error = w.db.set_character_slot(&CharacterSlotRow {
+        principal_id: who, role: "coder".into(), backend_id: w.deepseek, model: "ds-flash".into(),
+        max_tokens: Some(10), temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+    }).unwrap_err().to_string();
+    assert!(error.contains("kj character model set old-shape <backend>/<model>"), "{error}");
+    let error = w.db.set_character_slot(&CharacterSlotRow {
+        principal_id: who, role: "gate".into(), backend_id: w.deepseek, model: "ds-flash".into(),
+        max_tokens: Some(10), temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+    }).unwrap_err().to_string();
+    assert!(error.contains("`gate` slot names a council server") && error.contains("not mk"), "{error}");
+
+    w.exec(
+        "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens) VALUES (?1, 'coder', ?2, 'ds-flash', 10)",
+        params![blob_param(who.as_bytes()), blob_param(w.deepseek.as_bytes())],
+    );
+    let conv = w.ctx("conv", "coder", None, None);
+    let error = w.db.write_context_character(conv.context_id, who, None, None).unwrap_err().to_string();
+    assert!(error.contains("`coder` slot") && error.contains("kj character slot unset old-shape coder"), "{error}");
+    assert!(w.roles(&conv).is_empty(), "a refused write leaves nothing");
 }
 
 /// A model refuses the same ways a slot does, naming the character's model.
@@ -581,7 +655,7 @@ fn a_model_edit_after_create_moves_no_context() {
     w.db.write_context_character(second.context_id, who, None, None).unwrap();
 
     assert_eq!(content(w.slots(&first)), before);
-    assert_eq!(w.db.context_slot(second.context_id, "coder").unwrap().unwrap().model, "claude-x");
+    assert_eq!(w.db.context_slot(second.context_id, "model").unwrap().unwrap().model, "claude-x");
 }
 
 /// A slot row with the given thinking knobs and a `max_tokens` of 4096.
@@ -606,7 +680,7 @@ fn an_unknown_thinking_style_is_refused_on_character_slot_and_model_row_writes()
     let who = w.character("typo");
     let mut row = CharacterSlotRow {
         principal_id: who,
-        role: "coder".into(),
+        role: "distill".into(),
         backend_id: w.deepseek,
         model: "ds-flash".into(),
         max_tokens: Some(4096),
@@ -642,11 +716,11 @@ fn an_unknown_thinking_style_is_refused_on_character_slot_and_model_row_writes()
 fn a_budget_slot_with_no_thinking_budget_refuses_at_write_naming_role_and_model() {
     let w = world();
     let cast = w.cast("nobudget");
-    thinking_slot(&w, cast, "coder", Some("budget"), None);
+    thinking_slot(&w, cast, "distill", Some("budget"), None);
 
     let error = write_error(&w, cast);
 
-    for needle in ["thinker-", "coder", "think-model", "thinking_budget"] {
+    for needle in ["thinker-", "distill", "think-model", "thinking_budget"] {
         assert!(error.contains(needle), "{needle} missing from: {error}");
     }
     assert_eq!(w.count("context_characters"), 0, "a refused write leaves nothing");
@@ -663,7 +737,7 @@ fn a_budget_slot_takes_its_thinking_budget_from_the_model_row() {
         None,
     );
     let cast = w.cast("rowbudget");
-    thinking_slot(&w, cast, "coder", Some("budget"), None);
+    thinking_slot(&w, cast, "distill", Some("budget"), None);
     let who = w.character("thinker");
     w.default_cast(who, cast);
     let conv = w.ctx("conv", "coder", None, None);
@@ -676,14 +750,14 @@ fn a_thinking_budget_not_below_max_tokens_refuses_at_write() {
     let w = world();
     for (label, budget) in [("equal", 4096), ("over", 5000)] {
         let cast = w.cast(label);
-        thinking_slot(&w, cast, "coder", Some("budget"), Some(budget));
+        thinking_slot(&w, cast, "distill", Some("budget"), Some(budget));
         let error = write_error(&w, cast);
-        for needle in ["thinker-", "coder", "think-model", "thinking_budget", "max_tokens"] {
+        for needle in ["thinker-", "distill", "think-model", "thinking_budget", "max_tokens"] {
             assert!(error.contains(needle), "{needle} missing from: {error}");
         }
     }
     let cast = w.cast("below");
-    thinking_slot(&w, cast, "coder", Some("budget"), Some(4095));
+    thinking_slot(&w, cast, "distill", Some("budget"), Some(4095));
     let who = w.character("fine");
     w.default_cast(who, cast);
     let conv = w.ctx("conv2", "coder", None, None);
@@ -694,8 +768,9 @@ fn a_thinking_budget_not_below_max_tokens_refuses_at_write() {
 fn a_council_server_slot_is_exempt_from_the_thinking_checks() {
     let w = world();
     let cast = w.cast("council");
-    thinking_slot(&w, cast, "gate", Some("budget"), None);
-    thinking_slot(&w, cast, "judge", Some("budget"), Some(9000));
+    let mut gate = w.slot(cast, "gate", w.mk, "gemma", None);
+    gate.thinking_style = Some("budget".into());
+    w.set_cast_slot(&gate);
     let who = w.character("thinker");
     w.default_cast(who, cast);
     let conv = w.ctx("conv", "coder", None, None);
@@ -746,7 +821,7 @@ fn a_context_may_have_no_slot_for_a_role() {
     let castless = w.character("castless");
     let bare = w.ctx("castless", "coder", None, None);
     w.db.write_context_character(bare.context_id, castless, None, None).unwrap();
-    assert!(w.db.context_slot(bare.context_id, "coder").unwrap().is_none());
+    assert!(w.db.context_slot(bare.context_id, "model").unwrap().is_none());
     assert!(w.slots(&bare).is_empty());
 }
 
@@ -893,7 +968,7 @@ fn a_fork_copies_the_slots_verbatim_and_takes_the_forker_as_senpai() {
     assert_eq!((copy.principal_id, copy.persona.as_deref()), (who, Some("persona")));
     assert_eq!(copy.senpai_ctx, Some(source.context_id), "the forker, not the forker's senpai");
     assert_eq!(content(w.db.list_context_slots(child.context_id).unwrap()), content(w.slots(&source)), "slots are copied verbatim");
-    assert_eq!(w.db.context_slot(child.context_id, "coder").unwrap().unwrap().model, "ds-flash", "not the edited cast");
+    assert_eq!(w.db.context_slot(child.context_id, "model").unwrap().unwrap().model, "ds-flash", "not the edited cast");
     assert_eq!(w.db.get_context(child.context_id).unwrap().unwrap().performer, Some(who));
 
     let bare = w.ctx("bare", "coder", None, None);
@@ -927,9 +1002,9 @@ fn a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai() {
 
     let copy = w.db.context_character(successor.context_id).unwrap().unwrap();
     assert_eq!((copy.principal_id, copy.senpai_ctx), (who, Some(seat.context_id)), "the same character, the predecessor's senpai");
-    let slot = w.db.context_slot(successor.context_id, "coder").unwrap().unwrap();
+    let slot = w.db.context_slot(successor.context_id, "model").unwrap().unwrap();
     assert_eq!((slot.model.as_str(), slot.backend_id), ("claude-x", w.anthropic), "slots are read fresh from the character");
-    let old = w.db.context_slot(lane.context_id, "coder").unwrap().unwrap();
+    let old = w.db.context_slot(lane.context_id, "model").unwrap().unwrap();
     assert_eq!(old.model, "ds-flash", "the predecessor keeps its own");
 }
 
@@ -1570,14 +1645,4 @@ fn insert_new_context_rows_refuses_a_performer_with_no_sheet() {
     ).unwrap_err().to_string();
     assert!(start.contains("character"), "{start}");
     assert!(w.db.get_context(row.context_id).unwrap().is_none(), "nothing was written");
-
-    // A fork of a context whose performer has no sheet.
-    let source = w.ctx("source", "coder", None, None);
-    w.exec("UPDATE contexts SET performer = ?2 WHERE context_id = ?1", params![blob_param(source.context_id.as_bytes()), blob_param(sheetless.as_bytes())]);
-    let fork = make_context_row(Some("fork"));
-    let error = w.db.in_transaction(|db| {
-        insert_new_context_rows(db, &fork, CharacterPlacement::Fork { source: source.context_id })
-    }).unwrap_err().to_string();
-    assert!(error.contains("no character sheet"), "{error}");
-    assert!(w.db.get_context(fork.context_id).unwrap().is_none(), "nothing was written");
 }

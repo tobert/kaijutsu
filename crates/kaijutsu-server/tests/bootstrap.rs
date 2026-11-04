@@ -55,7 +55,7 @@ fn a_bootstrapped_kernel_answers_in_root() {
             let model = db.get_character_model(performer.principal_id).unwrap().expect("the performer holds a model");
             assert_eq!(model.model, "mock-model");
             assert!(db.list_character_slots(performer.principal_id).unwrap().is_empty(), "a model, not role slots");
-            let slot = db.context_slot(row.context_id, "console").unwrap().expect("the console copied the model under its type");
+            let slot = db.context_slot(row.context_id, "model").unwrap().expect("the console copied the model under model");
             assert_eq!(slot.model, "mock-model");
             assert!(db.context_slot(row.context_id, "distill").unwrap().is_some(), "and under distill");
             row.context_id
@@ -146,28 +146,32 @@ fn without_a_backend_root_waits_for_one() {
     });
 }
 
-/// A performer that already holds role slots is left alone: bootstrap gives it
-/// no model and rotates nothing.
+/// A slot gives a performer no chat model: one that holds only a `distill`
+/// slot gets bootstrap's model, keeps its slot, and the console it plays is
+/// rotated to take the model.
+///
+/// Falsified by counting a role slot as the performer's model.
 #[test]
-fn a_performer_with_slots_keeps_them_and_gets_no_model() {
+fn a_performer_with_only_a_distill_slot_gets_a_model() {
     run_local(async {
         let config = SshServerConfig::ephemeral_with_root(0, "amy");
         bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
         {
             let db = kernel_db(&config);
             let root = db.get_character_by_name("root").unwrap().unwrap();
-            db.seed_test_slot_entries(root.principal_id, &[("console", "mock", "mock-model")]).unwrap();
+            db.seed_test_slot_entries(root.principal_id, &[("distill", "mock", "mock-model")]).unwrap();
         }
         let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
             .await
             .expect("bootstrap with a backend");
-        assert!(
-            !report.ran.iter().any(|line| line.contains("character model set") || line.contains("character create")),
-            "{report:?}"
-        );
+        assert!(report.ran.iter().any(|line| line.contains("character model set root")), "{report:?}");
+        assert!(report.ran.iter().any(|line| line.contains("context rotate console")), "{report:?}");
         let db = kernel_db(&config);
         let root = db.get_character_by_name("root").unwrap().unwrap();
-        assert!(db.get_character_model(root.principal_id).unwrap().is_none());
+        assert!(db.get_character_model(root.principal_id).unwrap().is_some());
+        assert!(db.get_character_slot(root.principal_id, "distill").unwrap().is_some(), "the slot stays");
+        let console = db.find_context_by_label("console").unwrap().unwrap();
+        assert!(db.context_slot(console.context_id, "model").unwrap().is_some(), "the rotated console has a model");
     });
 }
 

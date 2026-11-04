@@ -126,7 +126,7 @@ pub fn seed_mock_backend(data_dir: &std::path::Path) {
 /// ran on its binding rather than on anything stamped on its row.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
-    use kaijutsu_kernel::kernel_db::{BackendRow, CharacterSlotRow, KernelDb};
+    use kaijutsu_kernel::kernel_db::{BackendRow, CharacterModelRow, KernelDb};
     use kaijutsu_types::{BackendId, PrincipalId};
 
     std::fs::create_dir_all(data_dir).expect("create data dir");
@@ -148,23 +148,20 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, model: &str) {
         })
         .expect("seed mock backend");
     // An ephemeral kernel has its performer; an offline home does not, and a
-    // test there gives its own character the slots with `kj character slot set`.
+    // test there gives its own character a model with `kj character model set`.
     if let Some(performer) = db.get_character_by_name(PERFORMER).expect("read the ephemeral performer") {
-        for role in ["default", "coder", "musician", "director", "assistant", "mcp", "toolie"] {
-            db.set_character_slot(&CharacterSlotRow {
-                principal_id: performer.principal_id,
-                role: role.to_string(),
-                backend_id: backend.backend_id,
-                model: model.to_string(),
-                max_tokens: Some(4096),
-                temperature: None,
-                top_p: None,
-                effort: None,
-                thinking_budget: None,
-                thinking_style: None,
-            })
-            .expect("seed a mock slot on the performer");
-        }
+        db.set_character_model(&CharacterModelRow {
+            principal_id: performer.principal_id,
+            backend_id: backend.backend_id,
+            model: model.to_string(),
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+        })
+        .expect("give the performer the mock model");
     }
 }
 

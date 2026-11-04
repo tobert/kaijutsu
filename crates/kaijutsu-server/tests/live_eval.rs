@@ -344,7 +344,7 @@ fn setup_run_dirs(suffix: &str) -> (PathBuf, PathBuf) {
 /// performer plays. Model config is SQL-native, so this writes the DB before
 /// the kernel opens it.
 fn write_haiku_defaults(state_dir: &std::path::Path) {
-    use kaijutsu_kernel::kernel_db::{BackendRow, CharacterSlotRow, KernelDb};
+    use kaijutsu_kernel::kernel_db::{BackendRow, CharacterModelRow, KernelDb};
     use kaijutsu_types::{BackendId, PrincipalId};
 
     fs::create_dir_all(state_dir).expect("create state dir");
@@ -370,21 +370,18 @@ fn write_haiku_defaults(state_dir: &std::path::Path) {
         .get_character_by_name(kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER)
         .expect("read the performer")
         .expect("the performer exists");
-    for role in ["default", "coder"] {
-        db.set_character_slot(&CharacterSlotRow {
-            principal_id: performer.principal_id,
-            role: role.to_string(),
-            backend_id: backend.backend_id,
-            model: HAIKU_MODEL.to_string(),
-            max_tokens: Some(16384),
-            temperature: None,
-            top_p: None,
-            effort: None,
-            thinking_budget: None,
-            thinking_style: None,
-        })
-        .expect("write a haiku slot");
-    }
+    db.set_character_model(&CharacterModelRow {
+        principal_id: performer.principal_id,
+        backend_id: backend.backend_id,
+        model: HAIKU_MODEL.to_string(),
+        max_tokens: Some(16384),
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+    })
+    .expect("give the performer the haiku model");
 }
 
 /// Local copy of the e2e_kj_workflow `shell_exec_wait_timeout` helper.

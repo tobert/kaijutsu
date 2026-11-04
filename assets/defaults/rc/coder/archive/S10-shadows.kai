@@ -1,3 +1,7 @@
 # A coder's judge shadow holds the coder's history for the council
-# (docs/council.md, "Shadow context"); it does not outlive its seat.
-kj context archive --children --type judge --confirm
+# (docs/council.md, "Shadow context"); it does not outlive its seat. The
+# shadow is the child the judge character performs.
+set -e
+# Must match `judge = "..."` in the coder's council block in gate.toml.
+JUDGE="judge"
+kj context archive --children --performer "$JUDGE" --confirm

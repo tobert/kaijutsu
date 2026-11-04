@@ -23,10 +23,11 @@ with `kj character create <name> --rc <dir>` or `kj character set <name> --rc
 above serve whichever characters name them. A context with no performer runs no
 rc, and a performer that names no directory fails the lifecycle and refuses
 `kj context create`, naming `kj character set <name> --rc <dir>`. A judge
-shadow runs `judge/` whoever performs it. Scripts read `KJ_CHARACTER` (the
+shadow is performed by the judge character, so it runs that character's
+directory, `judge/` when shipped. Scripts read `KJ_CHARACTER` (the
 performer's name) and `KJ_RC_DIR` (the directory that runs). The directories
 keep their type names, and `--type` still sets the context's type, which the
-gate, the slots and the clients read; see `docs/character.md`, "The type melts
+gate and the clients read; see `docs/character.md`, "The type melts
 into the character".
 
 Each context type owns its whole stance. No base is shared between types, and
@@ -117,7 +118,7 @@ The council type is a chat context for council guidance. Its own stance asks
 the model to think about submitted guidance and acknowledge it in one or two
 sentences. Its loadout grants compose input, capture, and editor access, with
 no model tools. Assign a live performer (whose senpai's holder is a distinct,
-live character) and give the character a slot for its type before chatting. Finished thinking and replies become council guidance;
+live character) and give the character a model before chatting. Finished thinking and replies become council guidance;
 see `docs/council.md`, "Council contexts are kaijutsu contexts".
 
 The judge type is a seat's shadow: the kernel creates it, runs its `create`
@@ -345,11 +346,11 @@ copy of the predecessor's beat attachments, as a fork's child does, and announce
 from its own `create` rc. A root console rotates the same way. Rotating a character's handoff log points `characters.handoff_ctx` at
 the successor.
 
-A context's model is the slot for its type in its instance's binding. A
-successor gets the next binding, so it runs whatever the character's cast
-holds at rotation. To move a running context to another model, change the
-character's slot and rotate; to run two models side by side, start a second
-context of a character whose slot has the other one.
+A context's model is its `model` slot, copied from the character's model
+when the context is made. A successor copies it again, so it runs whatever
+the character's model is at rotation. To move a running context to another
+model, change the character's model and rotate; to run two models side by
+side, start a second context of a character whose model is the other one.
 
 `ROTATED_FROM` names the predecessor. `S17-predecessor.kai` reads
 up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes
