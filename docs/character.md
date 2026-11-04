@@ -915,7 +915,7 @@ is run on demand; no lifecycle runs one.
 `contexts.context_type`, `characters.context_type`, `kj context create --type`, `kj character create|set --type`,
 `kj character set --no-type`, `kj context set --type`, `kj context archive --children --type`, `kj rc list --type`
 (now `--dir`), `KJ_CONTEXT_TYPE`, the `root`, `console`, `shell` and `mcp-hub` type constants, `[context_type.*]`
-gate layers, the `judge` slot role and type-keyed slots, `--backend` on `kj character create` and `model set`, the
+gate layers, the `judge` slot role and type-keyed slots, `--backend` on `kj character create`, `model set` and `slot set`, the
 fork's type fixup, the tui's `--context-type`, the MCP `register_session` `context_type` field, and the ACP default
 type.
 

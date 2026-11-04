@@ -85,10 +85,14 @@ pub fn init_root(
     let (character, changed_character) = match existing {
         Some(row) if row.root => (row, false),
         Some(row) => {
+            let root_dir = kaijutsu_types::ROOT_CONTEXT_TYPE;
             kernel_db
-                .update_character_root(row.principal_id, true)
+                .in_transaction(|db| {
+                    db.update_character_root(row.principal_id, true)?;
+                    db.set_character_rc_dir(row.principal_id, Some(root_dir))
+                })
                 .map_err(|e| format!("could not make '{name}' a root: {e}"))?;
-            (CharacterRow { root: true, ..row }, true)
+            (CharacterRow { root: true, rc_dir: Some(root_dir.to_string()), ..row }, true)
         }
         None => {
             let row = CharacterRow { rc_dir: Some(kaijutsu_types::ROOT_CONTEXT_TYPE.to_string()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
@@ -120,4 +124,35 @@ pub fn init_root(
     }
 
     Ok(InitReport { character, fingerprint, changed_character, bound_key })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+
+    /// `init --as <existing non-root>` promotes the character and points its
+    /// rc directory at `root`, so its root console runs the root directory.
+    ///
+    /// Falsified by dropping the `set_character_rc_dir` call.
+    #[test]
+    fn init_as_an_existing_character_sets_the_root_rc_directory() {
+        let kernel_db = KernelDb::temporary().unwrap();
+        let auth_db = AuthDb::temporary().unwrap();
+        kernel_db
+            .insert_character(&CharacterRow {
+                rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                principal_id: PrincipalId::new(), name: "amy".into(), created_at: 1, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            })
+            .unwrap();
+        let key = PublicKey::from_openssh(KEY).unwrap();
+        let report = init_root(&kernel_db, &auth_db, "amy", &key, None).unwrap();
+        assert!(report.character.root);
+        assert_eq!(report.character.rc_dir.as_deref(), Some("root"));
+        let stored = kernel_db.get_character_by_name("amy").unwrap().unwrap();
+        assert!(stored.root);
+        assert_eq!(stored.rc_dir.as_deref(), Some("root"));
+    }
 }

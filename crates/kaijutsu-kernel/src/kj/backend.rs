@@ -337,6 +337,26 @@ impl KjDispatcher {
         result
     }
 
+    /// Log a warning for each stored backend whose name holds a `/`. Such a
+    /// name predates the refusal and can no longer be addressed as
+    /// `<backend>/<model>`; the backend has to be recreated under a new name.
+    /// Called at kernel start.
+    pub fn warn_unaddressable_backends(&self) {
+        let backends = match self.kernel_db().lock().list_backends() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("could not list backends to check their names: {e}");
+                return;
+            }
+        };
+        for name in unaddressable_backend_names(backends.iter().map(|b| b.name.as_str())) {
+            tracing::warn!(
+                "backend '{name}' has a '/' in its name and cannot be addressed as <backend>/<model>; \
+                 recreate it under a new name with `kj backend set`"
+            );
+        }
+    }
+
     fn backend_list(&self) -> KjResult {
         let db = self.kernel_db().lock();
         let backends = match db.list_backends() {
@@ -698,8 +718,20 @@ impl Classify for BackendModelCommand {
     }
 }
 
+/// The names in `names` that hold a `/`.
+fn unaddressable_backend_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    names.into_iter().filter(|n| n.contains('/')).map(str::to_string).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unaddressable_backend_names_finds_slashes() {
+        let found = super::unaddressable_backend_names(["deepseek", "old/name", "ok-2", "a/b/c"]);
+        assert_eq!(found, vec!["old/name".to_string(), "a/b/c".to_string()]);
+        assert!(super::unaddressable_backend_names(["deepseek"]).is_empty());
+    }
+
     use super::super::test_helpers::{test_caller, test_dispatcher};
     use super::*;
 

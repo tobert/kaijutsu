@@ -2249,6 +2249,8 @@ pub async fn create_shared_kernel_in(
         shutdown,
     };
 
+    shared.kj_dispatcher.warn_unaddressable_backends();
+
     // Each live root character has a root context: type `root`, labeled
     // with its name, played by it. Create any that are missing.
     let created = shared

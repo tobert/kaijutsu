@@ -94,10 +94,12 @@ enum CharacterCommand {
         /// The character to update.
         name: String,
         /// Make this character a root: a model context whose `kj` requests
-        /// always need approval.
+        /// always need approval. Its rc directory becomes `root` unless `--rc`
+        /// names one in the same call.
         #[arg(long, conflicts_with = "no_root")]
         root: bool,
-        /// Make this character an ordinary one that a model can play.
+        /// Make this character an ordinary one that a model can play. Its rc
+        /// directory stays as it was; `--rc` changes it.
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
         /// The context type this character usually plays, such as `coder`.
@@ -115,11 +117,13 @@ enum CharacterCommand {
         rc_dir: Option<String>,
         /// A root's console: a live context performed by a non-root character
         /// that answers to the root's root console. A rotation of the console
-        /// moves this pointer to the successor.
-        #[arg(long, value_name = "CONTEXT", conflicts_with = "no_console")]
+        /// moves this pointer to the successor. The character must already be
+        /// a root: promote it with `--root` in an earlier call, not this one.
+        #[arg(long, value_name = "CONTEXT", conflicts_with_all = ["no_console", "root", "no_root"])]
         console: Option<String>,
-        /// Clear a root's console pointer.
-        #[arg(long = "no-console", conflicts_with = "console")]
+        /// Clear a root's console pointer. Conflicts with `--root` and
+        /// `--no-root`; change the console and the root flag in separate calls.
+        #[arg(long = "no-console", conflicts_with_all = ["console", "root", "no_root"])]
         no_console: bool,
     },
     /// The model a character runs. A context copies it when it is made, so a
@@ -410,13 +414,17 @@ impl KjDispatcher {
                 });
             }
         };
-        let row = CharacterRow { root_ctx: Some(root_ctx), ..row };
         let hub = match self.ensure_mcp_hub(row.principal_id) {
             Ok(hub) => hub,
             Err(e) => return KjResult::Err(format!(
                 "kj character create: created {name} as a root with root context {}, but not its MCP hub: {e}",
                 root_ctx.short()
             )),
+        };
+        let row = match self.kernel_db().lock().get_character(row.principal_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return KjResult::Err(format!("kj character create: {name} vanished")),
+            Err(e) => return KjResult::Err(format!("kj character create: {e}")),
         };
         KjResult::ok_with_data(
             format!(
@@ -569,7 +577,7 @@ impl KjDispatcher {
     /// callers cannot each make one.
     pub(crate) fn ensure_mcp_hub(&self, character: PrincipalId) -> Result<ContextId, String> {
         let new_id = ContextId::new();
-        let (name, label) = {
+        let (hub_id, name, label) = {
             let db = self.kernel_db().lock();
             let sheet = db
                 .get_character(character)
@@ -585,63 +593,67 @@ impl KjDispatcher {
             if let Some(pointed) = sheet.mcp_hub_ctx
                 && db.get_context(pointed).map_err(|e| e.to_string())?.is_some_and(|c| !c.is_archived())
             {
-                return Ok(pointed);
-            }
-            if let Some(held) = db.find_context_by_label(&label).map_err(|e| e.to_string())? {
-                if held.context_type == MCP_HUB_CONTEXT_TYPE {
-                    // A hub made before the sheet had a pointer: adopt it.
-                    db.set_character_mcp_hub_ctx(character, Some(held.context_id)).map_err(|e| e.to_string())?;
-                    return Ok(held.context_id);
+                (pointed, sheet.name, label)
+            } else if let Some(held) = db.find_context_by_label(&label).map_err(|e| e.to_string())? {
+                if held.context_type != MCP_HUB_CONTEXT_TYPE {
+                    return Err(format!(
+                        "{} (type '{}') holds the label '{label}', which {}'s MCP hub needs; rename or archive it",
+                        held.context_id.short(), held.context_type, sheet.name
+                    ));
                 }
-                return Err(format!(
-                    "{} (type '{}') holds the label '{label}', which {}'s MCP hub needs; rename or archive it",
-                    held.context_id.short(), held.context_type, sheet.name
-                ));
+                // A hub made before the sheet had a pointer: adopt it.
+                db.set_character_mcp_hub_ctx(character, Some(held.context_id)).map_err(|e| e.to_string())?;
+                (held.context_id, sheet.name, label)
+            } else {
+                let default_ws = db.get_or_create_default_workspace(character).map_err(|e| e.to_string())?;
+                let console = sheet.root_ctx.ok_or_else(|| {
+                    format!("{} has no root console for its MCP hub to answer to", sheet.name)
+                })?;
+                let row = ContextRow {
+                    context_id: new_id,
+                    label: Some(label.clone()),
+                    system_prompt: None,
+                    context_state: ContextState::Live,
+                    context_type: MCP_HUB_CONTEXT_TYPE.to_string(),
+                    created_at: kaijutsu_types::now_millis() as i64,
+                    created_by: character,
+                    forked_from: None,
+                    fork_kind: None,
+                    archived_at: None,
+                    workspace_id: None,
+                    preset_id: None,
+                    concluded_at: None,
+                    last_activity_at: None,
+                    promoted_at: None,
+                    demoted_at: None,
+                    paused_at: None,
+                    origin_host: None,
+                    performer: None, senpai_ctx: Some(console), persona: None,
+                };
+                db.insert_placed_context(&row, default_ws)
+                    .map_err(|e| format!("could not create the MCP hub '{label}': {e}"))?;
+                db.set_character_mcp_hub_ctx(character, Some(new_id))
+                    .map_err(|e| format!("could not point {} at its MCP hub '{label}': {e}", sheet.name))?;
+                (new_id, sheet.name, label)
             }
-            let default_ws = db.get_or_create_default_workspace(character).map_err(|e| e.to_string())?;
-            let console = sheet.root_ctx.ok_or_else(|| {
-                format!("{} has no root console for its MCP hub to answer to", sheet.name)
-            })?;
-            let row = ContextRow {
-                context_id: new_id,
-                label: Some(label.clone()),
-                system_prompt: None,
-                context_state: ContextState::Live,
-                context_type: MCP_HUB_CONTEXT_TYPE.to_string(),
-                created_at: kaijutsu_types::now_millis() as i64,
-                created_by: character,
-                forked_from: None,
-                fork_kind: None,
-                archived_at: None,
-                workspace_id: None,
-                preset_id: None,
-                concluded_at: None,
-                last_activity_at: None,
-                promoted_at: None,
-                demoted_at: None,
-                paused_at: None,
-                origin_host: None,
-                performer: None, senpai_ctx: Some(console), persona: None,
-            };
-            db.insert_placed_context(&row, default_ws)
-                .map_err(|e| format!("could not create the MCP hub '{label}': {e}"))?;
-            db.set_character_mcp_hub_ctx(character, Some(new_id))
-                .map_err(|e| format!("could not point {} at its MCP hub '{label}': {e}", sheet.name))?;
-            (sheet.name, label)
         };
 
-        // `insert_context_with_document` commits the KernelDb document row
-        // but does not seed the in-memory BlockStore. `DocumentAlreadyExists`
-        // means another path already seeded it.
-        match self.block_store().create_document(new_id, kaijutsu_types::DocKind::Conversation, None) {
+        // The pointer is committed before this tail runs, so every path
+        // (new, adopted, pointed) completes it: a failed tail is repaired by
+        // the next call. `insert_context_with_document` commits the KernelDb
+        // document row but does not seed the in-memory BlockStore;
+        // `DocumentAlreadyExists` means another path already seeded it.
+        match self.block_store().create_document(hub_id, kaijutsu_types::DocKind::Conversation, None) {
             Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
             Err(e) => return Err(format!("failed to seed the document of MCP hub '{label}': {e}")),
         }
-        self.drift_router()
-            .write()
-            .register(new_id, Some(&label), None, character)
-            .map_err(|e| format!("could not register MCP hub '{label}' for {name}: {e}"))?;
-        Ok(new_id)
+        let mut router = self.drift_router().write();
+        if router.get(hub_id).is_none() {
+            router
+                .register(hub_id, Some(&label), None, character)
+                .map_err(|e| format!("could not register MCP hub '{label}' for {name}: {e}"))?;
+        }
+        Ok(hub_id)
     }
 
     /// Return a live root character's root context, creating it when the
@@ -876,9 +888,6 @@ impl KjDispatcher {
         if root && context_type.is_some() {
             return KjResult::Err("kj character set: a root has no context type; drop --type, or drop --root".to_string());
         }
-        if no_root && console.is_some() {
-            return KjResult::Err("kj character set: a console belongs to a root; drop --console, or drop --no-root".to_string());
-        }
         if let Some(context_type) = context_type
             && let Err(e) = self.check_character_type(context_type).await
         {
@@ -943,25 +952,27 @@ impl KjDispatcher {
                 Ok(c) => c,
                 Err(e) => return KjResult::Err(format!("kj character set: --console: {e}")),
             };
-            if let Some(ctx) = console_ctx
-                && let Err(e) = db.set_character_console_ctx(row.principal_id, Some(ctx))
-            {
-                return KjResult::Err(format!("kj character set: {e}"));
-            }
-            if no_console && let Err(e) = db.set_character_console_ctx(row.principal_id, None) {
-                return KjResult::Err(format!("kj character set: {e}"));
-            }
-            if let Some(rc_dir) = rc_dir
-                && let Err(e) = db.set_character_rc_dir(row.principal_id, Some(rc_dir))
-            {
-                return KjResult::Err(format!("kj character set: {e}"));
-            }
-            if (root || no_root) && let Err(e) = db.update_character_root(row.principal_id, root) {
-                return KjResult::Err(format!("kj character set: {e}"));
-            }
-            if (context_type.is_some() || no_type)
-                && let Err(e) = db.update_character_context_type(row.principal_id, context_type)
-            {
+            // A root's rc directory is `root` (until the directory is renamed)
+            // unless `--rc` names one in the same call.
+            let rc_dir = rc_dir.or(root.then_some("root"));
+            if let Err(e) = db.in_transaction(|db| {
+                if let Some(ctx) = console_ctx {
+                    db.set_character_console_ctx(row.principal_id, Some(ctx))?;
+                }
+                if no_console {
+                    db.set_character_console_ctx(row.principal_id, None)?;
+                }
+                if let Some(rc_dir) = rc_dir {
+                    db.set_character_rc_dir(row.principal_id, Some(rc_dir))?;
+                }
+                if root || no_root {
+                    db.update_character_root(row.principal_id, root)?;
+                }
+                if context_type.is_some() || no_type {
+                    db.update_character_context_type(row.principal_id, context_type)?;
+                }
+                Ok(())
+            }) {
                 return KjResult::Err(format!("kj character set: {e}"));
             }
             row.principal_id
@@ -1732,6 +1743,91 @@ mod tests {
         let hubs = d.kernel_db().lock().list_all_contexts().unwrap()
             .into_iter().filter(|c| c.context_type == "mcp-hub" && c.archived_at.is_none()).count();
         assert_eq!(hubs, 1, "a repeated create must not make a second hub");
+    }
+
+    /// `create --root` reports the hub in its `.data`, not the pre-hub row.
+    ///
+    /// Falsified by building the data from the row read before `ensure_mcp_hub`.
+    #[tokio::test]
+    async fn create_root_data_names_the_hub() {
+        let d = rc_capable_dispatcher().await;
+        let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
+        let KjResult::Ok { data: Some(data), .. } = created else { panic!("expected Ok, got {created:?}") };
+        let hub = hub_of(&d, "sovereign").expect("a root has a hub");
+        assert_eq!(data["mcp_hub_ctx"], serde_json::json!(hub.context_id.to_hex()));
+    }
+
+    /// A hub whose pointer is committed but whose tail (BlockStore document,
+    /// drift registration) never ran is completed by the next `ensure_mcp_hub`.
+    ///
+    /// Falsified by returning at the pointer before the tail.
+    #[tokio::test]
+    async fn ensure_mcp_hub_completes_a_failed_tail() {
+        let d = rc_capable_dispatcher().await;
+        d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
+        let sheet = d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap();
+        let old = hub_of(&d, "sovereign").unwrap();
+        // Replace the hub with one whose row and pointer are committed and
+        // nothing else: the state a failed tail leaves.
+        let hub = kaijutsu_types::ContextId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.archive_context(old.context_id).unwrap();
+            d.drift_router().write().set_state(old.context_id, kaijutsu_types::ContextState::Archived).unwrap();
+            let row = crate::kernel_db::ContextRow {
+                context_id: hub, label: Some("mcp/sovereign".into()), context_type: "mcp-hub".into(),
+                created_by: sheet.principal_id, senpai_ctx: sheet.root_ctx, ..old.clone()
+            };
+            let ws = db.get_or_create_default_workspace(sheet.principal_id).unwrap();
+            db.insert_placed_context(&row, ws).unwrap();
+            db.set_character_mcp_hub_ctx(sheet.principal_id, Some(hub)).unwrap();
+        }
+        assert!(!d.block_store().contains(hub), "precondition: no document");
+        assert!(d.drift_router().read().get(hub).is_none(), "precondition: not registered");
+        assert_eq!(d.ensure_mcp_hub(sheet.principal_id).unwrap(), hub);
+        assert!(d.block_store().contains(hub), "the pointer path seeds the document");
+        assert!(d.drift_router().read().get(hub).is_some(), "the pointer path registers the hub");
+    }
+
+    /// `--console` conflicts with `--root` and `--no-root` in one call.
+    #[tokio::test]
+    async fn set_console_conflicts_with_root_flags() {
+        let d = rc_capable_dispatcher().await;
+        let cases: [&[&str]; 4] = [
+            &["character", "set", "x", "--root", "--console", "c"],
+            &["character", "set", "x", "--no-root", "--console", "c"],
+            &["character", "set", "x", "--root", "--no-console"],
+            &["character", "set", "x", "--no-root", "--no-console"],
+        ];
+        for args in cases {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let result = d.dispatch(&args, &test_caller()).await;
+            let KjResult::Err(message) = result else { panic!("expected a refusal for {args:?}, got {result:?}") };
+            assert!(message.contains("cannot be used with") || message.contains("conflict"), "{args:?}: {message}");
+        }
+    }
+
+    /// Promoting a character sets its rc directory to the root default, unless
+    /// `--rc` names one in the same call; demoting leaves it.
+    ///
+    /// Falsified by dropping the default from `character_set`.
+    #[tokio::test]
+    async fn set_root_defaults_the_rc_directory() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        let rc_of = |name: &str| d.kernel_db().lock().get_character_by_name(name).unwrap().unwrap().rc_dir;
+        for name in ["promoted", "pinned"] {
+            let made = d.dispatch(&[s("character"), s("create"), s(name), s("--rc"), s("default")], &caller).await;
+            assert!(matches!(made, KjResult::Ok { .. }), "{made:?}");
+            assert_eq!(rc_of(name).as_deref(), Some("default"));
+        }
+        let set = d.dispatch(&[s("character"), s("set"), s("promoted"), s("--root")], &caller).await;
+        assert!(matches!(set, KjResult::Ok { .. }), "{set:?}");
+        assert_eq!(rc_of("promoted").as_deref(), Some("root"), "a promoted character runs the root directory");
+
+        let set = d.dispatch(&[s("character"), s("set"), s("pinned"), s("--root"), s("--rc"), s("default")], &caller).await;
+        assert!(matches!(set, KjResult::Ok { .. }), "{set:?}");
+        assert_eq!(rc_of("pinned").as_deref(), Some("default"), "--rc in the same call wins");
     }
 
     /// An ordinary character gets no hub.

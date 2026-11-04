@@ -11,14 +11,9 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 rc runs the performer's `rc_dir` (`docs/character.md`, "The type melts into
 the character"). Open, outside M2:
 
-- `kj character set <name> --root` and `kaijutsu-server init --as <existing>`
-  make a character a root without touching its `rc_dir`, so its root console
-  runs whatever directory it had (`kj/character.rs::character_set`,
-  `kaijutsu-server/src/init.rs`). A new root gets `root`.
-- `migrate_keyring::migrate_legacy_names` still writes characters with no
-  `rc_dir`; it runs after `rc-dir-backfill-v1` has recorded itself, so those
-  rows stay NULL and their lifecycles fail naming `kj character set <name>
-  --rc <dir>`.
+- `migrate_keyring::migrate_legacy_names` writes ordinary (non-root) characters with no `rc_dir`; it runs after
+  `rc-dir-backfill-v1` has recorded itself, so those rows stay NULL and their lifecycles fail naming
+  `kj character set <name> --rc <dir>`.
 - A live context whose `context_type` differs from its performer's directory
   now runs the performer's directory. On zorak, check before deploy which live
   contexts that changes (a director-typed banto playing the `console` context,
@@ -112,8 +107,7 @@ against the code unless marked:
   not built (`VERB_ROTATE` fires only from the beat scheduler).
 - The builtin `kj context create --type mcp` allow cannot see the caller, so the character it names may be one with a
   model and its `distill` slot is copied. Small: an mcp seat already holds `config-write`.
-- `ensure_mcp_hub` seeds the BlockStore and drift router after the row commits; a failure there is repaired at
-  the next boot, not within the process. `kj character create --model` writes the character and its model as
+- `kj character create --model` writes the character and its model as
   two statements.
 - Tests still say "cast" for assigning a performer (kj/context.rs ~4629-4682).
 - `kj context set --type` refuses only reserved roles (kj/context.rs `resolve_context_config`), so it commits a

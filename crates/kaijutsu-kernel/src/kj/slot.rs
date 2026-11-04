@@ -139,9 +139,9 @@ pub(super) enum CharacterModelCommand {
 /// `/` (`kj backend set` refuses one), while model ids may (`zai-org/GLM-5.3`).
 /// A value with no `/`, or an empty half, refuses with the form.
 pub(super) fn split_backend_model(value: &str) -> Result<(String, String), String> {
-    match value.split_once('/') {
+    match value.trim().split_once('/') {
         Some((backend, model)) if !backend.trim().is_empty() && !model.trim().is_empty() => {
-            Ok((backend.to_string(), model.to_string()))
+            Ok((backend.trim().to_string(), model.trim().to_string()))
         }
         _ => Err(format!(
             "model '{value}' must be <backend>/<model>, such as deepseek/deepseek-flash; \
@@ -527,6 +527,14 @@ impl Classify for CharacterModelCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_backend_model_trims_both_halves() {
+        assert_eq!(super::split_backend_model(" deepseek/x ").unwrap(), ("deepseek".to_string(), "x".to_string()));
+        assert_eq!(super::split_backend_model(" deepseek / x ").unwrap(), ("deepseek".to_string(), "x".to_string()));
+        assert!(super::split_backend_model("deepseek/ ").is_err());
+        assert!(super::split_backend_model(" /x").is_err());
+    }
+
     use super::super::test_helpers::{test_caller, test_dispatcher};
     use super::*;
 

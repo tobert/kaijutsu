@@ -138,15 +138,16 @@ impl KernelDb {
                 "UPDATE characters SET handoff_ctx = ?1 WHERE handoff_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
-            let console_moved = db.conn.execute(
+            let root_ctx_moved = db.conn.execute(
                 "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
-            db.conn.execute(
+            // A console pointer moving does not touch the predecessor's senpai.
+            let _console_ctx_moved = db.conn.execute(
                 "UPDATE characters SET console_ctx = ?1 WHERE console_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
-            if console_moved > 0 {
+            if root_ctx_moved > 0 {
                 // The archived console answers to its successor, so it can be
                 // promoted or moved again.
                 db.conn.execute(
