@@ -48,12 +48,11 @@ enum CharacterCommand {
         /// context of its own. Its `kj` requests always need approval.
         #[arg(long)]
         root: bool,
-        /// Backend of the character's model. Needs --model; a root runs no
-        /// model.
-        #[arg(long, requires = "model")]
-        backend: Option<String>,
-        /// Model id of the character's model. Needs --backend.
-        #[arg(long, requires = "backend")]
+        /// The character's model as `<backend>/<model>`, split at the first
+        /// `/`, as `kj character show` prints it (for example
+        /// `deepseek/deepseek-flash`). `kj backend list` names the backends
+        /// and `kj models` lists their models. A root runs no model.
+        #[arg(long, value_name = "BACKEND/MODEL")]
         model: Option<String>,
         /// Maximum RESPONSE tokens of the character's model. Needs --model.
         /// Omit to read it from the model's `kj backend model set` row.
@@ -64,6 +63,11 @@ enum CharacterCommand {
         /// none, and then every create names `--type`. A root has none.
         #[arg(long = "type", value_name = "CONTEXT_TYPE")]
         context_type: Option<String>,
+        /// The directory under `/config/rc/` whose lifecycle scripts this
+        /// character's contexts run. It needs a runnable `create` script; `lib`
+        /// is reserved. Default: the character's name, or `person` for a root.
+        #[arg(long = "rc", value_name = "DIR")]
+        rc_dir: Option<String>,
     },
     /// List the live (non-retired) characters.
     #[command(alias = "ls")]
@@ -71,18 +75,20 @@ enum CharacterCommand {
         /// Include retired characters too.
         #[arg(long)]
         all: bool,
-        /// Emit each row as a JSON object (name, id, timestamps, root)
+        /// Emit each row as a JSON object (name, id, timestamps, root, rc_dir)
         /// instead of the default array of ids.
         #[arg(long)]
         json: bool,
     },
-    /// Show one character's sheet and its live contexts.
+    /// Show one character's sheet: rc directory, model, slots, pointers (a
+    /// root's console and MCP hub, and the handoff log) and live contexts.
     Show {
         /// The character's name.
         name: String,
     },
-    /// Update a character's sheet: whether it is a root, and the context type
-    /// it usually plays. Name at least one option.
+    /// Update a character's sheet: whether it is a root, the context type it
+    /// usually plays, its rc directory, and a root's console. Name at least
+    /// one option.
     Set {
         /// The character to update.
         name: String,
@@ -101,6 +107,19 @@ enum CharacterCommand {
         /// Clear the character's context type; every create then names `--type`.
         #[arg(long = "no-type", conflicts_with = "context_type")]
         no_type: bool,
+        /// The directory under `/config/rc/` whose lifecycle scripts this
+        /// character's contexts run. It needs a runnable `create` script; `lib`
+        /// is reserved.
+        #[arg(long = "rc", value_name = "DIR")]
+        rc_dir: Option<String>,
+        /// A root's console: a live context performed by a non-root character
+        /// that answers to the root's root console. A rotation of the console
+        /// moves this pointer to the successor.
+        #[arg(long, value_name = "CONTEXT", conflicts_with = "no_console")]
+        console: Option<String>,
+        /// Clear a root's console pointer.
+        #[arg(long = "no-console", conflicts_with = "console")]
+        no_console: bool,
     },
     /// The model a character runs. A context copies it when it is made, so a
     /// change reaches a running context at `kj context rotate`.
@@ -175,16 +194,14 @@ impl KjDispatcher {
         }
 
         match parsed.command {
-            CharacterCommand::Create { name, root, backend, model, max_tokens, context_type } => {
-                self.character_create(&name, root, backend.zip(model), max_tokens, context_type.as_deref(), caller).await
+            CharacterCommand::Create { name, root, model, max_tokens, context_type, rc_dir } => {
+                self.character_create(&name, root, model.as_deref(), max_tokens, context_type.as_deref(), rc_dir.as_deref(), caller).await
             }
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Set { name, root, no_root, context_type, no_type } => {
-                if !root && !no_root && context_type.is_none() && !no_type {
-                    return KjResult::Err("kj character set: specify --root, --no-root, --type <type> or --no-type".to_string());
-                }
-                self.character_set(&name, root, no_root, context_type.as_deref(), no_type, caller).await
+            CharacterCommand::Set { name, root, no_root, context_type, no_type, rc_dir, console, no_console } => {
+                let change = SetChange { root, no_root, context_type, no_type, rc_dir, console, no_console };
+                self.character_set(&name, change, caller).await
             }
             CharacterCommand::Model(cmd) => self.character_model(cmd),
             CharacterCommand::Slot(cmd) => self.character_slot(cmd),
@@ -210,15 +227,44 @@ impl KjDispatcher {
         }
     }
 
+    /// An explicit rc directory must be a top-level directory of `/config/rc`
+    /// with a runnable `create` script, and not the shared `lib`.
+    async fn check_rc_dir(&self, rc_dir: &str) -> Result<(), String> {
+        if rc_dir == "lib" {
+            return Err("'lib' holds shared fragments, not a directory a character runs".to_string());
+        }
+        let known = super::rc::known_context_types(self.kernel().vfs()).await?;
+        if !known.iter().any(|d| d == rc_dir) {
+            return Err(format!(
+                "no rc directory '{rc_dir}' at {}; known directories: {}",
+                kaijutsu_types::paths::RC_ROOT,
+                if known.is_empty() { "(none)".to_string() } else { known.join(", ") },
+            ));
+        }
+        match crate::rc::create_bucket_has_candidates(self, rc_dir).await? {
+            true => Ok(()),
+            false => Err(format!(
+                "rc directory '{rc_dir}' has no runnable create script at {}, so no context of it can be made",
+                kaijutsu_types::paths::rc_dir(rc_dir, crate::rc::VERB_CREATE),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn character_create(
         &self,
         name: &str,
         root: bool,
-        model: Option<(String, String)>,
+        model: Option<&str>,
         max_tokens: Option<u64>,
         context_type: Option<&str>,
+        rc_dir: Option<&str>,
         caller: &KjCaller,
     ) -> KjResult {
+        let model = match model.map(super::slot::split_backend_model).transpose() {
+            Ok(m) => m,
+            Err(e) => return KjResult::Err(format!("kj character create: --model: {e}")),
+        };
         if root && context_type.is_some() {
             return KjResult::Err(
                 "kj character create: a root has no context type; drop --type, or drop --root".to_string(),
@@ -233,9 +279,15 @@ impl KjDispatcher {
         {
             return KjResult::Err(format!("kj character create: --type: {e}"));
         }
+        if let Some(rc_dir) = rc_dir
+            && !exists
+            && let Err(e) = self.check_rc_dir(rc_dir).await
+        {
+            return KjResult::Err(format!("kj character create: --rc: {e}"));
+        }
         if root && model.is_some() {
             return KjResult::Err(
-                "kj character create: a root runs no model; drop --backend and --model, or drop --root".to_string(),
+                "kj character create: a root runs no model; drop --model, or drop --root".to_string(),
             );
         }
         let row = {
@@ -243,12 +295,15 @@ impl KjDispatcher {
             match db.get_character_by_name(name) {
                 Ok(Some(existing)) => {
                     let mut note = if model.is_some() {
-                        format!("; its model is unchanged (`kj character model set {name} --backend B --model M` changes it)")
+                        format!("; its model is unchanged (`kj character model set {name} BACKEND/MODEL` changes it)")
                     } else {
                         String::new()
                     };
                     if context_type.is_some() {
                         note.push_str(&format!("; its type is unchanged (`kj character set {name} --type T` changes it)"));
+                    }
+                    if rc_dir.is_some() {
+                        note.push_str(&format!("; its rc directory is unchanged (`kj character set {name} --rc DIR` changes it)"));
                     }
                     return KjResult::ok_with_data(
                         format!("{name} already exists ({}){note}", existing.principal_id.short()),
@@ -278,7 +333,7 @@ impl KjDispatcher {
                 }
             };
 
-            let row = CharacterRow {
+            let row = CharacterRow { console_ctx: None, mcp_hub_ctx: None,
                 principal_id: PrincipalId::new(),
                 name: name.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -286,6 +341,7 @@ impl KjDispatcher {
                 handoff_ctx: None, root_ctx: None,
                 root,
                 context_type: context_type.map(str::to_string),
+                rc_dir: Some(rc_dir.map_or_else(|| if root { "person".to_string() } else { name.to_string() }, str::to_string)),
             };
             if let Err(e) = db.insert_character(&row) {
                 return KjResult::Err(format!("kj character create: {e}"));
@@ -305,7 +361,7 @@ impl KjDispatcher {
             {
                 return KjResult::Err(format!(
                     "kj character create: created {name} ({}) but could not set its model: {e}; \
-                     `kj character model set {name} --backend B --model M` sets it",
+                     `kj character model set {name} BACKEND/MODEL` sets it",
                     row.principal_id.short()
                 ));
             }
@@ -492,8 +548,9 @@ impl KjDispatcher {
         ))
     }
 
-    /// Return a live root character's MCP hub, creating it when no live
-    /// context holds the label `mcp/<name>`: type `mcp-hub`, created by the
+    /// Return a live root character's MCP hub: the live context
+    /// `characters.mcp_hub_ctx` names, else the live context that holds the
+    /// label `mcp/<name>` (adopted by setting the pointer), else a new one: type `mcp-hub`, created by the
     /// root, with no parent and no performer, answering to the root's console.
     /// It runs no turns; it is the `forked_from` of the root's MCP sessions
     /// (`docs/senpai-kohai.md`, "MCP sessions"). A live context of another
@@ -516,8 +573,15 @@ impl KjDispatcher {
                 return Err(format!("{} is retired", sheet.name));
             }
             let label = format!("{MCP_HUB_LABEL_PREFIX}{}", sheet.name);
+            if let Some(pointed) = sheet.mcp_hub_ctx
+                && db.get_context(pointed).map_err(|e| e.to_string())?.is_some_and(|c| !c.is_archived())
+            {
+                return Ok(pointed);
+            }
             if let Some(held) = db.find_context_by_label(&label).map_err(|e| e.to_string())? {
                 if held.context_type == MCP_HUB_CONTEXT_TYPE {
+                    // A hub made before the sheet had a pointer: adopt it.
+                    db.set_character_mcp_hub_ctx(character, Some(held.context_id)).map_err(|e| e.to_string())?;
                     return Ok(held.context_id);
                 }
                 return Err(format!(
@@ -552,6 +616,8 @@ impl KjDispatcher {
             };
             db.insert_placed_context(&row, default_ws)
                 .map_err(|e| format!("could not create the MCP hub '{label}': {e}"))?;
+            db.set_character_mcp_hub_ctx(character, Some(new_id))
+                .map_err(|e| format!("could not point {} at its MCP hub '{label}': {e}", sheet.name))?;
             (sheet.name, label)
         };
 
@@ -732,11 +798,12 @@ impl KjDispatcher {
                 let context_names: Vec<String> = contexts.iter().map(|c| db.context_name(*c)).collect();
                 let mut text = format!(
                     "Character:       {}\nID:              {}\nRoot:            {}\n\
-                     Type:            {}\nModel:           {}\nSlots:           {}\nCreated:         {}\nRetired:         {}",
+                     Type:            {}\nRC dir:          {}\nModel:           {}\nSlots:           {}\nCreated:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
                     row.context_type.as_deref().unwrap_or("-"),
+                    row.rc_dir.as_deref().unwrap_or("-"),
                     model.as_ref().map_or_else(|| "-".to_string(), |m| super::slot::model_summary(m, &backends)),
                     if slot_names.is_empty() { "-".to_string() } else { slot_names.join(", ") },
                     super::format::format_timestamp(row.created_at),
@@ -744,6 +811,22 @@ impl KjDispatcher {
                         .map(super::format::format_timestamp)
                         .unwrap_or_else(|| "-".to_string()),
                 );
+                let pointer = |ctx: Option<ContextId>| match ctx {
+                    None => "-".to_string(),
+                    Some(ctx) => match db.get_context(ctx) {
+                        Ok(Some(c)) if c.is_archived() => format!("{} (archived)", db.context_name(ctx)),
+                        _ => db.context_name(ctx),
+                    },
+                };
+                if row.root {
+                    text.push_str(&format!(
+                        "\nRoot console:    {}\nConsole:         {}\nMCP hub:         {}",
+                        pointer(row.root_ctx),
+                        pointer(row.console_ctx),
+                        pointer(row.mcp_hub_ctx),
+                    ));
+                }
+                text.push_str(&format!("\nHandoff:         {}", pointer(row.handoff_ctx)));
                 text.push_str(&format!("\nLive contexts:   {}", if context_names.is_empty() { "-".to_string() } else { context_names.join(", ") }));
                 let mut data = character_to_json(&row);
                 data["model"] = super::slot::model_data(model.as_ref(), &backends);
@@ -771,25 +854,31 @@ impl KjDispatcher {
     /// Set or clear `root`. A root is a model context like any other: a
     /// model plays it, and its `kj` requests always need approval
     /// (`docs/character.md`, "Roots and rotation").
-    async fn character_set(
-        &self,
-        name: &str,
-        root: bool,
-        no_root: bool,
-        context_type: Option<&str>,
-        no_type: bool,
-        caller: &KjCaller,
-    ) -> KjResult {
-        if !root && !no_root && context_type.is_none() && !no_type {
-            return KjResult::Err("kj character set: specify --root, --no-root, --type <type> or --no-type".to_string());
+    async fn character_set(&self, name: &str, change: SetChange, caller: &KjCaller) -> KjResult {
+        let SetChange { root, no_root, context_type, no_type, rc_dir, console, no_console } = change;
+        let context_type = context_type.as_deref();
+        let rc_dir = rc_dir.as_deref();
+        if !root && !no_root && context_type.is_none() && !no_type && rc_dir.is_none() && console.is_none() && !no_console {
+            return KjResult::Err(
+                "kj character set: specify --root, --no-root, --type <type>, --no-type, --rc <dir>, --console <context> or --no-console"
+                    .to_string(),
+            );
         }
         if root && context_type.is_some() {
             return KjResult::Err("kj character set: a root has no context type; drop --type, or drop --root".to_string());
+        }
+        if no_root && console.is_some() {
+            return KjResult::Err("kj character set: a console belongs to a root; drop --console, or drop --no-root".to_string());
         }
         if let Some(context_type) = context_type
             && let Err(e) = self.check_character_type(context_type).await
         {
             return KjResult::Err(format!("kj character set: --type: {e}"));
+        }
+        if let Some(rc_dir) = rc_dir
+            && let Err(e) = self.check_rc_dir(rc_dir).await
+        {
+            return KjResult::Err(format!("kj character set: --rc: {e}"));
         }
         let principal_id = {
             let db = self.kernel_db().lock();
@@ -841,6 +930,23 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj character set: {e}")),
                 }
             }
+            let console_ctx = match console.as_deref().map(|c| check_console(&db, &row, c, caller)).transpose() {
+                Ok(c) => c,
+                Err(e) => return KjResult::Err(format!("kj character set: --console: {e}")),
+            };
+            if let Some(ctx) = console_ctx
+                && let Err(e) = db.set_character_console_ctx(row.principal_id, Some(ctx))
+            {
+                return KjResult::Err(format!("kj character set: {e}"));
+            }
+            if no_console && let Err(e) = db.set_character_console_ctx(row.principal_id, None) {
+                return KjResult::Err(format!("kj character set: {e}"));
+            }
+            if let Some(rc_dir) = rc_dir
+                && let Err(e) = db.set_character_rc_dir(row.principal_id, Some(rc_dir))
+            {
+                return KjResult::Err(format!("kj character set: {e}"));
+            }
             if (root || no_root) && let Err(e) = db.update_character_root(row.principal_id, root) {
                 return KjResult::Err(format!("kj character set: {e}"));
             }
@@ -889,6 +995,14 @@ impl KjDispatcher {
             changes.push(format!("usually plays {context_type}"));
         } else if no_type {
             changes.push("has no context type".to_string());
+        }
+        if let Some(rc_dir) = rc_dir {
+            changes.push(format!("runs rc directory {rc_dir}"));
+        }
+        if console.is_some() {
+            changes.push("has a new console".to_string());
+        } else if no_console {
+            changes.push("has no console".to_string());
         }
         let msg = format!("{name} {}", changes.join(" and "));
         KjResult::ok_with_data(msg, character_to_json(&updated))
@@ -985,6 +1099,68 @@ impl KjDispatcher {
     }
 }
 
+/// What `kj character set` was asked to change.
+struct SetChange {
+    root: bool,
+    no_root: bool,
+    context_type: Option<String>,
+    no_type: bool,
+    rc_dir: Option<String>,
+    console: Option<String>,
+    no_console: bool,
+}
+
+/// Resolve `--console <context>` for a root character: the character must be a
+/// live root with a root console, and the context live, performed by a live
+/// character that is not a root, and answering to that root console.
+fn check_console(
+    db: &crate::kernel_db::KernelDb,
+    sheet: &CharacterRow,
+    reference: &str,
+    caller: &KjCaller,
+) -> Result<ContextId, String> {
+    if !sheet.is_live_root() {
+        return Err(format!("{} is not a live root character, and only a root has a console", sheet.name));
+    }
+    let root_console = sheet
+        .root_ctx
+        .ok_or_else(|| format!("{} has no root console for its console to answer to", sheet.name))?;
+    let ctx = super::refs::resolve_context_arg(Some(reference), caller, db)?;
+    let row = db
+        .get_context(ctx)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("context {} not found", ctx.short()))?;
+    let label = db.context_name(ctx);
+    if row.is_archived() {
+        return Err(format!("context '{label}' is archived; a console is a live context"));
+    }
+    let performer = row
+        .performer
+        .ok_or_else(|| format!("context '{label}' has no performer; a console is performed by a character"))?;
+    match db.get_character(performer).map_err(|e| e.to_string())? {
+        Some(p) if p.retired_at.is_some() => {
+            return Err(format!("context '{label}' is performed by {}, who is retired", p.name));
+        }
+        Some(p) if p.root => {
+            return Err(format!(
+                "context '{label}' is performed by {}, a root; a console is performed by a model character",
+                p.name
+            ));
+        }
+        Some(_) => {}
+        None => return Err(format!("context '{label}' is performed by a character with no sheet")),
+    }
+    if row.senpai_ctx != Some(root_console) {
+        return Err(format!(
+            "context '{label}' does not answer to {}'s root console '{}'; `kj context set {label} --senpai {}` first",
+            sheet.name,
+            db.context_name(root_console),
+            db.context_name(root_console),
+        ));
+    }
+    Ok(ctx)
+}
+
 fn character_to_json(row: &CharacterRow) -> serde_json::Value {
     serde_json::json!({
         "principal_id": row.principal_id.to_hex(),
@@ -993,7 +1169,11 @@ fn character_to_json(row: &CharacterRow) -> serde_json::Value {
         "retired_at": row.retired_at,
         "root": row.root,
         "root_ctx": row.root_ctx.map(|ctx| ctx.to_hex()),
+        "handoff_ctx": row.handoff_ctx.map(|ctx| ctx.to_hex()),
         "context_type": row.context_type,
+        "rc_dir": row.rc_dir,
+        "console_ctx": row.console_ctx.map(|ctx| ctx.to_hex()),
+        "mcp_hub_ctx": row.mcp_hub_ctx.map(|ctx| ctx.to_hex()),
     })
 }
 
@@ -1347,7 +1527,7 @@ mod tests {
         let caller = test_caller();
         let [lead, coder] = [PrincipalId::new(), PrincipalId::new()];
         for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
@@ -1377,7 +1557,7 @@ mod tests {
     async fn show_lists_the_characters_live_contexts() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let live = register_context(&d, Some("lane-live"), None, coder);
@@ -1578,7 +1758,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at,
                     handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
@@ -1669,7 +1849,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at,
                     handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
@@ -1728,7 +1908,7 @@ mod tests {
         let character = PrincipalId::new();
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: character, name: "keeper".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: true,
             }).unwrap();
@@ -1869,5 +2049,299 @@ mod tests {
         let ctx_row = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
         assert!(ctx_row.archived_at.is_some(), "retirement archives the character's live contexts");
         assert!(d.kernel_db().lock().get_character_by_name("mentor").unwrap().unwrap().retired_at.is_some());
+    }
+    // ── M1: the sheet (rc_dir, console and hub pointers, one-value model) ──
+
+    fn sheet(d: &super::super::KjDispatcher, name: &str) -> crate::kernel_db::CharacterRow {
+        d.kernel_db().lock().get_character_by_name(name).unwrap().unwrap_or_else(|| panic!("{name} has a sheet"))
+    }
+
+    /// A new character runs the rc directory of its own name; a root runs
+    /// `person`. Falsified by leaving the column unset on create.
+    #[tokio::test]
+    async fn create_defaults_the_rc_dir_to_the_name_and_a_root_to_person() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("create"), s("hajime")], &caller).await.is_ok());
+        assert_eq!(sheet(&d, "hajime").rc_dir.as_deref(), Some("hajime"), "no check in M1: the name is the default");
+        let root = d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &caller).await;
+        assert!(root.is_ok(), "{}", root.message());
+        assert_eq!(sheet(&d, "boss").rc_dir.as_deref(), Some("person"));
+    }
+
+    /// `--rc` names an existing top-level rc directory with a runnable create
+    /// script, so two characters can share one.
+    #[tokio::test]
+    async fn create_with_an_explicit_rc_dir() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        let made = d.dispatch(&[s("character"), s("create"), s("coder-opus"), s("--rc"), s("coder")], &caller).await;
+        assert!(made.is_ok(), "{}", made.message());
+        assert_eq!(sheet(&d, "coder-opus").rc_dir.as_deref(), Some("coder"));
+        let KjResult::Ok { data: Some(data), .. } = made else { panic!("expected data") };
+        assert_eq!(data["rc_dir"], "coder");
+    }
+
+    /// An explicit `--rc` refuses a directory that does not exist, one with no
+    /// runnable create script, and `lib`; nothing is created.
+    #[tokio::test]
+    async fn create_refuses_an_invalid_rc_dir() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        super::super::test_helpers::install_rc_script_file(&d, "/config/rc/forkonly/fork/S00-x.kai", "echo hi\n").await;
+        for (dir, needle) in [("nowhere", "no rc directory 'nowhere'"), ("lib", "'lib'"), ("forkonly", "no runnable create script")] {
+            let result = d.dispatch(&[s("character"), s("create"), s("bad"), s("--rc"), s(dir)], &caller).await;
+            let KjResult::Err(message) = result else { panic!("--rc {dir} must refuse, got {result:?}") };
+            assert!(message.contains(needle), "--rc {dir}: {message}");
+            assert!(d.kernel_db().lock().get_character_by_name("bad").unwrap().is_none(), "--rc {dir} created a character");
+        }
+    }
+
+    /// `set --rc` changes the directory under the same validation.
+    #[tokio::test]
+    async fn set_changes_the_rc_dir_and_validates_it() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("worker")], &caller).await;
+        let set = d.dispatch(&[s("character"), s("set"), s("worker"), s("--rc"), s("coder")], &caller).await;
+        assert!(set.is_ok(), "{}", set.message());
+        assert_eq!(sheet(&d, "worker").rc_dir.as_deref(), Some("coder"));
+        for dir in ["nowhere", "lib"] {
+            let refused = d.dispatch(&[s("character"), s("set"), s("worker"), s("--rc"), s(dir)], &caller).await;
+            assert!(matches!(refused, KjResult::Err(_)), "--rc {dir}: {refused:?}");
+        }
+        assert_eq!(sheet(&d, "worker").rc_dir.as_deref(), Some("coder"), "a refusal changes nothing");
+    }
+
+    /// `show` prints the directory (`-` for a row that has none), a root's
+    /// console, console and hub, and the handoff; `.data` carries the ids.
+    #[tokio::test]
+    async fn show_prints_the_rc_dir_and_the_pointers() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &caller).await;
+        d.dispatch(&[s("character"), s("create"), s("plain")], &caller).await;
+        let plain = sheet(&d, "plain").principal_id;
+        d.kernel_db().lock().set_character_rc_dir(plain, None).unwrap();
+
+        let KjResult::Ok { message, data: Some(data), .. } =
+            d.dispatch(&[s("character"), s("show"), s("boss")], &caller).await else { panic!("show boss") };
+        assert!(message.contains("RC dir:          person"), "{message}");
+        assert!(message.contains("Root console:    boss"), "{message}");
+        assert!(message.contains("Console:         -"), "{message}");
+        assert!(message.contains("MCP hub:         mcp/boss"), "{message}");
+        assert!(message.contains("Handoff:         -"), "{message}");
+        let boss = sheet(&d, "boss");
+        assert_eq!(data["rc_dir"], "person");
+        assert_eq!(data["console_ctx"], serde_json::Value::Null);
+        assert_eq!(data["mcp_hub_ctx"], boss.mcp_hub_ctx.unwrap().to_hex());
+
+        let KjResult::Ok { message, data: Some(data), .. } =
+            d.dispatch(&[s("character"), s("show"), s("plain")], &caller).await else { panic!("show plain") };
+        assert!(message.contains("RC dir:          -"), "{message}");
+        assert!(!message.contains("Console:"), "only a root shows pointers: {message}");
+        assert_eq!(data["rc_dir"], serde_json::Value::Null);
+    }
+
+    /// A root, its root console, a model character, and a context that
+    /// character performs, answering to the root console.
+    async fn console_fixture() -> (std::sync::Arc<super::super::KjDispatcher>, kaijutsu_types::ContextId, kaijutsu_types::ContextId) {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &caller).await.is_ok());
+        assert!(d.dispatch(&[s("character"), s("create"), s("banto")], &caller).await.is_ok());
+        let root_ctx = sheet(&d, "boss").root_ctx.expect("the root has a console");
+        let banto = sheet(&d, "banto");
+        let con = register_context(&d, Some("con"), None, banto.principal_id);
+        d.kernel_db().lock().write_context_character(con, banto.principal_id, Some(root_ctx), None).unwrap();
+        (d, root_ctx, con)
+    }
+
+    /// `set --console` points a root at its console; `--no-console` clears it;
+    /// `show` labels it.
+    #[tokio::test]
+    async fn set_console_points_the_root_at_it_and_no_console_clears_it() {
+        let (d, _root_ctx, con) = console_fixture().await;
+        let caller = test_caller();
+        let set = d.dispatch(&[s("character"), s("set"), s("boss"), s("--console"), s("con")], &caller).await;
+        assert!(set.is_ok(), "{}", set.message());
+        assert_eq!(sheet(&d, "boss").console_ctx, Some(con));
+        let KjResult::Ok { message, data: Some(data), .. } =
+            d.dispatch(&[s("character"), s("show"), s("boss")], &caller).await else { panic!("show") };
+        assert!(message.contains("Console:         con"), "{message}");
+        assert_eq!(data["console_ctx"], con.to_hex());
+
+        let cleared = d.dispatch(&[s("character"), s("set"), s("boss"), s("--no-console")], &caller).await;
+        assert!(cleared.is_ok(), "{}", cleared.message());
+        assert_eq!(sheet(&d, "boss").console_ctx, None);
+    }
+
+    /// An archived console shows as such and is not cleared by archiving.
+    #[tokio::test]
+    async fn an_archived_console_shows_as_archived_and_stays_pointed_at() {
+        let (d, _root_ctx, con) = console_fixture().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("set"), s("boss"), s("--console"), s("con")], &caller).await.is_ok());
+        d.kernel_db().lock().archive_context(con).unwrap();
+        assert_eq!(sheet(&d, "boss").console_ctx, Some(con), "archiving clears nothing in this slice");
+        let KjResult::Ok { message, .. } = d.dispatch(&[s("character"), s("show"), s("boss")], &caller).await else { panic!("show") };
+        assert!(message.contains("Console:         con (") && message.contains(") (archived)"), "{message}");
+    }
+
+    /// `set --console` refuses a character that is not a live root, an
+    /// archived context, a root's performer, an unperformed context, and one
+    /// that answers to something other than the root's console.
+    #[tokio::test]
+    async fn set_console_refusals_leave_the_pointer_alone() {
+        let (d, root_ctx, con) = console_fixture().await;
+        let caller = test_caller();
+        let refuses = |args: Vec<&'static str>| {
+            let d = d.clone();
+            let caller = caller.clone();
+            async move {
+                let mut argv = vec![s("character"), s("set")];
+                argv.extend(args.into_iter().map(s));
+                match d.dispatch(&argv, &caller).await {
+                    KjResult::Err(message) => message,
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+        };
+
+        // Not a root.
+        let message = refuses(vec!["banto", "--console", "con"]).await;
+        assert!(message.contains("not a live root"), "{message}");
+
+        // Performed by a root (the root console itself).
+        let message = refuses(vec!["boss", "--console", "boss"]).await;
+        assert!(message.contains("a root"), "{message}");
+
+        // No performer.
+        register_context(&d, Some("bare"), None, PrincipalId::new());
+        let message = refuses(vec!["boss", "--console", "bare"]).await;
+        assert!(message.contains("no performer"), "{message}");
+
+        // Answers to another context, not the root's console.
+        let banto = sheet(&d, "banto").principal_id;
+        let stray = register_context(&d, Some("stray"), None, banto);
+        d.kernel_db().lock().write_context_character(stray, banto, Some(con), None).unwrap();
+        let message = refuses(vec!["boss", "--console", "stray"]).await;
+        assert!(message.contains("does not answer to boss's root console"), "{message}");
+
+        // Archived.
+        let gone = register_context(&d, Some("gone"), None, banto);
+        d.kernel_db().lock().write_context_character(gone, banto, Some(root_ctx), None).unwrap();
+        d.kernel_db().lock().archive_context(gone).unwrap();
+        let by_id = d
+            .dispatch(&[s("character"), s("set"), s("boss"), s("--console"), gone.to_hex()], &caller)
+            .await;
+        let KjResult::Err(message) = by_id else { panic!("an archived context must refuse, got {by_id:?}") };
+        assert!(message.contains("is archived"), "{message}");
+
+        // A retired performer.
+        let old = d.dispatch(&[s("character"), s("create"), s("old")], &caller).await;
+        assert!(old.is_ok());
+        let old_id = sheet(&d, "old").principal_id;
+        let by_old = register_context(&d, Some("by-old"), None, old_id);
+        d.kernel_db().lock().write_context_character(by_old, old_id, Some(root_ctx), None).unwrap();
+        d.kernel_db().lock().retire_character(old_id, 1).unwrap();
+        let message = refuses(vec!["boss", "--console", "by-old"]).await;
+        assert!(message.contains("retired"), "{message}");
+
+        assert_eq!(sheet(&d, "boss").console_ctx, None, "no refusal set the pointer");
+    }
+
+    /// A rotation that moves the label also moves the console pointer, in the
+    /// same transaction as `root_ctx` and `handoff_ctx`. Falsified by
+    /// dropping the console update from `commit_rotation`.
+    #[tokio::test]
+    async fn rotating_the_console_moves_the_pointer() {
+        let (d, _root_ctx, con) = console_fixture().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("set"), s("boss"), s("--console"), s("con")], &caller).await.is_ok());
+        let banto = sheet(&d, "banto").principal_id;
+        let successor = register_context(&d, Some("con-next"), None, banto);
+        d.kernel_db().lock().commit_rotation(con, successor).unwrap();
+        assert_eq!(sheet(&d, "boss").console_ctx, Some(successor), "the pointer follows the label");
+        let label = d.kernel_db().lock().get_context(successor).unwrap().unwrap().label;
+        assert_eq!(label.as_deref(), Some("con"), "the successor took the label");
+    }
+
+    /// The hub a root is created with is the one its pointer names.
+    #[tokio::test]
+    async fn create_root_points_the_sheet_at_its_mcp_hub() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &caller).await.is_ok());
+        let hub = d.kernel_db().lock().find_context_by_label("mcp/boss").unwrap().expect("the hub exists");
+        assert_eq!(sheet(&d, "boss").mcp_hub_ctx, Some(hub.context_id));
+        // Asking again finds it by the pointer and makes nothing new.
+        let again = d.ensure_mcp_hub(sheet(&d, "boss").principal_id).unwrap();
+        assert_eq!(again, hub.context_id);
+    }
+
+    /// A database that has a hub but no pointer keeps working: the hub found
+    /// by its label is adopted. Falsified by creating or refusing instead.
+    #[tokio::test]
+    async fn ensure_mcp_hub_adopts_a_hub_the_sheet_does_not_point_at() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &caller).await.is_ok());
+        let boss = sheet(&d, "boss");
+        let hub = boss.mcp_hub_ctx.expect("the hub is pointed at");
+        d.kernel_db().lock().set_character_mcp_hub_ctx(boss.principal_id, None).unwrap();
+        assert_eq!(sheet(&d, "boss").mcp_hub_ctx, None);
+
+        let found = d.ensure_mcp_hub(boss.principal_id).unwrap();
+        assert_eq!(found, hub, "the live mcp-hub holding mcp/boss is the hub");
+        assert_eq!(sheet(&d, "boss").mcp_hub_ctx, Some(hub), "and the pointer is set");
+    }
+
+    /// A pointer wins over the label: a hub the sheet names is returned even
+    /// when another context holds the label's neighbours.
+    #[tokio::test]
+    async fn ensure_mcp_hub_follows_the_pointer() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &caller).await.is_ok());
+        let boss = sheet(&d, "boss");
+        let other = register_context(&d, Some("elsewhere"), None, boss.principal_id);
+        d.kernel_db().lock().set_character_mcp_hub_ctx(boss.principal_id, Some(other)).unwrap();
+        assert_eq!(d.ensure_mcp_hub(boss.principal_id).unwrap(), other);
+    }
+
+    /// `kj character list --json` returns the rows, `rc_dir` among them; the
+    /// default stays the id array.
+    #[tokio::test]
+    async fn list_json_rows_carry_the_rc_dir() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("worker"), s("--rc"), s("coder")], &caller).await;
+        let KjResult::Ok { data: Some(serde_json::Value::Array(rows)), .. } =
+            d.dispatch(&[s("character"), s("list"), s("--json")], &caller).await else { panic!("rows") };
+        let worker = rows.iter().find(|r| r["name"] == "worker").expect("worker row");
+        assert_eq!(worker["rc_dir"], "coder");
+        let KjResult::Ok { data: Some(serde_json::Value::Array(ids)), .. } =
+            d.dispatch(&[s("character"), s("list")], &caller).await else { panic!("ids") };
+        assert!(ids.iter().all(|v| v.is_string()), "{ids:?}");
+    }
+
+    /// The help the four verbs print leads with the one-value forms.
+    #[tokio::test]
+    async fn help_for_the_changed_verbs_shows_the_one_value_forms() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        for (argv, needle) in [
+            (vec!["character", "create", "--help"], "--model <BACKEND/MODEL>"),
+            (vec!["character", "create", "--help"], "--rc <DIR>"),
+            (vec!["character", "set", "--help"], "--console <CONTEXT>"),
+            (vec!["character", "model", "set", "--help"], "<BACKEND/MODEL>"),
+            (vec!["character", "slot", "set", "--help"], "<BACKEND/MODEL>"),
+        ] {
+            let argv: Vec<String> = argv.into_iter().map(s).collect();
+            let help = d.dispatch(&argv, &caller).await.message().to_string();
+            assert!(help.contains(needle), "{argv:?}: {help}");
+            assert!(!help.contains("--backend"), "{argv:?} still offers --backend: {help}");
+        }
     }
 }

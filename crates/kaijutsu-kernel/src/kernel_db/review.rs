@@ -17,7 +17,7 @@ pub enum ReviewFrom {
 pub enum GovernedAct {
     /// `kj context set <ctx> --egress-allow|--egress-deny`.
     Egress,
-    /// `kj context move`.
+    /// `kj context set <ctx> --senpai <ctx>`.
     Move,
     /// `kj ledger escalate` on an ask raised in the context.
     Escalate,
@@ -263,7 +263,7 @@ impl KernelDb {
                 Some(sheet) if sheet.retired_at.is_none() => Ok(EffectiveReviewer::Assigned(holder)),
                 Some(sheet) => Err(KernelDbError::Validation(format!(
                     "{} is {}, the senpai of {under}, and is retired; routing does not pass over a retired character: \
-                     move {under} to another senpai with `kj context move`",
+                     move {under} to another senpai with `kj context set <ctx> --senpai <ctx>`",
                     sheet.name, self.context_name(above.context_id)
                 ))),
                 None => Err(KernelDbError::Corrupt(format!(
@@ -307,7 +307,7 @@ impl KernelDb {
         KernelDbError::Validation(format!(
             "nobody reviews {who} in context {name}: {} has no senpai above it, and only the live \
              root character holding a root console confirms its own statements; give the context a senpai \
-             with `kj context move`",
+             with `kj context set <ctx> --senpai <ctx>`",
             self.context_name(at.context_id)
         ))
     }

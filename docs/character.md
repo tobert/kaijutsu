@@ -1,7 +1,7 @@
 # Character — the persistent someone a name resolves to
 
 > Design + rollout plan, 2026-09-05, revised 2026-10-18 for senpai/kohai.
-> **Slices 0a–4 are built; slices 5–8 remain planned. Slice 5 is the type melt, M1–M7.**
+> **Slices 0a–4 are built; slices 5–8 remain planned. Slice 5 is the type melt, M1–M8.**
 > The review-routing, persona and slot parts follow `docs/senpai-kohai.md`.
 > Amy's statements are guidance, not rulings.
 
@@ -13,14 +13,14 @@ an instruction to use nonexistent features.
 
 | Part | Contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, and the `context_type` it usually plays (none for a root); `kj character create [--root] [--type <t>]\|list\|show\|set --root\|--no-root\|--type <t>\|--no-type\|retire` |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, `root_ctx`, the `context_type` it usually plays (none for a root), `rc_dir` (the directory under `/config/rc/` its contexts will run; nothing reads it yet, and a row from before it stays unset), and for a root the `console_ctx` and `mcp_hub_ctx` pointers; `kj character create [--root] [--type <t>] [--rc <dir>]\|list\|show\|set --root\|--no-root\|--type <t>\|--no-type\|--rc <dir>\|--console <ctx>\|--no-console\|retire`. `--rc` takes a top-level rc directory with a runnable `create` script, never `lib`; the default is the character's name, or `person` for a root. `--console` takes a live context performed by a live non-root character that answers to the root's root console; a rotation of that context moves the pointer with the label. `show` prints the directory and the pointers |
 | Bootstrap | `kaijutsu-server bootstrap` runs `init` and then the `kj` verbs that give the console a model (`docs/server-cli.md`, "bootstrap"). `kaijutsu-server init --as <name> --key <pubkey-file>` alone creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
-| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent and no senpai (a root console). `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live. Beside it each live root has an MCP hub, labeled `mcp/<name>`, of type `mcp-hub`, with no performer: the parent of the root's MCP sessions, made at the same three points |
+| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent and no senpai (a root console). `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live. Beside it each live root has an MCP hub, labeled `mcp/<name>`, of type `mcp-hub`, with no performer: the parent of the root's MCP sessions, made at the same three points and named by `mcp_hub_ctx`. A hub found by its label with the pointer unset is adopted |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
 | Context | A context carries its performer, senpai and persona (`contexts.performer`, `senpai_ctx`, `persona`) and a copy of the model slots it runs on (`docs/senpai-kohai.md`). `kj context create <character> [--name <label>] [--type <t>]` needs the Operator capability and a live character caller, requires the character, takes the label from `--name` or the character's name (`<name>-2`, `-3` while a live context holds it) and the type from `--type` or the character's `context_type` (refusing when neither names one), refuses an unknown or retired character and one that would review itself, and preserves the requester's `created_by`. It copies the character's slots into the context. A fork continues its source's performance; a rotation writes a successor with the same character and fresh slots. The performer of a context never changes; to put another character on the work, start a context of it |
 | Client creation | There is no create RPC. A client runs `kj context create <character>` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a root's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses. An `mcp` session created from a root console passes `--parent mcp/<root name>`, so the root's MCP hub is its `forked_from` and the gate raises no ask (`kaijutsu_client::mcp_hub_label`; `docs/senpai-kohai.md`, "MCP sessions") |
 | Senpai edge | Every context answers to one senpai context (`contexts.senpai_ctx`), except a root console; the senpai's character reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
-| Model | A character has one model (`character_models`), set with `kj character create <name> --backend <b> --model <m>` or `kj character model set\|unset\|show`; a root runs none. It may also hold role slots (`character_slots`, `kj character slot set\|unset\|list`) where a role differs. A context copies them into `context_slots` when it is made: every role slot, then the model under the context's own type and under `distill` where the character has no slot for that role. The model never fills `gate`, `judge` or the type of an `mcp` context. Unset parameters come from `backend_models`. Every model call reads the context's own slot for its type. No default stands in; a context with no slot for its type gives no model, and a turn refuses naming the fix (`kj character model set`, then `kj context rotate`). The judge and the gate use the context's `judge` and `gate` slots, and distillation its `distill` slot |
+| Model | A character has one model (`character_models`), set with `kj character create <name> --model <backend>/<model>` or `kj character model set <name> <backend>/<model>`, `unset` or `show`; a root runs none. It may also hold role slots (`character_slots`, `kj character slot set\|unset\|list`) where a role differs. A context copies them into `context_slots` when it is made: every role slot, then the model under the context's own type and under `distill` where the character has no slot for that role. The model never fills `gate`, `judge` or the type of an `mcp` context. Unset parameters come from `backend_models`. Every model call reads the context's own slot for its type. No default stands in; a context with no slot for its type gives no model, and a turn refuses naming the fix (`kj character model set`, then `kj context rotate`). The judge and the gate use the context's `judge` and `gate` slots, and distillation its `distill` slot |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation at a root context. See `docs/approval-identity.md` |
 | Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts whose senpai that character holds. See `docs/approval-identity.md`, "Standing rules for a character" |
@@ -43,8 +43,7 @@ the performer from context metadata.
 
 Still planned: character rc composition (slice 5), which would also grant
 statically what a character rule now learns from a first ask, roster grouping and character drift addressing (slices 6–7), and
-scheduled janitor/proctor work (slice 8). The sheet still has no
-`rc_dir` field. The handoff
+scheduled janitor/proctor work (slice 8). The handoff
 is a context, not a transport track. Requester and performer remain separate;
 a performer never changes credentials or rewrites existing asks and block authors.
 
@@ -107,7 +106,7 @@ Two things follow, and they are the ones to check a change against:
   Opaque UUIDv7 id in records and `.data`; given name in the UI and as the
   drift address. The word fits the cast vocabulary kaijutsu already uses: a
   character is what an actor is cast *as*, and a context is one performance.
-- **A character has slots.** Built: `kj character slot set <name> <role> --backend B --model M` (`unset` removes
+- **A character has slots.** Built: `kj character slot set <name> <role> <backend>/<model>` (`unset` removes
   one, `list` shows them, `kj character show` prints them). A context's model comes from its own slot for the
   context's type (the slot is named by the type string), copied from its performer's when the context is made. A
   character holds one slot per role; a `judge` slot gives the contexts it plays a judge shadow
@@ -977,7 +976,11 @@ Each slice leaves the tree green and is reviewed before the next starts. Nothing
   columns, their defaults and the constants (scratch, fork and cold-start writers included); bootstrap creates the
   shipped characters; `lib/recipes/pair.kai`; `docs/prompts.md`, `docs/senpai-kohai.md`, the Terms table and the
   Current implementation table.
-- **M7. zorak.** Retire stale characters by hand, rehearse `type-melt-v1` on a copy, rewrite the host `gate.toml`,
+- **M7. Docs alignment.** Before we call it done ("before we're done do a pass over docs and make sure they're
+  aligned with the new future", Amy, 2026-11-04): every document in `docs/`, `AGENTS.md`, `README.md`, the kj help
+  under `crates/kaijutsu-kernel/docs/help/`, and the shipped stances read as the melted design, with superseded
+  sections rewritten or deleted rather than annotated.
+- **M8. zorak.** Retire stale characters by hand, rehearse `type-melt-v1` on a copy, rewrite the host `gate.toml`,
   deploy, and check every shipped character and the console live.
 
 ### The handoff is an ordinary context
@@ -1098,7 +1101,7 @@ Each slice is independently shippable and leaves the tree green.
    ordinary authoring; the window is 50, set on the first note. `S16-handoff.kai` guards `kj handoff
    tail` inside the substitution; the kernel test
    `set_e_substitution_guards_behave_as_rc_scripts_place_them` pins the placement.
-5. **The type melts into the character.** Slices M1–M7 under "The type melts into the character".
+5. **The type melts into the character.** Slices M1–M8 under "The type melts into the character".
 6. **Roster inversion.** `kj roster` groups rows by character, presence
    specified as the aggregation above. The periodic refresh is already wired
    (`kaijutsu-server/src/rpc.rs:2984`; `roster_sources.rs:67`).

@@ -20,7 +20,7 @@ if ! kj character show council > /dev/null 2>&1; then
 fi
 # The council context runs the model its character's slot gives its type.
 if ! kj character slot list council | grep -q council; then
-  kj character slot set council council --backend deepseek --model deepseek-flash --max-tokens 65536
+  kj character slot set council council deepseek/deepseek-flash --max-tokens 65536
 fi
 for f in amy banto; do
   if kj context info "council-$f" > /dev/null 2>&1; then

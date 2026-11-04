@@ -292,7 +292,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             let mut argv = words(&["character", "create", performer]);
             if let Some(backend) = first {
                 argv.extend(words(&[
-                    "--backend", &backend.name, "--model", &backend.model, "--max-tokens",
+                    "--model", &format!("{}/{}", backend.name, backend.model), "--max-tokens",
                     &DEFAULT_MAX_TOKENS.to_string(),
                 ]));
             }
@@ -321,8 +321,8 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                     shared,
                     caller,
                     words(&[
-                        "character", "model", "set", performer, "--backend", &backend.name, "--model",
-                        &backend.model, "--max-tokens", &DEFAULT_MAX_TOKENS.to_string(),
+                        "character", "model", "set", performer, &format!("{}/{}", backend.name, backend.model),
+                        "--max-tokens", &DEFAULT_MAX_TOKENS.to_string(),
                     ]),
                     &mut report,
                 )
@@ -344,7 +344,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         .principal_id;
     match read(shared, |db| db.find_context_by_label(CONSOLE_LABEL))? {
         None => {
-            // The console is a kohai of the human root, the context the root
+            // The console is a context that answers to the human root, the context the root
             // character's `root_ctx` names.
             let human_root = read(shared, |db| db.get_character_by_name(&opts.root))?
                 .and_then(|row| row.root_ctx)
@@ -375,6 +375,20 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             dispatch(shared, caller, words(&["context", "rotate", CONSOLE_LABEL]), &mut report).await?;
         }
         Some(_) => report.notes.push("The console is already set up".to_string()),
+    }
+
+    // The root's sheet points at the console, so the kernel finds it without a
+    // label. A console that was made, rotated or accepted above and is not yet
+    // pointed at gets the pointer; one bootstrap does not accept is left alone.
+    let unpointed = read(shared, |db| {
+        let Some(row) = db.find_context_by_label(CONSOLE_LABEL)? else { return Ok(false) };
+        let accepted = row.context_type == "console"
+            && db.context_character(row.context_id)?.map(|c| c.principal_id) == Some(played_id);
+        let pointed = db.get_character_by_name(&opts.root)?.is_some_and(|sheet| sheet.console_ctx.is_some());
+        Ok(accepted && !pointed)
+    })?;
+    if unpointed {
+        dispatch(shared, caller, words(&["character", "set", &opts.root, "--console", CONSOLE_LABEL]), &mut report).await?;
     }
 
     Ok(report)

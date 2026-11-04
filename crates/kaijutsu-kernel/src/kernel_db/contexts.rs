@@ -397,6 +397,30 @@ impl KernelDb {
         })
     }
 
+    /// [`resolve_context`](Self::resolve_context), and when no live context
+    /// matches, the same label and id-prefix rules over the archived contexts.
+    /// A live match always wins; ambiguity among archived contexts refuses,
+    /// naming the candidates.
+    pub fn resolve_context_including_archived(&self, query: &str) -> KernelDbResult<ContextId> {
+        match self.resolve_context(query) {
+            Err(KernelDbError::NotFound(_)) => {}
+            other => return other,
+        }
+        let archived: Vec<ContextRow> = self.list_all_contexts()?.into_iter().filter(|c| c.is_archived()).collect();
+        let items = archived.iter().map(|c| (c.context_id, c.label.as_deref()));
+        kaijutsu_types::resolve_prefix(items, query).map_err(|e| match e {
+            kaijutsu_types::PrefixError::NoMatch(q) => {
+                KernelDbError::NotFound(format!("no context matches '{}'", q))
+            }
+            kaijutsu_types::PrefixError::Ambiguous { prefix, candidates } => {
+                KernelDbError::Validation(format!(
+                    "ambiguous prefix '{}': matches {:?}",
+                    prefix, candidates
+                ))
+            }
+        })
+    }
+
     /// Find the live context that currently holds a given label. Archived
     /// contexts keep their label but never hold it: `None` when only
     /// archived rows carry it, so the label is free to give again.

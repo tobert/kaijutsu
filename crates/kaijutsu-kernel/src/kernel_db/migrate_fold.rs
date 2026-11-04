@@ -220,7 +220,7 @@ impl KernelDb {
             notes.push((
                 "archived_no_senpai",
                 *ctx,
-                "archived with no senpai; it answers no asks, and promoting it needs a senpai first (`kj context move`)".to_string(),
+                "archived with no senpai; it answers no asks, and promoting it needs a senpai first (`kj context set <ctx> --senpai <ctx>`)".to_string(),
             ));
         }
         for (kind, ctx, note) in &notes {

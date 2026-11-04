@@ -307,7 +307,7 @@ impl SshServerConfig {
             return;
         }
         kernel_db
-            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
+            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: PrincipalId::new(),
                 name: Self::EPHEMERAL_PERFORMER.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -1373,7 +1373,7 @@ mod tests {
                 use kaijutsu_kernel::mcp::{CallContext, Capability, ContextToolBinding, InstanceId, KernelCallParams};
                 let principal = PrincipalId::new();
                 let db = kaijutsu_kernel::KernelDb::open(dir.join("kernel.db")).unwrap();
-                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: principal, name: "signal-test".into(), created_at: 1,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();

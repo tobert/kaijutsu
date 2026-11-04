@@ -45,11 +45,10 @@ pub(super) enum CharacterSlotCommand {
         /// shadow; or `distill` for the model that summarizes for `kj fork
         /// --compact` and `kj drift pull|merge`
         role: String,
-        /// Backend name
-        #[arg(long)]
-        backend: String,
-        /// Model id
-        #[arg(long)]
+        /// The model as `<backend>/<model>`, split at the first `/`, as `kj
+        /// character show` prints it (for example `deepseek/deepseek-flash`).
+        /// `kj backend list` names the backends and `kj models` the models
+        #[arg(value_name = "BACKEND/MODEL")]
         model: String,
         /// Maximum RESPONSE tokens. Omit to read it from the model's
         /// `kj backend model set` row when a context's slots are copied; a
@@ -96,11 +95,10 @@ pub(super) enum CharacterModelCommand {
     Set {
         /// The character's name
         character: String,
-        /// Backend name
-        #[arg(long)]
-        backend: String,
-        /// Model id
-        #[arg(long)]
+        /// The model as `<backend>/<model>`, split at the first `/`, as `kj
+        /// character show` prints it (for example `deepseek/deepseek-flash`).
+        /// `kj backend list` names the backends and `kj models` the models
+        #[arg(value_name = "BACKEND/MODEL")]
         model: String,
         /// Maximum RESPONSE tokens. Omit to read it from the model's
         /// `kj backend model set` row when a context is made; making a
@@ -135,6 +133,21 @@ pub(super) enum CharacterModelCommand {
         /// The character's name
         character: String,
     },
+}
+
+/// Split a `<backend>/<model>` value at the first `/`. Backend names hold no
+/// `/` (`kj backend set` refuses one), while model ids may (`zai-org/GLM-5.3`).
+/// A value with no `/`, or an empty half, refuses with the form.
+pub(super) fn split_backend_model(value: &str) -> Result<(String, String), String> {
+    match value.split_once('/') {
+        Some((backend, model)) if !backend.trim().is_empty() && !model.trim().is_empty() => {
+            Ok((backend.to_string(), model.to_string()))
+        }
+        _ => Err(format!(
+            "model '{value}' must be <backend>/<model>, such as deepseek/deepseek-flash; \
+             `kj backend list` names the backends and `kj models` lists their models"
+        )),
+    }
 }
 
 /// The structured form of a character's model, or null.
@@ -205,7 +218,6 @@ impl KjDispatcher {
         match cmd {
             CharacterModelCommand::Set {
                 character,
-                backend,
                 model,
                 max_tokens,
                 temperature,
@@ -214,6 +226,10 @@ impl KjDispatcher {
                 thinking_budget,
                 thinking_style,
             } => {
+                let (backend, model) = match split_backend_model(&model) {
+                    Ok(pair) => pair,
+                    Err(e) => return KjResult::Err(format!("kj character model set: {e}")),
+                };
                 let sheet = match db.get_character_by_name(&character) {
                     Ok(Some(sheet)) if sheet.retired_at.is_none() => sheet,
                     Ok(Some(_)) => {
@@ -283,7 +299,7 @@ impl KjDispatcher {
                 let text = match &model {
                     Some(m) => format!("{character}: {}", model_summary(m, &backends)),
                     None => format!(
-                        "{character} has no model (`kj character model set {character} --backend B --model M`)"
+                        "{character} has no model (`kj character model set {character} BACKEND/MODEL`)"
                     ),
                 };
                 KjResult::ok_with_data(text, model_data(model.as_ref(), &backends))
@@ -339,7 +355,6 @@ impl KjDispatcher {
             CharacterSlotCommand::Set {
                 character,
                 role,
-                backend,
                 model,
                 max_tokens,
                 temperature,
@@ -348,6 +363,10 @@ impl KjDispatcher {
                 thinking_budget,
                 thinking_style,
             } => {
+                let (backend, model) = match split_backend_model(&model) {
+                    Ok(pair) => pair,
+                    Err(e) => return KjResult::Err(format!("kj character slot set: {e}")),
+                };
                 let sheet = match db.get_character_by_name(&character) {
                     Ok(Some(sheet)) if sheet.retired_at.is_none() => sheet,
                     Ok(Some(_)) => {
@@ -467,7 +486,7 @@ fn slot_listing(
 ) -> KjResult {
     let mut lines = Vec::new();
     if slots.is_empty() {
-        lines.push(format!("{character} has no slots (`kj character slot set {character} <role> --backend B --model M`)"));
+        lines.push(format!("{character} has no slots (`kj character slot set {character} <role> BACKEND/MODEL`)"));
     }
     for s in slots {
         let backend = backends.get(&s.backend_id).cloned().unwrap_or_else(|| "(missing backend)".to_string());
@@ -548,8 +567,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--temperature", "0.3",
+                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--temperature", "0.3",
                 ]),
                 &test_caller(),
             )
@@ -572,7 +590,7 @@ mod tests {
         let c = test_caller();
         let set = |role: &'static str, extra: &[&'static str]| {
             let mut v = vec![
-                "character", "slot", "set", "house", role, "--backend", "anthropic", "--model", "claude-opus-5",
+                "character", "slot", "set", "house", role, "anthropic/claude-opus-5",
             ];
             v.extend_from_slice(extra);
             argv(&v)
@@ -593,7 +611,7 @@ mod tests {
         let c = test_caller();
         match d
             .dispatch(
-                &argv(&["character", "slot", "set", "house", "coder", "--backend", "nope", "--model", "m"]),
+                &argv(&["character", "slot", "set", "house", "coder", "nope/m"]),
                 &c,
             )
             .await
@@ -603,7 +621,7 @@ mod tests {
         }
         match d
             .dispatch(
-                &argv(&["character", "slot", "set", "ghost", "coder", "--backend", "anthropic", "--model", "m"]),
+                &argv(&["character", "slot", "set", "ghost", "coder", "anthropic/m"]),
                 &c,
             )
             .await
@@ -628,7 +646,7 @@ mod tests {
         let set = d
             .dispatch(
                 &argv(&[
-                    "character", "model", "set", "house", "--backend", "anthropic", "--model", "claude-opus-5",
+                    "character", "model", "set", "house", "anthropic/claude-opus-5",
                     "--temperature", "0.3",
                 ]),
                 &c,
@@ -654,17 +672,17 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         let bad_backend = d
-            .dispatch(&argv(&["character", "model", "set", "house", "--backend", "nope", "--model", "m"]), &c)
+            .dispatch(&argv(&["character", "model", "set", "house", "nope/m"]), &c)
             .await;
         assert!(matches!(&bad_backend, KjResult::Err(m) if m.contains("backend 'nope' not found")), "{bad_backend:?}");
         let ghost = d
-            .dispatch(&argv(&["character", "model", "set", "ghost", "--backend", "anthropic", "--model", "m"]), &c)
+            .dispatch(&argv(&["character", "model", "set", "ghost", "anthropic/m"]), &c)
             .await;
         assert!(matches!(&ghost, KjResult::Err(m) if m.contains("character 'ghost' not found")), "{ghost:?}");
         let hot = d
             .dispatch(
                 &argv(&[
-                    "character", "model", "set", "house", "--backend", "anthropic", "--model", "m", "--temperature", "9",
+                    "character", "model", "set", "house", "anthropic/m", "--temperature", "9",
                 ]),
                 &c,
             )
@@ -673,7 +691,7 @@ mod tests {
 
         d.kernel_db()
             .lock()
-            .insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: "boss".into(),
                 created_at: 0,
@@ -684,7 +702,7 @@ mod tests {
             })
             .unwrap();
         let refused = d
-            .dispatch(&argv(&["character", "model", "set", "boss", "--backend", "anthropic", "--model", "m"]), &c)
+            .dispatch(&argv(&["character", "model", "set", "boss", "anthropic/m"]), &c)
             .await;
         assert!(matches!(&refused, KjResult::Err(m) if m.contains("a root runs no model")), "{refused:?}");
     }
@@ -696,7 +714,7 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         let set = d
-            .dispatch(&argv(&["character", "model", "set", "house", "--backend", "anthropic", "--model", "m"]), &c)
+            .dispatch(&argv(&["character", "model", "set", "house", "anthropic/m"]), &c)
             .await;
         assert!(set.is_ok(), "{set:?}");
         let refused = d.dispatch(&argv(&["character", "set", "house", "--root"]), &c).await;
@@ -708,15 +726,15 @@ mod tests {
         assert!(!sheet.root, "a refused set --root leaves the flag alone");
     }
 
-    /// `create --backend --model` writes the character and its model; a bad
-    /// backend leaves no character; the flags come as a pair; a root refuses
-    /// them.
+    /// `create --model <backend>/<model>` writes the character and its model; a
+    /// bad backend leaves no character; a value with no `/` refuses; a root
+    /// refuses it.
     #[tokio::test]
     async fn create_with_a_model_is_all_or_nothing() {
         let d = seeded().await;
         let c = test_caller();
         let made = d
-            .dispatch(&argv(&["character", "create", "worker", "--backend", "anthropic", "--model", "claude-opus-5"]), &c)
+            .dispatch(&argv(&["character", "create", "worker", "--model", "anthropic/claude-opus-5"]), &c)
             .await;
         assert!(made.is_ok(), "{}", made.message());
         {
@@ -726,20 +744,71 @@ mod tests {
         }
 
         let bad = d
-            .dispatch(&argv(&["character", "create", "ghost", "--backend", "nope", "--model", "m"]), &c)
+            .dispatch(&argv(&["character", "create", "ghost", "--model", "nope/m"]), &c)
             .await;
         assert!(matches!(&bad, KjResult::Err(m) if m.contains("backend 'nope' not found")), "{bad:?}");
         assert!(d.kernel_db().lock().get_character_by_name("ghost").unwrap().is_none(), "a bad backend leaves no character");
 
-        let half = d.dispatch(&argv(&["character", "create", "half", "--backend", "anthropic"]), &c).await;
-        assert!(matches!(&half, KjResult::Err(m) if m.contains("--model")), "both or neither: {half:?}");
+        let half = d.dispatch(&argv(&["character", "create", "half", "--model", "anthropic"]), &c).await;
+        assert!(matches!(&half, KjResult::Err(m) if m.contains("<backend>/<model>")), "a value with no '/': {half:?}");
         assert!(d.kernel_db().lock().get_character_by_name("half").unwrap().is_none());
 
         let root = d
-            .dispatch(&argv(&["character", "create", "boss", "--root", "--backend", "anthropic", "--model", "m"]), &c)
+            .dispatch(&argv(&["character", "create", "boss", "--root", "--model", "anthropic/m"]), &c)
             .await;
         assert!(matches!(&root, KjResult::Err(m) if m.contains("a root runs no model")), "{root:?}");
         assert!(d.kernel_db().lock().get_character_by_name("boss").unwrap().is_none());
+    }
+
+    /// The value splits at the FIRST `/`, so a model id that holds a `/` stays
+    /// whole: `anthropic/zai-org/GLM-5.3` is backend `anthropic`, model
+    /// `zai-org/GLM-5.3`, for `create`, `model set` and `slot set`. Falsified
+    /// by splitting at the last `/`.
+    #[tokio::test]
+    async fn a_model_id_may_hold_a_slash() {
+        let d = seeded().await;
+        let c = test_caller();
+        let set = d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let slot = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
+        assert!(slot.is_ok(), "{}", slot.message());
+        let made = d.dispatch(&argv(&["character", "create", "glm", "--model", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
+        assert!(made.is_ok(), "{}", made.message());
+        let db = d.kernel_db().lock();
+        for name in ["house", "glm"] {
+            let sheet = db.get_character_by_name(name).unwrap().unwrap();
+            let model = db.get_character_model(sheet.principal_id).unwrap().unwrap();
+            assert_eq!(model.model, "zai-org/GLM-5.3", "{name}");
+        }
+        let house = db.get_character_by_name("house").unwrap().unwrap();
+        assert_eq!(db.get_character_slot(house.principal_id, "gate").unwrap().unwrap().model, "zai-org/GLM-5.3");
+    }
+
+    /// A value with no `/`, or an empty half, refuses with the form and names
+    /// where the parts are listed; nothing is written.
+    #[tokio::test]
+    async fn a_model_value_without_a_slash_refuses_with_the_form() {
+        let d = seeded().await;
+        let c = test_caller();
+        for value in ["anthropic", "/claude", "anthropic/"] {
+            for verb in [
+                vec!["character", "model", "set", "house", value],
+                vec!["character", "slot", "set", "house", "coder", value],
+                vec!["character", "create", "fresh", "--model", value],
+            ] {
+                match d.dispatch(&argv(&verb), &c).await {
+                    KjResult::Err(m) => {
+                        assert!(m.contains("<backend>/<model>"), "{verb:?}: {m}");
+                        assert!(m.contains("kj backend list") && m.contains("kj models"), "{verb:?}: {m}");
+                    }
+                    other => panic!("{verb:?} must refuse, got {other:?}"),
+                }
+            }
+        }
+        let db = d.kernel_db().lock();
+        let house = db.get_character_by_name("house").unwrap().unwrap();
+        assert!(db.get_character_model(house.principal_id).unwrap().is_none());
+        assert!(db.get_character_by_name("fresh").unwrap().is_none());
     }
 
     /// `kj character show` reports the model and keeps the slots apart as
@@ -752,8 +821,8 @@ mod tests {
         let KjResult::Ok { data: Some(v), .. } = &bare else { panic!("{bare:?}") };
         assert!(v["model"].is_null(), "{v}");
 
-        d.dispatch(&argv(&["character", "model", "set", "house", "--backend", "anthropic", "--model", "claude-opus-5"]), &c).await;
-        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "--backend", "anthropic", "--model", "g"]), &c).await;
+        d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/claude-opus-5"]), &c).await;
+        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/g"]), &c).await;
         let shown = d.dispatch(&argv(&["character", "show", "house"]), &c).await;
         let KjResult::Ok { data: Some(v), message, .. } = &shown else { panic!("{shown:?}") };
         assert_eq!(v["model"]["model"], "claude-opus-5");
@@ -773,7 +842,7 @@ mod tests {
         assert!(r.is_ok(), "{}", r.message());
         match d
             .dispatch(
-                &argv(&["character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model", "m"]),
+                &argv(&["character", "slot", "set", "house", "coder", "anthropic/m"]),
                 &c,
             )
             .await
@@ -792,8 +861,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "choreographer", "--backend", "deepseek", "--model",
-                    "deepseek-v4-pro",
+                    "character", "slot", "set", "house", "choreographer", "deepseek/deepseek-v4-pro",
                 ]),
                 &test_caller(),
             )
@@ -807,8 +875,7 @@ mod tests {
         match d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--top-p", "1.5",
+                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--top-p", "1.5",
                 ]),
                 &test_caller(),
             )
@@ -830,8 +897,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
+                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
                 ]),
                 &test_caller(),
             )
@@ -858,8 +924,7 @@ mod tests {
         let c = test_caller();
         let slot = |budget: &'static str| {
             argv(&[
-                "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                "claude-opus-5", "--thinking-budget", budget,
+                "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--thinking-budget", budget,
             ])
         };
         let r = d
@@ -888,8 +953,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--max-tokens", "1000", "--thinking-budget", "1500",
+                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "1000", "--thinking-budget", "1500",
                 ]),
                 &test_caller(),
             )
@@ -911,8 +975,7 @@ mod tests {
         let d = seeded().await;
         d.dispatch(
             &argv(&[
-                "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                "claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
+                "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "16384", "--thinking-budget", "20000",
             ]),
             &test_caller(),
         )
@@ -929,8 +992,7 @@ mod tests {
         let r = d
             .dispatch(
                 &argv(&[
-                    "character", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
-                    "claude-opus-5", "--max-tokens", "4096", "--thinking-budget", "1000",
+                    "character", "slot", "set", "house", "coder", "anthropic/claude-opus-5", "--max-tokens", "4096", "--thinking-budget", "1000",
                 ]),
                 &test_caller(),
             )
@@ -953,7 +1015,7 @@ mod tests {
             let r = d
                 .dispatch(
                     &argv(&[
-                        "character", "slot", "set", "house", role, "--backend", "anthropic", "--model", "claude-opus-5",
+                        "character", "slot", "set", "house", role, "anthropic/claude-opus-5",
                         "--max-tokens", "4096",
                     ]),
                     &c,

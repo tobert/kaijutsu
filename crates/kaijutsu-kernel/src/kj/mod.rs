@@ -1215,7 +1215,7 @@ pub(crate) mod test_helpers {
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
             let reviewer = test_reviewer_principal();
-            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: reviewer,
                 name: "amy".to_string(),
                 created_at: 0,
@@ -1448,7 +1448,7 @@ pub(crate) mod test_helpers {
             return sheet.principal_id;
         }
         let principal_id = PrincipalId::new();
-        db.insert_character(&crate::kernel_db::CharacterRow { context_type: Some("default".to_string()),
+        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: Some("default".to_string()),
             principal_id, name: TEST_PERFORMER.to_string(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -1481,7 +1481,7 @@ pub(crate) mod test_helpers {
         {
             let db = dispatcher.kernel_db().lock();
             if db.get_character(created_by).unwrap().is_none() {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: created_by, name: format!("model-{}", created_by.short()), created_at: 0,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -1571,7 +1571,7 @@ pub(crate) mod test_helpers {
     pub fn give_character(dispatcher: &KjDispatcher, caller: &KjCaller) {
         let db = dispatcher.kernel_db().lock();
         if db.get_character(caller.actor_id).unwrap().is_none() {
-            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: caller.actor_id, name: format!("caller-{}", caller.actor_id.short()), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -1591,7 +1591,7 @@ pub(crate) mod test_helpers {
     pub fn confirmed_holder_caller(dispatcher: &KjDispatcher, context: ContextId) -> KjCaller {
         let caller = confirmed_caller(context);
         let db = dispatcher.kernel_db().lock();
-        db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: caller.actor_id, name: format!("holder-{}", caller.actor_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -1614,7 +1614,7 @@ pub(crate) mod test_helpers {
     /// statements run without an ask. For tests that are not about the ask.
     pub fn root_character(dispatcher: &KjDispatcher) -> PrincipalId {
         let principal = PrincipalId::new();
-        dispatcher.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        dispatcher.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: principal, name: format!("root-{principal}"), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
@@ -2336,7 +2336,7 @@ mod house_verb_tests {
             let principal_id = PrincipalId::new();
             d.kernel_db()
                 .lock()
-                .insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                .insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id,
                     name: name.to_string(),
                     created_at: 0,

@@ -316,8 +316,8 @@ impl Tool for KjBuiltin {
                 ),
                 ("Merge fork back to parent", "kj drift merge"),
                 (
-                    "Set model on current context",
-                    "kj context set . --model anthropic/claude-sonnet-4-5-20250929",
+                    "Move the current context under another senpai",
+                    "kj context set . --senpai banto-seat",
                 ),
                 ("Bulk synthesize keywords", "kj synth all"),
             ],
@@ -411,6 +411,14 @@ impl Tool for KjBuiltin {
         // IS the confirmation; no nonce store or cross-call state exists.
         let confirmed = crate::kj::parse::has_flag(&argv, &["--confirm"]);
         crate::kj::parse::strip_flag(&mut argv, &["--confirm"]);
+
+        // kaish lifts a global `--json` out of the argv and renders `.data`.
+        // A verb that declares its own `--json` (`kj character list`, whose
+        // plain `.data` is ids and whose `--json` `.data` is rows) must still
+        // see it, or the flag is spent on the ids.
+        if args.has_flag("json") && crate::kj::parse::verb_declares_json(&argv) {
+            argv.push("--json".into());
+        }
 
         // Preserve stdin exactly when the command accepts content and no
         // explicit --content was supplied. File redirection avoids command
@@ -1196,6 +1204,50 @@ mod tests {
             res.data.is_some(),
             "ExecResult.data must survive alongside the rendered stdout"
         );
+    }
+
+    /// A verb that declares its own `--json` (`kj character list --json`
+    /// returns full rows where the plain call returns ids) must still see the
+    /// flag when it comes through the shell: kaish lifts a global `--json`
+    /// out of the argv, so the builtin hands it back to a verb that declares
+    /// it. Verbs that do not declare it keep getting the bare `.data`.
+    #[tokio::test]
+    async fn json_flag_reaches_a_verb_that_declares_its_own() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let alpha = register_context(&dispatcher, Some("alpha"), None, principal);
+        let made = dispatcher
+            .dispatch(
+                &["character".to_string(), "create".to_string(), "hajime".to_string()],
+                &crate::kj::test_helpers::test_caller(),
+            )
+            .await;
+        assert!(made.is_ok(), "{made:?}");
+        let kaish = embedded_with_kj(dispatcher.clone(), alpha).await;
+
+        let plain = kaish
+            .execute_with_options("kj character list", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        let ids: serde_json::Value = serde_json::from_str(&plain.text_out()).unwrap_or(serde_json::Value::Null);
+        assert!(ids.is_null() || ids.as_array().is_some_and(|a| a.iter().all(|v| v.is_string())), "{ids}");
+
+        for script in ["kj character list --json", "kj --json character list"] {
+            let res = kaish
+                .execute_with_options(script, ExecuteOptions::default())
+                .await
+                .expect("kaish exec");
+            assert!(res.ok(), "{script}: {res:?}");
+            let parsed: serde_json::Value = serde_json::from_str(&res.text_out())
+                .unwrap_or_else(|e| panic!("{script}: stdout not JSON ({e}): {}", res.text_out()));
+            let rows = parsed.as_array().unwrap_or_else(|| panic!("{script}: not an array: {parsed}"));
+            let row = rows
+                .iter()
+                .find(|r| r["name"] == "hajime")
+                .unwrap_or_else(|| panic!("{script}: --json must return rows, got {parsed}"));
+            assert!(row.get("principal_id").is_some(), "{script}: {row}");
+        }
     }
 
     /// `kj --json context list` (flag BEFORE the subcommand) is the other form

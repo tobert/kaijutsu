@@ -147,7 +147,7 @@ kj drift queue                                 # see what's staged
 kj drift flush                                 # deliver
 kj drift pull <label> [prompt]                 # LLM digest from another context into this one
 kj drift merge                                 # summarize this fork back into parent
-kj drift report "text"                        # deliver to the context this one answers to; no id, no ask
+kj drift push .senpai "text"                  # deliver to the context this one answers to; no id, no ask
 ```
 
 A drift block lands in the target context's document. The next time anyone
@@ -183,8 +183,8 @@ Give the character a `distill` slot on the cheap model and a slot for the
 context type on the expensive one:
 
 ```bash
-kj character slot set coder distill --backend anthropic --model claude-haiku-4-5-20251001
-kj character slot set coder coder   --backend anthropic --model claude-opus-4
+kj character slot set coder distill anthropic/claude-haiku-4-5-20251001
+kj character slot set coder coder   anthropic/claude-opus-4
 kj fork --name big-task --compact
 ```
 

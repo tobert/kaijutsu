@@ -607,7 +607,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
         {
             let db = shared_kernel.kernel_db.lock();
             for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
-                db.insert_character(&CharacterRow { context_type: None,
+                db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id,
                     name: name.into(),
                     created_at: 0,

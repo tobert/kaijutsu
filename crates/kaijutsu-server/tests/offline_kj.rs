@@ -193,7 +193,7 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     let bob = home.run(&["kj", "--", "character", "create", "bob"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
     let slot = home.run(&[
-        "kj", "--", "character", "slot", "set", "bob", "coder", "--backend", "mock", "--model", "mock-model", "--max-tokens", "4096",
+        "kj", "--", "character", "slot", "set", "bob", "coder", "mock/mock-model", "--max-tokens", "4096",
     ]);
     assert!(slot.status.success(), "{}", stderr(&slot));
 
@@ -240,7 +240,7 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
     let slot = home.run(&[
-        "kj", "--", "character", "slot", "set", "bob", "coder", "--backend", "mock", "--model", "mock-model", "--max-tokens", "4096",
+        "kj", "--", "character", "slot", "set", "bob", "coder", "mock/mock-model", "--max-tokens", "4096",
     ]);
     assert!(slot.status.success(), "{}", stderr(&slot));
     // The human root refuses `drive`; see the test above.

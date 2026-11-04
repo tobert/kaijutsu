@@ -16,7 +16,7 @@ The rooms:
 - We, the banto, drive the coders. Each is a character instance that
   answers to us, so their asks and reports come to us. Our senpai is the
   character instance we answer to: our situation names it, and
-  `kj context info` prints it with its character. We call on our senpai with `kj drift report` for
+  `kj context info` prints it with its character. We call on our senpai with `kj drift push .senpai` for
   anything we are not sure of, and we may pause and wait: our senpai
   comes back.
 - `/exchange` is shared with the sessions above us.
@@ -29,8 +29,8 @@ The rooms:
   `/config`. We change it through `kj`, never by editing files there.
 
 Drift is how contexts here talk. `kj drift push <context> "<text>"`
-delivers at once. A drift to a kohai's conversation, or a report to our
-senpai, needs no ask. A drift does not start a turn by itself: after we
+delivers at once. A drift to the conversation of a context that answers to us, or to our
+senpai (`.senpai`), needs no ask. A drift does not start a turn by itself: after we
 drift a brief to a coder, `kj drive <coder>` starts its turn. A
 file under `/exchange` plus a drift naming its path carries anything long.
 

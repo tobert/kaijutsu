@@ -91,10 +91,10 @@ kj character create "$project-coder"
 
 # A character's slots give its contexts their models, copied when a context is made. banto runs Haiku; the coder
 # runs DeepSeek. Each has a `distill` slot, which `kj fork --compact` and `kj drift pull` summarize on.
-kj character slot set banto director --backend anthropic --model claude-haiku-5-5
-kj character slot set banto distill --backend deepseek --model deepseek-flash
-kj character slot set "$project-coder" coder --backend deepseek --model deepseek-flash
-kj character slot set "$project-coder" distill --backend deepseek --model deepseek-flash
+kj character slot set banto director anthropic/claude-haiku-5-5
+kj character slot set banto distill deepseek/deepseek-flash
+kj character slot set "$project-coder" coder deepseek/deepseek-flash
+kj character slot set "$project-coder" distill deepseek/deepseek-flash
 
 # The overlay goes in before any context exists, so each create lifecycle reads it.
 rc="$base/kernel-data/config/kaijutsu/config/rc"
@@ -132,7 +132,7 @@ python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel
 # Without it, /usr/bin/awk counts bytes, and a 120-column check flags a line of multi-byte characters.
 kj context create banto --name "$project-banto" --type director --cwd "$repo" --env LANG=C.UTF-8
 # The coder is a character instance that answers to banto's instance (its senpai), so banto's character reviews its
-# asks, and a drift either way between their conversations, or a `kj drift report`, needs no ask. Banto starts the
+# asks, and a drift either way between their conversations, or a `kj drift push .senpai`, needs no ask. Banto starts the
 # coder's turns with `kj drive`.
 kj context create "$project-coder" --type coder --senpai "$project-banto" --cwd /workspace --env LANG=C.UTF-8
 kj context list
@@ -143,4 +143,4 @@ echo "  cp $here/kaijutsu-dev@.container ~/.config/containers/systemd/"
 echo "  systemctl --user daemon-reload && systemctl --user start kaijutsu-dev@$project"
 echo
 echo "banto answers to Amy's root console. Once senpai's MCP session has made its context, Amy moves banto's instance under it:"
-echo "  kj context move $project-banto <senpai's context>"
+echo "  kj context set $project-banto --senpai <senpai's context>"

@@ -148,8 +148,8 @@ overlay.
 - **Seats.** banto plays a `director` context on `anthropic/claude-haiku-5-5` in the project. Its senpai is the
   supervising Claude session's context, whose holder connects over MCP with its own key (`~/.ssh/kaijutsu-senpai`).
   That context does not exist when `bootstrap.sh` runs, so banto starts under Amy's root console, and Amy moves
-  it with `kj context move <project>-banto <senpai's context>` (bootstrap prints the command).
-  banto's asks go to senpai, and a drift between banto and senpai (`kj drift report`) needs no ask. banto starts
+  it with `kj context set <project>-banto --senpai <senpai's context>` (bootstrap prints the command).
+  banto's asks go to senpai, and a drift between banto and senpai (`kj drift push .senpai`) needs no ask. banto starts
   coder turns with `kj drive`; a drift does not start a turn, and the drift wake script is not written.
 - **Gate.** Coders run with `uncovered = "allow"`. The `mcp` type does too, so the supervisor's `kj` verbs do not
   wait on Amy. `root` allows `kj context create`, which MCP registration runs under Amy's root.
@@ -205,8 +205,8 @@ overlay.
 ### Seat, gate, and supervision
 
 - Characters: a `<project>-coder` performer on the `deepseek-flash` model,
-  and `banto`. Each coder context is a kohai of banto's seat, so its asks reach
-  banto, which is driving the loop; banto's seat is a kohai of the supervising
+  and `banto`. Each coder context answers to banto's seat, so its asks reach
+  banto, which is driving the loop; banto's seat answers to the supervising
   Claude session's context. The bootstrap creates both with `kj context create`.
   In the first runs the supervising Claude session outside the container can
   hold the banto seat itself and drive the coder seats over MCP. Later a model

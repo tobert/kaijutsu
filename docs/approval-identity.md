@@ -28,7 +28,7 @@ like any other; a climb passes over a senpai with no performer. A rotation write
 - The chain never has a cycle. Setting an edge that would close one is refused.
 
 `kj context info [<ctx>]` prints the instance, its senpai (label and character), the lineage root, and who would
-review an ask by its character. `kj context kohai [<ctx>]` lists the live kohai with character and type. Each takes
+review an ask by its character. `kj context list --senpai <ctx>` lists the live contexts that answer to a context. Each takes
 any context of an instance and uses that context's instance.
 
 ## Routing
@@ -68,7 +68,7 @@ refuses with the reason.
 
 One rule: **the character of an instance's senpai, or its lineage root**, may
 
-- move it to another senpai (`kj context move <ctx> <senpai-ctx>`, each naming any context of its instance);
+- move it to another senpai (`kj context set <ctx> --senpai <senpai-ctx>`, each naming any context of its instance);
 - escalate its asks;
 - rotate it (its own performer may also rotate it, with no ask);
 - archive it.
@@ -86,7 +86,7 @@ A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root
 - A senpai move refuses while any context of the instance has pending asks. Performer and reviewer must resolve
   to live, distinct characters.
 
-Create sets the edge, and nothing else moves it but `kj context move`: `kj fork` joins the forking context's
+Create sets the edge, and nothing else moves it but `kj context set --senpai`: `kj fork` joins the forking context's
 instance, and `kj context rotate` starts a new conversation in the same instance, so neither touches the senpai or
 the kohai. Every client creation names its performer as the positional character.
 
@@ -249,7 +249,7 @@ character holds the target's senpai. It covers these verbs:
 | `kj context create [--senpai <c>]` | `--senpai`; without it, the new context is the caller's own kohai | |
 
 The gate resolves the target the way the verb does (label, id, `.`,
-`.parent`). Every argument must be a literal word, because an expanded
+`.parent`, `.senpai`). Every argument must be a literal word, because an expanded
 argument could name another context or a flag, and a call with `--` is
 not covered. A `kj` call that the builtin layer allows (a read, `kj
 ledger`, `--help`) passes. Any other `kj` call is not covered, and

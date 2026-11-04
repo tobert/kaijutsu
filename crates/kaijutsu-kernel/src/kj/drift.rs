@@ -138,7 +138,7 @@ enum DriftCommand {
     /// `flush` instead of delivering now. Refuses an archived or concluded
     /// target, at both push and flush time — fork it to continue.
     Push {
-        /// Destination context reference
+        /// Destination context reference. `.senpai` names the context this one answers to
         dst: String,
         /// LLM-distill the caller's context instead of using literal content
         #[arg(long, short = 's')]
@@ -149,16 +149,6 @@ enum DriftCommand {
         /// Content to send (joined with spaces). Omit when using --summarize.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         content: Vec<String>,
-    },
-    /// Report to this context's senpai: the text lands in the senpai context
-    /// as a drift block from the current context, as `push` would put it
-    /// there, with no context id to type. A drift along the senpai edge needs
-    /// no ask. Refuses a context with no senpai, an archived senpai, and
-    /// empty text.
-    Report {
-        /// The report (joined with spaces).
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        text: Vec<String>,
     },
     /// Distill a source context into the caller's context. It runs on the
     /// caller's `distill` slot and refuses when the caller has none.
@@ -231,7 +221,6 @@ impl KjDispatcher {
         if matches!(
             parsed.command,
             DriftCommand::Push { .. }
-                | DriftCommand::Report { .. }
                 | DriftCommand::Pull { .. }
                 | DriftCommand::Merge { .. }
                 | DriftCommand::Flush
@@ -251,7 +240,6 @@ impl KjDispatcher {
                 self.drift_push(&dst, summarize, stage, &content, caller)
                     .await
             }
-            DriftCommand::Report { text } => self.drift_report(&text, caller).await,
             DriftCommand::Pull { src, prompt } => {
                 self.drift_pull(&src, &prompt, caller).await
             }
@@ -265,48 +253,6 @@ impl KjDispatcher {
             DriftCommand::Edge { op } => match op {
                 EdgeCommand::Rm { uuid } => self.drift_edge_rm(&uuid),
             },
-        }
-    }
-
-    /// `kj drift report <text>...`: `drift_push` to the caller's senpai, by
-    /// id, so the report can only reach the context this one answers to.
-    async fn drift_report(&self, text: &[String], caller: &KjCaller) -> KjResult {
-        let here = match caller.require_context() {
-            Ok(id) => id,
-            Err(e) => return e,
-        };
-        let senpai = {
-            let db = self.kernel_db().lock();
-            let found = (|| -> Result<crate::kernel_db::ContextRow, String> {
-                let (_, row) = super::context::resolve_character_arg(Some(&here.to_hex()), caller, &db)?;
-                let senpai_id = row.senpai_ctx.ok_or_else(|| {
-                    format!("{} has no senpai, so there is nobody to report to", db.context_name(row.context_id))
-                })?;
-                let senpai = db.get_context(senpai_id).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("senpai {} has no row", senpai_id.short()))?;
-                if senpai.is_archived() {
-                    return Err(format!(
-                        "{} is archived; `kj context promote` it to reach it again, or move this context with `kj context move`",
-                        db.context_name(senpai_id)
-                    ));
-                }
-                Ok(senpai)
-            })();
-            match found {
-                Ok(found) => found,
-                Err(e) => return KjResult::Err(format!("kj drift report: {e}")),
-            }
-        };
-        match self.drift_push(&senpai.context_id.to_hex(), false, false, text, caller).await {
-            KjResult::Ok { .. } => {
-                let db = self.kernel_db().lock();
-                KjResult::ok_with_data(
-                    format!("reported → {}", super::context::context_line(&db, &senpai)),
-                    serde_json::json!({ "senpai": super::context::context_json(&db, &senpai) }),
-                )
-            }
-            KjResult::Err(e) => KjResult::Err(e.replacen("kj drift push", "kj drift report", 1)),
-            other => other,
         }
     }
 
@@ -464,7 +410,7 @@ impl KjDispatcher {
         if !human {
             return Err(format!(
                 "The console's reviewer resolves to {}, which is not a live root character, and only a human \
-                 releases a drift into the console; set one with `kj context move console <root context>`",
+                 releases a drift into the console; set one with `kj context set console --senpai <root context>`",
                 db.name_for(reviewer)
             ));
         }
@@ -559,6 +505,19 @@ impl KjDispatcher {
         Some(format!("context '{name}' is {why}"))
     }
 
+    /// For a push to the caller's own archived senpai, the two ways to reach
+    /// a live senpai again; empty for any other refused target.
+    fn archived_senpai_way_out(&self, from: ContextId, target: ContextId) -> &'static str {
+        let db = self.kernel_db().lock();
+        let archived_senpai = db.get_context(from).ok().flatten().is_some_and(|row| row.senpai_ctx == Some(target))
+            && db.get_context(target).ok().flatten().is_some_and(|row| row.is_archived());
+        if archived_senpai {
+            "; `kj context promote` it to reach it again, or move this context under a live senpai with `kj context set <ctx> --senpai <ctx>`"
+        } else {
+            ""
+        }
+    }
+
     pub(super) async fn drift_push(
         &self,
         dst_query: &str,
@@ -600,12 +559,20 @@ impl KjDispatcher {
             }
         };
 
+        // A relative reference (`.senpai`, `.parent`) names nothing by itself:
+        // the messages below say which context it reached.
+        let dst_shown = if dst_query.starts_with('.') {
+            format!("{} ({dst_query})", self.kernel_db().lock().context_name(target_id))
+        } else {
+            dst_query.to_string()
+        };
+
         // Refuse before doing any work (including the `--summarize` distill
         // below, which would otherwise run an LLM call for content that can
         // never land) — on both the immediate-delivery and `--stage` paths,
         // since both share this one resolution point.
         if let Some(why) = self.drift_target_refusal(target_id) {
-            return KjResult::Err(format!("kj drift push: {why}"));
+            return KjResult::Err(format!("kj drift push: {why}{}", self.archived_senpai_way_out(context_id, target_id)));
         }
 
         // Determine content and drift kind
@@ -690,13 +657,13 @@ impl KjDispatcher {
                 )
                 .await
             {
-                Ok(DriftDeliveryOutcome::Complete(None)) => KjResult::ok(format!("drifted → {}", dst_query)),
-                Ok(DriftDeliveryOutcome::Complete(Some(ask))) => KjResult::ok(held_message(dst_query, &ask)),
+                Ok(DriftDeliveryOutcome::Complete(None)) => KjResult::ok(format!("drifted → {}", dst_shown)),
+                Ok(DriftDeliveryOutcome::Complete(Some(ask))) => KjResult::ok(held_message(&dst_shown, &ask)),
                 Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => KjResult::Err(format!(
-                    "kj drift push: delivered to {dst_query}, but its rc lifecycle was cancelled: {error}"
+                    "kj drift push: delivered to {dst_shown}, but its rc lifecycle was cancelled: {error}"
                 )),
                 Ok(DriftDeliveryOutcome::LifecycleFault(error)) => KjResult::Err(format!(
-                    "kj drift push: delivered to {dst_query}, but its rc lifecycle could not settle: {error}"
+                    "kj drift push: delivered to {dst_shown}, but its rc lifecycle could not settle: {error}"
                 )),
                 Err(e) => stage_after_failure(e),
             };
@@ -723,11 +690,11 @@ impl KjDispatcher {
         };
 
         match durable {
-            Ok(()) => KjResult::ok(format!("staged drift #{} → {}", staged_id, dst_query)),
+            Ok(()) => KjResult::ok(format!("staged drift #{} → {}", staged_id, dst_shown)),
             Err(attach_err) => KjResult::ok(format!(
                 "staged drift #{} → {} — WARNING: the durable drift queue could not be \
                  attached ({}), so this item will NOT survive a kernel restart",
-                staged_id, dst_query, attach_err
+                staged_id, dst_shown, attach_err
             )),
         }
     }
@@ -1331,7 +1298,6 @@ impl Classify for DriftCommand {
         match self {
             DriftCommand::Queue | DriftCommand::History { .. } => Effect::Read,
             DriftCommand::Push { .. }
-            | DriftCommand::Report { .. }
             | DriftCommand::Pull { .. }
             | DriftCommand::Merge { .. }
             | DriftCommand::Flush
@@ -1479,7 +1445,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(amy, "house-amy", true), (rootbot, "house-rootbot", false), (coder, "house-coder", false)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
                 }).unwrap();
             }

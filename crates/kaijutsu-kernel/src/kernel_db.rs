@@ -786,6 +786,9 @@ fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
         root: row.get(5)?,
         root_ctx: read_opt_context_id(row, 6)?,
         context_type: row.get(7)?,
+        rc_dir: row.get(8)?,
+        console_ctx: read_opt_context_id(row, 9)?,
+        mcp_hub_ctx: read_opt_context_id(row, 10)?,
     })
 }
 

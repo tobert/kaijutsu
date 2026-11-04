@@ -213,7 +213,7 @@ impl KernelDb {
     ///   trigger: a root console is inserted before `root_ctx` points at it,
     ///   so the insert paths check in Rust ([`Self::check_senpai_edge`]).
     ///
-    /// `senpai_ctx` stays updatable (`kj context move`).
+    /// `senpai_ctx` stays updatable (`kj context set --senpai`).
     pub(super) fn ensure_context_guards(conn: &Connection) -> KernelDbResult<()> {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_contexts_performer

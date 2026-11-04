@@ -23,9 +23,8 @@ Drift moves information between contexts. `kj drift push` puts text in another
 context's log without running a model; a running turn there reads it after its
 next tool call. `kj drift pull` has a model distill another context into ours.
 `kj drift merge`, run inside a fork, summarizes the fork into its parent.
-A drift between a context and its senpai, either way, needs no ask. A fork is
-a kohai of the context it forked from, so the same holds between a context and
-its fork.
+A drift between a context and its senpai, either way, needs no ask. A fork answers to the
+context it forked from, so the same holds between a context and its fork.
 
 When a context needs a decision outside its loadout, it raises an ask and
 waits. The ledger holds the asks, and the senpai's character allows or denies each one.
@@ -44,8 +43,8 @@ Find the character who will perform a new piece of work. The `coder` character p
 kj context create coder --name fix-login
 Start one piece of work as a new context for a character. Without --name the label is the character's name, and the type is the character's own; pass --type to pick another. It answers to us, so its asks come to us. Pick the type that fits the work; coder is one type.
 
-kj context kohai
-See the contexts that answer to us, each with its character and type.
+kj context list --senpai .
+See the live contexts that answer to us.
 
 kj drive fix-login --prompt "<the work, what it may touch, what done looks like, and how to check it>"
 Send the brief and start the turn.
@@ -68,8 +67,8 @@ Correct or inform a context without running a model.
 kj drift pull fix-login "List the files you changed and each check you ran, with its exit status."
 Bring a distilled result from a context into ours.
 
-kj drift report "Done: <...> Checked: <...> Open: <...>"
-Report to our senpai. It needs no context id.
+kj drift push .senpai "Done: <...> Checked: <...> Open: <...>"
+Report to our senpai. `.senpai` names it, so there is no context id to type.
 
 kj interrupt fix-login
 Stop a turn that is looping or off course. Add --immediate to stop it at once.

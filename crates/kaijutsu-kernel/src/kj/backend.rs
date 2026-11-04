@@ -233,7 +233,7 @@ fn model_summary(m: &BackendModelRow) -> String {
 pub(crate) const NO_BACKEND_HINT: &str = "No LLM backend is configured: add one with \
      `kj backend set`, then give a character a model on it with `kj character model set`. For example, \
      `kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY`, then \
-     `kj character model set coder --backend deepseek --model deepseek-flash --max-tokens 65536`.";
+     `kj character model set coder deepseek/deepseek-flash --max-tokens 65536`.";
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_backend(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -879,6 +879,21 @@ mod tests {
         );
     }
 
+    /// A model is written `<backend>/<model>` and split at the first `/`, so
+    /// a backend name with a `/` could not be addressed: `backend set` refuses
+    /// it and stores nothing.
+    #[tokio::test]
+    async fn backend_set_refuses_a_name_with_a_slash() {
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d.dispatch(&argv(&["backend", "set", "zai/glm", "--kind", "deepseek"]), &c).await;
+        match r {
+            KjResult::Err(m) => assert!(m.contains("must not contain '/'"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(d.kernel_db().lock().get_backend_by_name("zai/glm").unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn remove_is_refused_while_an_alias_points_at_the_backend() {
         let d = seeded().await;
@@ -910,7 +925,7 @@ mod tests {
         let principal = kaijutsu_types::PrincipalId::new();
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: principal, name: "bound".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();

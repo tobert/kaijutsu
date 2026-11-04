@@ -41,6 +41,25 @@ pub fn strip_flag(argv: &mut Vec<String>, names: &[&str]) {
     argv.retain(|a| !names.contains(&a.as_str()));
 }
 
+/// Whether the verb `argv` reaches declares its own `--json` flag (the root's
+/// is kaish's, and does not count). Walks the clap tree one subcommand token
+/// at a time and stops at the first token that is not one.
+pub fn verb_declares_json(argv: &[String]) -> bool {
+    let mut current = super::kj_command();
+    let mut descended = false;
+    for token in argv {
+        match current.find_subcommand(token.as_str()).cloned() {
+            Some(sub) => {
+                current = sub;
+                descended = true;
+            }
+            None if token.starts_with('-') && !descended => {}
+            None => break,
+        }
+    }
+    descended && current.get_arguments().any(|a| a.get_id().as_str() == "json")
+}
+
 /// Extract all instances of a repeatable named argument.
 ///
 /// e.g., `--path /a --path /b` → `vec!["/a", "/b"]`

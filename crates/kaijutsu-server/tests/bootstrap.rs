@@ -134,7 +134,7 @@ fn without_a_backend_root_waits_for_one() {
             filled.ran,
             [
                 "kj backend set mock --kind mock --key-optional",
-                "kj character model set root --backend mock --model mock-model --max-tokens 16384",
+                "kj character model set root mock/mock-model --max-tokens 16384",
                 "kj context rotate console",
             ],
             "the backend, the performer's model, and a rotated the console that takes it"
@@ -217,5 +217,59 @@ fn a_different_console_performer_is_reported_and_root_is_left_alone() {
             "the report names the mismatch: {again:?}"
         );
         assert!(!again.ran.iter().any(|line| line.contains("context rotate")), "the console was not rotated: {again:?}");
+    });
+}
+
+/// The root's sheet points at the console bootstrap makes, and a rotation that
+/// gives the console its model moves the pointer to the successor.
+#[test]
+fn bootstrap_points_the_root_at_the_console_and_rotation_moves_it() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let bare = bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
+        assert!(bare.ran.iter().any(|l| l == "kj character set amy --console console"), "{bare:?}");
+        let before = {
+            let db = kernel_db(&config);
+            let console = db.find_context_by_label("console").unwrap().expect("the console exists").context_id;
+            let amy = db.get_character_by_name("amy").unwrap().unwrap();
+            assert_eq!(amy.console_ctx, Some(console), "the root points at its console");
+            console
+        };
+
+        let filled = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
+            .await
+            .expect("bootstrap with a backend");
+        assert!(filled.ran.iter().any(|l| l == "kj context rotate console"), "{filled:?}");
+        let db = kernel_db(&config);
+        let after = db.find_context_by_label("console").unwrap().expect("the console exists").context_id;
+        assert_ne!(before, after, "the rotation made a successor");
+        let amy = db.get_character_by_name("amy").unwrap().unwrap();
+        assert_eq!(amy.console_ctx, Some(after), "the pointer moved with the label");
+        assert!(!filled.ran.iter().any(|l| l.contains("character set amy --console")), "the rotation moved it: {filled:?}");
+    });
+}
+
+/// A console made before the sheet had a pointer is accepted as it stands, and
+/// bootstrap sets the pointer without making another context.
+#[test]
+fn bootstrap_adopts_an_existing_console_the_sheet_does_not_point_at() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
+        let console = {
+            let db = kernel_db(&config);
+            let amy = db.get_character_by_name("amy").unwrap().unwrap();
+            db.set_character_console_ctx(amy.principal_id, None).unwrap();
+            db.find_context_by_label("console").unwrap().unwrap().context_id
+        };
+
+        let again = bootstrap(&config, &options(&config, None)).await.expect("bootstrap again");
+        assert_eq!(again.ran, ["kj character set amy --console console"], "{again:?}");
+        let db = kernel_db(&config);
+        assert_eq!(db.find_context_by_label("console").unwrap().unwrap().context_id, console, "no second console");
+        assert_eq!(db.get_character_by_name("amy").unwrap().unwrap().console_ctx, Some(console));
+
+        let third = bootstrap(&config, &options(&config, None)).await.expect("bootstrap a third time");
+        assert!(third.ran.is_empty(), "the pointer is set, so nothing is left: {third:?}");
     });
 }

@@ -421,7 +421,7 @@ grows with the gate.
   gives the seat a judge, pointing at the megakernel, lfm2d, or Jev through
   OpenRouter; a binding with no such slot gives none. "mk bumps", "lfm2d
   bumps", and "Jev bumps" become character slots. A character holds a
-  `judge` slot (`kj character slot set coder judge --backend mk-zorak --model ...`),
+  `judge` slot (`kj character slot set coder judge mk-zorak/...`),
   and each context copies the slots when it is made or rotated, so every
   context a `coder` character plays gets the judge with nothing to turn on per
   seat; to give a seat another slot, rotate it after the character's slot changes.
@@ -823,7 +823,7 @@ contexts = ["council-amy", "council-banto"]
 ```
 
 `gate.toml` names no council server and no served model. A context decides on its own `gate` slot:
-`kj character slot set coder gate --backend mk-zorak --model gemma-4` sends the gate decisions of every
+`kj character slot set coder gate mk-zorak/gemma-4` sends the gate decisions of every
 context `coder` plays, made after the slot was set, to the served model `gemma-4` on the council server at
 backend `mk-zorak`'s `base_url`. A context copies the slot when it is made or rotated, so a slot change moves no
 running context. A context with no `gate` slot has no council: its gate decides without one, whatever `gate.toml`

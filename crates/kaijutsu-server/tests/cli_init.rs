@@ -123,7 +123,7 @@ fn init_refuses_when_another_root_exists() {
 fn init_makes_an_existing_character_a_root() {
     let home = Home::new();
     let amy = PrincipalId::new();
-    KernelDb::open(home.kernel_db_path()).unwrap().insert_character(&CharacterRow { context_type: None,
+    KernelDb::open(home.kernel_db_path()).unwrap().insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: amy,
         name: "amy".into(),
         created_at: 1,
@@ -147,7 +147,7 @@ fn init_makes_an_existing_character_a_root() {
 fn init_refuses_a_key_bound_to_another_character() {
     let home = Home::new();
     let other = PrincipalId::new();
-    KernelDb::open(home.kernel_db_path()).unwrap().insert_character(&CharacterRow { context_type: None,
+    KernelDb::open(home.kernel_db_path()).unwrap().insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: other,
         name: "banto".into(),
         created_at: 1,

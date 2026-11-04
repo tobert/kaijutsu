@@ -76,7 +76,7 @@ pub fn migrate_legacy_names(
                 incoming: principal_id.short(),
             });
         }
-        kernel_db.insert_character(&CharacterRow { context_type: None,
+        kernel_db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: *principal_id,
             name: username.clone(),
             created_at: kaijutsu_types::now_millis() as i64,
@@ -218,7 +218,7 @@ CREATE TABLE IF NOT EXISTS credentials (
         let auth_db = AuthDb::open(dir.path().join("auth.db")).unwrap();
         let mut kernel_db = KernelDb::temporary().unwrap();
         kernel_db
-            .insert_character(&CharacterRow { context_type: None,
+            .insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: amy,
                 name: "kaijutsu-lead".to_string(),
                 created_at: 1,
@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS credentials (
         let mut kernel_db = KernelDb::temporary().unwrap();
         // A DIFFERENT principal already owns the name "amy".
         kernel_db
-            .insert_character(&CharacterRow { context_type: None,
+            .insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: PrincipalId::new(),
                 name: "amy".to_string(),
                 created_at: 1,

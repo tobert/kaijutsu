@@ -131,7 +131,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
     {
         let db = h.db.lock();
         if db.get_character_by_name("performer").unwrap().is_none() {
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: "performer".to_string(),
                 created_at: 0,

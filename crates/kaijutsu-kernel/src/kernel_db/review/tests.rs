@@ -112,7 +112,7 @@ fn route_review_refuses_a_non_root_actor_at_a_top_context() {
     assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
     let text = error.to_string();
     assert!(text.contains("bob") && text.contains("orphan-top") && text.contains("root"), "{text}");
-    assert!(text.contains("kj context move"), "names the fix: {text}");
+    assert!(text.contains("kj context set <ctx> --senpai <ctx>"), "names the fix: {text}");
 
     // A lane under a top held by the actor itself climbs into the same refusal.
     let lane = senpai_ctx_row(&db, ws_id, "under-bob", Some(&orphan), Some(coder));

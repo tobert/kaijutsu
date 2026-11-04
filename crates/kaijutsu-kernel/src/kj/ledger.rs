@@ -2399,7 +2399,7 @@ mod tests {
         let context = register_context(&d, Some("decision-context"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
@@ -3396,7 +3396,7 @@ mod tests {
         let root = register_root_context(d);
         let character = |name: &str| {
             let id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -3555,8 +3555,10 @@ mod tests {
             (&house.kei, "kj drift push lane-a 'not my kohai'", Pending),
             (&house.banto, "kj drift push $LANE 'which one?'", Pending),
             (&house.banto, "kj drift push lane-a 'x' > /tmp/out", Pending),
-            (&lane, "kj drift report 'the first part is done'", Allowed),
-            (&root, "kj drift report 'nobody above me'", Pending),
+            (&lane, "kj drift push .senpai 'the first part is done'", Allowed),
+            (&lane, "kj drift push .senpai.senpai 'two hops up'", Pending),
+            (&house.banto, "kj drift push .senpai 'up from the seat'", Allowed),
+            (&root, "kj drift push .senpai 'nobody above me'", Pending),
         ];
         for (caller, source, expected) in cases {
             let outcome = gate_once(&d, caller, planned_shell_spec(source)).await;
@@ -3616,6 +3618,9 @@ mod tests {
             (own, "kj drift push person-fork 'sideways'", Pending),
             (seat, "kj drift push lane-fork 'a fork of a kohai'", Pending),
             (seat, "kj drift push lane-a 'the kohai'", Allowed),
+            (own, "kj drift push .senpai 'branch done'", Allowed),
+            (person, "kj drift push .senpai 'a person made me'", Pending),
+            (grandchild, "kj drift push .senpai.senpai 'two hops up'", Pending),
         ];
         for (context, source, expected) in cases {
             let outcome = gate_once(&d, &from(*context), planned_shell_spec(source)).await;
@@ -4440,7 +4445,7 @@ mod tests {
     fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = kaijutsu_types::PrincipalId::new();
         // A person at a console is a live character, which `kj context create` needs.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -5112,7 +5117,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.update_performer(seat, Some(banto)).unwrap();
             db.update_performer(lane, Some(coder)).unwrap();
@@ -5156,7 +5161,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(lead, "lead", false), (bob, "bob", true)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
         }
@@ -5183,7 +5188,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
@@ -5218,7 +5223,7 @@ mod tests {
         caller.context_id = Some(lane);
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_performer(root, Some(amy)).unwrap();

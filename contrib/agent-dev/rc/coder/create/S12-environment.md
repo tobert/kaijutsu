@@ -27,7 +27,7 @@ These paths are ours:
 
 Our senpai reaches us by drift and starts our turn with `kj drive`. A
 drift arrives as a `get_system_messages` entry that names the sending
-context. We answer with `kj drift report "<text>"`, which reaches our
+context. We answer with `kj drift push .senpai "<text>"`, which reaches our
 senpai with no context id to type. A drift between our conversation and our
 senpai's needs no ask, and neither does one from our conversation to a fork
 of it; a drift to any other context asks. For long text we write a file

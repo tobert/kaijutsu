@@ -1,6 +1,6 @@
 //! Context reference parsing for kj commands.
 //!
-//! Supports `.` (current), `.parent` chains, labels, and hex prefixes.
+//! Supports `.` (current), `.parent` / `.senpai` chains, labels, and hex prefixes.
 
 use kaijutsu_types::ContextId;
 
@@ -13,10 +13,29 @@ use super::KjCaller;
 pub enum ContextRef {
     /// `.` — the caller's current context.
     Current,
-    /// `.parent`, `.parent.parent`, etc. — walk up fork lineage.
-    Parent(usize),
+    /// `.parent`, `.senpai`, `.parent.senpai`, etc. — one step per segment,
+    /// in any order, from the current context.
+    Chain(Vec<RefStep>),
     /// A label or hex prefix — resolved via KernelDb.
     Query(String),
+}
+
+/// One segment of a [`ContextRef::Chain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefStep {
+    /// `.parent` — the context this one was forked from (`forked_from`).
+    Parent,
+    /// `.senpai` — the context this one answers to (`senpai_ctx`).
+    Senpai,
+}
+
+impl RefStep {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Senpai => "senpai",
+        }
+    }
 }
 
 /// Parse a context reference string into a ContextRef.
@@ -25,15 +44,19 @@ pub fn parse_context_ref(s: &str) -> ContextRef {
         return ContextRef::Current;
     }
 
-    if s.starts_with(".parent") {
-        // Count the chain: .parent = 1, .parent.parent = 2, etc.
-        let depth = s.matches(".parent").count();
-        // Validate the format: should be exactly ".parent" repeated
-        let expected = (0..depth).map(|_| ".parent").collect::<String>();
-        if s == expected {
-            return ContextRef::Parent(depth);
+    // Exactly a chain of `.parent` and `.senpai` segments; anything else is a query.
+    if let Some(rest) = s.strip_prefix('.') {
+        let steps: Option<Vec<RefStep>> = rest
+            .split('.')
+            .map(|segment| match segment {
+                "parent" => Some(RefStep::Parent),
+                "senpai" => Some(RefStep::Senpai),
+                _ => None,
+            })
+            .collect();
+        if let Some(steps) = steps {
+            return ContextRef::Chain(steps);
         }
-        // If it doesn't match the exact pattern, treat as a query
     }
 
     ContextRef::Query(s.to_string())
@@ -56,23 +79,24 @@ pub fn resolve_context_ref_from(
 ) -> Result<ContextId, String> {
     match ctx_ref {
         ContextRef::Current => current.ok_or_else(|| "no active context joined".to_string()),
-        ContextRef::Parent(depth) => {
+        ContextRef::Chain(steps) => {
             let mut current = current.ok_or_else(|| "no active context joined".to_string())?;
-            for i in 0..*depth {
+            let written = || steps.iter().map(|step| format!(".{}", step.word())).collect::<String>();
+            for (i, step) in steps.iter().enumerate() {
                 let row = db
                     .get_context(current)
                     .map_err(|e| format!("db error: {e}"))?
                     .ok_or_else(|| {
-                        format!(
-                            "context {} not found at parent depth {}",
-                            current.short(),
-                            i
-                        )
+                        format!("context {} not found at step {} of {}", current.short(), i + 1, written())
                     })?;
-                current = row.forked_from.ok_or_else(|| {
+                let next = match step {
+                    RefStep::Parent => row.forked_from,
+                    RefStep::Senpai => row.senpai_ctx,
+                };
+                current = next.ok_or_else(|| {
                     let short = current.short();
                     let label = row.label.as_deref().unwrap_or(&short);
-                    format!("context '{}' has no parent (at depth {})", label, i + 1)
+                    format!("context '{label}' has no {} (step {} of {})", step.word(), i + 1, written())
                 })?;
             }
             Ok(current)
@@ -114,12 +138,31 @@ mod tests {
 
     #[test]
     fn parse_parent() {
-        assert_eq!(parse_context_ref(".parent"), ContextRef::Parent(1));
+        assert_eq!(parse_context_ref(".parent"), ContextRef::Chain(vec![RefStep::Parent]));
     }
 
     #[test]
     fn parse_grandparent() {
-        assert_eq!(parse_context_ref(".parent.parent"), ContextRef::Parent(2));
+        assert_eq!(
+            parse_context_ref(".parent.parent"),
+            ContextRef::Chain(vec![RefStep::Parent, RefStep::Parent])
+        );
+    }
+
+    #[test]
+    fn parse_senpai_and_mixed_chains() {
+        use RefStep::*;
+        assert_eq!(parse_context_ref(".senpai"), ContextRef::Chain(vec![Senpai]));
+        assert_eq!(parse_context_ref(".senpai.senpai"), ContextRef::Chain(vec![Senpai, Senpai]));
+        assert_eq!(parse_context_ref(".parent.senpai"), ContextRef::Chain(vec![Parent, Senpai]));
+        assert_eq!(parse_context_ref(".senpai.parent.senpai"), ContextRef::Chain(vec![Senpai, Parent, Senpai]));
+    }
+
+    #[test]
+    fn parse_not_exactly_a_chain_is_a_query() {
+        for s in [".senpaifoo", ".senpai.", ".senpai..parent", ".parent.foo", "senpai", ".senpai.parentx", "..parent"] {
+            assert_eq!(parse_context_ref(s), ContextRef::Query(s.to_string()), "{s}");
+        }
     }
 
     #[test]
@@ -210,7 +253,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
 
-        let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db);
+        let result = resolve_context_ref(&ContextRef::Chain(vec![RefStep::Parent]), &caller, &db);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no parent"));
     }
@@ -319,15 +362,15 @@ mod tests {
         };
 
         // .parent → parent_id
-        let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db);
+        let result = resolve_context_ref(&ContextRef::Chain(vec![RefStep::Parent]), &caller, &db);
         assert_eq!(result.unwrap(), parent_id);
 
         // .parent.parent → grandparent_id
-        let result = resolve_context_ref(&ContextRef::Parent(2), &caller, &db);
+        let result = resolve_context_ref(&ContextRef::Chain(vec![RefStep::Parent; 2]), &caller, &db);
         assert_eq!(result.unwrap(), grandparent_id);
 
         // .parent.parent.parent → error (grandparent has no parent)
-        let result = resolve_context_ref(&ContextRef::Parent(3), &caller, &db);
+        let result = resolve_context_ref(&ContextRef::Chain(vec![RefStep::Parent; 3]), &caller, &db);
         assert!(result.is_err());
     }
 }

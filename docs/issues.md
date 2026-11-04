@@ -57,7 +57,7 @@ after a wrap-up turn.
   `kaijutsu-server/src/rpc.rs` ~1277, whose refusal at ~1963 stops the boot). A designated kernel root, or another
   rule for a context with no creating context, is Amy's decision.
 - A live context may answer to an archived senpai, as zorak's old `ROOT` does. The fold does not check senpai
-  liveness for rows that already name one; `kj context kohai` of the archived senpai lists them.
+  liveness for rows that already name one; `kj context list --senpai <archived senpai>` lists them.
 
 ## A held MCP registration leaves an ask nobody sees (2026-11-01)
 
@@ -79,9 +79,9 @@ Default-cast kaibo review of 2f38f7ca, f40f4dd5, 90813b33. Fixed in the follow-u
 --root` refused a model only after flipping the flag; stale `kj model`/delegation/cast text. Open, each verified
 against the code unless marked:
 
-- `kj context move` refuses on any pending ask in the subtree, not only one whose reviewer would change
-  (kj/context.rs ~3128), against `docs/senpai-kohai.md`, "Creating, forking, rotating". Blocks the rotate handoff.
-- `kj context create --senpai` does not refuse an archived senpai; `kj context move` does (kj/context.rs ~1487).
+- `kj context set --senpai` refuses on any pending ask in the subtree, not only one whose reviewer would change
+  (kj/context.rs ~3192, `set_senpai`), against `docs/senpai-kohai.md`, "Creating, forking, rotating". Blocks the rotate handoff.
+- `kj context create --senpai` does not refuse an archived senpai; `kj context set --senpai` does (kj/context.rs ~1587, `set_senpai`'s archived check ~3216).
 - `kj context demote` twice archives a root console, and `kj character retire` of a root archives its console,
   leaving `characters.root_ctx` on an archived row (kernel_db.rs ~5770).
 - The kernel lets `kj context create <root>` create a context the root performs; only the client refuses. A test blesses it
@@ -91,7 +91,7 @@ against the code unless marked:
 - The builtin `kj context create --type mcp` allow cannot see the caller, so the character it names may be one with a
   model and its `distill` slot is copied. Small: an mcp seat already holds `config-write`.
 - `ensure_mcp_hub` seeds the BlockStore and drift router after the row commits; a failure there is repaired at
-  the next boot, not within the process. `kj character create --backend` writes the character and its model as
+  the next boot, not within the process. `kj character create --model` writes the character and its model as
   two statements.
 - Tests still say "cast" for assigning a performer (kj/context.rs ~4629-4682).
 - `kj context set --type` refuses only reserved roles (kj/context.rs `resolve_context_config`), so it commits a
@@ -182,6 +182,17 @@ TUI entries below). Open:
   `kaijutsu-server bootstrap` again.
 - The prose in `docs/approval-identity.md` still says "a root can never be a
   performer" in places; read it against `docs/character.md`, "Roots".
+- `serves_character`'s `CharacterTarget::NewChild` arm (kj/gate_policy.rs ~1522)
+  returns true without checking that the actor holds the caller's context. A
+  learned character create rule therefore covers a bare `kj context create`
+  run in a context the character does not hold, such as a root console, where
+  the gate ask is the only control. The code comment at ~1506 cites
+  `docs/senpai-kohai.md`, "Decided after the docs pass", a section that does
+  not exist.
+- Exact `always` and `session` rules key on the literal statement text. A rule
+  learned for a relative ref (`.`, `.parent`, `.senpai`) authorizes whatever
+  that ref resolves to later, in another context or after the senpai edge
+  moves. The ask should show the resolved target, or the rule should pin it.
 
 ---
 ## MCP tool-change notices: what is open (2026-10-28)
@@ -1667,7 +1678,7 @@ resolution climbs `senpai_ctx`, so a human's command in a model's lane is review
 lane's senpai holder. What stays open is item 1 below: a context with no senpai.
 
 Every path that mints a context decides who reviews. Fork and `kj context create` from inside a
-context set the senpai; nothing re-parents a context except `kj context move`. This is not covered:
+context set the senpai; nothing re-parents a context except `kj context set --senpai`. This is not covered:
 
 1. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a

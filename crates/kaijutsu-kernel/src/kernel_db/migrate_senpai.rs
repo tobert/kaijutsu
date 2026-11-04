@@ -87,7 +87,7 @@ impl KernelDb {
         };
         let characters: HashMap<PrincipalId, CharacterRow> = {
             let mut stmt = tx.prepare(
-                "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, NULL FROM characters",
+                "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, NULL, NULL, NULL, NULL FROM characters",
             )?;
             stmt.query_map([], row_to_character_row)?
                 .map(|r| r.map(|c| (c.principal_id, c)))
@@ -182,7 +182,7 @@ impl KernelDb {
                         senpai: console.context_id,
                         note: Some(format!(
                             "its {source} named {who}, who holds nothing above it: mapped to {who}'s root console; \
-                             set its senpai again with `kj context move`"
+                             set its senpai again with `kj context set <ctx> --senpai <ctx>`"
                         )),
                         old_reviewer: Some(reviewer),
                     };
@@ -195,7 +195,7 @@ impl KernelDb {
                         senpai: recent.context_id,
                         note: Some(format!(
                             "its {source} named {who}, who holds nothing above it: mapped to {who}'s most recent live context; \
-                             set its senpai again with `kj context move`"
+                             set its senpai again with `kj context set <ctx> --senpai <ctx>`"
                         )),
                         old_reviewer: Some(reviewer),
                     },

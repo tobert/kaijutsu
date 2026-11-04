@@ -12,7 +12,7 @@ impl KernelDb {
             return Ok((sheet.principal_id, sheet.root_ctx.expect("filtered on root_ctx")));
         }
         let principal_id = PrincipalId::new();
-        self.insert_character(&CharacterRow {
+        self.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
             principal_id,
             name: format!("root-fixture-{}", principal_id.short()),
             created_at: 0,

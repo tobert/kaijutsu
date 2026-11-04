@@ -341,9 +341,9 @@ fn kaijutsu_session_scenario() {
 
         // A character's slots are copied when a context is made: banto runs
         // `mock-banto`, and each coder lane runs its own coder's model.
-        s.kj("kj character slot set banto director --backend mock --model mock-banto --max-tokens 4096").await;
-        s.kj("kj character slot set coder-a coder --backend mock --model mock-coder-a --max-tokens 4096").await;
-        s.kj("kj character slot set coder-b coder --backend mock --model mock-coder-b --max-tokens 4096").await;
+        s.kj("kj character slot set banto director mock/mock-banto --max-tokens 4096").await;
+        s.kj("kj character slot set coder-a coder mock/mock-coder-a --max-tokens 4096").await;
+        s.kj("kj character slot set coder-b coder mock/mock-coder-b --max-tokens 4096").await;
 
         s.kj("kj context create banto --name banto --type director").await;
         let banto_ctx = s.context_by_label("banto");

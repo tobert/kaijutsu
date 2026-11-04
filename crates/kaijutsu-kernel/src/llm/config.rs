@@ -319,6 +319,13 @@ impl BackendConfig {
         if self.name.trim().is_empty() {
             return Err("backend name must not be empty".to_string());
         }
+        if self.name.contains('/') {
+            return Err(format!(
+                "backend name '{}' must not contain '/': a model is written <backend>/<model>, \
+                 split at the first '/'",
+                self.name
+            ));
+        }
         if self.kind.requires_base_url() && self.base_url.as_deref().unwrap_or("").trim().is_empty()
         {
             return Err(format!(

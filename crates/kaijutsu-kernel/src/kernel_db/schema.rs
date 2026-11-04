@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     performer    BLOB,
     -- The context this one answers to. NULL only for a character's root
     -- console (`characters.root_ctx`); a trigger refuses any other change to
-    -- NULL. `kj context move` is the one writer after creation.
+    -- NULL. `kj context set <ctx> --senpai <ctx>` is the one writer after creation.
     senpai_ctx   BLOB REFERENCES contexts(context_id),
     persona      TEXT
 );
@@ -793,7 +793,7 @@ CREATE INDEX IF NOT EXISTS idx_character_models_backend ON character_models(back
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- `rc_dir` arrives with the slice that reads it. See docs/character.md, "Character = principal + sheet".
+-- See docs/character.md, "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
     principal_id     BLOB NOT NULL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -817,7 +817,14 @@ CREATE TABLE IF NOT EXISTS characters (
     root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
     -- The context type this character usually plays; `kj context create
     -- <character>` takes it when `--type` is absent. NULL = none; a root has none.
-    context_type     TEXT
+    context_type     TEXT,
+    -- The directory under /config/rc/ whose lifecycle scripts this
+    -- character's contexts run. NULL until set.
+    rc_dir           TEXT,
+    -- A root character's console and MCP hub: contexts the kernel finds by
+    -- pointer. A rotation moves a pointer at its commit, as it moves root_ctx.
+    console_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
+    mcp_hub_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
 
 -- ── Model aliases ──────────────────────────────────────────────

@@ -50,7 +50,7 @@ result is missing:
    kernel finds the key wherever it runs.
 2. `kj backend model set` with the context window of a model it knows. For
    a model it does not know, the report names the model and this verb.
-3. `kj character create root --backend <b> --model <m> --max-tokens 16384` on the first provider's model, for
+3. `kj character create root --model <b>/<m> --max-tokens 16384` on the first provider's model, for
    the model character that plays the console (`--console-as` names another). A character that exists and has
    no model and no `console` or `distill` slot gets `kj character model set root ...` instead. A character that
    already has a model or either slot is left alone, and the report says so.
@@ -60,6 +60,9 @@ result is missing:
    `kj context rotate console`. When the console is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.
+5. `kj character set <root> --console console`, which points the root's sheet at the console. A console that
+   bootstrap accepts, including one made before the sheet had the pointer, gets it when it is unset; a
+   rotation moves it.
 
 It prints each line it ran. A second run runs nothing once every step is in place, and a kernel set up
 by hand is completed rather than overwritten. With no key found, it still

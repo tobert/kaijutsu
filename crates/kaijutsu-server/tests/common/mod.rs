@@ -244,7 +244,7 @@ pub fn seed_turn_identity(
     context: kaijutsu_types::ContextId,
 ) -> kaijutsu_types::PrincipalId {
     use kaijutsu_kernel::kernel_db::CharacterRow;
-    let sheet = |name: &str| CharacterRow { context_type: None,
+    let sheet = |name: &str| CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: kaijutsu_types::PrincipalId::new(),
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,

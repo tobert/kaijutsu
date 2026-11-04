@@ -124,7 +124,7 @@
             assert!(!expected.is_empty(), "{context_type} must exercise companion data");
             let mut caller = console_caller(&d);
             caller.actor_id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -310,7 +310,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
         // A person at a console is a live root character, which `kj context
         // create` needs and whose console anyone may create under.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
@@ -947,7 +947,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         ] {
             d.kernel_db()
                 .lock()
-                .insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                .insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id,
                     name: name.into(),
                     created_at: 0,
@@ -2493,7 +2493,7 @@ esac
             let db = d.kernel_db().lock();
             for (id, name) in [(caller.principal_id, "amy"), (teller, "kotone")] {
                 if db.get_character(id).unwrap().is_some() { continue; }
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -2567,7 +2567,7 @@ esac
             let db = d.kernel_db().lock();
             for (id, name) in [(caller.principal_id, "amy"), (kaiten, "kaiten")] {
                 if db.get_character(id).unwrap().is_some() { continue; }
-                db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -3337,7 +3337,7 @@ esac
                     let db = d.kernel_db().lock();
                     let (performer, reviewer) = (PrincipalId::new(), PrincipalId::new());
                     for (id, name) in [(performer, "performer"), (reviewer, "reviewer")] {
-                        db.insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+                        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
                             principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                             handoff_ctx: None, root_ctx: None, root: false,
                         }).unwrap();
@@ -3901,7 +3901,7 @@ esac
         install_rc_script_file(&d, "/config/rc/test/archive/S10-kid.kai", "kj context archive kid --confirm").await;
         install_rc_script_file(&d, "/config/rc/test/archive/S20-stranger.kai", "kj context archive stranger --confirm").await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -3927,7 +3927,7 @@ esac
         let d = archive_dispatcher().await;
         install_rc_script_file(&d, "/config/rc/test/archive/S10-cousin.kai", "kj context archive cousin --confirm").await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();

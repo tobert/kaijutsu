@@ -545,7 +545,7 @@ fn senpai_migration_refuses_an_unmappable_context_and_names_each() {
     assert!(error.contains("bad-override") && error.contains("nobody"), "{error}");
     assert!(error.contains("retired-override") && error.contains("gone"), "{error}");
     assert!(!error.contains("archived-bad") && !error.contains("fine"), "{error}");
-    assert!(error.contains("kj context move") || error.contains("senpai"), "{error}");
+    assert!(error.contains("senpai"), "{error}");
 
     assert_eq!(senpai_of(&db, &fine), None, "a refused migration writes nothing");
     assert_eq!(report_of(&db), vec![]);

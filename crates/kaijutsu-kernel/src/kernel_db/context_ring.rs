@@ -116,9 +116,9 @@ impl KernelDb {
     /// `successor` its label and ring placement, and point a character's
     /// `handoff_ctx` at the successor when it named the predecessor. Returns
     /// how many handoff pointers moved. A predecessor that is missing or
-    /// already archived refuses. Moves a character's `root_ctx` the same way;
+    /// already archived refuses. Moves a character's `root_ctx` and `console_ctx` the same way;
     /// the archived console then takes the successor as its senpai. The kernel
-    /// moves no kohai.
+    /// moves no context that answers to the predecessor.
     pub fn commit_rotation(&self, predecessor: ContextId, successor: ContextId) -> KernelDbResult<usize> {
         self.in_transaction(|db| {
             let row = db.get_context(predecessor)?.ok_or_else(|| {
@@ -140,6 +140,10 @@ impl KernelDb {
             )?;
             let console_moved = db.conn.execute(
                 "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
+                params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
+            )?;
+            db.conn.execute(
+                "UPDATE characters SET console_ctx = ?1 WHERE console_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
             if console_moved > 0 {
@@ -232,7 +236,7 @@ impl KernelDb {
             if self.senpai_of(id)?.is_none() && !self.is_root_console(id)? {
                 return Err(KernelDbError::Validation(format!(
                     "context {} has no senpai, and a live context answers to one; \
-                     give it one with `kj context move` before promoting it",
+                     give it one with `kj context set <ctx> --senpai <ctx>` before promoting it",
                     self.context_name(id)
                 )));
             }

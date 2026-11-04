@@ -108,8 +108,8 @@ pub(crate) enum Layer {
     /// The council's allow for a statement no other layer covered, naming
     /// the spec it read the submission under (`docs/council.md`).
     Council(String),
-    /// A drift along the caller's senpai edge — to its senpai or to one of its
-    /// kohai — that no key decided (`docs/senpai-kohai.md`, "Reports and drift").
+    /// A drift along the caller's senpai edge — to its senpai or to a context
+    /// that answers to it — that no key decided (`docs/senpai-kohai.md`, "Reports and drift").
     SenpaiEdge,
 }
 
@@ -1541,10 +1541,10 @@ pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &Rul
 /// (`docs/senpai-kohai.md`, "Reports and drift"):
 ///
 /// - `kj drift push` from a context to its senpai, or from a context to one
-///   of its kohai, with one exception: a push up from a fork (a context of
+///   that answers to it, with one exception: a push up from a fork (a context of
 ///   the same character as its senpai) whose `created_by` is not that
-///   character keeps the gate;
-/// - `kj drift report` from a context that has a senpai.
+///   character keeps the gate. `kj drift push .senpai` is that push: the
+///   target resolves through the same context references the verb reads.
 ///
 /// The edge is the context character's `senpai_ctx`. Every argument must be a
 /// literal word, and the command plain (no redirect, background flag or
@@ -1591,14 +1591,10 @@ fn senpai_edge_drift(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -
                     }
                     edge(format!("kj drift push to {}, its senpai", label(target)))
                 } else if target_row.senpai_ctx == Some(here) {
-                    edge(format!("kj drift push to {}, its kohai", label(target)))
+                    edge(format!("kj drift push to {}, which answers to it", label(target)))
                 } else {
                     None
                 }
-            }
-            ("report", _) => {
-                let senpai = here_row.senpai_ctx?;
-                edge(format!("kj drift report to {}", label(senpai)))
             }
             _ => None,
         },

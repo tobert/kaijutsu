@@ -256,6 +256,13 @@ impl KernelDb {
         Ok(approval_ledger::ask::list_pending(self.conn_for_ledger())?)
     }
 
+    /// Every ask that is not yet resolved: `pending` and `claimed`. A caller
+    /// that asks whether anything is still open in a context reads this;
+    /// [`list_pending_asks`](Self::list_pending_asks) hides a claimed row.
+    pub fn list_unresolved_asks(&self) -> KernelDbResult<Vec<approval_ledger::types::ApprovalRow>> {
+        Ok(approval_ledger::ask::list_unresolved(self.conn_for_ledger())?)
+    }
+
     /// Uncollected human answers for the execution/resume driver.
     /// Result reviews are consumed by their retained outcome owner.
     ///

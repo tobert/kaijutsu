@@ -110,6 +110,9 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN context_type TEXT",
+            "ALTER TABLE characters ADD COLUMN rc_dir TEXT",
+            "ALTER TABLE characters ADD COLUMN console_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
+            "ALTER TABLE characters ADD COLUMN mcp_hub_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
             "ALTER TABLE backend_models ADD COLUMN temperature REAL \
                  CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
