@@ -888,14 +888,20 @@ Shipped directories in `assets/defaults/rc/`:
 
 #### Gate
 
-`gate.toml` layers are `[global]`, then `[character.<name>]` for the performer, then `[root]` for a context a root
-character performs. `[context_type.<type>]` fails the load, naming the section, as any section the kernel no longer
-reads does. A council block moves with its layer: `[character.coder.council]`. A `[character.<name>]` that names
-no character on the sheet, live or retired, is logged as a warning at every load and listed by `kj ledger rules` as
-applying to nobody. It does not fail the load: a failed load refuses every gated statement, including the
-`kj character create` that would fix it. The council's case carries the performer's name where it carried the
-type, and the council contexts a context consults are composed from its performer's layer. The shipped
-`assets/defaults/gate.toml` and the embedded default change in the same slice.
+`gate.toml` layers are `[global]`, then `[rc.<dir>]` for the performer's rc directory, then `[character.<name>]`
+for the performer, then `[root]` for a context a root character performs. Each later layer reads over the earlier
+ones. A directory layer gives every character that shares a directory the same posture, so the shipped file can
+cover each MCP connection's character with `[rc.mcp]` without naming it; a character layer tunes one character
+("Character + directory", Amy, 2026-11-04). `[context_type.<type>]` fails the load, naming the section, as any
+section the kernel no longer reads does. A council block moves with its layer: `[rc.coder.council]` or
+`[character.coder.council]`.
+
+A `[rc.<dir>]` that names no directory in the rc tree, or a `[character.<name>]` that names no character on the
+sheet, live or retired, is logged as a warning at every load and listed by `kj ledger rules` as applying to nobody.
+It does not fail the load: a failed load refuses every gated statement, including the `kj character create` that
+would fix it. The council's case carries the performer's name where it carried the type, and the council contexts
+a context consults are composed from its performer's layers. The shipped `assets/defaults/gate.toml` and the
+embedded default change in the same slice.
 
 #### Shipped characters
 
@@ -966,7 +972,7 @@ Each slice leaves the tree green and is reviewed before the next starts. Nothing
   directories keep their names, and `contexts.context_type` stays, so the gate, slots and clients still work.
 - **M3. One model.** The slot-role migration; role `model`; council-server slots by backend kind; the judge
   character, its shadow and its server; bootstrap gives the console's performer its model, not a `console` slot.
-- **M4. Gate layers by character.** `[character.<name>]`, `[root]`, the council block, case and seat composition,
+- **M4. Gate layers by directory and character.** `[rc.<dir>]`, `[character.<name>]`, `[root]`, the council block, case and seat composition,
   the warning for a section that applies to nobody, `kj ledger rules`, the MCP session create rule, and the
   shipped and embedded `gate.toml`.
 - **M5. Persons and pointers.** The person rule (draft as shell, self-confirmation, no turns, the senpai-edge
