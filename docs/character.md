@@ -954,9 +954,6 @@ boot migration copies the database aside first and records itself, as the fold d
 Earlier migrations that read `context_type` still run on an old database before these, and a fresh database
 never needs them; both paths are tested.
 
-Earlier migrations that read `context_type` still run on an old database before this one, and a fresh database
-never needs them; both paths are tested.
-
 The host `gate.toml` is rewritten by hand at the deploy, with a backup beside it.
 
 #### Rollout
