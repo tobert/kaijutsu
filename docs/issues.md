@@ -6,6 +6,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Type melt M2: what rc-follows-the-performer leaves open (2026-11-04)
+
+rc runs the performer's `rc_dir` (`docs/character.md`, "The type melts into
+the character"). Open, outside M2:
+
+- `kj character set <name> --root` and `kaijutsu-server init --as <existing>`
+  make a character a root without touching its `rc_dir`, so its root console
+  runs whatever directory it had (`kj/character.rs::character_set`,
+  `kaijutsu-server/src/init.rs`). A new root gets `root`.
+- `migrate_keyring::migrate_legacy_names` still writes characters with no
+  `rc_dir`; it runs after `rc-dir-backfill-v1` has recorded itself, so those
+  rows stay NULL and their lifecycles fail naming `kj character set <name>
+  --rc <dir>`.
+- A live context whose `context_type` differs from its performer's directory
+  now runs the performer's directory. On zorak, check before deploy which live
+  contexts that changes (a director-typed banto playing the `console` context,
+  for one), and whether the backfill left any character unset
+  (`context_character_migration_report`, kinds `rc_dir_unset` and
+  `console_ambiguous`).
+- The Terms table's `context_type` row in `docs/writing.md` still says it is
+  the rc bundle a context runs (M6 rewrites it).
+
 ## Companion: what the first build leaves open (2026-11-02)
 
 The `companion` type (`docs/companion.md`) runs an hourly check-in as a fork of

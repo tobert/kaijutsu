@@ -335,9 +335,9 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Setup: characters, slots, banto's seat.
         // ------------------------------------------------------------
-        s.kj("kj character create banto").await;
-        s.kj("kj character create coder-a").await;
-        s.kj("kj character create coder-b").await;
+        s.kj("kj character create banto --rc director").await;
+        s.kj("kj character create coder-a --rc coder").await;
+        s.kj("kj character create coder-b --rc coder").await;
 
         // A character's slots are copied when a context is made: banto runs
         // `mock-banto`, and each coder lane runs its own coder's model.

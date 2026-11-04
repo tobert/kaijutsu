@@ -1865,7 +1865,7 @@ mod tests {
         d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
             context_id: parent, cwd: Some("/scratch".into()), updated_at: 0,
         }).unwrap();
-        d.kernel_db().lock().update_context_type(parent, "musician").unwrap();
+        crate::kj::test_helpers::perform_with_rc_dir(&d, parent, "musician");
 
         // Seed a track + attachment (with rotate cadence) so the fork-copy carries
         // the real values. This simulates what the scheduler would have persisted

@@ -1,9 +1,9 @@
 //! Run-control (rc) subcommands: add, list, rm, show.
 //!
 //! Manages lifecycle scripts and Markdown data at canonical paths
-//! `/config/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
+//! `/config/rc/<rc_dir>/<verb>/SXX-name.{kai,md}` (deployed under
 //! `~/.config/kaijutsu/config/rc/`). The path itself is the user-facing key;
-//! structural fields (context_type, verb, sort_key, name, extension) are
+//! structural fields (rc_dir, verb, sort_key, name, extension) are
 //! derived from it via `parse_rc_path`.
 //!
 //! **rc scripts are host files, so this is a convenience, not a gateway.**
@@ -29,7 +29,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "rc",
-    about = "Rc scripts (.kai) and companion data (.md) at /config/rc/<type>/<verb>/SXX-name.{kai,md}",
+    about = "Rc scripts (.kai) and companion data (.md) at /config/rc/<dir>/<verb>/SXX-name.{kai,md}",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -42,7 +42,7 @@ pub(crate) struct RcArgs {
 enum RcCommand {
     /// Install a script (.kai) or data file (.md) from --content or stdin.
     Add {
-        /// Canonical path: /config/rc/<type>/<verb>/SXX-name.{kai,md}
+        /// Canonical path: /config/rc/<dir>/<verb>/SXX-name.{kai,md}
         path: String,
         /// File content. Reads stdin when omitted; explicit content takes precedence.
         #[arg(long, allow_hyphen_values = true)]
@@ -56,10 +56,11 @@ enum RcCommand {
     /// link needs its target restored.
     #[command(alias = "ls")]
     List {
-        /// Filter by context_type (`lib` selects the shared bodies)
-        #[arg(long = "type")]
-        type_filter: Option<String>,
-        /// Filter by verb (create|fork|attach|drift|tick|rotate|submit), or `hooks`
+        /// Filter by rc directory, the one a character's `--rc` names (`lib`
+        /// selects the shared bodies)
+        #[arg(long = "dir", value_name = "DIR")]
+        dir_filter: Option<String>,
+        /// Filter by verb (create|fork|attach|drift|tick|rotate|submit|archive), or `hooks`
         #[arg(long = "verb")]
         verb_filter: Option<String>,
     },
@@ -153,9 +154,9 @@ impl RcEntry {
         }
     }
 
-    fn context_type(&self) -> &str {
+    fn rc_dir(&self) -> &str {
         match self {
-            Self::Script(p) | Self::Data(p) => &p.context_type,
+            Self::Script(p) | Self::Data(p) => &p.rc_dir,
             Self::HookBody { .. } => HOOK_BUCKET,
         }
     }
@@ -243,10 +244,10 @@ impl KjDispatcher {
                 self.rc_add(&path, content.as_deref(), caller).await
             }
             RcCommand::List {
-                type_filter,
+                dir_filter,
                 verb_filter,
             } => {
-                self.rc_list(type_filter.as_deref(), verb_filter.as_deref())
+                self.rc_list(dir_filter.as_deref(), verb_filter.as_deref())
                     .await
             }
             RcCommand::Rm { path } => self.rc_rm(&path).await,
@@ -288,8 +289,8 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj rc add: {e}"));
         }
         KjResult::ok(format!(
-            "installed rc script '{}' (type={}, verb={}, sort={}, name={})",
-            path, parts.context_type, parts.verb, parts.sort_key, parts.name
+            "installed rc script '{}' (dir={}, verb={}, sort={}, name={})",
+            path, parts.rc_dir, parts.verb, parts.sort_key, parts.name
         ))
     }
 
@@ -353,14 +354,14 @@ impl KjDispatcher {
     }
 
     /// Build the `(path, live_link, seed_status)` triple for every rc path
-    /// this kernel knows about — every live path under `/config/rc` (`type_filter`/
+    /// this kernel knows about — every live path under `/config/rc` (`dir_filter`/
     /// `verb_filter` narrow the walk, as `kj rc list` does) plus every embedded
     /// seed with nothing live at its path (reported as [`RcSeedStatus::NotInstalled`]
     /// rather than silently omitted — the anti-join `kj rc list` has always
     /// done).
     async fn rc_status_rows(
         &self,
-        type_filter: Option<&str>,
+        dir_filter: Option<&str>,
         verb_filter: Option<&str>,
     ) -> Result<Vec<(String, Option<String>, RcSeedStatus)>, String> {
         let mut paths = self.walk_rc_paths().await?;
@@ -369,7 +370,7 @@ impl KjDispatcher {
                 Ok(entry) => entry,
                 Err(_) => return false, // stray non-canonical file
             };
-            type_filter.is_none_or(|t| entry.context_type() == t)
+            dir_filter.is_none_or(|t| entry.rc_dir() == t)
                 && verb_filter.is_none_or(|v| entry.verb() == v)
         };
         paths.retain(|p| matches_filters(p));
@@ -410,8 +411,8 @@ impl KjDispatcher {
         Ok(rows)
     }
 
-    async fn rc_list(&self, type_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
-        let rows = match self.rc_status_rows(type_filter, verb_filter).await {
+    async fn rc_list(&self, dir_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
+        let rows = match self.rc_status_rows(dir_filter, verb_filter).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
         };
@@ -566,7 +567,7 @@ impl KjDispatcher {
         let record = serde_json::json!({
             "path": path,
             "kind": entry.kind(),
-            "context_type": entry.context_type(),
+            "rc_dir": entry.rc_dir(),
             "verb": entry.verb(),
             "sort_key": entry.sort_key(),
             "name": entry.name(),
@@ -591,10 +592,10 @@ impl KjDispatcher {
         // Fence content with the extension so .md renders as markdown and
         // .kai displays as a shell-ish block in surfaces that highlight it.
         let out = format!(
-            "path:       {}\nkind:       {}\ntype:       {}\nverb:       {}\n{}name:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
+            "path:       {}\nkind:       {}\ndir:        {}\nverb:       {}\n{}name:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
             path,
             entry.kind(),
-            entry.context_type(),
+            entry.rc_dir(),
             entry.verb(),
             sort_line,
             entry.name(),
@@ -703,7 +704,7 @@ mod tests {
         let shown = d.dispatch(&["rc", "show", path].map(String::from), &caller).await;
         assert!(shown.is_ok(), "{}", shown.message());
         assert!(shown.message().contains("kind:       data"));
-        let listed = d.dispatch(&["rc", "list", "--type", "default"].map(String::from), &caller).await;
+        let listed = d.dispatch(&["rc", "list", "--dir", "default"].map(String::from), &caller).await;
         assert!(listed.is_ok(), "{}", listed.message());
         assert!(listed.message().contains(&format!("{path} [in-sync] [data]")));
         assert!(matches!(parse_rc_entry(path).unwrap(), RcEntry::Data(_)));
@@ -720,7 +721,7 @@ mod tests {
             ("/config/rc/long-name-here/drift/S0-noop.kai", "long-name-here", "drift", "kai"),
         ] {
             let parts = parse_rc_path(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-            assert_eq!(parts.context_type, expected_type, "type for {path}");
+            assert_eq!(parts.rc_dir, expected_type, "dir for {path}");
             assert_eq!(parts.verb, expected_verb, "verb for {path}");
             assert_eq!(parts.extension, expected_ext, "ext for {path}");
         }
@@ -797,7 +798,7 @@ mod tests {
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
-        d.dispatch(
+        let added = d.dispatch(
             &[
                 s("rc"),
                 s("add"),
@@ -808,6 +809,7 @@ mod tests {
             &c,
         )
         .await;
+        assert!(added.message().contains("(dir=showtest, verb=create"), "{}", added.message());
 
         let result = d
             .dispatch(
@@ -826,7 +828,7 @@ mod tests {
                 ..
             } => {
                 let obj = v.as_object().expect("show emits an object");
-                assert_eq!(obj["context_type"].as_str(), Some("showtest"));
+                assert_eq!(obj["rc_dir"].as_str(), Some("showtest"));
                 assert_eq!(obj["verb"].as_str(), Some("create"));
                 assert_eq!(obj["sort_key"].as_str(), Some("S00"));
                 assert_eq!(obj["name"].as_str(), Some("hello"));
@@ -1121,7 +1123,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1157,7 +1159,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1204,7 +1206,7 @@ mod tests {
 
         let message = listed(
             d.dispatch(
-                &[s("rc"), s("list"), s("--type"), s("lib"), s("--verb"), s("hooks")],
+                &[s("rc"), s("list"), s("--dir"), s("lib"), s("--verb"), s("hooks")],
                 &c,
             )
             .await,
@@ -1234,7 +1236,7 @@ mod tests {
         match d.dispatch(&[s("rc"), s("show"), s(path)], &c).await {
             KjResult::Ok { data: Some(v), .. } => {
                 assert_eq!(v["path"], path);
-                assert_eq!(v["context_type"], "lib");
+                assert_eq!(v["rc_dir"], "lib");
                 assert_eq!(v["verb"], "hooks");
                 assert_eq!(v["name"], "shell-guard");
                 assert_eq!(v["extension"], "kai");
@@ -1273,7 +1275,7 @@ mod tests {
         .await;
 
         let result = d
-            .dispatch(&[s("rc"), s("list"), s("--type"), s("mine")], &c)
+            .dispatch(&[s("rc"), s("list"), s("--dir"), s("mine")], &c)
             .await;
         match result {
             KjResult::Ok { message, .. } => assert!(
@@ -1298,7 +1300,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("default"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("default"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1354,7 +1356,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("default"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("default"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1394,7 +1396,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1446,7 +1448,7 @@ mod tests {
         // Precondition: the link is a real seed symlink onto the shared target.
         let before = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1470,7 +1472,7 @@ mod tests {
         // ...and the listing says so instead of calling it healthy.
         let after = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
@@ -1519,7 +1521,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("tmpuser"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("tmpuser"), s("--verb"), s("create")],
                 &c,
             )
             .await;

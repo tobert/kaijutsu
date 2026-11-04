@@ -62,7 +62,7 @@ It may have failed. Read it with: kj block list -c $last"
     kj context unset --env LAST_CHECKIN
     ;;
 esac
-kj context archive --children --type companion --confirm
+kj context archive --children --performer "$KJ_CHARACTER" --confirm
 
 case "$wrapup" in
   "") ;;

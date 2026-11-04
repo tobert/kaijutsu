@@ -28,7 +28,7 @@ A new install, end to end:
 
 ```
 kaijutsu-server bootstrap --as amy --backend deepseek --model deepseek-flash
-kj character create senpai --type director --model deepseek/deepseek-flash
+kj character create senpai --type director --rc director --model deepseek/deepseek-flash
 kj character create kohai --type coder --model deepseek/deepseek-flash
 kj context create senpai
 kj context create kohai --senpai senpai

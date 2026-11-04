@@ -58,6 +58,7 @@ mod tests {
         let dispatcher = Arc::new(test_dispatcher_persistent().await);
         dispatcher.set_self_arc();
         let context = register_context(&dispatcher, Some("queued-tick"), None, PrincipalId::new());
+        crate::kj::test_helpers::perform_with_rc_dir(&dispatcher, context, "default");
         install_rc_script_file(&dispatcher, "/config/rc/default/tick/S00-snapshot.kai",
             "kj block create --role system --kind text --content $KJ_TICK").await;
         let kernel = dispatcher.kernel();

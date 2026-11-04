@@ -2399,7 +2399,7 @@ mod tests {
         let context = register_context(&d, Some("decision-context"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
@@ -3396,7 +3396,7 @@ mod tests {
         let root = register_root_context(d);
         let character = |name: &str| {
             let id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -4445,7 +4445,7 @@ mod tests {
     fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = kaijutsu_types::PrincipalId::new();
         // A person at a console is a live character, which `kj context create` needs.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -4492,7 +4492,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("context"), s("create"), s("kohai-tester"), s("--name"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
+                &[s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest")), s("--name"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
                 &c,
             )
             .await;
@@ -4525,7 +4525,7 @@ mod tests {
         let created = d
             .dispatch(
                 &[
-                    s("context"), s("create"), s("kohai-tester"), s("--name"), s("ledger-run-show-ctx"), s("--type"), s("ledgertest2")],
+                    s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest2")), s("--name"), s("ledger-run-show-ctx"), s("--type"), s("ledgertest2")],
                 &c,
             )
             .await;
@@ -4567,7 +4567,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("context"), s("create"), s("kohai-tester"), s("--name"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
+                &[s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest3")), s("--name"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
                 &c,
             )
             .await;
@@ -5117,7 +5117,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.update_performer(seat, Some(banto)).unwrap();
             db.update_performer(lane, Some(coder)).unwrap();
@@ -5161,7 +5161,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(lead, "lead", false), (bob, "bob", true)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "root" } else { "default" }.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
         }
@@ -5188,7 +5188,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
@@ -5223,7 +5223,7 @@ mod tests {
         caller.context_id = Some(lane);
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("director".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_performer(root, Some(amy)).unwrap();

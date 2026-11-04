@@ -127,13 +127,15 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         privileged: false,
         cancel: tokio_util::sync::CancellationToken::new(),
     };
-    // The context is an instance of a live, non-root character; a root cannot be assigned as a performer.
+    // The context is an instance of a live, non-root character whose rc
+    // directory is the type under test; a root cannot be assigned as a performer.
+    let performer = format!("rc-{context_type}");
     {
         let db = h.db.lock();
-        if db.get_character_by_name("performer").unwrap().is_none() {
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        if db.get_character_by_name(&performer).unwrap().is_none() {
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some(context_type.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
-                name: "performer".to_string(),
+                name: performer.clone(),
                 created_at: 0,
                 retired_at: None,
                 handoff_ctx: None,
@@ -143,7 +145,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
             .unwrap();
         }
     }
-    let argv: Vec<String> = ["context", "create", "performer", "--name", label, "--type", context_type]
+    let argv: Vec<String> = ["context", "create", performer.as_str(), "--name", label, "--type", context_type]
         .iter()
         .map(|s| s.to_string())
         .collect();

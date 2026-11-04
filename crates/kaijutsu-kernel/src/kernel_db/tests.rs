@@ -371,7 +371,7 @@ fn open_read_only_reads_an_existing_db_without_writing() {
     let character = PrincipalId::new();
     {
         let db = KernelDb::open(&path).unwrap();
-        db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: character,
             name: "hajime".to_string(),
             created_at: 1000,
@@ -388,7 +388,7 @@ fn open_read_only_reads_an_existing_db_without_writing() {
     // A write attempt through the read-only connection must fail loudly
     // rather than silently succeeding — the whole point of the mode.
     let err = ro
-        .insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        .insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: PrincipalId::new(),
             name: "intruder".to_string(),
             created_at: 2000,

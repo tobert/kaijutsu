@@ -958,6 +958,7 @@ mod tests {
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("rcdepth-home"), None, principal);
         dispatcher.kernel_db().lock().update_performer(home, Some(PrincipalId::system())).unwrap();
+        crate::kj::test_helpers::rc_performer(&dispatcher, "rdtest");
         // Inert banner: proves the lifecycle ran (pre-fix) or was refused (post-fix).
         install_rc_script_file(
             &dispatcher,
@@ -976,7 +977,7 @@ mod tests {
         );
         let res = kaish
             .execute_with_options(
-                "kj context create kohai-tester --name rcdepth-e2e --type rdtest",
+                "kj context create rc-rdtest --name rcdepth-e2e --type rdtest",
                 ExecuteOptions::new().with_vars(vars),
             )
             .await
@@ -1040,17 +1041,18 @@ mod tests {
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("chain-home"), None, principal);
         dispatcher.kernel_db().lock().update_performer(home, Some(PrincipalId::system())).unwrap();
+        crate::kj::test_helpers::rc_performer(&dispatcher, "chaintest");
         install_rc_script_file(
             &dispatcher,
             "/config/rc/chaintest/create/S00-recreate.kai",
-            "kj context create kohai-tester --name \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
+            "kj context create rc-chaintest --name \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
         )
         .await;
 
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
         let res = kaish
             .execute_with_options(
-                "kj context create kohai-tester --name chain-d0 --type chaintest",
+                "kj context create rc-chaintest --name chain-d0 --type chaintest",
                 ExecuteOptions::default(),
             )
             .await
@@ -1219,7 +1221,7 @@ mod tests {
         let alpha = register_context(&dispatcher, Some("alpha"), None, principal);
         let made = dispatcher
             .dispatch(
-                &["character".to_string(), "create".to_string(), "hajime".to_string()],
+                &["character", "create", "hajime", "--rc", "default"].map(String::from),
                 &crate::kj::test_helpers::test_caller(),
             )
             .await;
@@ -1341,14 +1343,14 @@ mod tests {
         assert!(dispatcher.kernel_db().lock().get_context(target).unwrap().unwrap().is_archived());
     }
 
-    /// A space-separated valued flag (`--type default`) must reach kj
-    /// through kaish, not just the `--type=default` form. Regression: kaish
+    /// A space-separated valued flag (`--dir default`) must reach kj
+    /// through kaish, not just the `--dir=default` form. Regression: kaish
     /// only treats `--flag value` as a valued arg when the flag is declared
-    /// in the kj tool schema; an undeclared `--type` was parsed as a bool
-    /// flag and the value dropped, so `kj rc list --type default` silently
-    /// listed every type. Asserts the filter actually applies.
+    /// in the kj tool schema; an undeclared flag was parsed as a bool flag
+    /// and the value dropped, so `kj rc list` silently listed every
+    /// directory. Asserts the filter actually applies.
     #[tokio::test]
-    async fn space_separated_type_flag_reaches_kj() {
+    async fn space_separated_dir_flag_reaches_kj() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
         let principal = PrincipalId::new();
@@ -1356,7 +1358,7 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
 
         let res = kaish
-            .execute_with_options("kj rc list --type default", ExecuteOptions::default())
+            .execute_with_options("kj rc list --dir default", ExecuteOptions::default())
             .await
             .expect("kaish exec");
         assert!(res.ok(), "kj rc list exit != 0: {res:?}");
@@ -1366,7 +1368,7 @@ mod tests {
             stdout.contains("/config/rc/default/"),
             "filtered list should include default paths: {stdout}"
         );
-        // The filter must EXCLUDE other types — the whole point of --type.
+        // The filter must EXCLUDE other directories — the whole point of --dir.
         for other in [
             "/config/rc/coder/",
             "/config/rc/mcp/",
@@ -1375,7 +1377,7 @@ mod tests {
         ] {
             assert!(
                 !stdout.contains(other),
-                "--type default must exclude {other}, got: {stdout}"
+                "--dir default must exclude {other}, got: {stdout}"
             );
         }
     }

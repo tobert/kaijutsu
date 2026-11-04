@@ -83,7 +83,7 @@ impl World {
     fn character(&self, name: &str) -> PrincipalId {
         let principal_id = PrincipalId::new();
         self.db
-            .insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id,
                 name: name.into(),
                 created_at: 0,

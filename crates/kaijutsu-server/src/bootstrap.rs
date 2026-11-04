@@ -289,7 +289,8 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     let first = opts.backends.first();
     match read(shared, |db| db.get_character_by_name(performer))? {
         None => {
-            let mut argv = words(&["character", "create", performer]);
+            // The console's performer runs the console's rc directory.
+            let mut argv = words(&["character", "create", performer, "--rc", "console"]);
             if let Some(backend) = first {
                 argv.extend(words(&[
                     "--model", &format!("{}/{}", backend.name, backend.model), "--max-tokens",
@@ -307,6 +308,13 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             ));
         }
         Some(row) => {
+            if row.rc_dir.as_deref() != Some("console") {
+                report.notes.push(format!(
+                    "{performer} runs rc directory {}, not console, so the console it plays runs that directory; \
+                     `kj character set {performer} --rc console` changes it",
+                    row.rc_dir.as_deref().unwrap_or("(none)")
+                ));
+            }
             let has_model = read(shared, |db| db.get_character_model(row.principal_id))?.is_some();
             let has_slots = read(shared, |db| {
                 PERFORMER_ROLES.iter().try_fold(false, |any, role| Ok(any || db.get_character_slot(row.principal_id, role)?.is_some()))

@@ -244,7 +244,7 @@ pub fn seed_turn_identity(
     context: kaijutsu_types::ContextId,
 ) -> kaijutsu_types::PrincipalId {
     use kaijutsu_kernel::kernel_db::CharacterRow;
-    let sheet = |name: &str| CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    let sheet = |name: &str| CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: kaijutsu_types::PrincipalId::new(),
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
@@ -546,14 +546,47 @@ pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijut
     create_context_typed(kernel, label, "default").await
 }
 
-/// [`create_context`] with a `context_type`.
+/// [`create_context`] with a `context_type`, performed by
+/// [`rc_performer`]`(context_type)`, so the context runs that type's rc.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context_typed(
     kernel: &KernelHandle,
     label: &str,
     context_type: &str,
 ) -> Result<kaijutsu_types::ContextId, String> {
-    create_context_typed_as(kernel, label, context_type, PERFORMER).await
+    let performer = rc_performer(kernel, context_type).await?;
+    create_context_typed_as(kernel, label, context_type, &performer).await
+}
+
+/// Make `context` of type `dir`, and point its performer at rc directory
+/// `dir`, so its later lifecycles run `/config/rc/<dir>/`. Every context that
+/// character performs runs `dir` from then on.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn perform_with_rc_dir(server: &kaijutsu_server::SharedKernel, context: kaijutsu_types::ContextId, dir: &str) {
+    let db = server.kernel_db.lock();
+    db.update_context_type(context, dir).unwrap();
+    let performer = db.get_context(context).unwrap().expect("the context exists").performer.expect("the context has a performer");
+    db.set_character_rc_dir(performer, Some(dir)).unwrap();
+}
+
+/// The live, non-root character whose rc directory is `dir`: [`PERFORMER`]
+/// for `default`, else `rc-<dir>`, created on first use with `kj character
+/// create rc-<dir> --rc <dir>` from the kernel's only root context. The
+/// directory needs a runnable `create` script when the character is made.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn rc_performer(kernel: &KernelHandle, dir: &str) -> Result<String, String> {
+    if dir == "default" {
+        return Ok(PERFORMER.to_string());
+    }
+    let name = format!("rc-{dir}");
+    let contexts = kernel.list_contexts().await.map_err(|e| e.to_string())?;
+    let root = kaijutsu_client::choose_parent(None, &contexts)?;
+    let argv = ["character", "create", &name, "--rc", dir].map(String::from).to_vec();
+    let result = kernel.execute_kj_quiet(root.context_id, &argv).await.map_err(|e| e.to_string())?;
+    if result.exit_code != 0 {
+        return Err(format!("kj character create {name} --rc {dir}: {}", result.stderr));
+    }
+    Ok(name)
 }
 
 /// Create `label` of type `default` as the live, non-root `character`.

@@ -91,7 +91,7 @@ pub fn init_root(
             (CharacterRow { root: true, ..row }, true)
         }
         None => {
-            let row = CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            let row = CharacterRow { rc_dir: Some(kaijutsu_types::ROOT_CONTEXT_TYPE.to_string()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: PrincipalId::new(),
                 name: name.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,

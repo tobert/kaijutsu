@@ -7,7 +7,7 @@ auto-registers a session context at startup, so its `shell` tool can carry a
 `kj` command.
 
 Usage:
-    kjmcp.py --port 22722 --key-file KEY 'kj character create bench-coder' ...
+    kjmcp.py --port 22722 --key-file KEY 'kj character create bench-coder --rc coder' ...
 
 Each argument after the flags is one command. They run in order on one
 connection. A non-zero exit code from any command fails the whole run, so a

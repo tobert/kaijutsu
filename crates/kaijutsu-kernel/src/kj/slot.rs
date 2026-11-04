@@ -541,7 +541,7 @@ mod tests {
             crate::test_backends::example_backends(&db);
         }
         d.reload_llm_registry().await.unwrap();
-        let r = d.dispatch(&argv(&["character", "create", "house"]), &test_caller()).await;
+        let r = d.dispatch(&argv(&["character", "create", "house", "--rc", "default"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
         d
     }
@@ -691,7 +691,7 @@ mod tests {
 
         d.kernel_db()
             .lock()
-            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: "boss".into(),
                 created_at: 0,
@@ -734,7 +734,7 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         let made = d
-            .dispatch(&argv(&["character", "create", "worker", "--model", "anthropic/claude-opus-5"]), &c)
+            .dispatch(&argv(&["character", "create", "worker", "--rc", "default", "--model", "anthropic/claude-opus-5"]), &c)
             .await;
         assert!(made.is_ok(), "{}", made.message());
         {
@@ -744,12 +744,12 @@ mod tests {
         }
 
         let bad = d
-            .dispatch(&argv(&["character", "create", "ghost", "--model", "nope/m"]), &c)
+            .dispatch(&argv(&["character", "create", "ghost", "--rc", "default", "--model", "nope/m"]), &c)
             .await;
         assert!(matches!(&bad, KjResult::Err(m) if m.contains("backend 'nope' not found")), "{bad:?}");
         assert!(d.kernel_db().lock().get_character_by_name("ghost").unwrap().is_none(), "a bad backend leaves no character");
 
-        let half = d.dispatch(&argv(&["character", "create", "half", "--model", "anthropic"]), &c).await;
+        let half = d.dispatch(&argv(&["character", "create", "half", "--rc", "default", "--model", "anthropic"]), &c).await;
         assert!(matches!(&half, KjResult::Err(m) if m.contains("<backend>/<model>")), "a value with no '/': {half:?}");
         assert!(d.kernel_db().lock().get_character_by_name("half").unwrap().is_none());
 
@@ -772,7 +772,7 @@ mod tests {
         assert!(set.is_ok(), "{}", set.message());
         let slot = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
         assert!(slot.is_ok(), "{}", slot.message());
-        let made = d.dispatch(&argv(&["character", "create", "glm", "--model", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
+        let made = d.dispatch(&argv(&["character", "create", "glm", "--rc", "default", "--model", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
         assert!(made.is_ok(), "{}", made.message());
         let db = d.kernel_db().lock();
         for name in ["house", "glm"] {
@@ -794,7 +794,7 @@ mod tests {
             for verb in [
                 vec!["character", "model", "set", "house", value],
                 vec!["character", "slot", "set", "house", "coder", value],
-                vec!["character", "create", "fresh", "--model", value],
+                vec!["character", "create", "fresh", "--rc", "default", "--model", value],
             ] {
                 match d.dispatch(&argv(&verb), &c).await {
                     KjResult::Err(m) => {

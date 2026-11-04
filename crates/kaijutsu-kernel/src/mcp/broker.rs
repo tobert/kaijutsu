@@ -10796,7 +10796,7 @@ mod tests {
         let db = db.lock();
         match db.get_character(ctx.actor_id).unwrap() {
             Some(_) => db.update_character_root(ctx.actor_id, true).unwrap(),
-            None => db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            None => db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: ctx.actor_id, name: format!("root-{}", ctx.actor_id), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
             }).unwrap(),
@@ -11592,7 +11592,7 @@ mod tests {
         let context_id = crate::kj::test_helpers::register_context(kj, Some(label), None, actor);
         let db = kj.kernel_db();
         let db = db.lock();
-        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();

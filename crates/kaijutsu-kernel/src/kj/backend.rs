@@ -925,7 +925,7 @@ mod tests {
         let principal = kaijutsu_types::PrincipalId::new();
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: principal, name: "bound".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();

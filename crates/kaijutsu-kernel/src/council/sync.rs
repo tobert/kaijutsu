@@ -1673,7 +1673,7 @@ mod tests {
         use kaijutsu_types::PrincipalId;
         let character = PrincipalId::new();
         let db = r.kernel.kernel_db().lock();
-        db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: character, name: "council-coder".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         })

@@ -1062,10 +1062,7 @@ mod tests {
         d.set_self_arc();
         let principal = kaijutsu_types::PrincipalId::new();
         let ctx = test_helpers::register_context(&d, Some("guard-install-e2e"), None, principal);
-        d.kernel_db()
-            .lock()
-            .update_context_type(ctx, "default")
-            .expect("set context_type");
+        test_helpers::perform_with_rc_dir(&d, ctx, "default");
 
         let caller = crate::kj::KjCaller {
             principal_id: principal,

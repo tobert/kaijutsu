@@ -95,7 +95,7 @@ fn shutdown_joins_submit_lifecycle_before_finishing_the_turn() {
             b"kj block create --role system --kind text --content submit-entered\nsleep 60\n").await.unwrap();
         vfs.write_all(Path::new("/config/rc/preparation/submit/S10-later.kai"),
             b"kj block create --role system --kind text --content must-not-run\n").await.unwrap();
-        server.kernel_db.lock().update_context_type(context, "preparation").unwrap();
+        common::perform_with_rc_dir(&server, context, "preparation");
         kj.edit_input(context, 0, "retained submitted draft", 0).await.unwrap();
         let (block_callback, mut blocks) = block_events_channel(32, MidiExchangeSlot::new());
         kj.subscribe_blocks(block_callback).await.unwrap();

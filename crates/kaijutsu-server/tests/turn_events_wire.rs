@@ -40,7 +40,7 @@ fn assign_turn_identity(
     let reviewer = PrincipalId::new();
     let db = server.kernel_db.lock();
     if db.get_character(actor).unwrap().is_none() {
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: actor,
             name: "turn-actor".into(),
             created_at: 0,
@@ -49,7 +49,7 @@ fn assign_turn_identity(
         })
         .unwrap();
     }
-    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: reviewer,
         name: "turn-reviewer".into(),
         created_at: 0,
@@ -493,7 +493,7 @@ fn timed_drives_keep_admission_targets_through_the_client() {
         }
         // Run the shipped tick body through rc, with the same captured transport
         // variables the scheduler supplies. Nothing is reseeded on the host.
-        server.kernel_db.lock().update_context_type(context, "musician").unwrap();
+        common::perform_with_rc_dir(&server, context, "musician");
         let admission = server.kernel.admit_context(context).unwrap();
         let admitted_at = timeline.lock().playhead();
         let session = server.kernel.turns().conversations().get_or_create(context);

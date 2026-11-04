@@ -1,4 +1,5 @@
-# root: a root character's admin console. The human root has no model and
+# root: every context a root character performs, its root console and the
+# shell children it opens with Ctrl-Z alike. The human root has no model and
 # composes no stance; the model console is a `console` context under it
 # (assets/defaults/rc/console). The root refuses drives.
 set -e

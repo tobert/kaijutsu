@@ -195,7 +195,7 @@ fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_per
         let performer = kaijutsu_types::PrincipalId::new();
         {
             let db = kernel.kernel_db.lock();
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: performer, name: "distinct-performer".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();

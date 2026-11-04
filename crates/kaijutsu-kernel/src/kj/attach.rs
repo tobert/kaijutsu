@@ -131,11 +131,9 @@ mod tests {
         }
     }
 
+    /// Make `ctx` a context of type `ty` whose performer runs rc directory `ty`.
     fn set_context_type(d: &KjDispatcher, ctx: ContextId, ty: &str) {
-        d.kernel_db()
-            .lock()
-            .update_context_type(ctx, ty)
-            .expect("set context_type");
+        crate::kj::test_helpers::perform_with_rc_dir(d, ctx, ty);
     }
 
     async fn install_attach_script(d: &KjDispatcher, ctx_type: &str, content: &str, ext: &str) {

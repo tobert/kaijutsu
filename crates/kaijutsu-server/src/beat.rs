@@ -4153,6 +4153,15 @@ mod tests {
                 workspace,
             )
             .unwrap();
+            // The lifecycle runs the performer's rc directory.
+            let performer = PrincipalId::new();
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                rc_dir: Some(context_type.to_string()), console_ctx: None, mcp_hub_ctx: None,
+                context_type: Some(context_type.to_string()), principal_id: performer,
+                name: format!("rc-{context_type}"), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            db.update_performer(ctx, Some(performer)).unwrap();
         }
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
         let rc = MemoryBackend::new();

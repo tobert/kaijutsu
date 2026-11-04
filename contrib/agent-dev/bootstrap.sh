@@ -84,10 +84,10 @@ kj backend model set deepseek deepseek-flash --context-window 1000000 --max-toke
 kj backend set anthropic --kind anthropic --api-key-file "$HOME/.anthropic-key.txt"
 kj backend model set anthropic claude-haiku-5-5 --max-tokens 64000
 
-kj character create senpai
+kj character create senpai --rc mcp
 run add-key /keys/senpai.pub --as senpai
-kj character create banto
-kj character create "$project-coder"
+kj character create banto --rc director
+kj character create "$project-coder" --rc coder
 
 # A character's slots give its contexts their models, copied when a context is made. banto runs Haiku; the coder
 # runs DeepSeek. Each has a `distill` slot, which `kj fork --compact` and `kj drift pull` summarize on.

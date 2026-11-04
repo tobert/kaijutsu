@@ -93,7 +93,7 @@ fn character_create_then_json_list_prints_data_not_the_message() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    let create = home.run(&["kj", "--", "character", "create", "bob"]);
+    let create = home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]);
     assert!(create.status.success(), "kj character create failed: {}", stderr(&create));
     assert!(stdout(&create).contains("bob"), "{}", stdout(&create));
 
@@ -128,7 +128,7 @@ fn context_create_and_info_name_the_performer() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    let bob = home.run(&["kj", "--", "character", "create", "bob"]);
+    let bob = home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
 
     let create = home.run(&["kj", "--", "context", "create", "bob", "--name", "lane", "--type", "coder"]);
@@ -150,7 +150,7 @@ fn a_held_lock_makes_kj_refuse_without_touching_the_database() {
 
     let _held = KernelLock::acquire(&home.kernel_dir()).expect("test process takes the lock first");
 
-    let out = home.run(&["kj", "--", "character", "create", "carol"]);
+    let out = home.run(&["kj", "--", "character", "create", "carol", "--rc", "default"]);
     assert!(!out.status.success(), "kj must refuse while the lock is held");
     assert!(stderr(&out).contains("kernel.lock"), "the refusal should name the lock path: {}", stderr(&out));
 
@@ -190,7 +190,7 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     home.bootstrap("amy");
     common::seed_mock_backend_with_model(&home.kernel_dir(), "mock-model");
 
-    let bob = home.run(&["kj", "--", "character", "create", "bob"]);
+    let bob = home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
     let slot = home.run(&[
         "kj", "--", "character", "slot", "set", "bob", "coder", "mock/mock-model", "--max-tokens", "4096",
@@ -199,7 +199,7 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
 
     // The human root refuses `drive`, so the lane is created and driven
     // from a director context, as a person would.
-    let banto = home.run(&["kj", "--", "character", "create", "banto"]);
+    let banto = home.run(&["kj", "--", "character", "create", "banto", "--rc", "director"]);
     assert!(banto.status.success(), "{}", stderr(&banto));
     let boss = home.run(&["kj", "--", "context", "create", "banto", "--name", "boss", "--type", "director"]);
     assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
@@ -238,13 +238,13 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
          {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}]
     ]).to_string()).unwrap();
 
-    assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
+    assert!(home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]).status.success());
     let slot = home.run(&[
         "kj", "--", "character", "slot", "set", "bob", "coder", "mock/mock-model", "--max-tokens", "4096",
     ]);
     assert!(slot.status.success(), "{}", stderr(&slot));
     // The human root refuses `drive`; see the test above.
-    let banto = home.run(&["kj", "--", "character", "create", "banto"]);
+    let banto = home.run(&["kj", "--", "character", "create", "banto", "--rc", "director"]);
     assert!(banto.status.success(), "{}", stderr(&banto));
     let boss = home.run(&["kj", "--", "context", "create", "banto", "--name", "boss", "--type", "director"]);
     assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
@@ -329,7 +329,7 @@ fn as_refuses_a_non_root_character() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    let bob = home.run(&["kj", "--", "character", "create", "bob"]);
+    let bob = home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]);
     assert!(bob.status.success(), "{}", stderr(&bob));
 
     let out = home.run(&["kj", "--as", "bob", "--", "character", "list"]);
@@ -345,7 +345,7 @@ fn a_second_kj_invocation_right_after_the_first_succeeds() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    let first = home.run(&["kj", "--", "character", "create", "bob"]);
+    let first = home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]);
     assert!(first.status.success(), "first kj invocation failed: {}", stderr(&first));
 
     let second = home.run(&["kj", "--", "character", "list"]);
@@ -365,7 +365,7 @@ fn a_destroy_verb_without_confirm_exits_2() {
     let home = Home::new();
     home.bootstrap("amy");
 
-    assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
+    assert!(home.run(&["kj", "--", "character", "create", "bob", "--rc", "coder"]).status.success());
     let create = home.run(&["kj", "--", "context", "create", "bob", "--name", "lane", "--type", "coder"]);
     assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
 

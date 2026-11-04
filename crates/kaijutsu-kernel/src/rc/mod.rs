@@ -1,7 +1,9 @@
 //! Run-control (rc) lifecycle dispatch.
 //!
-//! Runs at create, fork, attach, drift, tick, rotate, and submit. Scripts under
-//! `/config/rc/<context_type>/<verb>/SXX-name.kai` run in lexical order.
+//! Runs at create, fork, attach, drift, tick, rotate, submit, and archive.
+//! Scripts under `/config/rc/<rc_dir>/<verb>/SXX-name.kai` run in lexical
+//! order, where `rc_dir` is the directory the context's performer names
+//! (`characters.rc_dir`). A context with no performer runs none.
 //! Other files are data. Scripts use the shared runtime constructor
 //! with rc authority and `TimeoutPolicy::rc_script_timeout`.
 //!
@@ -197,7 +199,43 @@ impl<'a> RcInvocation<'a> {
     }
 }
 
-/// Run a context type's scripts after the triggering state change is committed.
+/// The rc directory a context of `context_type` performed by `sheet` runs:
+/// the character's `rc_dir`. A character with none is an error that names
+/// the fix.
+pub(crate) fn performer_rc_dir(context_type: &str, sheet: &crate::kernel_db::CharacterRow) -> Result<String, String> {
+    // The judge shadow runs judge/ until it has a performer of its own.
+    if context_type == crate::council::shadow::JUDGE {
+        return Ok(crate::council::shadow::JUDGE.to_string());
+    }
+    sheet.rc_dir.clone().ok_or_else(|| format!(
+        "{name} names no rc directory, so a context it performs cannot run its lifecycle; \
+         `kj character set {name} --rc <dir>` names one",
+        name = sheet.name,
+    ))
+}
+
+/// The rc directory a context's lifecycle runs and the character it runs
+/// for ([`performer_rc_dir`]), or `None` for a context with no performer. A
+/// performer with no sheet is an error.
+pub(crate) fn lifecycle_dir(
+    db: &crate::kernel_db::KernelDb,
+    row: &crate::kernel_db::ContextRow,
+) -> Result<Option<(String, String)>, String> {
+    let Some(performer) = row.performer else { return Ok(None) };
+    let sheet = match db.get_character(performer) {
+        Ok(Some(sheet)) => sheet,
+        Ok(None) => return Err(format!(
+            "rc lifecycle: context {} is performed by {}, which has no character sheet, so no rc directory can run",
+            row.context_id.short(), performer.short()
+        )),
+        Err(e) => return Err(format!("rc lifecycle: {e}")),
+    };
+    let dir = performer_rc_dir(&row.context_type, &sheet)
+        .map_err(|e| format!("rc lifecycle for context {}: {e}", row.context_id.short()))?;
+    Ok(Some((dir, sheet.name)))
+}
+
+/// Run the performer's rc scripts after the triggering state change is committed.
 /// Script failures are recorded and later scripts continue. Cancellation stops
 /// the lifecycle after active execution cleans up. Invalid verbs, unavailable
 /// context state, and discovery or settlement failures return an error.
@@ -220,10 +258,10 @@ pub async fn run(
 
     // Lifecycle diagnostics belong to the context creator. Commands inside
     // scripts author their blocks as the invoking performer.
-    let (context_type, owner) = {
+    let (resolved, owner) = {
         let db = dispatcher.kernel_db().lock();
         match db.get_context(new_id) {
-            Ok(Some(row)) => (row.context_type, row.created_by),
+            Ok(Some(row)) => (lifecycle_dir(&db, &row), row.created_by),
             Ok(None) => {
                 return Err(format!(
                     "rc lifecycle: context {} not found",
@@ -234,13 +272,19 @@ pub async fn run(
         }
     };
 
+    // The run records the directory that runs; a context with no performer,
+    // or one whose directory cannot be resolved, records none.
+    let recorded_dir = match &resolved {
+        Ok(Some((dir, _))) => dir.as_str(),
+        Ok(None) | Err(_) => "",
+    };
     let run_id = {
         let db = dispatcher.kernel_db().lock();
-        rc_runs::start_run(db.conn_for_ledger(), new_id.as_bytes(), &context_type, verb)
+        rc_runs::start_run(db.conn_for_ledger(), new_id.as_bytes(), recorded_dir, verb)
             .map_err(|error| format!("rc lifecycle {verb}: could not record admission: {error}"))?
     };
     let mut guard = RunGuard::new(dispatcher, run_id.clone());
-    let result = run_lifecycle(dispatcher, &invocation, caller, &context_type, owner, &run_id).await;
+    let result = run_lifecycle(dispatcher, &invocation, caller, resolved, owner, &run_id).await;
     let outcome = result.as_ref().copied().unwrap_or(RcOutcome::Failed);
     let settled = guard.finish(outcome);
     match (result, settled) {
@@ -250,11 +294,37 @@ pub async fn run(
     }
 }
 
+/// Record a failure that happened before any script ran as an Error block in
+/// the context, then return it. The ordinary script path ensures the
+/// in-memory document later, so this creates it, and the diagnostic survives
+/// context creation and makes `rebind` actionable instead of disappearing
+/// into tracing.
+fn fail_before_scripts(
+    dispatcher: &KjDispatcher,
+    new_id: ContextId,
+    rc_path: &str,
+    error: String,
+    owner: PrincipalId,
+) -> Result<RcOutcome, String> {
+    match dispatcher
+        .block_store()
+        .create_document(new_id, kaijutsu_types::DocKind::Conversation, None)
+    {
+        Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
+            insert_rc_failure_block(dispatcher, new_id, rc_path, "load", None, error.clone(), owner)?;
+            Err(error)
+        }
+        Err(document_error) => Err(format!(
+            "{error}; could not create the document for its diagnostic: {document_error}"
+        )),
+    }
+}
+
 async fn run_lifecycle(
     dispatcher: &KjDispatcher,
     invocation: &RcInvocation<'_>,
     caller: &KjCaller,
-    context_type: &str,
+    resolved: Result<Option<(String, String)>, String>,
     owner: PrincipalId,
     run_id: &str,
 ) -> Result<RcOutcome, String> {
@@ -264,42 +334,28 @@ async fn run_lifecycle(
         return Err(format!("rc lifecycle {verb} cancelled before script discovery"));
     }
 
+    let (rc_dir, character) = match resolved {
+        Ok(Some(found)) => found,
+        // No performer: no scripts, recorded as an empty bucket is.
+        Ok(None) => {
+            let db = dispatcher.kernel_db().lock();
+            rc_runs::set_run_script_count(db.conn_for_ledger(), run_id, 0)
+                .map_err(|error| format!("rc lifecycle {verb}: could not record script count: {error}"))?;
+            return Ok(RcOutcome::Ok);
+        }
+        Err(e) => return fail_before_scripts(dispatcher, new_id, paths::RC_ROOT, e, owner),
+    };
+    let rc_dir = rc_dir.as_str();
+
     let scripts = match tokio::select! {
         biased;
         _ = invocation.cancel.cancelled() => {
             return Err(format!("rc lifecycle {verb} cancelled during script discovery"));
         }
-        scripts = load_scripts(dispatcher, context_type, verb) => scripts,
+        scripts = load_scripts(dispatcher, rc_dir, verb) => scripts,
     } {
         Ok(s) => s,
-        Err(e) => {
-            // A loader error happens before the ordinary script path below
-            // ensures the in-memory document. Create it now so the
-            // diagnostic survives context creation and makes `rebind`
-            // actionable instead of disappearing into tracing.
-            match dispatcher
-                .block_store()
-                .create_document(new_id, kaijutsu_types::DocKind::Conversation, None)
-            {
-                Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
-                    insert_rc_failure_block(
-                        dispatcher,
-                        new_id,
-                        &paths::rc_dir(&context_type, verb),
-                        "load",
-                        None,
-                        e.clone(),
-                        owner,
-                    )?;
-                    return Err(e);
-                }
-                Err(document_error) => {
-                    return Err(format!(
-                        "{e}; could not create the document for its diagnostic: {document_error}"
-                    ));
-                }
-            }
-        }
+        Err(e) => return fail_before_scripts(dispatcher, new_id, &paths::rc_dir(rc_dir, verb), e, owner),
     };
 
     // The count records the snapshotted source set before execution. Readers
@@ -344,7 +400,7 @@ async fn run_lifecycle(
                 "rc depth limit exceeded ({} >= {}); refusing to run {}/* scripts",
                 caller.rc_depth,
                 MAX_RC_DEPTH,
-                paths::rc_dir(&context_type, verb)
+                paths::rc_dir(rc_dir, verb)
             ),
             owner,
         )?;
@@ -368,7 +424,7 @@ async fn run_lifecycle(
             rc_runs::begin_run_script(db.conn_for_ledger(), run_id, &script.path, &script.content, script_started_at)
                 .map_err(|error| format!("rc lifecycle {verb}: could not record {} before execution: {error}", script.path))?
         };
-        let result = run_kai_script(dispatcher, invocation, context_type, script, caller, owner).await;
+        let result = run_kai_script(dispatcher, invocation, rc_dir, &character, script, caller, owner).await;
         let cancelled = result.cancelled();
         any_script_failed |= result.failed();
         dispatcher.kernel().rc_settlements().retain_and_project(run_id, seq, result)?;
@@ -384,7 +440,7 @@ async fn run_lifecycle(
     Ok(if any_script_failed { RcOutcome::Failed } else { RcOutcome::Ok })
 }
 
-/// Load the rc scripts for `(context_type, verb)` from the `/config/rc`
+/// Load the rc scripts for `(rc_dir, verb)` from the `/config/rc`
 /// file tree, ordered lexically by filename (which is exactly
 /// `(sort_key, name)` order). A missing directory means "no scripts for
 /// this verb" — the common case — and returns empty, not an error. A
@@ -392,16 +448,16 @@ async fn run_lifecycle(
 /// lifecycle.
 async fn load_scripts(
     dispatcher: &KjDispatcher,
-    context_type: &str,
+    rc_dir: &str,
     verb: &str,
 ) -> Result<Vec<RcScript>, String> {
     use crate::vfs::{VfsError, VfsOps};
 
-    let dir = paths::rc_dir(context_type, verb);
+    let dir = paths::rc_dir(rc_dir, verb);
     let vfs = dispatcher.kernel().vfs();
     let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
         Ok(e) => e,
-        // Directory absent → no scripts for this (type, verb).
+        // Directory absent → no scripts for this (rc_dir, verb).
         Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => {
             return Ok(Vec::new());
         }
@@ -436,7 +492,7 @@ async fn load_scripts(
 
     let mut scripts = Vec::with_capacity(names.len());
     for name in names {
-        let path = paths::rc_script_path(context_type, verb, &name);
+        let path = paths::rc_script_path(rc_dir, verb, &name);
         // Read straight through the VFS to the host rc tree (no
         // FileDocumentCache mirror). Any read failure on a file we just enumerated is
         // corruption — boot WITHOUT the stance is worse than failing loud
@@ -455,7 +511,7 @@ async fn load_scripts(
     Ok(scripts)
 }
 
-/// Whether `(context_type, "create")`'s rc bucket lists at least one
+/// Whether `(rc_dir, "create")`'s rc bucket lists at least one
 /// candidate script: an entry that is a file or a symlink whose name ends in
 /// `.kai`. This is `load_scripts`' first pass — name-filtering only, before
 /// canonical-name validation or content reads — so a bucket holding an
@@ -464,19 +520,20 @@ async fn load_scripts(
 /// committed context, not an empty bucket. A missing directory reads as
 /// empty, the same as `load_scripts`.
 ///
-/// `kj context create` calls this before committing a context row: a type
-/// whose `create` bucket is missing or holds no candidate script would bind
-/// no loadout and be committed inert (deny-by-default). Other verbs keep
-/// `load_scripts`' "missing directory is zero scripts, not a failure" rule —
-/// an empty `attach` or `fork` bucket is a legitimate shape for a type that
-/// has no work to do at that verb.
+/// `kj context create` calls this with the performer's directory before
+/// committing a context row: a directory whose `create` bucket is missing or
+/// holds no candidate script would bind no loadout and commit the context
+/// inert (deny-by-default). Other verbs keep `load_scripts`' "missing
+/// directory is zero scripts, not a failure" rule — an empty `attach` or
+/// `fork` bucket is a legitimate shape for a directory that has no work to do
+/// at that verb.
 pub async fn create_bucket_has_candidates(
     dispatcher: &KjDispatcher,
-    context_type: &str,
+    rc_dir: &str,
 ) -> Result<bool, String> {
     use crate::vfs::{VfsError, VfsOps};
 
-    let dir = paths::rc_dir(context_type, VERB_CREATE);
+    let dir = paths::rc_dir(rc_dir, VERB_CREATE);
     let vfs = dispatcher.kernel().vfs();
     let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
         Ok(e) => e,
@@ -488,10 +545,12 @@ pub async fn create_bucket_has_candidates(
         .any(|e| (e.kind.is_file() || e.kind.is_symlink()) && e.name.ends_with(".kai")))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_kai_script(
     dispatcher: &KjDispatcher,
     invocation: &RcInvocation<'_>,
-    context_type: &str,
+    rc_dir: &str,
+    character: &str,
     script: &RcScript,
     caller: &KjCaller,
     principal: PrincipalId,
@@ -544,8 +603,12 @@ async fn run_kai_script(
         kaish_kernel::ast::Value::String(verb.to_string()),
     );
     vars.insert(
-        "KJ_CONTEXT_TYPE".into(),
-        kaish_kernel::ast::Value::String(context_type.to_string()),
+        "KJ_CHARACTER".into(),
+        kaish_kernel::ast::Value::String(character.to_string()),
+    );
+    vars.insert(
+        "KJ_RC_DIR".into(),
+        kaish_kernel::ast::Value::String(rc_dir.to_string()),
     );
     vars.insert(
         "KJ_RC_DEPTH".into(),

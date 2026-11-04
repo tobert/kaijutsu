@@ -219,8 +219,16 @@ fn several_roots_without_a_named_parent_refuse() {
         let mcp = connect_mcp(addr).await;
         let first = register_with_retry(&mcp, "seat").await;
         assert!(first.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{first}");
-        let out = run_shell(&mcp, "kj character create second-root --root").await;
-        assert_eq!(out["exit_code"].as_i64(), Some(0), "{out}");
+        // A second root is made from the first root's console, which holds
+        // config-write; the session runs its performer's rc directory.
+        let Backend::Remote(remote) = mcp.backend() else { unreachable!("connect_mcp is remote") };
+        let root = kaijutsu_client::choose_parent(None, &remote.actor.list_contexts().await.unwrap()).unwrap();
+        let out = remote
+            .actor
+            .execute_kj_quiet(root.context_id, ["character", "create", "second-root", "--root"].map(String::from).to_vec())
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "{}", out.stderr);
 
         let other = connect_mcp(addr).await;
         let mut raw = String::new();
@@ -338,7 +346,7 @@ fn an_mcp_session_raises_no_ask_and_another_type_is_held_until_approval() {
             SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
         });
         let kernel = kernel_rx.await.unwrap();
-        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: claude, name: "claude".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();

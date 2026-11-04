@@ -1445,7 +1445,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(amy, "house-amy", true), (rootbot, "house-rootbot", false), (coder, "house-coder", false)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "root" } else { "default" }.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
                 }).unwrap();
             }
@@ -2511,7 +2511,7 @@ mod tests {
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("cancel-flush-source"), None, principal);
         let dst = register_context(&d, Some("cancel-flush-target"), None, principal);
-        d.kernel_db().lock().update_context_type(dst, "cancel-flush").unwrap();
+        crate::kj::test_helpers::perform_with_rc_dir(&d, dst, "cancel-flush");
         d.block_store()
             .create_document(dst, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -3296,7 +3296,7 @@ mod tests {
         argv: &[String],
         caller: &crate::kj::KjCaller,
     ) -> Vec<crate::runtime::turn_state::LiveInput> {
-        d.kernel_db().lock().update_context_type(dst, "drift-order").unwrap();
+        crate::kj::test_helpers::perform_with_rc_dir(d, dst, "drift-order");
         install_rc_script_file(
             d,
             "/config/rc/drift-order/drift/S00-block.kai",

@@ -50,8 +50,8 @@ result is missing:
    kernel finds the key wherever it runs.
 2. `kj backend model set` with the context window of a model it knows. For
    a model it does not know, the report names the model and this verb.
-3. `kj character create root --model <b>/<m> --max-tokens 16384` on the first provider's model, for
-   the model character that plays the console (`--console-as` names another). A character that exists and has
+3. `kj character create root --rc console --model <b>/<m> --max-tokens 16384` on the first provider's model, for
+   the model character that plays the console (`--console-as` names another), running the `console` rc directory. A character that exists and has
    no model and no `console` or `distill` slot gets `kj character model set root ...` instead. A character that
    already has a model or either slot is left alone, and the report says so.
 4. `kj context create root --name console --type console`, a kohai of the root

@@ -938,7 +938,7 @@ mod tests {
         // The tick verb is wired into the rc path grammar.
         let parts = crate::rc::parse_rc_path("/config/rc/musician/tick/S10-drive.kai")
             .expect("tick rc path must parse");
-        assert_eq!(parts.context_type, "musician");
+        assert_eq!(parts.rc_dir, "musician");
         assert_eq!(parts.verb, "tick");
     }
 

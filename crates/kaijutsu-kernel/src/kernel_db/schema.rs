@@ -201,9 +201,10 @@ CREATE TABLE IF NOT EXISTS context_slots (
 );
 
 -- What `context-characters-v1` did not carry over or could not resolve, and
--- what `context-fold-v1` decided, by kind: dropped, unmapped, no_slot,
--- no_gate_slot, no_distill_slot, no_character_slot, senpai_assigned,
--- archived_no_senpai.
+-- what `context-fold-v1` and `rc-dir-backfill-v1` decided, by kind: dropped,
+-- unmapped, no_slot, no_gate_slot, no_distill_slot, no_character_slot,
+-- senpai_assigned, archived_no_senpai, rc_dir_unset (no context_id; the note
+-- names the character), console_ambiguous.
 CREATE TABLE IF NOT EXISTS context_character_migration_report (
     report_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT    NOT NULL,

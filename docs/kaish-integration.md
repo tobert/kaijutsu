@@ -53,8 +53,8 @@ context live. That demote step needs `--confirm`, as archive does.
 capability unless a live root character runs them. For the first three, no
 seat but the console acts on its own context, a human root, or a console
 (`docs/character.md`, "The console places contexts").
-`kj context archive --children [--type <type>]` archives a context's live
-children, each through its own lifecycle.
+`kj context archive --children [--type <type>] [--performer <character>]`
+archives a context's live children, each through its own lifecycle.
 Already accepted commands retain their settlement destination across archive.
 The migrated execution entry points order admission against archive under the kernel database lock:
 archive first refuses new work before user input, drafts, receipts or lifecycle

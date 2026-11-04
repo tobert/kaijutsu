@@ -464,7 +464,7 @@ mod tests {
     /// in this slice.
     async fn create_and_play(d: &super::super::KjDispatcher, name: &str) -> super::super::KjCaller {
         let admin = super::super::test_helpers::test_caller();
-        let result = d.dispatch(&[s("character"), s("create"), s(name)], &admin).await;
+        let result = d.dispatch(&[s("character"), s("create"), s(name), s("--rc"), s("default")], &admin).await;
         let KjResult::Ok { data: Some(serde_json::Value::Object(obj)), .. } = result else {
             panic!("expected character create to succeed, got {result:?}");
         };

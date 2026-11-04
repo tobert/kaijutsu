@@ -17,6 +17,18 @@ Only `.kai` lifecycle entries execute; Markdown is data read by scripts.
 /config/rc/director/create/S06-kj-help.md
 ```
 
+A context runs the rc directory its performer names: `characters.rc_dir`, set
+with `kj character create <name> --rc <dir>` or `kj character set <name> --rc
+<dir>`. The lifecycle reads `/config/rc/<rc_dir>/<verb>/`, so the directories
+above serve whichever characters name them. A context with no performer runs no
+rc, and a performer that names no directory fails the lifecycle and refuses
+`kj context create`, naming `kj character set <name> --rc <dir>`. A judge
+shadow runs `judge/` whoever performs it. Scripts read `KJ_CHARACTER` (the
+performer's name) and `KJ_RC_DIR` (the directory that runs). The directories
+keep their type names, and `--type` still sets the context's type, which the
+gate, the slots and the clients read; see `docs/character.md`, "The type melts
+into the character".
+
 Each context type owns its whole stance. No base is shared between types, and
 Kaijutsu never prepends a universal behavioral prompt. A stance is a Markdown
 companion read by a one-line `.kai`, so the text is the file. Every stance
