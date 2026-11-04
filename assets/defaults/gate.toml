@@ -5,9 +5,16 @@
 # Keys: "kj <verb> [<subcommand>]" (canonical names; an unknown verb fails
 # the load) or "<command> [<first argument>]". Verdicts: allow, ask, deny.
 # A more specific key wins; at equal specificity deny beats ask beats allow.
-# Layers compose: [global], then [context_type.<type>] over it. A learned
-# ledger rule outranks everything here; a verb's declared Read effect and
-# the whole `kj ledger` verb are allowed beneath it.
+# Layers compose for the context's performer: [global], then [rc.<dir>] for
+# its rc directory, then [character.<name>] for the character, then [root]
+# when a root character performs it. Each later layer reads over the earlier
+# ones; a context with no performer reads [global] alone. A learned ledger
+# rule outranks everything here; a verb's declared Read effect and the whole
+# `kj ledger` verb are allowed beneath it.
+#
+# A [rc.<dir>] naming no rc directory, or a [character.<name>] naming no
+# character, applies to nobody: the kernel logs a warning at every load and
+# `kj ledger rules` lists it, and the file still loads.
 #
 # allow covers a key, never arguments: a redirect, a background flag, a
 # heredoc or a substituted argument drops the statement back to the
@@ -29,7 +36,7 @@
 # ledger rule still outranks it. `kj ledger rules` states the posture when
 # it is on.
 #
-#   [context_type.coder]
+#   [rc.coder]
 #   uncovered = "allow"   # sandboxed benchmark kernels only
 #
 # A model that runs the `shell_write` tool from its shell asks twice: once
@@ -37,12 +44,14 @@
 # command it carries. Allowing the statement for a seat leaves the tool's
 # gate as the one ask. This default leaves it off so each seat opts in:
 #
-#   [context_type.coder]
+#   [rc.coder]
 #   allow = ["shell_write"]
 
 # Council: a System 1 model check that may allow a statement the tiers
 # above leave to the human. It is off. To turn it on, uncomment the
-# sections below and enable it per context type. The file refuses to load
+# sections below and enable it per rc directory or per character. A council
+# block reads over the blocks before it key by key, in the order the layers
+# compose, and the last block's `enabled` decides. The file refuses to load
 # on an unknown field, a threshold naming no spec, or two thresholds for one
 # spec. The council server is not named here: a context decides on its
 # `gate` slot (`kj character slot set <character> gate <mk backend>/<served
@@ -67,15 +76,15 @@
 #   allow_at = 0.98                         # pooled p(allow); 0 < x <= 1
 #   mass_floor = -0.05                      # each read's verdict mass; log probability, <= 0
 #
-#   [context_type.coder.council]
-#   enabled = true                          # off for every type that does not say so
+#   [rc.coder.council]
+#   enabled = true                          # off for every performer whose layers do not say so
 #   judge = "judge"                         # the character that performs each seat's judge shadow; its model is
 #                                           # the judge's council server. No judge key, no judge. The kernel
 #                                           # archives a seat's judge shadows with the seat
 #
-#   [context_type.director.council]
+#   [rc.director.council]
 #   enabled = true
-#   contexts = ["council-amy", "council-banto"]  # replaces the shared contexts for this type; spec contexts still join
+#   contexts = ["council-amy", "council-banto"]  # replaces the shared contexts for this directory; spec contexts still join
 
 [global]
 allow = [
@@ -97,27 +106,27 @@ deny = [
   "dd",                  # no kaijutsu seat has a reason; uniform loud refusal
 ]
 
-[context_type.toolie]
+[rc.toolie]
 deny = [
   "kj context create",     # a toolie uses tools; lifecycle belongs to its parent
 ]
 
-[context_type.mcp]
+[rc.mcp]
 allow = [
   "kj context create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
   "kj context archive",  # a session ends itself; recoverable: `kj context promote`
 ]
 
-[context_type.director]
+[rc.director]
 allow = [
   "kj context create",     # a director creates its lanes, `kj context create coder --name <lane>`
-  "kj fork",             # a fork copies this seat's own performer and type
+  "kj fork",             # a fork copies this seat's own performer
   "kj drive",            # runs a turn on a lane this seat directs
   "kj price set",        # appends a price row; a correction is a later row
 ]
 
-[context_type.root]
+[root]
 allow = [
   "kj price set",        # appends a price row; a correction is a later row
 ]
@@ -126,7 +135,7 @@ allow = [
 # present (docs/companion.md). The statement is quiet; the tool's own gate
 # still judges the command it carries, and anything no key covers asks. A
 # check-in has the read-only shell and needs no key.
-[context_type.companion]
+[rc.companion]
 allow = [
   "shell_write",
 ]

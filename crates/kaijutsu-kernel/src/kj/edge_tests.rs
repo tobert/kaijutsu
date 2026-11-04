@@ -126,7 +126,7 @@ async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
 
     let gate = "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"loglinear\", weights = \"mass\" }\ndeadline_ms = 700\n\n\
                 [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
-                [context_type.default.council]\nenabled = true\njudge = \"judge\"\n";
+                [rc.default.council]\nenabled = true\njudge = \"judge\"\n";
     let path = kaijutsu_types::paths::config_path(crate::kj::gate_policy::GATE_CONFIG_FILE);
     d.kernel().vfs().write_all(std::path::Path::new(&path), gate.as_bytes()).await.expect("write gate.toml");
     let judge = d.kernel_db().lock().get_character_by_name("judge").unwrap().unwrap().principal_id;
@@ -141,6 +141,25 @@ async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
     d.kernel_db().lock().update_context_type(h.other, "judge").unwrap();
     let moved = d.dispatch(&[s("context"), s("set"), h.other.to_hex(), s("--senpai"), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
     assert!(moved.is_ok(), "a context of type judge that no judge performs moves: {}", moved.message());
+}
+
+/// The judge names that tell a judge shadow come from every section's
+/// council block that enables a council: `[rc.<dir>]`, `[character.<name>]`
+/// and `[root]` alike.
+///
+/// Falsified by reading the judge names from one kind of section only.
+#[tokio::test]
+async fn the_council_judges_come_from_every_layer_s_council_block() {
+    let d = test_dispatcher().await;
+    write_gate_toml(&d, "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"loglinear\", weights = \"mass\" }\ndeadline_ms = 700\n\n\
+                         [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
+                         [rc.default.council]\nenabled = true\njudge = \"judge\"\n\
+                         [character.banto.council]\nenabled = true\njudge = \"banto-judge\"\n\
+                         [root.council]\nenabled = true\njudge = \"root-judge\"\n\
+                         [character.quiet.council]\nenabled = false\n").await;
+    let mut judges = d.council_judges().await.expect("gate.toml loads");
+    judges.sort();
+    assert_eq!(judges, ["banto-judge", "judge", "root-judge"]);
 }
 
 /// Write `text` as the kernel's gate.toml.

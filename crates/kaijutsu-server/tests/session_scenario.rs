@@ -217,7 +217,7 @@ async fn boot() -> Scenario {
     bootstrap_mock(&config, "mock-model").await;
 
     // `gate.toml`'s shipped default (`assets/defaults/gate.toml`) allow-lists
-    // "kj handoff note" globally and gives `[context_type.director]` create,
+    // "kj handoff note" globally and gives `[rc.director]` create,
     // fork, and drive, but banto's own `context set`/`wait`/`handoff signoff`
     // /`drift push` tool calls would each raise their own ask (`Uncovered`
     // falls to `ask`, `crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s
@@ -237,13 +237,13 @@ async fn boot() -> Scenario {
         "/../../assets/defaults/gate.toml"
     ))
     .expect("read shipped gate.toml");
-    let director_tier = "[context_type.director]\nallow = [\n";
+    let director_tier = "[rc.director]\nallow = [\n";
     assert_eq!(shipped.matches(director_tier).count(), 1, "the shipped gate.toml carries one director allow tier");
     std::fs::write(
         &gate_toml_path,
         shipped.replacen(
             director_tier,
-            "[context_type.director]\nallow = [\n  \"kj context set\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n",
+            "[rc.director]\nallow = [\n  \"kj context set\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n",
             1,
         ),
     )
@@ -521,7 +521,7 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Turn 3: banto's gated statement raises an ask. `echo` names no
         // `kj` verb, so no tier in `gate.toml` — not even the
-        // `[context_type.director]` one this scenario just wrote — ever
+        // `[rc.director]` one this scenario just wrote — ever
         // covers it; it is `Uncovered` and falls to the default `ask`
         // (`crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s module doc).
         // No hook install needed: this is the kernel's real default gate

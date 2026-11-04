@@ -401,8 +401,10 @@ enum LedgerCommand {
     },
     /// List the gate rules in force for this context: standing rules a
     /// human taught (exact-text and family, newest first, capped at
-    /// `--limit`, default 20), then the gate.toml tiers that apply to this
-    /// context's type. Each names the layer that decides it.
+    /// `--limit`, default 20), then the gate.toml sections this context's
+    /// performer reads ([global], [rc.<dir>], [character.<name>], [root])
+    /// and their tiers, and any section that applies to nobody. Each names
+    /// the layer that decides it.
     Rules {
         /// Newest N rules. Default 20.
         #[arg(long, default_value_t = 20)]
@@ -1081,9 +1083,9 @@ impl KjDispatcher {
     /// `kj ledger rules`: every rule with a verdict for the calling
     /// context, each naming the layer that decides it — the human-taught
     /// rules (exact text and family) first, newest first and capped by
-    /// `--limit`, then the `gate.toml` tiers in force for the caller's
-    /// context type. `.data` is the learned rule ids, the ones `forget`
-    /// takes.
+    /// `--limit`, then the `gate.toml` sections the caller's performer reads
+    /// and the tiers in force from them, then the sections that apply to
+    /// nobody. `.data` is the learned rule ids, the ones `forget` takes.
     async fn ledger_rules(&self, limit: u32, since: Option<&str>, caller: &KjCaller) -> KjResult {
         let since_ms = match since {
             Some(s) => match parse_since_duration_ms(s) {
@@ -1093,10 +1095,13 @@ impl KjDispatcher {
             None => None,
         };
         let filter = approval_ledger::rules::RuleListFilter { since_ms, limit: limit as i64 };
-        let gate_config = crate::kj::gate_policy::load_config(self.kernel.vfs()).await;
-        let (context_type, digest_rules, family_rules, total, names) = {
+        let gate_config = crate::kj::gate_policy::load_config(self.kernel.vfs(), self.kernel.kernel_db()).await;
+        let (performer, digest_rules, family_rules, total, names) = {
             let db = self.kernel_db.lock();
-            let context_type = crate::kj::gate_policy::context_type_of(&db, caller.context_id);
+            let performer = match crate::kj::gate_policy::performer_of(&db, caller.context_id) {
+                Ok(performer) => performer,
+                Err(e) => return KjResult::Err(format!("kj ledger rules: {e}")),
+            };
             let conn = db.conn_for_ledger();
             let (digest, t1) = match approval_ledger::rules::list_rules_filtered(conn, &filter) {
                 Ok(r) => r,
@@ -1113,7 +1118,7 @@ impl KjDispatcher {
                     names.entry(actor.clone()).or_insert_with(|| character_name(&db, Some(actor)));
                 }
             }
-            (context_type, digest, family, t1 + t2, names)
+            (performer, digest, family, t1 + t2, names)
         };
         let scope_text = |scope: RuleScope, actor: &Option<Vec<u8>>| match (scope, actor) {
             (RuleScope::Character, Some(actor)) => format!("character {}", names[actor]),
@@ -1166,19 +1171,17 @@ impl KjDispatcher {
         }
         match &gate_config {
             Ok(config) => {
-                let entries = config.entries_for(context_type.as_deref());
+                lines.push(gate_layers_line(config, performer.as_ref()));
+                let entries = config.entries_for(performer.as_ref());
                 if entries.is_empty() {
-                    lines.push(format!(
-                        "gate.toml: no tiers apply to this context (type {})",
-                        context_type.as_deref().unwrap_or("unknown")
-                    ));
+                    lines.push("gate.toml: no tiers apply to this context".to_string());
                 } else {
                     lines.push(format!("  {:<40}  {:<7}  {}", "GATE.TOML KEY", "VERDICT", "LAYER"));
                     for (layer, key, verdict) in entries {
                         lines.push(format!("  {:<40}  {:<7}  {layer}", truncate_key(&key), verdict));
                     }
                 }
-                if config.allows_uncovered(context_type.as_deref()) {
+                if config.allows_uncovered(performer.as_ref()) {
                     lines.push(String::new());
                     lines.push(
                         "gate.toml sets uncovered = \"allow\" for this context: every statement \
@@ -1186,6 +1189,15 @@ impl KjDispatcher {
                          sandboxed or throwaway kernel."
                             .to_string(),
                     );
+                }
+                let nobody = config.applies_to_nobody();
+                if !nobody.is_empty() {
+                    lines.push(String::new());
+                    let named: Vec<String> = nobody.iter().map(|s| s.header()).collect();
+                    lines.push(format!(
+                        "gate.toml sections that apply to nobody, naming no rc directory or character: {}",
+                        named.join(", ")
+                    ));
                 }
             }
             Err(e) => lines.push(format!("gate.toml: {e}")),
@@ -2130,6 +2142,30 @@ fn learn_family_for_ask(
 }
 
 /// A key or label on one listing line.
+
+/// The `gate.toml` sections a context `performer` plays reads, earliest
+/// first, each later one reading over the ones before it; a section the
+/// file does not have is marked.
+fn gate_layers_line(config: &crate::kj::gate_policy::GateConfig, performer: Option<&crate::kj::gate_policy::GatePerformer>) -> String {
+    use crate::kj::gate_policy::Section;
+    let Some(performer) = performer else {
+        return "gate.toml layers: this context has no performer, so it reads [global] alone".to_string();
+    };
+    let sections: Vec<String> = std::iter::once(Section::Global)
+        .chain(performer.sections())
+        .map(|section| match config.has_section(&section) {
+            true => section.header(),
+            false => format!("{} (not in the file)", section.header()),
+        })
+        .collect();
+    let dir = performer.rc_dir.as_deref().unwrap_or("none");
+    let root = if performer.root { ", a root character" } else { "" };
+    format!(
+        "gate.toml layers for {} (rc directory {dir}{root}), earliest first: {}",
+        performer.name,
+        sections.join(", ")
+    )
+}
 fn truncate_key(s: &str) -> String {
     const LIMIT: usize = 40;
     if s.chars().count() <= LIMIT {
@@ -3984,6 +4020,65 @@ mod tests {
         let text = result.message();
         assert!(text.contains("no active rules"), "{text}");
         assert!(text.contains("kj handoff note") && text.contains("global config"), "{text}");
+    }
+
+    /// `kj ledger rules` names the caller's performer, its rc directory and
+    /// root flag, and the sections it reads in order, each section's entries
+    /// labeled with it, the latest first. A section that names no rc
+    /// directory or character is listed as applying to nobody; a context
+    /// with no performer reads `[global]` alone.
+    ///
+    /// Falsified by listing entries by context type, by dropping a layer
+    /// from the listing, or by dropping the nobody line.
+    #[tokio::test]
+    async fn ledger_rules_shows_the_performer_s_layers_and_the_sections_that_apply_to_nobody() {
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let ctx = c.context_id.unwrap();
+        crate::kj::test_helpers::perform_with_rc_dir(&d, ctx, "coder");
+        let performer = d.kernel_db.lock().get_context(ctx).unwrap().unwrap().performer.unwrap();
+        let name = d.kernel_db.lock().get_character(performer).unwrap().unwrap().name;
+        let path = kaijutsu_types::paths::config_path(crate::kj::gate_policy::GATE_CONFIG_FILE);
+        let text = format!(
+            "[global]\nask = [\"git push\"]\n[rc.coder]\nallow = [\"rg\"]\n[character.{name}]\ndeny = [\"dd\"]\n\
+             [root]\nallow = [\"kj price set\"]\n[rc.codr]\nallow = [\"wc\"]\n[character.nobody-here]\nallow = [\"wc\"]\n"
+        );
+        d.kernel().vfs().write_all(std::path::Path::new(&path), text.as_bytes()).await.expect("write gate.toml");
+
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(rules.is_ok(), "{rules:?}");
+        let out = rules.message();
+        assert!(
+            out.contains(&format!(
+                "gate.toml layers for {name} (rc directory coder), earliest first: [global], [rc.coder], [character.{name}]\n"
+            )),
+            "{out}"
+        );
+        let row = |key: &str| out.lines().position(|l| l.trim_start().starts_with(key)).unwrap_or_else(|| panic!("{key}: {out}"));
+        assert!(out.lines().nth(row("dd")).unwrap().ends_with(&format!("character config ({name})")), "{out}");
+        assert!(out.lines().nth(row("rg")).unwrap().ends_with("rc config (coder)"), "{out}");
+        assert!(out.lines().nth(row("git push")).unwrap().ends_with("global config"), "{out}");
+        assert!(row("dd") < row("rg") && row("rg") < row("git push"), "the latest section first: {out}");
+        assert!(!out.contains("kj price set"), "[root] is for a root performer: {out}");
+        assert!(
+            out.contains("gate.toml sections that apply to nobody, naming no rc directory or character: [rc.codr], [character.nobody-here]"),
+            "{out}"
+        );
+
+        // The root console, which a root character performs, reads [root].
+        let console = crate::kj::test_helpers::register_root_context(&d);
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &crate::kj::test_helpers::caller_with_context(console)).await;
+        let out = rules.message();
+        assert!(out.contains("gate.toml layers for amy (rc directory root, a root character), earliest first: [global], [rc.root] (not in the file), [character.amy] (not in the file), [root]"), "{out}");
+        assert!(out.lines().any(|l| l.trim_start().starts_with("kj price set") && l.ends_with("root config")), "{out}");
+
+        // A context with no performer reads [global] alone.
+        let bare = crate::kj::test_helpers::register_context(&d, Some("bare"), None, kaijutsu_types::PrincipalId::new());
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &crate::kj::test_helpers::caller_with_context(bare)).await;
+        let out = rules.message();
+        assert!(out.contains("this context has no performer, so it reads [global] alone"), "{out}");
+        assert!(out.lines().any(|l| l.trim_start().starts_with("git push")) && !out.contains("rc config"), "{out}");
     }
 
     /// A family learned from an ask with a stored command leaves that

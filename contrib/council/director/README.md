@@ -26,7 +26,7 @@ script by its path in a context shell does nothing, so do not run it that way.
 Add this to the director's existing council section in `gate.toml`:
 
 ```toml
-[context_type.director.council]
+[rc.director.council]
 enabled = true
 contexts = ["council-amy", "council-banto"]
 ```

@@ -323,7 +323,8 @@ fn a_manual_register_racing_startup_registration_joins_once() {
 /// allows the create, registering again with the same label joins the
 /// context the approved create made.
 ///
-/// Falsified by dropping the builtin allow of `kj context create --type mcp`.
+/// Falsified by dropping the gate's rule that a create under the MCP hub of
+/// the caller's lineage root needs no ask.
 #[test]
 fn an_mcp_session_raises_no_ask_and_another_type_is_held_until_approval() {
     run_local(async {

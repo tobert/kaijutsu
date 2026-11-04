@@ -67,8 +67,10 @@ fn a_non_root_registration_lands_under_the_hub_and_archives_itself_with_no_ask()
             kaijutsu_server::SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
         });
         let kernel = kernel_rx.await.unwrap();
+        // An MCP connection's character runs the `mcp` directory, so its
+        // sessions read `[rc.mcp]`, which allows a session's own archive.
         for (name, principal_id, _) in &keys {
-            kernel.kernel_db.lock().insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            kernel.kernel_db.lock().insert_character(&CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: *principal_id, name: (*name).into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();

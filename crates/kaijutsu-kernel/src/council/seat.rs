@@ -59,11 +59,11 @@ fn task(spec_name: &str) -> &'static str {
     }
 }
 
-/// The working directory, mounts, and context type every example runs
+/// The working directory, mounts, and performer every example runs
 /// with.
 const EXAMPLE_CWD: &str = "/work";
 const EXAMPLE_MOUNTS: [(&str, bool); 2] = [("/", true), ("/work", false)];
-const EXAMPLE_CONTEXT_TYPE: &str = "coder";
+const EXAMPLE_CHARACTER: &str = "coder";
 
 /// A worked example's case, before the gate's builders shape it.
 enum ExampleCase {
@@ -132,7 +132,7 @@ fn example_state(case: &ExampleCase) -> Result<String, String> {
     let submission = Submission {
         command,
         planned: &planned,
-        context_type: Some(EXAMPLE_CONTEXT_TYPE),
+        character: Some(EXAMPLE_CHARACTER),
         cwd: Some(EXAMPLE_CWD),
         facts: &facts,
     };
@@ -386,7 +386,7 @@ mod tests {
         let first = messages[5]["content"].as_str().unwrap();
         assert_eq!(
             first,
-            r#"{"command":"grep -rn TODO src","context_type":"coder","cwd":"/work","statements":[{"index":0,"kind":"command","commands":[{"name":"grep","runs":"kaish builtin","args":["-rn","TODO","src"],"paths":[{"word":"src","path":"/work/src","mount":"/work","access":"rw"}]}]}],"mount_access":"ro mounts refuse writes by kaish builtins and redirects; rw mounts allow them. A host program is not limited by kaijutsu mounts."}"#
+            r#"{"command":"grep -rn TODO src","character":"coder","cwd":"/work","statements":[{"index":0,"kind":"command","commands":[{"name":"grep","runs":"kaish builtin","args":["-rn","TODO","src"],"paths":[{"word":"src","path":"/work/src","mount":"/work","access":"rw"}]}]}],"mount_access":"ro mounts refuse writes by kaish builtins and redirects; rw mounts allow them. A host program is not limited by kaijutsu mounts."}"#
         );
         let second: serde_json::Value = serde_json::from_str(messages[7]["content"].as_str().unwrap()).unwrap();
         assert_eq!(second["statements"][0]["commands"][0]["redirects"][0]["writes"], "/work/notes.md");
@@ -399,7 +399,7 @@ mod tests {
         assert!(!case.contains(": ") && !case.contains(", \""), "compact: {case}");
         let case: serde_json::Value = serde_json::from_str(case).unwrap();
         let keys: Vec<&String> = case.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["invocation", "language", "context_type", "cwd", "program"]);
+        assert_eq!(keys, ["invocation", "language", "character", "cwd", "program"]);
         assert_eq!(case["program"], r#"import json; print(json.load(open("package.json"))["version"])"#);
         assert_eq!(
             messages[6]["tool_calls"][0]["input"],

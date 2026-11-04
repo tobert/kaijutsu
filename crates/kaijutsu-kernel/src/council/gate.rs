@@ -95,7 +95,8 @@ pub(crate) struct Submission<'a> {
     pub(crate) command: &'a str,
     /// Its plan, one entry per top-level statement.
     pub(crate) planned: &'a [kaish_kernel::PlannedStatement],
-    pub(crate) context_type: Option<&'a str>,
+    /// The name of the seat's performer, when it has one.
+    pub(crate) character: Option<&'a str>,
     pub(crate) cwd: Option<&'a str>,
     /// What the kernel resolved about the plan before it runs.
     pub(crate) facts: &'a super::shell_case::Facts,
@@ -105,7 +106,7 @@ pub(crate) struct Submission<'a> {
 struct CaseState<'a> {
     command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    context_type: Option<&'a str>,
+    character: Option<&'a str>,
     cwd: &'a str,
     statements: Vec<super::shell_case::StatementView>,
     #[serde(skip_serializing_if = "is_zero")]
@@ -193,7 +194,7 @@ pub(crate) fn elide(text: &str, programs: &[&str]) -> String {
     programs.iter().filter(|p| !p.is_empty()).fold(text.to_string(), |t, p| t.replace(p, JUDGED_SEPARATELY))
 }
 
-/// The shell case, sent as a decision's `case`: the command whole, the seat's context type, the
+/// The shell case, sent as a decision's `case`: the command whole, the seat's performer, the
 /// directory relative paths resolve against, and each statement with its
 /// commands as kaish planned them and what the kernel resolved about them
 /// (`super::shell_case`), with members in that order. Each of `judged`,
@@ -208,7 +209,7 @@ pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str], programs:
     let statements = super::shell_case::statements(submission.command, submission.planned, submission.facts, judged);
     let state = CaseState {
         command: super::shell_case::clip(&elide(submission.command, judged), MAX_COMMAND),
-        context_type: submission.context_type,
+        character: submission.character,
         cwd: &submission.facts.cwd,
         statements: statements.shown,
         statements_not_shown: statements.not_shown,
@@ -227,7 +228,7 @@ struct ProgramState<'a> {
     path: Option<&'a str>,
     language: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    context_type: Option<&'a str>,
+    character: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
@@ -247,7 +248,7 @@ struct Invocation<'a> {
 
 /// A program case, sent as a decision's `case`: how the program is invoked (the command, its
 /// statement, and the submission), the file it was read from, its language,
-/// the seat's context type and working directory, the local imports the
+/// the seat's performer and working directory, the local imports the
 /// decision does not show, and the program text last, with members in that
 /// order.
 pub(crate) fn program_case_state(
@@ -266,7 +267,7 @@ pub(crate) fn program_case_state(
         invocation: Invocation { command: &run.command, statement, submission: submission.command },
         path,
         language: run.language.as_str(),
-        context_type: submission.context_type,
+        character: submission.character,
         cwd: submission.cwd,
         imports_not_shown: &text.imports_not_shown,
         program: &text.text,
@@ -1852,13 +1853,13 @@ pub(crate) async fn consult(
     if spec.planned.is_empty() {
         return Ok(None);
     }
-    let (context_type, cwd) = {
+    let (performer, council, cwd) = {
         let db = kernel.kernel_db().lock();
-        let context_type = crate::kj::gate_policy::context_type_of(&db, Some(context_id));
-        if !config.council_enabled_for(context_type.as_deref()) {
+        let performer = crate::kj::gate_policy::performer_of(&db, Some(context_id))?;
+        let Some(council) = config.council_for(performer.as_ref()) else {
             return Ok(None);
-        }
-        let layers = Layers { config, context_type: context_type.as_deref() };
+        };
+        let layers = Layers { config, performer: performer.as_ref() };
         if let Some(why) = decided_without_council(&db, spec, caller, layers)? {
             tracing::info!("the council is not consulted: {why}");
             return Ok(None);
@@ -1867,11 +1868,10 @@ pub(crate) async fn consult(
             .get_context_shell(context_id)
             .map_err(|e| format!("the council could not read the context's working directory: {e}"))?
             .and_then(|row| row.cwd);
-        (context_type, cwd)
+        (performer, council, cwd)
     };
-    let Some(council) = config.council_for(context_type.as_deref()) else { return Ok(None) };
-    let Some(shell) = shell_spec(council) else { return Ok(None) };
-    let (routed, chain) = match seat_route(&kernel.kernel_db().lock(), council, context_id, Some(caller.actor_id))? {
+    let Some(shell) = shell_spec(&council) else { return Ok(None) };
+    let (routed, chain) = match seat_route(&kernel.kernel_db().lock(), &council, context_id, Some(caller.actor_id))? {
         SeatRoute::NoCouncil => return Ok(None),
         SeatRoute::Council(routed, chain) => (routed, chain),
     };
@@ -1881,7 +1881,7 @@ pub(crate) async fn consult(
     let submission = Submission {
         command,
         planned: &spec.planned,
-        context_type: context_type.as_deref(),
+        character: performer.as_ref().map(|p| p.name.as_str()),
         cwd: cwd.as_deref(),
         facts: &facts,
     };
@@ -2328,7 +2328,7 @@ mod tests {
         let state = case_state(&Submission {
             command: "echo hi > out.txt; git push origin main",
             planned: &planned,
-            context_type: Some("coder"),
+            character: Some("coder"),
             cwd: Some("/src"),
             facts: &facts,
         }, &[], &[]);
@@ -2343,7 +2343,7 @@ mod tests {
         assert_eq!(body["pool"], serde_json::json!({"method": "loglinear", "weights": "mass"}));
         assert!(body.get("ask").is_none() && body.get("options").is_none(), "the gate never narrows: {body}");
         let text = serde_json::to_string(&req.case).unwrap();
-        let order: Vec<usize> = ["\"command\"", "\"context_type\"", "\"cwd\"", "\"statements\"", "\"mount_access\""]
+        let order: Vec<usize> = ["\"command\"", "\"character\"", "\"cwd\"", "\"statements\"", "\"mount_access\""]
             .iter()
             .map(|k| text.find(k).unwrap_or_else(|| panic!("{k} missing from {text}")))
             .collect();
@@ -2353,7 +2353,7 @@ mod tests {
         assert_eq!(state["statements"].as_array().unwrap().len(), 2);
         assert_eq!(state["statements"][1]["commands"][0]["name"], "git");
         assert_eq!(state["statements"][1]["commands"][0]["args"], serde_json::json!(["push", "origin", "main"]));
-        assert_eq!(state["context_type"], "coder");
+        assert_eq!(state["character"], "coder");
         assert_eq!(state["cwd"], "/src");
         assert!(state.get("programs").is_none(), "a submission with no programs has no programs field: {state}");
     }
@@ -2367,7 +2367,7 @@ mod tests {
         let state = case_state(&Submission {
             command,
             planned: &planned,
-            context_type: Some("coder"),
+            character: Some("coder"),
             cwd: Some("/home/u/src/proj"),
             facts: &facts,
         }, &[], &[]);
@@ -2460,7 +2460,7 @@ mod tests {
         let command = format!("python3 <<'PY'\n{program}PY");
         let planned = kaish_kernel::plan_program(&command).unwrap();
         let facts = super::super::shell_case::Facts::offline("/w", &[("/", true)], &[("python3", "/usr/bin/python3")], &[], &planned);
-        let submission = Submission { command: &command, planned: &planned, context_type: None, cwd: None, facts: &facts };
+        let submission = Submission { command: &command, planned: &planned, character: None, cwd: None, facts: &facts };
         let state = serde_json::to_value(case_state(&submission, &[program], &[])).unwrap();
         assert_eq!(state["statements"][0]["commands"][0]["heredocs"], serde_json::json!([
             {"delimiter": "PY", "expands": false, "body": JUDGED_SEPARATELY},

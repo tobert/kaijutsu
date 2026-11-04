@@ -295,7 +295,7 @@ impl McpServerLike for ShellServer {
             // the command, so the approval worker runs it once when it is
             // allowed; a retry of the same call does not.
             let gate_config =
-                crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
+                crate::kj::gate_policy::load_config(dispatcher.kernel().vfs(), dispatcher.kernel().kernel_db()).await;
             let outcome = crate::kj::gate::run_gate(
                 dispatcher.kernel(),
                 &caller,

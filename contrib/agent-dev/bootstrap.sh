@@ -89,11 +89,11 @@ run add-key /keys/senpai.pub --as senpai
 kj character create banto --rc director
 kj character create "$project-coder" --rc coder
 
-# A character's slots give its contexts their models, copied when a context is made. banto runs Haiku; the coder
+# A character's model and slots go to its contexts, copied when a context is made. banto runs Haiku; the coder
 # runs DeepSeek. Each has a `distill` slot, which `kj fork --compact` and `kj drift pull` summarize on.
-kj character slot set banto director anthropic/claude-haiku-5-5
+kj character model set banto anthropic/claude-haiku-5-5
 kj character slot set banto distill deepseek/deepseek-flash
-kj character slot set "$project-coder" coder deepseek/deepseek-flash
+kj character model set "$project-coder" deepseek/deepseek-flash
 kj character slot set "$project-coder" distill deepseek/deepseek-flash
 
 # The overlay goes in before any context exists, so each create lifecycle reads it.
@@ -104,14 +104,13 @@ kernel_cfg="$base/kernel-data/config/kaijutsu/config/kernel"
 cat >> "$kernel_cfg/gate.toml" <<'GATE'
 
 # Agent development container (contrib/agent-dev): the container is the boundary, and Git is the undo.
-[context_type.coder]
+[rc.coder]
 uncovered = "allow"
 allow = ["shell_write"]
-# The supervisor's MCP session registers by creating its context under Amy's root; only Amy's and senpai's keys
-# are bound in this kernel.
-[context_type.root]
-allow = ["kj context create"]
 GATE
+# The supervisor's MCP session registers by creating its context under Amy's root; only Amy's and senpai's keys
+# are bound in this kernel. The default gate.toml already has a [root] allow list, so the key goes into it.
+sed -i '/^\[root\]$/,/^\]$/ s/^allow = \[$/allow = [\n  "kj context create",/' "$kernel_cfg/gate.toml"
 cat >> "$kernel_cfg/mcp.toml" <<MCP
 
 # A second opinion from another model family than the coder's (docs/container.md).
@@ -124,8 +123,8 @@ call_timeout_ms = 900000
 MCP
 
 # senpai drives the seats over MCP; an ask to Amy for each kj verb would stall the run. The default gate.toml
-# already has a [context_type.mcp] table, so the key goes into it.
-sed -i 's/^\[context_type\.mcp\]$/[context_type.mcp]\nuncovered = "allow"/' "$kernel_cfg/gate.toml"
+# already has a [rc.mcp] table, so the key goes into it.
+sed -i 's/^\[rc\.mcp\]$/[rc.mcp]\nuncovered = "allow"/' "$kernel_cfg/gate.toml"
 python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$kernel_cfg/gate.toml"
 
 # The kernel passes only HOME, PATH and context exports to the programs a context runs, so set the locale at create.

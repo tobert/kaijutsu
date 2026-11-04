@@ -65,17 +65,19 @@ const HARNESS_ROOT_ALLOW: &[&str] = &[
 ];
 
 /// Write `/config/kernel/gate.toml` under `home` before boot: the shipped
-/// policy plus a `[context_type.root]` allow tier for [`HARNESS_ROOT_ALLOW`].
-/// Without it each setup command raises an ask that the root must confirm
-/// and the harness never answers (`docs/gate-policy-tuning.md`).
+/// policy with [`HARNESS_ROOT_ALLOW`] added to its `[root]` allow tier, which
+/// covers every context a root character performs. Without it each setup
+/// command raises an ask that the root must confirm and the harness never
+/// answers (`docs/gate-policy-tuning.md`). The keys join the shipped table,
+/// since a second `[root]` table does not parse.
 fn write_harness_gate_policy(home: &std::path::Path) {
     let kernel_config = home.join(".config/kaijutsu/config/kernel");
     std::fs::create_dir_all(&kernel_config).expect("create /config/kernel host dir");
     let allow = HARNESS_ROOT_ALLOW.iter().map(|key| format!("  \"{key}\",\n")).collect::<String>();
-    let policy = format!(
-        "{}\n[context_type.root]\nallow = [\n{allow}]\n",
-        include_str!("../../../../assets/defaults/gate.toml"),
-    );
+    let shipped = include_str!("../../../../assets/defaults/gate.toml");
+    const ROOT_ALLOW: &str = "\n[root]\nallow = [\n";
+    assert_eq!(shipped.matches(ROOT_ALLOW).count(), 1, "the shipped gate.toml has one [root] allow list to extend");
+    let policy = shipped.replace(ROOT_ALLOW, &format!("{ROOT_ALLOW}{allow}"));
     std::fs::write(kernel_config.join("gate.toml"), policy).expect("write harness gate.toml");
 }
 

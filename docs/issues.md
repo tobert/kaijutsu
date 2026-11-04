@@ -130,8 +130,9 @@ against the code unless marked:
   (`a_root_character_can_be_cast_as_a_performer`, kj/context.rs ~3929).
 - `kj ledger list --reviewer` and the director `rotate` rc lifecycle are documented in docs/senpai-kohai.md and
   not built (`VERB_ROTATE` fires only from the beat scheduler).
-- The builtin `kj context create --type mcp` allow cannot see the caller, so the character it names may be one with a
-  model and its `distill` slot is copied. Small: an mcp seat already holds `config-write`.
+- The MCP session create rule (`gate_policy::mcp_session_create`) checks the parent against the caller's hub but
+  not the character it names, so a character with a model may be created there with no ask and its `distill` slot
+  is copied. Small: an mcp seat already holds `config-write`.
 - `kj character create --model` writes the character and its model as
   two statements.
 - Tests still say "cast" for assigning a performer (kj/context.rs ~4629-4682).
@@ -838,7 +839,7 @@ contexts whose senpai that character holds (`docs/approval-identity.md`,
 - `cd <dir>` keys on its directory, so each new workspace path asks once
   more even under a family rule. Whether `cd` belongs in `[global] allow`
   is undecided.
-- The shipped `[context_type.director]` allow in `assets/defaults/gate.toml`
+- The shipped `[rc.director]` allow in `assets/defaults/gate.toml`
   covers `kj drive` on any target, which is wider than a character rule.
   Moltar's host `gate.toml` has no director section, which is why
   banto-shadow asked. Decide whether to narrow the default to the
@@ -2315,7 +2316,7 @@ it.
 a hand-listed allow tier for the harness's own setup commands, because an
 unanswered ask hung the run. The harness tests process isolation and VFS
 protection, not the gate, and it throws its kernel away per run — a
-`[context_type.root] uncovered = "allow"` section would replace the list and
+`[root] uncovered = "allow"` section would replace the list and
 stop it drifting as setup commands change. Left alone here: that crate is
 another lane's this week.
 
@@ -3935,7 +3936,7 @@ and burn down all the approval options". Delete each line as it ships.
   agent key, so Claude Code there acts as Amy and runs uncovered statements
   without an ask. Closing it needs the bridge identity
   (`docs/character.md`, "The bridge identity: a key per model character")
-  and a `[context_type.mcp]` allow tier wide enough for daily reads.
+  and a `[rc.mcp]` allow tier wide enough for daily reads.
 - **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
   auto-allows leave no row; the ORIGIN column is narrower than `shell_gate`.
 - **F11** Approving a streaming RPC ask authors a Model-role pair and can

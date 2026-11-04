@@ -211,7 +211,7 @@ overlay.
   In the first runs the supervising Claude session outside the container can
   hold the banto seat itself and drive the coder seats over MCP. Later a model
   banto in the kernel's `director` seat drives them the same way.
-- `gate.toml` sets `[context_type.coder] uncovered = "allow"` and
+- `gate.toml` sets `[rc.coder] uncovered = "allow"` and
   `allow = ["shell_write"]`. Explicit `ask` keys in `[global]` still fire,
   so the file needs an audit for this kernel. The council stays off:
   Jev bumps need a council port to a chat backend

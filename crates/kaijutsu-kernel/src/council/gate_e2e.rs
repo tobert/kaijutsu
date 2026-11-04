@@ -461,7 +461,7 @@ allow_at = 0.98
 mass_floor = -0.05
 
 {programs}
-[context_type.default.council]
+[rc.default.council]
 enabled = {enabled}
 {judge}
 "#,
@@ -985,7 +985,7 @@ async fn a_council_allow_runs_the_submission_with_a_row_naming_the_council() {
         assert_eq!(sent[0].timeout_ms, Some(700));
         let state = serde_json::to_value(&sent[0].case).unwrap();
         assert_eq!(state["command"], "echo council-ran", "{via:?}: {state}");
-        assert_eq!(state["context_type"], "default");
+        assert_eq!(state["character"], "council-seat-performer");
         rig.finish().await;
     }
 }
@@ -1513,7 +1513,7 @@ async fn a_static_ask_still_asks_after_a_council_allow() {
     }
 }
 
-/// With the council off for the context type, nothing changes: the same
+/// With the council off for the seat's performer, nothing changes: the same
 /// ask with the same description, no signal, no record, no request.
 #[tokio::test]
 async fn with_the_council_disabled_nothing_changes() {
@@ -1778,19 +1778,31 @@ async fn with_reviewer_contexts_off_the_decision_reads_the_configured_contexts()
     }
 }
 
+/// A character's council block reads over its directory's: the seat's
+/// performer reads its own contexts once its block names them, and another
+/// character's block does not reach it.
+///
+/// Falsified by keying the council on the directory alone, or by letting
+/// any character's block apply to every seat.
 #[tokio::test]
-async fn a_context_type_reads_its_own_council_without_changing_other_types() {
+async fn a_character_reads_its_own_council_contexts_over_its_directory_s() {
     use crate::vfs::VfsOps;
     for via in BOTH {
         let rig = rig(via, Setup::default()).await;
         live_context(rig.d.kernel(), "council-amy");
         live_context(rig.d.kernel(), "council-banto");
-        let toml = format!("{}\n[context_type.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n", gate_toml(&Setup::default()));
-        rig.d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
+        let block = |character: &str| {
+            format!(
+                "{}\n[character.{character}.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n",
+                gate_toml(&Setup::default())
+            )
+        };
+        let path = std::path::Path::new("/config/kernel/gate.toml");
+        rig.d.kernel().vfs().write_all(path, block("banto").as_bytes()).await.unwrap();
         rig.mock.set(allow_each);
         rig.submit("echo inherited").await.unwrap();
-        rig.d.kernel().kernel_db().lock().update_context_type(rig.ctx.context_id, "director").unwrap();
-        rig.submit("echo director").await.unwrap();
+        rig.d.kernel().vfs().write_all(path, block("council-seat-performer").as_bytes()).await.unwrap();
+        rig.submit("echo its own").await.unwrap();
         let sent = rig.mock.decisions();
         assert_eq!(sent.len(), 2, "{via:?}");
         assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("reviewer"), rig.context_of("system-rules")], "{via:?}");
@@ -2218,7 +2230,7 @@ async fn a_script_the_council_allows_runs_with_both_decisions_recorded() {
         assert_eq!(state["invocation"]["command"], "python3 /work/fix.py");
         assert_eq!(state["invocation"]["submission"], "python3 /work/fix.py");
         assert_eq!(state["imports_not_shown"], serde_json::json!(["helper"]));
-        assert_eq!(state["context_type"], "default");
+        assert_eq!(state["character"], "council-seat-performer");
         rig.finish().await;
     }
 }
@@ -3401,8 +3413,12 @@ fn shadows_of(rig: &Rig, seat: kaijutsu_types::ContextId) -> Vec<crate::kernel_d
 async fn rotating_a_judged_seat_archives_its_shadow_and_the_successor_gets_its_own() {
     use kaijutsu_types::Role::{Model, User};
     for rc_dir in ["default", "coder"] {
-        let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), chain: true, ..Setup::default() }).await;
+        let setup = Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), chain: true, ..Setup::default() };
+        let rig = rig(Via::Tool, setup.clone()).await;
         rig.d.kernel_db().lock().set_character_rc_dir(rig.ctx.actor_id, Some(rc_dir)).unwrap();
+        // The council block follows the seat's rc directory.
+        let toml = gate_toml(&setup).replace("[rc.default.council]", &format!("[rc.{rc_dir}.council]"));
+        crate::vfs::VfsOps::write_all(rig.d.kernel().vfs().as_ref(), std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
         rig.submit("echo before").await.unwrap();
         let old = shadows_of(&rig, rig.ctx.context_id);
         assert_eq!(old.len(), 1, "{rc_dir}: {old:?}");

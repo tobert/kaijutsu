@@ -14,8 +14,11 @@
 //!    scope `character` matches the actor it was learned from, wherever
 //!    it performs; its allow covers a `kj` command only under the
 //!    character condition ([`serves_character`]).
-//! 2. **context_type config** — `[context_type.<type>]` in
-//!    `/config/kernel/gate.toml`, for the calling context's type.
+//! 2. **Performer config** — in `/config/kernel/gate.toml`, for the
+//!    calling context's performer, latest first: `[root]` when a root
+//!    character performs it, `[character.<name>]` for the performer, then
+//!    `[rc.<dir>]` for the performer's rc directory. A context with no
+//!    performer reads none of them.
 //! 3. **Global config** — `[global]` in the same file.
 //! 4. **Builtin** — the verb's declared effect: a `kj` call that classifies
 //!    as [`Effect::Read`](super::effect::Effect::Read), any `kj ledger`
@@ -94,17 +97,15 @@ pub(crate) enum Layer {
     UserRule,
     /// A family-keyed rule a human taught the ledger.
     UserFamily,
-    /// `[context_type.<type>]` in `gate.toml`.
-    ContextTypeConfig(String),
-    /// `[global]` in `gate.toml`.
-    GlobalConfig,
-    /// The verb's declared effect, the `kj ledger` structural exemption, or
-    /// a `kj … --help` invocation.
+    /// A tier table in `gate.toml`.
+    Config(Section),
+    /// The verb's declared effect, the `kj ledger` structural exemption, a
+    /// `kj … --help` invocation, or an MCP session created under the
+    /// caller's own MCP hub.
     Builtin,
-    /// `uncovered = "allow"` in `gate.toml` — the sandbox posture. `Some`
-    /// names the `[context_type.<type>]` section that set it; `None` is
-    /// `[global]`.
-    UncoveredAllow(Option<String>),
+    /// `uncovered = "allow"` in `gate.toml` — the sandbox posture, naming
+    /// the section that set it.
+    UncoveredAllow(Section),
     /// The council's allow for a statement no other layer covered, naming
     /// the spec it read the submission under (`docs/council.md`).
     Council(String),
@@ -118,14 +119,78 @@ impl std::fmt::Display for Layer {
         match self {
             Self::UserRule => f.write_str("user rule"),
             Self::UserFamily => f.write_str("user family rule"),
-            Self::ContextTypeConfig(t) => write!(f, "context_type config ({t})"),
-            Self::GlobalConfig => f.write_str("global config"),
+            Self::Config(section) => write!(f, "{section}"),
             Self::Builtin => f.write_str("builtin"),
-            Self::UncoveredAllow(None) => f.write_str("global config uncovered tier"),
-            Self::UncoveredAllow(Some(t)) => write!(f, "context_type config ({t}) uncovered tier"),
+            Self::UncoveredAllow(section) => write!(f, "{section} uncovered tier"),
             Self::Council(spec) => write!(f, "council ({spec})"),
             Self::SenpaiEdge => f.write_str("senpai edge"),
         }
+    }
+}
+
+/// A `gate.toml` section that holds a tier table.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Section {
+    /// `[global]`.
+    Global,
+    /// `[rc.<dir>]`: every context whose performer runs this rc directory.
+    Rc(String),
+    /// `[character.<name>]`: every context this character performs.
+    Character(String),
+    /// `[root]`: every context a root character performs.
+    Root,
+}
+
+impl Section {
+    /// The section as the file spells it.
+    pub(crate) fn header(&self) -> String {
+        match self {
+            Self::Global => "[global]".into(),
+            Self::Rc(dir) => format!("[rc.{dir}]"),
+            Self::Character(name) => format!("[character.{name}]"),
+            Self::Root => "[root]".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Section {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => f.write_str("global config"),
+            Self::Rc(dir) => write!(f, "rc config ({dir})"),
+            Self::Character(name) => write!(f, "character config ({name})"),
+            Self::Root => f.write_str("root config"),
+        }
+    }
+}
+
+/// What the gate's layers key on: the calling context's performer, read
+/// once per decision from the context row and the character sheet
+/// ([`performer_of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GatePerformer {
+    /// The character's name: `[character.<name>]`.
+    pub name: String,
+    /// The character's rc directory: `[rc.<dir>]`. `None` reads no
+    /// directory layer.
+    pub rc_dir: Option<String>,
+    /// The sheet's root flag: `[root]`.
+    pub root: bool,
+}
+
+impl GatePerformer {
+    /// The sections this performer reads beyond `[global]`, earliest
+    /// first: each later one reads over the ones before it.
+    pub(crate) fn sections(&self) -> Vec<Section> {
+        let mut out = Vec::with_capacity(3);
+        if let Some(dir) = &self.rc_dir {
+            out.push(Section::Rc(dir.clone()));
+        }
+        out.push(Section::Character(self.name.clone()));
+        if self.root {
+            out.push(Section::Root);
+        }
+        out
     }
 }
 
@@ -335,8 +400,7 @@ impl UncoveredTier {
     }
 }
 
-/// One tier table: `[global]` or one `[context_type.<type>]` section, keys
-/// normalized to canonical names.
+/// One tier table: one [`Section`], keys normalized to canonical names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TierTable {
     /// `(normalized key, verdict)`; a key may appear under more than one
@@ -344,6 +408,18 @@ struct TierTable {
     entries: Vec<(String, TierVerdict)>,
     /// This section's `uncovered` setting, when it states one.
     uncovered: Option<UncoveredTier>,
+    /// This section's council block, when it has one. `[global]` has none.
+    council: Option<CouncilBlock>,
+}
+
+/// One section's council block, `[<section>.council]`: the keys it states.
+/// A later section's stated key reads over an earlier one's
+/// ([`GateConfig::council_for`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CouncilBlock {
+    enabled: bool,
+    contexts: Option<Vec<String>>,
+    judge: Option<String>,
 }
 
 impl TierTable {
@@ -365,15 +441,19 @@ impl TierTable {
     }
 }
 
-/// The parsed `gate.toml`: the global tier, one tier per context type, and
-/// the council's settings when the file declares them.
+/// The parsed `gate.toml`: the global tier, one tier per rc directory, per
+/// character and for roots, and the council's settings when the file
+/// declares them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct GateConfig {
     global: TierTable,
-    context_types: BTreeMap<String, TierTable>,
+    rc: BTreeMap<String, TierTable>,
+    character: BTreeMap<String, TierTable>,
+    root: Option<TierTable>,
     council: Option<CouncilConfig>,
-    /// Enabled councils by context type, with any context override applied.
-    council_by_type: BTreeMap<String, CouncilConfig>,
+    /// The `[rc.<dir>]` and `[character.<name>]` sections that name no rc
+    /// directory or character, found by [`load_config`].
+    nobody: Vec<Section>,
 }
 
 /// How the kernel pools the council's per-context reads.
@@ -481,9 +561,10 @@ pub(crate) struct CouncilConfig {
     pub(crate) escalate: Option<CouncilEscalate>,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
-    /// `judge = "<character>"` in the type's council block: the character
-    /// that performs each seat's judge shadow (`docs/council.md`, "Shadow
-    /// context"). `None` runs the council with no judge.
+    /// `judge = "<character>"` in a council block of the seat's performer:
+    /// the character that performs each seat's judge shadow
+    /// (`docs/council.md`, "Shadow context"). `None` runs the council with
+    /// no judge.
     pub(crate) judge: Option<String>,
 }
 
@@ -604,15 +685,15 @@ struct CouncilThresholdToml {
     template: Option<toml::Value>,
 }
 
-/// `[context_type.<type>.council]`.
+/// `[rc.<dir>.council]`, `[character.<name>.council]` or `[root.council]`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CouncilSwitchToml {
     enabled: bool,
     #[serde(default)]
     contexts: Option<Vec<String>>,
-    /// The character that performs a seat's judge shadow. None gives the
-    /// council no judge.
+    /// The character that performs a seat's judge shadow. None leaves the
+    /// judge an earlier section named, or none.
     #[serde(default)]
     judge: Option<String>,
 }
@@ -623,7 +704,15 @@ struct GateToml {
     #[serde(default)]
     global: TierToml,
     #[serde(default)]
-    context_type: BTreeMap<String, TierToml>,
+    rc: BTreeMap<String, TierToml>,
+    #[serde(default)]
+    character: BTreeMap<String, TierToml>,
+    #[serde(default)]
+    root: Option<TierToml>,
+    /// The sections the kernel no longer reads. Parsed only to refuse them
+    /// with their replacements.
+    #[serde(default)]
+    context_type: BTreeMap<String, toml::Value>,
     council: Option<CouncilToml>,
 }
 
@@ -638,7 +727,7 @@ struct TierToml {
     deny: Vec<String>,
     /// `ask` (the default) or `allow`.
     uncovered: Option<String>,
-    /// Accepted under `[context_type.<type>]` only; `[global]` is refused.
+    /// Accepted under every section but `[global]`, which is refused.
     council: Option<CouncilSwitchToml>,
 }
 
@@ -682,83 +771,96 @@ pub(crate) fn no_config() -> GateConfigLoad {
 impl GateConfig {
     /// Parse a `gate.toml` body. Unknown sections and verdict words, and a
     /// `kj` key that names no live verb, fail with the section and key
-    /// named.
+    /// named. A `[context_type.<type>]` section fails naming its
+    /// replacements.
     pub(crate) fn parse(text: &str) -> Result<Self, GateConfigError> {
         let raw: GateToml =
             toml::from_str(text).map_err(|e| GateConfigError::Parse(e.to_string()))?;
-        let mut config = GateConfig {
-            global: Self::table_from(&raw.global, "[global]")?,
-            context_types: BTreeMap::new(),
-            council: None,
-            council_by_type: BTreeMap::new(),
-        };
+        if let Some(name) = raw.context_type.keys().next() {
+            return Err(GateConfigError::Parse(format!(
+                "[context_type.{name}]: the kernel no longer reads context_type sections; write \
+                 [rc.{name}] for every character whose rc directory is {name}, or \
+                 [character.<name>] for one character"
+            )));
+        }
         if raw.global.council.is_some() {
             return Err(GateConfigError::Parse(
-                "[global.council]: the council has no global switch; enable it per context type \
-                 with [context_type.<type>.council]"
+                "[global.council]: the council has no global switch; enable it per rc directory \
+                 with [rc.<dir>.council] or per character with [character.<name>.council]"
                     .into(),
             ));
         }
-        if let Some(council) = &raw.council {
-            config.council = Some(Self::council_from(council)?);
+        let council = raw.council.as_ref().map(Self::council_from).transpose()?;
+        let table = |tier: &TierToml, section: Section| Self::table_from(tier, &section, council.as_ref());
+        let mut config = GateConfig {
+            global: table(&raw.global, Section::Global)?,
+            rc: BTreeMap::new(),
+            character: BTreeMap::new(),
+            root: raw.root.as_ref().map(|tier| table(tier, Section::Root)).transpose()?,
+            council: None,
+            nobody: Vec::new(),
+        };
+        for (dir, tier) in &raw.rc {
+            config.rc.insert(dir.clone(), table(tier, Section::Rc(dir.clone()))?);
         }
-        for (context_type, tier) in &raw.context_type {
-            let section = format!("[context_type.{context_type}]");
-            config
-                .context_types
-                .insert(context_type.clone(), Self::table_from(tier, &section)?);
-            if let Some(switch) = &tier.council {
-                let section = format!("[context_type.{context_type}.council]");
-                let Some(mut council) = config.council.clone() else {
-                    if switch.enabled || switch.contexts.is_some() || switch.judge.is_some() {
-                        return Err(GateConfigError::Parse(format!(
-                            "{section}: the file has no [council] section to enable or override"
-                        )));
-                    }
-                    continue;
+        for (name, tier) in &raw.character {
+            config.character.insert(name.clone(), table(tier, Section::Character(name.clone()))?);
+        }
+        config.council = council;
+        Ok(config)
+    }
+
+    /// One section's council block, checked against the file's `[council]`.
+    fn council_block(
+        switch: &CouncilSwitchToml,
+        section: &Section,
+        council: Option<&CouncilConfig>,
+    ) -> Result<CouncilBlock, GateConfigError> {
+        let header = section.header();
+        let section = format!("{}.council]", header.trim_end_matches(']'));
+        let Some(council) = council else {
+            if switch.enabled || switch.contexts.is_some() || switch.judge.is_some() {
+                return Err(GateConfigError::Parse(format!(
+                    "{section}: the file has no [council] section to enable or override"
+                )));
+            }
+            return Ok(CouncilBlock { enabled: false, contexts: None, judge: None });
+        };
+        if let Some(contexts) = &switch.contexts {
+            if !switch.enabled {
+                return Err(GateConfigError::Parse(format!(
+                    "{section} contexts: the council is enabled = false, so the list would do nothing; remove it or enable the council"
+                )));
+            }
+            if contexts.is_empty() {
+                return Err(GateConfigError::Parse(format!("{section} contexts: at least one label is required")));
+            }
+            for (i, label) in contexts.iter().enumerate() {
+                let why = if label.trim().is_empty() {
+                    Some("labels must be non-empty".to_string())
+                } else if contexts[..i].contains(label) {
+                    Some(format!("`{label}` is listed twice"))
+                } else if let Some(spec) = council.specs.iter().find(|s| s.contexts.contains(label)) {
+                    Some(format!("`{label}` is already in spec {} contexts", spec.name))
+                } else {
+                    None
                 };
-                if let Some(contexts) = &switch.contexts {
-                    if !switch.enabled {
-                        return Err(GateConfigError::Parse(format!(
-                            "{section} contexts: the council is enabled = false, so the list would do nothing; remove it or enable the council"
-                        )));
-                    }
-                    if contexts.is_empty() {
-                        return Err(GateConfigError::Parse(format!("{section} contexts: at least one label is required")));
-                    }
-                    for (i, label) in contexts.iter().enumerate() {
-                        let why = if label.trim().is_empty() {
-                            Some("labels must be non-empty".to_string())
-                        } else if contexts[..i].contains(label) {
-                            Some(format!("`{label}` is listed twice"))
-                        } else if let Some(spec) = council.specs.iter().find(|s| s.contexts.contains(label)) {
-                            Some(format!("`{label}` is already in spec {} contexts", spec.name))
-                        } else {
-                            None
-                        };
-                        if let Some(why) = why {
-                            return Err(GateConfigError::Parse(format!("{section} contexts: {why}")));
-                        }
-                    }
-                    council.contexts = contexts.clone();
-                }
-                if let Some(judge) = &switch.judge {
-                    if !switch.enabled {
-                        return Err(GateConfigError::Parse(format!(
-                            "{section} judge: the council is enabled = false, so the judge would do nothing; remove it or enable the council"
-                        )));
-                    }
-                    if judge.trim().is_empty() {
-                        return Err(GateConfigError::Parse(format!("{section} judge: name a character")));
-                    }
-                    council.judge = Some(judge.clone());
-                }
-                if switch.enabled {
-                    config.council_by_type.insert(context_type.clone(), council);
+                if let Some(why) = why {
+                    return Err(GateConfigError::Parse(format!("{section} contexts: {why}")));
                 }
             }
         }
-        Ok(config)
+        if let Some(judge) = &switch.judge {
+            if !switch.enabled {
+                return Err(GateConfigError::Parse(format!(
+                    "{section} judge: the council is enabled = false, so the judge would do nothing; remove it or enable the council"
+                )));
+            }
+            if judge.trim().is_empty() {
+                return Err(GateConfigError::Parse(format!("{section} judge: name a character")));
+            }
+        }
+        Ok(CouncilBlock { enabled: switch.enabled, contexts: switch.contexts.clone(), judge: switch.judge.clone() })
     }
 
     fn council_from(raw: &CouncilToml) -> Result<CouncilConfig, GateConfigError> {
@@ -967,24 +1069,75 @@ impl GateConfig {
         self.council.as_ref()
     }
 
-    /// Every enabled council, one per context type that has one.
-    pub(crate) fn councils(&self) -> impl Iterator<Item = &CouncilConfig> {
-        self.council_by_type.values()
+    /// Whether the file has `section`.
+    pub(crate) fn has_section(&self, section: &Section) -> bool {
+        self.table(section).is_some()
     }
 
-    /// The enabled council for a context type, with its context override.
-    pub(crate) fn council_for(&self, context_type: Option<&str>) -> Option<&CouncilConfig> {
-        context_type.and_then(|t| self.council_by_type.get(t))
+    /// The table of one section, when the file has it.
+    fn table(&self, section: &Section) -> Option<&TierTable> {
+        match section {
+            Section::Global => Some(&self.global),
+            Section::Rc(dir) => self.rc.get(dir),
+            Section::Character(name) => self.character.get(name),
+            Section::Root => self.root.as_ref(),
+        }
     }
 
-    /// Whether the council reads for a caller of `context_type`: the file
-    /// declares `[council]` and the type's own section enables it. Off for
-    /// every other type, and for a caller with no type.
-    pub(crate) fn council_enabled_for(&self, context_type: Option<&str>) -> bool {
-        self.council_for(context_type).is_some()
+    /// The tables `performer` reads beyond `[global]`, latest first: the
+    /// order a lookup walks them, so a later section reads over an earlier
+    /// one. A caller with no performer reads none.
+    fn performer_tables(&self, performer: Option<&GatePerformer>) -> Vec<(Section, &TierTable)> {
+        let Some(performer) = performer else { return Vec::new() };
+        performer
+            .sections()
+            .into_iter()
+            .rev()
+            .filter_map(|section| self.table(&section).map(|table| (section, table)))
+            .collect()
     }
 
-    fn table_from(tier: &TierToml, section: &str) -> Result<TierTable, GateConfigError> {
+    /// Every council a performer's layers can compose: for each section
+    /// whose block enables one, `[council]` with that block's keys over
+    /// it. A council [`Self::council_for`] composes reads the contexts and
+    /// judge of one of these, so a reader that needs every label or judge
+    /// any seat can use reads them here.
+    pub(crate) fn councils(&self) -> Vec<CouncilConfig> {
+        let Some(base) = &self.council else { return Vec::new() };
+        let tables = self.rc.values().chain(self.character.values()).chain(self.root.as_ref());
+        tables
+            .filter_map(|table| table.council.as_ref())
+            .filter(|block| block.enabled)
+            .map(|block| block.over(base.clone()))
+            .collect()
+    }
+
+    /// The enabled council for a context `performer` plays: `[council]`,
+    /// then each of its sections' council blocks in order (`[rc.<dir>]`,
+    /// `[character.<name>]`, `[root]`), where a block's stated key reads
+    /// over the same key before it. The last block decides `enabled`. A
+    /// caller with no performer, or whose sections have no council block,
+    /// has none.
+    pub(crate) fn council_for(&self, performer: Option<&GatePerformer>) -> Option<CouncilConfig> {
+        let mut council = self.council.clone()?;
+        let mut enabled = false;
+        for section in performer?.sections() {
+            if let Some(block) = self.table(&section).and_then(|t| t.council.as_ref()) {
+                enabled = block.enabled;
+                council = block.over(council);
+            }
+        }
+        enabled.then_some(council)
+    }
+
+    /// Whether the council reads for a context `performer` plays
+    /// ([`Self::council_for`]).
+    pub(crate) fn council_enabled_for(&self, performer: Option<&GatePerformer>) -> bool {
+        self.council_for(performer).is_some()
+    }
+
+    fn table_from(tier: &TierToml, section: &Section, council: Option<&CouncilConfig>) -> Result<TierTable, GateConfigError> {
+        let header = section.header();
         let mut entries = Vec::new();
         for (verdict, list) in [
             (TierVerdict::Allow, &tier.allow),
@@ -993,105 +1146,112 @@ impl GateConfig {
         ] {
             for raw in list {
                 let key = normalize_config_key(raw).map_err(|why| {
-                    GateConfigError::Parse(format!("{section} {}: `{raw}` — {why}", verdict.word()))
+                    GateConfigError::Parse(format!("{header} {}: `{raw}` — {why}", verdict.word()))
                 })?;
                 entries.push((key, verdict));
             }
         }
         let uncovered = match &tier.uncovered {
             Some(raw) => Some(UncoveredTier::parse(raw).map_err(|why| {
-                GateConfigError::Parse(format!("{section} uncovered: {why}"))
+                GateConfigError::Parse(format!("{header} uncovered: {why}"))
             })?),
             None => None,
         };
-        Ok(TierTable { entries, uncovered })
+        let council = match &tier.council {
+            Some(switch) => Some(Self::council_block(switch, section, council)?),
+            None => None,
+        };
+        Ok(TierTable { entries, uncovered, council })
     }
 
-    /// The uncovered tier in force for a caller of `context_type`, and the
-    /// section that set it: the context type's own setting when it states
-    /// one, else `[global]`, else `ask`.
-    pub(crate) fn uncovered_for(
-        &self,
-        context_type: Option<&str>,
-    ) -> (UncoveredTier, Option<String>) {
-        if let Some(t) = context_type
-            && let Some(tier) = self.context_types.get(t).and_then(|table| table.uncovered)
-        {
-            return (tier, Some(t.to_string()));
-        }
-        (self.global.uncovered.unwrap_or_default(), None)
-    }
-
-    /// Refuse a `[context_type.<name>]` section naming no live context
-    /// type, whatever the section holds: an unknown section applies to
-    /// nobody, so a typo'd `ask` tier silently leaves its type on whatever
-    /// `[global]` said.
-    ///
-    /// `known` is the rc tree's list (`kj::rc::known_context_types`), and
-    /// an empty list accepts every section — there is nothing to validate
-    /// against, and a kernel with no rc tree is a legitimate shape. That is
-    /// the rule `kj::rc::check_context_type` states for `--type`, kept as
-    /// one rule with one meaning.
-    pub(crate) fn check_context_types(&self, known: &[String]) -> Result<(), GateConfigError> {
-        if known.is_empty() {
-            return Ok(());
-        }
-        for name in self.context_types.keys() {
-            if !known.iter().any(|t| t == name) {
-                return Err(GateConfigError::Parse(format!(
-                    "[context_type.{name}] names no context type: no rc bucket at {}/{name}; \
-                     known types: {}",
-                    kaijutsu_types::paths::RC_ROOT,
-                    known.join(", "),
-                )));
+    /// The uncovered tier in force for a context `performer` plays, and the
+    /// section that set it: the latest of its sections that states one,
+    /// else `[global]`, else `ask`.
+    pub(crate) fn uncovered_for(&self, performer: Option<&GatePerformer>) -> (UncoveredTier, Section) {
+        for (section, table) in self.performer_tables(performer) {
+            if let Some(tier) = table.uncovered {
+                return (tier, section);
             }
         }
-        Ok(())
+        (self.global.uncovered.unwrap_or_default(), Section::Global)
     }
 
-    /// Whether the sandbox posture is on for a caller of `context_type` —
+    /// Find the `[rc.<dir>]` and `[character.<name>]` sections that apply
+    /// to nobody: a directory not in `rc_dirs`, a character not in
+    /// `characters`. An empty `rc_dirs` names every directory, the rule
+    /// `kj::rc::check_context_type` states: there is nothing to validate
+    /// against, and a kernel with no rc tree is a legitimate shape.
+    fn find_nobody(&mut self, rc_dirs: &[String], characters: &[String]) {
+        let dirs = self
+            .rc
+            .keys()
+            .filter(|dir| !rc_dirs.is_empty() && !rc_dirs.contains(dir))
+            .map(|dir| Section::Rc(dir.clone()));
+        let names = self
+            .character
+            .keys()
+            .filter(|name| !characters.contains(name))
+            .map(|name| Section::Character(name.clone()));
+        self.nobody = dirs.chain(names).collect();
+    }
+
+    /// The sections that name no rc directory or character, so apply to
+    /// nobody; `kj ledger rules` lists them.
+    pub(crate) fn applies_to_nobody(&self) -> &[Section] {
+        &self.nobody
+    }
+
+    /// Whether the sandbox posture is on for a context `performer` plays —
     /// what `kj ledger rules` states plainly.
-    pub(crate) fn allows_uncovered(&self, context_type: Option<&str>) -> bool {
-        self.uncovered_for(context_type).0 == UncoveredTier::Allow
+    pub(crate) fn allows_uncovered(&self, performer: Option<&GatePerformer>) -> bool {
+        self.uncovered_for(performer).0 == UncoveredTier::Allow
     }
 
-    /// The config entries in force for a caller of `context_type`, for
-    /// `kj ledger rules`: `(layer, key, verdict)`, the context_type section
-    /// first.
-    pub(crate) fn entries_for(&self, context_type: Option<&str>) -> Vec<(Layer, String, &'static str)> {
+    /// The config entries in force for a context `performer` plays, for
+    /// `kj ledger rules`: `(layer, key, verdict)`, in the order a lookup
+    /// reads them, the latest section first and `[global]` last.
+    pub(crate) fn entries_for(&self, performer: Option<&GatePerformer>) -> Vec<(Layer, String, &'static str)> {
         let mut out = Vec::new();
         // The widest entry first: it decides every key the lists below do
         // not name.
-        if let (UncoveredTier::Allow, section) = self.uncovered_for(context_type) {
+        if let (UncoveredTier::Allow, section) = self.uncovered_for(performer) {
             out.push((Layer::UncoveredAllow(section), "uncovered".to_string(), "allow"));
         }
-        if let Some(t) = context_type
-            && let Some(table) = self.context_types.get(t)
-        {
-            out.extend(
-                table
-                    .entries
-                    .iter()
-                    .map(|(k, v)| (Layer::ContextTypeConfig(t.to_string()), k.clone(), v.word())),
-            );
+        let tables = self.performer_tables(performer).into_iter().chain([(Section::Global, &self.global)]);
+        for (section, table) in tables {
+            out.extend(table.entries.iter().map(|(k, v)| (Layer::Config(section.clone()), k.clone(), v.word())));
         }
-        out.extend(self.global.entries.iter().map(|(k, v)| (Layer::GlobalConfig, k.clone(), v.word())));
         out
     }
 
-    /// Every key with a verdict, for inspection: `(section, key, verdict)`.
+    /// Every key with a verdict, for inspection: `(section, key, verdict)`,
+    /// the section as the file spells it.
     #[cfg(test)]
     pub(crate) fn entries(&self) -> Vec<(String, String, &'static str)> {
-        let mut out: Vec<(String, String, &'static str)> = self
-            .global
-            .entries
-            .iter()
-            .map(|(k, v)| ("global".to_string(), k.clone(), v.word()))
-            .collect();
-        for (t, table) in &self.context_types {
-            out.extend(table.entries.iter().map(|(k, v)| (t.clone(), k.clone(), v.word())));
+        let sections = [Section::Global, Section::Root]
+            .into_iter()
+            .chain(self.rc.keys().map(|d| Section::Rc(d.clone())))
+            .chain(self.character.keys().map(|n| Section::Character(n.clone())));
+        let mut out = Vec::new();
+        for section in sections {
+            if let Some(table) = self.table(&section) {
+                out.extend(table.entries.iter().map(|(k, v)| (section.header(), k.clone(), v.word())));
+            }
         }
         out
+    }
+}
+
+impl CouncilBlock {
+    /// `council` with this block's stated keys over it.
+    fn over(&self, mut council: CouncilConfig) -> CouncilConfig {
+        if let Some(contexts) = &self.contexts {
+            council.contexts = contexts.clone();
+        }
+        if let Some(judge) = &self.judge {
+            council.judge = Some(judge.clone());
+        }
+        council
     }
 }
 
@@ -1139,13 +1299,18 @@ fn normalize_config_key(raw: &str) -> Result<String, String> {
     }
 }
 
-/// Read, parse and validate `/config/kernel/gate.toml`. An absent file (or
-/// no `/config/kernel` mount) is the empty config; any other failure is an
+/// Read and parse `/config/kernel/gate.toml`. An absent file (or no
+/// `/config/kernel` mount) is the empty config; any other failure is an
 /// error the caller must refuse on.
 ///
-/// Validation needs the live rc tree, which is why it lives here and not in
-/// [`GateConfig::parse`]: `parse` is a pure shape check over the text.
-pub(crate) async fn load_config(vfs: &MountTable) -> GateConfigLoad {
+/// A `[rc.<dir>]` naming no directory in the rc tree, or a
+/// `[character.<name>]` naming no character on the sheet, live or retired,
+/// applies to nobody. It is a warning at every load and listed by `kj
+/// ledger rules`, never a failed load: a failed load refuses every gated
+/// statement, including the one that would fix it. Finding them needs the
+/// rc tree and the sheet, which is why it lives here and not in
+/// [`GateConfig::parse`], a pure shape check over the text.
+pub(crate) async fn load_config(vfs: &MountTable, db: &parking_lot::Mutex<KernelDb>) -> GateConfigLoad {
     use crate::vfs::{VfsError, VfsOps};
     let path = kaijutsu_types::paths::config_path(GATE_CONFIG_FILE);
     let bytes = match vfs.read_all(std::path::Path::new(&path)).await {
@@ -1157,22 +1322,44 @@ pub(crate) async fn load_config(vfs: &MountTable) -> GateConfigLoad {
     };
     let text = String::from_utf8(bytes)
         .map_err(|e| GateConfigError::Parse(format!("not valid UTF-8: {e}")))?;
-    let config = GateConfig::parse(&text)?;
-    let known = super::rc::known_context_types(vfs)
+    let mut config = GateConfig::parse(&text)?;
+    if config.rc.is_empty() && config.character.is_empty() {
+        return Ok(config);
+    }
+    let rc_dirs = super::rc::known_context_types(vfs)
         .await
         .map_err(GateConfigError::Read)?;
-    config.check_context_types(&known)?;
+    let characters: Vec<String> = db
+        .lock()
+        .list_characters(true)
+        .map_err(|e| GateConfigError::Read(format!("the character sheet could not be read: {e}")))?
+        .into_iter()
+        .map(|sheet| sheet.name)
+        .collect();
+    config.find_nobody(&rc_dirs, &characters);
+    for section in config.applies_to_nobody() {
+        let why = match section {
+            Section::Rc(dir) => format!("no rc directory at {}/{dir}", kaijutsu_types::paths::RC_ROOT),
+            _ => "no character on the sheet has that name".to_string(),
+        };
+        tracing::warn!(
+            target: "kaijutsu::gate",
+            section = %section.header(),
+            "/config/kernel/{GATE_CONFIG_FILE}: {} applies to nobody: {why}",
+            section.header()
+        );
+    }
     Ok(config)
 }
 
 // ── Layers for one evaluation ───────────────────────────────────────────
 
 /// The config layers in force for one caller: the parsed file and the
-/// calling context's type, when it has one.
+/// calling context's performer, when it has one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layers<'a> {
     pub config: &'a GateConfig,
-    pub context_type: Option<&'a str>,
+    pub performer: Option<&'a GatePerformer>,
 }
 
 impl Layers<'_> {
@@ -1180,7 +1367,7 @@ impl Layers<'_> {
     /// is `ask` — the default, where an uncovered statement meets the
     /// pre_call hooks and the gate. `key` names what was allowed.
     fn uncovered_allow(&self, key: impl FnOnce() -> String) -> Option<Decision> {
-        match self.config.uncovered_for(self.context_type) {
+        match self.config.uncovered_for(self.performer) {
             (UncoveredTier::Allow, section) => Some(Decision {
                 layer: Layer::UncoveredAllow(section),
                 key: key(),
@@ -1199,14 +1386,31 @@ impl Layers<'_> {
     }
 }
 
-/// The `context_type` of a context, read off its row. `None` for a caller
-/// with no context or a context the db does not know.
-pub(crate) fn context_type_of(
-    db: &KernelDb,
-    context_id: Option<kaijutsu_types::ContextId>,
-) -> Option<String> {
-    let id = context_id?;
-    db.get_context(id).ok().flatten().map(|row| row.context_type)
+/// The performer of a context, as the gate's layers key on it: its name,
+/// rc directory and root flag off the character sheet. `Ok(None)` for a
+/// caller with no context, a context the db does not know, or a context
+/// with no performer, which reads `[global]` alone. A performer with no
+/// sheet, or a read that fails, is an error the caller refuses on.
+pub(crate) fn performer_of(db: &KernelDb, context_id: Option<ContextId>) -> Result<Option<GatePerformer>, String> {
+    let Some(id) = context_id else { return Ok(None) };
+    let row = db
+        .get_context(id)
+        .map_err(|e| format!("gate policy could not read context {}: {e} (fail-closed)", id.short()))?;
+    let Some(performer) = row.and_then(|row| row.performer) else { return Ok(None) };
+    match db.get_character(performer) {
+        Ok(Some(sheet)) => Ok(Some(GatePerformer {
+            name: sheet.name,
+            rc_dir: sheet.rc_dir.filter(|dir| !dir.is_empty()),
+            root: sheet.root,
+        })),
+        Ok(None) => Err(format!(
+            "gate policy: context {} is performed by {}, which has no character sheet, so its gate \
+             layers cannot be read (fail-closed)",
+            id.short(),
+            performer.short()
+        )),
+        Err(e) => Err(format!("gate policy could not read the performer's character sheet: {e} (fail-closed)")),
+    }
 }
 
 // ── Evaluation ──────────────────────────────────────────────────────────
@@ -1278,7 +1482,9 @@ pub(crate) fn evaluate(
     }
 
     let family = family_layer_per_gated_statement(db, spec, &caller, &context)?;
-    let edge = |cmd: &PlannedCommand| senpai_edge_drift(db, cmd, &caller);
+    let edge = |cmd: &PlannedCommand| {
+        senpai_edge_drift(db, cmd, &caller).or_else(|| mcp_session_create(db, cmd, &caller))
+    };
     let lower = lower_layers_per_gated_statement(spec, layers, &edge);
     let per_statement = exact
         .iter()
@@ -1681,16 +1887,16 @@ fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>, edge: &
     }
 }
 
-/// The senpai-edge check [`statement_verdict`] consults for a command no
-/// key decided: `Some` names the edge it travels. Only the gate's own
-/// evaluation ([`evaluate`]) reads the database; broker PreCall passes a
-/// check that finds no edge.
+/// The database checks [`statement_verdict`] consults for a command no key
+/// decided: a drift along the senpai edge, or a context created under the
+/// caller's own MCP hub. `Some` names the allow. Only [`evaluate`] reads the
+/// database; [`evaluate_planned`] passes a check that finds neither.
 type EdgeCheck<'a> = dyn Fn(&PlannedCommand) -> Option<Decision> + 'a;
 
 /// One statement's verdict: the fold of its commands' verdicts. A
 /// statement with no commands is not an allow. A command no key decides
-/// is allowed when it drifts along the caller's senpai edge, before the
-/// uncovered tier.
+/// is allowed when it drifts along the caller's senpai edge or creates a
+/// context under the caller's own MCP hub, before the uncovered tier.
 fn statement_verdict(statement: &PlannedStatement, layers: Layers<'_>, edge: &EdgeCheck<'_>) -> PolicyVerdict {
     let verdicts: Vec<PolicyVerdict> = statement
         .plan
@@ -1761,7 +1967,7 @@ fn fold_verdicts(verdicts: Vec<PolicyVerdict>) -> PolicyVerdict {
     PolicyVerdict::Allow(decisions)
 }
 
-/// One command's verdict through layers 2–4: the context_type table, then
+/// One command's verdict through layers 2–4: the performer's tables, then
 /// the global table, then the builtin layer, and last the uncovered tier.
 /// This is also what stamps the per-command `tier` on `KJ_TOOL_PLAN`.
 pub(crate) fn command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerdict {
@@ -1784,17 +1990,16 @@ fn command_key(cmd: &PlannedCommand) -> String {
 /// [`command_verdict`] without the uncovered tier: the keyed layers alone.
 fn keyed_command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerdict {
     if let Some(keys) = command_keys(cmd) {
-        let context_table = layers
-            .context_type
-            .and_then(|t| layers.config.context_types.get(t).map(|table| (t, table)));
-        let mut tables: Vec<(Layer, &TierTable)> = Vec::with_capacity(2);
-        if let Some((t, table)) = context_table {
-            tables.push((Layer::ContextTypeConfig(t.to_string()), table));
-        }
-        tables.push((Layer::GlobalConfig, &layers.config.global));
-        for (layer, table) in tables {
+        // The performer's sections, latest first, then `[global]`: the
+        // first table with a verdict for any of the command's keys decides.
+        let tables = layers
+            .config
+            .performer_tables(layers.performer)
+            .into_iter()
+            .chain([(Section::Global, &layers.config.global)]);
+        for (section, table) in tables {
             if let Some((key, verdict)) = table.lookup(&keys.candidates) {
-                let decision = Decision { layer, key };
+                let decision = Decision { layer: Layer::Config(section), key };
                 match verdict {
                     TierVerdict::Deny => return PolicyVerdict::Deny(decision),
                     TierVerdict::Ask => return PolicyVerdict::Ask(decision),
@@ -1881,9 +2086,6 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
             _ => "kj --help".to_string(),
         });
     }
-    if is_mcp_context_create(&args) {
-        return Some(MCP_CREATE_KEY.to_string());
-    }
     if !readonly::is_gate_exempt_kj(cmd) {
         return None;
     }
@@ -1901,23 +2103,42 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
     Some(key)
 }
 
-/// The builtin key of `kj context create --type mcp`.
-const MCP_CREATE_KEY: &str = "kj context create --type mcp";
-
-/// Whether `args` (the argv after `kj`, from [`readonly::resolved_kj_args`])
-/// parse as `kj context create` with `--type mcp`, in either flag spelling.
-/// An MCP connection's character has no model, so the new context holds no
-/// `model` slot and making one spends nothing (`docs/senpai-kohai.md`, "MCP sessions"). An argv that
-/// does not parse is not one.
-fn is_mcp_context_create(args: &[String]) -> bool {
-    let mut args = args.to_vec();
+/// Whether `cmd` creates a context under the caller's own MCP hub, which
+/// needs no ask (`docs/senpai-kohai.md`, "MCP sessions"): `kj context create
+/// <character> --parent <hub>`, where `--parent` resolves, as the verb
+/// resolves it, to the `mcp_hub_ctx` of the caller's lineage root. A context
+/// whose parent is an MCP hub is an MCP session, and creating one runs no
+/// turn. Every argument must be a literal word and the command plain (no
+/// redirect, background flag or heredoc), since the decision reads the
+/// parent out of the arguments. `None` for anything else, including a
+/// caller whose lineage has no live root or whose root has no hub.
+fn mcp_session_create(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
+    if cmd.name != "kj" || !cmd.redirects.is_empty() || cmd.background || !cmd.heredocs.is_empty() {
+        return None;
+    }
+    let here = caller.context_id?;
+    let mut args = literal_args(cmd)?;
+    // After `--` a token such as `--json` is a word, which `strip_flag`
+    // would drop: the parent read here could then differ from the verb's.
+    if args.iter().any(|a| a == "--") {
+        return None;
+    }
     super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
-    let Ok(matches) = super::effect::cached_kj_args_command().try_get_matches_from(args) else {
-        return false;
-    };
-    let Some(("context", context)) = matches.subcommand() else { return false };
-    let Some(("create", create)) = context.subcommand() else { return false };
-    create.try_get_one::<String>("type_").ok().flatten().is_some_and(|t| t == "mcp")
+    let matches = super::effect::cached_kj_args_command().try_get_matches_from(&args).ok()?;
+    let ("context", context) = matches.subcommand()? else { return None };
+    let ("create", create) = context.subcommand()? else { return None };
+    let parent = create.try_get_one::<String>("parent").ok()??;
+    let parent = super::refs::resolve_context_arg_from(Some(parent.as_str()), Some(here), db).ok()?;
+    let root = db.live_lineage_root(here).ok()??;
+    let hub = db.get_character(root).ok()??.mcp_hub_ctx?;
+    if parent != hub {
+        return None;
+    }
+    let label = db.get_context(hub).ok()??.label.unwrap_or_else(|| hub.short());
+    Some(Decision {
+        layer: Layer::Builtin,
+        key: format!("kj context create under {label}, the MCP hub of its lineage root"),
+    })
 }
 
 /// One command as a human would read it in a refusal: the name and its
@@ -1959,22 +2180,33 @@ mod tests {
             .unwrap_or_else(|e| panic!("plan_program({source:?}) failed to parse: {e:?}"))
     }
 
-    /// No file and no context type: the builtin layer alone.
+    /// No file and no performer: the builtin layer alone.
     fn unconfigured(source: &str) -> PolicyEvaluation {
-        evaluate_planned(&plan(source), Layers { config: &GateConfig::default(), context_type: None })
+        evaluate_planned(&plan(source), Layers { config: &GateConfig::default(), performer: None })
     }
 
     fn config(text: &str) -> GateConfig {
         GateConfig::parse(text).unwrap_or_else(|e| panic!("test config must parse: {e}"))
     }
 
-    fn first_verdict(source: &str, cfg: &GateConfig, context_type: Option<&str>) -> PolicyVerdict {
-        let layers = Layers { config: cfg, context_type };
+    /// The character named `name`, whose rc directory has the same name, as
+    /// the shipped characters are made.
+    fn dir(name: &str) -> GatePerformer {
+        GatePerformer { name: name.to_string(), rc_dir: Some(name.to_string()), root: false }
+    }
+
+    /// The first statement's verdict for a context played by [`dir`]`(name)`,
+    /// or by no performer.
+    fn first_verdict(source: &str, cfg: &GateConfig, played_by: Option<&str>) -> PolicyVerdict {
+        let performer = played_by.map(dir);
+        first_verdict_for(source, cfg, performer.as_ref())
+    }
+
+    fn first_verdict_for(source: &str, cfg: &GateConfig, performer: Option<&GatePerformer>) -> PolicyVerdict {
+        let layers = Layers { config: cfg, performer };
         evaluate_planned(&plan(source), layers).per_statement.remove(0)
     }
 
-    /// A context env argument (`--env KEY=VALUE`) is plain text and must
-    /// not drop a tier-allowed `kj context create` to Uncovered.
     /// The verbs a character allow can cover each name their target by a
     /// clap field id. A renamed field must read as `Unread`, never as the
     /// current context, so this pins every id the table reads.
@@ -2037,9 +2269,11 @@ mod tests {
         assert_eq!(refusal("grep -r kjx src"), None, "a word that only starts with kj is not kj");
     }
 
+    /// A context env argument (`--env KEY=VALUE`) is plain text and must
+    /// not drop a tier-allowed `kj context create` to Uncovered.
     #[test]
-    fn env_argument_keeps_the_context_type_allow() {
-        let cfg = config("[context_type.mcp]\nallow = [\"kj context create\"]\n");
+    fn env_argument_keeps_the_rc_allow() {
+        let cfg = config("[rc.mcp]\nallow = [\"kj context create\"]\n");
         let v = first_verdict(
             "kj context create banto --name banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=console",
             &cfg,
@@ -2047,7 +2281,7 @@ mod tests {
         );
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::ContextTypeConfig("mcp".to_string()), "kj context create".to_string())],
+            vec![(Layer::Config(Section::Rc("mcp".into())), "kj context create".to_string())],
             "got {v:?}"
         );
     }
@@ -2094,52 +2328,23 @@ mod tests {
         assert_eq!(e.verdict(), AskVerdict::Escalate);
     }
 
-    /// `kj context create --type mcp` runs no model and holds no slot for
-    /// its type, so the builtin layer allows it. Both flag spellings count;
-    /// any other type, a redirect and a substituted argument do not.
+    /// `--type mcp` allows no create: the MCP session rule reads the
+    /// parent against the caller's MCP hub, which needs the database
+    /// ([`mcp_session_create`]; `kj/gate.rs` tests it through the gate), so
+    /// the planned layers alone leave every create uncovered.
     ///
-    /// Falsified by dropping the `--type mcp` arm from `builtin_key`.
+    /// Falsified by an argv-only arm in `builtin_key` keyed on `--type mcp`
+    /// or on `--parent`.
     #[test]
-    fn creating_an_mcp_context_is_builtin_allowed() {
+    fn the_planned_layers_allow_no_context_create_by_its_type() {
         for source in [
             "kj context create claude --name sess --type mcp",
             "kj context create claude --name sess --type=mcp --parent mcp/amy",
+            "kj context create claude --name sess --parent mcp/amy",
             "kj ctx create claude --name sess --cwd /tmp --cwd-optional --type mcp",
-            "kj --json context create claude --name sess --type mcp",
-        ] {
-            let e = unconfigured(source);
-            assert_eq!(builtin_key_of(&e.per_statement[0]), "kj context create --type mcp", "{source}");
-            assert_eq!(e.verdict(), AskVerdict::Allow, "{source}");
-        }
-        for source in [
-            "kj context create claude --name sess --type coder",
-            "kj context create claude --name sess --type=mcp-hub",
-            "kj context create claude --name sess",
-            "kj context create claude --name sess --env NOTE=mcp --type default",
-            "kj context create claude --name sess --type mcp > /tmp/x",
-            "kj context create claude --name sess --type $(cat /tmp/t)",
-            "kj context create --type mcp",
-            "kj context fork sess --type mcp",
         ] {
             assert_eq!(unconfigured(source).per_statement[0], PolicyVerdict::Uncovered, "{source}");
         }
-    }
-
-    /// A `gate.toml` key on `kj context create` still decides before the
-    /// builtin allow, for the calling type and for the global table.
-    ///
-    /// Falsified by checking the builtin layer ahead of the config tables.
-    #[test]
-    fn a_config_key_on_context_create_still_asks_for_an_mcp_create() {
-        let source = "kj context create claude --name sess --type mcp";
-        let ask = config("[global]\nask = [\"kj context create\"]\n");
-        assert!(matches!(first_verdict(source, &ask, Some("root")), PolicyVerdict::Ask(_)));
-        let typed = config("[context_type.root]\nask = [\"kj context create\"]\n");
-        assert!(matches!(first_verdict(source, &typed, Some("root")), PolicyVerdict::Ask(_)));
-        assert_eq!(builtin_key_of(&first_verdict(source, &typed, Some("coder"))), "kj context create --type mcp",
-            "a key for another type does not reach this one");
-        let deny = config("[context_type.root]\ndeny = [\"kj context create\"]\n");
-        assert!(matches!(first_verdict(source, &deny, Some("root")), PolicyVerdict::Deny(_)));
     }
 
     #[test]
@@ -2166,10 +2371,10 @@ mod tests {
     /// the structural check, skipping the builtin layer.
     #[test]
     fn a_config_allow_does_not_take_help_away() {
-        let cfg = config("[global]\nallow = [\"kj context create\"]\n[context_type.director]\nallow = [\"kj context create\"]\n");
-        for context_type in [None, Some("director")] {
-            assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, context_type)), "kj context --help",
-                "{context_type:?}");
+        let cfg = config("[global]\nallow = [\"kj context create\"]\n[rc.director]\nallow = [\"kj context create\"]\n");
+        for played_by in [None, Some("director")] {
+            assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, played_by)), "kj context --help",
+                "{played_by:?}");
         }
         assert_eq!(first_verdict("kj context create coder --name x --type default > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
             "a redirect still keeps the allow from covering, and no builtin covers it");
@@ -2226,7 +2431,7 @@ mod tests {
         assert_eq!(only_answers.verdict(), AskVerdict::Allow);
 
         let none = GateConfig::default();
-        let layers = Layers { config: &none, context_type: None };
+        let layers = Layers { config: &none, performer: None };
         assert_eq!(evaluate_planned(&[], layers).verdict(), AskVerdict::Escalate);
     }
 
@@ -2236,7 +2441,7 @@ mod tests {
     #[test]
     fn a_council_allow_converts_only_uncovered_statements() {
         let cfg = config("[global]\nask = [\"git push\"]\ndeny = [\"dd\"]\n");
-        let layers = Layers { config: &cfg, context_type: None };
+        let layers = Layers { config: &cfg, performer: None };
         let mut mixed = evaluate_planned(&plan("kj block list; touch x"), layers);
         mixed.apply_council_allow("shell-gate", |i| format!("statement #{i} at p=0.991"));
         assert_eq!(mixed.verdict(), AskVerdict::Allow);
@@ -2349,7 +2554,7 @@ mod tests {
         let deny = PolicyEvaluation {
             per_statement: vec![
                 PolicyVerdict::Uncovered,
-                PolicyVerdict::Deny(Decision { layer: Layer::GlobalConfig, key: "rm".into() }),
+                PolicyVerdict::Deny(Decision { layer: Layer::Config(Section::Global), key: "rm".into() }),
             ],
         };
         let text = deny.describe(&statements, false);
@@ -2364,7 +2569,7 @@ allow = ["kj handoff note", "rg", "wc"]
 ask = ["kj rc add", "git push"]
 deny = ["dd"]
 
-[context_type.explorer]
+[rc.explorer]
 deny = ["kj context create"]
 "#;
 
@@ -2374,7 +2579,7 @@ deny = ["kj context create"]
         assert!(
             cfg.entries()
                 .iter()
-                .any(|(s, k, v)| s == "global" && k == "kj handoff note" && *v == "allow"),
+                .any(|(s, k, v)| s == "[global]" && k == "kj handoff note" && *v == "allow"),
             "{:?}",
             cfg.entries()
         );
@@ -2393,9 +2598,9 @@ deny = ["kj context create"]
         let err = GateConfig::parse("[global]\nallow = [\"kj blok list\"]\n").unwrap_err();
         let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
         assert!(m.contains("[global] allow") && m.contains("kj blok list") && m.contains("blok"), "{m}");
-        let err = GateConfig::parse("[context_type.coder]\ndeny = [\"kj block lisst\"]\n").unwrap_err();
+        let err = GateConfig::parse("[rc.coder]\ndeny = [\"kj block lisst\"]\n").unwrap_err();
         let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
-        assert!(m.contains("[context_type.coder] deny") && m.contains("lisst"), "{m}");
+        assert!(m.contains("[rc.coder] deny") && m.contains("lisst"), "{m}");
         let err = GateConfig::parse("[global]\nask = [\"git push origin\"]\n").unwrap_err();
         assert!(matches!(err, GateConfigError::Parse(_)), "three tokens is not a key: {err:?}");
         // A flag as the second token could never match a command (the key
@@ -2440,9 +2645,9 @@ deny = ["kj context create"]
     fn a_global_allow_covers_a_kj_write_verb_and_a_non_kj_command() {
         let cfg = config(EXAMPLE);
         let v = first_verdict("kj handoff note 'a note'", &cfg, None);
-        assert_eq!(allow_keys(&v), vec![(Layer::GlobalConfig, "kj handoff note".to_string())]);
+        assert_eq!(allow_keys(&v), vec![(Layer::Config(Section::Global), "kj handoff note".to_string())]);
         let v = first_verdict("rg -n foo src", &cfg, Some("coder"));
-        assert_eq!(allow_keys(&v), vec![(Layer::GlobalConfig, "rg".to_string())]);
+        assert_eq!(allow_keys(&v), vec![(Layer::Config(Section::Global), "rg".to_string())]);
     }
 
     #[test]
@@ -2489,24 +2694,83 @@ deny = ["kj context create"]
     }
 
     #[test]
-    fn the_context_type_layer_outranks_global_and_a_specific_key_outranks_a_general_one() {
+    fn the_rc_layer_outranks_global_and_a_specific_key_outranks_a_general_one() {
         let cfg = config(
             "[global]\nallow = [\"kj context\"]\ndeny = [\"kj context create\"]\n\
-             [context_type.explorer]\nallow = [\"kj context create\"]\n",
+             [rc.explorer]\nallow = [\"kj context create\"]\n",
         );
         // Within global: the specific deny beats the general allow.
         assert!(matches!(first_verdict("kj context create coder --name x --type default", &cfg, None), PolicyVerdict::Deny(_)));
         assert!(matches!(first_verdict("kj context list", &cfg, None), PolicyVerdict::Allow(_)));
-        // The context_type layer sits above global.
+        // The rc layer sits above global.
         let v = first_verdict("kj context create coder --name x --type default", &cfg, Some("explorer"));
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::ContextTypeConfig("explorer".into()), "kj context create".to_string())]
+            vec![(Layer::Config(Section::Rc("explorer".into())), "kj context create".to_string())]
         );
         assert!(matches!(
             first_verdict("kj context create coder --name x --type default", &cfg, Some("coder")),
             PolicyVerdict::Deny(_)
         ));
+    }
+
+    /// Each later layer reads over the earlier: `[global]`, then
+    /// `[rc.<dir>]`, then `[character.<name>]`, then `[root]` for a root
+    /// performer. The first table with a verdict for a command's keys
+    /// decides; a later section with no verdict for the key leaves the
+    /// earlier one's.
+    ///
+    /// Falsified by walking the performer's sections earliest first, or by
+    /// leaving any of the three out.
+    #[test]
+    fn each_later_layer_reads_over_the_earlier_ones() {
+        let cfg = config(
+            "[global]\nask = [\"git push\", \"rg\", \"wc\", \"cat\"]\n\
+             [rc.coder]\nallow = [\"git push\", \"rg\", \"wc\"]\n\
+             [character.coder-opus]\ndeny = [\"git push\", \"rg\"]\n\
+             [root]\nallow = [\"git push\"]\n",
+        );
+        let coder = dir("coder");
+        let opus = GatePerformer { name: "coder-opus".into(), rc_dir: Some("coder".into()), root: false };
+        let rooted = GatePerformer { name: "coder-opus".into(), rc_dir: Some("coder".into()), root: true };
+        let layer = |v: PolicyVerdict| match v {
+            PolicyVerdict::Allow(ds) => (ds[0].layer.clone(), "allow"),
+            PolicyVerdict::Ask(d) => (d.layer, "ask"),
+            PolicyVerdict::Deny(d) => (d.layer, "deny"),
+            PolicyVerdict::Uncovered => panic!("every command here has a key"),
+        };
+        let rc = Layer::Config(Section::Rc("coder".into()));
+        let character = Layer::Config(Section::Character("coder-opus".into()));
+        let global = Layer::Config(Section::Global);
+        // The directory reads over global, for every character of it.
+        assert_eq!(layer(first_verdict_for("git push", &cfg, Some(&coder))), (rc.clone(), "allow"));
+        // The character reads over its directory.
+        assert_eq!(layer(first_verdict_for("git push", &cfg, Some(&opus))), (character.clone(), "deny"));
+        assert_eq!(layer(first_verdict_for("rg x", &cfg, Some(&opus))), (character.clone(), "deny"));
+        // A key the character does not name keeps the directory's verdict,
+        // and one neither names keeps global's.
+        assert_eq!(layer(first_verdict_for("wc x", &cfg, Some(&opus))), (rc, "allow"));
+        assert_eq!(layer(first_verdict_for("cat x", &cfg, Some(&opus))), (global.clone(), "ask"));
+        // `[root]` reads over the character for a root performer only.
+        assert_eq!(layer(first_verdict_for("git push", &cfg, Some(&rooted))), (Layer::Config(Section::Root), "allow"));
+        assert_eq!(layer(first_verdict_for("rg x", &cfg, Some(&rooted))), (character, "deny"));
+        // A context with no performer reads `[global]` alone.
+        assert_eq!(layer(first_verdict_for("git push", &cfg, None)), (global, "ask"));
+        // A performer with no rc directory reads no directory layer.
+        let undirected = GatePerformer { name: "loose".into(), rc_dir: None, root: false };
+        assert_eq!(layer(first_verdict_for("wc x", &cfg, Some(&undirected))), (Layer::Config(Section::Global), "ask"));
+    }
+
+    /// A layer's reasons and `kj ledger rules` name the section the way an
+    /// operator reads the file.
+    #[test]
+    fn each_section_names_itself_in_a_reason() {
+        assert_eq!(Layer::Config(Section::Global).to_string(), "global config");
+        assert_eq!(Layer::Config(Section::Rc("coder".into())).to_string(), "rc config (coder)");
+        assert_eq!(Layer::Config(Section::Character("coder-opus".into())).to_string(), "character config (coder-opus)");
+        assert_eq!(Layer::Config(Section::Root).to_string(), "root config");
+        assert_eq!(Layer::UncoveredAllow(Section::Root).to_string(), "root config uncovered tier");
+        assert_eq!(Section::Character("coder-opus".into()).header(), "[character.coder-opus]");
     }
 
     #[test]
@@ -2521,7 +2785,7 @@ deny = ["kj context create"]
     fn a_config_deny_outranks_the_builtin_allow_and_an_ask_is_firm() {
         let cfg = config("[global]\ndeny = [\"kj block list\"]\nask = [\"kj block read\"]\n");
         assert!(matches!(first_verdict("kj block list", &cfg, None), PolicyVerdict::Deny(_)));
-        let e = evaluate_planned(&plan("kj block read 01a0"), Layers { config: &cfg, context_type: None });
+        let e = evaluate_planned(&plan("kj block read 01a0"), Layers { config: &cfg, performer: None });
         assert!(matches!(e.per_statement[0], PolicyVerdict::Ask(_)));
         assert_eq!(e.verdict(), AskVerdict::Escalate);
         assert_eq!(e.per_statement[0].tier(), "ask");
@@ -2530,7 +2794,7 @@ deny = ["kj context create"]
     #[test]
     fn a_statement_folds_its_commands_deny_first_then_ask_then_all_allow() {
         let cfg = config(EXAMPLE);
-        let layers = Layers { config: &cfg, context_type: None };
+        let layers = Layers { config: &cfg, performer: None };
         assert!(matches!(
             evaluate_planned(&plan("rg x | dd"), layers).per_statement[0],
             PolicyVerdict::Deny(_)
@@ -2544,7 +2808,7 @@ deny = ["kj context create"]
             allow_keys(&v),
             vec![
                 (Layer::Builtin, "kj block list".to_string()),
-                (Layer::GlobalConfig, "rg".to_string()),
+                (Layer::Config(Section::Global), "rg".to_string()),
             ]
         );
         assert_eq!(
@@ -2556,7 +2820,7 @@ deny = ["kj context create"]
     #[test]
     fn tiers_name_the_hook_facing_words() {
         let cfg = config(EXAMPLE);
-        let layers = Layers { config: &cfg, context_type: None };
+        let layers = Layers { config: &cfg, performer: None };
         let stmt = &plan("rg x")[0];
         assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "allow");
         let stmt = &plan("git push")[0];
@@ -2576,7 +2840,7 @@ allow = ["rg"]
 ask = ["git push"]
 deny = ["dd"]
 
-[context_type.coder]
+[rc.coder]
 uncovered = "allow"
 "#;
 
@@ -2633,7 +2897,7 @@ uncovered = "allow"
         assert_eq!(
             allow_keys(&v),
             vec![(
-                Layer::UncoveredAllow(Some("coder".to_string())),
+                Layer::UncoveredAllow(Section::Rc("coder".into())),
                 "`OUT=log`, a statement with no command".to_string()
             )]
         );
@@ -2653,7 +2917,7 @@ uncovered = "allow"
         assert_eq!(
             allow_keys(&v),
             vec![(
-                Layer::UncoveredAllow(Some("coder".to_string())),
+                Layer::UncoveredAllow(Section::Rc("coder".into())),
                 "python3 build.py".to_string()
             )]
         );
@@ -2691,7 +2955,7 @@ uncovered = "allow"
             let v = first_verdict(source, &cfg, Some("director"));
             let keys = allow_keys(&v);
             assert_eq!(keys.len(), 1, "{source}: {v:?}");
-            assert_eq!(keys[0].0, Layer::ContextTypeConfig("director".to_string()), "{source}: {v:?}");
+            assert_eq!(keys[0].0, Layer::Config(Section::Rc("director".into())), "{source}: {v:?}");
             assert_eq!(
                 first_verdict(source, &cfg, Some("coder")),
                 PolicyVerdict::Uncovered,
@@ -2709,7 +2973,7 @@ uncovered = "allow"
     /// example: loosening is the operator's choice, per seat (F16).
     #[test]
     fn the_shipped_default_comments_out_the_shell_write_allow() {
-        const EXAMPLE_LINES: [&str; 2] = ["#   [context_type.coder]", "#   allow = [\"shell_write\"]"];
+        const EXAMPLE_LINES: [&str; 2] = ["#   [rc.coder]", "#   allow = [\"shell_write\"]"];
         let shipped = crate::config_seed::DEFAULT_GATE_CONFIG;
         assert!(
             shipped.contains(&EXAMPLE_LINES.join("\n")),
@@ -2721,7 +2985,7 @@ uncovered = "allow"
         let v = first_verdict(source, &config(&uncommented), Some("coder"));
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::ContextTypeConfig("coder".to_string()), "shell_write".to_string())],
+            vec![(Layer::Config(Section::Rc("coder".into())), "shell_write".to_string())],
             "got {v:?}"
         );
     }
@@ -2730,19 +2994,21 @@ uncovered = "allow"
     #[test]
     fn the_shipped_default_leaves_the_uncovered_tier_at_ask() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
-        for context_type in [None, Some("coder"), Some("mcp"), Some("explorer")] {
+        let person = GatePerformer { name: "amy".into(), rc_dir: Some("root".into()), root: true };
+        let performers = [None, Some(dir("coder")), Some(dir("mcp")), Some(dir("director")), Some(person)];
+        for performer in &performers {
             assert_eq!(
-                cfg.uncovered_for(context_type),
-                (UncoveredTier::Ask, None),
-                "{context_type:?}"
+                cfg.uncovered_for(performer.as_ref()),
+                (UncoveredTier::Ask, Section::Global),
+                "{performer:?}"
             );
             assert_eq!(
-                first_verdict("python3 build.py", &cfg, context_type),
+                first_verdict_for("python3 build.py", &cfg, performer.as_ref()),
                 PolicyVerdict::Uncovered,
-                "{context_type:?}"
+                "{performer:?}"
             );
         }
-        assert_eq!(config(EXAMPLE).uncovered_for(Some("coder")), (UncoveredTier::Ask, None));
+        assert_eq!(config(EXAMPLE).uncovered_for(Some(&dir("coder"))), (UncoveredTier::Ask, Section::Global));
     }
 
     /// Ask stays firm and deny stays deny: both are decided before the
@@ -2758,7 +3024,7 @@ uncovered = "allow"
             first_verdict("git push origin main", &cfg, Some("coder")),
             PolicyVerdict::Ask(_)
         ));
-        let layers = Layers { config: &cfg, context_type: Some("coder") };
+        let layers = Layers { config: &cfg, performer: Some(&dir("coder")) };
         assert_eq!(
             evaluate_planned(&plan("python3 x.py; git push origin main"), layers).verdict(),
             AskVerdict::Escalate,
@@ -2775,10 +3041,10 @@ uncovered = "allow"
         let v = first_verdict("rg foo > ~/.bashrc", &cfg, Some("coder"));
         assert_eq!(
             allow_keys(&v),
-            vec![(Layer::UncoveredAllow(Some("coder".to_string())), "rg foo".to_string())]
+            vec![(Layer::UncoveredAllow(Section::Rc("coder".into())), "rg foo".to_string())]
         );
         let v = first_verdict("rg foo src", &cfg, Some("coder"));
-        assert_eq!(allow_keys(&v), vec![(Layer::GlobalConfig, "rg".to_string())]);
+        assert_eq!(allow_keys(&v), vec![(Layer::Config(Section::Global), "rg".to_string())]);
     }
 
     /// The whole submission auto-allows: every statement is an Allow,
@@ -2786,7 +3052,7 @@ uncovered = "allow"
     #[test]
     fn a_whole_program_auto_allows_under_the_uncovered_tier() {
         let cfg = config(SANDBOX);
-        let layers = Layers { config: &cfg, context_type: Some("coder") };
+        let layers = Layers { config: &cfg, performer: Some(&dir("coder")) };
         let e = evaluate_planned(
             &plan("OUT=log; cargo test --workspace 2>&1 | tee $OUT; kj block create --role user --kind text"),
             layers,
@@ -2806,21 +3072,42 @@ uncovered = "allow"
     #[test]
     fn the_uncovered_tier_stamps_allow_on_every_command() {
         let cfg = config(SANDBOX);
-        let layers = Layers { config: &cfg, context_type: Some("coder") };
+        let layers = Layers { config: &cfg, performer: Some(&dir("coder")) };
         let stmt = &plan("cat /etc/passwd")[0];
         assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "allow");
-        let layers = Layers { config: &cfg, context_type: Some("explorer") };
+        let layers = Layers { config: &cfg, performer: Some(&dir("explorer")) };
         assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "score");
     }
 
-    /// A context type's setting wins over the global one, in both
-    /// directions — a global sandbox can be withheld from one role.
+    /// A directory's setting wins over the global one, in both directions —
+    /// a global sandbox can be withheld from one role.
     #[test]
-    fn a_context_type_setting_outranks_the_global_one() {
-        let cfg = config("[global]\nuncovered = \"allow\"\n[context_type.director]\nuncovered = \"ask\"\n");
+    fn an_rc_setting_outranks_the_global_one() {
+        let cfg = config("[global]\nuncovered = \"allow\"\n[rc.director]\nuncovered = \"ask\"\n");
         let v = first_verdict("cat x", &cfg, Some("coder"));
-        assert_eq!(allow_keys(&v), vec![(Layer::UncoveredAllow(None), "cat x".to_string())]);
+        assert_eq!(allow_keys(&v), vec![(Layer::UncoveredAllow(Section::Global), "cat x".to_string())]);
         assert_eq!(first_verdict("cat x", &cfg, Some("director")), PolicyVerdict::Uncovered);
+    }
+
+    /// The uncovered posture reads over the same way the key lists do: the
+    /// latest of the performer's sections that states one decides, else
+    /// `[global]`. A character withholds its directory's sandbox, and
+    /// `[root]` reads over the character.
+    ///
+    /// Falsified by reading the sections earliest first.
+    #[test]
+    fn the_latest_section_stating_the_uncovered_posture_decides_it() {
+        let cfg = config(
+            "[global]\nuncovered = \"ask\"\n[rc.coder]\nuncovered = \"allow\"\n\
+             [character.coder-opus]\nuncovered = \"ask\"\n[root]\nuncovered = \"allow\"\n",
+        );
+        let coder = dir("coder");
+        let opus = GatePerformer { name: "coder-opus".into(), rc_dir: Some("coder".into()), root: false };
+        let rooted = GatePerformer { root: true, ..opus.clone() };
+        assert_eq!(cfg.uncovered_for(Some(&coder)), (UncoveredTier::Allow, Section::Rc("coder".into())));
+        assert_eq!(cfg.uncovered_for(Some(&opus)), (UncoveredTier::Ask, Section::Character("coder-opus".into())));
+        assert_eq!(cfg.uncovered_for(Some(&rooted)), (UncoveredTier::Allow, Section::Root));
+        assert_eq!(cfg.uncovered_for(None), (UncoveredTier::Ask, Section::Global));
     }
 
     #[test]
@@ -2833,9 +3120,9 @@ uncovered = "allow"
         );
         // `deny` is a key list, never a posture: denying everything unlisted
         // is not offered here.
-        let err = GateConfig::parse("[context_type.coder]\nuncovered = \"deny\"\n").unwrap_err();
+        let err = GateConfig::parse("[rc.coder]\nuncovered = \"deny\"\n").unwrap_err();
         let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
-        assert!(m.contains("[context_type.coder]") && m.contains("deny"), "{m}");
+        assert!(m.contains("[rc.coder]") && m.contains("deny"), "{m}");
     }
 
     /// `kj ledger rules` lists the posture, so an operator sees it without
@@ -2843,19 +3130,19 @@ uncovered = "allow"
     #[test]
     fn the_uncovered_tier_is_listed_for_the_context_it_applies_to() {
         let cfg = config(SANDBOX);
-        let entries = cfg.entries_for(Some("coder"));
+        let entries = cfg.entries_for(Some(&dir("coder")));
         assert_eq!(
             entries.first().map(|(l, k, v)| (l.clone(), k.clone(), *v)),
             Some((
-                Layer::UncoveredAllow(Some("coder".to_string())),
+                Layer::UncoveredAllow(Section::Rc("coder".into())),
                 "uncovered".to_string(),
                 "allow"
             )),
             "{entries:?}"
         );
-        assert!(cfg.allows_uncovered(Some("coder")));
-        assert!(!cfg.allows_uncovered(Some("explorer")));
-        assert!(!cfg.entries_for(Some("explorer")).iter().any(|(l, _, _)| {
+        assert!(cfg.allows_uncovered(Some(&dir("coder"))));
+        assert!(!cfg.allows_uncovered(Some(&dir("explorer"))));
+        assert!(!cfg.entries_for(Some(&dir("explorer"))).iter().any(|(l, _, _)| {
             matches!(l, Layer::UncoveredAllow(_))
         }));
     }
@@ -2899,15 +3186,15 @@ uncovered = "allow"
         assert!(err("kj blok list").contains("names no kj verb"));
     }
 
-    // ── context_type sections ───────────────────────────────────────
+    // ── sections and the load ───────────────────────────────────────
 
-    /// A `MountTable` with an rc tree naming `types`, for the section
-    /// validation `load_config` does.
-    async fn rc_tree(types: &[&str]) -> (MountTable, tempfile::TempDir, tempfile::TempDir) {
+    /// A `MountTable` with an rc tree naming `dirs`, for the sections
+    /// `load_config` checks.
+    async fn rc_tree(dirs: &[&str]) -> (MountTable, tempfile::TempDir, tempfile::TempDir) {
         use crate::vfs::LocalBackend;
         let rc = tempfile::tempdir().unwrap();
-        for t in types {
-            std::fs::create_dir_all(rc.path().join(t)).unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(rc.path().join(d)).unwrap();
         }
         let config = tempfile::tempdir().unwrap();
         let vfs = MountTable::new();
@@ -2920,79 +3207,107 @@ uncovered = "allow"
         std::fs::write(config.path().join(GATE_CONFIG_FILE), text).unwrap();
     }
 
-    /// A typo'd section names no context type, so it applies to nobody and
-    /// the type it meant to name keeps whatever `[global]` said. The load
-    /// refuses it the way a kj key naming no verb is refused.
+    /// A sheet holding `live` and `retired` characters.
+    fn sheet(live: &[&str], retired: &[&str]) -> parking_lot::Mutex<KernelDb> {
+        let db = KernelDb::open(":memory:").unwrap();
+        for (name, retired_at) in live.iter().map(|n| (n, None)).chain(retired.iter().map(|n| (n, Some(1)))) {
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: PrincipalId::new(), name: name.to_string(), created_at: 0, retired_at,
+                handoff_ctx: None, root_ctx: None, root: false, context_type: None, rc_dir: Some(name.to_string()),
+                console_ctx: None, mcp_hub_ctx: None,
+            })
+            .unwrap();
+        }
+        parking_lot::Mutex::new(db)
+    }
+
+    /// Capture what the current thread logs until the guard drops.
+    fn capture_logs() -> (std::sync::Arc<std::sync::Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Default::default());
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || sink.clone()).with_ansi(false).finish();
+        (buf.0, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// The type sections are gone: one fails the load, naming both
+    /// replacements, through the error every unknown section takes.
+    ///
+    /// Falsified by accepting the section, or by refusing it as an unknown
+    /// field with no replacement named.
+    #[test]
+    fn a_context_type_section_fails_the_load_naming_its_replacements() {
+        for text in [
+            "[context_type.coder]\nallow = [\"rg\"]\n",
+            "[global]\nallow = [\"rg\"]\n[context_type.coder.council]\nenabled = false\n",
+        ] {
+            let err = GateConfig::parse(text).unwrap_err();
+            let GateConfigError::Parse(m) = &err else { panic!("{err:?}") };
+            assert!(m.contains("[context_type.coder]") && m.contains("[rc.coder]") && m.contains("[character.<name>]"), "{m}");
+            assert!(err.to_string().contains("kj config reset gate.toml"), "{err}");
+        }
+    }
+
+    /// A section naming no rc directory or character applies to nobody. It
+    /// loads, so the fix can run, and the load lists it and warns about it
+    /// every time. A retired character is still on the sheet, and `lib` is
+    /// not a directory a character runs.
+    ///
+    /// Falsified by failing the load on such a section, by not finding it,
+    /// or by warning only once.
     #[tokio::test]
-    async fn an_unknown_context_type_section_fails_the_load_naming_the_known_types() {
+    async fn a_section_that_applies_to_nobody_loads_is_listed_and_warns_at_every_load() {
         let (vfs, _rc, config) = rc_tree(&["coder", "director", "lib"]).await;
+        let db = sheet(&["amy", "coder"], &["old-lane"]);
         write_gate(
             &config,
-            "[global]\nuncovered = \"allow\"\n[context_type.directer]\nuncovered = \"ask\"\n",
+            "[global]\nuncovered = \"allow\"\n\
+             [rc.directer]\nuncovered = \"ask\"\n[rc.coder]\nallow = [\"rg\"]\n[rc.lib]\nallow = [\"rg\"]\n\
+             [character.bobb]\nallow = [\"rg\"]\n[character.amy]\nallow = [\"rg\"]\n[character.old-lane]\nallow = [\"rg\"]\n",
         );
-        let err = load_config(&vfs).await.unwrap_err();
-        let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
-        assert!(
-            m.contains("context_type.directer") && m.contains("coder, director"),
-            "{m}"
+        let (logs, guard) = capture_logs();
+        let cfg = load_config(&vfs, &db).await.expect("a section that applies to nobody does not fail the load");
+        load_config(&vfs, &db).await.expect("and loads again");
+        drop(guard);
+        assert_eq!(
+            cfg.applies_to_nobody(),
+            [Section::Rc("directer".into()), Section::Rc("lib".into()), Section::Character("bobb".into())]
         );
-        assert!(!m.contains("lib"), "`lib` is not a seat: {m}");
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        for header in ["[rc.directer]", "[rc.lib]", "[character.bobb]"] {
+            let lines: Vec<&str> = logs.lines().filter(|l| l.contains(header)).collect();
+            assert_eq!(lines.len(), 2, "one warning per load for {header}: {logs}");
+            assert!(lines.iter().all(|l| l.contains("WARN") && l.contains("applies to nobody")), "{logs}");
+        }
+        assert!(!logs.contains("[rc.coder]") && !logs.contains("[character.amy]") && !logs.contains("old-lane"), "{logs}");
+        // The typo'd section applies to nobody, so `director` keeps what
+        // `[global]` says: the reason the section is listed.
+        assert!(cfg.allows_uncovered(Some(&dir("director"))));
     }
 
-    /// The fail-open shape the check exists for: without it the typo'd
-    /// section is inert and `director` inherits the global allow. With the
-    /// name spelled right, the section applies and holds the tier at ask.
-    #[tokio::test]
-    async fn a_typo_can_no_longer_leave_a_context_type_on_the_global_allow() {
-        let (vfs, _rc, config) = rc_tree(&["coder", "director"]).await;
-        write_gate(
-            &config,
-            "[global]\nuncovered = \"allow\"\n[context_type.director]\nuncovered = \"ask\"\n",
-        );
-        let cfg = load_config(&vfs).await.expect("the spelled-right file loads");
-        assert!(cfg.allows_uncovered(Some("coder")));
-        assert!(!cfg.allows_uncovered(Some("director")), "the section protects its type");
-
-        // The same file with the name misspelled must not load at all: a
-        // parsed-clean typo would leave `director` on the global allow.
-        write_gate(
-            &config,
-            "[global]\nuncovered = \"allow\"\n[context_type.directer]\nuncovered = \"ask\"\n",
-        );
-        let typo = load_config(&vfs).await;
-        assert!(typo.is_err(), "a typo'd section must refuse the file");
-        let parsed = GateConfig::parse(
-            "[global]\nuncovered = \"allow\"\n[context_type.directer]\nuncovered = \"ask\"\n",
-        )
-        .expect("parse itself stays a pure shape check");
-        assert!(
-            parsed.allows_uncovered(Some("director")),
-            "this is what the load refuses to hand out: the typo'd section applies to nobody"
-        );
-    }
-
-    /// Any unknown section, not only one setting `uncovered`: a typo'd
-    /// allow list is inert in the same way.
-    #[tokio::test]
-    async fn an_unknown_section_with_only_a_key_list_fails_the_load_too() {
-        let (vfs, _rc, config) = rc_tree(&["coder"]).await;
-        write_gate(&config, "[context_type.codr]\nallow = [\"rg\"]\n");
-        assert!(matches!(load_config(&vfs).await, Err(GateConfigError::Parse(_))));
-    }
-
-    /// An rc tree that lists nothing accepts every section — there is
-    /// nothing to validate against, and a kernel with no rc tree is a
+    /// An rc tree that lists nothing names every directory: there is
+    /// nothing to check against, and a kernel with no rc tree is a
     /// legitimate shape. The rule `kj::rc::check_context_type` states.
     #[tokio::test]
-    async fn an_empty_rc_tree_accepts_any_section() {
+    async fn an_empty_rc_tree_names_every_directory() {
         let (vfs, _rc, config) = rc_tree(&[]).await;
-        write_gate(&config, "[context_type.anything-goes]\nallow = [\"rg\"]\n");
-        assert!(load_config(&vfs).await.is_ok());
+        write_gate(&config, "[rc.anything-goes]\nallow = [\"rg\"]\n");
+        let cfg = load_config(&vfs, &sheet(&[], &[])).await.expect("loads");
+        assert!(cfg.applies_to_nobody().is_empty(), "{:?}", cfg.applies_to_nobody());
     }
 
-    /// The shipped `gate.toml` must load against the shipped rc tree.
-    /// `[context_type.explorer]` did not: the type was renamed and the
-    /// section had been inert ever since.
+    /// The shipped `gate.toml` loads against the shipped rc tree, and every
+    /// section it ships names a shipped directory.
     #[tokio::test]
     async fn the_shipped_default_loads_against_the_shipped_rc_tree() {
         use crate::vfs::LocalBackend;
@@ -3007,22 +3322,25 @@ uncovered = "allow"
         let vfs = MountTable::new();
         vfs.mount(kaijutsu_types::paths::RC_ROOT, LocalBackend::new(rc.path())).await;
         vfs.mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(config.path())).await;
-        let loaded = load_config(&vfs).await;
-        assert!(loaded.is_ok(), "{loaded:?}");
+        let loaded = load_config(&vfs, &sheet(&[], &[])).await;
+        let cfg = loaded.unwrap_or_else(|e| panic!("{e}"));
+        assert!(cfg.applies_to_nobody().is_empty(), "{:?}", cfg.applies_to_nobody());
+        assert!(cfg.has_section(&Section::Root), "the shipped root tier");
     }
 
     #[tokio::test]
     async fn an_absent_file_is_the_empty_config_and_a_bad_one_is_an_error() {
         use crate::vfs::LocalBackend;
+        let db = sheet(&[], &[]);
         let vfs = MountTable::new();
-        assert_eq!(load_config(&vfs).await, Ok(GateConfig::default()), "no mount at all");
+        assert_eq!(load_config(&vfs, &db).await, Ok(GateConfig::default()), "no mount at all");
         let dir = tempfile::tempdir().unwrap();
         vfs.mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(dir.path())).await;
-        assert_eq!(load_config(&vfs).await, Ok(GateConfig::default()), "mounted, file absent");
+        assert_eq!(load_config(&vfs, &db).await, Ok(GateConfig::default()), "mounted, file absent");
         std::fs::write(dir.path().join(GATE_CONFIG_FILE), "[global]\nallow = [\"kj nope\"]\n").unwrap();
-        assert!(matches!(load_config(&vfs).await, Err(GateConfigError::Parse(_))));
+        assert!(matches!(load_config(&vfs, &db).await, Err(GateConfigError::Parse(_))));
         std::fs::write(dir.path().join(GATE_CONFIG_FILE), EXAMPLE).unwrap();
-        assert_eq!(load_config(&vfs).await, Ok(config(EXAMPLE)));
+        assert_eq!(load_config(&vfs, &db).await, Ok(config(EXAMPLE)));
     }
 
     // ---- council configuration ----
@@ -3042,10 +3360,10 @@ spec = "shell-gate"
 allow_at = 0.98
 mass_floor = -0.05
 
-[context_type.coder.council]
+[rc.coder.council]
 enabled = true
 
-[context_type.toolie.council]
+[rc.toolie.council]
 enabled = false
 "#;
 
@@ -3209,39 +3527,76 @@ enabled = false
         let cfg = config("[global]\nallow = [\"rg\"]\n");
         assert!(cfg.council().is_none());
         assert!(!cfg.council_enabled_for(None));
-        assert!(!cfg.council_enabled_for(Some("coder")));
+        assert!(!cfg.council_enabled_for(Some(&dir("coder"))));
         let shipped = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         assert!(shipped.council().is_none(), "the shipped default is council-off");
-        assert!(!shipped.council_enabled_for(Some("coder")));
+        assert!(!shipped.council_enabled_for(Some(&dir("coder"))));
     }
 
     #[test]
-    fn council_is_enabled_per_context_type() {
+    fn council_is_enabled_per_rc_directory() {
         let cfg = config(COUNCIL_FULL);
-        assert!(cfg.council_enabled_for(Some("coder")));
-        assert!(!cfg.council_enabled_for(Some("toolie")), "enabled = false");
-        assert!(!cfg.council_enabled_for(Some("director")), "unmentioned type");
-        assert!(!cfg.council_enabled_for(None), "no context type");
+        assert!(cfg.council_enabled_for(Some(&dir("coder"))));
+        assert!(!cfg.council_enabled_for(Some(&dir("toolie"))), "enabled = false");
+        assert!(!cfg.council_enabled_for(Some(&dir("director"))), "unmentioned directory");
+        assert!(!cfg.council_enabled_for(None), "no performer");
     }
 
     #[test]
-    fn a_context_type_can_replace_the_council_contexts() {
-        let cfg = config(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n"));
-        let director = cfg.council_for(Some("director")).unwrap();
+    fn an_rc_directory_can_replace_the_council_contexts() {
+        let cfg = config(&format!("{COUNCIL_FULL}\n[rc.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n"));
+        let director = cfg.council_for(Some(&dir("director"))).unwrap();
         assert_eq!(director.contexts, ["council-amy", "council-banto"]);
-        let coder = cfg.council_for(Some("coder")).unwrap();
+        let coder = cfg.council_for(Some(&dir("coder"))).unwrap();
         assert_eq!(coder.contexts, ["reviewer", "system-rules"]);
         // Everything but the list is inherited: mode, deadline, house rules,
         // reviewer contexts, agreement, specs, and thresholds.
         let mut inherited = coder.clone();
         inherited.contexts = director.contexts.clone();
-        assert_eq!(director, &inherited);
-        assert!(cfg.council_for(Some("toolie")).is_none());
+        assert_eq!(director, inherited);
+        assert!(cfg.council_for(Some(&dir("toolie"))).is_none());
         assert!(cfg.council_for(None).is_none());
     }
 
+    /// A council block reads over the blocks before it key by key, as the
+    /// type's block read over `[council]`: `enabled` is the last block's, and
+    /// `contexts` and `judge` are the last stated. So a character keeps its
+    /// directory's judge and contexts unless it states its own, `[root]`
+    /// reads over the character, and a later `enabled = false` turns the
+    /// council off.
+    ///
+    /// Falsified by letting a block replace the whole council, by reading
+    /// the blocks earliest-last, or by letting an earlier `enabled` stand.
     #[test]
-    fn a_context_type_council_rejects_empty_duplicate_and_spec_contexts() {
+    fn a_later_council_block_reads_over_an_earlier_one_key_by_key() {
+        let cfg = config(&format!(
+            "{COUNCIL_FULL}\n\
+             [rc.coder.council]\nenabled = true\njudge = \"judge\"\ncontexts = [\"council-coder\"]\n\
+             [character.coder-opus.council]\nenabled = true\ncontexts = [\"council-opus\"]\n\
+             [character.coder-quiet.council]\nenabled = false\n\
+             [character.coder-jev.council]\nenabled = true\njudge = \"jev\"\n\
+             [root.council]\nenabled = true\njudge = \"root-judge\"\n",
+        ).replace("[rc.coder.council]\nenabled = true\n\n", ""));
+        let played = |name: &str, root: bool| GatePerformer { name: name.into(), rc_dir: Some("coder".into()), root };
+        let coder = cfg.council_for(Some(&played("coder", false))).unwrap();
+        assert_eq!((coder.contexts.as_slice(), coder.judge.as_deref()), (["council-coder".to_string()].as_slice(), Some("judge")));
+        let opus = cfg.council_for(Some(&played("coder-opus", false))).unwrap();
+        assert_eq!((opus.contexts.as_slice(), opus.judge.as_deref()), (["council-opus".to_string()].as_slice(), Some("judge")),
+            "a character keeps its directory's judge");
+        let jev = cfg.council_for(Some(&played("coder-jev", false))).unwrap();
+        assert_eq!((jev.contexts.as_slice(), jev.judge.as_deref()), (["council-coder".to_string()].as_slice(), Some("jev")),
+            "and its directory's contexts");
+        assert!(cfg.council_for(Some(&played("coder-quiet", false))).is_none(), "a later enabled = false turns it off");
+        let rooted = cfg.council_for(Some(&played("coder-quiet", true))).unwrap();
+        assert_eq!(rooted.judge.as_deref(), Some("root-judge"), "[root] reads over the character");
+        // Every judge any block names is one the councils list.
+        let mut judges: Vec<String> = cfg.councils().into_iter().filter_map(|c| c.judge).collect();
+        judges.sort();
+        assert_eq!(judges, ["jev", "judge", "root-judge"]);
+    }
+
+    #[test]
+    fn a_section_council_rejects_empty_duplicate_and_spec_contexts() {
         for (contexts, why) in [
             ("[]", "at least one label"),
             ("[\"\"]", "non-empty"),
@@ -3249,40 +3604,52 @@ enabled = false
             ("[\"examples\"]", "already in spec"),
         ] {
             let base = council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"examples\"]");
-            let m = council_err(&format!("{base}\n[context_type.director.council]\nenabled = true\ncontexts = {contexts}\n"));
-            assert!(m.contains("context_type.director.council") && m.contains(why), "{contexts}: {m}");
+            let m = council_err(&format!("{base}\n[rc.director.council]\nenabled = true\ncontexts = {contexts}\n"));
+            assert!(m.contains("[rc.director.council]") && m.contains(why), "{contexts}: {m}");
+            let m = council_err(&format!("{base}\n[character.banto.council]\nenabled = true\ncontexts = {contexts}\n"));
+            assert!(m.contains("[character.banto.council]") && m.contains(why), "{contexts}: {m}");
         }
     }
 
     /// A list on a disabled council would be validated and then dropped, so
     /// the file says something it does not do. The load refuses it.
     #[test]
-    fn a_disabled_type_council_cannot_name_contexts() {
-        let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
-        assert!(m.contains("[context_type.director.council]") && m.contains("enabled = false"), "{m}");
+    fn a_disabled_section_council_cannot_name_contexts() {
+        let m = council_err(&format!("{COUNCIL_FULL}\n[rc.director.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
+        assert!(m.contains("[rc.director.council]") && m.contains("enabled = false"), "{m}");
+        let m = council_err(&format!("{COUNCIL_FULL}\n[root.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
+        assert!(m.contains("[root.council]") && m.contains("enabled = false"), "{m}");
     }
 
-    /// A type's council block names its judge character; a block with no
-    /// `judge` runs the council with no judge, and no default name stands in.
-    /// A judge on a disabled council, or an empty name, fails the load.
+    /// Each layer's council block can name its judge character; a council
+    /// whose blocks name none runs with no judge, and no default name
+    /// stands in. A judge on a disabled council, or an empty name, fails
+    /// the load.
     #[test]
-    fn a_type_council_names_its_judge_character() {
-        let cfg = config(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = true\njudge = \"judge\"\n"));
-        assert_eq!(cfg.council_for(Some("director")).unwrap().judge.as_deref(), Some("judge"));
-        assert_eq!(cfg.council_for(Some("coder")).unwrap().judge, None, "no judge key, no judge");
-        let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = false\njudge = \"judge\"\n"));
-        assert!(m.contains("[context_type.director.council] judge") && m.contains("enabled = false"), "{m}");
-        let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = true\njudge = \" \"\n"));
-        assert!(m.contains("judge: name a character"), "{m}");
-        let m = council_err("[context_type.coder.council]\nenabled = false\njudge = \"judge\"\n");
+    fn each_layer_s_council_can_name_its_judge_character() {
+        let cfg = config(&format!(
+            "{COUNCIL_FULL}\n[rc.director.council]\nenabled = true\njudge = \"judge\"\n\
+             [character.banto.council]\nenabled = true\njudge = \"banto-judge\"\n"
+        ));
+        assert_eq!(cfg.council_for(Some(&dir("director"))).unwrap().judge.as_deref(), Some("judge"));
+        let banto = GatePerformer { name: "banto".into(), rc_dir: Some("director".into()), root: false };
+        assert_eq!(cfg.council_for(Some(&banto)).unwrap().judge.as_deref(), Some("banto-judge"));
+        assert_eq!(cfg.council_for(Some(&dir("coder"))).unwrap().judge, None, "no judge key, no judge");
+        for section in ["rc.director", "character.banto", "root"] {
+            let m = council_err(&format!("{COUNCIL_FULL}\n[{section}.council]\nenabled = false\njudge = \"judge\"\n"));
+            assert!(m.contains(&format!("[{section}.council] judge")) && m.contains("enabled = false"), "{m}");
+            let m = council_err(&format!("{COUNCIL_FULL}\n[{section}.council]\nenabled = true\njudge = \" \"\n"));
+            assert!(m.contains("judge: name a character"), "{m}");
+        }
+        let m = council_err("[rc.coder.council]\nenabled = false\njudge = \"judge\"\n");
         assert!(m.contains("no [council] section"), "{m}");
     }
 
     #[test]
-    fn a_type_enabling_a_council_the_file_lacks_fails_the_load() {
-        let m = council_err("[context_type.coder.council]\nenabled = true\n");
+    fn a_section_enabling_a_council_the_file_lacks_fails_the_load() {
+        let m = council_err("[rc.coder.council]\nenabled = true\n");
         assert!(m.contains("coder") && m.contains("[council]"), "{m}");
-        config("[context_type.coder.council]\nenabled = false\n");
+        config("[rc.coder.council]\nenabled = false\n");
     }
 
     #[test]
@@ -3438,10 +3805,10 @@ spec = "program-gate"
 allow_at = 0.98
 mass_floor = -2.5
 
-[context_type.coder]
+[rc.coder]
 deny = ["kj ledger", "kj rc", "kj binding"]
 
-[context_type.coder.council]
+[rc.coder.council]
 enabled = true
 "#,
         );
@@ -3453,7 +3820,7 @@ enabled = true
         assert_eq!(c.specs[1].contexts, ["council-code"]);
         assert!(c.require_agree_for("shell-bump") && !c.require_agree_for("program-gate"));
         assert!(c.threshold_for("shell-bump").is_some() && c.threshold_for("program-gate").is_some());
-        assert!(cfg.council_enabled_for(Some("coder")));
+        assert!(cfg.council_enabled_for(Some(&dir("coder"))));
         assert!(c.house_rules);
         for verb in ["kj ledger show 01a1", "kj ledger list --history", "kj rc list", "kj binding list"] {
             assert!(matches!(first_verdict(verb, &cfg, Some("coder")), PolicyVerdict::Deny(_)), "{verb}");
@@ -3498,8 +3865,8 @@ enabled = true
     #[test]
     fn two_thresholds_for_one_spec_are_an_error() {
         let second = COUNCIL_FULL.replacen(
-            "[context_type.coder.council]",
-            "[[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.9\nmass_floor = -0.1\n\n[context_type.coder.council]",
+            "[rc.coder.council]",
+            "[[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.9\nmass_floor = -0.1\n\n[rc.coder.council]",
             1,
         );
         let m = council_err(&second);

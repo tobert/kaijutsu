@@ -445,7 +445,7 @@ pub(crate) fn announce_ledger_change(
 /// `gate_policy::no_config()`.
 ///
 /// A `shell_write` submission (`Origin::ShellGate`) is read by the council
-/// first when `gate.toml` enables it for the caller's context type
+/// first when `gate.toml` enables it for the caller's performer
 /// (`crate::council::gate::consult`), and recorded with its outcome in the
 /// seat's shadow when it has one (`crate::council::shadow`); every other
 /// origin goes straight to [`run_gate_recorded`].
@@ -628,9 +628,10 @@ pub(crate) async fn run_gate_recorded(
     {
         let decided = {
             let db = kernel.kernel_db().lock();
-            let context_type = super::gate_policy::context_type_of(&db, caller.context_id);
-            let layers = super::gate_policy::Layers { config: gate_config, context_type: context_type.as_deref() };
-            crate::council::gate::decided_without_council(&db, &spec, caller, layers)
+            super::gate_policy::performer_of(&db, caller.context_id).and_then(|performer| {
+                let layers = super::gate_policy::Layers { config: gate_config, performer: performer.as_ref() };
+                crate::council::gate::decided_without_council(&db, &spec, caller, layers)
+            })
         };
         match decided {
             Ok(Some(why)) => {
@@ -864,13 +865,13 @@ async fn run_gate_once(
             ));
         }
     };
-    let context_type = {
-        let db = db.lock();
-        super::gate_policy::context_type_of(&db, caller.context_id)
+    let performer = match super::gate_policy::performer_of(&db.lock(), caller.context_id) {
+        Ok(performer) => performer,
+        Err(reason) => return GateOutcome::unavailable_without_row(reason),
     };
     let layers = super::gate_policy::Layers {
         config,
-        context_type: context_type.as_deref(),
+        performer: performer.as_ref(),
     };
 
     let context = caller_context_bytes(caller);
@@ -2954,31 +2955,139 @@ mod tests {
         assert!(outcome.reason.contains("user rule allows"), "{}", outcome.reason);
     }
 
-    /// The context_type layer reads the calling context's row.
+    /// The performer layers read the calling context's performer off its
+    /// row and sheet: its rc directory, then its name. Another context's
+    /// performer gets neither.
+    ///
+    /// Falsified by keying the layers on the context type, or by reading
+    /// the actor instead of the performer.
     #[tokio::test]
-    async fn the_context_type_layer_applies_to_the_calling_context_s_type() {
+    async fn the_performer_layers_apply_to_the_calling_context_s_performer() {
         let d = gate_dispatcher().await;
         let principal = kaijutsu_types::PrincipalId::new();
         let context_id =
-            crate::kj::test_helpers::register_rooted_context(&d, Some("ctype-gate"), principal);
-        d.kernel_db.lock().update_context_type(context_id, "explorer").unwrap();
+            crate::kj::test_helpers::register_rooted_context(&d, Some("performer-gate"), principal);
+        crate::kj::test_helpers::perform_with_rc_dir(&d, context_id, "explorer");
+        let performer = d.kernel_db.lock().get_context(context_id).unwrap().unwrap().performer.unwrap();
+        let name = d.kernel_db.lock().get_character(performer).unwrap().unwrap().name;
         let caller = crate::kj::test_helpers::caller_with_context(context_id);
-        let config = gate_config(
-            "[global]\nallow = [\"kj context create\"]\n[context_type.explorer]\ndeny = [\"kj context create\"]\n",
-        );
+        let config = gate_config(&format!(
+            "[global]\nallow = [\"kj context create\", \"kj fork\"]\n[rc.explorer]\ndeny = [\"kj context create\"]\n\
+             [character.{name}]\ndeny = [\"kj fork\"]\n",
+        ));
 
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create coder --name x --type default").unwrap();
         let outcome =
             run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
-        assert!(outcome.reason.contains("context_type config (explorer) denies"), "{}", outcome.reason);
-
-        // Another context of no particular type gets the global allow.
-        let other = registered_caller(&d);
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create coder --name x --type default").unwrap();
+        assert!(outcome.reason.contains("rc config (explorer) denies"), "{}", outcome.reason);
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj fork --name lane").unwrap();
         let outcome =
-            run_gate(d.kernel(), &other, spec, d.kernel.ledger_flows(), &config).await;
+            run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
+        assert!(outcome.reason.contains(&format!("character config ({name}) denies")), "{}", outcome.reason);
+
+        // Another context, performed by another character, gets the global allow.
+        let other = registered_caller(&d);
+        crate::kj::test_helpers::give_character(&d, &other);
+        for source in ["kj context create coder --name x --type default", "kj fork --name lane"] {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+            let outcome =
+                run_gate(d.kernel(), &other, spec, d.kernel.ledger_flows(), &config).await;
+            assert_eq!(outcome.verdict, GateVerdict::Allowed, "{source}: {}", outcome.reason);
+        }
+    }
+
+    /// The argv `kaijutsu-mcp` sends to create a session from a root
+    /// console (`kaijutsu_client::context_create_argv_under`): the
+    /// connection's character, a label, `--type mcp` (until the clients stop
+    /// sending it), the client's cwd, and `--parent` naming the root's MCP
+    /// hub.
+    const MCP_SESSION_ARGV: &str = "kj context create claude --name sess --type mcp --cwd /app --parent mcp/amy";
+
+    /// The MCP hub of `root`, labeled `mcp/<name>`, with the sheet pointing
+    /// at it as `ensure_mcp_hub` leaves it.
+    fn mcp_hub(d: &crate::kj::KjDispatcher, root: kaijutsu_types::PrincipalId, name: &str) -> kaijutsu_types::ContextId {
+        let hub = crate::kj::test_helpers::register_context(d, Some(&format!("mcp/{name}")), None, root);
+        d.kernel_db.lock().set_character_mcp_hub_ctx(root, Some(hub)).unwrap();
+        hub
+    }
+
+    /// A caller in `context`, acting as the connection's character
+    /// `claude`, which has no model and runs the `mcp` directory.
+    fn mcp_connection(d: &crate::kj::KjDispatcher, context: kaijutsu_types::ContextId) -> KjCaller {
+        let caller = crate::kj::test_helpers::caller_with_context(context);
+        d.kernel_db.lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None,
+            mcp_hub_ctx: None, context_type: None, principal_id: caller.actor_id, name: "claude".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        caller
+    }
+
+    /// A context created under the MCP hub of the caller's lineage root
+    /// raises no ask, with the argv the client sends and without its `--type
+    /// mcp`. The same create under another root's hub, under no hub, or
+    /// with the parent in a variable asks.
+    ///
+    /// Falsified by keying the rule on `--type mcp`, by accepting any MCP
+    /// hub, or by dropping the rule.
+    #[tokio::test]
+    async fn an_mcp_session_under_the_lineage_root_s_hub_raises_no_ask() {
+        let d = gate_dispatcher().await;
+        let console = crate::kj::test_helpers::register_root_context(&d);
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        mcp_hub(&d, amy, "amy");
+        let bob = crate::kj::test_helpers::root_character(&d);
+        mcp_hub(&d, bob, "bob");
+        let caller = mcp_connection(&d, console);
+        let config = gate_config(crate::config_seed::DEFAULT_GATE_CONFIG);
+        for source in [MCP_SESSION_ARGV, "kj context create claude --name sess2 --parent mcp/amy"] {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+            let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+            assert_eq!(outcome.verdict, GateVerdict::Allowed, "{source}: {}", outcome.reason);
+            assert!(
+                outcome.reason.contains("builtin allows kj context create under mcp/amy, the MCP hub of its lineage root"),
+                "{source}: {}",
+                outcome.reason
+            );
+        }
+        // A kohai of the console shares its lineage root, and so its hub.
+        let lane = crate::kj::test_helpers::register_rooted_context(&d, Some("lane"), kaijutsu_types::PrincipalId::new());
+        let in_lane = crate::kj::test_helpers::caller_with_context(lane);
+        let spec = crate::kj::shell_gate::build_shell_gate_spec(MCP_SESSION_ARGV).unwrap();
+        let outcome = run_gate(d.kernel(), &in_lane, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);
+        for source in [
+            "kj context create claude --name sess3 --type mcp --parent mcp/bob",
+            "kj context create claude --name sess4 --type mcp",
+            "kj context create claude --name sess5 --type mcp --parent $HUB",
+        ] {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+            let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+            assert_eq!(outcome.verdict, GateVerdict::Pending, "{source}: {}", outcome.reason);
+        }
+    }
+
+    /// A `gate.toml` key on `kj context create` decides before the MCP
+    /// session rule: `[root]` reaches the root console it is created from,
+    /// and `[global]` reaches every context.
+    ///
+    /// Falsified by checking the rule ahead of the config tables.
+    #[tokio::test]
+    async fn a_config_key_on_context_create_decides_before_the_mcp_session_rule() {
+        let d = gate_dispatcher().await;
+        let console = crate::kj::test_helpers::register_root_context(&d);
+        mcp_hub(&d, crate::kj::test_helpers::test_reviewer_principal(), "amy");
+        let caller = mcp_connection(&d, console);
+        for (text, verdict) in [
+            ("[root]\nask = [\"kj context create\"]\n", GateVerdict::Pending),
+            ("[global]\ndeny = [\"kj context create\"]\n", GateVerdict::Denied),
+            ("[rc.coder]\ndeny = [\"kj context create\"]\n", GateVerdict::Allowed),
+        ] {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(MCP_SESSION_ARGV).unwrap();
+            let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &gate_config(text)).await;
+            assert_eq!(outcome.verdict, verdict, "{text}: {}", outcome.reason);
+        }
     }
 
     /// A file that does not load is a fault, not a decision: the gate is

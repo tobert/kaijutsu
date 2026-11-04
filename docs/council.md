@@ -1,7 +1,7 @@
 # The council: System 1 in the gate
 
 **Status: built, off by default.** The gate consults the council on both
-paths when `gate.toml` enables it for a context type, with a second decision
+paths when `gate.toml` enables it for a seat's performer, with a second decision
 for each program a submission runs; report-stop is built but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is council v2, gogi's
 `docs/council-api.md` (github.com/tobert/gogi), and the kernel uses
 `gogi-proto` for its types, spec ids, and pooling math; outside source
@@ -298,8 +298,8 @@ are no server-side context ids, and a seat is sent whole each time.
   server (the live shadow's `model` slot, or before the shadow is made, the
   judge character's model, which the shadow will copy). The create and fork
   lifecycles of coder, default, and director run it
-  (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
-  builds nothing. Root, the owner's privileged space, the console (the model
+  (`lib/{create,fork}/S50-council-seats.kai`); a seat whose performer's
+  layers enable no council builds nothing. Root, the owner's privileged space, the console (the model
   seat under it), shell (the REPL beside it), and mcp (the debugging and admin
   seat) are not put under a council and do not run it. A seat with no
   performer or an unresolved chain builds without the chain, and its first
@@ -419,8 +419,9 @@ grows with the gate.
   reviewer-chain walk never takes it for a character's council context. Each child
   keeps its own dialogue, so a judge sees only its own earlier opinions.
 - **The judge is a character.** The council block names it: `judge =
-  "judge"` in `[context_type.<type>.council]`. A block with no `judge` key
-  runs the council with no judge; no default name stands in. The shadow
+  "judge"` in `[rc.<dir>.council]` or `[character.<name>.council]`. A
+  council whose blocks name no judge runs with no judge; no default name
+  stands in. The shadow
   copies its slots from the judge character when it is made, and its
   `model` slot names the judge's server: the megakernel or lfm2d (a backend
   of kind `mk`). `kj character model set judge mk-zorak/<served model>`
@@ -597,7 +598,7 @@ answers with a different id as a fault. A spec change is a new spec id and
 new thresholds.
 
 The shell case, a decision's `case`, is a JSON object: the submitted command whole,
-the seat's context type and working directory, each statement's commands
+the seat's performer and working directory, each statement's commands
 as kaish planned them with what the kernel resolved about them, and, when
 the submission runs programs, their decisions' outcomes (`programs`, see
 "Programs"). "The shell case" below lists the fields.
@@ -617,7 +618,7 @@ the submission runs programs, their decisions' outcomes (`programs`, see
 `ls -la src`, with the seat in `/home/u/src/proj`, is this `case`:
 
 ```json
-{"command": "ls -la src", "context_type": "coder", "cwd": "/home/u/src/proj",
+{"command": "ls -la src", "character": "coder", "cwd": "/home/u/src/proj",
  "statements": [{"index": 0, "kind": "command", "commands": [
    {"name": "ls", "runs": "kaish builtin", "args": ["-la", "src"],
     "paths": [{"word": "src", "path": "/home/u/src/proj/src", "mount": "/home/u/src", "access": "rw"}]}]}],
@@ -629,9 +630,9 @@ The kernel builds it from the kaish plan before anything runs
 is instead of working it out from the text. Members keep this order:
 
 - **`command`**: the submission whole, cut at 8 KiB.
-- **`context_type`**, when the seat has one, and **`cwd`**: the directory
-  relative paths resolve against; the home directory when the context has
-  no working directory.
+- **`character`**, the name of the seat's performer when it has one, and
+  **`cwd`**: the directory relative paths resolve against; the home
+  directory when the context has no working directory.
 - **`statements`**: per top-level statement, `index`, `rendered` (kaish's
   unexpanded rendering, left out when it is the whole `command`), `kind`,
   `commands`, `reads_variables` (names read and not set by the statement),
@@ -715,7 +716,7 @@ does, so the council reads the file too (`council/programs.rs`).
   escapes, stays as written.
 - **The program case.** The `case` holds `invocation` (the `command` that runs the
   program, its `statement`, and the whole `submission`), `path`,
-  `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
+  `language` (`python`, `shell`, or `shebang`), `character`, `cwd`,
   `imports_not_shown`, and `program`, the text, last.
 - **The program spec decides on its rubric.** `program-gate.json` asks
   `originals` (`reads`, `changes_routine`, `changes`; opening data with a
@@ -827,13 +828,16 @@ spec = "shell-gate"
 allow_at = 0.98                # pooled p(allow)
 mass_floor = -0.05             # each read's verdict mass, a log probability
 
-[context_type.coder.council]
+[rc.coder.council]
 enabled = true
 judge = "judge"                # the character that performs each seat's judge shadow
 
-[context_type.director.council]
+[rc.director.council]
 enabled = true
 contexts = ["council-amy", "council-banto"]
+
+[character.coder-opus.council]
+enabled = false                # this character keeps its directory's tiers but runs no council
 ```
 
 `gate.toml` names no council server and no served model. A context decides on its own `gate` slot:
@@ -848,14 +852,20 @@ model's identity is recorded with each decision. `kj character slot set` refuses
 not kind `mk`, and a `distill` slot on one that is. A character's slots are `distill` and `gate`; its chat model is `kj character model set`, copied
 under role `model`. A slot on an `mk` backend is never a chat model and needs no `max_tokens`. `model`, `gate`,
 `distill` and `judge` are reserved: `kj context create` and `kj context set` refuse them as `--type`. The slot chooses only
-the server and its served model; whether a type gets the council, `mode`, specs, thresholds, contexts, and
+the server and its served model; whether a performer gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program decisions included, and the
 observing reviewer contexts read after it go to the binding's server, under that server's endpoint concurrency
 limit (`docs/retries-and-ratelimits.md`). At startup the kernel builds the seats of each live context whose
 instance has a `gate` slot, on that slot's server.
 
-A context type's `contexts` replaces `[council] contexts` for that type.
-Omitting it keeps the shared list. The replacement must hold at least one
+A council block sits in a section the gate composes for the seat's
+performer: `[rc.<dir>.council]`, `[character.<name>.council]` or
+`[root.council]`. The blocks read in that order, each over `[council]` and
+the blocks before it, key by key: `enabled` is the last block's, and
+`contexts` and `judge` are the last stated. A performer whose sections have
+no council block has no council; `[global.council]` is refused. A block's
+`contexts` replaces `[council] contexts` and any earlier block's list.
+Omitting it keeps the list before it. The replacement must hold at least one
 distinct, non-empty label and cannot repeat a spec's own context. Specs,
 thresholds, worked examples, reviewer contexts, and house rules keep their shared
 settings. Explicitly listing `council-banto` makes it a voting read; this

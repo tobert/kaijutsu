@@ -2053,10 +2053,19 @@ impl Broker {
                     });
                 }
             };
-            let context_type = self.context_type_for(ctx).await;
+            let performer = match self.performer_for(ctx).await {
+                Ok(performer) => performer,
+                Err(reason) => {
+                    return Ok(PhaseOutcome::GateUnavailable {
+                        hook_id: HookId(GATE_POLICY_SUBJECT.into()),
+                        reason,
+                        ask: None,
+                    });
+                }
+            };
             let layers = crate::kj::gate_policy::Layers {
                 config,
-                context_type: context_type.as_deref(),
+                performer: performer.as_ref(),
             };
             let policy = match self.program_policy(command, &statements, ctx, layers).await {
                 Ok(policy) => policy,
@@ -2332,18 +2341,20 @@ impl Broker {
     async fn gate_config_load(&self) -> crate::kj::gate_policy::GateConfigLoad {
         match self.kj_dispatcher().await {
             Some(dispatcher) => {
-                crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await
+                crate::kj::gate_policy::load_config(dispatcher.kernel().vfs(), dispatcher.kernel().kernel_db()).await
             }
             None => crate::kj::gate_policy::no_config(),
         }
     }
 
-    /// The calling context's `context_type`, for the config layer keyed on
-    /// it. `None` with no dispatcher wired or no row for the context.
-    async fn context_type_for(&self, ctx: &CallContext) -> Option<String> {
-        let dispatcher = self.kj_dispatcher().await?;
+    /// The calling context's performer, for the config layers keyed on it
+    /// (`gate_policy::performer_of`). `None` with no dispatcher wired, no
+    /// row for the context, or no performer. `Err` when the sheet does not
+    /// read, so the call is refused.
+    async fn performer_for(&self, ctx: &CallContext) -> Result<Option<crate::kj::gate_policy::GatePerformer>, String> {
+        let Some(dispatcher) = self.kj_dispatcher().await else { return Ok(None) };
         let db = dispatcher.kernel_db().lock();
-        crate::kj::gate_policy::context_type_of(&db, Some(ctx.context_id))
+        crate::kj::gate_policy::performer_of(&db, Some(ctx.context_id))
     }
 
     /// Record a durable ask with the phase's authority. PreCall approval can
@@ -2422,7 +2433,7 @@ impl Broker {
         };
         gate_spec.publishes_pair = ctx.publishes_pair && phase == McpHookPhase::PreCall;
         gate_spec.tool_call = ctx.tool_call;
-        let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
+        let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs(), dispatcher.kernel().kernel_db()).await;
         if cancel.is_cancelled() {
             return Err(McpError::Cancelled);
         }
@@ -2667,7 +2678,7 @@ impl Broker {
         // call (see `preloaded_gate_config`'s doc comment).
         let gate_config_load: crate::kj::gate_policy::GateConfigLoad = match preloaded_gate_config {
             Some(config) => Ok(config.clone()),
-            None => crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await,
+            None => crate::kj::gate_policy::load_config(dispatcher.kernel().vfs(), dispatcher.kernel().kernel_db()).await,
         };
 
         match payload {
@@ -2749,13 +2760,19 @@ impl Broker {
                                 crate::kj::gate_policy::GateConfig::default()
                             }
                         };
-                        let context_type = {
+                        // A performer that does not read stamps from
+                        // `[global]` alone, like the file that does not
+                        // load above: PreCall refused on it already.
+                        let performer = {
                             let db = dispatcher.kernel_db().lock();
-                            crate::kj::gate_policy::context_type_of(&db, Some(ctx.context_id))
+                            crate::kj::gate_policy::performer_of(&db, Some(ctx.context_id)).unwrap_or_else(|e| {
+                                tracing::error!(target: "kaijutsu::hooks", error = %e, "KJ_TOOL_PLAN tiers read [global] alone");
+                                None
+                            })
                         };
                         let layers = crate::kj::gate_policy::Layers {
                             config: &gate_config,
-                            context_type: context_type.as_deref(),
+                            performer: performer.as_ref(),
                         };
                         let mut plan_value = serde_json::json!({
                             "statements": statements,
@@ -3025,14 +3042,14 @@ impl Broker {
         };
         let load = self.gate_config_load().await;
         let config = load.as_ref().map_err(|e| e.to_string())?;
-        let context_type = self.context_type_for(ctx).await;
-        let layers = crate::kj::gate_policy::Layers { config, context_type: context_type.as_deref() };
+        let performer = self.performer_for(ctx).await?;
+        let layers = crate::kj::gate_policy::Layers { config, performer: performer.as_ref() };
         let policy = self.program_policy(command, &statements, ctx, layers).await?;
         if policy.verdict() != approval_ledger::types::AskVerdict::Escalate {
             return Ok(None);
         }
         let root = self.actor_is_root(ctx).await?;
-        let council = !root && config.council_enabled_for(context_type.as_deref());
+        let council = !root && config.council_enabled_for(performer.as_ref());
         Ok(policy.describe_asks_planned(&statements, !root).map(|description| AskTier { description, council }))
     }
 
@@ -3088,7 +3105,7 @@ impl Broker {
     /// "Settled while reviewing".
     ///
     /// The council reads the ask first when `gate.toml` enables it for the
-    /// caller's context type and the actor is not a live root character,
+    /// caller's performer and the actor is not a live root character,
     /// whose uncovered statements run without an ask here. Its verdict
     /// reaches the gate's own evaluation through `run_permission_ask`; a
     /// council allow leaves an auto-decided row naming the council and the

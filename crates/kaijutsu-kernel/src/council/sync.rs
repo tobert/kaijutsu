@@ -554,7 +554,7 @@ impl CouncilSync {
     /// leaves it out and the server's own expiry decides what happens to
     /// it. A gate config that does not load forgets nothing.
     pub(crate) async fn forget_unreachable(&self, kernel: &crate::Kernel) {
-        let config = match crate::kj::gate_policy::load_config(kernel.vfs()).await {
+        let config = match crate::kj::gate_policy::load_config(kernel.vfs(), kernel.kernel_db()).await {
             Ok(config) => config,
             Err(e) => {
                 tracing::warn!(error = %e, "council seats are kept: the gate config does not load");
@@ -812,7 +812,7 @@ impl SeatBuild {
 /// workspace, routed to the server its context's `gate` slot names; each
 /// observing reviewer context alone under `direction-check`; and, when its
 /// council names a judge whose model is on an `mk` backend, the judge read's
-/// labels and house rules on the judge's server. Empty when its type has no council or its context has no
+/// labels and house rules on the judge's server. Empty when its performer's layers enable no council or its context has no
 /// `gate` slot. Waits on no server.
 ///
 /// The second value says why the reviewer chain is left out: a context
@@ -824,7 +824,7 @@ pub(crate) async fn plan_context_seats(
     context: ContextId,
 ) -> Result<(Vec<SeatBuild>, Option<String>), String> {
     use crate::kj::gate_policy::CouncilCase;
-    let config = crate::kj::gate_policy::load_config(kernel.vfs())
+    let config = crate::kj::gate_policy::load_config(kernel.vfs(), kernel.kernel_db())
         .await
         .map_err(|e| format!("the gate config does not load: {e}"))?;
     let db = kernel.kernel_db().lock();
@@ -832,8 +832,9 @@ pub(crate) async fn plan_context_seats(
         .get_context(context)
         .map_err(|e| format!("context {} cannot be read: {e}", context.short()))?
         .ok_or_else(|| format!("context {} has no row", context.short()))?;
-    let Some(council) = config.council_for(Some(&row.context_type)) else { return Ok((Vec::new(), None)) };
-    let (routed, chain) = match super::gate::seat_route(&db, council, context, row.performer)? {
+    let performer = crate::kj::gate_policy::performer_of(&db, Some(context))?;
+    let Some(council) = config.council_for(performer.as_ref()) else { return Ok((Vec::new(), None)) };
+    let (routed, chain) = match super::gate::seat_route(&db, &council, context, row.performer)? {
         super::gate::SeatRoute::NoCouncil => return Ok((Vec::new(), None)),
         super::gate::SeatRoute::Council(routed, chain) => (routed, chain),
     };
@@ -918,7 +919,7 @@ pub(crate) async fn build_context_seats(kernel: &crate::Kernel, context: Context
 async fn reachable(kernel: &crate::Kernel, config: &crate::kj::gate_policy::GateConfig, key: &HeldKey, id: ContextId) -> bool {
     use crate::vfs::VfsOps;
     let (_, _, slot, spec) = key;
-    let councils: Vec<&CouncilConfig> = config.councils().collect();
+    let councils: Vec<CouncilConfig> = config.councils();
     let reviewer_contexts = councils.iter().any(|c| c.reviewer_contexts);
     if !councils.iter().any(|c| c.specs.iter().any(|s| s.name == *spec))
         && !(reviewer_contexts && spec == super::observe::DIRECTION_CHECK)
@@ -1479,12 +1480,12 @@ mod tests {
         let gate = format!(
             "[council]\ncontexts = [\"reviewer\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
              [[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.98\nmass_floor = -0.05\n\n\
-             [context_type.coder.council]\nenabled = true\n"
+             [rc.default.council]\nenabled = true\n"
         );
         coder_on_the_mock_council(&r);
         std::fs::write(r.config.path().join("gate.toml"), gate).unwrap();
-        let loaded = crate::kj::gate_policy::load_config(r.kernel.vfs()).await.expect("the gate config loads");
-        assert_eq!(loaded.councils().count(), 1);
+        let loaded = crate::kj::gate_policy::load_config(r.kernel.vfs(), r.kernel.kernel_db()).await.expect("the gate config loads");
+        assert_eq!(loaded.councils().len(), 1);
         build_seats(&r.kernel).await;
         assert_eq!(r.mock.bodies("/council/v2/contexts").len(), 1, "{:?}", r.mock.calls("POST"));
         assert_eq!(pin_puts(&r, 1).await.len(), 1);
@@ -1867,7 +1868,7 @@ mod tests {
             format!(
                 "[council]\ncontexts = [\"{label}\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n\
                  [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
-                 [context_type.coder.council]\nenabled = true\n"
+                 [rc.default.council]\nenabled = true\n"
             )
         };
         std::fs::write(r.config.path().join("gate.toml"), gate("reviewer")).unwrap();

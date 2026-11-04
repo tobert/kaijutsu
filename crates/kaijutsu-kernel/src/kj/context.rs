@@ -3229,12 +3229,14 @@ impl KjDispatcher {
 }
 
 impl KjDispatcher {
-    /// The judge characters the council blocks of gate.toml name, or `None`
-    /// when gate.toml does not load (logged), so that a judge shadow is told
-    /// by its judge's model alone ([`KernelDb::is_judge_shadow`]).
+    /// The judge characters the council blocks of gate.toml name, in every
+    /// `[rc.<dir>]`, `[character.<name>]` and `[root]` section that enables
+    /// a council, or `None` when gate.toml does not load (logged), so that a
+    /// judge shadow is told by its judge's model alone
+    /// ([`KernelDb::is_judge_shadow`]).
     pub(crate) async fn council_judges(&self) -> Option<Vec<String>> {
-        match crate::kj::gate_policy::load_config(self.kernel().vfs()).await {
-            Ok(config) => Some(config.councils().filter_map(|c| c.judge.clone()).collect()),
+        match crate::kj::gate_policy::load_config(self.kernel().vfs(), self.kernel().kernel_db()).await {
+            Ok(config) => Some(config.councils().into_iter().filter_map(|c| c.judge).collect()),
             Err(e) => {
                 tracing::warn!("gate.toml does not load, so a judge shadow is told by its judge's model alone: {e}");
                 None

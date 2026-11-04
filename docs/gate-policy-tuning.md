@@ -104,14 +104,14 @@ Uncovered otherwise — today's behavior, stated rather than discovered.
 |---|---|---|---|
 | 1. Builtin | each verb's declared `Effect` (`kj/effect.rs`, §Builtin tier) | compile | shipped in-repo, reviewed like code |
 | 2. Global config | `/config/kernel/gate.toml`, `[global]` | host file, seeded from `assets/defaults/gate.toml` via `config_seed.rs` | Amy, at the keyboard, no rebuild |
-| 3. context_type config | same file, `[context_type.<type>]` sections | same | Amy, per role |
+| 3. Performer config | same file: `[rc.<dir>]`, then `[character.<name>]`, then `[root]` (§Performer layers) | same | Amy, per rc directory and per character |
 | 4. User explicit | `approval_rules` (digest) + family rules (§Learned family rules) | `kj ledger allow --remember` at answer time | a human decision, attributed and revocable |
 
 Top wins (ruling 1). A learned human allow overrides a config deny; a
 config deny overrides the builtin allow tier. Every auto-decision leaves the
 durable row it leaves today, with `auto_reason` naming the winning layer and
-key — `gate policy: context_type config (coder) allows family kj handoff
-note` — so `kj ledger show` says which list decided.
+key — `gate policy: rc config (coder) allows kj handoff note` — so `kj
+ledger show` says which list decided.
 
 ### The key space
 
@@ -207,7 +207,8 @@ layer is empty and `kj ledger rules` says so. The example is the rule:
 # Gate policy — the tuned allow/ask/deny tiers beneath the ledger's
 # per-decision rules. Keys: "kj <verb> [<subcommand>]" or
 # "<command> [<first-token>]". Verdicts: allow, ask, deny.
-# Layers compose: [global], then [context_type.<type>] over it.
+# Layers compose: [global], then [rc.<dir>], [character.<name>] and [root]
+# for the context's performer, each over the ones before it.
 # A learned ledger rule outranks everything here.
 
 [global]
@@ -230,20 +231,20 @@ deny = [
   "dd",                  # no kaijutsu seat has a reason; uniform loud refusal
 ]
 
-[context_type.toolie]
+[rc.toolie]
 deny = [
   "kj context create",     # a toolie uses tools; lifecycle belongs to its senpai
 ]
-[context_type.mcp]
+[rc.mcp]
 allow = [
   "kj context create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
 
-[context_type.director]
+[rc.director]
 allow = [
   "kj context create",     # a director creates the lanes that answer to it, `kj context create coder --name <lane>`
-  "kj fork",             # a fork copies this seat's own performer and type
+  "kj fork",             # a fork copies this seat's own performer
   "kj drive",            # runs a turn on a lane this seat directs
 ]
 ```
@@ -253,26 +254,55 @@ and key (a TOML syntax error names the line) —
 a policy file that silently half-parses is the failure shape this repo does
 not ship.
 
-**A `[context_type.<name>]` section must name a live context type**, one
-with an rc bucket under `/config/rc` (`kj::rc::known_context_types`, the
-list `kj context create --type` validates against). A section naming no live
-type applies to nobody, so a typo'd `ask` tier leaves its type on whatever
-`[global]` said — fail-open for exactly the role the operator meant to
-protect. The refusal names the section and lists the known types, and it
-covers a section holding only key lists too, which is inert the same way.
-The check needs the live rc tree, so it runs in `load_config` rather than
-`GateConfig::parse`, which stays a pure shape check over the text. An rc
-tree that lists nothing accepts every section, the rule
-`kj::rc::check_context_type` already states for `--type`.
+`[context_type.<type>]` fails the load, naming the section and its
+replacements, `[rc.<type>]` or `[character.<name>]`.
 
-A context whose stored `context_type` predates a rename is the one hazard
-this creates: the section naming its old type refuses the whole file. The
-remedy is the same one the message gives — correct the section.
+### Performer layers
+
+A context's layers come from its performer, read once per decision from
+the context row and the character sheet (`gate_policy::performer_of`):
+
+| Section | Applies to |
+|---|---|
+| `[global]` | every context |
+| `[rc.<dir>]` | every context whose performer's `rc_dir` is `<dir>` |
+| `[character.<name>]` | every context the character `<name>` performs |
+| `[root]` | every context a root character performs |
+
+They compose in that order, each later one reading over the earlier ones.
+A context with no performer reads `[global]` alone; a performer with no
+`rc_dir` reads no `[rc.<dir>]`. A performer with no character sheet, or a
+sheet that does not read, refuses the submission (gate unavailable). "Reads
+over" is the rule `[context_type.<type>]` had over `[global]`, extended one
+level at a time:
+
+- **Key lists**: the tables are walked latest first, and the first table
+  with a verdict for any of a command's keys decides it; inside one table
+  the more specific key wins, and deny beats ask beats allow. So
+  `[character.coder-opus] deny = ["git push"]` beats `[rc.coder] allow =
+  ["git push"]`, and a key the character does not name keeps the
+  directory's verdict. An allow the structural veto drops leaves the
+  decision to the builtin layer, as before.
+- **`uncovered`**: the latest section that states it decides, else
+  `[global]`, else `ask`.
+- **The council block** (`[<section>.council]`): see `docs/council.md`,
+  "Configuration". Each stated key reads over the same key before it, and
+  the last block's `enabled` decides.
+
+**A section that applies to nobody is a warning, not a refusal.** A
+`[rc.<dir>]` naming no directory in the rc tree, or a `[character.<name>]`
+naming no character on the sheet, live or retired, is logged at warn at
+every load and listed by `kj ledger rules` as applying to nobody. The file
+still loads: a failed load refuses every gated statement, including the
+`kj character create` that would fix it. An rc tree that lists nothing
+names every directory, the rule `kj::rc::check_context_type` states. The
+check needs the rc tree and the sheet, so it runs in `load_config` rather
+than `GateConfig::parse`, which stays a pure shape check over the text.
 
 ## The uncovered tier: a sandbox posture
 
 ```toml
-[context_type.coder]
+[rc.coder]
 uncovered = "allow"   # sandboxed or throwaway kernels only
 ```
 
@@ -282,12 +312,14 @@ default, and what the shipped file leaves in force) or `allow`. Under
 heredocs, background flags and substituted arguments included — and nothing
 asks anyone. Explicit `ask` and `deny` keys still fire, and a learned ledger
 rule still outranks the tier; the tier is decided last, after every key and
-after the structural veto. A section's own setting wins over `[global]`, so
-a global sandbox can be withheld from one context type with
+after the structural veto. The latest of the performer's sections that sets
+it wins over the ones before it and over `[global]`, so a global sandbox
+can be withheld from one rc directory or one character with
 `uncovered = "ask"`.
 
 **Set it only where the work is disposable**: a benchmark container, a
-throwaway kernel. It removes the human from the loop for that context type.
+throwaway kernel. It removes the human from the loop for every context the
+section covers.
 It also removes every PreCall hook: broker PreCall skips hooks for a program
 it allows outright, so the shell-escape guard never runs on one. That is consistent with the design — the gate is an ergonomic nudge
 inside one trust boundary, not a security boundary
@@ -305,7 +337,7 @@ for output it had not been given
 (`~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`).
 
 **An operator sees the posture.** An auto-decision made by the tier reads
-`gate policy: context_type config (coder) uncovered tier allows python3
+`gate policy: rc config (coder) uncovered tier allows python3
 build.py` in its durable row, never as an allow-list hit, and `kj ledger
 rules` lists `uncovered / allow` with the section that set it plus one line
 of prose. `KJ_TOOL_PLAN` stamps `tier = "allow"` on each such command.
@@ -429,8 +461,8 @@ verb's effect:
 
 - **`kj ledger`** is allowed as a whole verb in the builtin layer via
   `is_gate_exempt_kj`, so no hook asks about an answer. The builtin layer
-  sits beneath `gate.toml`, so a `[context_type.<type>]` key can still deny
-  part of the verb to a seat; moltar denies coders `kj ledger list` and
+  sits beneath `gate.toml`, so a `[rc.<dir>]` or `[character.<name>]` key
+  can still deny part of the verb to a seat; moltar denies coders `kj ledger list` and
   `kj ledger show` and leaves `kj ledger cancel` open. People answer through
   the typed ledger RPCs (`listAsks`, `decideAsk`; `docs/approval-identity.md`),
   which take no context and never meet a gate. The senpai edge, enforced
@@ -482,6 +514,11 @@ unreleased one:
    last and reported as its own layer in `kj ledger rules`; a
    `[context_type.<name>]` section naming no live context type fails the
    load (§The file).
+7. **Performer layers — shipped** (`docs/character.md`, "Rollout", M4).
+   `[rc.<dir>]`, `[character.<name>]` and `[root]` replace
+   `[context_type.<type>]` (§Performer layers); a section that applies to
+   nobody warns instead of failing the load; the MCP session create rule
+   reads the parent against the caller's MCP hub.
 
 ### Tests each slice must land with
 
@@ -525,8 +562,9 @@ verdict for the calling context, each naming its winning layer:
   ls -la /srv/builds   allow    user rule (session, rule 01a0…)
   kj handoff note      allow    user family rule (always, rule 01a0…)
 
+gate.toml layers for coder (rc directory coder), earliest first: [global], [rc.coder], [character.coder] (not in the file)
   GATE.TOML KEY        VERDICT  LAYER
-  uncovered            allow    context_type config (coder) uncovered tier
+  uncovered            allow    rc config (coder) uncovered tier
   kj rc add            ask      global config
   dd                   deny     global config
 
@@ -535,10 +573,13 @@ forget with: kj ledger forget <rule-id>
 ```
 
 As built: the learned rules of both kinds come first, newest first and
-cut by `--limit`; the `gate.toml` tiers in force for the caller's
-context type follow, uncounted, the uncovered tier first when it is on and
-with a line of prose beneath the table; the builtin layer is one line rather
-than a row per Read verb. The listing is not context-scoped — another
+cut by `--limit`; then a line naming the caller's performer, its rc
+directory and root flag, and the sections it reads, earliest first, each
+marked when the file lacks it; then the `gate.toml` tiers in force for it,
+uncounted, latest section first, the uncovered tier first when it is on and
+with a line of prose beneath the table; then the sections that apply to
+nobody, when there are any; the builtin layer is one line rather than a row
+per Read verb. The listing is not context-scoped — another
 context's session rules appear too — which is how the digest listing
 already behaved.
 
@@ -623,11 +664,11 @@ name `gate_policy` is the sanctioned exception, visible only in source.
 - **The gate's own model setup** (step 7). Today the `gate` slot of a character names the council server and
   served model that decide its gate (`docs/council.md`, "Configuration"). The plan is for the gate to get a
   setup of its own, as kaibo's config does. To be decided in step 7: the config shape (a key in `gate.toml`
-  or a separate setup), and whether one serves every seat or one is chosen per `[context_type.<type>]`.
-- **The director tier** (`[context_type.director]` above) is keyed by the context type, which step 6 reworks
-  or replaces. The tier's contents (allow `kj context create`, `kj fork`, `kj drive`) do not change.
-  To be decided in step 6: the new type name; the section is renamed with it, and a section naming no live
-  type is refused loudly as it is today.
+  or a separate setup), and whether one serves every seat or one is chosen per `[rc.<dir>]` or
+  `[character.<name>]`.
+- **The director tier** is `[rc.director]` above, keyed by the rc directory banto runs. The directory is
+  renamed `banto/` with the type melt (`docs/character.md`, "Rollout", M6), and the section with it. The
+  tier's contents (allow `kj context create`, `kj fork`, `kj drive`) do not change.
 
 ## Out of scope
 
