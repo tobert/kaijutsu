@@ -1526,3 +1526,58 @@ fn a_new_database_has_none_of_the_dropped_columns_and_runs_neither_migration() {
     assert_eq!(w.count("kernel_migrations WHERE name IN ('senpai-edges-v1', 'context-characters-v1')"), 0);
     KernelDb::apply_additive_migrations(&w.db.conn).unwrap();
 }
+
+// ── a performer has a sheet ─────────────────────────────────────────
+
+/// A performer with no character sheet is refused on every path that sets
+/// `contexts.performer`, and the context stays unperformed.
+#[test]
+fn write_context_character_refuses_a_performer_with_no_sheet() {
+    let w = world();
+    let sheetless = PrincipalId::new();
+    let conv = w.ctx("conv", "coder", None, None);
+
+    let error = w.db.write_context_character(conv.context_id, sheetless, None, None).unwrap_err().to_string();
+
+    assert!(error.contains("no character sheet"), "{error}");
+    assert!(w.db.context_character(conv.context_id).unwrap().is_none());
+}
+
+#[test]
+fn copy_context_character_refuses_a_source_performer_with_no_sheet() {
+    let w = world();
+    let sheetless = PrincipalId::new();
+    let source = w.ctx("source", "coder", None, None);
+    // Write the performer past the checks, as a database from before them held it.
+    w.exec("UPDATE contexts SET performer = ?2 WHERE context_id = ?1", params![blob_param(source.context_id.as_bytes()), blob_param(sheetless.as_bytes())]);
+    let child = w.ctx("child", "coder", None, None);
+
+    let error = w.db.copy_context_character(source.context_id, child.context_id).unwrap_err().to_string();
+
+    assert!(error.contains("no character sheet"), "{error}");
+    assert!(w.db.context_character(child.context_id).unwrap().is_none());
+}
+
+#[test]
+fn insert_new_context_rows_refuses_a_performer_with_no_sheet() {
+    let w = world();
+    let top = w.ctx("top", "default", None, None);
+    let sheetless = PrincipalId::new();
+    let row = make_context_row(Some("new"));
+
+    let start = insert_new_context_rows(
+        &w.db, &row, CharacterPlacement::Start { performer: sheetless, senpai: Some(top.context_id) },
+    ).unwrap_err().to_string();
+    assert!(start.contains("character"), "{start}");
+    assert!(w.db.get_context(row.context_id).unwrap().is_none(), "nothing was written");
+
+    // A fork of a context whose performer has no sheet.
+    let source = w.ctx("source", "coder", None, None);
+    w.exec("UPDATE contexts SET performer = ?2 WHERE context_id = ?1", params![blob_param(source.context_id.as_bytes()), blob_param(sheetless.as_bytes())]);
+    let fork = make_context_row(Some("fork"));
+    let error = w.db.in_transaction(|db| {
+        insert_new_context_rows(db, &fork, CharacterPlacement::Fork { source: source.context_id })
+    }).unwrap_err().to_string();
+    assert!(error.contains("no character sheet"), "{error}");
+    assert!(w.db.get_context(fork.context_id).unwrap().is_none(), "nothing was written");
+}

@@ -273,3 +273,43 @@ fn bootstrap_adopts_an_existing_console_the_sheet_does_not_point_at() {
         assert!(third.ran.is_empty(), "the pointer is set, so nothing is left: {third:?}");
     });
 }
+
+/// The note about a performer whose directory is not `console` says that the
+/// change moves every context the character plays, and does not recommend it
+/// when the character plays a context of another type: it names that context.
+#[test]
+fn the_rc_note_warns_that_the_change_moves_every_context_the_character_plays() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let opts = options(&config, Some(BackendChoice::mock("mock-model")));
+        bootstrap(&config, &opts).await.expect("bootstrap");
+        {
+            let db = kernel_db(&config);
+            let root = db.get_character_by_name("root").unwrap().unwrap();
+            db.set_character_rc_dir(root.principal_id, Some("coder")).unwrap();
+        }
+        let only_console = bootstrap(&config, &opts).await.expect("bootstrap again");
+        let note = only_console.notes.iter().find(|n| n.contains("runs rc directory coder")).expect("rc note");
+        assert!(note.contains("kj character set root --rc console"), "{note}");
+        assert!(note.contains("every context root plays"), "{note}");
+
+        {
+            let db = kernel_db(&config);
+            let root = db.get_character_by_name("root").unwrap().unwrap();
+            let console = db.find_context_by_label("console").unwrap().unwrap();
+            let mut row = console.clone();
+            row.context_id = kaijutsu_types::ContextId::new();
+            row.label = Some("side-coder".to_string());
+            row.context_type = "coder".to_string();
+            row.performer = None;
+            row.senpai_ctx = console.senpai_ctx;
+            let ws = db.get_or_create_default_workspace(row.created_by).unwrap();
+            db.insert_placed_context(&row, ws).unwrap();
+            db.write_context_character(row.context_id, root.principal_id, console.senpai_ctx, None).unwrap();
+        }
+        let with_coder = bootstrap(&config, &opts).await.expect("bootstrap with a coder context");
+        let note = with_coder.notes.iter().find(|n| n.contains("runs rc directory coder")).expect("rc note");
+        assert!(note.contains("side-coder"), "the note names the context of another type: {note}");
+        assert!(!note.contains("kj character set root --rc console"), "and does not recommend the change: {note}");
+    });
+}

@@ -234,16 +234,24 @@ impl KjDispatcher {
 
     /// An explicit rc directory must be a top-level directory of `/config/rc`
     /// with a runnable `create` script, and not the shared `lib`.
+    ///
+    /// When the rc tree lists no directory at all, every name is accepted
+    /// (except `lib`), the rule `kj::rc::check_context_type` states for
+    /// `--type`: there is nothing to validate against, and a kernel with no rc
+    /// tree is a legitimate shape.
     async fn check_rc_dir(&self, rc_dir: &str) -> Result<(), String> {
         if rc_dir == "lib" {
             return Err("'lib' holds shared fragments, not a directory a character runs".to_string());
         }
         let known = super::rc::known_context_types(self.kernel().vfs()).await?;
+        if known.is_empty() {
+            return Ok(());
+        }
         if !known.iter().any(|d| d == rc_dir) {
             return Err(format!(
                 "no rc directory '{rc_dir}' at {}; known directories: {}",
                 kaijutsu_types::paths::RC_ROOT,
-                if known.is_empty() { "(none)".to_string() } else { known.join(", ") },
+                known.join(", "),
             ));
         }
         match crate::rc::create_bucket_has_candidates(self, rc_dir).await? {
@@ -784,7 +792,8 @@ impl KjDispatcher {
             .iter()
             .map(|r| {
                 let status = if r.retired_at.is_some() { "  (retired)" } else { "" };
-                format!("  {:<name_w$}  {}{status}", r.name, r.principal_id.short())
+                let no_dir = if r.rc_dir.as_deref().is_none_or(str::is_empty) { "  (no rc dir)" } else { "" };
+                format!("  {:<name_w$}  {}{status}{no_dir}", r.name, r.principal_id.short())
             })
             .collect();
         KjResult::ok_with_data(lines.join("\n"), data)
@@ -824,7 +833,10 @@ impl KjDispatcher {
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
                     row.context_type.as_deref().unwrap_or("-"),
-                    row.rc_dir.as_deref().unwrap_or("-"),
+                    match row.rc_dir.as_deref().filter(|dir| !dir.is_empty()) {
+                        Some(dir) => dir.to_string(),
+                        None => format!("- (unset: kj character set {} --rc <dir>)", row.name),
+                    },
                     model.as_ref().map_or_else(|| "-".to_string(), |m| super::slot::model_summary(m, &backends)),
                     if slot_names.is_empty() { "-".to_string() } else { slot_names.join(", ") },
                     super::format::format_timestamp(row.created_at),
@@ -849,7 +861,17 @@ impl KjDispatcher {
                 }
                 text.push_str(&format!("\nHandoff:         {}", pointer(row.handoff_ctx)));
                 text.push_str(&format!("\nLive contexts:   {}", if context_names.is_empty() { "-".to_string() } else { context_names.join(", ") }));
+                let notes: Vec<_> = match db.context_character_migration_report() {
+                    Ok(notes) => notes.into_iter().filter(|n| n.principal_id == Some(row.principal_id)).collect(),
+                    Err(e) => return KjResult::Err(format!("kj character show: migration notes: {e}")),
+                };
+                for note in &notes {
+                    text.push_str(&format!("\nMigration note ({}): {}", note.kind, note.note));
+                }
                 let mut data = character_to_json(&row);
+                data["migration_notes"] = serde_json::Value::Array(
+                    notes.iter().map(|n| serde_json::json!({ "kind": n.kind, "note": n.note })).collect(),
+                );
                 data["model"] = super::slot::model_data(model.as_ref(), &backends);
                 data["slots"] = super::slot::slot_data(&slots, &backends);
                 data["contexts"] = serde_json::Value::Array(
@@ -2230,6 +2252,22 @@ mod tests {
         }
     }
 
+    /// An rc tree that lists no directory validates against nothing, so any
+    /// directory is accepted, as `kj::rc::check_context_type` does.
+    #[tokio::test]
+    async fn an_empty_rc_tree_accepts_any_rc_dir() {
+        let d = rc_capable_dispatcher().await;
+        let empty = tempfile::tempdir().unwrap();
+        d.kernel().mount(kaijutsu_types::paths::RC_ROOT, crate::vfs::LocalBackend::new(empty.path())).await;
+        assert!(super::super::rc::known_context_types(d.kernel().vfs()).await.unwrap().is_empty(), "the fixture's rc tree is empty");
+        let caller = test_caller();
+        let made = d.dispatch(&[s("character"), s("create"), s("loose"), s("--rc"), s("anything")], &caller).await;
+        assert!(made.is_ok(), "{}", made.message());
+        assert_eq!(sheet(&d, "loose").rc_dir.as_deref(), Some("anything"));
+        let lib = d.dispatch(&[s("character"), s("set"), s("loose"), s("--rc"), s("lib")], &caller).await;
+        assert!(matches!(lib, KjResult::Err(_)), "lib is never a directory a character runs: {lib:?}");
+    }
+
     /// `set --rc` changes the directory under the same validation.
     #[tokio::test]
     async fn set_changes_the_rc_dir_and_validates_it() {
@@ -2271,9 +2309,45 @@ mod tests {
 
         let KjResult::Ok { message, data: Some(data), .. } =
             d.dispatch(&[s("character"), s("show"), s("plain")], &caller).await else { panic!("show plain") };
-        assert!(message.contains("RC dir:          -"), "{message}");
+        assert!(message.contains("RC dir:          - (unset: kj character set plain --rc <dir>)"), "{message}");
         assert!(!message.contains("Console:"), "only a root shows pointers: {message}");
         assert_eq!(data["rc_dir"], serde_json::Value::Null);
+    }
+
+    /// A character the migration left without a directory shows its note in
+    /// `show`, and `list` marks it; naming a directory clears both.
+    #[tokio::test]
+    async fn show_and_list_flag_a_character_with_no_rc_dir() {
+        let d = rc_capable_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("ghost"), s("--rc"), s("default")], &caller).await;
+        d.dispatch(&[s("character"), s("create"), s("fine"), s("--rc"), s("default")], &caller).await;
+        let ghost = sheet(&d, "ghost").principal_id;
+        {
+            let db = d.kernel_db().lock();
+            db.set_character_rc_dir(ghost, None).unwrap();
+            db.conn_for_ledger().execute(
+                "INSERT INTO context_character_migration_report (kind, context_id, note, recorded_at, principal_id) VALUES ('rc_dir_unset', NULL, ?1, 1, ?2)",
+                rusqlite::params!["ghost plays no context", ghost.as_bytes().to_vec()],
+            ).unwrap();
+        }
+
+        let KjResult::Ok { message, data: Some(data), .. } =
+            d.dispatch(&[s("character"), s("show"), s("ghost")], &caller).await else { panic!("show ghost") };
+        assert!(message.contains("RC dir:          - (unset: kj character set ghost --rc <dir>)"), "{message}");
+        assert!(message.contains("Migration note (rc_dir_unset): ghost plays no context"), "{message}");
+        assert_eq!(data["migration_notes"][0]["kind"], "rc_dir_unset");
+
+        let listed = d.dispatch(&[s("character"), s("list")], &caller).await.message().to_string();
+        let ghost_line = listed.lines().find(|l| l.contains("ghost")).expect("ghost listed");
+        let fine_line = listed.lines().find(|l| l.contains("fine")).expect("fine listed");
+        assert!(ghost_line.contains("(no rc dir)"), "{listed}");
+        assert!(!fine_line.contains("(no rc dir)"), "{listed}");
+
+        let set = d.dispatch(&[s("character"), s("set"), s("ghost"), s("--rc"), s("coder")], &caller).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let shown = d.dispatch(&[s("character"), s("show"), s("ghost")], &caller).await.message().to_string();
+        assert!(!shown.contains("Migration note") && !shown.contains("unset"), "{shown}");
     }
 
     /// A root, its root console, a model character, and a context that

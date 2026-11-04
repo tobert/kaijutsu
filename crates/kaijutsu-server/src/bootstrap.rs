@@ -309,11 +309,29 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         }
         Some(row) => {
             if row.rc_dir.as_deref() != Some("console") {
-                report.notes.push(format!(
-                    "{performer} runs rc directory {}, not console, so the console it plays runs that directory; \
-                     `kj character set {performer} --rc console` changes it",
-                    row.rc_dir.as_deref().unwrap_or("(none)")
-                ));
+                let others: Vec<String> = read(shared, |db| {
+                    let mut others = Vec::new();
+                    for id in db.character_live_contexts(row.principal_id)? {
+                        if let Some(ctx) = db.get_context(id)?.filter(|c| c.context_type != "console") {
+                            others.push(format!("{} (type {})", db.context_name(id), ctx.context_type));
+                        }
+                    }
+                    Ok(others)
+                })?;
+                let current = row.rc_dir.as_deref().unwrap_or("(none)");
+                report.notes.push(if others.is_empty() {
+                    format!(
+                        "{performer} runs rc directory {current}, not console, so the console it plays runs that directory; \
+                         `kj character set {performer} --rc console` changes it, and changes the directory of every context {performer} plays"
+                    )
+                } else {
+                    format!(
+                        "{performer} runs rc directory {current}, not console, so the console it plays runs that directory. \
+                         It also plays {}, whose lifecycles would change with the directory, so bootstrap does not \
+                         recommend changing the directory; name another performer with --console-as",
+                        others.join(", ")
+                    )
+                });
             }
             let has_model = read(shared, |db| db.get_character_model(row.principal_id))?.is_some();
             let has_slots = read(shared, |db| {

@@ -27,10 +27,11 @@ impl KernelDb {
     }
 
     /// Copy a database that `rc-dir-backfill-v1` is about to change aside
-    /// first. A database needs the backfill when it has characters and the
-    /// migration is not recorded. The copy is a consistent snapshot; an
-    /// existing copy stays as it is, and a copy that cannot be made fails the
-    /// open.
+    /// first. A database needs the copy when the migration is not recorded and
+    /// would change a row: a character with no `rc_dir`, or a root with no
+    /// `console_ctx` that has a live console to point at. The copy is a
+    /// consistent snapshot; an existing copy stays as it is, and a copy that
+    /// cannot be made fails the open.
     pub(super) fn back_up_before_rc_dir_backfill(conn: &Connection, path: &Path) -> KernelDbResult<()> {
         if !Self::has_table(conn, "characters")? {
             return Ok(());
@@ -45,9 +46,32 @@ impl KernelDb {
                 return Ok(());
             }
         }
+        // An older shape lacks the columns the checks read; it has rows the
+        // backfill will change, so it is copied.
         let any: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM characters)", [], |r| r.get(0))?;
         if !any {
             return Ok(());
+        }
+        let current_shape = Self::has_column(conn, "characters", "rc_dir")?
+            && Self::has_column(conn, "characters", "console_ctx")?
+            && Self::has_column(conn, "characters", "root_ctx")?
+            && Self::has_column(conn, "contexts", "context_type")?
+            && Self::has_column(conn, "contexts", "senpai_ctx")?
+            && Self::has_column(conn, "contexts", "archived_at")?;
+        if current_shape {
+            let changes: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM characters WHERE rc_dir IS NULL OR rc_dir = '')
+                    OR EXISTS(SELECT 1 FROM characters c
+                              WHERE c.root AND c.console_ctx IS NULL AND c.root_ctx IS NOT NULL
+                                AND EXISTS(SELECT 1 FROM contexts x
+                                           WHERE x.senpai_ctx = c.root_ctx AND x.context_type = ?1
+                                             AND x.archived_at IS NULL))",
+                [kaijutsu_types::CONSOLE_CONTEXT_TYPE],
+                |r| r.get(0),
+            )?;
+            if !changes {
+                return Ok(());
+            }
         }
         Self::back_up_aside(conn, &Self::pre_rc_dir_backup_path(path), "the characters take their rc directories")
     }
@@ -57,10 +81,17 @@ impl KernelDb {
     /// A root character gets `root`. A character with a `context_type` gets
     /// that value. Any other gets the `context_type` most of its live
     /// contexts have, not counting `judge` contexts, which run `judge/`
-    /// whoever performs them. A tie or no live context leaves `rc_dir` NULL;
-    /// each such character is listed in `context_character_migration_report`
-    /// (kind `rc_dir_unset`) and logged, and a create for it refuses until
-    /// `kj character set <name> --rc <dir>` names one.
+    /// whoever performs them. A character with no live vote takes the vote of
+    /// all its contexts, archived included (an MCP lead's sessions archive
+    /// when their process ends). A tie or no vote leaves `rc_dir` NULL; each
+    /// such character is listed in `context_character_migration_report`
+    /// (kind `rc_dir_unset`, naming the character by `principal_id`) and
+    /// logged, and a create for it refuses until `kj character set <name>
+    /// --rc <dir>` names one. An empty `rc_dir` counts as unset.
+    ///
+    /// A database without `contexts.context_type` or `characters.context_type`
+    /// has nothing to vote with: the migration records itself and changes
+    /// nothing.
     ///
     /// The same pass points a root with no `console_ctx` at its console when
     /// exactly one live `console` context answers to the root's root console.
@@ -73,6 +104,10 @@ impl KernelDb {
             |r| r.get(0),
         )?;
         if done {
+            return Ok(());
+        }
+        if !Self::has_column(conn, "contexts", "context_type")? || !Self::has_column(conn, "characters", "context_type")? {
+            conn.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [Self::RC_DIR_BACKFILL_MIGRATION])?;
             return Ok(());
         }
         let tx = conn.unchecked_transaction()?;
@@ -95,18 +130,24 @@ impl KernelDb {
             .collect::<SqliteResult<_>>()?
         };
         let recorded_at = now_millis();
-        let report = |kind: &str, context: Option<ContextId>, note: String| -> KernelDbResult<()> {
+        let report = |kind: &str, context: Option<ContextId>, principal: Option<PrincipalId>, note: String| -> KernelDbResult<()> {
             tx.execute(
-                "INSERT INTO context_character_migration_report (kind, context_id, note, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![kind, context.map(|c| c.as_bytes().to_vec()), note, recorded_at],
+                "INSERT INTO context_character_migration_report (kind, context_id, principal_id, note, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    kind,
+                    context.map(|c| c.as_bytes().to_vec()),
+                    principal.map(|p| p.as_bytes().to_vec()),
+                    note,
+                    recorded_at
+                ],
             )?;
             Ok(())
         };
         let mut assigned = 0usize;
         let mut unset: Vec<String> = Vec::new();
         for c in &characters {
-            if c.rc_dir.is_some() {
+            if c.rc_dir.as_deref().is_some_and(|dir| !dir.is_empty()) {
                 continue;
             }
             let chosen = if c.root {
@@ -114,25 +155,47 @@ impl KernelDb {
             } else if let Some(context_type) = &c.context_type {
                 Ok(context_type.clone())
             } else {
-                let counts: Vec<(String, i64)> = {
-                    let mut stmt = tx.prepare(
+                // Live contexts vote; with none, every context does.
+                let votes = |live_only: bool| -> KernelDbResult<Vec<(String, i64)>> {
+                    let archived = if live_only { "AND archived_at IS NULL" } else { "" };
+                    let mut stmt = tx.prepare(&format!(
                         "SELECT context_type, COUNT(*) FROM contexts
-                         WHERE performer = ?1 AND archived_at IS NULL AND context_type != ?2
-                         GROUP BY context_type ORDER BY COUNT(*) DESC, context_type",
-                    )?;
-                    stmt.query_map(
-                        params![blob_param(c.id.as_bytes()), crate::council::shadow::JUDGE],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )?
-                    .collect::<SqliteResult<_>>()?
+                         WHERE performer = ?1 {archived} AND context_type != ?2
+                         GROUP BY context_type ORDER BY COUNT(*) DESC, context_type"
+                    ))?;
+                    let rows = stmt
+                        .query_map(params![blob_param(c.id.as_bytes()), crate::council::shadow::JUDGE], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?
+                        .collect::<SqliteResult<_>>()?;
+                    Ok(rows)
+                };
+                let (counts, which) = match votes(true)? {
+                    live if !live.is_empty() => (live, "live contexts"),
+                    _ => (votes(false)?, "contexts (none is live)"),
                 };
                 match counts.as_slice() {
-                    [] => Err(format!(
-                        "{} has no context type and no live context; `kj character set {} --rc <dir>` names its rc directory",
-                        c.name, c.name
-                    )),
+                    [] => {
+                        let judges: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM contexts WHERE performer = ?1)",
+                            params![blob_param(c.id.as_bytes())],
+                            |r| r.get(0),
+                        )?;
+                        if judges {
+                            Err(format!(
+                                "{} has no context type and plays only judge contexts, which run judge/ whoever performs them and cast no vote; \
+                                 `kj character set {} --rc <dir>` names its rc directory",
+                                c.name, c.name
+                            ))
+                        } else {
+                            Err(format!(
+                                "{} has no context type and plays no context; `kj character set {} --rc <dir>` names its rc directory",
+                                c.name, c.name
+                            ))
+                        }
+                    }
                     [(top, n), (next, m), ..] if n == m => Err(format!(
-                        "{}'s live contexts are as often '{top}' as '{next}' ({n} each), so the migration did not choose; \
+                        "{}'s {which} are as often '{top}' as '{next}' ({n} each), so the migration did not choose; \
                          `kj character set {} --rc <dir>` names its rc directory",
                         c.name, c.name
                     )),
@@ -149,7 +212,7 @@ impl KernelDb {
                 }
                 Err(note) => {
                     warn!(character = %c.name, "{note}");
-                    report("rc_dir_unset", None, note)?;
+                    report("rc_dir_unset", None, Some(c.id), note)?;
                     unset.push(c.name.clone());
                 }
             }
@@ -194,7 +257,7 @@ impl KernelDb {
                     );
                     warn!(character = %c.name, "{note}");
                     for (id, _) in several {
-                        report("console_ambiguous", Some(*id), note.clone())?;
+                        report("console_ambiguous", Some(*id), None, note.clone())?;
                     }
                 }
             }

@@ -113,6 +113,7 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN rc_dir TEXT",
             "ALTER TABLE characters ADD COLUMN console_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN mcp_hub_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
+            "ALTER TABLE context_character_migration_report ADD COLUMN principal_id BLOB REFERENCES characters(principal_id) ON DELETE CASCADE",
             "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
             "ALTER TABLE backend_models ADD COLUMN temperature REAL \
                  CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
@@ -620,6 +621,12 @@ impl KernelDb {
             [Self::HOUSE_MIGRATION], |row| row.get(0),
         )?;
         if done {
+            return Ok(());
+        }
+        // A database created after `contexts.context_type` went has no
+        // binding that predates the capability: record the marker, grant nothing.
+        if !Self::has_column(conn, "contexts", "context_type")? {
+            conn.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [Self::HOUSE_MIGRATION])?;
             return Ok(());
         }
         let tx = conn.unchecked_transaction()?;

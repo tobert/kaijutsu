@@ -758,6 +758,19 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         assert_eq!((run.context_type.as_str(), run.script_count, run.outcome), ("", Some(0), Some(RcOutcome::Ok)));
     }
 
+    /// An empty `rc_dir` names no directory: it is as unset as NULL.
+    #[test]
+    fn an_empty_rc_dir_is_unset() {
+        let sheet = |rc_dir: Option<&str>| crate::kernel_db::CharacterRow {
+            rc_dir: rc_dir.map(str::to_string), console_ctx: None, mcp_hub_ctx: None,
+            context_type: None, principal_id: PrincipalId::new(), name: "blank".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        };
+        let error = performer_rc_dir("default", &sheet(Some(""))).unwrap_err();
+        assert!(error.contains("kj character set blank --rc <dir>"), "{error}");
+        assert_eq!(performer_rc_dir("default", &sheet(Some("coder"))).unwrap(), "coder");
+    }
+
     /// A performer with no rc directory fails the lifecycle loudly: the run
     /// is failed, and the context and the error name the character and the
     /// command that fixes it.

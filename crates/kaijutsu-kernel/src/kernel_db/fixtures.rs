@@ -252,8 +252,9 @@ impl KernelDb {
     /// Write `id`'s context character as creation does. A root character's
     /// first context with no senpai becomes its console. An existing context
     /// character of another character is rewritten. A performer with no sheet
-    /// gets one, `performer-<id>`, that runs rc directory `default`, since
-    /// every performer the kernel writes has a sheet.
+    /// gets one here, `performer-<id>`, that runs rc directory `default`: the
+    /// production write paths refuse a performer with none
+    /// (`require_character_sheet`), so the fixture supplies it for the test.
     #[cfg(any(test, feature = "test-util"))]
     pub(super) fn assign_context_character(&self, id: ContextId, played_by: PrincipalId) -> KernelDbResult<ContextCharacterRow> {
         self.get_context(id)?

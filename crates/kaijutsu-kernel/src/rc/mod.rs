@@ -200,14 +200,14 @@ impl<'a> RcInvocation<'a> {
 }
 
 /// The rc directory a context of `context_type` performed by `sheet` runs:
-/// the character's `rc_dir`. A character with none is an error that names
-/// the fix.
+/// the character's `rc_dir`. A character with none, or an empty one, is an
+/// error that names the fix.
 pub(crate) fn performer_rc_dir(context_type: &str, sheet: &crate::kernel_db::CharacterRow) -> Result<String, String> {
     // The judge shadow runs judge/ until it has a performer of its own.
     if context_type == crate::council::shadow::JUDGE {
         return Ok(crate::council::shadow::JUDGE.to_string());
     }
-    sheet.rc_dir.clone().ok_or_else(|| format!(
+    sheet.rc_dir.clone().filter(|dir| !dir.is_empty()).ok_or_else(|| format!(
         "{name} names no rc directory, so a context it performs cannot run its lifecycle; \
          `kj character set {name} --rc <dir>` names one",
         name = sheet.name,

@@ -23,7 +23,10 @@ fn character(db: &KernelDb, name: &str, root: bool, context_type: Option<&str>) 
 }
 
 fn rig() -> Rig {
-    let db = KernelDb::temporary().unwrap();
+    rig_on(KernelDb::temporary().unwrap())
+}
+
+fn rig_on(db: KernelDb) -> Rig {
     let ws = setup_test_db(&db);
     let amy = character(&db, "amy", true, None);
     let mut root_console = make_context_row(Some("amy"));
@@ -65,6 +68,16 @@ impl Rig {
         self.db.get_character_by_name(name).unwrap().unwrap().rc_dir
     }
 
+    fn report_principals(&self, kind: &str) -> Vec<Option<PrincipalId>> {
+        self.db
+            .context_character_migration_report()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.principal_id)
+            .collect()
+    }
+
     fn notes(&self, kind: &str) -> Vec<(Option<ContextId>, String)> {
         self.db
             .context_character_migration_report()
@@ -90,12 +103,11 @@ fn the_backfill_gives_each_character_the_directory_its_sheet_or_live_contexts_na
     r.context("banto", "director", Some(banto));
     r.context("mcp-1", "mcp", Some(lead));
     r.context("mcp-2", "mcp", Some(lead));
-    // Archived contexts do not vote.
+    // Archived contexts vote only when no live one can.
     r.archived("old-coder-1", "coder", lead);
     r.archived("old-coder-2", "coder", lead);
     r.archived("old-coder-3", "coder", lead);
     r.context("bass", "bassist", Some(bassist));
-    r.archived("gone", "coder", ghost);
 
     r.backfill();
 
@@ -103,11 +115,12 @@ fn the_backfill_gives_each_character_the_directory_its_sheet_or_live_contexts_na
     assert_eq!(r.rc_dir("banto").as_deref(), Some("director"), "a typed character gets its type");
     assert_eq!(r.rc_dir("kaijutsu-lead").as_deref(), Some("mcp"), "an MCP lead gets its live contexts' type");
     assert_eq!(r.rc_dir("bassist").as_deref(), Some("bassist"), "a host-only directory goes to the character that plays it");
-    assert_eq!(r.rc_dir("ghost"), None, "nothing live leaves it unset");
+    assert_eq!(r.rc_dir("ghost"), None, "no context at all leaves it unset");
     assert_eq!(r.rc_dir("already").as_deref(), Some("toolie"), "a set directory is kept");
     let unset = r.notes("rc_dir_unset");
     assert_eq!(unset.len(), 1, "{unset:?}");
     assert_eq!(unset[0].0, None);
+    assert_eq!(r.report_principals("rc_dir_unset"), vec![Some(ghost)], "the note names the character");
     assert!(unset[0].1.contains("ghost") && unset[0].1.contains("kj character set ghost --rc <dir>"), "{}", unset[0].1);
 
     // Recorded once: a second open changes nothing, even for a character
@@ -214,9 +227,161 @@ fn the_database_is_copied_aside_before_the_backfill() {
     assert_eq!(copy.get_character_by_name("amy").unwrap().unwrap().rc_dir, None, "the copy is the database before the backfill");
 
     let unwritable = Path::new("/nonexistent-kernel-db-directory/kernel.db");
+    db.conn.execute("UPDATE characters SET rc_dir = NULL", []).unwrap();
     db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::RC_DIR_BACKFILL_MIGRATION]).unwrap();
     let error = KernelDb::back_up_before_rc_dir_backfill(&db.conn, unwritable).unwrap_err().to_string();
     assert!(error.contains("kernel.db.pre-rc-dir") && error.contains("could not be made"), "{error}");
     KernelDb::migrate_rc_dir_backfill(&db.conn).unwrap();
     KernelDb::back_up_before_rc_dir_backfill(&db.conn, unwritable).expect("a backfilled database needs no copy");
+}
+
+/// An MCP lead whose sessions are all archived (they archive at process
+/// shutdown) still votes: with no live context, the archived ones count. A
+/// live context outvotes archived ones, and an archived tie leaves NULL.
+#[test]
+fn archived_contexts_vote_when_nothing_is_live() {
+    let r = rig();
+    let lead = character(&r.db, "lead", false, None);
+    r.archived("mcp-1", "mcp", lead);
+    r.archived("mcp-2", "mcp", lead);
+    r.archived("old-coder", "coder", lead);
+    let tied = character(&r.db, "tied", false, None);
+    r.archived("t-1", "mcp", tied);
+    r.archived("t-2", "coder", tied);
+
+    r.backfill();
+
+    assert_eq!(r.rc_dir("lead").as_deref(), Some("mcp"));
+    assert_eq!(r.rc_dir("tied"), None);
+    let unset = r.notes("rc_dir_unset");
+    assert_eq!(unset.len(), 1, "{unset:?}");
+    assert!(unset[0].1.contains("tied") && unset[0].1.contains("'mcp'") && unset[0].1.contains("'coder'"), "{}", unset[0].1);
+}
+
+/// A character that plays only judge contexts is not told it has no live
+/// context: the note says judge contexts cast no vote.
+#[test]
+fn a_judge_only_character_is_told_why_it_has_no_vote() {
+    let r = rig();
+    let seat = character(&r.db, "judge-only", false, None);
+    r.context("j1", "judge", Some(seat));
+
+    r.backfill();
+
+    assert_eq!(r.rc_dir("judge-only"), None);
+    let unset = r.notes("rc_dir_unset");
+    assert_eq!(unset.len(), 1, "{unset:?}");
+    assert!(unset[0].1.contains("judge") && !unset[0].1.contains("no live context"), "{}", unset[0].1);
+    assert!(unset[0].1.contains("kj character set judge-only --rc <dir>"), "{}", unset[0].1);
+}
+
+/// An empty `rc_dir` is unset: the backfill fills it.
+#[test]
+fn an_empty_rc_dir_is_backfilled() {
+    let r = rig();
+    let blank = character(&r.db, "blank", false, Some("coder"));
+    r.db.set_character_rc_dir(blank, Some("")).unwrap();
+
+    r.backfill();
+
+    assert_eq!(r.rc_dir("blank").as_deref(), Some("coder"));
+}
+
+/// Naming a directory clears the character's unset note.
+#[test]
+fn setting_the_rc_dir_clears_the_unset_note() {
+    let r = rig();
+    let ghost = character(&r.db, "ghost", false, None);
+    r.backfill();
+    assert_eq!(r.report_principals("rc_dir_unset"), vec![Some(ghost)]);
+
+    r.db.set_character_rc_dir(ghost, Some("coder")).unwrap();
+
+    assert!(r.report_principals("rc_dir_unset").is_empty());
+}
+
+fn backed_up(path: &Path) -> bool {
+    KernelDb::pre_rc_dir_backup_path(path).exists()
+}
+
+/// The copy is made only when the backfill would change something: a
+/// character with no directory, or a root with no console pointer and a live
+/// console to point at.
+#[test]
+fn the_copy_is_skipped_when_nothing_would_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel.db");
+    {
+        let db = KernelDb::open(&path).unwrap();
+        let named = character(&db, "named", false, Some("coder"));
+        db.set_character_rc_dir(named, Some("coder")).unwrap();
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::RC_DIR_BACKFILL_MIGRATION]).unwrap();
+    }
+    drop(KernelDb::open(&path).unwrap());
+    assert!(!backed_up(&path), "every directory is set and there is no root: nothing to change");
+
+    // A character with no directory is a change.
+    {
+        let db = KernelDb::open(&path).unwrap();
+        character(&db, "bare", false, Some("coder"));
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::RC_DIR_BACKFILL_MIGRATION]).unwrap();
+    }
+    drop(KernelDb::open(&path).unwrap());
+    assert!(backed_up(&path), "a character with no rc directory needs the copy");
+}
+
+#[test]
+fn a_root_with_a_live_console_to_point_at_needs_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel.db");
+    {
+        let r = rig_on(KernelDb::open(&path).unwrap());
+        let banto = character(&r.db, "banto", false, Some("director"));
+        r.db.set_character_rc_dir(banto, Some("director")).unwrap();
+        r.db.set_character_rc_dir(r.amy, Some("root")).unwrap();
+        r.context("console", "console", Some(banto));
+        r.db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::RC_DIR_BACKFILL_MIGRATION]).unwrap();
+    }
+    drop(KernelDb::open(&path).unwrap());
+    assert!(backed_up(&path), "a console pointer the backfill would set needs the copy");
+}
+
+/// A root whose console pointer the backfill could not set (no live console)
+/// does not cost a copy.
+#[test]
+fn a_root_with_no_console_to_point_at_needs_no_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel.db");
+    {
+        let r = rig_on(KernelDb::open(&path).unwrap());
+        r.db.set_character_rc_dir(r.amy, Some("root")).unwrap();
+        r.db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::RC_DIR_BACKFILL_MIGRATION]).unwrap();
+    }
+    drop(KernelDb::open(&path).unwrap());
+    assert!(!backed_up(&path));
+}
+
+/// A database whose `contexts` and `characters` tables no longer have
+/// `context_type` opens, and the migrations that read it record themselves
+/// without work.
+#[test]
+fn migrations_that_read_context_type_record_themselves_when_the_column_is_gone() {
+    let db = KernelDb::temporary().unwrap();
+    db.conn.execute("ALTER TABLE contexts DROP COLUMN context_type", []).unwrap();
+    db.conn.execute("ALTER TABLE characters DROP COLUMN context_type", []).unwrap();
+    let guarded = [KernelDb::HOUSE_MIGRATION, KernelDb::CONSOLE_LABEL_MIGRATION, KernelDb::RC_DIR_BACKFILL_MIGRATION];
+    for name in guarded {
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [name]).unwrap();
+    }
+
+    KernelDb::migrate_house_capability(&db.conn).unwrap();
+    KernelDb::migrate_console_label(&db.conn).unwrap();
+    KernelDb::migrate_rc_dir_backfill(&db.conn).unwrap();
+
+    for name in guarded {
+        let recorded: bool = db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)", [name], |r| r.get(0),
+        ).unwrap();
+        assert!(recorded, "{name} records itself");
+    }
 }

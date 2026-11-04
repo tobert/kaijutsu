@@ -51,6 +51,9 @@ pub struct ContextSlotRow {
 pub struct ContextCharacterMigrationNote {
     pub kind: String,
     pub context_id: Option<ContextId>,
+    /// The character the note is about, for a note that is not about a
+    /// context (`rc_dir_unset`).
+    pub principal_id: Option<PrincipalId>,
     pub note: String,
 }
 
@@ -169,6 +172,23 @@ const SLOT_COLS: &str = "context_id, role, backend_id, model, max_tokens, contex
 /// persona and every slot verbatim, with `source` as its senpai. A source with
 /// no performer gives the child only the senpai edge. Returns whether a
 /// performer was copied.
+/// Refuse a performer with no character sheet: every performer the kernel
+/// writes names one, and `rc` and `kj` read the sheet to run the context.
+pub(super) fn require_character_sheet(conn: &Connection, performer: PrincipalId) -> KernelDbResult<()> {
+    let sheet: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM characters WHERE principal_id = ?1)",
+        params![blob_param(performer.as_bytes())],
+        |r| r.get(0),
+    )?;
+    if !sheet {
+        return Err(KernelDbError::Validation(format!(
+            "performer {} has no character sheet; `kj character create` makes one",
+            performer.short()
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn copy_character_into(conn: &Connection, source: ContextId, child: ContextId) -> KernelDbResult<bool> {
     let row = conn
         .query_row(
@@ -179,6 +199,9 @@ pub(super) fn copy_character_into(conn: &Connection, source: ContextId, child: C
         .optional()?
         .ok_or_else(|| KernelDbError::NotFound(format!("context {}", source.short())))?;
     let (performer, persona) = row;
+    if let Some(performer) = performer {
+        require_character_sheet(conn, performer)?;
+    }
     conn.execute(
         "UPDATE contexts SET senpai_ctx = ?2, performer = ?3, persona = ?4 WHERE context_id = ?1",
         params![
@@ -388,7 +411,8 @@ impl KernelDb {
     /// Make `principal_id` the performer of `context_id`, answering to
     /// `senpai`, with slots copied fresh from the character's own slots
     /// (none gives a context with no slots). Refuses, and writes nothing,
-    /// when a slot has no `max_tokens`, the context already has a performer,
+    /// when a slot has no `max_tokens`, the performer has no character sheet,
+    /// the context already has a performer,
     /// or a `senpai` is not a valid edge ([`Self::check_senpai_edge`]). A
     /// `None` senpai is the creator's to justify: the row was written by
     /// [`Self::insert_placed_context`] or `insert_new_context_rows`, which
@@ -411,6 +435,7 @@ impl KernelDb {
                     db.context_name(context_id)
                 )));
             }
+            require_character_sheet(&db.conn, principal_id)?;
             if senpai.is_some() {
                 db.check_senpai_edge(context_id, &row.context_type, Some(principal_id), senpai)?;
             }
@@ -663,13 +688,14 @@ impl KernelDb {
     /// or could not resolve.
     pub fn context_character_migration_report(&self) -> KernelDbResult<Vec<ContextCharacterMigrationNote>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kind, context_id, note FROM context_character_migration_report ORDER BY report_id",
+            "SELECT kind, context_id, note, principal_id FROM context_character_migration_report ORDER BY report_id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ContextCharacterMigrationNote {
                 kind: r.get(0)?,
                 context_id: read_opt_context_id(r, 1)?,
                 note: r.get(2)?,
+                principal_id: read_opt_principal_id(r, 3)?,
             })
         })?;
         Ok(rows.collect::<SqliteResult<_>>()?)

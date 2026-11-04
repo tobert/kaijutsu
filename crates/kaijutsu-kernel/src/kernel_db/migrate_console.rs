@@ -22,6 +22,12 @@ impl KernelDb {
         if done {
             return Ok(());
         }
+        // Without `contexts.context_type` there is no console to tell from
+        // another type: record the migration with nothing to relabel.
+        if !Self::has_column(conn, "contexts", "context_type")? {
+            conn.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [Self::CONSOLE_LABEL_MIGRATION])?;
+            return Ok(());
+        }
         let tx = conn.unchecked_transaction()?;
         let live_root: Vec<(ContextId, String)> = {
             let mut stmt = tx.prepare(

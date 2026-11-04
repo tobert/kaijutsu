@@ -331,9 +331,17 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// Set (or clear) a character's `rc_dir`.
+    /// Set (or clear) a character's `rc_dir`. Naming a directory clears the
+    /// character's `rc_dir_unset` migration note.
     pub fn set_character_rc_dir(&self, principal_id: PrincipalId, rc_dir: Option<&str>) -> KernelDbResult<()> {
-        self.set_character_column("rc_dir", principal_id, rc_dir.map(str::to_string))
+        self.set_character_column("rc_dir", principal_id, rc_dir.map(str::to_string))?;
+        if rc_dir.is_some_and(|dir| !dir.is_empty()) {
+            self.conn.execute(
+                "DELETE FROM context_character_migration_report WHERE kind = 'rc_dir_unset' AND principal_id = ?1",
+                params![blob_param(principal_id.as_bytes())],
+            )?;
+        }
+        Ok(())
     }
 
     /// Set (or clear) a root character's console pointer.
