@@ -889,11 +889,11 @@ Shipped directories in `assets/defaults/rc/`:
 
 #### Gate
 
-`gate.toml` layers are `[global]`, then `[rc.<dir>]` for the performer's rc directory, then `[character.<name>]`
-for the performer, then `[root]` for a context a root character performs. Each later layer reads over the earlier
-ones. A directory layer gives every character that shares a directory the same posture, so the shipped file can
-cover each MCP connection's character with `[rc.mcp]` without naming it; a character layer tunes one character
-("Character + directory", Amy, 2026-11-04). `[context_type.<type>]` fails the load, naming the section, as any
+`gate.toml` layers are `[global]`, then `[rc.<dir>]` for the performer's rc directory, then `[root]` for a context
+a root character performs, then `[character.<name>]` for the performer. Each later layer reads over the earlier
+ones, so the narrowest section decides. A directory layer gives every character that shares a directory the same
+posture, so the shipped file can cover each MCP connection's character with `[rc.mcp]` without naming it; `[root]`
+covers every person; a character layer tunes one character ("Character + directory", Amy, 2026-11-04). `[context_type.<type>]` fails the load, naming the section, as any
 section the kernel no longer reads does. A council block moves with its layer: `[rc.coder.council]` or
 `[character.coder.council]`.
 
