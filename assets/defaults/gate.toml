@@ -6,15 +6,16 @@
 # the load) or "<command> [<first argument>]". Verdicts: allow, ask, deny.
 # A more specific key wins; at equal specificity deny beats ask beats allow.
 # Layers compose for the context's performer: [global], then [rc.<dir>] for
-# its rc directory, then [character.<name>] for the character, then [root]
-# when a root character performs it. Each later layer reads over the earlier
-# ones; a context with no performer reads [global] alone. A learned ledger
+# its rc directory, then [root] when a root character performs it, then
+# [character.<name>] for the character. Each later layer reads over the
+# earlier ones, so the narrowest decides; a context with no performer reads
+# [global] alone. A learned ledger
 # rule outranks everything here; a verb's declared Read effect and the whole
 # `kj ledger` verb are allowed beneath it.
 #
 # A [rc.<dir>] naming no rc directory, or a [character.<name>] naming no
-# character, applies to nobody: the kernel logs a warning at every load and
-# `kj ledger rules` lists it, and the file still loads.
+# character, applies to nobody: `kj ledger rules` lists it, the kernel logs a
+# warning when the set of such sections changes, and the file still loads.
 #
 # allow covers a key, never arguments: a redirect, a background flag, a
 # heredoc or a substituted argument drops the statement back to the

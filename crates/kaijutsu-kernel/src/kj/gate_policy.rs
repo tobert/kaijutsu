@@ -15,8 +15,8 @@
 //!    it performs; its allow covers a `kj` command only under the
 //!    character condition ([`serves_character`]).
 //! 2. **Performer config** — in `/config/kernel/gate.toml`, for the
-//!    calling context's performer, latest first: `[root]` when a root
-//!    character performs it, `[character.<name>]` for the performer, then
+//!    calling context's performer, narrowest first: `[character.<name>]`
+//!    for the performer, `[root]` when a root character performs it, then
 //!    `[rc.<dir>]` for the performer's rc directory. A context with no
 //!    performer reads none of them.
 //! 3. **Global config** — `[global]` in the same file.
@@ -180,16 +180,17 @@ pub(crate) struct GatePerformer {
 
 impl GatePerformer {
     /// The sections this performer reads beyond `[global]`, earliest
-    /// first: each later one reads over the ones before it.
+    /// first: each later one reads over the ones before it, so the
+    /// narrowest, the character, decides.
     pub(crate) fn sections(&self) -> Vec<Section> {
         let mut out = Vec::with_capacity(3);
         if let Some(dir) = &self.rc_dir {
             out.push(Section::Rc(dir.clone()));
         }
-        out.push(Section::Character(self.name.clone()));
         if self.root {
             out.push(Section::Root);
         }
+        out.push(Section::Character(self.name.clone()));
         out
     }
 }
@@ -423,21 +424,20 @@ struct CouncilBlock {
 }
 
 impl TierTable {
-    /// The winning entry for a command's candidate keys, given most
-    /// specific first.
-    fn lookup(&self, candidates: &[String]) -> Option<(String, TierVerdict)> {
-        for key in candidates {
-            let best = self
-                .entries
+    /// The entries for a command's candidate keys, given most specific
+    /// first: for each key the table names, its strongest verdict (deny over
+    /// ask over allow). The caller takes the first, so a more specific key
+    /// wins, and reads on past an allow it cannot use, so a less specific
+    /// key's deny or ask in the same table still fires.
+    fn lookup<'a>(&'a self, candidates: &'a [String]) -> impl Iterator<Item = (String, TierVerdict)> + 'a {
+        candidates.iter().filter_map(|key| {
+            self.entries
                 .iter()
                 .filter(|(k, _)| k == key)
                 .map(|(_, v)| *v)
-                .max_by_key(|v| v.rank());
-            if let Some(v) = best {
-                return Some((key.clone(), v));
-            }
-        }
-        None
+                .max_by_key(|v| v.rank())
+                .map(|v| (key.clone(), v))
+        })
     }
 }
 
@@ -712,7 +712,7 @@ struct GateToml {
     /// The sections the kernel no longer reads. Parsed only to refuse them
     /// with their replacements.
     #[serde(default)]
-    context_type: BTreeMap<String, toml::Value>,
+    context_type: Option<toml::Value>,
     council: Option<CouncilToml>,
 }
 
@@ -742,6 +742,9 @@ pub(crate) enum GateConfigError {
     /// shows: bad TOML, an unknown section or verdict word, a key that
     /// names no kj verb.
     Parse(String),
+    /// The character sheet could not be listed, so the sections that name
+    /// no character cannot be found. The file may be fine.
+    Sheet(String),
 }
 
 impl std::fmt::Display for GateConfigError {
@@ -749,6 +752,14 @@ impl std::fmt::Display for GateConfigError {
         let (what, detail) = match self {
             Self::Read(e) => ("could not be read", e),
             Self::Parse(e) => ("is not a valid gate policy file", e),
+            Self::Sheet(e) => {
+                return write!(
+                    f,
+                    "the character sheet could not be read: {e} — every gated shell submission is \
+                     refused until the kernel database reads again; /config/kernel/{GATE_CONFIG_FILE} \
+                     was not at fault"
+                );
+            }
         };
         write!(
             f,
@@ -776,12 +787,19 @@ impl GateConfig {
     pub(crate) fn parse(text: &str) -> Result<Self, GateConfigError> {
         let raw: GateToml =
             toml::from_str(text).map_err(|e| GateConfigError::Parse(e.to_string()))?;
-        if let Some(name) = raw.context_type.keys().next() {
-            return Err(GateConfigError::Parse(format!(
-                "[context_type.{name}]: the kernel no longer reads context_type sections; write \
-                 [rc.{name}] for every character whose rc directory is {name}, or \
-                 [character.<name>] for one character"
-            )));
+        if let Some(value) = &raw.context_type {
+            let name = value.as_table().and_then(|t| t.keys().next());
+            return Err(GateConfigError::Parse(match name {
+                Some(name) => format!(
+                    "[context_type.{name}]: the kernel no longer reads context_type sections; write \
+                     [rc.{name}] for every character whose rc directory is {name}, or \
+                     [character.<name>] for one character"
+                ),
+                None => "[context_type]: the kernel no longer reads context_type sections; write \
+                         [rc.<dir>] for every character whose rc directory is <dir>, or \
+                         [character.<name>] for one character"
+                    .to_string(),
+            }));
         }
         if raw.global.council.is_some() {
             return Err(GateConfigError::Parse(
@@ -1097,11 +1115,14 @@ impl GateConfig {
             .collect()
     }
 
-    /// Every council a performer's layers can compose: for each section
-    /// whose block enables one, `[council]` with that block's keys over
-    /// it. A council [`Self::council_for`] composes reads the contexts and
-    /// judge of one of these, so a reader that needs every label or judge
-    /// any seat can use reads them here.
+    /// The union of the councils any performer's layers can compose: for
+    /// each section whose block enables one, `[council]` with that block's
+    /// keys over it. It is a deliberate superset of any one performer's
+    /// composed council ([`Self::council_for`] reads blocks over one
+    /// another and lets the last `enabled` decide, so a council it composes
+    /// is built from one of these blocks plus earlier ones). Use it for
+    /// judge discovery and seat reachability, which need every label or
+    /// judge any seat can use; never as one performer's answer.
     pub(crate) fn councils(&self) -> Vec<CouncilConfig> {
         let Some(base) = &self.council else { return Vec::new() };
         let tables = self.rc.values().chain(self.character.values()).chain(self.root.as_ref());
@@ -1114,7 +1135,7 @@ impl GateConfig {
 
     /// The enabled council for a context `performer` plays: `[council]`,
     /// then each of its sections' council blocks in order (`[rc.<dir>]`,
-    /// `[character.<name>]`, `[root]`), where a block's stated key reads
+    /// `[root]`, `[character.<name>]`), where a block's stated key reads
     /// over the same key before it. The last block decides `enabled`. A
     /// caller with no performer, or whose sections have no council block,
     /// has none.
@@ -1305,11 +1326,14 @@ fn normalize_config_key(raw: &str) -> Result<String, String> {
 ///
 /// A `[rc.<dir>]` naming no directory in the rc tree, or a
 /// `[character.<name>]` naming no character on the sheet, live or retired,
-/// applies to nobody. It is a warning at every load and listed by `kj
-/// ledger rules`, never a failed load: a failed load refuses every gated
-/// statement, including the one that would fix it. Finding them needs the
-/// rc tree and the sheet, which is why it lives here and not in
-/// [`GateConfig::parse`], a pure shape check over the text.
+/// applies to nobody. It is listed by `kj ledger rules` and logged as a
+/// warning when the set of such sections differs from the previous load's
+/// ([`warn_nobody`]), never a failed load: a failed load refuses every
+/// gated statement, including the one that would fix it. Finding them
+/// needs the rc tree and the sheet, which is why it lives here and not in
+/// [`GateConfig::parse`], a pure shape check over the text. An rc tree that
+/// cannot be listed skips the check for `[rc.*]` with a warning; a sheet
+/// that cannot be read refuses, as [`GateConfigError::Sheet`].
 pub(crate) async fn load_config(vfs: &MountTable, db: &parking_lot::Mutex<KernelDb>) -> GateConfigLoad {
     use crate::vfs::{VfsError, VfsOps};
     let path = kaijutsu_types::paths::config_path(GATE_CONFIG_FILE);
@@ -1324,20 +1348,51 @@ pub(crate) async fn load_config(vfs: &MountTable, db: &parking_lot::Mutex<Kernel
         .map_err(|e| GateConfigError::Parse(format!("not valid UTF-8: {e}")))?;
     let mut config = GateConfig::parse(&text)?;
     if config.rc.is_empty() && config.character.is_empty() {
+        warn_nobody(db as *const _ as usize, &[]);
         return Ok(config);
     }
-    let rc_dirs = super::rc::known_context_types(vfs)
-        .await
-        .map_err(GateConfigError::Read)?;
+    // An empty list names every directory, the rule `find_nobody` states, so
+    // a tree that cannot be listed skips the directory check.
+    let rc_dirs = match super::rc::known_context_types(vfs).await {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            tracing::warn!(
+                target: "kaijutsu::gate",
+                "the rc tree {} could not be listed ({e}); the [rc.<dir>] sections of /config/kernel/{GATE_CONFIG_FILE} \
+                 are not checked against it",
+                kaijutsu_types::paths::RC_ROOT
+            );
+            Vec::new()
+        }
+    };
     let characters: Vec<String> = db
         .lock()
         .list_characters(true)
-        .map_err(|e| GateConfigError::Read(format!("the character sheet could not be read: {e}")))?
+        .map_err(|e| GateConfigError::Sheet(e.to_string()))?
         .into_iter()
         .map(|sheet| sheet.name)
         .collect();
     config.find_nobody(&rc_dirs, &characters);
-    for section in config.applies_to_nobody() {
+    warn_nobody(db as *const _ as usize, config.applies_to_nobody());
+    Ok(config)
+}
+
+/// Log the sections that apply to nobody, once per change: when the set
+/// differs from the last one `kernel` (the address of its database, which
+/// lives as long as the kernel) saw, and always on its first load. A
+/// submission loads the file two or three times, so a steady state logs
+/// once rather than at every load; fixing the file and breaking it again is
+/// a change and logs again.
+fn warn_nobody(kernel: usize, nobody: &[Section]) {
+    static LAST: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<usize, Vec<Section>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut last = LAST.lock();
+    let mut now = nobody.to_vec();
+    now.sort();
+    if last.get(&kernel) == Some(&now) {
+        return;
+    }
+    for section in &now {
         let why = match section {
             Section::Rc(dir) => format!("no rc directory at {}/{dir}", kaijutsu_types::paths::RC_ROOT),
             _ => "no character on the sheet has that name".to_string(),
@@ -1349,7 +1404,7 @@ pub(crate) async fn load_config(vfs: &MountTable, db: &parking_lot::Mutex<Kernel
             section.header()
         );
     }
-    Ok(config)
+    last.insert(kernel, now);
 }
 
 // ── Layers for one evaluation ───────────────────────────────────────────
@@ -1388,15 +1443,18 @@ impl Layers<'_> {
 
 /// The performer of a context, as the gate's layers key on it: its name,
 /// rc directory and root flag off the character sheet. `Ok(None)` for a
-/// caller with no context, a context the db does not know, or a context
-/// with no performer, which reads `[global]` alone. A performer with no
+/// caller with no context or a known context with no performer, which
+/// reads `[global]` alone. A context id with no row, a performer with no
 /// sheet, or a read that fails, is an error the caller refuses on.
 pub(crate) fn performer_of(db: &KernelDb, context_id: Option<ContextId>) -> Result<Option<GatePerformer>, String> {
     let Some(id) = context_id else { return Ok(None) };
     let row = db
         .get_context(id)
-        .map_err(|e| format!("gate policy could not read context {}: {e} (fail-closed)", id.short()))?;
-    let Some(performer) = row.and_then(|row| row.performer) else { return Ok(None) };
+        .map_err(|e| format!("gate policy could not read context {}: {e} (fail-closed)", id.short()))?
+        .ok_or_else(|| {
+            format!("gate policy: context {} has no row, so its gate layers cannot be read (fail-closed)", id.short())
+        })?;
+    let Some(performer) = row.performer else { return Ok(None) };
     match db.get_character(performer) {
         Ok(Some(sheet)) => Ok(Some(GatePerformer {
             name: sheet.name,
@@ -1991,23 +2049,26 @@ fn command_key(cmd: &PlannedCommand) -> String {
 fn keyed_command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerdict {
     if let Some(keys) = command_keys(cmd) {
         // The performer's sections, latest first, then `[global]`: the
-        // first table with a verdict for any of the command's keys decides.
+        // first deny, ask or usable allow for any of the command's keys
+        // decides, most specific key first within a table.
         let tables = layers
             .config
             .performer_tables(layers.performer)
             .into_iter()
             .chain([(Section::Global, &layers.config.global)]);
         for (section, table) in tables {
-            if let Some((key, verdict)) = table.lookup(&keys.candidates) {
-                let decision = Decision { layer: Layer::Config(section), key };
+            for (key, verdict) in table.lookup(&keys.candidates) {
+                let decision = Decision { layer: Layer::Config(section.clone()), key };
                 match verdict {
                     TierVerdict::Deny => return PolicyVerdict::Deny(decision),
                     TierVerdict::Ask => return PolicyVerdict::Ask(decision),
                     TierVerdict::Allow if keys.structural_ok => return PolicyVerdict::Allow(vec![decision]),
                     // An allow that cannot cover this command decides
-                    // nothing, so the builtin layer still can: `--help` on
-                    // an allowed verb stays help.
-                    TierVerdict::Allow => break,
+                    // nothing, for this key or this table: the walk goes on,
+                    // so a deny or ask in an earlier layer still fires and
+                    // the builtin layer can still decide (`--help` on an
+                    // allowed verb stays help).
+                    TierVerdict::Allow => {}
                 }
             }
         }
@@ -2106,9 +2167,11 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
 /// Whether `cmd` creates a context under the caller's own MCP hub, which
 /// needs no ask (`docs/senpai-kohai.md`, "MCP sessions"): `kj context create
 /// <character> --parent <hub>`, where `--parent` resolves, as the verb
-/// resolves it, to the `mcp_hub_ctx` of the caller's lineage root. A context
-/// whose parent is an MCP hub is an MCP session, and creating one runs no
-/// turn. Every argument must be a literal word and the command plain (no
+/// resolves it, to the `mcp_hub_ctx` of the caller's lineage root, and the
+/// senpai the create sets (`--senpai`, else the caller's own context) is
+/// that root's console, `root_ctx`: an MCP session answers to the person's
+/// root console. A context whose parent is an MCP hub is an MCP session, and
+/// creating one runs no turn. Every argument must be a literal word and the command plain (no
 /// redirect, background flag or heredoc), since the decision reads the
 /// parent out of the arguments. `None` for anything else, including a
 /// caller whose lineage has no live root or whose root has no hub.
@@ -2130,8 +2193,22 @@ fn mcp_session_create(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) 
     let parent = create.try_get_one::<String>("parent").ok()??;
     let parent = super::refs::resolve_context_arg_from(Some(parent.as_str()), Some(here), db).ok()?;
     let root = db.live_lineage_root(here).ok()??;
-    let hub = db.get_character(root).ok()??.mcp_hub_ctx?;
+    let sheet = db.get_character(root).ok()??;
+    let hub = sheet.mcp_hub_ctx?;
     if parent != hub {
+        return None;
+    }
+    // The session answers to the person's root console. The senpai the verb
+    // will set is `--senpai` resolved as the verb resolves it (an empty
+    // word is an error there, so it covers nothing here), or the caller's
+    // own context when none is named. Any other senpai takes the ordinary
+    // layers.
+    let senpai = match create.try_get_one::<String>("senpai").ok()? {
+        Some(word) if word.is_empty() => return None,
+        Some(word) => super::refs::resolve_context_ref_from(&super::refs::parse_context_ref(word), Some(here), db).ok()?,
+        None => here,
+    };
+    if Some(senpai) != sheet.root_ctx {
         return None;
     }
     let label = db.get_context(hub).ok()??.label.unwrap_or_else(|| hub.short());
@@ -2715,20 +2792,21 @@ deny = ["kj context create"]
     }
 
     /// Each later layer reads over the earlier: `[global]`, then
-    /// `[rc.<dir>]`, then `[character.<name>]`, then `[root]` for a root
-    /// performer. The first table with a verdict for a command's keys
-    /// decides; a later section with no verdict for the key leaves the
-    /// earlier one's.
+    /// `[rc.<dir>]`, then `[root]` for a root performer, then
+    /// `[character.<name>]`: the narrowest section decides. The first table
+    /// with a verdict for a command's keys decides; a later section with no
+    /// verdict for the key leaves the earlier one's.
     ///
-    /// Falsified by walking the performer's sections earliest first, or by
-    /// leaving any of the three out.
+    /// Falsified by walking the performer's sections earliest first, by
+    /// putting `[root]` after the character, or by leaving any of the three
+    /// out.
     #[test]
     fn each_later_layer_reads_over_the_earlier_ones() {
         let cfg = config(
             "[global]\nask = [\"git push\", \"rg\", \"wc\", \"cat\"]\n\
              [rc.coder]\nallow = [\"git push\", \"rg\", \"wc\"]\n\
-             [character.coder-opus]\ndeny = [\"git push\", \"rg\"]\n\
-             [root]\nallow = [\"git push\"]\n",
+             [root]\nallow = [\"git push\", \"cat\"]\n\
+             [character.coder-opus]\ndeny = [\"git push\", \"rg\"]\n",
         );
         let coder = dir("coder");
         let opus = GatePerformer { name: "coder-opus".into(), rc_dir: Some("coder".into()), root: false };
@@ -2751,14 +2829,69 @@ deny = ["kj context create"]
         // and one neither names keeps global's.
         assert_eq!(layer(first_verdict_for("wc x", &cfg, Some(&opus))), (rc, "allow"));
         assert_eq!(layer(first_verdict_for("cat x", &cfg, Some(&opus))), (global.clone(), "ask"));
-        // `[root]` reads over the character for a root performer only.
-        assert_eq!(layer(first_verdict_for("git push", &cfg, Some(&rooted))), (Layer::Config(Section::Root), "allow"));
+        // `[root]` reads over the directory for a root performer only, and
+        // the character reads over `[root]`.
+        assert_eq!(layer(first_verdict_for("cat x", &cfg, Some(&rooted))), (Layer::Config(Section::Root), "allow"));
+        assert_eq!(layer(first_verdict_for("cat x", &cfg, Some(&opus))), (global.clone(), "ask"));
+        assert_eq!(layer(first_verdict_for("git push", &cfg, Some(&rooted))), (character.clone(), "deny"));
         assert_eq!(layer(first_verdict_for("rg x", &cfg, Some(&rooted))), (character, "deny"));
         // A context with no performer reads `[global]` alone.
         assert_eq!(layer(first_verdict_for("git push", &cfg, None)), (global, "ask"));
         // A performer with no rc directory reads no directory layer.
         let undirected = GatePerformer { name: "loose".into(), rc_dir: None, root: false };
         assert_eq!(layer(first_verdict_for("wc x", &cfg, Some(&undirected))), (Layer::Config(Section::Global), "ask"));
+    }
+
+    /// An allow a redirect (or any structural condition) vetoes decides
+    /// nothing for its table, so the walk goes on to the earlier tables: a
+    /// deny in `[global]` still fires under a vetoed `[rc.coder]` allow,
+    /// including when the rc section also sets `uncovered = "allow"`.
+    ///
+    /// Falsified by `break`ing the walk on a vetoed allow.
+    #[test]
+    fn a_vetoed_allow_leaves_an_earlier_layers_deny_standing() {
+        let cfg = config(
+            "[global]\ndeny = [\"rg\"]\n[rc.coder]\nallow = [\"rg\"]\nuncovered = \"allow\"\n",
+        );
+        // Plain, the narrower allow reads over the deny.
+        assert!(matches!(first_verdict("rg foo", &cfg, Some("coder")), PolicyVerdict::Allow(_)));
+        // With a redirect the allow is vetoed; the deny fires.
+        let v = first_verdict("rg foo > ~/.bashrc", &cfg, Some("coder"));
+        assert_eq!(
+            v,
+            PolicyVerdict::Deny(Decision { layer: Layer::Config(Section::Global), key: "rg".into() }),
+            "got {v:?}"
+        );
+    }
+
+    /// A vetoed allow also leaves an ask in an earlier layer standing, and
+    /// the builtin layer still decides when nothing else does.
+    #[test]
+    fn a_vetoed_allow_leaves_an_earlier_ask_and_the_builtin_standing() {
+        let cfg = config("[global]\nask = [\"rg\"]\n[rc.coder]\nallow = [\"rg\", \"kj context\"]\n");
+        assert!(matches!(first_verdict("rg foo > out", &cfg, Some("coder")), PolicyVerdict::Ask(_)));
+        // `--help` on an allowed verb stays help, with no earlier table to
+        // consult.
+        assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, Some("coder"))), "kj context --help");
+    }
+
+    /// Inside one table the more specific key's allow, once vetoed, leaves
+    /// the same table's less specific deny standing: `lookup` reports every
+    /// candidate key's verdict, most specific first, so the walk can pass a
+    /// vetoed allow to the next key.
+    ///
+    /// Falsified by a `lookup` that returns only the first key that hits.
+    #[test]
+    fn a_vetoed_allow_leaves_the_same_tables_less_specific_deny_standing() {
+        let cfg = config("[global]\nallow = [\"git push\"]\ndeny = [\"git\"]\n");
+        let plain = first_verdict("git push origin", &cfg, None);
+        assert_eq!(allow_keys(&plain), vec![(Layer::Config(Section::Global), "git push".to_string())]);
+        let v = first_verdict("git push origin > log", &cfg, None);
+        assert_eq!(
+            v,
+            PolicyVerdict::Deny(Decision { layer: Layer::Config(Section::Global), key: "git".into() }),
+            "got {v:?}"
+        );
     }
 
     /// A layer's reasons and `kj ledger rules` name the section the way an
@@ -3091,10 +3224,12 @@ uncovered = "allow"
 
     /// The uncovered posture reads over the same way the key lists do: the
     /// latest of the performer's sections that states one decides, else
-    /// `[global]`. A character withholds its directory's sandbox, and
-    /// `[root]` reads over the character.
+    /// `[global]`. `[root]` reads over the directory, and the character
+    /// reads over `[root]`: a character withholds its directory's sandbox
+    /// even when it is a root.
     ///
-    /// Falsified by reading the sections earliest first.
+    /// Falsified by reading the sections earliest first, or by reading
+    /// `[root]` after the character.
     #[test]
     fn the_latest_section_stating_the_uncovered_posture_decides_it() {
         let cfg = config(
@@ -3106,7 +3241,9 @@ uncovered = "allow"
         let rooted = GatePerformer { root: true, ..opus.clone() };
         assert_eq!(cfg.uncovered_for(Some(&coder)), (UncoveredTier::Allow, Section::Rc("coder".into())));
         assert_eq!(cfg.uncovered_for(Some(&opus)), (UncoveredTier::Ask, Section::Character("coder-opus".into())));
-        assert_eq!(cfg.uncovered_for(Some(&rooted)), (UncoveredTier::Allow, Section::Root));
+        assert_eq!(cfg.uncovered_for(Some(&rooted)), (UncoveredTier::Ask, Section::Character("coder-opus".into())));
+        let plain_root = GatePerformer { name: "coder-plain".into(), rc_dir: Some("coder".into()), root: true };
+        assert_eq!(cfg.uncovered_for(Some(&plain_root)), (UncoveredTier::Allow, Section::Root));
         assert_eq!(cfg.uncovered_for(None), (UncoveredTier::Ask, Section::Global));
     }
 
@@ -3258,15 +3395,32 @@ uncovered = "allow"
         }
     }
 
+    /// A bare `[context_type]` header, or an empty `context_type` table, is
+    /// the same removed section with no type named: it fails the load
+    /// naming both replacements.
+    ///
+    /// Falsified by refusing only a non-empty table.
+    #[test]
+    fn a_bare_context_type_header_fails_the_load_naming_its_replacements() {
+        for text in ["[context_type]\n", "[global]\nallow = [\"rg\"]\n[context_type]\n", "context_type = {}\n"] {
+            let err = GateConfig::parse(text).unwrap_err();
+            let GateConfigError::Parse(m) = &err else { panic!("{text}: {err:?}") };
+            assert!(m.contains("[context_type]") && m.contains("[rc.") && m.contains("[character.<name>]"), "{text}: {m}");
+        }
+    }
+
     /// A section naming no rc directory or character applies to nobody. It
-    /// loads, so the fix can run, and the load lists it and warns about it
-    /// every time. A retired character is still on the sheet, and `lib` is
-    /// not a directory a character runs.
+    /// loads, so the fix can run, and the load lists it. A retired
+    /// character is still on the sheet, and `lib` is not a directory a
+    /// character runs. The warning is logged when the set of such sections
+    /// differs from the last load's, so a steady state logs once: every
+    /// shell submission loads the file two or three times.
     ///
     /// Falsified by failing the load on such a section, by not finding it,
-    /// or by warning only once.
+    /// by warning at every load, or by never warning again once the set
+    /// changes.
     #[tokio::test]
-    async fn a_section_that_applies_to_nobody_loads_is_listed_and_warns_at_every_load() {
+    async fn a_section_that_applies_to_nobody_loads_is_listed_and_warns_when_the_set_changes() {
         let (vfs, _rc, config) = rc_tree(&["coder", "director", "lib"]).await;
         let db = sheet(&["amy", "coder"], &["old-lane"]);
         write_gate(
@@ -3278,6 +3432,7 @@ uncovered = "allow"
         let (logs, guard) = capture_logs();
         let cfg = load_config(&vfs, &db).await.expect("a section that applies to nobody does not fail the load");
         load_config(&vfs, &db).await.expect("and loads again");
+        load_config(&vfs, &db).await.expect("and again");
         drop(guard);
         assert_eq!(
             cfg.applies_to_nobody(),
@@ -3286,13 +3441,79 @@ uncovered = "allow"
         let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         for header in ["[rc.directer]", "[rc.lib]", "[character.bobb]"] {
             let lines: Vec<&str> = logs.lines().filter(|l| l.contains(header)).collect();
-            assert_eq!(lines.len(), 2, "one warning per load for {header}: {logs}");
+            assert_eq!(lines.len(), 1, "one warning for {header} across three identical loads: {logs}");
             assert!(lines.iter().all(|l| l.contains("WARN") && l.contains("applies to nobody")), "{logs}");
         }
         assert!(!logs.contains("[rc.coder]") && !logs.contains("[character.amy]") && !logs.contains("old-lane"), "{logs}");
         // The typo'd section applies to nobody, so `director` keeps what
         // `[global]` says: the reason the section is listed.
         assert!(cfg.allows_uncovered(Some(&dir("director"))));
+
+        // A changed set warns again, naming the new set; the same set after
+        // that is quiet.
+        write_gate(&config, "[rc.directer]\nallow = [\"rg\"]\n[character.bobb]\nallow = [\"rg\"]\n[character.carol]\nallow = [\"rg\"]\n");
+        let (logs, guard) = capture_logs();
+        load_config(&vfs, &db).await.expect("loads");
+        load_config(&vfs, &db).await.expect("loads");
+        drop(guard);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        for header in ["[rc.directer]", "[character.bobb]", "[character.carol]"] {
+            assert_eq!(logs.lines().filter(|l| l.contains(header)).count(), 1, "{header}: {logs}");
+        }
+        // Fixing the file and breaking it again is a changed set too.
+        write_gate(&config, "[global]\nallow = [\"rg\"]\n");
+        load_config(&vfs, &db).await.expect("loads");
+        write_gate(&config, "[rc.directer]\nallow = [\"rg\"]\n");
+        let (logs, guard) = capture_logs();
+        load_config(&vfs, &db).await.expect("loads");
+        drop(guard);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.lines().filter(|l| l.contains("[rc.directer]")).count(), 1, "{logs}");
+    }
+
+    /// An rc tree that cannot be listed (here `/config/rc` is a file, not a
+    /// directory) skips the check for `[rc.*]` sections with a warning that
+    /// names the rc tree. The load succeeds: refusing it would refuse every
+    /// gated statement, blaming a gate.toml that is fine. The character
+    /// sections are still checked.
+    ///
+    /// Falsified by mapping the readdir failure to a load error.
+    #[tokio::test]
+    async fn an_unreadable_rc_tree_skips_the_rc_check_and_the_load_succeeds() {
+        use crate::vfs::LocalBackend;
+        let rc = tempfile::tempdir().unwrap();
+        let rc_file = rc.path().join("not-a-dir");
+        std::fs::write(&rc_file, "x").unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let vfs = MountTable::new();
+        vfs.mount(kaijutsu_types::paths::RC_ROOT, LocalBackend::new(&rc_file)).await;
+        vfs.mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(config.path())).await;
+        write_gate(&config, "[rc.unreadable-tree-dir]\nallow = [\"rg\"]\n[character.unreadable-tree-who]\nallow = [\"rg\"]\n");
+        let (logs, guard) = capture_logs();
+        let cfg = load_config(&vfs, &sheet(&["amy"], &[])).await.expect("an unreadable rc tree does not fail the load");
+        drop(guard);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(cfg.applies_to_nobody(), [Section::Character("unreadable-tree-who".into())], "the rc sections are unchecked");
+        assert!(
+            logs.lines().any(|l| l.contains("WARN") && l.contains(kaijutsu_types::paths::RC_ROOT) && l.contains("could not be listed")),
+            "{logs}"
+        );
+    }
+
+    /// A character sheet that cannot be read still refuses the load, and
+    /// the message says the sheet is what failed, not the policy file.
+    ///
+    /// Falsified by reporting the failure as an invalid gate.toml.
+    #[tokio::test]
+    async fn an_unreadable_character_sheet_refuses_naming_the_sheet() {
+        let (vfs, _rc, config) = rc_tree(&["coder"]).await;
+        write_gate(&config, "[character.amy]\nallow = [\"rg\"]\n");
+        let db = sheet(&[], &[]);
+        db.lock().conn_for_ledger().execute_batch("DROP TABLE characters").unwrap();
+        let err = load_config(&vfs, &db).await.unwrap_err();
+        let m = err.to_string();
+        assert!(m.contains("character sheet could not be read"), "{m}");
+        assert!(!m.contains("is not a valid gate policy file") && !m.contains("kj config reset"), "{m}");
     }
 
     /// An rc tree that lists nothing names every directory: there is
@@ -3561,9 +3782,9 @@ enabled = false
     /// A council block reads over the blocks before it key by key, as the
     /// type's block read over `[council]`: `enabled` is the last block's, and
     /// `contexts` and `judge` are the last stated. So a character keeps its
-    /// directory's judge and contexts unless it states its own, `[root]`
-    /// reads over the character, and a later `enabled = false` turns the
-    /// council off.
+    /// directory's judge and contexts unless it states its own, the
+    /// character reads over `[root]`, and a later `enabled = false` turns
+    /// the council off.
     ///
     /// Falsified by letting a block replace the whole council, by reading
     /// the blocks earliest-last, or by letting an earlier `enabled` stand.
@@ -3587,8 +3808,11 @@ enabled = false
         assert_eq!((jev.contexts.as_slice(), jev.judge.as_deref()), (["council-coder".to_string()].as_slice(), Some("jev")),
             "and its directory's contexts");
         assert!(cfg.council_for(Some(&played("coder-quiet", false))).is_none(), "a later enabled = false turns it off");
-        let rooted = cfg.council_for(Some(&played("coder-quiet", true))).unwrap();
-        assert_eq!(rooted.judge.as_deref(), Some("root-judge"), "[root] reads over the character");
+        let rooted = cfg.council_for(Some(&played("coder-other", true))).unwrap();
+        assert_eq!(rooted.judge.as_deref(), Some("root-judge"), "[root] reads over the directory");
+        assert!(cfg.council_for(Some(&played("coder-quiet", true))).is_none(), "the character reads over [root]");
+        let rooted_jev = cfg.council_for(Some(&played("coder-jev", true))).unwrap();
+        assert_eq!(rooted_jev.judge.as_deref(), Some("jev"), "the character reads over [root]");
         // Every judge any block names is one the councils list.
         let mut judges: Vec<String> = cfg.councils().into_iter().filter_map(|c| c.judge).collect();
         judges.sort();

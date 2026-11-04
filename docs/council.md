@@ -859,8 +859,8 @@ limit (`docs/retries-and-ratelimits.md`). At startup the kernel builds the seats
 instance has a `gate` slot, on that slot's server.
 
 A council block sits in a section the gate composes for the seat's
-performer: `[rc.<dir>.council]`, `[character.<name>.council]` or
-`[root.council]`. The blocks read in that order, each over `[council]` and
+performer: `[rc.<dir>.council]`, `[root.council]` or
+`[character.<name>.council]`. The blocks read in that order, each over `[council]` and
 the blocks before it, key by key: `enabled` is the last block's, and
 `contexts` and `judge` are the last stated. A performer whose sections have
 no council block has no council; `[global.council]` is refused. A block's

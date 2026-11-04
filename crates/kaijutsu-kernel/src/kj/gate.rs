@@ -3051,12 +3051,14 @@ mod tests {
                 outcome.reason
             );
         }
-        // A kohai of the console shares its lineage root, and so its hub.
+        // A kohai of the console shares its lineage root, and so its hub,
+        // but the create sets the kohai itself as the session's senpai, not
+        // the root console, so the ordinary layers decide.
         let lane = crate::kj::test_helpers::register_rooted_context(&d, Some("lane"), kaijutsu_types::PrincipalId::new());
         let in_lane = crate::kj::test_helpers::caller_with_context(lane);
         let spec = crate::kj::shell_gate::build_shell_gate_spec(MCP_SESSION_ARGV).unwrap();
         let outcome = run_gate(d.kernel(), &in_lane, spec, d.kernel.ledger_flows(), &config).await;
-        assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);
+        assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
         for source in [
             "kj context create claude --name sess3 --type mcp --parent mcp/bob",
             "kj context create claude --name sess4 --type mcp",
@@ -3065,6 +3067,47 @@ mod tests {
             let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
             let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
             assert_eq!(outcome.verdict, GateVerdict::Pending, "{source}: {}", outcome.reason);
+        }
+    }
+
+    /// The session answers to the person's root console: the senpai the
+    /// create will set, `--senpai` resolved as the verb resolves it or the
+    /// caller's own context, must be the lineage root's console. From the
+    /// console the client's argv (no `--senpai`) qualifies, and so does
+    /// naming the console. From a seat under it, the default senpai is the
+    /// seat itself and `--senpai .` names the seat, so both ask, as does
+    /// any other context or an empty word.
+    ///
+    /// Falsified by checking only `--parent`.
+    #[tokio::test]
+    async fn an_mcp_session_must_answer_to_the_lineage_root_s_console() {
+        let d = gate_dispatcher().await;
+        let console = crate::kj::test_helpers::register_root_context(&d);
+        mcp_hub(&d, crate::kj::test_helpers::test_reviewer_principal(), "amy");
+        let other = crate::kj::test_helpers::register_rooted_context(&d, Some("other"), kaijutsu_types::PrincipalId::new());
+        let seat = crate::kj::test_helpers::register_rooted_context(&d, Some("seat"), kaijutsu_types::PrincipalId::new());
+        let config = gate_config(crate::config_seed::DEFAULT_GATE_CONFIG);
+        let from_console = mcp_connection(&d, console);
+        let from_seat = crate::kj::test_helpers::caller_with_context(seat);
+        let session = |tail: &str| format!("{MCP_SESSION_ARGV} {tail}");
+        let cases: Vec<(&KjCaller, String, GateVerdict)> = vec![
+            (&from_console, session(""), GateVerdict::Allowed),
+            (&from_console, session("--senpai amy"), GateVerdict::Allowed),
+            (&from_console, session("--senpai ."), GateVerdict::Allowed),
+            (&from_console, session("--senpai other"), GateVerdict::Pending),
+            (&from_console, session("--senpai ''"), GateVerdict::Pending),
+            (&from_console, session("--senpai nowhere-at-all"), GateVerdict::Pending),
+            (&from_seat, session("--senpai ."), GateVerdict::Pending),
+            (&from_seat, session("--senpai seat"), GateVerdict::Pending),
+            (&from_seat, session("--senpai other"), GateVerdict::Pending),
+            (&from_seat, session("--senpai amy"), GateVerdict::Allowed),
+            (&from_seat, session("--senpai .parent"), GateVerdict::Allowed),
+        ];
+        let _ = other;
+        for (caller, source, expected) in cases {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(&source).unwrap();
+            let outcome = run_gate(d.kernel(), caller, spec, d.kernel.ledger_flows(), &config).await;
+            assert_eq!(outcome.verdict, expected, "{source}: {}", outcome.reason);
         }
     }
 

@@ -48,6 +48,19 @@ the character"). Open, outside M2:
 - Read-only pipes (`kj ... | head`, `| jq`) through the MCP shell raise asks
   for Amy; a probe should run the bare verb.
 
+## Type melt M4: what gate layers by directory and character leave open (2026-11-04)
+
+- The `KJ_TOOL_PLAN` tier stamp comes from `command_verdict` (`kj/gate_policy.rs`), which does not consult the
+  edge rules (senpai-edge drift, MCP session create): a create or drift push the gate allows as builtin stamps
+  `score`. Safe direction (a hook scores rather than skips), but two classifications.
+- `councils()` is a union of every enabled block over `[council]`, a superset of any one performer's composed
+  council. A fork performed by a judge with no `mk` model, answering to its parent, can be taken for a judge
+  shadow of a council its parent's performer does not run, and is archived with the parent.
+- The MCP session rule's kernel test mirrors the client's argv by hand (`MCP_SESSION_ARGV`); the wire tests in
+  kaijutsu-mcp and kaijutsu-server are the end-to-end check.
+- `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate` failed once in a parallel
+  `ledger::` run and passes alone: a tracing-subscriber span capture under parallel tests.
+
 ## Companion: what the first build leaves open (2026-11-02)
 
 The `companion` type (`docs/companion.md`) runs an hourly check-in as a fork of

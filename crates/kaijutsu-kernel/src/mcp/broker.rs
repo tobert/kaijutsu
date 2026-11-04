@@ -9085,7 +9085,8 @@ mod tests {
     /// granularity, finer than clauses. Entries are read by array position.
     #[tokio::test]
     async fn kj_tool_plan_projects_the_shell_command() {
-        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-plan").await;
+        let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-plan").await;
+        let ctx = approval_call_context(&kj, "kj_tool_plan_projects_the_shell_command");
 
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker
@@ -9115,7 +9116,7 @@ mod tests {
             serde_json::json!({ "command": "a && b; c | d; for f in x; do delete $f; done" });
 
         let result = broker
-            .call_tool(call, &CallContext::test(), CancellationToken::new())
+            .call_tool(call, &ctx, CancellationToken::new())
             .await
             .expect("KJ_TOOL_PLAN must carry three statements with `delete` inside the loop");
         assert!(!result.is_error);
@@ -9152,7 +9153,8 @@ mod tests {
             ),
         ];
         for (index, (command, interpreter, raw, raw_path)) in cases.into_iter().enumerate() {
-            let (broker, _kernel, _kj) = wired_kaish_broker(&format!("kaish-hook-python-{index}")).await;
+            let (broker, _kernel, kj) = wired_kaish_broker(&format!("kaish-hook-python-{index}")).await;
+            let ctx = approval_call_context(&kj, "kj_tool_plan_names_a_python_program");
             let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
             broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
             broker.hooks().write().await.pre_call.entries.push(HookEntry {
@@ -9175,7 +9177,7 @@ mod tests {
             let mut call = params("svc", "shell_write");
             call.arguments = serde_json::json!({ "command": command });
             let result = broker
-                .call_tool(call, &CallContext::test(), CancellationToken::new())
+                .call_tool(call, &ctx, CancellationToken::new())
                 .await
                 .unwrap_or_else(|error| panic!("KJ_TOOL_PLAN for `{command}` must carry {interpreter} and {raw}: {error:?}"));
             assert!(!result.is_error, "{command}");
@@ -9190,7 +9192,8 @@ mod tests {
     /// unnoticed.
     #[tokio::test]
     async fn kj_tool_plan_clause_matches_the_shared_renderer() {
-        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-clause").await;
+        let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-clause").await;
+        let ctx = approval_call_context(&kj, "kj_tool_plan_clause_matches_the_shared_r");
 
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker
@@ -9230,7 +9233,7 @@ mod tests {
         call.arguments = serde_json::json!({ "command": command });
 
         let result = broker
-            .call_tool(call, &CallContext::test(), CancellationToken::new())
+            .call_tool(call, &ctx, CancellationToken::new())
             .await
             .expect("KJ_TOOL_PLAN's `clause` must match the shared renderer");
         assert!(!result.is_error);
@@ -9437,6 +9440,7 @@ mod tests {
     #[tokio::test]
     async fn shell_guard_denies_sh_dash_c_and_allows_benign_shapes() {
         let (broker, kernel, kj) = wired_kaish_broker("shell-guard-falsify").await;
+        let ctx = approval_call_context(&kj, "shell_guard_denies_sh_dash_c_and_allows_");
 
         // `HookBody::KaishPath` (docs/rc-on-disk.md) reads the
         // guard's body fresh from `/config/rc` at every fire, so this test
@@ -9538,7 +9542,7 @@ mod tests {
             let mut call = params("svc", "shell_write");
             call.arguments = serde_json::json!({ "command": cmd });
             match broker
-                .call_tool(call, &CallContext::test(), CancellationToken::new())
+                .call_tool(call, &ctx, CancellationToken::new())
                 .await
             {
                 Err(err) if err.is_refusal(RefusalKind::Denied) => {}
@@ -9550,7 +9554,7 @@ mod tests {
         // A denial names its fix: write a script file and run the file.
         let mut call = params("svc", "shell_write");
         call.arguments = serde_json::json!({ "command": "bash -c 'echo hi'" });
-        let err = broker.call_tool(call, &CallContext::test(), CancellationToken::new()).await
+        let err = broker.call_tool(call, &ctx, CancellationToken::new()).await
             .expect_err("bash -c is denied");
         let text = format!("{err}");
         assert!(text.contains("script file") && text.contains("`./FILE`"), "the denial names the fix: {text}");
@@ -9559,7 +9563,7 @@ mod tests {
         // denial: say so, carry kaish's message, and name both fixes.
         let mut call = params("svc", "shell_write");
         call.arguments = serde_json::json!({ "command": "for x in a b; do echo $x; done | (cat)" });
-        let err = broker.call_tool(call, &CallContext::test(), CancellationToken::new()).await
+        let err = broker.call_tool(call, &ctx, CancellationToken::new()).await
             .expect_err("an unparseable command is denied");
         let text = format!("{err}");
         assert!(text.contains("kaish cannot parse this command") && text.contains("help syntax")
@@ -9572,7 +9576,7 @@ mod tests {
         let long = format!("for h in {}; do echo $h; done | (cat)", "abc ".repeat(200));
         let mut call = params("svc", "shell_write");
         call.arguments = serde_json::json!({ "command": long });
-        let err = broker.call_tool(call, &CallContext::test(), CancellationToken::new()).await
+        let err = broker.call_tool(call, &ctx, CancellationToken::new()).await
             .expect_err("an unparseable command is denied");
         let text = format!("{err}");
         assert!(text.contains("kaish cannot parse this command") && text.contains("script file"),
@@ -9614,7 +9618,7 @@ mod tests {
             let mut call = params("svc", "shell_write");
             call.arguments = serde_json::json!({ "command": cmd });
             let result = broker
-                .call_tool(call, &CallContext::test(), CancellationToken::new())
+                .call_tool(call, &ctx, CancellationToken::new())
                 .await;
             if result.is_err() {
                 blocked.push(format!("{cmd:?} -> {result:?}"));
@@ -10590,14 +10594,15 @@ mod tests {
     /// and the call comes back pending instead of denied.
     #[tokio::test]
     async fn a_deny_tier_statement_is_refused_at_pre_call_naming_the_layer_and_key() {
-        let (broker, _kernel, _kj, _dir) =
+        let (broker, _kernel, kj, _dir) =
             wired_kaish_broker_with_gate_toml("gate-toml-deny", "[global]\ndeny = [\"dd\"]\n").await;
+        let ctx = approval_call_context(&kj, "a_deny_tier_statement_is_refused_at_pre_");
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_shell_write_hook(&broker, "asker", HookAction::Ask(AskSpec { description: None })).await;
 
         let err = broker
-            .call_tool(shell_write_call("dd if=/dev/zero of=/dev/sda"), &CallContext::test(), CancellationToken::new())
+            .call_tool(shell_write_call("dd if=/dev/zero of=/dev/sda"), &ctx, CancellationToken::new())
             .await
             .expect_err("a deny-tier statement must be refused");
         let text = err.to_string();
@@ -10619,20 +10624,21 @@ mod tests {
     /// and the call comes back pending.
     #[tokio::test]
     async fn an_allow_tier_program_skips_the_hooks() {
-        let (broker, _kernel, _kj, _dir) =
+        let (broker, _kernel, kj, _dir) =
             wired_kaish_broker_with_gate_toml("gate-toml-allow", "[global]\nallow = [\"rg\"]\n").await;
+        let ctx = approval_call_context(&kj, "an_allow_tier_program_skips_the_hooks");
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_shell_write_hook(&broker, "asker", HookAction::Ask(AskSpec { description: None })).await;
 
         let result = broker
-            .call_tool(shell_write_call("rg -n todo src"), &CallContext::test(), CancellationToken::new())
+            .call_tool(shell_write_call("rg -n todo src"), &ctx, CancellationToken::new())
             .await
             .expect("an allow-tier program reaches no hook");
         assert!(!result.is_error);
         // The same hook still fires once anything else rides along.
         let err = broker
-            .call_tool(shell_write_call("rg -n todo src; cat notes"), &CallContext::test(), CancellationToken::new())
+            .call_tool(shell_write_call("rg -n todo src; cat notes"), &ctx, CancellationToken::new())
             .await
             .expect_err("a mixed program still meets the hook");
         assert!(err.to_string().contains("asker") || err.to_string().contains("pending"), "{err}");
@@ -10643,11 +10649,12 @@ mod tests {
     /// an ask-tier clause firm.
     #[tokio::test]
     async fn kj_tool_plan_carries_the_tier_per_command() {
-        let (broker, _kernel, _kj, _dir) = wired_kaish_broker_with_gate_toml(
+        let (broker, _kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
             "gate-toml-tier",
             "[global]\nallow = [\"rg\"]\nask = [\"git push\"]\n",
         )
         .await;
+        let ctx = approval_call_context(&kj, "kj_tool_plan_carries_the_tier_per_comman");
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
@@ -10668,7 +10675,7 @@ mod tests {
         let result = broker
             .call_tool(
                 shell_write_call("rg x; git push origin; cat y; kj block list"),
-                &CallContext::test(),
+                &ctx,
                 CancellationToken::new(),
             )
             .await
@@ -10770,6 +10777,39 @@ mod tests {
             }
             other => panic!("a remembered family deny refuses on the RPC path, got {other:?}"),
         }
+    }
+
+    /// A context id with no row is not a context with no performer: the
+    /// policy cannot know which layers apply, so PreCall refuses with the
+    /// gate unavailable instead of reading `[global]` alone. A known
+    /// context with no performer still reads `[global]`.
+    ///
+    /// Falsified by `performer_of` returning `Ok(None)` for a missing row.
+    #[tokio::test]
+    async fn a_context_id_with_no_row_makes_the_gate_unavailable_at_pre_call() {
+        let (broker, _kernel, kj, _dir) =
+            wired_kaish_broker_with_gate_toml("no-row", "[global]\nallow = [\"rg\"]\n").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+
+        let err = broker
+            .call_tool(shell_write_call("rg -n todo src"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect_err("a context with no row is refused");
+        assert!(err.is_refusal(RefusalKind::GateUnavailable), "{err:?}");
+        assert!(err.to_string().contains("has no row"), "{err}");
+        // The ask path reads the same performer.
+        let ctx = CallContext::test();
+        match broker.shell_pre_call_hooks("rg -n todo src", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(err) => assert!(err.is_refusal(RefusalKind::GateUnavailable), "{err:?}"),
+            other => panic!("a context with no row is unavailable, got {other:?}"),
+        }
+        // A registered context reads `[global]`.
+        let known = approval_call_context(&kj, "no-row-known");
+        broker
+            .call_tool(shell_write_call("rg -n todo src"), &known, CancellationToken::new())
+            .await
+            .expect("a known context reads [global]");
     }
 
     /// On the RPC shell paths, posture follows the actor's character sheet:

@@ -3519,7 +3519,11 @@ mod tests {
         let kei = drive(&house.kei, "kj drive kei-lane --prompt 'kei work'").await;
         assert_eq!(kei.verdict, Pending, "banto's rule is not kei's: {}", kei.reason);
 
-        let rules = d.dispatch(&[s("ledger"), s("rules")], &answering_seat()).await;
+        // `kj ledger rules` reads the caller's gate layers, so it needs a
+        // caller whose context has a row.
+        let mut reader = registered_caller(&d);
+        reader.actor_id = crate::kj::test_helpers::test_reviewer_principal();
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &reader).await;
         assert!(rules.message().contains("user family rule (character banto, rule "), "{}", rules.message());
         let rule_id = match &rules {
             KjResult::Ok { data: Some(data), .. } => data.as_array().unwrap()[0].as_str().unwrap().to_string(),
@@ -4015,7 +4019,7 @@ mod tests {
         // The rc-shaped dispatcher mounts /config/kernel with the seeded
         // gate.toml; the plain one has no config tree at all.
         let d = crate::kj::test_helpers::test_dispatcher_rc().await;
-        let result = d.dispatch(&[s("ledger"), s("rules")], &test_caller()).await;
+        let result = d.dispatch(&[s("ledger"), s("rules")], &registered_caller(&d)).await;
         assert!(result.is_ok(), "{result:?}");
         let text = result.message();
         assert!(text.contains("no active rules"), "{text}");
@@ -4070,7 +4074,7 @@ mod tests {
         let console = crate::kj::test_helpers::register_root_context(&d);
         let rules = d.dispatch(&[s("ledger"), s("rules")], &crate::kj::test_helpers::caller_with_context(console)).await;
         let out = rules.message();
-        assert!(out.contains("gate.toml layers for amy (rc directory root, a root character), earliest first: [global], [rc.root] (not in the file), [character.amy] (not in the file), [root]"), "{out}");
+        assert!(out.contains("gate.toml layers for amy (rc directory root, a root character), earliest first: [global], [rc.root] (not in the file), [root], [character.amy] (not in the file)"), "{out}");
         assert!(out.lines().any(|l| l.trim_start().starts_with("kj price set") && l.ends_with("root config")), "{out}");
 
         // A context with no performer reads [global] alone.

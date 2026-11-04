@@ -104,7 +104,7 @@ Uncovered otherwise — today's behavior, stated rather than discovered.
 |---|---|---|---|
 | 1. Builtin | each verb's declared `Effect` (`kj/effect.rs`, §Builtin tier) | compile | shipped in-repo, reviewed like code |
 | 2. Global config | `/config/kernel/gate.toml`, `[global]` | host file, seeded from `assets/defaults/gate.toml` via `config_seed.rs` | Amy, at the keyboard, no rebuild |
-| 3. Performer config | same file: `[rc.<dir>]`, then `[character.<name>]`, then `[root]` (§Performer layers) | same | Amy, per rc directory and per character |
+| 3. Performer config | same file: `[rc.<dir>]`, then `[root]`, then `[character.<name>]` (§Performer layers) | same | Amy, per rc directory and per character |
 | 4. User explicit | `approval_rules` (digest) + family rules (§Learned family rules) | `kj ledger allow --remember` at answer time | a human decision, attributed and revocable |
 
 Top wins (ruling 1). A learned human allow overrides a config deny; a
@@ -207,7 +207,7 @@ layer is empty and `kj ledger rules` says so. The example is the rule:
 # Gate policy — the tuned allow/ask/deny tiers beneath the ledger's
 # per-decision rules. Keys: "kj <verb> [<subcommand>]" or
 # "<command> [<first-token>]". Verdicts: allow, ask, deny.
-# Layers compose: [global], then [rc.<dir>], [character.<name>] and [root]
+# Layers compose: [global], then [rc.<dir>], [root] and [character.<name>]
 # for the context's performer, each over the ones before it.
 # A learned ledger rule outranks everything here.
 
@@ -266,23 +266,31 @@ the context row and the character sheet (`gate_policy::performer_of`):
 |---|---|
 | `[global]` | every context |
 | `[rc.<dir>]` | every context whose performer's `rc_dir` is `<dir>` |
-| `[character.<name>]` | every context the character `<name>` performs |
 | `[root]` | every context a root character performs |
+| `[character.<name>]` | every context the character `<name>` performs |
 
-They compose in that order, each later one reading over the earlier ones.
+They compose in that order, each later one reading over the earlier ones,
+so the narrowest section decides.
 A context with no performer reads `[global]` alone; a performer with no
 `rc_dir` reads no `[rc.<dir>]`. A performer with no character sheet, or a
 sheet that does not read, refuses the submission (gate unavailable). "Reads
 over" is the rule `[context_type.<type>]` had over `[global]`, extended one
 level at a time:
 
-- **Key lists**: the tables are walked latest first, and the first table
-  with a verdict for any of a command's keys decides it; inside one table
-  the more specific key wins, and deny beats ask beats allow. So
-  `[character.coder-opus] deny = ["git push"]` beats `[rc.coder] allow =
-  ["git push"]`, and a key the character does not name keeps the
-  directory's verdict. An allow the structural veto drops leaves the
-  decision to the builtin layer, as before.
+- **Key lists**: the tables are walked latest first (`[character.<name>]`,
+  `[root]`, `[rc.<dir>]`, then `[global]`), and the first deny, ask or
+  usable allow for any of a command's keys decides it; inside one table the
+  more specific key wins, and at equal specificity deny beats ask beats
+  allow. So `[character.coder-opus] deny = ["git push"]` beats `[rc.coder]
+  allow = ["git push"]`, and a key the character does not name keeps the
+  directory's verdict. An allow the structural veto drops (a redirect, a
+  background flag, a heredoc) decides nothing for its table: the walk goes
+  on to the table's less specific keys and then to the earlier tables, so
+  `[global] deny = ["rg"]` still refuses `rg foo > ~/.bashrc` under
+  `[rc.coder] allow = ["rg"]`, and a table with `allow = ["git push"]` and
+  `deny = ["git"]` still denies `git push origin > log`. When no table
+  decides, the builtin layer does (`--help` on an allowed verb stays
+  help), then the uncovered tier.
 - **`uncovered`**: the latest section that states it decides, else
   `[global]`, else `ask`.
 - **The council block** (`[<section>.council]`): see `docs/council.md`,
@@ -291,13 +299,20 @@ level at a time:
 
 **A section that applies to nobody is a warning, not a refusal.** A
 `[rc.<dir>]` naming no directory in the rc tree, or a `[character.<name>]`
-naming no character on the sheet, live or retired, is logged at warn at
-every load and listed by `kj ledger rules` as applying to nobody. The file
-still loads: a failed load refuses every gated statement, including the
+naming no character on the sheet, live or retired, is listed by `kj
+ledger rules` as applying to nobody and logged at warn when the set of such
+sections differs from the previous load's (the first load always logs it),
+so a steady state logs once, not at each of the two or three loads a
+submission makes. The file still loads: a failed load refuses every gated statement, including the
 `kj character create` that would fix it. An rc tree that lists nothing
-names every directory, the rule `kj::rc::check_context_type` states. The
-check needs the rc tree and the sheet, so it runs in `load_config` rather
-than `GateConfig::parse`, which stays a pure shape check over the text.
+names every directory, the rule `kj::rc::check_context_type` states. An rc
+tree that cannot be listed (`/config/rc` is a file, say) skips the check
+for `[rc.<dir>]` sections with a warning naming the rc tree; it does not
+refuse the load. A character sheet that cannot be read does refuse it, and
+the message says the sheet could not be read, not that the file is
+invalid. The check needs the rc tree and the sheet, so it runs in
+`load_config` rather than `GateConfig::parse`, which stays a pure shape
+check over the text.
 
 ## The uncovered tier: a sandbox posture
 
@@ -518,7 +533,8 @@ unreleased one:
    `[rc.<dir>]`, `[character.<name>]` and `[root]` replace
    `[context_type.<type>]` (§Performer layers); a section that applies to
    nobody warns instead of failing the load; the MCP session create rule
-   reads the parent against the caller's MCP hub.
+   reads the parent against the caller's MCP hub and the senpai the create
+   sets against the lineage root's console.
 
 ### Tests each slice must land with
 
