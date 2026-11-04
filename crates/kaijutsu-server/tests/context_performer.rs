@@ -147,3 +147,51 @@ fn create_context_refuses_a_characterless_principal() {
         tokio::task::yield_now().await;
     });
 }
+
+/// `listContexts` and `resolveContextLabel` carry the facts the kernel
+/// computes from performers and pointers: the root console is the person's
+/// and is performed by a person, the console is the one the person's sheet
+/// names, an MCP session's parent is the person's hub, and the hub has no
+/// performer. Falsified by leaving the facts at their wire defaults.
+#[test]
+fn context_listings_carry_the_person_console_and_session_facts() {
+    run_local(async {
+        let (addr, _kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
+        let person = SshServerConfig::EPHEMERAL_ROOT;
+        let contexts = kj.list_contexts().await.unwrap();
+        let root = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        let run = |argv: Vec<String>| {
+            let kj = kj.clone();
+            async move {
+                let result = kj.execute_kj_quiet(root, &argv).await.unwrap();
+                assert_eq!(result.exit_code, 0, "kj {}: {}", argv.join(" "), result.stderr);
+            }
+        };
+        let words = |line: &str| line.split(' ').map(String::from).collect::<Vec<_>>();
+        run(words(&format!("context create {PERFORMER} --name facts-console --type default"))).await;
+        run(words(&format!("character set {person} --console facts-console"))).await;
+        run(words(&format!("context create {PERFORMER} --name facts-session --type default --parent mcp/{person}"))).await;
+
+        let listed = kj.list_contexts().await.unwrap();
+        let find = |label: &str| listed.iter().find(|c| c.label == label).unwrap_or_else(|| panic!("{label} is listed")).clone();
+        let root_info = listed.iter().find(|c| c.id == root).unwrap();
+        assert_eq!(root_info.performer.as_deref(), Some(person));
+        assert!(root_info.performed_by_person && root_info.is_root_console, "{root_info:?}");
+        assert!(!root_info.is_console && !root_info.is_mcp_session, "{root_info:?}");
+        let console = find("facts-console");
+        assert!(console.is_console && !console.performed_by_person && !console.is_root_console, "{console:?}");
+        assert_eq!(console.performer.as_deref(), Some(PERFORMER));
+        let session = find("facts-session");
+        assert!(session.is_mcp_session && !session.is_console, "{session:?}");
+        let hub = find(&format!("mcp/{person}"));
+        assert_eq!(hub.performer, None, "the hub has no performer: {hub:?}");
+        assert!(!hub.is_mcp_session && !hub.performed_by_person, "{hub:?}");
+
+        let resolved = kj.resolve_context_label("facts-console").await.unwrap().expect("the console resolves");
+        assert!(resolved.is_console && resolved.performer.as_deref() == Some(PERFORMER), "{resolved:?}");
+        let resolved = kj.resolve_context_label("facts-session").await.unwrap().expect("the session resolves");
+        assert!(resolved.is_mcp_session, "{resolved:?}");
+    });
+}

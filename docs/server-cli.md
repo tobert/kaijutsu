@@ -64,9 +64,11 @@ result is missing:
    When the console is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.
-5. `kj character set <root> --console console`, which points the root's sheet at the console. A console that
-   bootstrap accepts, including one made before the sheet had the pointer, gets it when it is unset; a
-   rotation moves it.
+5. `kj character set <root> --console console`, which points the root's sheet at the console. Bootstrap finds
+   the console by that pointer, not by its type or label. With the pointer unset, a live context labeled
+   `console` that the console's performer plays under the root console is adopted and pointed at; any other
+   context holding the label is named in the report and left alone. A rotation moves the pointer, and archiving
+   the console clears it.
 
 It prints each line it ran. A second run runs nothing once every step is in place, and a kernel set up
 by hand is completed rather than overwritten. With no key found, it still

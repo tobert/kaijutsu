@@ -121,14 +121,15 @@ impl KjDispatcher {
         }
     }
 
-    /// Label and seat type for a context, for display only. A context the
-    /// DB cannot describe is shown rather than hidden: a turn running on
-    /// one is exactly the shape of a bug.
-    fn describe_context(&self, id: kaijutsu_types::ContextId) -> (String, String) {
+    /// Label and performer for a context, for display only: the performer
+    /// is `None` for a context with no performer. A context the DB cannot
+    /// describe is shown as `?` rather than hidden: a turn running on one
+    /// is exactly the shape of a bug.
+    fn describe_context(&self, id: kaijutsu_types::ContextId) -> (String, Option<String>) {
         let db = self.kernel_db().lock();
         match db.get_context(id) {
-            Ok(Some(row)) => (row.label.unwrap_or_else(|| id.short()), row.context_type),
-            _ => (id.short(), "?".to_string()),
+            Ok(Some(row)) => (row.label.unwrap_or_else(|| id.short()), row.performer.map(|p| db.name_for(p))),
+            _ => (id.short(), Some("?".to_string())),
         }
     }
 
@@ -250,19 +251,19 @@ impl KjDispatcher {
 
     fn system_ps_inner(&self) -> KjResult {
         let mut lines = vec![format!(
-            "{:<6} {:<10} {:<20} {:<9} {:>8}  {}",
-            "KIND", "ID", "CONTEXT", "TYPE", "ELAPSED", "DETAIL"
+            "{:<6} {:<10} {:<20} {:<12} {:>8}  {}",
+            "KIND", "ID", "CONTEXT", "PERFORMER", "ELAPSED", "DETAIL"
         )];
         let mut rows: Vec<serde_json::Value> = Vec::new();
 
         for (id, age) in self.kernel().turns_in_flight() {
-            let (label, ctype) = self.describe_context(id);
+            let (label, performer) = self.describe_context(id);
             lines.push(format!(
-                "{:<6} {:<10} {:<20} {:<9} {:>8}  {}",
+                "{:<6} {:<10} {:<20} {:<12} {:>8}  {}",
                 "turn",
                 id.short(),
                 label,
-                ctype,
+                performer.as_deref().unwrap_or("-"),
                 elapsed(age),
                 "-"
             ));
@@ -270,7 +271,7 @@ impl KjDispatcher {
                 "kind": "turn",
                 "id": id.to_string(),
                 "context": label,
-                "context_type": ctype,
+                "performer": performer,
                 "elapsed_ms": age.as_millis() as u64,
             }));
         }
@@ -280,18 +281,21 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("system status: {e}")),
         };
         for context_id in summaries.keys() {
-            let (label, ctype) = self.describe_context(*context_id);
+            let (label, performer) = self.describe_context(*context_id);
             let operations = match self.kernel().shell_operations().list_for_context(*context_id) {
                 Ok(operations) => operations,
                 Err(e) => return KjResult::Err(format!("system status: {e}")),
             };
             for operation in operations.into_iter().filter(|operation| operation.completed_at.is_none()) {
                 let age = std::time::Duration::from_millis(now_unix_ms().saturating_sub(operation.created_at as u64));
-                lines.push(format!("operation {}  {}  {}  {}", operation.receipt.operation_id, label, elapsed(age), operation.source));
+                lines.push(format!(
+                    "operation {}  {}  {}  {}  {}",
+                    operation.receipt.operation_id, label, performer.as_deref().unwrap_or("-"), elapsed(age), operation.source
+                ));
                 rows.push(serde_json::json!({
                     "kind": "operation", "id": operation.receipt.operation_id,
                     "job_id": operation.receipt.job_id, "ask_id": operation.receipt.ask_id,
-                    "context": label, "context_type": ctype,
+                    "context": label, "performer": performer,
                     "elapsed_ms": age.as_millis() as u64, "command": operation.source,
                 }));
             }
@@ -330,4 +334,28 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kj::test_helpers::*;
+
+    /// `kj system ps` names each turn's context and its performer, in the
+    /// text and the JSON, and no type. Falsified by showing the type.
+    #[tokio::test]
+    async fn ps_names_the_performer_of_a_turn() {
+        let d = test_dispatcher().await;
+        let performer = seed_test_performer(&d.kernel_db().lock());
+        let context = register_rooted_context(&d, Some("ps-lane"), performer);
+        let _lease = d.kernel().turns().begin(context);
+        let result = d.dispatch(&["system".to_string(), "ps".to_string()], &test_caller()).await;
+        let crate::kj::KjResult::Ok { message, data: Some(serde_json::Value::Array(rows)), .. } = result else {
+            panic!("expected rows, got {result:?}");
+        };
+        assert!(message.contains("PERFORMER") && !message.contains("TYPE"), "{message}");
+        assert!(message.contains("ps-lane") && message.contains(TEST_PERFORMER), "{message}");
+        let row = rows.iter().find(|r| r["context"] == "ps-lane").expect("the turn row");
+        assert_eq!(row["performer"], TEST_PERFORMER);
+        assert!(row.get("context_type").is_none(), "{row}");
+    }
 }

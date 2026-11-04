@@ -130,6 +130,11 @@ mod tests {
             cache_ttl_secs: None,
             input_tokens: None,
             cost: None,
+            performer: None,
+            performed_by_person: false,
+            is_root_console: false,
+            is_console: false,
+            is_mcp_session: false,
         }
     }
 
@@ -249,6 +254,11 @@ mod start_tests {
             cache_ttl_secs: None,
             input_tokens: None,
             cost: None,
+            performer: None,
+            performed_by_person: false,
+            is_root_console: false,
+            is_console: false,
+            is_mcp_session: false,
         }
     }
 

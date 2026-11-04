@@ -59,7 +59,7 @@ impl McpServerLike for KernelInfoServer {
         Ok(vec![KernelTool {
             instance: self.instance_id.clone(),
             name: "whoami".to_string(),
-            description: Some("Show current context identity: ID, label, model, type, trace, parent".to_string()),
+            description: Some("Show current context identity: ID, label, model, performer, trace, parent".to_string()),
             input_schema: tool_input_schema::<WhoamiParams>(),
         }])
     }
@@ -101,9 +101,12 @@ impl McpServerLike for KernelInfoServer {
             )));
         }
 
-        let context_type = row.map(|row| row.context_type);
-        // The model the context's binding gives its type; absent when the
-        // binding has no such slot.
+        // The performer's name; `null` for a context with no performer.
+        let performer = match row.and_then(|row| row.performer) {
+            Some(performer) => Some(self.kernel_db.lock().name_for(performer)),
+            None => None,
+        };
+        // The model of the context's `model` slot; absent when it has none.
         let bound = crate::model_resolution::context_model(&self.kernel_db.lock(), ctx.context_id)
             .map_err(|e| McpError::Protocol(format!("whoami: failed to read the model binding: {e}")))?;
         let (provider, model) = match &bound {
@@ -117,7 +120,7 @@ impl McpServerLike for KernelInfoServer {
             "label": handle.and_then(|h| h.label.as_deref()),
             "model": model,
             "provider": provider,
-            "context_type": context_type,
+            "performer": performer,
             "trace_id": handle.map(|h| hex32(h.trace_id)),
             "forked_from": handle.and_then(|h| h.forked_from.map(|p| p.short())),
         });
@@ -140,13 +143,13 @@ mod tests {
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
     use kaijutsu_types::{ContextId, ContextState, DocKind, PrincipalId};
 
-    fn ctx_row(id: ContextId, context_type: &str) -> ContextRow {
+    fn ctx_row(id: ContextId, performer: Option<PrincipalId>) -> ContextRow {
         ContextRow {
             context_id: id,
             label: Some("ctx".to_string()),
             system_prompt: None,
             context_state: ContextState::Live,
-            context_type: context_type.to_string(),
+            context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,
@@ -160,13 +163,13 @@ mod tests {
             demoted_at: None,
             paused_at: None,
             origin_host: None,
-            performer: None, senpai_ctx: None, persona: None,
+            performer, senpai_ctx: None, persona: None,
         }
     }
 
-    /// In-memory DB seeded with a persisted context row of the given type, so
-    /// whoami's DB-backed `context_type` is always populated (never null).
-    fn db_with_context(id: ContextId, context_type: &str) -> Arc<Mutex<KernelDb>> {
+    /// In-memory DB seeded with a persisted context row performed by a
+    /// character named `performer`, or by nobody.
+    fn db_with_context(id: ContextId, performer: Option<&str>) -> Arc<Mutex<KernelDb>> {
         let db = Arc::new(Mutex::new(KernelDb::temporary().unwrap()));
         {
             let g = db.lock();
@@ -182,7 +185,15 @@ mod tests {
                 created_by: creator,
             })
             .unwrap();
-            g.insert_context(&ctx_row(id, context_type)).unwrap();
+            let performer = performer.map(|name| {
+                let principal_id = PrincipalId::new();
+                g.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None,
+                    context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+                principal_id
+            });
+            g.insert_context(&ctx_row(id, performer)).unwrap();
         }
         db
     }
@@ -191,7 +202,7 @@ mod tests {
     async fn whoami_reaches_broker() {
         let ctx = CallContext::test();
         let drift = shared_drift_router();
-        let db = db_with_context(ctx.context_id, "coder");
+        let db = db_with_context(ctx.context_id, Some("coder"));
         let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker
@@ -216,15 +227,16 @@ mod tests {
         match result.content.first().unwrap() {
             ToolContent::Text(s) => {
                 assert!(s.contains(&ctx.context_id.to_hex()));
-                // DB-backed context_type flows through the broker path.
-                assert!(s.contains("\"context_type\": \"coder\""));
+                // The DB-backed performer flows through the broker path.
+                assert!(s.contains("\"performer\": \"coder\""), "{s}");
+                assert!(!s.contains("context_type"), "whoami shows the performer, not a type: {s}");
             }
             other => panic!("expected text content, got {:?}", other),
         }
     }
 
     #[tokio::test]
-    async fn whoami_surfaces_context_type_and_trace_id() {
+    async fn whoami_surfaces_the_performer_and_trace_id() {
         let ctx = CallContext::test();
         let drift = shared_drift_router();
         drift
@@ -232,7 +244,7 @@ mod tests {
             .register(ctx.context_id, Some("ctx"), None, PrincipalId::new())
             .unwrap();
 
-        let db = db_with_context(ctx.context_id, "coder");
+        let db = db_with_context(ctx.context_id, Some("coder"));
         let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker
@@ -257,7 +269,7 @@ mod tests {
         match result.content.first().unwrap() {
             ToolContent::Text(s) => {
                 let json: serde_json::Value = serde_json::from_str(s).unwrap();
-                assert_eq!(json["context_type"], "coder");
+                assert_eq!(json["performer"], "coder");
                 let trace = json["trace_id"].as_str().expect("trace_id present");
                 assert_eq!(trace.len(), 32);
                 assert!(trace.chars().all(|c| c.is_ascii_hexdigit()));
@@ -267,7 +279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whoami_context_type_is_independent_of_handle_label() {
+    async fn whoami_performer_is_null_for_a_context_with_none() {
         let ctx = CallContext::test();
         let drift = shared_drift_router();
         drift
@@ -275,7 +287,7 @@ mod tests {
             .register(ctx.context_id, None, None, PrincipalId::new())
             .unwrap();
 
-        let db = db_with_context(ctx.context_id, "planner");
+        let db = db_with_context(ctx.context_id, None);
         let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker
@@ -300,7 +312,7 @@ mod tests {
         match result.content.first().unwrap() {
             ToolContent::Text(s) => {
                 let json: serde_json::Value = serde_json::from_str(s).unwrap();
-                assert_eq!(json["context_type"], "planner");
+                assert!(json["performer"].is_null(), "{json}");
                 assert!(json["label"].is_null());
                 assert!(json["trace_id"].is_string());
             }

@@ -507,6 +507,18 @@ pub struct ContextInfo {
     /// What the context's turns have cost, or `None` when it has recorded no
     /// calls. Unpriced calls are counted apart, never as free.
     pub cost: Option<ContextCost>,
+    /// The performer's name, or `None` for a context with no performer
+    /// (empty on the wire).
+    pub performer: Option<String>,
+    /// The performer is a person (a root character): the context runs no
+    /// model turns and its draft runs as shell.
+    pub performed_by_person: bool,
+    /// Some character's root console (`characters.root_ctx`).
+    pub is_root_console: bool,
+    /// Some character's console (`characters.console_ctx`).
+    pub is_console: bool,
+    /// An MCP session: its parent is some character's MCP hub.
+    pub is_mcp_session: bool,
 }
 
 /// A context's cost: micro-dollars over the calls a price covered, and how
@@ -3624,6 +3636,14 @@ fn parse_context_info(
         cache_ttl_secs,
         input_tokens,
         cost,
+        performer: match reader.get_performer()?.to_str()? {
+            "" => None,
+            name => Some(name.to_string()),
+        },
+        performed_by_person: reader.get_performed_by_person(),
+        is_root_console: reader.get_is_root_console(),
+        is_console: reader.get_is_console(),
+        is_mcp_session: reader.get_is_mcp_session(),
     })
 }
 

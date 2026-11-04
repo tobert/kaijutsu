@@ -80,12 +80,6 @@ impl ContextRow {
         self.archived_at.is_some() || self.context_state == ContextState::Archived
     }
 
-    /// Whether this is a model console (type `console`). Not [`KernelDb::is_root_console`], which asks
-    /// whether a context is a character's root console (type `root`).
-    pub fn is_console(&self) -> bool {
-        self.context_type == kaijutsu_types::CONSOLE_CONTEXT_TYPE
-    }
-
     /// Convert to the lightweight `kaijutsu_types::Context`.
     pub fn to_context(&self) -> kaijutsu_types::Context {
         kaijutsu_types::Context {
@@ -129,7 +123,7 @@ impl KernelDb {
     /// through `insert_new_context_rows`, which applies it too
     /// ([`Self::check_senpai_edge`]).
     pub fn insert_placed_context(&self, row: &ContextRow, default_workspace_id: WorkspaceId) -> KernelDbResult<()> {
-        self.check_senpai_edge(row.context_id, &row.context_type, row.performer, row.senpai_ctx)?;
+        self.check_senpai_edge(row.context_id, row.performer, row.senpai_ctx)?;
         self.insert_context_with_document(row, default_workspace_id)
     }
 

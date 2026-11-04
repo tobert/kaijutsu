@@ -537,7 +537,7 @@ impl KjDispatcher {
             character = %character.name,
             character_id = %character.principal_id.short(),
             context = %ctx.short(),
-            context_type = ROOT_CONTEXT_TYPE,
+            rc_dir = character.rc_dir.as_deref().unwrap_or("(none)"),
             "root context has no usable loadout at boot — rebinding via the rc create lifecycle",
         );
 
@@ -563,23 +563,26 @@ impl KjDispatcher {
             Err(e) => format!(": {e}"),
             _ => String::new(),
         };
+        let expected = match character.rc_dir.as_deref() {
+            Some(dir) => format!("Expected rc bucket /config/rc/{dir}/create — restore it (e.g. `kaijutsu-server rc reseed`)"),
+            None => format!("{} names no rc directory — set one with `kj character set {} --rc <dir>`", character.name, character.name),
+        };
         Err(format!(
-            "root character '{}' root context {} (type '{ROOT_CONTEXT_TYPE}') still has no \
-             usable loadout after rebinding at boot{detail}. Expected rc bucket \
-             /config/rc/{ROOT_CONTEXT_TYPE}/create — restore it (e.g. `kaijutsu-server rc \
-             reseed`) and restart.",
+            "root character '{}' root context {} still has no usable loadout after rebinding \
+             at boot{detail}. {expected} and restart.",
             character.name,
             ctx.short()
         ))
     }
 
     /// Return a live root character's MCP hub: the live context
-    /// `characters.mcp_hub_ctx` names, else the live context that holds the
-    /// label `mcp/<name>` (adopted by setting the pointer), else a new one: type `mcp-hub`, created by the
-    /// root, with no parent and no performer, answering to the root's console.
-    /// It runs no turns; it is the `forked_from` of the root's MCP sessions
-    /// (`docs/senpai-kohai.md`, "MCP sessions"). A live context of another
-    /// type on the label is an error naming it.
+    /// `characters.mcp_hub_ctx` names, else the live context with no
+    /// performer that holds the label `mcp/<name>` (adopted by setting the
+    /// pointer), else a new one, created by the root, with no parent and no
+    /// performer, answering to the root's console. It runs no turns; it is
+    /// the `forked_from` of the root's MCP sessions (`docs/senpai-kohai.md`,
+    /// "MCP sessions"). A live context with a performer on the label is an
+    /// error naming it and its performer.
     ///
     /// The lookup and the insert run under one `KernelDb` lock, so two
     /// callers cannot each make one.
@@ -603,10 +606,11 @@ impl KjDispatcher {
             {
                 (pointed, sheet.name, label)
             } else if let Some(held) = db.find_context_by_label(&label).map_err(|e| e.to_string())? {
-                if held.context_type != MCP_HUB_CONTEXT_TYPE {
+                if let Some(performer) = held.performer {
                     return Err(format!(
-                        "{} (type '{}') holds the label '{label}', which {}'s MCP hub needs; rename or archive it",
-                        held.context_id.short(), held.context_type, sheet.name
+                        "{} (performed by {}) holds the label '{label}', which {}'s MCP hub needs, \
+                         and a hub has no performer; rename or archive it",
+                        held.context_id.short(), db.name_for(performer), sheet.name
                     ));
                 }
                 // A hub made before the sheet had a pointer: adopt it.
@@ -710,7 +714,7 @@ impl KjDispatcher {
                 let default_ws = db.get_or_create_default_workspace(requester)?;
                 // A root console is the one context with no senpai; the performer
                 // is written after the row, so check the edge with it named.
-                db.check_senpai_edge(new_id, ROOT_CONTEXT_TYPE, Some(character), None)?;
+                db.check_senpai_edge(new_id, Some(character), None)?;
                 db.insert_context_with_document(&row, default_ws)?;
                 db.write_context_character(new_id, character, None, None)?;
                 db.set_character_root_ctx(character, Some(new_id))?;
@@ -1864,16 +1868,32 @@ mod tests {
         assert!(hub_of(&d, "worker").is_none());
     }
 
-    /// `create --root` refuses, naming the context, when a live context of
-    /// another type holds the hub's label.
+    /// `create --root` refuses, naming the context and its performer, when a
+    /// live context with a performer holds the hub's label.
     #[tokio::test]
     async fn create_root_refuses_when_another_context_holds_the_hub_label() {
         let d = rc_capable_dispatcher().await;
         let squatter = super::super::test_helpers::register_context(&d, Some("mcp/sovereign"), None, PrincipalId::new());
+        let performer = super::super::test_helpers::seed_test_performer(&d.kernel_db().lock());
+        d.kernel_db().lock().update_performer(squatter, Some(performer)).unwrap();
         let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
         let KjResult::Err(message) = created else { panic!("expected a refusal, got {created:?}") };
         assert!(message.contains("mcp/sovereign") && message.contains(&squatter.short()), "{message}");
+        assert!(message.contains(super::super::test_helpers::TEST_PERFORMER), "names the performer: {message}");
         assert!(hub_of(&d, "sovereign").is_some_and(|row| row.context_id == squatter), "the squatter is left alone");
+    }
+
+    /// A live context with no performer on the hub's label is the hub,
+    /// whatever its type: it is adopted by setting the pointer. Falsified by
+    /// checking the type.
+    #[tokio::test]
+    async fn create_root_adopts_a_performerless_context_on_the_hub_label() {
+        let d = rc_capable_dispatcher().await;
+        let found = super::super::test_helpers::register_context(&d, Some("mcp/sovereign"), None, PrincipalId::new());
+        d.kernel_db().lock().update_context_type(found, "default").unwrap();
+        let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
+        assert!(created.is_ok(), "{}", created.message());
+        assert_eq!(sheet(&d, "sovereign").mcp_hub_ctx, Some(found), "the performer-less context is adopted");
     }
 
     /// At start every live root gets a hub, including one whose console
@@ -1934,8 +1954,11 @@ mod tests {
         let amy = super::super::test_helpers::test_reviewer_principal();
         let amy_name = d.kernel_db().lock().get_character(amy).unwrap().unwrap().name;
         let squatter = super::super::test_helpers::register_context(&d, Some(&format!("mcp/{amy_name}")), None, PrincipalId::new());
+        let performer = super::super::test_helpers::seed_test_performer(&d.kernel_db().lock());
+        d.kernel_db().lock().update_performer(squatter, Some(performer)).unwrap();
         d.ensure_root_contexts(PrincipalId::system()).await.expect("a held hub label must not stop boot");
         assert_eq!(hub_of(&d, &amy_name).unwrap().context_id, squatter);
+        assert_eq!(d.kernel_db().lock().get_character(amy).unwrap().unwrap().mcp_hub_ctx, None, "the squatter is not adopted");
     }
 
     /// An ordinary character gets no context at create.
@@ -2009,7 +2032,8 @@ mod tests {
     }
 
     /// A root-console rotation that stopped before its commit left a live
-    /// `root` context with no senpai. Boot archives it and keeps the console.
+    /// context the root performs with no senpai. Boot archives it and keeps
+    /// the console.
     #[tokio::test]
     async fn boot_archives_an_uncommitted_root_console_successor() {
         let d = rc_capable_dispatcher().await;
@@ -2017,7 +2041,7 @@ mod tests {
         let amy = super::super::test_helpers::test_reviewer_principal();
         let console = d.kernel_db().lock().get_character(amy).unwrap().unwrap().root_ctx.expect("console");
         let stray = super::super::test_helpers::register_context(&d, Some("amy-next"), None, amy);
-        d.kernel_db().lock().update_context_type(stray, super::ROOT_CONTEXT_TYPE).unwrap();
+        d.kernel_db().lock().update_performer(stray, Some(amy)).unwrap();
         assert_eq!(d.kernel_db().lock().senpai_of(stray).unwrap(), None, "precondition: no senpai");
 
         d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
@@ -2387,16 +2411,29 @@ mod tests {
         assert_eq!(sheet(&d, "boss").console_ctx, None);
     }
 
-    /// An archived console shows as such and is not cleared by archiving.
+    /// Archiving the console clears its pointer in the same transaction, so
+    /// an archived context is never the console. Falsified by dropping the
+    /// clearing from `archive_one_context`.
     #[tokio::test]
-    async fn an_archived_console_shows_as_archived_and_stays_pointed_at() {
+    async fn archiving_the_console_clears_its_pointer() {
         let (d, _root_ctx, con) = console_fixture().await;
         let caller = test_caller();
         assert!(d.dispatch(&[s("character"), s("set"), s("boss"), s("--console"), s("con")], &caller).await.is_ok());
+        assert!(d.kernel_db().lock().is_console(con).unwrap());
         d.kernel_db().lock().archive_context(con).unwrap();
-        assert_eq!(sheet(&d, "boss").console_ctx, Some(con), "archiving clears nothing in this slice");
-        let KjResult::Ok { message, .. } = d.dispatch(&[s("character"), s("show"), s("boss")], &caller).await else { panic!("show") };
-        assert!(message.contains("Console:         con (") && message.contains(") (archived)"), "{message}");
+        assert_eq!(sheet(&d, "boss").console_ctx, None, "archiving the console clears the pointer");
+        assert!(!d.kernel_db().lock().is_console(con).unwrap());
+    }
+
+    /// Archiving the MCP hub clears `mcp_hub_ctx` in the same transaction,
+    /// and the next start makes a new hub. Falsified by dropping the clearing.
+    #[tokio::test]
+    async fn archiving_the_mcp_hub_clears_its_pointer() {
+        let d = rc_capable_dispatcher().await;
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &test_caller()).await.is_ok());
+        let hub = sheet(&d, "boss").mcp_hub_ctx.expect("the hub is pointed at");
+        d.kernel_db().lock().archive_context(hub).unwrap();
+        assert_eq!(sheet(&d, "boss").mcp_hub_ctx, None, "archiving the hub clears the pointer");
     }
 
     /// `set --console` refuses a character that is not a live root, an

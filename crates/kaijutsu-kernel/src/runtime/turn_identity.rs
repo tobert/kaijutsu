@@ -11,10 +11,12 @@ pub(crate) struct TurnIdentity {
     pub reviewer: PrincipalId,
 }
 
-/// The human root (`docs/character.md`, "The root console and its shell")
-/// has no model, so it is refused before its performer, who is its own
-/// reviewer, meets the self-review refusal.
-pub(crate) const HUMAN_ROOT_REFUSAL: &str = "The human root runs no model turns. Talk to a model in the console, or press Ctrl+Z for this root's shell.";
+/// A context a person performs runs no model turns (`docs/character.md`, "A
+/// person, the console, MCP sessions, the judge"), so it is refused before
+/// the person, often their own reviewer, meets the self-review refusal.
+pub(crate) fn person_refusal(person: &str) -> String {
+    format!("{person} is a person, and a context a person performs runs no model turns; its draft runs as shell. Talk to a model in the console.")
+}
 
 /// The performer is checked before the reviewer resolves: the reviewer walk
 /// starts above the performer, so with none set it fails with a message
@@ -73,19 +75,24 @@ mod tests {
         assert!(resolve(&db, Some(amy), amy).unwrap_err().contains("cannot review"));
     }
 
-    /// A root character is a model context like any other: turn identity
-    /// admits it as a performer when a distinct reviewer is assigned. The
-    /// self-review refusal still holds for the root, so a root performer
-    /// cannot review its own work.
-    #[test]
-    fn a_root_character_performs_a_turn_with_a_distinct_reviewer() {
-        let db = KernelDb::temporary().unwrap();
-        let amy = character(&db, "amy");
-        let banto = character(&db, "banto");
-        db.update_character_root(amy, true).unwrap();
-        assert_eq!(resolve(&db, Some(amy), banto).unwrap(), TurnIdentity { actor: amy, reviewer: banto });
-        let error = resolve(&db, Some(amy), amy).unwrap_err();
-        assert!(error.contains("cannot review"), "{error}");
+    /// Every context a person performs runs no model turns, whatever its
+    /// type and whoever reviews it: the turn is refused naming the person,
+    /// before the self-review check. Falsified by reading the context type.
+    #[tokio::test]
+    async fn a_context_a_person_performs_runs_no_model_turns() {
+        let d = crate::kj::test_helpers::test_dispatcher().await;
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let lane = crate::kj::test_helpers::register_context(&d, Some("amy-lane"), Some(root), amy);
+        d.kernel_db().lock().assign_test_review(lane, Some(amy), None).unwrap();
+        d.kernel_db().lock().update_context_type(lane, "coder").unwrap();
+        for context in [root, lane] {
+            let Err(IdentityError::Refused(message)) = resolve_for_context(d.kernel(), context).await else {
+                panic!("a person's context must refuse a model turn");
+            };
+            assert!(message.contains("amy is a person") && message.contains("console"), "{message}");
+            assert!(!message.contains("review"), "the person rule comes before the self-review check: {message}");
+        }
     }
 
     /// A routing error the senpai's holder can repair refuses; corruption and
@@ -152,17 +159,17 @@ pub(crate) async fn resolve_for_context(
     let row = kernel.kernel_db().lock().get_context(context_id)
         .map_err(|e| IdentityError::Failed(format!("Could not read performer assignment: {e}")))?
         .ok_or_else(|| IdentityError::Failed(format!("No such context: {context_id}")))?;
-    if row.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE {
-        return Err(IdentityError::Refused(HUMAN_ROOT_REFUSAL.to_string()));
-    }
     let actor = row.performer;
     let performer = require_performer(actor).map_err(IdentityError::Refused)?;
     let sheet = kernel.kernel_db().lock().get_character(performer)
         .map_err(|e| IdentityError::Failed(format!("Could not resolve performer: {e}")))?;
-    if sheet.is_none() {
+    let Some(sheet) = sheet else {
         return Err(IdentityError::Failed(format!(
             "The assigned performer {performer} has no character sheet, which stored state requires."
         )));
+    };
+    if sheet.root {
+        return Err(IdentityError::Refused(person_refusal(&sheet.name)));
     }
     let routed = kernel.kernel_db().lock()
         .route_review(crate::kernel_db::ReviewQuery::ask(context_id, performer))

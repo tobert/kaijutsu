@@ -1039,30 +1039,37 @@ fn root_ctx_moves_at_commit_rotation() {
     assert_eq!(w.db.senpai_of(successor.context_id).unwrap(), None, "the successor is the top");
 }
 
-/// A live `root` context with no senpai that no character's `root_ctx` names
-/// is a rotation's successor that never committed. Boot archives it and
-/// leaves a console, a root context with a senpai, and archived rows alone.
+/// A live context a root character performs, with no senpai, that no
+/// character's `root_ctx` names is a rotation's successor that never
+/// committed, whatever its type. Boot archives it and leaves the console, a
+/// person's context with a senpai, a context of type `root` with no
+/// performer, and archived rows alone. Falsified by selecting by type.
 #[test]
 fn an_uncommitted_root_successor_is_archived_and_nothing_else() {
     let w = world();
     let amy = w.character("amy");
+    let coder = w.character("coder");
     w.db.update_character_root(amy, true).unwrap();
     let console = w.ctx("amy-console", "root", None, None);
     w.db.write_context_character(console.context_id, amy, None, None).unwrap();
     w.db.set_character_root_ctx(amy, Some(console.context_id)).unwrap();
-    let stray = w.ctx("stray-successor", "root", None, None);
+    let stray = w.ctx("stray-successor", "default", None, None);
+    w.db.write_context_character(stray.context_id, amy, None, None).unwrap();
     let placed = w.ctx("placed-root", "root", None, None);
-    w.db.set_context_senpai(placed.context_id, Some(console.context_id)).unwrap();
+    w.db.write_context_character(placed.context_id, amy, Some(console.context_id), None).unwrap();
     let archived_stray = w.ctx("old-stray", "root", None, None);
+    w.db.write_context_character(archived_stray.context_id, amy, None, None).unwrap();
     w.archive(&archived_stray);
-    let other_type = w.ctx("scratch", "default", None, None);
+    let unperformed = w.ctx("scratch", "root", None, None);
+    let model_top = w.ctx("model-top", "root", None, None);
+    w.db.write_context_character(model_top.context_id, coder, None, None).unwrap();
 
     let archived = w.db.archive_uncommitted_root_successors().unwrap();
 
     assert_eq!(archived, vec![stray.context_id]);
     let live = |ctx: &ContextRow| w.db.get_context(ctx.context_id).unwrap().unwrap().archived_at.is_none();
     assert!(!live(&stray));
-    assert!(live(&console) && live(&placed) && live(&other_type), "only the stray goes");
+    assert!(live(&console) && live(&placed) && live(&unperformed) && live(&model_top), "only the stray goes");
     assert_eq!(w.db.root_console(amy).unwrap(), Some(console.context_id));
     assert!(w.db.archive_uncommitted_root_successors().unwrap().is_empty(), "a second pass finds none");
 }

@@ -186,14 +186,15 @@ fn several_live_consoles_leave_the_pointer_unset_and_name_them() {
     assert!(notes[0].1.contains("console-2") && notes[0].1.contains("kj character set amy --console"), "{}", notes[0].1);
 }
 
-/// A console pointer that is already set is kept.
+/// A console pointer that is already set is kept, even on an archived
+/// context (a database from before archiving cleared the pointer).
 #[test]
 fn a_set_console_pointer_is_kept() {
     let r = rig();
     let banto = character(&r.db, "banto", false, None);
     let first = r.context("console", "console", Some(banto));
-    r.db.set_character_console_ctx(r.amy, Some(first.context_id)).unwrap();
     r.db.archive_context(first.context_id).unwrap();
+    r.db.set_character_console_ctx(r.amy, Some(first.context_id)).unwrap();
     r.context("console-2", "console", Some(banto));
 
     r.backfill();

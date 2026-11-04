@@ -42,11 +42,14 @@ with no ask.
 
 ## Names
 
-- **Root console**: the context of a root character, type `root`, held in `characters.root_ctx`. It is the
-  person's own, runs no model turns, and has no senpai.
-- **The console**: the model console a person talks to, type `console`, label `console`. A non-root character
-  performs it and the person's root console is its senpai. `kaijutsu-server bootstrap` makes it. Drifts into it
-  wait for the person ("Reports and drift").
+- **Person**: a root character. Every context a person performs is alike, whatever its type: it runs no model
+  turns, its draft runs as shell, and the person may confirm their own commands there.
+- **Root console**: the context `characters.root_ctx` names on a root character's sheet. It is the person's own,
+  performed by them, and has no senpai.
+- **The console**: the model console a person talks to, the context `characters.console_ctx` names on the
+  person's sheet; bootstrap labels it `console`. A non-root character performs it and the person's root console
+  is its senpai. `kaijutsu-server bootstrap` makes it. Archiving it clears the pointer. Drifts into it wait for
+  the person ("Reports and drift").
 - **Performer**: the character that plays a context. **Senpai**: the context a context answers to. **Kohai**: a word for the
   relationship only. The kj surface says "the contexts that answer to X" and lists them with `kj context list
   --senpai X`.
@@ -92,8 +95,9 @@ turns                           turn_id, context_id, provider, model, raw tokens
   that would close one is refused.
 - **The root console** of a root character is `characters.root_ctx`, a pointer like `handoff_ctx`. Rotating the
   root console moves the pointer at the commit, as it moves `handoff_ctx`. A root console cannot be forked,
-  moved under a senpai, or archived: each would leave the root character performing a context other than its
-  root console, or with none.
+  moved under a senpai, or archived; `kj context rotate` replaces it. A context with no senpai must be performed
+  by a root character, whatever its type; boot archives a live one that no `root_ctx` names (a rotation that
+  never committed).
 - **Live** means not archived. A concluded context is live; verbs that refuse a concluded target say so.
 - **The contexts that answer to** a context (its kohai) are the live contexts whose `senpai_ctx` is that context.
 - **The handoff log** belongs to the character: `characters.handoff_ctx`. Every context of the character writes
@@ -213,8 +217,8 @@ The refusal names the rule: "only <context>'s senpai (<character>) or its lineag
 context's performer never changes, so there is no recast act; to put another character on the work, create a
 context for it.
 
-Unchanged: a root character never performs a context other than its root console; the performer can never review
-its own work; a model turn refuses to start when its performer would review itself.
+Unchanged: the performer can never review its own work, except a person in a context they perform, which runs no
+model turns; a model turn refuses to start when its performer would review itself.
 
 ## Creating, forking, rotating
 
@@ -230,7 +234,7 @@ its own work; a model turn refuses to start when its performer would review itse
   - **Slots** are copied from the character, with unset parameters filled from each model's `backend_models`
     row. There is no per-create model option: to run another model, start a context of a character whose slot
     has it. The create needs the Operator capability and a live character caller.
-  - A root character performs only its root console and its `shell` contexts, so a root's `kaijutsu-tui` or
+  - A context a root character performs runs no model turns, so a root's `kaijutsu-tui` or
     `kaijutsu-mcp` session names the character that plays what it creates: `--character <name>` on both, and
     `KAIJUTSU_CHARACTER` for MCP (the flag wins). Without it a root refuses, with an error that names the option.
     The shell child `Ctrl+Z` makes is performed by the human at the seat, whatever `--character` says.
@@ -297,7 +301,8 @@ senpai that no `root_ctx` names. At the commit the archived console takes the su
   connected with the fork's character's key reads as the character. A context forks itself the way Claude Code
   forks a subagent, and its pushes up run with no ask. A push two or more hops away keeps the gate. A
   `gate.toml` key on `kj drift push` still wins over the edge.
-- **A drift into the console waits for its person.** The hold keys on the context type `console`, not on a label.
+- **A drift into the console waits for its person.** The hold keys on the person's `console_ctx` pointer, not on a
+  type or a label.
   Every drift kind holds except `Notification` (`docs/character.md`, "A drift into the console waits for the
   human").
 
@@ -313,12 +318,13 @@ senpai that no `root_ctx` names. At the commit the archived console takes the su
 An MCP client (Claude Code, Codex) brings its own model. It needs a context to author into and a reviewer for its
 asks, and no model.
 
-- **The hub.** Each live root character has one MCP hub: a context labeled `mcp/<root name>`, of type `mcp-hub`,
-  with no performer, answering to the root console, created by the root. The kernel makes it beside the root
-  console, at `kj character create --root` and `set --root`, and at start for every live root that has none.
-  Making it is idempotent: a live context with that label and type is reused. A live context of another type on
-  the label refuses `create --root` and `set --root`, naming it, and at start is logged as an error and left
-  alone, since the hub is a view and must not stop boot. Like a handoff log, the hub runs no turns and routes
+- **The hub.** Each live root character has one MCP hub: the context `characters.mcp_hub_ctx` names, labeled
+  `mcp/<root name>`, with no performer, answering to the root console, created by the root. The kernel makes it
+  beside the root console, at `kj character create --root` and `set --root`, and at start for every live root
+  that has none. Making it is idempotent: the pointer is trusted first, and with the pointer unset a live context
+  with no performer on the label is adopted. A live context with a performer on the label refuses
+  `create --root` and `set --root`, naming it and its performer, and at start is logged as an error and left
+  alone, since the hub is a view and must not stop boot. Archiving the hub clears the pointer. Like a handoff log, the hub runs no turns and routes
   nothing. It exists so `kj context list --tree` shows every session of that root in one place.
 - **Registration.** When the parent is a root console (none named and the kernel has one root, or an explicit
   parent that is a root console), the client runs, from the root console:
@@ -329,12 +335,14 @@ asks, and no model.
   not a root console creates under that context instead. A root console with no live hub refuses registration,
   naming the hub. Other context types requested through `register_session` keep the gate's ask.
 - **No ask.** The gate's builtin layer allows `kj context create <character> --parent <hub>` when `--parent`
-  resolves to the MCP hub of the caller's lineage root (`characters.mcp_hub_ctx`) and every argument is a
-  literal word; `--type` plays no part. The decision reads `builtin allows kj context create under mcp/<root
+  resolves to the MCP hub of the caller's lineage root (`characters.mcp_hub_ctx`), the senpai the create sets
+  (`--senpai`, else the calling context) is that root's console, and every argument is a literal word; `--type`
+  plays no part. A create from a kohai of the root console takes the ordinary layers and asks. The decision reads `builtin allows kj context create under mcp/<root
   name>, the MCP hub of its lineage root`. Creating a context runs no turn. A `gate.toml` ask or deny key on `kj
   context create`, in any of the caller's layers, still wins.
-- **No model.** The character's model never fills the `mcp` slot. A `distill` slot is copied as for any context,
-  so `kj fork --compact` and `kj drift pull|merge` work from a session.
+- **No model.** The client brings its own model, so the session's character has none and the session gets no
+  `model` slot; a session prints no no-model notice. A `distill` slot on the character is copied as for any
+  context, so `kj fork --compact` and `kj drift pull|merge` work from a session.
 - **Session end.** The client runs `kj context archive <id> --confirm` from the session context itself, which its
   own performer may archive (Authority). The gate would ask for it from an `mcp` context, so `gate.toml` ships
   `kj context archive` in `[rc.mcp] allow`.
@@ -437,8 +445,8 @@ context it cannot map in `context_character_migration_report`, which `kj context
   write, and so does a character slot of any role but `distill` and `gate`.
 - A drift along the edge runs with no ask, both ways; up from a fork a person made asks; two hops away asks; a
   drift to a sibling still asks; a `gate.toml` ask key wins.
-- The drift hold keys on type `console`; bootstrap labels the console `console`; a root labeled `console` of
-  another type is not held.
+- The drift hold keys on `console_ctx`; a context of type `console` that no sheet names is not held, and
+  archiving the console clears the pointer.
 - Two contexts of one character read and write the same handoff log; rotating the handoff context repoints
   `characters.handoff_ctx`.
 - The prompt's `<situation>` names the performer and the senpai.

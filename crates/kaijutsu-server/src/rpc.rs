@@ -2393,6 +2393,7 @@ fn write_context_row_to_handle_info(
     row: &ContextRow,
     cwd: Option<&str>,
     bound: &kaijutsu_kernel::ContextModelLookup,
+    facts: &kaijutsu_kernel::kernel_db::ContextFacts,
 ) {
     info.set_id(row.context_id.as_bytes());
     info.set_label(row.label.as_deref().unwrap_or(""));
@@ -2418,6 +2419,17 @@ fn write_context_row_to_handle_info(
     info.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
     info.set_cwd(cwd.unwrap_or(""));
+    set_context_facts(info, facts);
+}
+
+/// Fill the `ContextHandleInfo` facts the kernel computed
+/// ([`kaijutsu_kernel::kernel_db::KernelDb::context_facts`]).
+fn set_context_facts(mut info: context_handle_info::Builder<'_>, facts: &kaijutsu_kernel::kernel_db::ContextFacts) {
+    info.set_performer(facts.performer.as_deref().unwrap_or(""));
+    info.set_performed_by_person(facts.performed_by_person);
+    info.set_is_root_console(facts.is_root_console);
+    info.set_is_console(facts.is_console);
+    info.set_is_mcp_session(facts.is_mcp_session);
 }
 
 /// Verify a context can be joined, healing the DriftRouter registration from
@@ -3583,6 +3595,14 @@ impl kernel::Server for KernelImpl {
                         Err(_) => HashMap::new(),
                     }
                 };
+                // Context → what it is, from its performer and the character
+                // pointers (one query for the whole kernel). Clients decide
+                // from these facts; a read failure fails the listing rather
+                // than show a person's context as a model's.
+                let facts_by_ctx: HashMap<ContextId, kaijutsu_kernel::kernel_db::ContextFacts> = kernel_db_arc
+                    .lock()
+                    .all_context_facts()
+                    .map_err(|e| capnp::Error::failed(format!("list_contexts: context facts unreadable: {e}")))?;
                 // Context → track binding (one query for the whole kernel). The
                 // attachments table is transactional on attach/detach, so —
                 // unlike the playhead — the persisted rows ARE current. A
@@ -3688,6 +3708,9 @@ impl kernel::Server for KernelImpl {
                         c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_context_type(&row.context_type);
+                        if let Some(facts) = facts_by_ctx.get(&ctx.id) {
+                            set_context_facts(c.reborrow(), facts);
+                        }
                         // Stage 1 (time-well) kernel truth: last block-op
                         // recency, stamped by BlockStore::journal_op via
                         // KernelDb::touch_context_activity. 0 = never/unknown
@@ -3822,7 +3845,7 @@ impl kernel::Server for KernelImpl {
         let kernel_db_arc = self.kernel.kernel_db.clone();
         Promise::from_future(
             async move {
-                let (row, cwd, bound) = {
+                let (row, cwd, bound, facts) = {
                     let db = kernel_db_arc.lock();
                     let row = db.find_context_by_label(&label).map_err(|e| {
                         capnp::Error::failed(format!(
@@ -3854,14 +3877,20 @@ impl kernel::Server for KernelImpl {
                             mcp_session: false,
                         }),
                     };
-                    (row, cwd, bound)
+                    let facts = match &row {
+                        Some(r) => db.context_facts(r.context_id).map_err(|e| {
+                            capnp::Error::failed(format!("resolve_context_label: facts of '{label}' unreadable: {e}"))
+                        })?,
+                        None => Default::default(),
+                    };
+                    (row, cwd, bound, facts)
                 };
                 let mut res = results.get();
                 match row {
                     Some(row) => {
                         res.set_found(true);
                         let info = res.init_info();
-                        write_context_row_to_handle_info(info, &row, cwd.as_deref(), &bound);
+                        write_context_row_to_handle_info(info, &row, cwd.as_deref(), &bound, &facts);
                     }
                     None => res.set_found(false),
                 }
@@ -5525,12 +5554,12 @@ impl kernel::Server for KernelImpl {
 
                 let documents = kernel.documents.clone();
 
-                // A shell context is a REPL: its draft runs as a shell command
-                // whatever mode the client sent, and no model turn starts.
+                // A context a person performs is a REPL: its draft runs as a
+                // shell command whatever mode the client sent, and no model
+                // turn starts.
                 let is_shell = is_shell || kernel.kernel.kernel_db().lock()
-                    .get_context(context_id)
-                    .map_err(|e| capnp::Error::failed(format!("read context type: {e}")))?
-                    .is_some_and(|row| row.context_type == kaijutsu_types::SHELL_CONTEXT_TYPE);
+                    .performed_by_person(context_id)
+                    .map_err(|e| capnp::Error::failed(format!("read the context's performer: {e}")))?;
 
                 if is_shell {
                     // A shell draft runs the shell its seat's facade chose,

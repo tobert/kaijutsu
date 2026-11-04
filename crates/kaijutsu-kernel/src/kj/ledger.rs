@@ -1285,21 +1285,29 @@ impl KjDispatcher {
             return KjResult::ok_with_data("(no rc runs recorded)".to_string(), data);
         }
         let mut lines = vec![format!(
-            "  {:<38}  {:<12}  {:<20}  {:<8}  {:<13}  {}",
-            "RUN", "CONTEXT", "TYPE", "VERB", "STARTED_MS", "OUTCOME"
+            "  {:<38}  {:<12}  {:<16}  {:<16}  {:<8}  {:<13}  {}",
+            "RUN", "CONTEXT", "PERFORMER", "DIR", "VERB", "STARTED_MS", "OUTCOME"
         )];
         for r in &rows {
-            let context = ContextId::try_from_slice(&r.context_id)
+            let id = ContextId::try_from_slice(&r.context_id);
+            let context = id
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "(unparseable)".to_string());
+            let performer = {
+                let db = self.kernel_db.lock();
+                id.and_then(|id| db.get_context(id).ok().flatten())
+                    .and_then(|row| row.performer)
+                    .map_or_else(|| "-".to_string(), |performer| db.name_for(performer))
+            };
             let outcome = match r.outcome {
                 Some(o) => o.to_string(),
                 None => r.intended_outcome.map_or_else(|| "(running)".to_string(),
                     |outcome| format!("settlement pending ({outcome})")),
             };
+            // `rc_runs.context_type` records the rc directory the run read.
             lines.push(format!(
-                "  {:<38}  {:<12}  {:<20}  {:<8}  {:<13}  {}",
-                r.run_id, context, r.context_type, r.verb, r.started_at, outcome,
+                "  {:<38}  {:<12}  {:<16}  {:<16}  {:<8}  {:<13}  {}",
+                r.run_id, context, performer, r.context_type, r.verb, r.started_at, outcome,
             ));
         }
         lines.push(String::new());
@@ -1443,13 +1451,20 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj ledger runs: {e}")),
         };
 
-        let context = ContextId::try_from_slice(&run.context_id).map(|c| c.to_string());
+        let context_id = ContextId::try_from_slice(&run.context_id);
+        let context = context_id.map(|c| c.to_string());
         let outcome = run.outcome.map(|o| o.to_string());
+        let performer = context_id
+            .and_then(|id| db.get_context(id).ok().flatten())
+            .and_then(|row| row.performer)
+            .map(|performer| db.name_for(performer));
 
+        // `rc_runs.context_type` records the rc directory the run read.
         let mut lines = vec![
             format!("run:          {}", run.run_id),
             format!("context:      {}", context.as_deref().unwrap_or("(unparseable)")),
-            format!("context_type: {}", run.context_type),
+            format!("performer:    {}", performer.as_deref().unwrap_or("-")),
+            format!("dir:          {}", run.context_type),
             format!("verb:         {}", run.verb),
             format!("started_at:   {}", run.started_at),
             format!(
@@ -1525,7 +1540,8 @@ impl KjDispatcher {
         let data = serde_json::json!({
             "run_id": run.run_id,
             "context_id": context,
-            "context_type": run.context_type,
+            "performer": performer,
+            "rc_dir": run.context_type,
             "verb": run.verb,
             "started_at": run.started_at,
             "finished_at": run.finished_at,
@@ -4601,6 +4617,10 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert!(result.message().contains("ledgertest"), "{}", result.message());
         assert!(result.message().contains("create"), "{}", result.message());
+        // The run's directory shows as DIR, beside the context's performer.
+        assert!(result.message().contains("PERFORMER") && result.message().contains("DIR"), "{}", result.message());
+        assert!(!result.message().contains("TYPE"), "{}", result.message());
+        assert!(result.message().contains("rc-ledgertest"), "names the performer: {}", result.message());
 
         let data = match &result {
             KjResult::Ok { data: Some(d), .. } => d.clone(),
@@ -4645,6 +4665,11 @@ mod tests {
             other => panic!("kj ledger runs <id> must emit structured data: {other:?}"),
         };
         assert_eq!(obj["run_id"].as_str(), Some(run_id.as_str()));
+        assert_eq!(obj["rc_dir"], "ledgertest2", "{obj}");
+        assert_eq!(obj["performer"], "rc-ledgertest2", "{obj}");
+        assert!(obj.get("context_type").is_none(), "{obj}");
+        assert!(shown.message().contains("dir:          ledgertest2"), "{}", shown.message());
+        assert!(shown.message().contains("performer:    rc-ledgertest2"), "{}", shown.message());
         let scripts = obj["scripts"].as_array().expect("scripts array");
         assert_eq!(scripts.len(), 1, "{obj}");
         assert!(

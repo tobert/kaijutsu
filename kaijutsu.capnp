@@ -1343,6 +1343,15 @@ struct ContextHandleInfo {
   costMicros @36 :UInt64;
   costPricedCalls @37 :UInt64;
   costUnpricedCalls @38 :UInt64;
+
+  # What the context is, read from its performer and the character pointers
+  # (docs/character.md, "A person, the console, MCP sessions, the judge").
+  # Clients decide from these, never from `contextType` or a label.
+  performer @39 :Text;          # The performer's name; empty = the context has no performer
+  performedByPerson @40 :Bool;  # The performer is a root character (a person): no model turns, the draft runs as shell
+  isRootConsole @41 :Bool;      # Some character's `root_ctx` names this context
+  isConsole @42 :Bool;          # Some character's `console_ctx` names this context
+  isMcpSession @43 :Bool;       # The parent (`parentId`) is the MCP hub some character's `mcp_hub_ctx` names
 }
 
 struct PresetInfo {

@@ -400,19 +400,12 @@ pub(crate) fn first_free_label(db: &KernelDb, name: &str) -> KernelDbResult<Stri
     }
 }
 
-/// A context of this type never starts a model turn: a `shell` context's
-/// submit runs as shell. Its performer is the human typing there and may
-/// confirm their own commands, as in their root. A model turn still refuses
-/// a performer who is its own reviewer (`runtime/turn_identity.rs`).
-fn runs_no_model(context_type: &str) -> bool {
-    context_type == kaijutsu_types::SHELL_CONTEXT_TYPE
-}
-
 /// The body of [`insert_new_context_checked`], for a caller that already
 /// holds a transaction and writes more rows in it. A context that starts or
 /// continues a character must be reviewed by someone other than that
-/// character, except when a root rotates its own console or the context runs
-/// no model ([`runs_no_model`]).
+/// character, except a context a person performs: it runs no model turns,
+/// and the person may confirm their own commands there
+/// ([`KernelDb::is_person`]).
 pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement: CharacterPlacement) -> KernelDbResult<()> {
     let default_ws = db.get_or_create_default_workspace(row.created_by)?;
     let live_character = |performer: kaijutsu_types::PrincipalId| -> KernelDbResult<()> {
@@ -441,7 +434,7 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
     db.insert_context_with_document(row, default_ws)?;
     match placement {
         CharacterPlacement::Senpai(senpai) => {
-            db.check_senpai_edge(row.context_id, &row.context_type, None, Some(senpai))?;
+            db.check_senpai_edge(row.context_id, None, Some(senpai))?;
             db.set_context_senpai(row.context_id, Some(senpai))?;
         }
         CharacterPlacement::Start { performer, senpai } => {
@@ -452,19 +445,15 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
             db.copy_attachments(predecessor, row.context_id)?;
             let predecessor = db.require_context_character(predecessor)?;
             // Only a root console rotates into a context with no senpai.
-            db.check_senpai_edge(row.context_id, &row.context_type, Some(predecessor.principal_id), predecessor.senpai_ctx)?;
+            db.check_senpai_edge(row.context_id, Some(predecessor.principal_id), predecessor.senpai_ctx)?;
             db.write_context_character(row.context_id, predecessor.principal_id, predecessor.senpai_ctx, predecessor.persona.as_deref())?;
         }
     }
-    if let Some(performer) = performer {
-        // Only the rotation of a root console has its root confirm itself:
-        // the successor is a top held by the root, as its predecessor was.
-        let rotates_root_console = match placement {
-            CharacterPlacement::Rotate { predecessor } => db.is_root_console(predecessor)?,
-            _ => false,
-        };
+    if let Some(performer) = performer
+        && !db.is_person(performer)?
+    {
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(row.context_id, performer))?.reviewer();
-        if !rotates_root_console && !runs_no_model(&row.context_type) && performer == reviewer {
+        if performer == reviewer {
             return Err(KernelDbError::Validation("the performer cannot review its own work".into()));
         }
     }
@@ -1028,9 +1017,7 @@ impl KjDispatcher {
             }
         }
 
-        if let Some(ref name) = performer_name {
-            info.push_str(&format!("\nPerformer: {name}"));
-        }
+        info.push_str(&format!("\nPerformer: {}", performer_name.as_deref().unwrap_or("none")));
         // A context with no performer still routes its asks: the gate climbs
         // the senpai chain with the caller as the actor, so route for nobody in particular.
         let review = match row.performer {
@@ -1102,7 +1089,6 @@ impl KjDispatcher {
             "context_id": row.context_id.to_hex(),
             "label": row.label,
             "context_state": format!("{:?}", row.context_state),
-            "context_type": row.context_type,
             // Advisory: the registering client's self-reported hostname
             // (`null` when unknown — old client, or a creation path with
             // nothing to report). See `ContextRow::origin_host`'s doc
@@ -1700,9 +1686,13 @@ impl KjDispatcher {
         // invoking performer.
         let admission = {
             // The context does not exist yet, so routing starts at the senpai
-            // it will name. A shell context runs no model turn, so it has no
-            // model performer to review ([`runs_no_model`]).
-            if !runs_no_model(&context_type)
+            // it will name. A context a person performs runs no model turn,
+            // so it has no model performer to review.
+            let person = match self.kernel_db().lock().is_person(performer) {
+                Ok(person) => person,
+                Err(error) => return KjResult::Err(format!("kj context create: {error}")),
+            };
+            if !person
                 && let Err(error) = self.kernel().validate_model_review_assignment(crate::kernel_db::ReviewFrom::Senpai(senpai_ctx), performer).await
             {
                 return KjResult::Err(format!("kj context create: {error}"));
@@ -2343,6 +2333,19 @@ impl KjDispatcher {
             )),
             Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
         }
+        // Only the person whose console it is archives the console, and the
+        // archive clears the pointer.
+        let owner = {
+            let db = self.kernel_db().lock();
+            db.console_owner(target_id).map(|owner| owner.map(|owner| (owner, db.name_for(owner))))
+        };
+        match owner {
+            Ok(Some((owner, name))) if owner != caller.actor_id => return KjResult::Err(format!(
+                "kj context archive: refused — {target_label} is {name}'s console, and only {name} may archive it"
+            )),
+            Ok(_) => {}
+            Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+        }
         // A nested archive from an rc lifecycle (an archive bucket retiring
         // its context's kohai) is checked with the seat — the context whose
         // lifecycle runs — as the actor, not whoever started the lifecycle:
@@ -2761,30 +2764,36 @@ impl KjDispatcher {
     /// Authority to conclude a context or change its ring placement
     /// (`docs/character.md`, "The console places contexts").
     ///
-    /// - A live root character, acting from any context, is a human root
-    ///   and needs no capability. Every other caller needs Operator.
-    /// - A human root (a live root character, or a `root` context) may act
-    ///   on any context, except that nobody concludes a human root.
-    /// - The console (type `console`) may act on
-    ///   any context, but only a human root demotes or concludes a human
-    ///   root or a console.
-    /// - Any other seat may act on any context that is not a human root, a
-    ///   console, or its own. Its own is the context the call runs in, or
-    ///   any context its character plays.
+    /// - A person (a live root character), acting from any context, needs
+    ///   no capability. Every other caller needs Operator. A context grants
+    ///   nothing because of what it is.
+    /// - A person may act on any context, except that nobody concludes a
+    ///   root console (`characters.root_ctx`), and only the person whose
+    ///   console it is (`characters.console_ctx`) concludes or demotes the
+    ///   console.
+    /// - A caller in the console may act on any context, but may not demote
+    ///   or conclude a root console or the console.
+    /// - Any other seat may act on any context that is not a root console,
+    ///   the console, or its own. Its own is the context the call runs in,
+    ///   or any context its character plays.
     fn require_placement_authority(&self, verb: &str, target_id: ContextId, caller: &KjCaller) -> Result<(), KjResult> {
-        use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, ROOT_CONTEXT_TYPE};
-        let (row, caller_row) = {
+        let (row, target_is_root, console_owner, in_console) = {
             let db = self.kernel_db().lock();
-            let row = match db.get_context(target_id) {
-                Ok(Some(row)) => row,
+            let read = || -> KernelDbResult<Option<(ContextRow, bool, Option<(PrincipalId, String)>, bool)>> {
+                let Some(row) = db.get_context(target_id)? else { return Ok(None) };
+                let target_is_root = db.is_root_console(target_id)?;
+                let owner = db.console_owner(target_id)?.map(|owner| (owner, db.name_for(owner)));
+                let in_console = match caller.context_id {
+                    Some(context) => db.is_console(context)?,
+                    None => false,
+                };
+                Ok(Some((row, target_is_root, owner, in_console)))
+            };
+            match read() {
+                Ok(Some(found)) => found,
                 Ok(None) => return Err(KjResult::Err(format!("kj context {verb}: context {} not found", target_id.short()))),
                 Err(e) => return Err(KjResult::Err(format!("kj context {verb}: {e}"))),
-            };
-            let caller_row = match caller.context_id.map(|id| db.get_context(id)).transpose() {
-                Ok(caller_row) => caller_row.flatten(),
-                Err(e) => return Err(KjResult::Err(format!("kj context {verb}: could not read the caller's context: {e}"))),
-            };
-            (row, caller_row)
+            }
         };
         let name = row.label.clone().unwrap_or_else(|| target_id.short());
         let refuse = |why: String| Err(KjResult::Err(format!("kj context {verb}: refused — {why}")));
@@ -2792,17 +2801,15 @@ impl KjDispatcher {
             Ok(human) => human,
             Err(e) => return refuse(e),
         };
-        let human_root = human || caller_row.as_ref().is_some_and(|c| c.context_type == ROOT_CONTEXT_TYPE);
-        let console = caller_row.as_ref().is_some_and(|c| c.is_console());
-        let target_is_root = row.context_type == ROOT_CONTEXT_TYPE;
-        let target_is_console = row.context_type == CONSOLE_CONTEXT_TYPE;
+        let what = if target_is_root {
+            Some(format!("{name} is a root console"))
+        } else {
+            console_owner.as_ref().map(|(_, owner)| format!("{name} is {owner}'s console"))
+        };
 
-        if !human_root && !console {
-            if target_is_root || target_is_console {
-                return refuse(format!(
-                    "{name} is a '{}' context, and only the console or a human root may {verb} it",
-                    row.context_type
-                ));
+        if !human && !in_console {
+            if let Some(what) = &what {
+                return refuse(format!("{what}, and only the console or a person may {verb} it"));
             }
             if caller.context_id == Some(target_id) || row.performer == Some(caller.actor_id) {
                 return refuse(format!(
@@ -2822,12 +2829,19 @@ impl KjDispatcher {
         }
         if verb == "conclude" && target_is_root {
             return refuse(format!(
-                "{name} is a human root. Conclusion has no undo, and a concluded context \
+                "{name} is a root console. Conclusion has no undo, and a concluded context \
                  refuses drifts. To start its history fresh, run kj context rotate {name}"
             ));
         }
-        if console && !human_root && verb != "promote" && (target_is_root || target_is_console) {
-            return refuse(format!("only a human root may {verb} {name}, a '{}' context", row.context_type));
+        if verb != "promote" {
+            if let Some((owner, owner_name)) = &console_owner
+                && caller.actor_id != *owner
+            {
+                return refuse(format!("{name} is {owner_name}'s console, and only {owner_name} may {verb} it"));
+            }
+            if !human && target_is_root {
+                return refuse(format!("{name} is a root console, and only a person may {verb} it"));
+            }
         }
         Ok(())
     }
@@ -4272,12 +4286,12 @@ mod tests {
         );
     }
 
-    /// A root character does not perform below its own root: the climb from
-    /// the new context reaches the root itself, and a performer never reviews
-    /// its own work. A root's own context comes from `kj character create`,
-    /// and a model plays the console above it.
+    /// A person performs a context of any type under their own root console:
+    /// it runs no model turns, so the person confirms their own work there
+    /// and the self-review check does not apply. Falsified by reading the
+    /// type.
     #[tokio::test]
-    async fn a_root_character_cannot_perform_a_kohai_under_its_own_root() {
+    async fn a_person_performs_a_context_of_any_type_under_their_root_console() {
         let d = test_dispatcher().await;
         let amy = PrincipalId::new();
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
@@ -4291,15 +4305,16 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let refused = d.dispatch(&[s("context"), s("create"), s("owner"), s("--name"), s("owner-lane"), s("--type"), s("default")], &caller).await;
-        assert!(!refused.is_ok(), "a root would review its own work");
-        assert!(refused.message().contains("cannot review its own work"), "{}", refused.message());
-        assert!(d.kernel_db().lock().find_context_by_label("owner-lane").unwrap().is_none(), "nothing was written");
+        let created = d.dispatch(&[s("context"), s("create"), s("owner"), s("--name"), s("owner-lane"), s("--type"), s("default")], &caller).await;
+        assert!(created.is_ok(), "a person performs a context under their root console: {}", created.message());
+        let lane = d.kernel_db().lock().find_context_by_label("owner-lane").unwrap().expect("the context exists");
+        assert_eq!(d.kernel_db().lock().context_character(lane.context_id).unwrap().unwrap().principal_id, amy);
+        assert_eq!(lane.senpai_ctx, Some(context), "it answers to the context it was opened from");
     }
 
-    /// A shell context runs no model turn, so the human who opens one under
-    /// their own root performs it and confirms their own commands there, as
-    /// in the root itself. Any other type keeps the refusal above.
+    /// A person's shell child under their own root console is performed by
+    /// the person and runs the person's directory, so it carries the person's
+    /// whole loadout.
     #[tokio::test]
     async fn a_root_character_performs_a_shell_child_under_its_own_root() {
         let d = std::sync::Arc::new(test_dispatcher().await);
@@ -5300,11 +5315,12 @@ mod tests {
         assert!(d.kernel_db().lock().get_context(context_id).unwrap().is_none(), "nothing was inserted");
     }
 
-    /// A root performer is exempt from the self-review check only when it
-    /// rotates its own root console. Starting a kohai of the root under its
-    /// own console would make it review itself.
+    /// A person is exempt from the self-review check in every context they
+    /// perform: a kohai of the person under their own console, and the
+    /// rotation of the console itself. Falsified by exempting only the root
+    /// console's rotation.
     #[tokio::test]
-    async fn a_root_may_rotate_its_console_but_not_perform_a_kohai_under_it() {
+    async fn a_person_starts_a_kohai_under_their_console_and_rotates_it() {
         let d = test_dispatcher().await;
         let root = register_root_context(&d);
         let amy = d.kernel_db().lock().context_character(root).unwrap().unwrap().principal_id;
@@ -5315,13 +5331,12 @@ mod tests {
             demoted_at: None, paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
         };
         let kohai = row("root-kohai");
-        let error = insert_new_context_checked(&d.kernel_db().lock(), &kohai, CharacterPlacement::Start { performer: amy, senpai: Some(root) }).unwrap_err();
-        assert!(error.to_string().contains("cannot review its own work"), "{error}");
-        assert!(d.kernel_db().lock().get_context(kohai.context_id).unwrap().is_none(), "nothing was inserted");
+        insert_new_context_checked(&d.kernel_db().lock(), &kohai, CharacterPlacement::Start { performer: amy, senpai: Some(root) })
+            .expect("a person performs a kohai under their own console");
 
-        let successor = crate::kernel_db::ContextRow { context_type: s(kaijutsu_types::ROOT_CONTEXT_TYPE), ..row("root-successor") };
+        let successor = row("root-successor");
         insert_new_context_checked(&d.kernel_db().lock(), &successor, CharacterPlacement::Rotate { predecessor: root })
-            .expect("a root rotates its own console");
+            .expect("a person rotates their own console");
     }
 
     /// The default senpai, the caller's own context, follows the placing
@@ -6154,19 +6169,21 @@ mod tests {
     }
 
     /// The house as `kaijutsu-server bootstrap` builds it. amy (a root)
-    /// plays her human root `amy` (type `root`); the console (type
-    /// `console`) sits under it, played by the model character `rootbot`;
-    /// banto plays the director seat `banto` under `amy`, and coder plays
-    /// `lane` under banto's seat. bob (another root) plays `bob`, and
-    /// `elsewhere` is a worker in bob's lineage, played by `other`. The
-    /// root, console, and director seats hold Operator, as their rc grants
-    /// it; the workers do not.
+    /// plays her root console `amy` (her sheet's `root_ctx`); the console
+    /// (her sheet's `console_ctx`) sits under it, played by the model
+    /// character `rootbot`; banto plays the director seat `banto` under
+    /// `amy`, and coder plays `lane` under banto's seat. bob (another root)
+    /// plays his root console `bob`, and `elsewhere` is a worker in bob's
+    /// lineage, played by `other`. No context's type is set: the rules read
+    /// the pointers and the performers. The root, console, and director
+    /// seats hold Operator, as their rc grants it; the workers do not.
     struct PlacementFixture {
         d: std::sync::Arc<crate::kj::KjDispatcher>,
         amy: PrincipalId,
         rootbot: PrincipalId,
         banto: PrincipalId,
         coder: PrincipalId,
+        bob: PrincipalId,
         root: ContextId,
         console: ContextId,
         seat: ContextId,
@@ -6195,14 +6212,14 @@ mod tests {
                 principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
             }).unwrap();
         }
-        for (context, performer, context_type) in [
-            (root, amy, crate::kj::character::ROOT_CONTEXT_TYPE), (console, rootbot, kaijutsu_types::CONSOLE_CONTEXT_TYPE),
-            (seat, banto, "director"), (lane, coder, "coder"), (bob_root, bob, crate::kj::character::ROOT_CONTEXT_TYPE),
-            (elsewhere, other, "coder"),
+        for (context, performer) in [
+            (root, amy), (console, rootbot), (seat, banto), (lane, coder), (bob_root, bob), (elsewhere, other),
         ] {
             db.update_performer(context, Some(performer)).unwrap();
-            db.update_context_type(context, context_type).unwrap();
         }
+        db.set_character_root_ctx(amy, Some(root)).unwrap();
+        db.set_character_root_ctx(bob, Some(bob_root)).unwrap();
+        db.set_character_console_ctx(amy, Some(console)).unwrap();
         let mut operator = crate::mcp::ContextToolBinding::new();
         operator.grant(crate::mcp::Capability::Operator);
         let mut worker = crate::mcp::ContextToolBinding::new();
@@ -6214,7 +6231,7 @@ mod tests {
             db.upsert_context_binding(context, binding).unwrap();
         }
         drop(db);
-        PlacementFixture { d, amy, rootbot, banto, coder, root, console, seat, lane, bob_root, elsewhere }
+        PlacementFixture { d, amy, rootbot, banto, coder, bob, root, console, seat, lane, bob_root, elsewhere }
     }
 
     fn placement_caller(context: ContextId, actor: PrincipalId) -> crate::kj::KjCaller {
@@ -6337,9 +6354,10 @@ mod tests {
         assert!(placement_unchanged(&placement_row(&f, f.lane)));
     }
 
-    /// Only the console moves a human root or the console. A director with
-    /// Operator is refused on both. The console itself may not demote or
-    /// conclude a human root, or demote itself: only a human root does.
+    /// Only the console or a person moves a root console or the console. A
+    /// director with Operator is refused on both. The console itself may not
+    /// demote or conclude a root console, or demote itself: only a person
+    /// does, and for the console only the person whose console it is.
     #[tokio::test]
     async fn only_root_places_a_root_or_the_console() {
         let f = placement_fixture().await;
@@ -6354,11 +6372,14 @@ mod tests {
         }
 
         let console = placement_caller(f.console, f.rootbot);
-        for (verb, target) in [("demote", "amy"), ("demote", "bob"), ("demote", "console")] {
+        for (verb, target) in [("demote", "amy"), ("demote", "bob")] {
             let result = f.d.dispatch(&[s("context"), s(verb), s(target)], &console).await;
             assert!(!result.is_ok(), "the console may not {verb} {target}: {}", result.message());
-            assert!(result.message().contains("human root"), "{}", result.message());
+            assert!(result.message().contains("only a person"), "{}", result.message());
         }
+        let result = f.d.dispatch(&[s("context"), s("demote"), s("console")], &console).await;
+        assert!(!result.is_ok(), "the console may not demote itself: {}", result.message());
+        assert!(result.message().contains("amy's console") && result.message().contains("only placement-amy"), "{}", result.message());
         for id in [f.root, f.bob_root, f.console] {
             assert!(placement_unchanged(&placement_row(&f, id)), "a refusal changes nothing");
         }
@@ -6431,6 +6452,77 @@ mod tests {
         let result = f.d.dispatch(&[s("context"), s("demote"), s("elsewhere")], &amy).await;
         assert!(!result.is_ok(), "a retired root has no privilege: {}", result.message());
         assert!(placement_unchanged(&placement_row(&f, f.elsewhere)));
+    }
+
+    /// A context grants nothing because of what it is: a model seat acting
+    /// from inside a person's root console, even one whose type is `root`,
+    /// has no person's authority there. Falsified by reading the caller's
+    /// context type.
+    #[tokio::test]
+    async fn a_root_console_grants_a_model_seat_nothing() {
+        let f = placement_fixture().await;
+        f.d.kernel_db().lock().update_context_type(f.root, crate::kj::character::ROOT_CONTEXT_TYPE).unwrap();
+        let banto = placement_caller(f.root, f.banto);
+        for (verb, target) in [("demote", "console"), ("conclude", "console"), ("demote", "bob")] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s(target)], &banto).await;
+            assert!(!result.is_ok(), "banto may not {verb} {target} from amy's root console: {}", result.message());
+        }
+        for id in [f.console, f.bob_root] {
+            assert!(placement_unchanged(&placement_row(&f, id)), "a refusal changes nothing");
+        }
+    }
+
+    /// The console is the context a person's sheet points at, whatever its
+    /// type or label: a model seat in a context of type `console` labeled
+    /// `console-2` that no sheet names holds no console authority. Falsified
+    /// by reading the type.
+    #[tokio::test]
+    async fn a_console_typed_context_no_sheet_names_is_not_the_console() {
+        let f = placement_fixture().await;
+        let other = register_context(&f.d, Some("console-2"), Some(f.root), f.amy);
+        {
+            let db = f.d.kernel_db().lock();
+            db.update_performer(other, Some(f.rootbot)).unwrap();
+            db.update_context_type(other, kaijutsu_types::CONSOLE_CONTEXT_TYPE).unwrap();
+        }
+        let impostor = placement_caller(other, f.rootbot);
+        let result = f.d.dispatch(&[s("context"), s("promote"), s("amy")], &impostor).await;
+        assert!(!result.is_ok(), "a console-typed context no sheet names is not the console: {}", result.message());
+        assert!(result.message().contains("root console"), "the refusal names the pointer, not a type: {}", result.message());
+        assert!(!result.message().contains("'console' context"), "{}", result.message());
+        assert!(placement_unchanged(&placement_row(&f, f.root)));
+    }
+
+    /// Only the person whose console it is concludes, demotes or archives
+    /// it: another person is refused, and so is the console's own
+    /// performer for archive. The person does all three from any context.
+    #[tokio::test]
+    async fn only_its_person_concludes_demotes_or_archives_the_console() {
+        let f = placement_fixture().await;
+        let mut bob = placement_caller(f.bob_root, f.bob);
+        bob.confirmed = true;
+        for verb in ["demote", "conclude", "archive"] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s("console")], &bob).await;
+            assert!(!result.is_ok(), "bob may not {verb} amy's console: {}", result.message());
+            assert!(result.message().contains("only placement-amy"), "{}", result.message());
+        }
+        let mut rootbot = placement_caller(f.console, f.rootbot);
+        rootbot.confirmed = true;
+        let result = f.d.dispatch(&[s("context"), s("archive"), s("console")], &rootbot).await;
+        assert!(!result.is_ok(), "the console's performer may not archive it: {}", result.message());
+        assert!(placement_unchanged(&placement_row(&f, f.console)), "a refusal changes nothing");
+
+        let promoted = f.d.dispatch(&[s("context"), s("promote"), s("console")], &bob).await;
+        assert!(promoted.is_ok(), "another person may still promote the console: {}", promoted.message());
+
+        let mut amy = placement_caller(f.lane, f.amy);
+        amy.confirmed = true;
+        for verb in ["demote", "conclude", "archive"] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s("console")], &amy).await;
+            assert!(result.is_ok(), "amy may {verb} her console from a lane: {}", result.message());
+        }
+        assert!(placement_row(&f, f.console).is_archived());
+        assert_eq!(f.d.kernel_db().lock().get_character(f.amy).unwrap().unwrap().console_ctx, None, "the archive cleared the pointer");
     }
 
     /// The demote step that archives a context latches like
@@ -8466,6 +8558,22 @@ mod tests {
         assert!(!bare_info.message().contains("Senpai:"), "{}", bare_info.message());
         let KjResult::Ok { data: Some(bare_data), .. } = &bare_info else { panic!("expected data") };
         assert!(bare_data["senpai"].is_null());
+        assert!(bare_info.message().contains("Performer: none"), "{}", bare_info.message());
+    }
+
+    /// `kj context info` names the performer and shows no type, in the text
+    /// and the JSON. Falsified by showing the type.
+    #[tokio::test]
+    async fn context_info_shows_the_performer_and_no_type() {
+        let d = test_dispatcher().await;
+        let performer = seed_test_performer(&d.kernel_db().lock());
+        let lane = register_rooted_context(&d, Some("info-lane"), performer);
+        let info = d.dispatch(&[s("context"), s("info"), s("info-lane")], &caller_with_context(lane)).await;
+        assert!(info.message().contains(&format!("Performer: {TEST_PERFORMER}")), "{}", info.message());
+        assert!(!info.message().contains("Type:"), "{}", info.message());
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("expected data") };
+        assert_eq!(data["performer_name"], TEST_PERFORMER);
+        assert!(data.get("context_type").is_none(), "{data}");
     }
 
     /// `--json`'s `data.prompt` must be exactly the string rendered in the

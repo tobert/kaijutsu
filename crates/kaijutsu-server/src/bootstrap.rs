@@ -303,14 +303,14 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         }
         Some(row) => {
             if row.rc_dir.as_deref() != Some("console") {
+                // Every live context the performer plays but the root's console.
                 let others: Vec<String> = read(shared, |db| {
-                    let mut others = Vec::new();
-                    for id in db.character_live_contexts(row.principal_id)? {
-                        if let Some(ctx) = db.get_context(id)?.filter(|c| c.context_type != "console") {
-                            others.push(format!("{} (type {})", db.context_name(id), ctx.context_type));
-                        }
-                    }
-                    Ok(others)
+                    let console = db.get_character_by_name(&opts.root)?.and_then(|sheet| sheet.console_ctx);
+                    Ok(db.character_live_contexts(row.principal_id)?
+                        .into_iter()
+                        .filter(|id| Some(*id) != console)
+                        .map(|id| db.context_name(id))
+                        .collect())
                 })?;
                 let current = row.rc_dir.as_deref().unwrap_or("(none)");
                 report.notes.push(if others.is_empty() {
@@ -356,36 +356,62 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     let played_id = read(shared, |db| db.get_character_by_name(performer))?
         .ok_or_else(|| format!("no '{performer}' character row"))?
         .principal_id;
-    match read(shared, |db| db.find_context_by_label(CONSOLE_LABEL))? {
-        None => {
-            // The console is a context that answers to the human root, the context the root
-            // character's `root_ctx` names.
-            let human_root = read(shared, |db| db.get_character_by_name(&opts.root))?
-                .and_then(|row| row.root_ctx)
-                .ok_or_else(|| format!("'{}' has no root context for the console to answer to", opts.root))?
-                .to_string();
-            let argv = words(&[
-                "context", "create", performer, "--name", CONSOLE_LABEL, "--type", "console",
-                "--parent", &human_root, "--senpai", &human_root,
-            ]);
-            dispatch(shared, caller, argv, &mut report).await?;
-        }
-        Some(row) if row.context_type != "console" => report.notes.push(format!(
-            "The console is a '{}' context, not the model console; archive it and run bootstrap again \
-             to create the console",
-            row.context_type
+    // The console is the live context the root's sheet points at. With no
+    // pointer, a live context labeled `console` that the performer plays
+    // under the root's root console is adopted; one that is not is left
+    // alone and named.
+    let (root_console, pointed) = read(shared, |db| {
+        let sheet = db.get_character_by_name(&opts.root)?;
+        let pointed = match sheet.as_ref().and_then(|sheet| sheet.console_ctx) {
+            Some(id) => db.get_context(id)?.filter(|row| !row.is_archived()),
+            None => None,
+        };
+        Ok((sheet.and_then(|sheet| sheet.root_ctx), pointed))
+    })?;
+    let root_console = root_console.ok_or_else(|| format!("'{}' has no root context for the console to answer to", opts.root))?;
+    let console = match pointed {
+        Some(row) => Some(row),
+        None => match read(shared, |db| db.find_context_by_label(CONSOLE_LABEL))? {
+            None => {
+                let argv = words(&[
+                    "context", "create", performer, "--name", CONSOLE_LABEL, "--type", "console",
+                    "--parent", &root_console.to_string(), "--senpai", &root_console.to_string(),
+                ]);
+                dispatch(shared, caller, argv, &mut report).await?;
+                dispatch(shared, caller, words(&["character", "set", &opts.root, "--console", CONSOLE_LABEL]), &mut report).await?;
+                None
+            }
+            Some(row) if row.performer == Some(played_id) && row.senpai_ctx == Some(root_console) => {
+                dispatch(shared, caller, words(&["character", "set", &opts.root, "--console", CONSOLE_LABEL]), &mut report).await?;
+                Some(row)
+            }
+            Some(row) => {
+                let performed = match row.performer {
+                    Some(other) => format!("performed by {}", read(shared, |db| Ok(db.name_for(other)))?),
+                    None => "with no performer".to_string(),
+                };
+                report.notes.push(format!(
+                    "{} holds the label {CONSOLE_LABEL} ({performed}) and is not {}'s console; archive or rename it \
+                     and run bootstrap again to create the console",
+                    row.context_id.short(), opts.root
+                ));
+                return Ok(report);
+            }
+        },
+    };
+    match console {
+        // Just created, with the performer's model as it is now.
+        None => {}
+        Some(row) if row.performer != Some(played_id) => report.notes.push(format!(
+            "The console is not played by {performer}; rotation keeps its character, so archive the console and run \
+             bootstrap again to create it as {performer}"
         )),
-        Some(row) if read(shared, |db| db.context_character(row.context_id))?.map(|c| c.principal_id) != Some(played_id) => {
-            report.notes.push(format!(
-                "The console is not played by {performer}; rotation keeps its character, so archive the console and run \
-                 bootstrap again to create it as {performer}"
-            ))
-        }
         // A context copies its character's model when it is made, so a
         // console whose own model does not resolve takes its performer's on
         // rotation, once the performer has a chat model.
         Some(row) if read(shared, |db| Ok(performer_model_usable(db, played_id)? && !console_model_resolves(db, row.context_id)?))? => {
-            let argv = words(&["context", "rotate", CONSOLE_LABEL]);
+            let label = row.label.clone().unwrap_or_else(|| row.context_id.to_string());
+            let argv = words(&["context", "rotate", &label]);
             let line = format!("kj {}", argv.join(" "));
             match shared.kj_dispatcher.dispatch(&argv, caller).await {
                 KjResult::Ok { .. } | KjResult::Switch(..) => report.ran.push(line),
@@ -396,20 +422,6 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             }
         }
         Some(_) => report.notes.push("The console is already set up".to_string()),
-    }
-
-    // The root's sheet points at the console, so the kernel finds it without a
-    // label. A console that was made, rotated or accepted above and is not yet
-    // pointed at gets the pointer; one bootstrap does not accept is left alone.
-    let unpointed = read(shared, |db| {
-        let Some(row) = db.find_context_by_label(CONSOLE_LABEL)? else { return Ok(false) };
-        let accepted = row.context_type == "console"
-            && db.context_character(row.context_id)?.map(|c| c.principal_id) == Some(played_id);
-        let pointed = db.get_character_by_name(&opts.root)?.is_some_and(|sheet| sheet.console_ctx.is_some());
-        Ok(accepted && !pointed)
-    })?;
-    if unpointed {
-        dispatch(shared, caller, words(&["character", "set", &opts.root, "--console", CONSOLE_LABEL]), &mut report).await?;
     }
 
     Ok(report)

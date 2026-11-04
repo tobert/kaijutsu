@@ -242,6 +242,8 @@ pub fn drift_into_a_root_console(server: &EphemeralServer, text: &str) {
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
         for argv in [
             vec!["context", "create", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER, "--name", "console", "--type", "console"],
+            // The console is the context the root's sheet points at.
+            vec!["character", "set", kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT, "--console", "console"],
             vec!["drift", "push", "console", text],
         ] {
             let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();

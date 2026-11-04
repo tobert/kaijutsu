@@ -30,6 +30,41 @@ pub struct ContextCharacterRow {
     pub created_at: i64,
 }
 
+/// What a context is, read from its performer and the character pointers
+/// (`docs/character.md`, "A person, the console, MCP sessions, the judge").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextFacts {
+    /// The performer's name; `None` for a context with no performer.
+    pub performer: Option<String>,
+    /// The performer is a root character, a person.
+    pub performed_by_person: bool,
+    /// Some character's `root_ctx` names the context.
+    pub is_root_console: bool,
+    /// Some character's `console_ctx` names the context.
+    pub is_console: bool,
+    /// The context's parent (`forked_from`) is the MCP hub some character's
+    /// `mcp_hub_ctx` names.
+    pub is_mcp_session: bool,
+}
+
+/// The facts columns, selected from `contexts c` left-joined to its
+/// performer's sheet `p`.
+const CONTEXT_FACTS_SELECT: &str = "SELECT c.context_id, p.name, COALESCE(p.root, 0),
+        EXISTS(SELECT 1 FROM characters r WHERE r.root_ctx = c.context_id),
+        EXISTS(SELECT 1 FROM characters k WHERE k.console_ctx = c.context_id),
+        EXISTS(SELECT 1 FROM characters h WHERE h.mcp_hub_ctx = c.forked_from)
+     FROM contexts c LEFT JOIN characters p ON p.principal_id = c.performer";
+
+fn read_context_facts(r: &rusqlite::Row<'_>) -> SqliteResult<(ContextId, ContextFacts)> {
+    Ok((read_context_id(r, 0)?, ContextFacts {
+        performer: r.get(1)?,
+        performed_by_person: r.get(2)?,
+        is_root_console: r.get(3)?,
+        is_console: r.get(4)?,
+        is_mcp_session: r.get(5)?,
+    }))
+}
+
 /// A copy of one character slot, tunables filled from the model's row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextSlotRow {
@@ -268,22 +303,21 @@ impl KernelDb {
     }
 
     /// The one Rust check on a senpai edge about to be written. `senpai`
-    /// must exist and not be `context`; `None` is allowed only for a root
-    /// console: a context of type `root` whose performer is a root character
-    /// (`characters.root_ctx` is set after the console row is written).
+    /// must exist and not be `context`; `None` is allowed only for a context
+    /// a root character performs, which is that character's root console
+    /// once `characters.root_ctx` is pointed at it after the row is written.
     pub fn check_senpai_edge(
         &self,
         context: ContextId,
-        context_type: &str,
         performer: Option<PrincipalId>,
         senpai: Option<ContextId>,
     ) -> KernelDbResult<()> {
         let Some(senpai) = senpai else {
             let root = match performer {
-                Some(performer) => self.get_character(performer)?.is_some_and(|sheet| sheet.root),
+                Some(performer) => self.is_person(performer)?,
                 None => false,
             };
-            if !root || context_type != kaijutsu_types::ROOT_CONTEXT_TYPE {
+            if !root {
                 return Err(KernelDbError::Validation(format!(
                     "context {} needs a senpai: only a root character's console has none, \
                      and `kj character create --root` makes it",
@@ -431,9 +465,9 @@ impl KernelDb {
         persona: Option<&str>,
     ) -> KernelDbResult<ContextCharacterRow> {
         self.atomically(|db| {
-            let Some(row) = db.get_context(context_id)? else {
+            if db.get_context(context_id)?.is_none() {
                 return Err(KernelDbError::NotFound(format!("context {}", context_id.short())));
-            };
+            }
             if db.context_character(context_id)?.is_some() {
                 return Err(KernelDbError::Validation(format!(
                     "context {} already has a performer, which is fixed when the context is made",
@@ -442,7 +476,7 @@ impl KernelDb {
             }
             require_character_sheet(&db.conn, principal_id)?;
             if senpai.is_some() {
-                db.check_senpai_edge(context_id, &row.context_type, Some(principal_id), senpai)?;
+                db.check_senpai_edge(context_id, Some(principal_id), senpai)?;
             }
             db.conn.execute(
                 "UPDATE contexts SET performer = ?2, senpai_ctx = ?3, persona = ?4 WHERE context_id = ?1",
@@ -584,20 +618,80 @@ impl KernelDb {
         )?)
     }
 
-    /// Archive each live `root` context that has no senpai and that no
-    /// character's `root_ctx` names, and return them. A root console's
-    /// rotation inserts its successor before `commit_rotation` moves
-    /// `root_ctx`; a rotation that stopped between the two leaves such a row,
-    /// which no verb can place or promote. The predecessor is still the console.
+    /// Whether `principal_id` is a person: a character whose sheet has the
+    /// `root` flag. A principal with no sheet is not one.
+    pub fn is_person(&self, principal_id: PrincipalId) -> KernelDbResult<bool> {
+        Ok(self.get_character(principal_id)?.is_some_and(|sheet| sheet.root))
+    }
+
+    /// Whether a person performs `context`. Every context a person performs
+    /// is alike: it runs no model turns, its draft runs as shell, and the
+    /// person may confirm their own commands there.
+    pub fn performed_by_person(&self, context: ContextId) -> KernelDbResult<bool> {
+        match self.get_context(context)?.and_then(|row| row.performer) {
+            Some(performer) => self.is_person(performer),
+            None => Ok(false),
+        }
+    }
+
+    /// The character whose `console_ctx` names `context`: the person whose
+    /// console it is. `None` when no sheet points at it.
+    pub fn console_owner(&self, context: ContextId) -> KernelDbResult<Option<PrincipalId>> {
+        Ok(self.conn.query_row(
+            "SELECT principal_id FROM characters WHERE console_ctx = ?1 ORDER BY principal_id LIMIT 1",
+            params![blob_param(context.as_bytes())],
+            |r| read_principal_id(r, 0),
+        ).optional()?)
+    }
+
+    /// Whether `context` is a console: the context some character's
+    /// `console_ctx` names.
+    pub fn is_console(&self, context: ContextId) -> KernelDbResult<bool> {
+        Ok(self.console_owner(context)?.is_some())
+    }
+
+    /// Every live console: the live contexts that a `console_ctx` names.
+    pub fn list_live_consoles(&self) -> KernelDbResult<Vec<ContextId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT c.context_id FROM contexts c JOIN characters k ON k.console_ctx = c.context_id
+             WHERE c.archived_at IS NULL ORDER BY c.context_id",
+        )?;
+        Ok(stmt.query_map([], |r| read_context_id(r, 0))?.collect::<SqliteResult<_>>()?)
+    }
+
+    /// The facts about `context` that clients read instead of a context type
+    /// ([`ContextFacts`]). A context with no row has none and refuses.
+    pub fn context_facts(&self, context: ContextId) -> KernelDbResult<ContextFacts> {
+        self.conn.query_row(
+            &format!("{CONTEXT_FACTS_SELECT} WHERE c.context_id = ?1"),
+            params![blob_param(context.as_bytes())],
+            read_context_facts,
+        ).optional()?
+            .map(|(_, facts)| facts)
+            .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context.short())))
+    }
+
+    /// [`Self::context_facts`] for every context, in one query.
+    pub fn all_context_facts(&self) -> KernelDbResult<std::collections::HashMap<ContextId, ContextFacts>> {
+        let mut stmt = self.conn.prepare(CONTEXT_FACTS_SELECT)?;
+        Ok(stmt.query_map([], read_context_facts)?.collect::<SqliteResult<_>>()?)
+    }
+
+    /// Archive each live context a root character performs that has no
+    /// senpai and that no character's `root_ctx` names, and return them. A
+    /// root console's rotation inserts its successor before `commit_rotation`
+    /// moves `root_ctx`; a rotation that stopped between the two leaves such
+    /// a row, which no verb can place or promote. The predecessor is still
+    /// the console.
     pub fn archive_uncommitted_root_successors(&self) -> KernelDbResult<Vec<ContextId>> {
         let strays: Vec<ContextId> = {
             let mut stmt = self.conn.prepare(
-                "SELECT context_id FROM contexts
-                 WHERE context_type = ?1 AND senpai_ctx IS NULL AND archived_at IS NULL
-                   AND context_id NOT IN (SELECT root_ctx FROM characters WHERE root_ctx IS NOT NULL)
-                 ORDER BY created_at, context_id",
+                "SELECT c.context_id FROM contexts c JOIN characters p ON p.principal_id = c.performer
+                 WHERE p.root = 1 AND c.senpai_ctx IS NULL AND c.archived_at IS NULL
+                   AND c.context_id NOT IN (SELECT root_ctx FROM characters WHERE root_ctx IS NOT NULL)
+                 ORDER BY c.created_at, c.context_id",
             )?;
-            stmt.query_map([kaijutsu_types::ROOT_CONTEXT_TYPE], |r| read_context_id(r, 0))?
+            stmt.query_map([], |r| read_context_id(r, 0))?
                 .collect::<SqliteResult<_>>()?
         };
         for stray in &strays {
@@ -663,7 +757,7 @@ impl KernelDb {
                 self.context_name(context)
             )));
         }
-        self.check_senpai_edge(context, &row.context_type, row.performer, senpai)?;
+        self.check_senpai_edge(context, row.performer, senpai)?;
         if let Some(senpai) = senpai {
             let mut visited = HashSet::new();
             let mut walk = self.senpai_of(senpai)?;

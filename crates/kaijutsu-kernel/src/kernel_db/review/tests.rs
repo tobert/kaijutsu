@@ -602,18 +602,22 @@ fn a_null_senpai_outside_a_root_console_is_refused() {
     // The Rust guard.
     let error = db.set_context_senpai(lane.context_id, None).unwrap_err().to_string();
     assert!(error.contains("only a root console has no senpai"), "{error}");
-    let error = db.check_senpai_edge(lane.context_id, "coder", Some(coder), None).unwrap_err().to_string();
+    let error = db.check_senpai_edge(lane.context_id, Some(coder), None).unwrap_err().to_string();
     assert!(error.contains("needs a senpai"), "{error}");
-    assert!(
-        db.check_senpai_edge(console.context_id, kaijutsu_types::ROOT_CONTEXT_TYPE, Some(amy), None).is_ok(),
-        "a root's console has none"
-    );
-    let error = db.check_senpai_edge(lane.context_id, "coder", Some(amy), None).unwrap_err().to_string();
-    assert!(error.contains("needs a senpai"), "a root character's other contexts have one: {error}");
+    let error = db.check_senpai_edge(lane.context_id, None, None).unwrap_err().to_string();
+    assert!(error.contains("needs a senpai"), "a context with no performer has one: {error}");
+    assert!(db.check_senpai_edge(console.context_id, Some(amy), None).is_ok(), "a root's console has none");
     let mut bare = make_context_row(Some("bare"));
     bare.performer = Some(coder);
     let error = db.insert_placed_context(&bare, ws_id).unwrap_err().to_string();
     assert!(error.contains("needs a senpai"), "{error}");
+    // The rule reads the performer, not the type: a context of any type a
+    // root character performs may be written with no senpai, to become its
+    // root console when the same transaction sets `root_ctx`.
+    let mut person = make_context_row(Some("person-top"));
+    person.context_type = "coder".into();
+    person.performer = Some(amy);
+    db.insert_placed_context(&person, ws_id).expect("a root character's context may have no senpai");
     // The trigger, under the guard.
     let error = db
         .conn

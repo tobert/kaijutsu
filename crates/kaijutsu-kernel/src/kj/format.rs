@@ -346,7 +346,6 @@ pub fn format_context_info(
         lines.push(format!("Context: {}", label_display));
     }
     lines.push(format!("ID:      {}", ctx.context_id.short()));
-    lines.push(format!("Type:    {}", ctx.context_type));
     if let Some(tid) = trace_id {
         lines.push(format!("Trace:   {}", hex32(tid)));
     }
@@ -721,8 +720,8 @@ mod tests {
         assert!(output.contains("test-ctx *"));
         assert!(output.contains("Children: 2"));
         assert!(output.contains("Drifts:  1"));
-        // context_type always renders.
-        assert!(output.contains("Type:    default"));
+        // The type is not shown; `kj context info` names the performer.
+        assert!(!output.contains("Type:"), "{output}");
         // No trace id passed -> no Trace line.
         assert!(!output.contains("Trace:"));
     }
@@ -761,12 +760,10 @@ mod tests {
     #[test]
     fn info_shows_trace_id_when_present() {
         let id = ContextId::new();
-        let mut row = make_row(Some("coder-ctx"), id);
-        row.context_type = "coder".to_string();
+        let row = make_row(Some("coder-ctx"), id);
         let mut tid = [0u8; 16];
         tid[15] = 0xab;
         let output = format_context_info(&row, 0, 0, false, Some(tid));
-        assert!(output.contains("Type:    coder"));
         // 32 lowercase hex chars, leading zeros preserved.
         assert!(output.contains("Trace:   000000000000000000000000000000ab"));
     }

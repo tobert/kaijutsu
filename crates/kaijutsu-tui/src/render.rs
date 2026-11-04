@@ -708,6 +708,11 @@ mod tests {
             cache_ttl_secs: Some(300),
             input_tokens: Some(1_000),
             cost: None,
+            performer: None,
+            performed_by_person: false,
+            is_root_console: false,
+            is_console: false,
+            is_mcp_session: false,
         }
     }
 

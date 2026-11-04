@@ -252,6 +252,8 @@ fn a_drift_into_root_waits_on_the_wire_for_the_humans_allow() {
         add_character(&rig.kernel, rootbot, "rootbot");
         let console = common::create_context_typed(&rig.amy_kj, "console", "console").await.unwrap();
         rig.kernel.kernel_db.lock().assign_test_review_recasting(console, Some(rootbot), None).unwrap();
+        // The console is the context amy's sheet points at.
+        rig.kernel.kernel_db.lock().set_character_console_ctx(rig.amy, Some(console)).unwrap();
         let source = common::create_context_typed(&rig.amy_kj, "drift-source", "default").await.unwrap();
         rig.kernel.kernel_db.lock().assign_test_review_recasting(source, Some(rig.coder), None).unwrap();
 

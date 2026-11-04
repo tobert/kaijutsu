@@ -78,7 +78,8 @@ lifecycle runs.
 
 A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root (<root>) may <act>". Also true:
 
-- A root character never performs an instance other than its root console.
+- A person (a root character) may perform any context; every context a person performs runs no model turns,
+  and its draft runs as shell.
 - `kj context create <character>` needs the Operator capability and a live character caller, and raises no ask. The new
   instance's senpai is the caller's instance, or the `--senpai <ctx>` instance the caller has authority over.
 - A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own
@@ -92,11 +93,13 @@ the kohai. Every client creation names its performer as the positional character
 
 Ring placement and conclusion do not follow the lineage. `kj context
 promote`, `demote`, and `conclude` need the operator capability, except
-for a live root character: it acts as a human root from any context. The console
-and a human root may act on any context. Another seat, such
-as a director, may act on any context except a human root, a console, or
-its own; for its own, it asks the console. Only a human root demotes or concludes
-a human root or a console, and nobody concludes a human root. See
+for a person (a live root character): they act as a human root from any context,
+and a context grants nothing because of its type or label. The console (the
+context a person's `console_ctx` names) and a person may act on any context.
+Another seat, such as a director, may act on any context except a root console,
+the console, or its own; for its own, it asks the console. Only a person demotes
+or concludes a root console, only the person whose console it is concludes,
+demotes or archives the console, and nobody concludes a root console. See
 `docs/character.md`, "The console places contexts".
 
 ## Three identities
@@ -159,8 +162,8 @@ it, the kernel's only live root console is used. The named character
 becomes the performer, the new instance is a kohai of the instance of the
 context that creates it, and the reviewer follows the senpai edge.
 `kaijutsu-tui` and `kaijutsu-mcp` take the same `--character` (MCP also reads
-`KAIJUTSU_CHARACTER`); a root's connection needs it, since a root performs
-only its root console. Without `--character`, use ACP session loading
+`KAIJUTSU_CHARACTER`); a root's connection needs it, since a context a root
+performs runs no model turns. Without `--character`, use ACP session loading
 to attach to an already configured context. The flag selects a character;
 `--context-type` still selects the rc bundle.
 

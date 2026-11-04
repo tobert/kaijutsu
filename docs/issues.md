@@ -48,6 +48,14 @@ the character"). Open, outside M2:
 - Read-only pipes (`kj ... | head`, `| jq`) through the MCP shell raise asks
   for Amy; a probe should run the bare verb.
 
+## Type melt M5a: what persons and pointers leave open (2026-11-04)
+
+- `kaijutsu-tui` `ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs` fails at "Ctrl+Z did not
+  return to the root … no context attached", identically at the commit before M5a (checked on a clean copy); a client-side
+  Ctrl+Z return bug for M5b.
+- docs/writing.md Terms define "root console" and "console" by type, and docs/character.md "Roots and rotation"
+  says "The console is a type, not a label"; M7 rewrites both.
+
 ## Type melt M4: what gate layers by directory and character leave open (2026-11-04)
 
 - The `KJ_TOOL_PLAN` tier stamp comes from `command_verdict` (`kj/gate_policy.rs`), which does not consult the

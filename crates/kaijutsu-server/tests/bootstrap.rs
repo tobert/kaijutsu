@@ -393,3 +393,50 @@ fn the_rc_note_warns_that_the_change_moves_every_context_the_character_plays() {
         assert!(!note.contains("kj character set root --rc console"), "and does not recommend the change: {note}");
     });
 }
+
+/// Bootstrap finds the console by the root's pointer and its performer, not
+/// by its type: a pointed console of another type is the console, and a
+/// second run changes nothing. Falsified by reading the type.
+#[test]
+fn bootstrap_finds_the_console_by_the_pointer_not_the_type() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let opts = options(&config, Some(BackendChoice::mock("mock-model")));
+        bootstrap(&config, &opts).await.expect("bootstrap");
+        let console = {
+            let db = kernel_db(&config);
+            let console = db.get_character_by_name("amy").unwrap().unwrap().console_ctx.expect("the root points at its console");
+            db.update_context_type(console, "coder").unwrap();
+            console
+        };
+        let again = bootstrap(&config, &opts).await.expect("bootstrap again");
+        assert!(again.ran.is_empty(), "{again:?}");
+        assert!(again.notes.iter().any(|n| n == "The console is already set up"), "{again:?}");
+        assert_eq!(kernel_db(&config).get_character_by_name("amy").unwrap().unwrap().console_ctx, Some(console));
+    });
+}
+
+/// With no pointer, a context labeled `console` that the performer does not
+/// play is not adopted: the report names it and its performer, and nothing
+/// is made or pointed at.
+#[test]
+fn bootstrap_leaves_a_console_label_it_does_not_accept_alone() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let opts = options(&config, None);
+        bootstrap(&config, &opts).await.expect("bootstrap");
+        let console = {
+            let db = kernel_db(&config);
+            let amy = db.get_character_by_name("amy").unwrap().unwrap();
+            db.set_character_console_ctx(amy.principal_id, None).unwrap();
+            db.find_context_by_label("console").unwrap().unwrap().context_id
+        };
+        let mut other = opts.clone();
+        other.console_performer = "other".to_string();
+        let again = bootstrap(&config, &other).await.expect("bootstrap as another performer");
+        let note = again.notes.iter().find(|n| n.contains("holds the label console")).unwrap_or_else(|| panic!("{again:?}"));
+        assert!(note.contains(&console.short()) && note.contains("performed by root"), "{note}");
+        assert!(!again.ran.iter().any(|l| l.contains("context create") || l.contains("--console")), "{again:?}");
+        assert_eq!(kernel_db(&config).get_character_by_name("amy").unwrap().unwrap().console_ctx, None);
+    });
+}

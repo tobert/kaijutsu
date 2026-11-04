@@ -68,9 +68,8 @@ pub(crate) fn settle_drift_answer(
 /// approval worker acts on. A held drift whose ask is open, or answered and
 /// not yet settled, is left for that answer. Returns how many it dismissed.
 pub fn reconcile_root_held_drifts(kernel: &crate::Kernel) -> Result<usize, String> {
-    let consoles: Vec<ContextId> = kernel.kernel_db().lock().list_active_contexts()
-        .map_err(|e| format!("could not list contexts: {e}"))?
-        .into_iter().filter(|row| row.is_console()).map(|row| row.context_id).collect();
+    let consoles: Vec<ContextId> = kernel.kernel_db().lock().list_live_consoles()
+        .map_err(|e| format!("could not list the consoles: {e}"))?;
     let mut dismissed = 0;
     for console in consoles {
         let live = {
@@ -286,9 +285,8 @@ impl KjDispatcher {
         caller: &KjCaller,
     ) -> Result<DriftDeliveryOutcome, String> {
         let admission = self.kernel().admit_context(target_ctx)?;
-        let held = drift_kind != DriftKind::Notification && self.kernel_db().lock().get_context(target_ctx)
-            .map_err(|e| format!("could not read the target context: {e}"))?
-            .is_some_and(|row| row.is_console());
+        let held = drift_kind != DriftKind::Notification && self.kernel_db().lock().is_console(target_ctx)
+            .map_err(|e| format!("could not read whether the target is a console: {e}"))?;
         // Resolved before anything is written, so a refusal leaves no trace.
         let reviewer = if held { Some(self.drift_reviewer(target_ctx)?) } else { None };
         let after = self.block_store().last_block_id(target_ctx);
@@ -1452,14 +1450,12 @@ mod tests {
             for model in [rootbot, coder] {
                 db.seed_test_slot_entries(model, &[("distill", "mock", "mock-model")]).unwrap();
             }
-            for (context, performer, reviewer, context_type) in [
-                (root, amy, None, crate::kj::character::ROOT_CONTEXT_TYPE),
-                (console, rootbot, Some(amy), kaijutsu_types::CONSOLE_CONTEXT_TYPE),
-                (lane, coder, Some(amy), "coder"),
-            ] {
+            for (context, performer, reviewer) in [(root, amy, None), (console, rootbot, Some(amy)), (lane, coder, Some(amy))] {
                 db.assign_test_review(context, Some(performer), reviewer).unwrap();
-                db.update_context_type(context, context_type).unwrap();
             }
+            // The console is the one amy's sheet points at; its type is not read.
+            db.set_character_root_ctx(amy, Some(root)).unwrap();
+            db.set_character_console_ctx(amy, Some(console)).unwrap();
         }
         for context in [console, lane] {
             d.block_store().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
@@ -1772,7 +1768,6 @@ mod tests {
     async fn a_drift_into_a_root_console_with_no_character_is_refused() {
         let h = root_house().await;
         let bare = register_context(&h.d, Some("console-bare"), Some(h.console), h.amy);
-        h.d.kernel_db().lock().update_context_type(bare, kaijutsu_types::CONSOLE_CONTEXT_TYPE).unwrap();
         let outcome = h.d.drift_reviewer(bare);
         let error = outcome.expect_err("a console with no character has no reviewer");
         assert!(error.contains("no performer") && error.contains("kj context create"), "names the repair: {error}");

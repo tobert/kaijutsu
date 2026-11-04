@@ -715,20 +715,20 @@ fn shell_submit_authors_the_command_before_clearing_the_draft() {
     });
 }
 
-/// A shell context is a REPL: a chat-mode submit runs the draft as a shell
-/// command, the way a shell-mode submit does, and starts no model turn.
+/// A context a person performs is a REPL, whatever its type: a chat-mode
+/// submit runs the draft as a shell command, the way a shell-mode submit
+/// does, and starts no model turn. Falsified by reading the context type.
 #[test]
-fn shell_context_chat_submit_runs_the_draft_as_shell() {
+fn a_persons_context_chat_submit_runs_the_draft_as_shell() {
     run_local(async {
         let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
-        let context_id = open_context(&kernel, "draft-shell-repl").await;
-        server
-            .kernel_db
-            .lock()
-            .update_context_type(context_id, "shell")
-            .unwrap();
+        let person = kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT;
+        let context_id = common::create_context_typed_as(&kernel, "draft-shell-repl", "shell", person).await.unwrap();
+        // The type is not what makes it a REPL.
+        server.kernel_db.lock().update_context_type(context_id, "default").unwrap();
+        kernel.join_context(context_id, "draft-test").await.unwrap();
 
         kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
         let result = kernel.submit_input(context_id, false).await.unwrap();
@@ -863,33 +863,26 @@ fn refused_shell_submit_keeps_its_draft() {
     });
 }
 
-/// Typing in the human root is refused as a refusal, not a fault: the human
-/// root runs no model turns, and the reason points to the console and `Ctrl+Z`
-/// instead of asking for a reviewer. The draft stays as typed.
+/// A person's root console is a context the person performs, so a chat
+/// submit there runs the draft as shell and starts no model turn.
 #[test]
-fn a_chat_submit_in_the_human_root_says_it_runs_no_model_turns() {
+fn a_chat_submit_in_the_root_console_runs_the_draft_as_shell() {
     run_local(async {
         let (addr, _live_kernel) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
         let root = kernel.list_contexts().await.unwrap().into_iter()
-            .find(|c| c.context_type == kaijutsu_types::ROOT_CONTEXT_TYPE)
-            .expect("the kernel has a human root")
+            .find(|c| c.is_root_console)
+            .expect("the kernel has a root console")
             .id;
         kernel.join_context(root, "draft-test").await.unwrap();
-        kernel.edit_input(root, 0, "hello root", 0).await.unwrap();
-        let before = draft(&kernel, root).await.unwrap();
+        kernel.edit_input(root, 0, "echo hello root", 0).await.unwrap();
 
-        let error = kernel.submit_input(root, false).await.unwrap_err();
-        let kaijutsu_client::RpcError::Refused(refusal) = error else {
-            panic!("expected a refusal, not a fault: {error:?}");
-        };
-        assert!(refusal.reason.contains("human root runs no model turns"), "{refusal:?}");
-        assert!(refusal.reason.contains("console") && refusal.reason.contains("Ctrl+Z"), "{refusal:?}");
-        assert!(!refusal.reason.contains("review"), "{refusal:?}");
-        let after = draft(&kernel, root).await.expect("refusal preserves the draft");
-        assert_eq!(after.id, before.id);
-        assert_eq!(after.content, "hello root");
+        let result = kernel.submit_input(root, false).await.unwrap();
+        let all = blocks(&kernel, root).await;
+        let command = all.iter().find(|b| b.id == result.block_id).expect("the command block exists");
+        assert_eq!(command.kind, BlockKind::ToolCall, "the root console's submit authors the shell command");
+        assert!(!all.iter().any(|b| b.role == Role::Model), "the root console's submit starts no model turn");
     });
 }
 
