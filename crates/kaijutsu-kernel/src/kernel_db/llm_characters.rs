@@ -124,25 +124,32 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
 
 impl KernelDb {
     /// Insert or replace one slot of a character. The role is `distill` or
-    /// `gate`, and a `gate` slot names a council server (a backend of kind
-    /// `mk`); anything else refuses, naming the fix.
+    /// `gate`. A `gate` slot names a council server (a backend of kind `mk`),
+    /// and a `distill` slot names a chat model (any other kind); anything
+    /// else refuses, naming the fix.
     pub fn set_character_slot(&self, row: &CharacterSlotRow) -> KernelDbResult<()> {
         if row.role.trim().is_empty() {
             return Err(KernelDbError::Validation("role must not be empty".into()));
         }
         crate::model_resolution::refuse_character_slot_role(&row.role, &self.name_for(row.principal_id))
             .map_err(KernelDbError::Validation)?;
-        if row.role == crate::council::gate::GATE {
-            let backend = self
-                .get_backend(row.backend_id)?
-                .ok_or_else(|| KernelDbError::NotFound(format!("backend {}", row.backend_id)))?;
-            if !crate::model_resolution::is_council_kind(&backend.kind) {
-                return Err(KernelDbError::Validation(format!(
-                    "a `gate` slot names a council server, and backend {} is kind {}, not mk; \
-                     `kj backend list` names the mk backends",
-                    backend.name, backend.kind
-                )));
-            }
+        let backend = self
+            .get_backend(row.backend_id)?
+            .ok_or_else(|| KernelDbError::NotFound(format!("backend {}", row.backend_id)))?;
+        let council_server = crate::model_resolution::is_council_kind(&backend.kind);
+        if row.role == crate::council::gate::GATE && !council_server {
+            return Err(KernelDbError::Validation(format!(
+                "a `gate` slot names a council server, and backend {} is kind {}, not mk; \
+                 `kj backend list` names the mk backends",
+                backend.name, backend.kind
+            )));
+        }
+        if row.role == crate::model_resolution::DISTILL && council_server {
+            return Err(KernelDbError::Validation(format!(
+                "a `distill` slot names a chat model, and backend {} is kind mk, a council server, which \
+                 distills nothing; name a backend of another kind (`kj backend list`)",
+                backend.name
+            )));
         }
         if row.model.trim().is_empty() {
             return Err(KernelDbError::Validation("model must not be empty".into()));

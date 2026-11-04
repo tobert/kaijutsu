@@ -862,8 +862,9 @@ answers its turns. A context with no performer runs no rc and no turns.
 `load_scripts(rc_dir, verb)` reads `/config/rc/<rc_dir>/<verb>/`, where `rc_dir` is the performer's. A context
 with no performer runs none. rc gets `KJ_CHARACTER` (the performer's name) and `KJ_RC_DIR`; `KJ_CONTEXT_TYPE` is
 gone. Shared fragments stay in `lib/` and are linked into a directory, as today. A script that wants only some of
-a context's children names them by performer: `kj context archive --children --performer judge --confirm` (the
-coder's archive) and `--performer "$KJ_CHARACTER"` (the companion's tick) replace `--children --type`.
+a context's children names them by performer: `kj context archive --children --performer "$KJ_CHARACTER"` (the
+companion's tick) replaces `--children --type`. The kernel archives a context's judge shadows with it, in the same
+transaction, wherever it archives that context; no rc script does.
 
 The merged directories take these bodies. `person/` takes the root console's bindings, so a person's Ctrl+Z
 contexts carry the person's whole loadout ("your contexts are all alike": yes, 2026-11-04); capabilities narrow

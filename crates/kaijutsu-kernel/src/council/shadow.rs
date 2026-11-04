@@ -19,9 +19,9 @@
 //! backend of kind `mk`) is primed after each call: the shadow is sent whole
 //! on a task of its own, warming the seat's shell spec, so the server holds
 //! the dialogue before it is asked about it. A judge on a chat backend is
-//! hydrated whole when it is asked. A judge on an `mk` backend with no
-//! address, or a shadow with no `model` slot, is never primed, and each
-//! judge read is a miss that names why.
+//! not asked: its shadow records the dialogue and nothing reads it. A judge
+//! on an `mk` backend with no address, or a shadow with no `model` slot, is
+//! never primed, and each judge read is a miss that names why.
 //!
 //! After the council decides a judged seat's call, [`spawn_judge`] reads the
 //! decision's configured contexts and the shadow on the judge's server,
@@ -78,6 +78,8 @@ pub(crate) struct JudgeRead {
     seat: ContextId,
     seat_name: String,
     shadow: ContextId,
+    /// The shadow's own label, which names it in the record.
+    shadow_label: String,
     call: BlockId,
     /// The judge's council server and served model, or why its `mk`
     /// backend names none.
@@ -87,6 +89,8 @@ pub(crate) struct JudgeRead {
 /// A seat's judge shadow and where its model is served.
 struct Judge {
     shadow: ContextId,
+    /// The shadow's label, or its short id when it has none.
+    shadow_label: String,
     /// The seat's label, or its short id when it has none.
     seat_name: String,
     seat_type: String,
@@ -134,6 +138,7 @@ pub(crate) async fn record_call(
         seat,
         seat_name: judge.seat_name.clone(),
         shadow,
+        shadow_label: judge.shadow_label.clone(),
         call: call.clone(),
         server,
     });
@@ -225,7 +230,7 @@ async fn judge_one(
     use gogi_proto::decision::PooledAnswer;
 
     let started = std::time::Instant::now();
-    let label = shadow_label(&read.seat_name);
+    let label = read.shadow_label.clone();
     let spec = super::gate::shell_spec(&council).cloned();
     let mut judged = Judged {
         observation: NewCouncilObservation {
@@ -473,8 +478,13 @@ fn judge_character(db: &crate::kernel_db::KernelDb, name: &str) -> KernelDbResul
 
 /// The seat's live judge shadow: the live child of `seat` that `judge`
 /// performs.
-fn live_shadow(db: &crate::kernel_db::KernelDb, seat: ContextId, judge: PrincipalId) -> KernelDbResult<Option<ContextId>> {
-    Ok(db.fork_children(seat)?.into_iter().find(|c| c.performer == Some(judge)).map(|c| c.context_id))
+fn live_shadow(db: &crate::kernel_db::KernelDb, seat: ContextId, judge: PrincipalId) -> KernelDbResult<Option<ContextRow>> {
+    Ok(db.fork_children(seat)?.into_iter().find(|c| c.performer == Some(judge)))
+}
+
+/// A context's label, or its short id when it has none.
+fn name_of(row: &ContextRow) -> String {
+    row.label.clone().unwrap_or_else(|| row.context_id.short())
 }
 
 /// The seat's live judge shadow, created when the seat's council names a
@@ -492,18 +502,20 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
         let sheet = judge_character(&db, &name)?;
         let mut judge = Judge {
             shadow: seat,
-            seat_name: seat_row.label.clone().unwrap_or_else(|| seat.short()),
+            shadow_label: String::new(),
+            seat_name: name_of(&seat_row),
             seat_type: seat_row.context_type.clone(),
             server: None,
         };
         if let Some(existing) = live_shadow(&db, seat, sheet.principal_id)? {
-            judge.shadow = existing;
-            judge.server = shadow_server(&db, existing)?;
+            judge.shadow = existing.context_id;
+            judge.shadow_label = name_of(&existing);
+            judge.server = shadow_server(&db, existing.context_id)?;
             return Ok(Some((judge, false)));
         }
         // A shadow is performed by the judge character, a child of its seat
         // that answers to it, with the judge character's slots.
-        let row = shadow_row(&seat_row);
+        let row = shadow_row(&db, &seat_row)?;
         db.in_transaction(|db| {
             crate::kj::context::insert_new_context_rows(
                 db,
@@ -512,6 +524,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
             )
         })?;
         judge.shadow = row.context_id;
+        judge.shadow_label = name_of(&row);
         judge.server = shadow_server(&db, row.context_id)?;
         if judge.server.is_none() {
             // The shadow row is already written, so a fault here names the
@@ -576,7 +589,7 @@ pub(crate) fn judge_server(
     let Some(name) = council.judge.as_deref() else { return Ok(None) };
     let Ok(sheet) = judge_character(db, name) else { return Ok(None) };
     if let Some(shadow) = live_shadow(db, seat, sheet.principal_id)? {
-        return Ok(shadow_server(db, shadow)?.and_then(Result::ok));
+        return Ok(shadow_server(db, shadow.context_id)?.and_then(Result::ok));
     }
     let Some(model) = db.get_character_model(sheet.principal_id)? else { return Ok(None) };
     let Some(backend) = db.get_backend(model.backend_id)? else { return Ok(None) };
@@ -592,13 +605,14 @@ pub(crate) fn judge_labels(
     super::reviewer_contexts::ReviewerContextChain::default().decision_labels(council, spec)
 }
 
-/// A judge shadow's row: a child of the seat. The caller gives it its
-/// performer and senpai.
-fn shadow_row(seat: &ContextRow) -> ContextRow {
-    let seat_name = seat.label.clone().unwrap_or_else(|| seat.context_id.short());
-    ContextRow {
+/// A judge shadow's row: a child of the seat, labeled `judge-<seat>`, or
+/// the first free `judge-<seat>-<n>` when a live context holds that. The
+/// caller gives it its performer and senpai.
+fn shadow_row(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbResult<ContextRow> {
+    let label = crate::kj::context::first_free_label(db, &shadow_label(&name_of(seat)))?;
+    Ok(ContextRow {
         context_id: ContextId::new(),
-        label: Some(shadow_label(&seat_name)),
+        label: Some(label),
         system_prompt: None,
         context_state: ContextState::Live,
         context_type: JUDGE.into(),
@@ -616,7 +630,7 @@ fn shadow_row(seat: &ContextRow) -> ContextRow {
         paused_at: None,
         origin_host: None,
         performer: None, senpai_ctx: None, persona: None,
-    }
+    })
 }
 
 #[cfg(test)]

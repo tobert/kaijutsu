@@ -3846,7 +3846,9 @@ impl kernel::Server for KernelImpl {
                         })?,
                         None => kaijutsu_kernel::ContextModelLookup::None(kaijutsu_kernel::NoModel {
                             context: label.clone(),
+                            context_ref: label.clone(),
                             character: None,
+                            rotation_fills: false,
                             role: String::new(),
                             reason: kaijutsu_kernel::model_resolution::NoModelReason::NoContextCharacter,
                             mcp_session: false,

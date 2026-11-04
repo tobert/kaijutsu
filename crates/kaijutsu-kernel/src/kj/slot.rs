@@ -620,6 +620,22 @@ mod tests {
         assert!(council_model.is_ok() && !council_model.message().contains("WARN"), "{}", council_model.message());
     }
 
+    /// A `distill` slot names a chat model, so a council server (a backend
+    /// of kind `mk`) refuses for it, as a chat backend refuses for `gate`.
+    ///
+    /// Falsified by a `distill` slot written on a council server.
+    #[tokio::test]
+    async fn slot_set_refuses_a_distill_slot_on_a_council_server() {
+        let d = seeded().await;
+        let c = test_caller();
+        let refused = d.dispatch(&argv(&["character", "slot", "set", "house", "distill", "mk-zorak/gemma"]), &c).await;
+        assert!(!refused.is_ok(), "{}", refused.message());
+        assert!(refused.message().contains("`distill`") && refused.message().contains("mk-zorak"), "{}", refused.message());
+        let db = d.kernel_db().lock();
+        let house = db.get_character_by_name("house").unwrap().unwrap();
+        assert!(db.get_character_slot(house.principal_id, "distill").unwrap().is_none(), "nothing was written");
+    }
+
     #[tokio::test]
     async fn slot_set_refuses_an_unknown_backend_and_an_unknown_character() {
         let d = seeded().await;

@@ -206,7 +206,7 @@ CREATE TABLE IF NOT EXISTS context_slots (
 -- by kind: dropped, unmapped, no_slot, no_gate_slot, no_distill_slot,
 -- no_character_slot, senpai_assigned, archived_no_senpai, rc_dir_unset and
 -- slot_dropped (no context_id; the principal_id names the character),
--- console_ambiguous.
+-- no_model, console_ambiguous.
 CREATE TABLE IF NOT EXISTS context_character_migration_report (
     report_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT    NOT NULL,

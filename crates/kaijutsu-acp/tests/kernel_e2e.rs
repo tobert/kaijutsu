@@ -608,11 +608,10 @@ fn a_session_at_the_root_opens_with_a_warning() {
 // ---------------------------------------------------------------------------
 
 /// `session/delete` archives the session's context through `kj context
-/// archive`, so the performer's archive rc lifecycle runs: a coder's judge
-/// shadow, the child the judge character performs, is archived with its
-/// seat. A retried delete succeeds.
+/// archive`, and the kernel archives its judge shadow, the child the judge
+/// character performs, with its seat. A retried delete succeeds.
 #[test]
-fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
+fn deleting_a_session_archives_its_context_and_its_judge_shadow() {
     let kernel = Kernel::start(Vec::new());
     let mut client = kernel.connect();
     let cwd = workspace();
@@ -645,6 +644,20 @@ fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
             handoff_ctx: None, root_ctx: None, root: false,
         })
         .expect("create the judge character");
+        // A character whose model is on a council server is a judge.
+        let mk = db
+            .upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "mk".into(),
+                base_url: None, api_key_env: None, api_key_file: None, key_optional: true,
+                request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
+                created_by: PrincipalId::system(),
+            })
+            .expect("a council-server backend");
+        db.set_character_model(&kaijutsu_kernel::kernel_db::CharacterModelRow {
+            principal_id: judge, backend_id: mk.backend_id, model: "gemma".into(), max_tokens: None,
+            temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+        })
+        .expect("give the judge its council server");
         db.note_senpai_intent(shadow, Some(seat)).expect("the shadow answers to the session");
         db.update_performer(shadow, Some(judge)).expect("the judge character performs the shadow");
     }
@@ -660,7 +673,7 @@ fn deleting_a_session_archives_its_context_and_runs_its_archive_lifecycle() {
     let db = kernel.db.lock();
     let archived = |id| db.get_context(id).expect("read").expect("rows are retained").archived_at.is_some();
     assert!(archived(seat), "session/delete archives the session's context");
-    assert!(archived(shadow), "the coder's archive rc lifecycle archived its judge shadow");
+    assert!(archived(shadow), "the kernel archived its judge shadow with it");
 }
 
 // ---------------------------------------------------------------------------

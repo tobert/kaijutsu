@@ -1078,11 +1078,14 @@ impl KjDispatcher {
                 ));
             }
         }
-        self.character_retire_commit(name)
+        let judges = self.council_judges().await;
+        self.character_retire_commit(name, judges.as_deref())
     }
 
-    /// Retire after each played context's archive lifecycle has run.
-    fn character_retire_commit(&self, name: &str) -> KjResult {
+    /// Retire after each played context's archive lifecycle has run. Each
+    /// context's judge shadows are archived with it; `judges` are the judge
+    /// characters gate.toml names, or `None` when it did not load.
+    fn character_retire_commit(&self, name: &str, judges: Option<&[String]>) -> KjResult {
         let db = self.kernel_db().lock();
         let row = match db.get_character_by_name(name) {
             Ok(Some(r)) => r,
@@ -1107,6 +1110,7 @@ impl KjDispatcher {
         // second archival implementation — conclude first (gives up the
         // ring-0 seat, same ladder `kj context archive` walks), then
         // archive (soft delete + sweep the context's unresolved asks).
+        let mut shadows = Vec::new();
         for ctx in &live {
             if let Err(e) = db.conclude_context(ctx.context_id) {
                 return KjResult::Err(format!(
@@ -1114,11 +1118,14 @@ impl KjDispatcher {
                     ctx.context_id.short()
                 ));
             }
-            if let Err(e) = db.archive_context(ctx.context_id) {
-                return KjResult::Err(format!(
-                    "kj character retire: failed to archive {}: {e}",
-                    ctx.context_id.short()
-                ));
+            match db.archive_with_shadows(ctx.context_id, judges) {
+                Ok(archived) => shadows.extend(archived.shadows),
+                Err(e) => {
+                    return KjResult::Err(format!(
+                        "kj character retire: failed to archive {}: {e}",
+                        ctx.context_id.short()
+                    ));
+                }
             }
         }
         let now = kaijutsu_types::now_millis() as i64;
@@ -1130,12 +1137,7 @@ impl KjDispatcher {
         // The in-memory drift router must agree with the row, or an active
         // session could still write a drift op into a context whose
         // character no longer plays it (mirrors `kj context archive`).
-        {
-            let mut drift = self.drift_router().write();
-            for ctx in &live {
-                let _ = drift.set_state(ctx.context_id, ContextState::Archived);
-            }
-        }
+        self.archived_in_router(live.iter().map(|ctx| ctx.context_id).chain(shadows.iter().copied()));
 
         KjResult::ok(format!("retired {name}: {} context(s) archived", live.len()))
     }
@@ -2470,7 +2472,7 @@ mod tests {
         assert!(d.dispatch(&[s("character"), s("set"), s("boss"), s("--console"), s("con")], &caller).await.is_ok());
         let banto = sheet(&d, "banto").principal_id;
         let successor = register_context(&d, Some("con-next"), None, banto);
-        d.kernel_db().lock().commit_rotation(con, successor).unwrap();
+        d.kernel_db().lock().commit_rotation(con, successor, None).unwrap();
         assert_eq!(sheet(&d, "boss").console_ctx, Some(successor), "the pointer follows the label");
         let label = d.kernel_db().lock().get_context(successor).unwrap().unwrap().label;
         assert_eq!(label.as_deref(), Some("con"), "the successor took the label");

@@ -175,6 +175,82 @@ fn a_performer_with_only_a_distill_slot_gets_a_model() {
     });
 }
 
+/// A console whose `model` slot names a council server has no chat model,
+/// though it has a slot: bootstrap rotates it to take its performer's model.
+///
+/// Falsified by reading the slot's existence as a usable model.
+#[test]
+fn a_console_on_a_council_server_slot_is_rotated() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
+        let before = {
+            let db = kernel_db(&config);
+            let mk = db.upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: "mk-zorak".into(), kind: "mk".into(),
+                base_url: None, api_key_env: None, api_key_file: None, key_optional: true,
+                request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
+                created_by: kaijutsu_types::PrincipalId::system(),
+            }).unwrap();
+            let console = db.find_context_by_label("console").unwrap().unwrap().context_id;
+            let conn = rusqlite::Connection::open(config.data_dir.as_ref().unwrap().join("kernel.db")).unwrap();
+            conn.execute(
+                "INSERT INTO context_slots (context_id, role, backend_id, model) VALUES (?1, 'model', ?2, 'gemma')",
+                rusqlite::params![console.as_bytes().to_vec(), mk.backend_id.as_bytes().to_vec()],
+            ).unwrap();
+            console
+        };
+        let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
+            .await
+            .expect("bootstrap with a backend");
+        assert!(report.ran.iter().any(|line| line == "kj context rotate console"), "{report:?}");
+        let db = kernel_db(&config);
+        let console = db.find_context_by_label("console").unwrap().unwrap().context_id;
+        assert_ne!(console, before, "the console was rotated");
+        assert_eq!(db.context_slot(console, "model").unwrap().unwrap().model, "mock-model");
+    });
+}
+
+/// A console rotation that refuses (here, the console holds a drift for its
+/// person) does not fail bootstrap: the report names the refusal and the
+/// rotation to run once it clears, and the console stays as it was.
+///
+/// Falsified by a bootstrap that stops at the refusal.
+#[test]
+fn a_refused_console_rotation_is_reported_and_bootstrap_goes_on() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
+        let console = {
+            let db = kernel_db(&config);
+            let console = db.find_context_by_label("console").unwrap().unwrap().context_id;
+            let amy = db.get_character_by_name("amy").unwrap().unwrap().principal_id;
+            let conn = rusqlite::Connection::open(config.data_dir.as_ref().unwrap().join("kernel.db")).unwrap();
+            let ask = approval_ledger::ask::create_ask(&conn, &approval_ledger::types::NewAsk {
+                context_id: console.as_bytes().to_vec(), principal_id: amy.as_bytes().to_vec(),
+                actor_id: amy.as_bytes().to_vec(), reviewer_id: amy.as_bytes().to_vec(),
+                origin: approval_ledger::types::Origin::Drift, instance: None, tool: None, hook_id: None,
+                description: "a held drift".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: None, exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            // Answered and not yet settled, so it still holds the console.
+            conn.execute("UPDATE approvals SET status = 'allowed' WHERE request_id = ?1", [&ask]).unwrap();
+            console
+        };
+        let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
+            .await
+            .expect("a refused rotation does not fail bootstrap");
+        assert!(!report.ran.iter().any(|line| line.contains("context rotate")), "{report:?}");
+        let note = report.notes.iter().find(|n| n.contains("refused")).unwrap_or_else(|| panic!("a note names the refusal: {report:?}"));
+        assert!(note.contains("drift") && note.contains("`kj context rotate console`"), "the refusal and the rotation: {note}");
+        let db = kernel_db(&config);
+        assert_eq!(db.find_context_by_label("console").unwrap().unwrap().context_id, console, "the console stays");
+        let root = db.get_character_by_name("root").unwrap().unwrap();
+        assert!(db.get_character_model(root.principal_id).unwrap().is_some(), "the steps before it ran");
+    });
+}
+
 /// A model bootstrap has no window for gets no model row, and the report
 /// says so and names the verb that adds one.
 #[test]

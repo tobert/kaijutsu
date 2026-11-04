@@ -8,7 +8,7 @@
 //! changes nothing, and a kernel set up by hand is completed rather than
 //! overwritten.
 
-use kaijutsu_kernel::kernel_db::KernelDb;
+use kaijutsu_kernel::kernel_db::{KernelDb, KernelDbError, KernelDbResult};
 use kaijutsu_kernel::{KjCaller, KjResult};
 use russh::keys::ssh_key::PublicKey;
 
@@ -19,9 +19,6 @@ use crate::ssh::SshServerConfig;
 
 /// The label of the model console.
 const CONSOLE_LABEL: &str = "console";
-/// The role of the console's own model slot: a context copies its character's model
-/// under `model`, which its turns run on.
-const MODEL_ROLE: &str = kaijutsu_kernel::model_resolution::MODEL;
 /// The response budget bootstrap gives the performer's model.
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 
@@ -384,12 +381,19 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                  bootstrap again to create it as {performer}"
             ))
         }
-        // A context copies its character's model when it is written, so a
-        // The console made before its character had a model takes it on rotation.
-        Some(row) if read(shared, |db| {
-            Ok(db.get_character_model(played_id)?.is_some() && db.context_slot(row.context_id, MODEL_ROLE)?.is_none())
-        })? => {
-            dispatch(shared, caller, words(&["context", "rotate", CONSOLE_LABEL]), &mut report).await?;
+        // A context copies its character's model when it is made, so a
+        // console whose own model does not resolve takes its performer's on
+        // rotation, once the performer has a chat model.
+        Some(row) if read(shared, |db| Ok(performer_model_usable(db, played_id)? && !console_model_resolves(db, row.context_id)?))? => {
+            let argv = words(&["context", "rotate", CONSOLE_LABEL]);
+            let line = format!("kj {}", argv.join(" "));
+            match shared.kj_dispatcher.dispatch(&argv, caller).await {
+                KjResult::Ok { .. } | KjResult::Switch(..) => report.ran.push(line),
+                KjResult::Err(message) | KjResult::Latch { message, .. } => report.notes.push(format!(
+                    "The console has no model it can run, and the rotation that gives it {performer}'s refused: \
+                     {message}. Resolve that, then run `{line}`"
+                )),
+            }
         }
         Some(_) => report.notes.push("The console is already set up".to_string()),
     }
@@ -409,6 +413,27 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     }
 
     Ok(report)
+}
+
+/// Whether `performer` has a model a console can run: one on a backend that
+/// is no council server.
+fn performer_model_usable(db: &KernelDb, performer: kaijutsu_types::PrincipalId) -> KernelDbResult<bool> {
+    match db.get_character_model(performer)? {
+        Some(model) => Ok(!db.backend_is_council_server(model.backend_id)?),
+        None => Ok(false),
+    }
+}
+
+/// Whether the console's own `model` slot resolves to a chat model. A slot
+/// on a council server, a chat slot with no `max_tokens`, and no slot at all
+/// do not.
+fn console_model_resolves(db: &KernelDb, console: kaijutsu_types::ContextId) -> KernelDbResult<bool> {
+    match kaijutsu_kernel::context_model(db, console) {
+        Ok(kaijutsu_kernel::ContextModelLookup::Model(_)) => Ok(true),
+        Ok(kaijutsu_kernel::ContextModelLookup::None(_)) => Ok(false),
+        Err(KernelDbError::Validation(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn read<T>(

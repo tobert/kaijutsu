@@ -57,8 +57,11 @@ result is missing:
 4. `kj context create root --name console --type console`, a kohai of the root
    character's own context. The context copies the character's model under `model`, and under `distill` when
    the character has no `distill` slot.
-   When the console exists but has no `model` slot and its character now has a model, bootstrap runs
-   `kj context rotate console`. When the console is played by
+   When the console exists, its `model` slot does not resolve to a chat model (it has none, it names a council
+   server, or it has no `max_tokens`), and its character now has a model that is no council server, bootstrap runs
+   `kj context rotate console`. A rotation that refuses, such as one held by a drift for its person, does not
+   fail bootstrap: the report names the refusal and `kj context rotate console`, and the steps after it run.
+   When the console is played by
    another character than `--console-as` names, the report says so and
    changes nothing, since a rotation keeps the character.
 5. `kj character set <root> --console console`, which points the root's sheet at the console. A console that

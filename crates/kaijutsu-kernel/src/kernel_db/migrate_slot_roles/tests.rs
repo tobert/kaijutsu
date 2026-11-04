@@ -189,7 +189,11 @@ fn live_judge_shadows_are_archived() {
     assert_eq!(row.context_state, kaijutsu_types::ContextState::Archived);
     assert_eq!(r.db.get_context(archived.context_id).unwrap().unwrap().archived_at, archived_at, "an archived one is left alone");
     assert!(r.db.get_context(seat.context_id).unwrap().unwrap().archived_at.is_none(), "the seat stays live");
-    assert_eq!(r.context_roles(&live), [("model".into(), "the-judge".into())], "its own type slot became model");
+    assert_eq!(
+        r.context_roles(&live),
+        [("distill".into(), "the-judge".into()), ("model".into(), "the-judge".into())],
+        "its own type slot became model, and its distill fallback",
+    );
 }
 
 /// The migration runs once: a row written after it is recorded is left
@@ -282,4 +286,125 @@ fn the_migration_records_itself_when_context_type_is_gone() {
         stmt.query_map(params![blob_param(lane.context_id.as_bytes())], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
     };
     assert_eq!(roles, ["distill"]);
+}
+
+impl Rig {
+    /// Make `who` the performer of `ctx`, as a context made before the slot
+    /// roles moved would have.
+    fn perform(&self, ctx: &ContextRow, who: PrincipalId) {
+        self.db.conn.execute(
+            "UPDATE contexts SET performer = ?1 WHERE context_id = ?2",
+            params![blob_param(who.as_bytes()), blob_param(ctx.context_id.as_bytes())],
+        ).unwrap();
+    }
+
+    fn no_model_notes(&self) -> Vec<ContextCharacterMigrationNote> {
+        self.db.context_character_migration_report().unwrap().into_iter().filter(|n| n.kind == "no_model").collect()
+    }
+}
+
+/// A live context with a performer whose slots hold no role equal to its
+/// type had no model, and keeps none; the migration reports it on the
+/// context, naming the roles it dropped and the rotation that gives the
+/// context its character's model. A context with a model, one with no
+/// performer, and an archived one are not reported.
+///
+/// Falsified by dropping the slots silently, or by reporting a context that
+/// kept a model.
+#[test]
+fn a_context_left_with_no_model_is_reported_with_its_rotation() {
+    let r = rig();
+    let coder = r.character("coder", Some("coder"));
+    let odd = r.context("odd-lane", "coder");
+    r.perform(&odd, coder);
+    r.context_slot(&odd, "musician", "the-musician");
+    r.context_slot(&odd, "judge", "the-judge");
+    let fine = r.context("fine-lane", "coder");
+    r.perform(&fine, coder);
+    r.context_slot(&fine, "coder", "the-coder");
+    r.context_slot(&fine, "musician", "the-musician");
+    let unplayed = r.context("unplayed", "coder");
+    r.context_slot(&unplayed, "musician", "the-musician");
+    let gone = r.context("gone-lane", "coder");
+    r.perform(&gone, coder);
+    r.context_slot(&gone, "musician", "the-musician");
+    r.db.archive_context(gone.context_id).unwrap();
+
+    r.migrate();
+
+    assert!(r.context_roles(&odd).is_empty(), "it had no model and keeps none");
+    let notes = r.no_model_notes();
+    assert_eq!(notes.iter().map(|n| n.context_id).collect::<Vec<_>>(), [Some(odd.context_id)], "{notes:?}");
+    let note = &notes[0].note;
+    assert!(note.contains("`judge`") && note.contains("`musician`"), "names the dropped roles: {note}");
+    assert!(note.contains("`kj context rotate odd-lane`"), "names the fix: {note}");
+}
+
+/// An old slot that breaks a `character_models` CHECK cannot become its
+/// character's model. The open goes on: the slot is dropped and reported,
+/// saying why, and a slot whose character has no sheet is dropped with no
+/// report row to name it by.
+///
+/// Falsified by failing the open on either row.
+#[test]
+fn an_old_slot_that_breaks_a_check_is_reported_and_the_open_goes_on() {
+    let r = rig();
+    let banto = r.character("banto", Some("director"));
+    r.db.conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+    r.db.conn.execute(
+        "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens, temperature)
+         VALUES (?1, 'director', ?2, 'ds-pro', 8192, 9.0)",
+        params![blob_param(banto.as_bytes()), blob_param(r.deepseek.as_bytes())],
+    ).unwrap();
+    r.db.conn.execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA foreign_keys = OFF").unwrap();
+    let nobody = PrincipalId::new();
+    r.db.conn.execute(
+        "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens) VALUES (?1, 'coder', ?2, 'm', 10)",
+        params![blob_param(nobody.as_bytes()), blob_param(r.deepseek.as_bytes())],
+    ).unwrap();
+    r.db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+    // Only this migration: the open's earlier table rebuilds refuse a
+    // dangling foreign key of their own.
+    r.forget();
+    KernelDb::migrate_slot_roles(&r.db.conn).unwrap();
+
+    assert!(r.db.get_character_model(banto).unwrap().is_none(), "the slot could not become the model");
+    assert!(r.character_roles(banto).is_empty(), "and is dropped");
+    let notes = r.notes();
+    assert_eq!(notes.iter().map(|n| n.principal_id).collect::<Vec<_>>(), [Some(banto)], "{notes:?}");
+    assert!(notes[0].note.contains("`director`") && notes[0].note.contains("could not become"), "{}", notes[0].note);
+    let left: i64 = r.db.conn.query_row(
+        "SELECT COUNT(*) FROM character_slots WHERE role NOT IN ('distill', 'gate')", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(left, 0, "every old role is gone");
+}
+
+/// A context whose model moved to role `model` on a chat backend, with no
+/// `distill` slot, distills on that model, as a context made now does; one
+/// with its own `distill` keeps it, and one whose model is a council server
+/// gets none.
+///
+/// Falsified by leaving a migrated chat context with nothing to distill on.
+#[test]
+fn a_migrated_chat_model_is_the_distill_model_of_a_context_with_none() {
+    let r = rig();
+    let lane = r.context("lane", "coder");
+    r.context_slot(&lane, "coder", "the-coder");
+    let kept = r.context("kept", "coder");
+    r.context_slot(&kept, "coder", "the-coder");
+    r.context_slot(&kept, "distill", "the-distill");
+    let council = r.context("council-lane", "council");
+    r.db.conn.execute(
+        "INSERT INTO context_slots (context_id, role, backend_id, model) VALUES (?1, 'council', ?2, 'gemma')",
+        params![blob_param(council.context_id.as_bytes()), blob_param(r.mk.as_bytes())],
+    ).unwrap();
+
+    r.migrate();
+
+    assert_eq!(r.context_roles(&lane), [("distill".into(), "the-coder".into()), ("model".into(), "the-coder".into())]);
+    let distill = r.db.context_slot(lane.context_id, "distill").unwrap().unwrap();
+    assert_eq!((distill.backend_id, distill.max_tokens), (r.deepseek, Some(4096)), "a copy of the model row");
+    assert_eq!(r.context_roles(&kept), [("distill".into(), "the-distill".into()), ("model".into(), "the-coder".into())]);
+    assert_eq!(r.context_roles(&council), [("model".into(), "gemma".into())]);
 }

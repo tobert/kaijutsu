@@ -97,7 +97,7 @@ pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
-pub use context_ring::{ACTIVE_RING_CAPACITY, DemoteOutcome, PromoteOutcome};
+pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, PromoteOutcome, RotationCommit};
 use schema::SCHEMA;
 
 // ============================================================================

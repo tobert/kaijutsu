@@ -73,8 +73,8 @@ One rule: **the character of an instance's senpai, or its lineage root**, may
 - rotate it (its own performer may also rotate it, with no ask);
 - archive it.
 
-An rc lifecycle may also act on another context of its own instance, so the coder's archive rc archives its
-judge shadows.
+An rc lifecycle may also act on another context of its own instance, such as a kohai of the context whose
+lifecycle runs.
 
 A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root (<root>) may <act>". Also true:
 

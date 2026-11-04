@@ -3364,6 +3364,118 @@ async fn a_council_that_names_no_judge_makes_no_shadow() {
     rig.finish().await;
 }
 
+/// A `kj` caller acting as the rig seat's performer from `context`, with
+/// the latch confirmed.
+fn performer_caller(rig: &Rig, context: kaijutsu_types::ContextId) -> crate::kj::KjCaller {
+    crate::kj::KjCaller {
+        principal_id: rig.ctx.actor_id,
+        actor_id: rig.ctx.actor_id,
+        reviewer_id: None,
+        context_id: Some(context),
+        session_id: SessionId::new(),
+        confirmed: true,
+        rc_depth: 0,
+        privileged: true,
+        cancel: CancellationToken::new(),
+    }
+}
+
+/// The live children of `seat` the judge character performs.
+fn shadows_of(rig: &Rig, seat: kaijutsu_types::ContextId) -> Vec<crate::kernel_db::ContextRow> {
+    let db = rig.d.kernel_db().lock();
+    let judge = db.get_character_by_name(super::shadow::JUDGE).unwrap().unwrap();
+    db.fork_children(seat).unwrap().into_iter().filter(|c| c.performer == Some(judge.principal_id)).collect()
+}
+
+/// Rotating a judged seat archives its judge shadow in the rotation's
+/// commit, and the successor's first gated call makes it a shadow of its
+/// own under the same label. It holds for a seat running the shipped
+/// `coder/` directory and for one running `default/`; neither has an
+/// archive script that names the judge. The judge is on a chat backend, so
+/// only gate.toml names it.
+///
+/// Falsified by leaving the shadow to an rc archive script (the old shadow
+/// stays live, and the successor's shadow cannot take its label), or by
+/// telling a shadow by its model alone.
+#[tokio::test]
+async fn rotating_a_judged_seat_archives_its_shadow_and_the_successor_gets_its_own() {
+    use kaijutsu_types::Role::{Model, User};
+    for rc_dir in ["default", "coder"] {
+        let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), chain: true, ..Setup::default() }).await;
+        rig.d.kernel_db().lock().set_character_rc_dir(rig.ctx.actor_id, Some(rc_dir)).unwrap();
+        rig.submit("echo before").await.unwrap();
+        let old = shadows_of(&rig, rig.ctx.context_id);
+        assert_eq!(old.len(), 1, "{rc_dir}: {old:?}");
+        let old = old[0].context_id;
+        // The successor's create lifecycle writes its loadout through the broker.
+        rig.broker.set_db(rig.d.kernel_db().clone()).await;
+
+        let argv = ["context", "rotate"].map(String::from);
+        let rotated = rig.d.dispatch(&argv, &performer_caller(&rig, rig.ctx.context_id)).await;
+        assert!(rotated.is_ok(), "{rc_dir}: {}", rotated.message());
+        let crate::kj::KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("{rotated:?}") };
+        let successor = kaijutsu_types::ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        {
+            let db = rig.d.kernel_db().lock();
+            assert!(db.get_context(old).unwrap().unwrap().archived_at.is_some(), "{rc_dir}: the shadow is archived with its seat");
+        }
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        rig.broker.set_binding(successor, binding).await.unwrap();
+        let next = CallContext::new(rig.ctx.actor_id, successor, SessionId::new(), rig.d.kernel_id())
+            .with_actor(rig.ctx.actor_id, rig.ctx.reviewer_id);
+        rig.submit_in(&next, "echo after").await.unwrap();
+        let new = shadows_of(&rig, successor);
+        assert_eq!(new.len(), 1, "{rc_dir}: the successor gets its own shadow: {new:?}");
+        assert_ne!(new[0].context_id, old);
+        assert_eq!(new[0].label.as_deref(), Some("judge-council-seat"), "{rc_dir}: the archived shadow freed the label");
+        let turns = dialogue(&rig, new[0].context_id);
+        assert_eq!(turns, [(User, "shell_write: echo after".to_string()), (Model, "ran".to_string())], "{rc_dir}");
+        rig.finish().await;
+    }
+}
+
+/// A live context that already holds `judge-<seat>` does not stop the
+/// seat's shadow: the shadow takes the first free label after it.
+///
+/// Falsified by inserting the shadow under the taken label, which the
+/// label index refuses on every gated call.
+#[tokio::test]
+async fn a_shadow_whose_label_is_taken_takes_the_next_free_one() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
+    crate::kj::test_helpers::register_context(&rig.d, Some("judge-council-seat"), None, rig.ctx.actor_id);
+    rig.submit("echo first").await.unwrap();
+    let shadows = judge_shadows(&rig);
+    assert_eq!(shadows.len(), 1, "{shadows:?}");
+    assert_eq!(shadows[0].label.as_deref(), Some("judge-council-seat-2"));
+    assert_eq!(dialogue(&rig, shadows[0].context_id).len(), 2, "the call and its outcome are recorded");
+    rig.finish().await;
+}
+
+/// `kj context archive` of a judged seat archives its judge shadow in the
+/// same transaction, and leaves an ordinary fork of the seat live, though
+/// the fork's parent is its senpai too.
+///
+/// Falsified by archiving the seat alone, or by archiving every child.
+#[tokio::test]
+async fn archiving_a_judged_seat_archives_its_shadow() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), chain: true, ..Setup::default() }).await;
+    rig.submit("echo before").await.unwrap();
+    let shadow = shadows_of(&rig, rig.ctx.context_id)[0].context_id;
+    let fork = crate::kj::test_helpers::register_context(&rig.d, Some("seat-fork"), Some(rig.ctx.context_id), rig.ctx.actor_id);
+    rig.d.kernel_db().lock().write_context_character(fork, rig.ctx.actor_id, Some(rig.ctx.context_id), None).unwrap();
+
+    let argv = ["context", "archive", "council-seat"].map(String::from);
+    let archived = rig.d.dispatch(&argv, &performer_caller(&rig, rig.ctx.context_id)).await;
+    assert!(archived.is_ok(), "{}", archived.message());
+    let db = rig.d.kernel_db().lock();
+    assert!(db.get_context(shadow).unwrap().unwrap().archived_at.is_some(), "the shadow is archived with its seat");
+    assert!(db.get_context(fork).unwrap().unwrap().archived_at.is_none(), "an ordinary fork stays live");
+    drop(db);
+    rig.finish().await;
+}
+
 /// A council block that names a judge character with no model still makes
 /// the shadow, and each judged decision records a miss that names the judge
 /// character and the verb that gives it a model.

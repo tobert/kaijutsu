@@ -23,6 +23,31 @@ the character"). Open, outside M2:
 - The Terms table's `context_type` row in `docs/writing.md` still says it is
   the rc bundle a context runs (M6 rewrites it).
 
+## Type melt M3: what one-model and the judge character leave open (2026-11-04)
+
+- A judge shadow made while its judge character had no model keeps no `model`
+  slot until it is archived; each judge read records a miss naming
+  `kj character model set` and the archive (`council/shadow.rs`).
+- A context is a judge shadow when its parent is its senpai and its performer
+  is a judge: a character whose model is on a council server, or one some
+  council block names as `judge` (`KernelDb::is_judge_shadow`). When gate.toml
+  does not load, the model alone tells, so a shadow whose judge has no model or
+  a chat model moves under `kj context set --senpai` and is not archived with
+  its seat until gate.toml loads again.
+- Renaming `judge = ` in gate.toml leaves the old judge's live shadows beside
+  the new judge's until their seats are archived: the gate finds only the
+  named judge's shadow. The archive takes the old ones with their seat only
+  while the old judge's model is on a council server; otherwise they outlive
+  their seats.
+- docs/council.md build-order item 4 (measurement notes) and "Two types: judge
+  and bump" still speak in types; M7 rewrites them.
+- The test `KjDispatcher` builds its own drift router, apart from `kernel.drift()`; a shadow
+  `council/shadow.rs` registers is absent from it, so router-sync assertions live in `kj/edge_tests.rs`
+  rather than `council/gate_e2e.rs`.
+- Bootstrap's console rotation on a NULL-`max_tokens` `model` slot has no test of its own.
+- Read-only pipes (`kj ... | head`, `| jq`) through the MCP shell raise asks
+  for Amy; a probe should run the bare verb.
+
 ## Companion: what the first build leaves open (2026-11-02)
 
 The `companion` type (`docs/companion.md`) runs an hourly check-in as a fork of

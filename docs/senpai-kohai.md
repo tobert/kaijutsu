@@ -142,10 +142,11 @@ model.
   its council with no judge.
 - A judge shadow belongs to one context. The gate makes it as a context performed by the judge character the
   council block names, with K as its parent and its senpai, and slots copied from the judge character. It is
-  found as K's live child that character performs. `kj context set --senpai` refuses to move a context performed
-  by a character some council block names as judge whose parent is its senpai. The coder's archive rc archives it
-  (`--children --performer judge`) when a rotation archives the predecessor, and the successor's first gate call
-  makes a new one.
+  found as K's live child that character performs. A context is a judge shadow when its parent is its senpai and
+  its performer is a judge: a character whose model is on a council server, or one some council block in a
+  gate.toml that loaded names as `judge`. `kj context set --senpai` refuses to move one. The kernel archives K's
+  judge shadows in the same transaction that archives K, at `kj context archive`, a rotation's commit, a demote
+  past the rim and a character's retirement, and the successor's first gate call makes a new one.
 - A fork's distillation runs on the forking context's `distill` slot, and `kj drift pull|merge` on the caller's
   `distill` slot, so a cheap model can summarize for an expensive conversation. A character with a model and no
   `distill` slot distills on its model. With no `distill` slot in the context, a fork that asks for distillation
@@ -203,8 +204,8 @@ console, or several and no usable origin, refuses (`KernelDb::default_console_fo
 set|unset`, which need the `ConfigWrite` capability, as `kj character set` does.
 
 A verb nested in an rc lifecycle uses a narrower rule in place of this one, with the context whose lifecycle runs
-as the actor: it may act on the contexts that answer to that context, so the coder's archive rc archives its own judge shadows
-(`coder/archive/S10-shadows.kai`). In a rotate lifecycle it may also act on the contexts that answer to the predecessor (see
+as the actor: it may act on the contexts that answer to that context, so an archive rc may archive its own kohai. In a
+rotate lifecycle it may also act on the contexts that answer to the predecessor (see
 "Rotation hands off its contexts"). The context's character lends the lifecycle nothing. A selection such as
 `--children` that names a context the rule does not cover refuses, naming it.
 
@@ -245,8 +246,9 @@ its own work; a model turn refuses to start when its performer would review itse
 - `kj context archive` archives the context it names, and with `--children` the selection it names. The kernel
   moves no context that answers to it: their asks still reach the archived senpai's character, and a push to it
   refuses until they are moved (`kj context set <ctx> --senpai <ctx>`) or the senpai is promoted. Unresolved asks raised *in* the archived context are
-  swept with a note; asks raised in the contexts that answer to it are not touched. Contexts that should go with it go by their type's
-  archive rc, as the coder's judge shadows do (`coder/archive/S10-shadows.kai`).
+  swept with a note; asks raised in the contexts that answer to it are not touched. The kernel archives its judge shadows in the
+  same transaction, as it does at a rotation's commit and a character's retirement (`docs/council.md`, "Shadow
+  context"); other contexts that should go with it go by its archive rc.
 - `kj context set [<ctx>] --senpai <senpai-ctx>`: moves a context under another senpai. It needs the authority rule over the moved context and
   "Placing under a senpai" over the new one. It refuses a cycle, a root console, and a judge shadow. It refuses
   while a pending ask would change reviewer: it re-resolves every pending ask raised in the moved context and in

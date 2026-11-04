@@ -444,7 +444,8 @@ pub(crate) struct CouncilThreshold {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CouncilConfig {
     /// The council server decisions go to: the address of the backend of a
-    /// context's `gate` (or `judge`) slot. gate.toml names none, so a config
+    /// context's `gate` slot, or of a judge shadow's `model` slot for a judge
+    /// read. gate.toml names none, so a config
     /// it loads holds an empty address until the gate routes it to a slot
     /// ([`crate::council::gate::seat_route`]); a config never reaches a
     /// server unrouted.

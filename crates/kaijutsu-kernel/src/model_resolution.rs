@@ -102,8 +102,16 @@ pub enum NoModelReason {
 /// A context, or a role of it, that has no model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoModel {
+    /// `label (short-id)` of the context.
     pub context: String,
+    /// The context as a `kj` argument: its label, or its short id.
+    pub context_ref: String,
     pub character: Option<String>,
+    /// The performer now has what the role copies when a context is made:
+    /// its model for `model`; a `distill` slot, or a model that is no council
+    /// server, for `distill`; the slot itself for any other role. Rotating
+    /// the context then fills the role.
+    pub rotation_fills: bool,
     /// The role looked up: `model`, `gate` or `distill`.
     pub role: String,
     pub reason: NoModelReason,
@@ -113,6 +121,20 @@ pub struct NoModel {
 }
 
 impl NoModel {
+    /// The role `role` of `bound`'s context, whose slot names a council
+    /// server rather than a chat model.
+    pub fn council_server(bound: &BoundSlot, role: &str) -> Self {
+        NoModel {
+            context: bound.context.clone(),
+            context_ref: bound.context_ref.clone(),
+            character: Some(bound.character.clone()),
+            rotation_fills: false,
+            role: role.to_string(),
+            reason: NoModelReason::CouncilServer,
+            mcp_session: false,
+        }
+    }
+
     /// One line for `kj context create`, `kj context rotate` and `kj context info`.
     /// `None` for an MCP session with no `model` slot, whose client brings its
     /// own model.
@@ -134,9 +156,23 @@ impl NoModel {
                 "{} runs on a council server, not a chat model: its {} slot names the server",
                 self.context, self.role
             ),
+            NoModelReason::NoSlot if self.rotation_fills && self.role == MODEL => format!(
+                "{} has no model: it was made before {character} had one; `kj context rotate {}` copies \
+                 {character}'s model",
+                self.context, self.context_ref
+            ),
+            NoModelReason::NoSlot if self.rotation_fills => format!(
+                "{} has no {} slot: it was made before {character} had one to copy; `kj context rotate {}` \
+                 copies it",
+                self.context, self.role, self.context_ref
+            ),
             NoModelReason::NoSlot if self.role == MODEL => format!(
                 "{} has no model: {character} has no model; `kj character model set {character} \
                  <backend>/<model>`, then `kj context rotate`",
+                self.context
+            ),
+            NoModelReason::NoSlot if self.role == DISTILL => format!(
+                "{} has no {DISTILL} slot: {character} has no {DISTILL} slot and no chat model",
                 self.context
             ),
             NoModelReason::NoSlot => format!(
@@ -163,14 +199,34 @@ impl NoModel {
                  `kj context create <character> [--name <label>] [--type <type>]`",
                 self.context
             ),
+            NoModelReason::CouncilServer if self.role == DISTILL => format!(
+                "{} {what}: its {DISTILL} slot names a council server, not a chat model. Fix: \
+                 `kj character slot set {character} {DISTILL} <backend>/<model>` with a chat model, \
+                 then `kj context rotate {}`",
+                self.context, self.context_ref
+            ),
             NoModelReason::CouncilServer => format!(
                 "{} {what}: its {} slot names a council server, not a chat model",
                 self.context, self.role
+            ),
+            NoModelReason::NoSlot if self.rotation_fills && self.role == MODEL => format!(
+                "{} {what}: it was made before character {character} had a model. Fix: `kj context rotate {}`",
+                self.context, self.context_ref
+            ),
+            NoModelReason::NoSlot if self.rotation_fills => format!(
+                "{} {what}: it was made before character {character} had a {} model to copy. Fix: \
+                 `kj context rotate {}`",
+                self.context, self.role, self.context_ref
             ),
             NoModelReason::NoSlot if self.role == MODEL => format!(
                 "{} {what}: character {character} has no model. Fix: `kj character model set {character} \
                  <backend>/<model>`, then `kj context rotate`",
                 self.context
+            ),
+            NoModelReason::NoSlot if self.role == DISTILL => format!(
+                "{} {what}: character {character} has no {DISTILL} slot and no chat model. Fix: \
+                 `kj character slot set {character} {DISTILL} <backend>/<model>`, then `kj context rotate {}`",
+                self.context, self.context_ref
             ),
             NoModelReason::NoSlot => format!(
                 "{} {what}: character {character} has no {} slot and no model. Fix: `kj character model set`, \
@@ -178,6 +234,30 @@ impl NoModel {
                 self.context, self.role
             ),
         }
+    }
+}
+
+/// The context `context_id` as a `kj` argument: its label, or its short id.
+fn context_ref(db: &KernelDb, context_id: ContextId) -> KernelDbResult<String> {
+    Ok(db.get_context(context_id)?.and_then(|row| row.label).unwrap_or_else(|| context_id.short()))
+}
+
+/// Whether `principal`'s sheet now holds what `role` copies when a context
+/// is made ([`NoModel::rotation_fills`]).
+fn character_fills(db: &KernelDb, principal: kaijutsu_types::PrincipalId, role: &str) -> KernelDbResult<bool> {
+    let model = db.get_character_model(principal)?;
+    match role {
+        MODEL => Ok(model.is_some()),
+        DISTILL => {
+            if db.get_character_slot(principal, DISTILL)?.is_some() {
+                return Ok(true);
+            }
+            match model {
+                Some(model) => Ok(!db.backend_is_council_server(model.backend_id)?),
+                None => Ok(false),
+            }
+        }
+        _ => Ok(db.get_character_slot(principal, role)?.is_some()),
     }
 }
 
@@ -206,10 +286,13 @@ fn corrupt(what: String) -> KernelDbError {
 /// `role` is [`MODEL`] for the chat model, or `gate` or `distill`.
 pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbResult<RoleSlot> {
     let context = db.context_name(context_id);
+    let context_ref = context_ref(db, context_id)?;
     let Some(row) = db.context_character(context_id)? else {
         return Ok(RoleSlot::None(NoModel {
             context,
+            context_ref,
             character: None,
+            rotation_fills: false,
             role: role.to_string(),
             reason: NoModelReason::NoContextCharacter,
             mcp_session: false,
@@ -222,7 +305,9 @@ pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbRe
     let Some(slot) = db.context_slot(context_id, role)? else {
         return Ok(RoleSlot::None(NoModel {
             context,
+            context_ref,
             character: Some(character),
+            rotation_fills: character_fills(db, row.principal_id, role)?,
             role: role.to_string(),
             reason: NoModelReason::NoSlot,
             mcp_session: db.is_mcp_session(context_id)?,
@@ -233,7 +318,14 @@ pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbRe
         .into_iter()
         .find(|b| b.backend_id == slot.backend_id)
         .ok_or_else(|| corrupt(format!("context {context} slot {role} names a backend that does not exist")))?;
-    Ok(RoleSlot::Slot(BoundSlot { context, character, backend: backend.name, council_server: is_council_kind(&backend.kind), slot }))
+    Ok(RoleSlot::Slot(BoundSlot {
+        context,
+        context_ref,
+        character,
+        backend: backend.name,
+        council_server: is_council_kind(&backend.kind),
+        slot,
+    }))
 }
 
 /// A context slot with the names a caller reports.
@@ -241,6 +333,8 @@ pub fn role_slot(db: &KernelDb, context_id: ContextId, role: &str) -> KernelDbRe
 pub struct BoundSlot {
     /// `label (short-id)` of the context.
     pub context: String,
+    /// The context as a `kj` argument: its label, or its short id.
+    pub context_ref: String,
     pub character: String,
     /// Backend NAME.
     pub backend: String,
@@ -267,13 +361,7 @@ fn non_negative(value: Option<i64>) -> Option<u64> {
 pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<ContextModelLookup> {
     match role_slot(db, context_id, MODEL)? {
         RoleSlot::None(none) => Ok(ContextModelLookup::None(none)),
-        RoleSlot::Slot(bound) if bound.council_server => Ok(ContextModelLookup::None(NoModel {
-            context: bound.context,
-            character: Some(bound.character),
-            role: MODEL.to_string(),
-            reason: NoModelReason::CouncilServer,
-            mcp_session: false,
-        })),
+        RoleSlot::Slot(bound) if bound.council_server => Ok(ContextModelLookup::None(NoModel::council_server(&bound, MODEL))),
         RoleSlot::Slot(bound) => {
             let slot = &bound.slot;
             let max_tokens = non_negative(slot.max_tokens).filter(|m| *m > 0).ok_or_else(|| {

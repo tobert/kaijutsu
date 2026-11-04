@@ -4005,12 +4005,13 @@ esac
         assert!(unknown.message().contains("nobody-by-this-name"), "{}", unknown.message());
     }
 
-    /// The shipped coder archive script archives the seat's judge shadows,
-    /// the children the `judge` character performs, so a shadow does not
-    /// outlive its seat. Another child stays.
+    /// Archiving a seat that runs the shipped `coder/` directory archives
+    /// its judge shadow, the child a judge character performs, though the
+    /// directory has no archive script for it: the kernel archives it in the
+    /// same transaction. Another child stays.
     ///
-    /// Falsified by an archive script that matches the type: the shadow is
-    /// of type `judge-shadow-type-unread` here.
+    /// Falsified by telling a shadow by its type: the shadow is of type
+    /// `judge-shadow-type-unread` here, and the other child of type `judge`.
     #[tokio::test]
     async fn archiving_a_coder_archives_its_judge_shadow() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
@@ -4018,10 +4019,23 @@ esac
         d.kernel().broker().set_kj_dispatcher(&d).await;
         let seat = archivable(&d, "coder-seat", None, "coder");
         let judge_character = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None,
-            mcp_hub_ctx: None, context_type: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-        }).unwrap();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None,
+                mcp_hub_ctx: None, context_type: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            // A character whose model is on a council server is a judge.
+            let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "mk".into(), base_url: None,
+                api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
+                idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
+            }).unwrap();
+            db.set_character_model(&crate::kernel_db::CharacterModelRow {
+                principal_id: judge_character, backend_id: mk.backend_id, model: "gemma".into(), max_tokens: None,
+                temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
+            }).unwrap();
+        }
         let judge = archivable_by(&d, "judge-coder-seat", Some(seat), "judge-shadow-type-unread", judge_character);
         let other = archivable(&d, "other-child", Some(seat), "judge");
         let caller = root_archiver(&d);

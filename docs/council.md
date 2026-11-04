@@ -423,10 +423,11 @@ grows with the gate.
   runs the council with no judge; no default name stands in. The shadow
   copies its slots from the judge character when it is made, and its
   `model` slot names the judge's server: the megakernel or lfm2d (a backend
-  of kind `mk`), or a chat model such as Jev through OpenRouter. `kj
-  character model set judge mk-zorak/<served model>` points it. A shadow
-  made before the model changed keeps the model it copied; archiving it
-  lets the next gate call make one with the new model.
+  of kind `mk`). `kj character model set judge mk-zorak/<served model>`
+  points it. A judge on a chat model, such as Jev through OpenRouter, gets
+  a shadow that records the dialogue, and is not asked (build order 5). A
+  shadow made before the model changed keeps the model it copied;
+  archiving it lets the next gate call make one with the new model.
 - **Outward actions only.** Council time is limited on our hardware, so a
   shadow records what the seat does to the world, not what it reads. The
   gate already draws that line: the read-only `shell` tool runs no gate,
@@ -452,9 +453,10 @@ grows with the gate.
   - A council server (megakernel, lfm2d) gets each call as it arrives: the
     kernel builds the shadow's seat off the hot path, so the server holds
     its snapshot when the question comes.
-  - A chat model (Jev) is hydrated whole for each request: the dialogue is
-    rendered as one script-like transcript in a single prompt, with the
-    question about its last call.
+  - A chat model (Jev) is to be hydrated whole for each request: the
+    dialogue rendered as one script-like transcript in a single prompt,
+    with the question about its last call. Not built: the kernel asks only
+    a judge on a council server (build order 5).
 - **Append-only keeps a council server cheap.** `snap` falls on every
   eighth turn by position, so each new turn re-feeds at most eight turns.
   Each snapshot costs `snapshot_bytes` per token. Kaijutsu chooses what the
@@ -490,12 +492,16 @@ shipped. A fresh session resumes at the first step not marked done.
    1b. **The RPC shell path.** Seats that reach the gate through
    `shell_pre_call_hooks` (MCP clients) are not recorded yet. ACP seats
    run kernel model turns, so their `shell_write` calls are recorded.
-   1c. **Done: archive with the seat.** The shipped `coder` archive script
-   (`rc/coder/archive/S10-shadows.kai`) runs `kj context archive
-   --children --performer judge --confirm`, so a seat's judge shadows are
-   archived with it (`docs/kaish-integration.md`, the `archive` verb). The
-   script names the judge character once, and it must match the council
-   block's `judge`.
+   1c. **Done: archive with the seat.** The kernel archives a seat's live
+   judge shadows in the transaction that archives the seat: `kj context
+   archive`, a rotation's commit, a demote past the rim, and a character's
+   retirement (`KernelDb::archive_with_shadows`). No rc script takes part.
+   A judge shadow is a child whose parent is its senpai and whose
+   performer is a judge: a character whose model is on a council server,
+   or one a council block of a gate.toml that loaded names. A new shadow
+   takes the first free label of `judge-<seat>`, `judge-<seat>-2`, and so
+   on. Tests: `rotating_a_judged_seat_archives_its_shadow_and_the_successor_gets_its_own`,
+   `archiving_a_judged_seat_archives_its_shadow`.
    1d. **Done: the stance.** A new shadow runs its performer's `create`
    lifecycle, `judge/` for the shipped judge character
    (`rc/judge/create/S00-stance.md`). Its system instruction
@@ -839,7 +845,7 @@ enables. A `[council] server` or `[council] model` key is refused as an unknown 
 kind `mk` and a `base_url`; any other backend makes every decision on the submission a miss that names the
 backend, and no other server is asked in its place. The slot's `--model` names the served model; the served
 model's identity is recorded with each decision. `kj character slot set` refuses a `gate` slot on a backend that is
-not kind `mk`. A character's slots are `distill` and `gate`; its chat model is `kj character model set`, copied
+not kind `mk`, and a `distill` slot on one that is. A character's slots are `distill` and `gate`; its chat model is `kj character model set`, copied
 under role `model`. A slot on an `mk` backend is never a chat model and needs no `max_tokens`. `model`, `gate`,
 `distill` and `judge` are reserved: `kj context create` and `kj context set` refuse them as `--type`. The slot chooses only
 the server and its served model; whether a type gets the council, `mode`, specs, thresholds, contexts, and

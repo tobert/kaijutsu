@@ -1029,7 +1029,7 @@ fn root_ctx_moves_at_commit_rotation() {
     insert_new_context_rows(&w.db, &successor, CharacterPlacement::Rotate { predecessor: old.context_id }).unwrap();
     assert_eq!(w.db.root_console(amy).unwrap(), Some(old.context_id), "the pointer waits for the commit");
 
-    w.db.commit_rotation(old.context_id, successor.context_id).unwrap();
+    w.db.commit_rotation(old.context_id, successor.context_id, None).unwrap();
 
     assert_eq!(w.db.root_console(amy).unwrap(), Some(successor.context_id), "the commit moves the console");
     assert_eq!(w.db.root_console(bob).unwrap(), Some(bob_console.context_id), "another root's console stays");

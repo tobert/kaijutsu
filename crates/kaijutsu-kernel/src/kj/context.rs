@@ -222,8 +222,8 @@ enum ContextCommand {
     /// env, and cwd, then runs the `create` rc lifecycle. `ROTATED_FROM`
     /// names the predecessor by id. When the successor has a loadout, it takes
     /// the label and the ring seat, and the predecessor is archived after its
-    /// `archive` rc lifecycle runs. The kernel moves no context that answers to
-    /// the predecessor. The senpai's
+    /// `archive` rc lifecycle runs, with its judge shadows. The kernel moves
+    /// no context that answers to the predecessor. The senpai's
     /// character, the lineage root, or the context's own character may
     /// rotate. Rotating a character's handoff log points the character at the
     /// successor.
@@ -234,9 +234,10 @@ enum ContextCommand {
     },
     /// Archive one context, retaining its history (latched). Needs the
     /// operator capability, or a person's live root character acting from
-    /// any context. Children keep their parent edge and state. A push to an
-    /// archived context and `kj context set --senpai` onto it refuse, and its
-    /// forks and the contexts that answer to it stay live. Restore with `kj context promote <id>`. A character
+    /// any context. Its judge shadows are archived with it; other children
+    /// keep their parent edge and state. A push to an archived context and
+    /// `kj context set --senpai` onto it refuse, and its other forks and the
+    /// contexts that answer to it stay live. Restore with `kj context promote <id>`. A character
     /// may also archive an `mcp` context it plays.
     /// The context's `archive` rc lifecycle runs first, while it is still
     /// live; a failing script is recorded and the archive still commits.
@@ -385,7 +386,7 @@ fn insert_new_context_checked(db: &KernelDb, row: &ContextRow, placement: Charac
 
 /// `name` when no live context holds it, else `<name>-2`, `-3`, … the first
 /// free one. Live contexts only: an archived holder frees its label.
-fn first_free_label(db: &KernelDb, name: &str) -> KernelDbResult<String> {
+pub(crate) fn first_free_label(db: &KernelDb, name: &str) -> KernelDbResult<String> {
     if db.find_context_by_label(name)?.is_none() {
         return Ok(name.to_string());
     }
@@ -2305,9 +2306,10 @@ impl KjDispatcher {
     /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
     ///
-    /// Never recurses. Children keep their `forked_from` and their own
-    /// state, so a lineage stays walkable after most of it is archived
-    /// (`docs/issues.md`, "Managing roots").
+    /// Recurses into nothing but the context's judge shadows, which the same
+    /// transaction archives. Other children keep their `forked_from` and
+    /// their own state, so a lineage stays walkable after most of it is
+    /// archived (`docs/issues.md`, "Managing roots").
     async fn context_archive(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
@@ -2341,10 +2343,10 @@ impl KjDispatcher {
             )),
             Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
         }
-        // A nested archive from an rc lifecycle (a coder's archive bucket
-        // retiring its judge shadows) is checked with the seat — the
-        // context whose lifecycle runs — as the actor, not whoever started
-        // the lifecycle: the seat may archive only its own kohai.
+        // A nested archive from an rc lifecycle (an archive bucket retiring
+        // its context's kohai) is checked with the seat — the context whose
+        // lifecycle runs — as the actor, not whoever started the lifecycle:
+        // the seat may archive only its own kohai.
         let in_rc_lifecycle = caller.privileged && caller.rc_depth > 0;
         let authority = if in_rc_lifecycle {
             self.require_lifecycle_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
@@ -2364,26 +2366,31 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj context archive: {target_label} stays live: {e}"));
         }
 
-        let archived = {
+        let judges = self.council_judges().await;
+        let (archived, shadows) = {
             let db = self.kernel_db().lock();
-            match db.archive_context(target_id) {
-                Ok(v) => v,
+            match db.archive_with_shadows(target_id, judges.as_deref()) {
+                Ok(v) => {
+                    let shadows: Vec<String> = v.shadows.iter().map(|id| db.context_name(*id)).collect();
+                    (v, shadows)
+                }
                 Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
             }
         };
 
         // The in-memory drift router must agree with the row, or an active
         // session can write a drift op that resurrects the context.
-        {
-            let mut drift = self.drift_router().write();
-            let _ = drift.set_state(target_id, ContextState::Archived);
-        }
+        self.archived_in_router(std::iter::once(target_id).chain(archived.shadows.iter().copied()));
 
-        if archived {
-            KjResult::ok(format!("archived {target_label}"))
+        let mut msg = if archived.context {
+            format!("archived {target_label}")
         } else {
-            KjResult::ok(format!("{target_label} already archived"))
+            format!("{target_label} already archived")
+        };
+        if !shadows.is_empty() {
+            msg.push_str(&format!("; archived its judge shadow {}", shadows.join(", ")));
         }
+        KjResult::ok(msg)
     }
 
     /// Run `target`'s `archive` rc lifecycle while it is still live. An
@@ -2666,8 +2673,13 @@ impl KjDispatcher {
                  {successor}{name} stays live, and its archive lifecycle already ran"
             ));
         }
-        let moved = match self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id) {
-            Ok(moved) => moved,
+        let judges = self.council_judges().await;
+        let committed = self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id, judges.as_deref());
+        let moved = match committed {
+            Ok(commit) => {
+                self.archived_in_router(commit.shadows.iter().copied());
+                commit.handoffs_moved
+            }
             Err(e) => {
                 let successor = if self.successor_fate(root_console, successor_id).is_empty() {
                     "is unlabeled"
@@ -2725,9 +2737,10 @@ impl KjDispatcher {
         if !root_console {
             return "";
         }
-        match self.kernel_db().lock().archive_context(successor) {
-            Ok(_) => {
-                let _ = self.drift_router().write().set_state(successor, ContextState::Archived);
+        let archived = self.kernel_db().lock().archive_with_shadows(successor, None);
+        match archived {
+            Ok(archived) => {
+                self.archived_in_router(std::iter::once(successor).chain(archived.shadows));
                 "archived the successor because a root console's successor has no senpai until the rotation commits; "
             }
             Err(e) => {
@@ -2965,8 +2978,9 @@ impl KjDispatcher {
         if archiving && let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
             return KjResult::Err(format!("kj context demote: {} stays live: {e}", target_id.short()));
         }
+        let judges = self.council_judges().await;
 
-        let outcome = {
+        let (outcome, shadows) = {
             let db = self.kernel_db().lock();
             // Another demote may have landed after the read above; an
             // unconfirmed step still must not archive.
@@ -2977,11 +2991,12 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
                 }
             }
-            match db.demote_context(target_id) {
+            match db.demote_context_with_shadows(target_id, judges.as_deref()) {
                 Ok(v) => v,
                 Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
             }
         };
+        self.archived_in_router(shadows);
 
         match outcome {
             DemoteOutcome::Unpromoted => KjResult::ok(format!(
@@ -3195,15 +3210,12 @@ impl KjDispatcher {
     /// the council blocks name are read from gate.toml first, to tell a
     /// judge shadow.
     async fn context_set_senpai(&self, context: Option<&str>, senpai: &str, caller: &KjCaller) -> KjResult {
-        let judges: Result<Vec<String>, String> = crate::kj::gate_policy::load_config(self.kernel().vfs())
-            .await
-            .map(|config| config.councils().filter_map(|c| c.judge.clone()).collect())
-            .map_err(|e| e.to_string());
+        let judges = self.council_judges().await;
         let db = self.kernel_db().lock();
         let moved = (|| -> Result<(ContextRow, ContextRow), String> {
             let (target, _) = resolve_character_arg(context, caller, &db)?;
             let senpai = resolve_senpai_arg(senpai, caller, &db, false)?;
-            db.in_transaction(|db| Ok(set_senpai(db, target, senpai, caller, &judges)))
+            db.in_transaction(|db| Ok(set_senpai(db, target, senpai, caller, judges.as_deref())))
                 .map_err(|e| e.to_string())?
         })();
         match moved {
@@ -3216,31 +3228,39 @@ impl KjDispatcher {
     }
 }
 
-/// Whether `row` is a judge shadow: a context performed by a character some
-/// council block names as judge (`judges`, or why gate.toml did not load),
-/// whose parent is the context it answers to. A context that could be one
-/// refuses when the names cannot be read.
-fn is_judge_shadow(db: &KernelDb, row: &ContextRow, judges: &Result<Vec<String>, String>) -> Result<bool, String> {
-    let (Some(performer), Some(parent)) = (row.performer, row.forked_from) else { return Ok(false) };
-    if row.senpai_ctx != Some(parent) {
-        return Ok(false);
+impl KjDispatcher {
+    /// The judge characters the council blocks of gate.toml name, or `None`
+    /// when gate.toml does not load (logged), so that a judge shadow is told
+    /// by its judge's model alone ([`KernelDb::is_judge_shadow`]).
+    pub(crate) async fn council_judges(&self) -> Option<Vec<String>> {
+        match crate::kj::gate_policy::load_config(self.kernel().vfs()).await {
+            Ok(config) => Some(config.councils().filter_map(|c| c.judge.clone()).collect()),
+            Err(e) => {
+                tracing::warn!("gate.toml does not load, so a judge shadow is told by its judge's model alone: {e}");
+                None
+            }
+        }
     }
-    let judges = judges
-        .as_ref()
-        .map_err(|e| format!("cannot tell whether {} is a judge shadow: {e}", db.context_name(row.context_id)))?;
-    let name = db.get_character(performer).map_err(|e| e.to_string())?.map(|sheet| sheet.name);
-    Ok(name.is_some_and(|name| judges.contains(&name)))
+
+    /// Mark `archived` contexts archived in the drift router, so it agrees
+    /// with their rows and frees their labels.
+    pub(crate) fn archived_in_router(&self, archived: impl IntoIterator<Item = ContextId>) {
+        let mut drift = self.drift_router().write();
+        for id in archived {
+            let _ = drift.set_state(id, ContextState::Archived);
+        }
+    }
 }
 
 /// The checks and the write behind `kj context set --senpai`, inside the caller's
 /// transaction. The inner `Err` is the refusal. `judges` are the judge
-/// characters the council blocks name.
+/// characters the council blocks name, or `None` when gate.toml did not load.
 fn set_senpai(
     db: &KernelDb,
     target: ContextId,
     senpai: ContextId,
     caller: &KjCaller,
-    judges: &Result<Vec<String>, String>,
+    judges: Option<&[String]>,
 ) -> Result<(ContextRow, ContextRow), String> {
     let row = db.get_context(target).map_err(|e| e.to_string())?
         .ok_or_else(|| format!("context {} has no row", target.short()))?;
@@ -3250,7 +3270,7 @@ fn set_senpai(
             db.context_name(target)
         ));
     }
-    if is_judge_shadow(db, &row, judges)? {
+    if db.is_judge_shadow(&row, judges).map_err(|e| e.to_string())? {
         return Err(format!(
             "{} is a judge shadow, which answers to the context it shadows; archive it with that context instead",
             db.context_name(target)
@@ -4546,8 +4566,7 @@ mod tests {
     }
 
     /// Rotation archives the predecessor through its `archive` lifecycle,
-    /// so its scripts (a coder's judge shadows) run as they do for
-    /// `kj context archive`.
+    /// so its scripts run as they do for `kj context archive`.
     ///
     /// Falsified by archiving the predecessor inside the rotation
     /// transaction alone: no archive run is recorded for it.
@@ -7363,6 +7382,78 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// A context made before its performer had a model says so, and names
+    /// the rotation that copies the model, not `kj character model set`: the
+    /// character already has one. A distillation refuses the same way.
+    ///
+    /// Falsified by telling the person to set a model the character has.
+    #[tokio::test]
+    async fn a_context_made_before_its_character_had_a_model_names_its_rotation() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let early = register_context_with_model(&d, Some("early-ctx"), None, principal, &[]);
+        d.block_store().create_document(early, crate::DocumentKind::Conversation, None).unwrap();
+        d.block_store()
+            .insert_block(
+                early, None, None, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text, "material",
+                kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        d.kernel_db().lock().seed_test_slots(principal, "mock", "mock-model", &["model"]).unwrap();
+
+        let result = d.dispatch(&[s("context"), s("info")], &caller_with_context(early)).await;
+        let KjResult::Ok { data: Some(v), .. } = &result else { panic!("{result:?}") };
+        let line = v["model_absent"].as_str().expect("a reason");
+        assert!(line.contains("early-ctx") && line.contains("made before"), "{line}");
+        assert!(line.contains("`kj context rotate early-ctx`"), "{line}");
+        assert!(!line.contains("kj character model set"), "the character has a model: {line}");
+
+        let fork = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &caller_with_context(early)).await;
+        assert!(!fork.is_ok(), "{}", fork.message());
+        let msg = fork.message();
+        assert!(msg.contains("cannot distill") && msg.contains("made before"), "{msg}");
+        assert!(msg.contains("`kj context rotate early-ctx`") && !msg.contains("kj character model set"), "{msg}");
+    }
+
+    /// A distill slot on a council server distills nothing: a distillation
+    /// refuses, naming the verb that gives the character a chat distill
+    /// slot, and never sends the request.
+    ///
+    /// Falsified by a distillation that reads the slot's server as a chat
+    /// model.
+    #[tokio::test]
+    async fn a_distill_slot_on_a_council_server_refuses_naming_the_fix() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context_with_model(&d, Some("mk-distill"), None, principal, &[]);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        d.block_store()
+            .insert_block(
+                source, None, None, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text, "material",
+                kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        let name = {
+            let db = d.kernel_db().lock();
+            let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("mk"), base_url: None,
+                api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
+                idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
+            }).unwrap();
+            db.conn_for_ledger().execute(
+                "INSERT INTO context_slots (context_id, role, backend_id, model) VALUES (?1, 'distill', ?2, 'gemma')",
+                rusqlite::params![source.as_bytes().to_vec(), mk.backend_id.as_bytes().to_vec()],
+            ).unwrap();
+            db.get_character(principal).unwrap().unwrap().name
+        };
+        let fork = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &caller_with_context(source)).await;
+        assert!(!fork.is_ok(), "{}", fork.message());
+        let msg = fork.message();
+        assert!(msg.contains("cannot distill") && msg.contains("council server"), "{msg}");
+        assert!(msg.contains(&format!("`kj character slot set {name} distill <backend>/<model>`")), "{msg}");
     }
     /// The flip side: once `LlmRegistry::context_window_for` resolves a real
     /// window (mirroring how it's populated from the backend model metadata in
