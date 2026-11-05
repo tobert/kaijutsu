@@ -229,7 +229,7 @@ design (`mount_backend.rs:264-267`), so they are straight-from-disk with no
 staleness window, and a backend error refuses to serve disk bytes rather than
 serving stale ones.
 
-So slice 1 is **one rc script**: `/config/rc/<type>/create/S15-recall.kai` reads
+So slice 1 is **one rc script**: `/config/rc/<rc_dir>/create/S15-recall.kai` reads
 the index surfaces and injects one compact recall block carrying receipts —
 claim, date, observer — plus computed age and **the git HEAD it read**.
 Staleness becomes *visible, not absent*; that is the whole claim.
@@ -380,8 +380,8 @@ wrong cost:
 - Search is RPC-only (`kaijutsu.capnp:1547`) — unreachable from `kj`, rc, or
   MCP. Slice 2 has to expose it regardless.
 
-**Giving `context_type=assistant` memory duties.** The seat itself already
-exists: `assets/defaults/rc/assistant/` ships `create` and `tick` scripts.
+**Giving the `assistant` character memory duties.** The character already
+exists: its rc directory `assets/defaults/rc/assistant/` ships `create` and `tick` scripts.
 What is open is putting memory work on it. Ticks ride `VERB_TICK` on the beat
 scheduler. Quiet-hours-at-tick is a legitimate *mechanism* — unlike the
 create-time probe — because the tick's own action is the thing being gated.

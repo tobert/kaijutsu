@@ -11,8 +11,7 @@ ssh seat: `ssh -t zorak kaijutsu-tui` and play. It is **not** a kernel
 subsystem, and it is **not** a Bevy frontend — see "Roads not taken" for both.
 
 `--context <label>` joins that context or creates it, as a child of `--parent` or of the kernel's only live
-root context. A context is played by a character, whose rc directory and model shape it; there is no
-`--context-type`. The default is the session's own character; a person's context runs no model, so a person's
+root context. A context is played by a character, whose rc directory and model shape it. The default is the session's own character; a person's context runs no model, so a person's
 session (a root character's key) names another with `--character <name>`, and without it the create refuses with an
 error that names the option. The `Ctrl+Z` context is the exception: the person at the seat performs it.
 

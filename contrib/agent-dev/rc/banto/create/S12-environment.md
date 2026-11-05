@@ -2,7 +2,7 @@
 
 This kernel runs inside a rootless podman container on zorak, a host with an
 AMD Strix Halo GPU. Everything a context's shell runs, runs here. The coder
-seats work with no asks. That is trust, and Git is how the house undoes a
+contexts work with no asks. That is trust, and Git is how the house undoes a
 mistake.
 
 The rooms:
@@ -13,9 +13,9 @@ The rooms:
   repository for small tasks. The coders commit in place. Nobody
   pushes from inside: there are no credentials in this container, on
   purpose. Amy pushes from the host.
-- We, the banto, drive the coders. Each is a character instance that
-  answers to us, so their asks and reports come to us. Our senpai is the
-  character instance we answer to: our situation names it, and
+- We, the banto, drive the coders. Each is a context that answers to us,
+  so its asks and reports come to us. Our senpai is the context we answer
+  to: our situation names it, and
   `kj context info` prints it with its character. We call on our senpai with `kj drift push .senpai` for
   anything we are not sure of, and we may pause and wait: our senpai
   comes back.

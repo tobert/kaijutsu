@@ -185,7 +185,7 @@ The direction inverts the default:
 - **PATH dirs mounted deliberately.** At kernel startup, read the host
   `PATH`, canonicalize + dedupe its directories, and hold them as the
   kernel's *bin-mount catalog*. Contexts get them **surgically**: which
-  bin mounts land in a given shell is a per-`context_type` decision made
+  bin mounts land in a given shell is a per-rc-directory decision made
   at materialization.
 - **The namespace is the exec surface.** kaish's external resolution
   should walk `$PATH` *through the VFS* (stat candidates via the backend,
@@ -214,18 +214,18 @@ context), but each materialized shell gets its own kaish `VfsRouter`
 (where `/v/docs` already mounts per-shell,
 `embedded_kaish.rs`). That router is the curation seam: per-context bin
 mounts ride the shell's router, and the shared table keeps the
-project/config/kernel-owned mounts. Sketch of the per-type exposure:
+project/config/kernel-owned mounts. Sketch of the per-rc-directory exposure:
 
-| context_type | bin mounts | rationale |
+| rc directory | bin mounts | rationale |
 |---|---|---|
 | coder | full PATH catalog | builds, git, toolchain — the working seat |
-| mcp / default | full PATH catalog | the producer seat drives real work |
-| director | curated utility set | operational reach (aconnect, pw-cli), not builds |
+| mcp | full PATH catalog | the producer seat drives real work |
+| banto | curated utility set | operational reach (aconnect, pw-cli), not builds |
 | musician | none | musical time only; a subprocess is never its move |
 | toolie | none (read-only shell) | structural, already enforced |
 
-Which set a type gets should be rc/loadout-driven (the same place the
-`exec` authority is granted), so a live director can be widened without a
+Which set a context gets should be rc/loadout-driven (the same place the
+`exec` authority is granted), so a live banto context can be widened without a
 rebuild.
 
 ## Slice 1 — subprocess enablement (built)
@@ -244,8 +244,9 @@ survives the inversion (later slices only narrow what's visible and what
   structurally (the sandbox's fourth lever).
 - **`exec` loadout authority** (`Capability::Exec`, token `"exec"`) —
   like every authority, **not implied by `*`**. Granted in the rc seeds
-  to the broad roles (`lib/create/S10-binding.kai` → coder/mcp/default)
-  and to `director`; musician/toolie never carry it. The gate is applied
+  to the broad roles (`lib/create/S10-binding.kai` → mcp; `coder`, `banto`
+  and `person` grant it in their own `S10-binding.kai`); musician/toolie
+  never carry it. The gate is applied
   in `EmbeddedKaish::for_context`: no binding or no grant → `Deny`.
 - **`MountBackend::resolve_real_path`** now resolves (it returned `None`
   unconditionally): sync mount-table walk
@@ -257,17 +258,17 @@ survives the inversion (later slices only narrow what's visible and what
   itself.
 
 Deploy note: rc seeds are **once-only** on a fresh kernel — the live
-kernel's copies of `lib/create/S10-binding.kai` and
-`director/create/S10-binding.kai` need `kaijutsu-server rc reseed --force`
+kernel's copies of `lib/create/S10-binding.kai`,
+`coder/create/S10-binding.kai` and `banto/create/S10-binding.kai` need `kaijutsu-server rc reseed --force`
 (or a plain file edit — rc is a host file now, `docs/rc-on-disk.md`) to pick
 up the `exec` grant, and only *newly created* contexts run
-create-rc; existing coder/director contexts need a one-time
+create-rc; existing coder and banto contexts need a one-time
 `kj binding allow "exec"` from a binding-admin context.
 
 ## Later slices (direction)
 
 1. **Bin-mount catalog** — kernel startup reads `PATH`, mounts each dir
-   read-only into the shells that get them (per-type, via the
+   read-only into the shells that get them (per rc directory, via the
    materialization seam). Namespace TBD (`/host/bin/NN-<name>` vs a
    union view; note kaish reserves `/v/bin/` for builtin dispatch —
    don't collide).

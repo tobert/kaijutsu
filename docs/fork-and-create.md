@@ -16,10 +16,10 @@ Two verbs mint context rows, and each means one thing.
   character that performs, then `--name`, `--cwd`, `--env`, `--parent` and
   `--senpai`, and carries no history. The label defaults to the character's
   name (`<name>-2` when a live context holds it). The context runs the
-  character's rc directory and model; there is no `--type`. Without `--cwd` it starts in the current context's cwd,
+  character's rc directory and model. Without `--cwd` it starts in the current context's cwd,
   as fork does; a current cwd that no longer resolves refuses the create and
   names `--cwd`. A lane gets its brief from the prompt it is driven with. This
-  is how a director makes a coder: `kj context create coder --name <label>`.
+  is how banto makes a coder: `kj context create coder --name <label>`.
 
 The positional of `kj context create` is the character who performs.
 

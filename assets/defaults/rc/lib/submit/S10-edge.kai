@@ -12,8 +12,8 @@
 # an ordinary appended turn (llm/hydrate.rs) and is never swept into the
 # system prompt.
 #
-# No context type links this by default; a type opts in with a symlink into
-# its own <type>/submit/ directory, the way any rc verb composes.
+# No rc directory links this by default; one opts in with a symlink into
+# its own <rc_dir>/submit/ directory, the way any rc verb composes.
 #
 # kaish trap: a `case` pattern does NOT expand a variable — `case "$a" in
 # "$b") ... esac` never matches even when they hold the same string. Use

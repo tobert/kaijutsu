@@ -11,7 +11,7 @@ kj binding allow "drift"
 kj binding allow "transport"
 kj binding allow "operator"
 # house: the kj administration verbs (ledger, rc, binding, config, ...).
-# Not implied by "*"; the worker types (coder, toolie, musician) leave it out.
+# Not implied by "*"; the worker rc directories (coder, toolie, musician) leave it out.
 kj binding allow "house"
 # Host subprocess exec from the context shell (cargo, git, aconnect…). A
 # subprocess bypasses the VFS entirely, so it's a dedicated authority — the

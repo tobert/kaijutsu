@@ -34,15 +34,15 @@ in the server-bootstrap sequence, before the freeze.
 ## Orientation: script-first, three clean roles
 
 The earlier draft leaned on human-typeable symlink farms (`live/<label>`,
-`by-type/<type>`, `by-time/NNNN`, `by-lineage/`). They're cute but they don't scale,
+`by-performer/<name>`, `by-time/NNNN`, `by-lineage/`). They're cute but they don't scale,
 and they bias the surface toward a human at a prompt. This surface is mostly for
 **scripts and expert debugging**, so navigation collapses into three roles that never
 overlap:
 
 1. **`index` — the resolver.** One greppable TSV table per collection, carrying
-   `label`, `type`, and a `path` column: a caller does
+   `label`, `performer`, and a `path` column: a caller does
    `grep feature-x /v/ctx/index`, reads `path`, and `cd`s there. Nobody computes a
-   shard path, nobody walks a farm. The index *is* `by-type` (a column), `live` (a
+   shard path, nobody walks a farm. The index *is* `by-performer` (a column), `live` (a
    column), and `by-time` (row order).
 2. **Sharded pools — pure storage.** `/v/ctx/<shard>/<full-id>/`. You reach a dir by
    resolving a known id (from the index, or from an edge), never by browsing.
@@ -73,7 +73,7 @@ driver it was in the first draft (see "Capability").
 3. **Directories are objects, edges are symlinks** (the kobject model). Contexts and
    blocks are dirs; `parent`, `head`, `children`, and a tool-result's `call` are
    symlinks. We **do not** ship symlink *farms* for naming convenience — `live`,
-   `by-type`, `by-lineage` are index columns, not directory trees.
+   `by-performer`, `by-lineage` are index columns, not directory trees.
 4. **Stable identity, separate from ordering and views.** `/proc`'s pid-reuse footgun
    (a stale path silently addressing a different process) is our timeline-ordinal
    instability. Identity is the stable `BlockId` key (the shard path); ordering is a

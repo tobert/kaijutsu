@@ -144,7 +144,7 @@ grow a second command vocabulary.
 Keep the three ACP affordances distinct:
 
 - **modes** are persistent operating stances, naturally backed by casts,
-  presets, or context type;
+  presets, or characters;
 - **configuration options** are selectable session settings such as model or
   cast;
 - **available commands** are one-shot kj actions.
@@ -166,7 +166,7 @@ moment `clientInfo` arrives, replayed on reconnect like every other actor
 peer.
 
 Client identity is ergonomic routing and presence, not a security boundary.
-A session's context runs the model its performer's slot gives its type; the
+A session's context runs the model copied from its performer when the context was made; the
 client's identity chooses none (there is no per-client model file).
 
 ### Rich prompt content
@@ -247,7 +247,7 @@ a Toad flight before the next one needs to start.
    stable-v1 `session/resume` is advertised and attaches without replay.
 2. **Archive through `session/delete` — shipped.** The bridge runs `kj
    context archive <id> --confirm` from the context the session was created
-   from, so the context type's archive rc lifecycle runs; a coder seat lacks
+   from, so the performer's rc directory runs its archive lifecycle; a coder lacks
    the `operator` capability that archive needs. Kernel archive is
    idempotent for client retries; a successful request unbinds the session
    registry entry and stops its event pump, while context data remains
@@ -274,7 +274,7 @@ a Toad flight before the next one needs to start.
    context; see "Client-declared MCP servers" below. `http` stays
    unadvertised until a test drives the broker's streamable-HTTP transport
    from ACP; `sse` has no broker transport.
-6. **Modes and config options.** Project casts/presets/context type and useful
+6. **Modes and config options.** Project casts/presets/characters and useful
    settings; implement both client-set methods and asynchronous updates.
 7. **Rich prompt content.** Carry resources and media end to end, then turn on
    only the capabilities proven by that path.
@@ -347,8 +347,9 @@ tests/dispatch.rs  the six-handler chain actually dispatches by type
 
 **Which way agency points.** In MCP kaijutsu is a *tool* another agent calls;
 in ACP kaijutsu *is* the agent and the client is the human's seat. So new
-sessions take `context_type=coder` (the model-facing stance bundle), not
-`mcp`. `--context-type` overrides.
+sessions are performed by a model character such as `coder`, not by the `mcp`
+hub. `--character <name>` overrides; without it the connection's own character
+performs, and a person's connection must name one.
 
 **Decisions worth remembering:**
 
@@ -747,8 +748,8 @@ that remain genuinely open:
   command catalog? Do not freeze an ACP-only command vocabulary before reading
   the existing kj metadata closely.
 - Which kaijutsu concept should be the primary ACP mode: cast, preset, or a
-  smaller curated projection across both? Context type is lifecycle identity
-  and may be too structural to expose as an ordinary mode switch.
+  smaller curated projection across both? A character's rc directory is lifecycle
+  identity and may be too structural to expose as an ordinary mode switch.
 - Should an ACP attachment always reassert cwd even when sibling activity is
   live, or should the bridge warn/refuse when a turn is currently executing?
   Start with the deterministic reset rule above; revisit only after a real

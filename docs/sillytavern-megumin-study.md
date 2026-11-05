@@ -30,7 +30,7 @@ credit. Borrowed text stays in host rc and never goes into `assets/defaults`.
 
 ## What runs today
 
-- **Stock** (commit `6db3b86a`): the `storyteller` type.
+- **Stock** (commit `6db3b86a`): the `storyteller` rc directory.
   - `create/S05-card.kai` reads `cards/<performer>.md`, the SillyTavern card
     description.
   - `submit/S10-reminder.kai` adds a `(System, Notification)` after each
@@ -135,8 +135,10 @@ background work. We read `docs/hyoushigi.md` and the anticipation notes in
 
 ### Smaller items
 
-- **Character rc directory**: cards at `/config/rc/storyteller/cards/` stand
-  in for the planned `rc_dir` sheet field (`docs/character.md`, slice 5).
+- **Character-specific rc**: a character's `rc_dir` names a whole directory, so
+  cards at `/config/rc/storyteller/cards/` carry the per-character prose.
+  Rc that differs per character is a design direction, not a loader feature
+  (`docs/character.md`).
 - **Interjecting while a model thinks**, for council API clients. This is an
   idea, already listed in `docs/issues.md`.
 

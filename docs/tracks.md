@@ -78,7 +78,7 @@ each leaving a mark.*
 ### 2. The score container is a real per-track score context (option C)
 
 The score's durable home is a **score context** minted when the track is created:
-a real `Live` context (`context_type="score"`, label `score-<track>`) whose
+a real `Live` context (no performer, label `score-<track>`) whose
 Conversation document *is* the track's score, stored set-once on the `tracks`
 row. Because it is a **real `ContextId`**, the entire per-context block machinery
 is reused unchanged — `reserve_block_id`, `insert_from_snapshot_as`,
@@ -120,8 +120,8 @@ score.
 
 `kj context rotate` copies the attachment rows to the successor the same way,
 and the successor's `create` rc runs `kj transport attach` (no flags) to
-announce itself. The predecessor's `archive` rc detaches it. The `companion`
-context type does this (`docs/companion.md`).
+announce itself. The predecessor's `archive` rc detaches it. A `companion`
+context does this (`docs/companion.md`).
 
 ### 5. Non-rotating attachments are first-class
 
@@ -224,7 +224,7 @@ A **musician**'s tick behaviour produces ABC into the track's score; a
 **probe**'s tick behaviour runs a kaish script that writes `/run`
 (`shared-state.md`). Same mechanism, different rc. *Being a "musician" = being
 attached to a beat track with the musician tick behaviour* — the
-`context_type`-is-an-rc-bundle decomposition (`chameleon.md`): **arming is
+rc-directory decomposition (`chameleon.md`): **arming is
 attaching.**
 
 The **death certificate** (a woken context that crashed/timed out — only the

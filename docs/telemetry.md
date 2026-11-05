@@ -67,7 +67,7 @@ reviewer. See `docs/approval-identity.md` for their authorization roles.
 | `actor.id` | Character performing the work |
 | `reviewer.id` | Character assigned to review that work |
 | `actor.name`, `reviewer.name` | Character names resolved at model-turn start |
-| `review.source` | How the reviewer was chosen: `senpai` (the holder of the nearest senpai that is not the actor, after any climb) or `self_confirmation` (a live root at a context with no senpai). There is no `director.id`; the senpai edge replaced the director column |
+| `review.source` | How the reviewer was chosen: `senpai` (the holder of the nearest senpai that is not the actor, after any climb) or `self_confirmation` (a live root at a context with no senpai). |
 | `context.id` | Context in which the work runs |
 | `ask.id` | Durable approval request |
 | `decision.actor.id` | Character attempting the decision, cancellation, or escalation |

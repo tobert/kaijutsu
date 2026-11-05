@@ -73,11 +73,29 @@ specs live under `/config/kernel/council/`; copy any missing ones from
 installs them on an existing host yet). Run
 `kaijutsu-server rc reseed` with the service stopped: it installs new seeds,
 names files that differ from theirs, and names retired defaults still
-installed. `--force` overwrites the first and removes the second; to keep
-your own edits, delete the named retired files by hand instead. A
+installed. `--force` overwrites the first, removes retired files, and moves a retired
+directory aside to `<dir>.retired-<UTC timestamp>`; to keep your own edits, create a
+`<path>.keep` beside them (`docs/config-namespace.md`). Scripts of your own in a
+retired directory (`director/`, `console/`, `default/`, `root/`, `shell/`) do not
+run again until you copy them into the directory that absorbed it: `banto/`,
+`coder/` or `person/`. A
 `gate.toml` section the kernel no longer reads fails the load and refuses
 every gated shell submission, naming the section; delete it from
-`~/.config/kaijutsu/config/kernel/gate.toml` before the restart.
+`~/.config/kaijutsu/config/kernel/gate.toml` before the restart. The
+`[context_type.<type>]` sections are among them: write the same policy under
+`[rc.<dir>]` or `[character.<name>]` (`docs/gate-policy-tuning.md`).
+
+Two boot migrations change `kernel.db` on the first start of a binary that has
+them, and each copies the database aside first when it would change a row. An
+existing copy stays as it is, and a copy that cannot be made fails the start.
+
+| Migration | What it changes | Copy |
+|---|---|---|
+| `rc-dir-rename-v1` | `characters.rc_dir` moves to the directory that absorbed the retired one: `director` and `console` to `banto`, `root` and `shell` to `person` for a root, `default` to `coder`. A character that is not a root and ran `root` or `shell` gets no directory; its create refuses until `kj character set <name> --rc <dir>` sets one | `kernel.db.pre-rc-dir-rename` |
+| `type-melt-v1` | Drops `contexts.context_type` and `characters.context_type`, and renames the approval ledger's `rc_runs.context_type` to `rc_dir` | `kernel.db.pre-type-melt` |
+
+The copies sit beside `kernel.db`; prune them by hand once the new kernel has run
+well.
 
 ## The MCP binary
 
@@ -120,7 +138,7 @@ shell-escape guard. The performing character cannot approve its own ask. Its ass
 can answer from the same context; external model leads need a credential bound
 to their own character. See `docs/approval-identity.md`.
 
-`kj context create <character> --type <t>` is how to probe a type's rc. A reseed seeds
+`kj context create <character>` is how to probe a character's rc directory. A reseed seeds
 from the **binary**, so build first.
 
 ## Builds beside a live kernel

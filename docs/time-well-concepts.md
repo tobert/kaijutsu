@@ -97,7 +97,7 @@ summarized overview with dive-in.)*
 - **Status colors**: cyan pulse + rising token-particles = streaming; amber =
   focused/waiting; red = error; dim grey = archived. Round avatar chips show
   *which peer* is working.
-- **HUD**: search + breadcrumb top; filter rail left (provider / context_type
+- **HUD**: search + breadcrumb top; filter rail left (provider / performer
   / archived); detail sidebar right (label, model, keywords, preview,
   lineage tree, JOIN); TODAY ◂▸ PAST jog-dial scrubber bottom; status strip
   with counts ("14 contexts · 3 streaming · 1 waiting"); activity ticker.
@@ -163,7 +163,7 @@ report, let Amy browse the rest. Don't refine before the human has reacted.
 - **Imagen 4 Ultra (`imagen`)** is better at atmosphere/composition but
   washes out into grey "concept gloss" on busy prompts (17) and garbles
   small text. Use it for mood/motion studies (25, 34).
-- **Name the real data fields** — label, model badge, context_type, status,
+- **Name the real data fields** — label, model badge, performer, status,
   keywords, archived-dimming, lineage. Prompts grounded in `ContextInfo`
   produced mockups that map directly onto the data model; vague prompts
   produced pretty pictures.
@@ -341,7 +341,7 @@ its still-true substrate content is timewell.md's appendix, the rest is git
 history). The radial-axis question is resolved there (four idle-age bands).
 
 - What exactly is the overview summarization rule — roots + drivers, or
-  roots + anything-with-active-drift, or RC-configurable per context_type?
+  roots + anything-with-active-drift, or RC-configurable per rc directory?
 - Dive-in layout for a subgraph: same ring grammar at smaller scale, or a
   freer tree layout while still on the table?
 - How does the join transition (34) hand off to the rebuilt conversation

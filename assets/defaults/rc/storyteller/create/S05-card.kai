@@ -1,6 +1,6 @@
 # The performer's card: who this storyteller plays. A card is local prose at
 # /config/rc/storyteller/cards/<performer>.md, written by the person; no card
-# ships. It becomes cached instruction text after the type stance. A seat
+# ships. It becomes cached instruction text after the stance. A context
 # without a performer or without a card plays the stance's narrator.
 #
 # Character names are not validated, so a name that could leave the cards

@@ -39,7 +39,7 @@ every lifecycle run and records what it ran in the approval ledger's
 content-addressed store. Git is optional and unmanaged by us.
 
 Shared prompt text is an ordinary rc file chosen through relative symlinks.
-Coder, default, and director opt in; other context types keep their own instructions.
+The `coder`, `banto`, `mcp`, `storyteller`, `toolie` and `person` rc directories link scripts under `lib/`; the other rc directories keep their own.
 See `docs/prompts.md` for composition and when edited text reaches a context.
 
 ## Rc lifecycle and kaish execution

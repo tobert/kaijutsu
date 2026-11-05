@@ -13,7 +13,7 @@ context with an empty list reaches nothing: `curl` stays registered, refuses
 the request before any connection opens, and its error names the host and says
 the context's egress list does not allow it.
 
-The list belongs to the context, not to its type and not to a file. It is rows
+The list belongs to the context, not to its performer and not to a file. It is rows
 in `kernel.db`:
 
 ```

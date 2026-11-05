@@ -275,7 +275,7 @@ one and a half:
 | Needed | Status |
 |---|---|
 | Fork parent | ✅ `forked_from` |
-| Title, keywords, accent | ✅ `label`, `keywords`, `context_type` |
+| Title, keywords, accent | ✅ `label`, `keywords`, `performer` |
 | **When it fell past the horizon** | ❌ Derivable-ish from `demoted_at` / `concluded_at`, but plain overflow has no stamp at all — it fell past because *other* contexts arrived, and nothing recorded when. |
 | **Drift / crosstalk partners** | ❌ `StagedDriftInfo` covers the *staged* queue only. Historical drift between two long-cold contexts isn't queryable. |
 | **The horizon list itself** | ❌ `assign_ring_seats` returns `horizon: Vec<Id>` app-side from a full context list. Fine at 300; a paging RPC at 10k. |

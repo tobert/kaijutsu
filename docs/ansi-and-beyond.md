@@ -258,7 +258,7 @@ version. So the parser is a kernel builtin: `ansi-strip@N`.
 **Which transforms bind to which flows: yes — that's rc's job.** rc doesn't
 implement the filesystem; it decides what mounts where. Same here: rc (or
 `/config/kernel`) declares "shell output in coder contexts passes through
-ansi-strip", per context type, per flow. Policy is composition; mechanism is
+ansi-strip", per rc directory, per flow. Policy is composition; mechanism is
 versioned.
 
 **Ad-hoc composition: yes — the transform is also a kaish verb.** `ansi-strip`

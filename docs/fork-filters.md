@@ -199,7 +199,7 @@ Full fork = "inherit almost everything + CoW" (Amy). What travels:
 |---|---|
 | blocks | per selection; deep copy = *semantic* CoW (child diverges freely, parent untouched; storage-CoW is an optimization we don't need — storage-is-cheap is locked) |
 | env, shell/cwd, bindings, workspace | copied (existing; one transaction) |
-| context_type | inherited (existing post-commit fixup) |
+| performer | inherited: a fork continues its source's performance |
 | model | inherited unless `--model` (existing) |
 | **hydration policy row** | **travels whenever the marked block survives the selection** — `full`: always; `window`: by construction; `spawn`: never (child rc re-marks); ad-hoc ranges: iff the marker survived, else the row is omitted and the fork-marker block says so visibly |
 | transport arm state | **never** — arming is always explicit |

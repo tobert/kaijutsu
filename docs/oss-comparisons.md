@@ -496,13 +496,12 @@ instructions remain unverified. See
 ## Direction for base, coder, and general-purpose contexts
 
 **Implemented composition decision:** Amy chose ordinary rc
-symlinks to opt each context type into shared prose, with no mandatory base
+symlinks to opt each rc directory into shared prose, with no mandatory base
 prompt. This supersedes a larger universal base and a smaller mandatory
 stance alike. See [prompt configuration](prompts.md).
 
-The shipped seeds strengthen the optional common contract and make
-`default` useful for general work without adding a new context type. Coder
-keeps a specific coding procedure. An extra type earns its existence when a
+The shipped seeds strengthen the optional common contract. Coder keeps a
+specific coding procedure. An extra rc directory earns its existence when a
 different loadout, lifecycle, or sustained role needs a name—not just a copy
 of the same stance with “coding” removed.
 
@@ -597,7 +596,7 @@ Several findings needed correction:
 Claude identified a conflict between universal working guidance and the
 musician's ABC-only, deadline-driven output. Amy then removed the premise of a
 universal base: “I don't think kaijutsu should force any one prompt into every
-context type.” Ordinary rc symlinks let each type choose shared instructions.
+context type.” Ordinary rc symlinks let each rc directory choose shared instructions.
 That decision supersedes both the larger universal draft and the proposed
 smaller mandatory base. The optional shared body retains
 `頑張（がんば）って！` at Amy's request.

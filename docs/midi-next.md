@@ -111,8 +111,8 @@ MIDI toolbox*. Flip to it, say "turn the reverb down 25%" (or whatever the
 device actually has), and the model works it out from injected knowledge.
 Everything needed already exists:
 
-- **rc scripts author device instructions.** A `subharmonicon` context type
-  can read its profile with `kj block create --role system --kind text
+- **rc scripts author device instructions.** A `subharmonicon` character with
+  its own rc directory can read its profile with `kj block create --role system --kind text
   --content-type text/markdown < /config/midi/devices/subharmonicon`. Put that
   command in `S20-device.kai`; a `.md` file or symlink alone does not execute.
 - **The narrow loadout is what makes a cheap model workable.** The chameleon

@@ -75,10 +75,11 @@ out-of-band-change notification companion described in "Hydration" below.
      `kaijutsu-mcp` (the external stdio server) changes are needed: `shell`
      dispatches task commands through the calling context's broker binding and
      retains their operation results. `list_kernel_tools` exposes their input
-     schemas. The `mcp`/`coder`/`director` rc loadouts
+     schemas. The `mcp` rc directory's loadout
      (`assets/defaults/rc/lib/create/S10-binding.kai`)
-     grant `*` (`Capability::AllInstances`), so `builtin.tasks` is visible
-     the moment it's registered — the "curate the external subset"
+     grants `*` (`Capability::AllInstances`), so `builtin.tasks` is visible
+     the moment it's registered; the `coder` loadout names it
+     (`assets/defaults/rc/coder/create/S10-binding.kai`) — the "curate the external subset"
      framing in the original task brief predates that slim-down.
    - Task's `role` is `Role::Tool` (created via a tool call) — deliberately
      NOT forced to `Role::System` the way `notification_payload`/

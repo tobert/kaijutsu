@@ -347,7 +347,7 @@ that, opportunistic, never required for correctness.
 
 > The beat lives on the **track**, not the context: the track is the clock
 > domain and owns the clock, playhead, transport, and score (a durable
-> **score context**, `context_type="score"`, holds the materialized blocks;
+> **score context**, a context with no performer, holds the materialized blocks;
 > producers attach, come, and go). A **beaten** (musician) context produces
 > into its *track's* timeline; a plain coder context owns a per-context
 > timeline exactly as described below. Read this section as the substrate —
@@ -715,8 +715,8 @@ fallback are exercised by their first user.
 >   stays runtime-agnostic; the server scheduler supplies its only timebase.
 > - **Kernel integration — track-keyed (`docs/tracks.md`):** for beaten
 >   contexts the timeline lives on the **track**, which owns clock + playhead
->   + transport + score. A durable **score context** (`context_type="score"`,
->   app-viewable, never takes a turn) holds the materialized blocks, so every
+>   + transport + score. A durable **score context** (a context with no
+>   performer, app-viewable, never takes a turn) holds the materialized blocks, so every
 >   per-context block API is reused unchanged. Materialize runs **once per
 >   track per beat** through one cursor; resolve failures drain into the
 >   **producing** context's conversation, routed by `played_by`. N producers
@@ -769,7 +769,7 @@ The coordinate (`Tick`/`TickDelta`), the engine crate, materialization into
 blocks, and a musician-lite proof (an internal beat, one `Resolver`, a real
 speculate→commit-or-squash→fallback loop) all landed in that order — position
 first, because a coding-only proof never runs the speculative apparatus at
-all. The real musician followed: the `context_type` (rc scripts, tool
+all. The real musician followed: the musician's rc directory (rc scripts, tool
 policy), the ABC path through the `DeriverRegistry`, and disciplining the
 beat to an external MIDI clock (`docs/midi.md`) are all built, per the
 "As landed" status above. Audio drivers (`docs/pcm.md`) and MIDI hardware I/O

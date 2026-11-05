@@ -53,7 +53,7 @@ context live. That demote step needs `--confirm`, as archive does.
 capability unless a live root character runs them. For the first three, no
 seat but the console acts on its own context, a human root, or a console
 (`docs/character.md`, "The console places contexts").
-`kj context archive --children [--type <type>] [--performer <character>]`
+`kj context archive --children [--performer <character>]`
 archives a context's live children, each through its own lifecycle.
 Already accepted commands retain their settlement destination across archive.
 The migrated execution entry points order admission against archive under the kernel database lock:
@@ -716,7 +716,7 @@ Shipped instruction scripts use the ordinary `kj` write path:
 kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
 ```
 
-`$0` is the invoked VFS entry path, including its context-type symlink name.
+`$0` is the invoked VFS entry path, including the symlink name an rc directory gives it.
 Companion lookup is relative to that entry. Composed seeds include both a
 script symlink and a data symlink. Existing Markdown paths remain unchanged,
 so non-forced reseeding can install wrappers while preserving edited text.
@@ -739,7 +739,7 @@ of every instruction body.
 Tests cover regular and symlinked invocation paths, distinct creator/requester/
 performer identities, more than 4 MiB of exact UTF-8 input, missing and invalid
 input, executable snapshots versus live data reads, reseeding with custom
-Markdown, and rendered prompts for every migrated context type. The locked
+Markdown, and rendered prompts for every migrated rc directory. The locked
 kaish API supplies positional parameters directly; no upstream API change was
 needed. Its unsupported `${0%.kai}` expansion is recorded in `docs/issues.md`;
 the shipped scripts use supported `dirname` and `basename` builtins.

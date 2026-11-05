@@ -51,10 +51,10 @@ The full surface is `kj transport`:
 **Attaching is the whole trick.** A context becomes a beat participant exactly
 when its rc attaches it: `kj transport attach` (no flags) targets the current
 context, derives the track from its label, and arms **stopped** + OODA-armed
-(no surprise token spend — `play` starts the clock). This used to be a kernel
-special-case on `context_type == "musician"`; now it is rc, so any role — a
-chorus, a lyricist in time with the music, a probe — is a beat participant
-exactly when its `create/` rc attaches it. No kernel edit.
+(no surprise token spend — `play` starts the clock). Attaching is rc, not a
+kernel special case, so any role — a chorus, a lyricist in time with the music,
+a probe — is a beat participant exactly when its `create/` rc attaches it. No
+kernel edit.
 
 ## Tempo — the clock story
 
@@ -97,9 +97,11 @@ the rack. Until that's confirmed for a given room, the jam procedure is:
 with `kj audio beats`** on any recording of the rack. Measure, don't receive
 — the modeled lock is a bonus, not a prerequisite.
 
-## Players — a context_type is an rc bundle
+## Players — a character's rc directory is its whole behavior
 
-A player's whole behavior is rc (`assets/defaults/rc/musician/`):
+A player is a context performed by a character whose rc directory is
+`musician`. Its whole behavior is that directory
+(`assets/defaults/rc/musician/`):
 
 - **create/S20-arm.kai** — `kj transport attach`: the entry into the transport.
 - **create/S30-hydrate.kai** — hydration window 16 (`kj context hydrate
@@ -186,8 +188,8 @@ makes an unbounded wait tolerable rather than lost.
 Where a model fits: a seat built like `musician` — narrow loadout, rc-driven,
 no human turn — that reads the tool plan and the classifier's signals and
 *prepares* the ask, writing a clear description and a recommendation. It does
-not decide; a human still answers. A character slot is keyed by `context_type`, so
-giving that seat a model is a config line, exactly like casting a chair. Full record
+not decide; a human still answers. A character carries its model, so
+giving that seat a model is a config line (`kj character model set`), exactly like casting a chair. Full record
 and the open pieces: `docs/issues.md`, "The escalation seat: a small model
 that prepares the ask".
 
@@ -216,8 +218,8 @@ players whose work is not quantized.
 
 ## Starting a jam
 
-1. Create the track and player: `kj context create <character> --type musician --name
-   <track>` (the create rc attaches it to the track, stopped).
+1. Create the track and player: `kj context create <character> --name
+   <track>` (the character's rc directory is `musician`) (the create rc attaches it to the track, stopped).
 2. Set the tempo: read it off the gear (or a rack's clock module) →
    `kj transport tempo --track <track> <bpm>`; verify with `kj audio beats`
    on a short recording if unsure. Upgrade to `kj transport clock --track

@@ -167,7 +167,7 @@ practice machine. Those are stable across weeks. Nothing in the system models
 them today — which is why the well drowns.
 
 **Decision: generalize the existing Track rather than invent a fourth grouping
-concept.** We already have `context_type` (an rc bucket, not a grouping),
+concept.** We already have a performer's rc directory (a behavior bucket, not a grouping),
 semantic clusters (kernel-derived, cold-data only), and `workspace_id`
 (unshipped). Adding a separate "lane/project/workspace" noun would make four.
 Instead, the hyoushigi Track — already a named, persisted, attachable lane —
@@ -491,7 +491,7 @@ navigation surfaces": append-on-join, compact-on-conclude, rule over address.
   removes and **compacts later positions by exactly one** (the memorable rule);
   `kj rank move` exists for deliberate reshuffles but nothing reorders
   implicitly. Which contexts auto-join on creation is rc-configurable per
-  context_type — user-created work contexts yes; musician rotation children and
+  performer — user-created work contexts yes; musician rotation children and
   MCP verify sessions never.
 - Render: the rank is the **table-edge ring** (mockup 27's control ring) — 10
   stations around the rim of the well, occupied ones showing a mini-card
@@ -526,7 +526,7 @@ The durable lane layer, per the ontology above.
   track run led by a **track header chip**. The 16 rotation-children collapse
   into their track's deck ("bassline ×16 · 1 running") — the aggregation
   grammar from mockup 37, applied where the census says it's needed most.
-- Score contexts (`context_type=score`) stop rendering as peer cards; they are
+- Score contexts (no performer) stop rendering as peer cards; they are
   equipment, shown on their track's chip/detail instead.
 
 Acceptance: the well shows ~6 track decks + a handful of loose contexts instead
@@ -610,7 +610,7 @@ The "not another JavaScript thing" pass, once the structure is honest.
   commit), hover previews; the rank rail clickable.
 - Motion identity: easing pass over dive/back-out, ripple/ring balance, bloom
   budget; deliberate type scale on cards vs chips vs headers.
-- A semantic accent palette (context_type/track → stable hue map) replacing the
+- A semantic accent palette (performer/track → stable hue map) replacing the
   FNV-hash-to-HSL placeholder (`scene.rs:733-742`).
 - Perf: poll costs (5s/8s cadences), texture rebuild audit, throat instancing.
 - Empty/degraded states: fresh kernel, no tracks, kernel restart mid-view.
@@ -677,7 +677,7 @@ won't discover until they hurt:
    The kernel auto-promotes on `setLastContext` (the app reports every switch),
    so the ring-0 row builds itself from where you've actually sat; demoted and
    concluded contexts are sticky (only explicit `p` returns them), and
-   synthetic churn never visits, so it never joins. No per-context_type policy
+   synthetic churn never visits, so it never joins. No per-performer policy
    needed yet.
 3. **Conclude hygiene for synthetic churn** — mostly dissolved by the idle-age
    bands (Stage 1): expiry is a pure derivation, so idle verify/mcp sessions

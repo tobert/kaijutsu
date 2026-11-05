@@ -1,9 +1,9 @@
 # The companion
 
-A `companion` is a context type for a long-lived personal agent. One person
+A `companion` is a character, with its own rc directory, for a long-lived personal agent. One person
 talks to it. While the person is away, a clock wakes a short-lived copy of it
 once an hour. That copy looks at the world, decides whether anything matters,
-and stops. The rc lives in `assets/defaults/rc/companion/`. The type is
+and stops. The rc lives in `assets/defaults/rc/companion/`. The directory is
 standalone: each script is a copy of what it uses, so copying the directory to
 `rc/<other-name>/` makes an experiment you can change freely.
 
@@ -14,7 +14,7 @@ standalone: each script is a copy of what it uses, so copying the directory to
   character. Its tools are the writable shell and the input surfaces
   (`create/S10-binding.kai`). The person is present when it runs, so the gate
   lets the `shell_write` statement through; `kj handoff note` is allowed for
-  every type, and any other command no `gate.toml` key covers asks the person.
+  every character, and any other command no `gate.toml` key covers asks the person.
 - **A check-in** is a fork of the main context, made with `--preset spawn`, so
   it starts empty. Its own `fork/` rc gives it the check-in stance
   (`fork/S20-stance.md`) and the recent handoff notes. Its loadout is cleared

@@ -303,7 +303,7 @@ server.
 
 ## Lifecycle: how fork/new/drift hook in
 
-`rc::run` takes `RcInvocation`, resolves `/config/rc/<context_type>/<verb>/`,
+`rc::run` takes `RcInvocation`, resolves `/config/rc/<rc_dir>/<verb>/` from the performer's rc directory,
 snapshots selected bodies before execution, and runs them in lexical filename
 order. The rc module owns the path grammar shared with the `kj rc` adapter.
 Wired verbs are `create`, `fork`, `attach`, `drift`, `tick`, `rotate`, and
