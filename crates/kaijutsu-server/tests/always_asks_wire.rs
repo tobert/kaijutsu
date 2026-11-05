@@ -1,8 +1,8 @@
-//! The two acts that always ask, over the product wire (`docs/character.md`,
+//! The acts that always ask, over the product wire (`docs/character.md`,
 //! "Gate"). A person's uncovered statements run without an ask, but a
 //! person's `kj context archive` of their console and `kj character set
 //! <name> --no-root` raise one. The person answers it, an allow runs the
-//! command, and a denial runs nothing.
+//! command as confirmed, and a denial runs nothing.
 
 mod common;
 use common::*;
@@ -80,6 +80,50 @@ fn a_person_s_archive_of_the_console_asks_and_runs_on_allow() {
         assert!(server.kernel_db.lock().get_character(person).unwrap().unwrap().root, "nothing ran before the answer");
         let (code, out) = kj(&handle, root, &["ledger", "deny", &ask.request_id]).await;
         assert_eq!(code, 0, "{out}");
+
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+/// An allowed ask runs its command as confirmed: an approval is a stronger
+/// confirmation than `--confirm`. The person's archive of their console
+/// without `--confirm` asks, and an allow archives it; a held verb that is
+/// not `Destroy` (`--no-root`) runs on its allow as before. Falsified by
+/// building the approved shell's `kj` unconfirmed: the archive latches and
+/// the console stays live.
+#[test]
+fn an_allowed_ask_runs_its_command_as_confirmed() {
+    run_local(async {
+        let (addr, server) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (handle, _) = client.bind_kernel().await.unwrap();
+        let root = kaijutsu_client::choose_parent(None, &handle.list_contexts().await.unwrap()).unwrap().context_id;
+        let person = server.kernel_db.lock().get_context(root).unwrap().unwrap().performer.expect("a person performs the root console");
+        let name = server.kernel_db.lock().name_for(person);
+        let pending = || server.kernel_db.lock().list_pending_asks().unwrap();
+        let live = |ctx: ContextId| !server.kernel_db.lock().get_context(ctx).unwrap().unwrap().is_archived();
+
+        let con = create_context(&handle, "con-unconfirmed").await.unwrap();
+        let (code, out) = kj(&handle, root, &["character", "set", &name, "--console", &con.to_hex()]).await;
+        assert_eq!(code, 0, "{out}");
+        let (code, out) = kj(&handle, root, &["context", "archive", &con.to_hex()]).await;
+        assert_ne!(code, 0, "the archive waits for its ask: {out}");
+        let ask = pending().pop().expect("the archive of the console raised an ask");
+        let (code, out) = kj(&handle, root, &["ledger", "allow", &ask.request_id]).await;
+        assert_eq!(code, 0, "{out}");
+        wait_for("the approved archive without --confirm", || !live(con)).await;
+
+        // `--no-root` leaves another person to answer the kernel's asks.
+        let (code, out) = kj(&handle, root, &["character", "create", "second-person", "--root"]).await;
+        assert_eq!(code, 0, "{out}");
+        assert!(pending().is_empty(), "the person's own setup runs without an ask");
+        let (code, out) = kj(&handle, root, &["character", "set", &name, "--no-root", "--rc", "coder"]).await;
+        assert_ne!(code, 0, "--no-root waits for its ask: {out}");
+        let ask = pending().pop().expect("--no-root raised an ask");
+        let (code, out) = kj(&handle, root, &["ledger", "allow", &ask.request_id]).await;
+        assert_eq!(code, 0, "{out}");
+        wait_for("the approved --no-root", || !server.kernel_db.lock().get_character(person).unwrap().unwrap().root).await;
+        assert!(!live(root), "--no-root archived the root console");
 
         server.kernel.shutdown_runtime_worker().await.unwrap();
     });

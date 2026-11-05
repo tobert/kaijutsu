@@ -6653,6 +6653,27 @@ mod tests {
         assert!(placement_row(&f, f.lane).is_archived());
     }
 
+    /// The demote step that archives a console refuses a caller who may not
+    /// archive it before the console's archive lifecycle runs, as `kj
+    /// context archive` does. Falsified by leaving the owner check to the
+    /// archive write alone: the lifecycle runs, then the write refuses.
+    #[tokio::test]
+    async fn the_demote_step_that_archives_a_console_checks_its_owner_before_the_lifecycle() {
+        let f = placement_fixture().await;
+        install_archive_script(&f.d, f.console, "true").await;
+        let amy = placement_caller(f.lane, f.amy);
+        let demoted = f.d.dispatch(&[s("context"), s("demote"), s("console")], &amy).await;
+        assert!(demoted.is_ok() && demoted.message().contains("demoted"), "{}", demoted.message());
+
+        let mut bob = placement_caller(f.bob_root, f.bob);
+        bob.confirmed = true;
+        let refused = f.d.dispatch(&[s("context"), s("demote"), s("console")], &bob).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains("only placement-amy"), "{message}");
+        assert!(!archive_lifecycle_ran(&f.d, f.console), "the refusal ran no archive lifecycle");
+        assert!(!placement_row(&f, f.console).is_archived());
+    }
+
     #[tokio::test]
     async fn context_promote_surfaces_the_ring_full_error() {
         let d = test_dispatcher().await;

@@ -2181,17 +2181,25 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
     Some(key)
 }
 
-/// Whether `cmd` is one of the two acts that always ask (`docs/character.md`,
+/// Whether `cmd` is one of the acts that always ask (`docs/character.md`,
 /// "Gate"), and the ask it raises: `kj context archive` whose target is a
 /// console (a context a sheet's `console_ctx` names), or with `--children`
-/// whose children include one, and `kj character set <name> --no-root`.
+/// whose children include one; `kj context demote` whose next step archives
+/// a console; `kj character set <name> --no-root`; and `kj character retire
+/// <name>` when `<name>` is a person or performs a live console.
 /// [`evaluate`] decides the ask over every layer but a deny, so an allow key,
 /// a learned rule, the uncovered tier and the council do not skip it. The
-/// target is resolved as the verb resolves it. Either verb with an argument
-/// that is not a literal word, or with `--`, asks, and so does a target
-/// whose read fails: the gate cannot tell that it is not one of the two.
-/// `None` for anything else, including a target that does not resolve,
-/// which the verb refuses.
+/// target is resolved as the verb resolves it. Each verb with an argument
+/// that is not a literal word, or with `--`, asks, and so does a read that
+/// fails: the gate cannot tell that it is not one of the acts.
+///
+/// `None` for anything else: a target that does not resolve, which the verb
+/// refuses, and a caller the verb refuses whatever the answer, so no ask
+/// offers a reviewer a command that cannot run. That caller is one who is
+/// not a live person, for `--no-root` and a person's retirement; one
+/// [`KernelDb::console_archive_refusal`] refuses, for a console's archive or
+/// demote; and one who is not the console's live person, for the retirement
+/// of its performer (`retire_refusal` in `kj/character.rs`).
 fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
     use kaish_types::plan::PlannedValue;
     if cmd.name != "kj" {
@@ -2222,7 +2230,9 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
     };
     let act = match (verb.get_name(), sub.get_name()) {
         ("context", "archive") => "kj context archive",
+        ("context", "demote") => "kj context demote",
         ("character", "set") => "kj character set",
+        ("character", "retire") => "kj character retire",
         _ => return None,
     };
     if !readable {
@@ -2230,15 +2240,76 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
     }
     let matches = super::effect::cached_kj_args_command().try_get_matches_from(&head).ok()?;
     let unread = |what: &str| ask(format!("{act}, whose {what} the gate could not read"));
+    // The verb refuses `--no-root` and a person's retirement to a caller who
+    // is not a live person, and a console's archive to a caller
+    // `console_archive_refusal` refuses. A read that fails still asks.
+    let not_a_person = || matches!(db.is_live_person(caller.actor_id), Ok(false));
+    let refused_console = |ctx: ContextId| matches!(db.console_archive_refusal(ctx, caller.actor_id), Ok(Some(_)));
     let (_, m) = matches.subcommand()?;
     let (_, m) = m.subcommand()?;
-    if act == "kj character set" {
-        let name = m.try_get_one::<String>("name").ok().flatten().cloned().unwrap_or_default();
-        return match m.try_get_one::<bool>("no_root") {
-            Ok(Some(true)) => ask(format!("kj character set {name} --no-root, which always asks")),
-            Ok(_) => None,
-            Err(_) => unread("--no-root flag"),
-        };
+    match act {
+        "kj character set" => {
+            let name = m.try_get_one::<String>("name").ok().flatten().cloned().unwrap_or_default();
+            return match m.try_get_one::<bool>("no_root") {
+                Ok(Some(true)) if not_a_person() => None,
+                Ok(Some(true)) => ask(format!("kj character set {name} --no-root, which always asks")),
+                Ok(_) => None,
+                Err(_) => unread("--no-root flag"),
+            };
+        }
+        "kj character retire" => {
+            let Ok(Some(name)) = m.try_get_one::<String>("name") else { return unread("name") };
+            let sheet = match db.get_character_by_name(name) {
+                Ok(Some(sheet)) if sheet.retired_at.is_none() => sheet,
+                Ok(_) => return None,
+                Err(_) => return unread("character sheet"),
+            };
+            if sheet.root {
+                return if not_a_person() { None } else { ask(format!("kj character retire {name}, a person, which always asks")) };
+            }
+            let Ok(live) = db.contexts_played_by(sheet.principal_id) else { return unread("contexts") };
+            for ctx in live {
+                let owner = match db.console_owner(ctx.context_id) {
+                    Ok(Some(owner)) => owner,
+                    Ok(None) => continue,
+                    Err(_) => return unread("console pointers"),
+                };
+                // Only the console's live person retires its performer.
+                if owner != caller.actor_id && matches!(db.is_live_person(owner), Ok(true)) {
+                    continue;
+                }
+                return ask(format!(
+                    "kj character retire {name}, who performs the console {}, which always asks",
+                    db.context_name(ctx.context_id)
+                ));
+            }
+            return None;
+        }
+        "kj context demote" => {
+            let Ok(Some(target)) = m.try_get_one::<String>("context") else { return unread("target") };
+            let Ok(target) = super::refs::resolve_context_arg_from(Some(target), caller.context_id, db) else {
+                return None;
+            };
+            // The ladder's next step archives a context already demoted
+            // (`context_demote` in `kj/context.rs`).
+            let archiving = match db.get_context(target) {
+                Ok(row) => row.is_some_and(|row| row.demoted_at.is_some() && !row.is_archived()),
+                Err(_) => return unread("place on the ladder"),
+            };
+            if !archiving {
+                return None;
+            }
+            return match db.is_console(target) {
+                Ok(true) if refused_console(target) => None,
+                Ok(true) => ask(format!(
+                    "kj context demote of {}, whose next step archives a console, which always asks",
+                    db.context_name(target)
+                )),
+                Ok(false) => None,
+                Err(_) => unread("console pointer"),
+            };
+        }
+        _ => {}
     }
     let (Ok(target), Ok(children)) = (m.try_get_one::<String>("context"), m.try_get_one::<bool>("children")) else {
         return unread("target");
@@ -2248,6 +2319,7 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
     };
     if !children.copied().unwrap_or(false) {
         return match db.is_console(target) {
+            Ok(true) if refused_console(target) => None,
             Ok(true) => ask(format!("kj context archive of {}, a console, which always asks", db.context_name(target))),
             Ok(false) => None,
             Err(_) => unread("console pointer"),
@@ -2265,6 +2337,7 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
     let Ok(children) = db.fork_children(target) else { return unread("children") };
     for child in children.into_iter().filter(|c| performer.is_none_or(|p| c.performer == Some(p))) {
         match db.is_console(child.context_id) {
+            Ok(true) if refused_console(child.context_id) => {}
             Ok(true) => {
                 return ask(format!(
                     "kj context archive --children of {}, whose child {} is a console, which always asks",

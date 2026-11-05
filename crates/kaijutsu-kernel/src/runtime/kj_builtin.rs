@@ -41,15 +41,20 @@ pub struct KjBuiltin {
     /// setter can tell rc-assigned loadouts from agent-issued ones. Trusted
     /// because the agent cannot influence how its `KjBuiltin` was built.
     privileged: bool,
+    /// True only in the shell that runs an allowed ask's source
+    /// (`ShellPolicy::Approved`): every `kj` there runs as confirmed, because
+    /// the approval confirmed it.
+    approved: bool,
 }
 
 impl KjBuiltin {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dispatcher: Arc<KjDispatcher>, session_contexts: SessionContextMap,
         identity: ShellIdentity, semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
-        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool, read_only: bool,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool, read_only: bool, approved: bool,
     ) -> Self {
-        Self { dispatcher, session_contexts, identity, semantic_index, block_source, privileged, read_only }
+        Self { dispatcher, session_contexts, identity, semantic_index, block_source, privileged, read_only, approved }
     }
 
     fn current_context_id(&self) -> Option<ContextId> {
@@ -408,8 +413,9 @@ impl Tool for KjBuiltin {
         }
 
         // Extract the bare --confirm flag before dispatch. Presence of the flag
-        // IS the confirmation; no nonce store or cross-call state exists.
-        let confirmed = crate::kj::parse::has_flag(&argv, &["--confirm"]);
+        // IS the confirmation; no nonce store or cross-call state exists. An
+        // approved ask's source is confirmed by its approval.
+        let confirmed = self.approved || crate::kj::parse::has_flag(&argv, &["--confirm"]);
         crate::kj::parse::strip_flag(&mut argv, &["--confirm"]);
 
         // kaish lifts a global `--json` out of the argv and renders `.data`.
@@ -775,7 +781,7 @@ mod tests {
                         reviewer: None, context: ctx, session: sid },
                     index,
                     source,
-                    false, false,
+                    false, false, false,
                 ));
             };
 

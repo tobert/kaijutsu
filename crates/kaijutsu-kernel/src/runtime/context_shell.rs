@@ -29,6 +29,10 @@ pub struct ShellIdentity {
 pub enum ShellPolicy {
     /// Context loadout controls host execution; output uses the agent limit.
     Agent,
+    /// [`Self::Agent`] for the source of an ask a reviewer allowed. Its `kj`
+    /// runs as confirmed: an approval is a stronger confirmation than
+    /// `--confirm` (`docs/character.md`, "Gate").
+    Approved,
     /// Hook and editor output uses the internal limit, without rc authority.
     Internal,
     /// Shared file/state writes, host execution, MCP calls, and network tools
@@ -134,8 +138,9 @@ impl EmbeddedKaish {
         let ShellIdentity {
             requester: principal, context: context_id, session: session_id, ..
         } = identity;
+        let approved = matches!(policy, ShellPolicy::Approved);
         let (privileged, read_only, output) = match policy {
-            ShellPolicy::Agent => (false, false, OutputProfile::Agent),
+            ShellPolicy::Agent | ShellPolicy::Approved => (false, false, OutputProfile::Agent),
             ShellPolicy::Internal => (false, false, OutputProfile::Internal),
             ShellPolicy::ReadOnly => (false, true, OutputProfile::Agent),
             ShellPolicy::Rc(_) => (true, false, OutputProfile::Internal),
@@ -181,7 +186,7 @@ impl EmbeddedKaish {
                     identity,
                     semantic_index,
                     block_source,
-                    privileged, read_only,
+                    privileged, read_only, approved,
                 ));
                 // The read-only interpreter replaces curl with an explicit
                 // refusal after tool registration.

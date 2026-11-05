@@ -430,15 +430,8 @@ impl KernelDb {
                 )));
             }
         }
-        let another = self
-            .list_characters(false)?
-            .into_iter()
-            .any(|other| other.root && other.principal_id != sheet.principal_id);
-        if !another {
-            return Ok(Some(format!(
-                "{name} is the last live person, and a kernel keeps one to answer its asks; \
-                 make another with `kj character create <name> --root` first"
-            )));
+        if let Some(why) = self.last_person_refusal(sheet)? {
+            return Ok(Some(why));
         }
         for ctx in [sheet.root_ctx, sheet.console_ctx, sheet.mcp_hub_ctx].into_iter().flatten() {
             if let Some(why) = self.held_drift_refusal(ctx)? {
@@ -453,6 +446,21 @@ impl KernelDb {
         Ok(None)
     }
 
+    /// Why the person `sheet` may not stop being one: it is the last live
+    /// person, and a kernel keeps one to answer its asks. `--no-root` and a
+    /// retirement both check it. `None` while another live person remains.
+    pub(crate) fn last_person_refusal(&self, sheet: &CharacterRow) -> KernelDbResult<Option<String>> {
+        let another = self
+            .list_characters(false)?
+            .into_iter()
+            .any(|other| other.root && other.principal_id != sheet.principal_id);
+        Ok((!another).then(|| format!(
+            "{} is the last live person, and a kernel keeps one to answer its asks; \
+             make another with `kj character create <name> --root` first",
+            sheet.name
+        )))
+    }
+
     /// Make the person `principal_id` an ordinary character on behalf of
     /// `by`, in one transaction: archive each live context its `root_ctx`,
     /// `console_ctx` and `mcp_hub_ctx` name, with their judge shadows
@@ -462,9 +470,15 @@ impl KernelDb {
     /// other archive refusal still applies. [`Self::demote_refusal`] is
     /// checked inside the write. Any refusal or fault rolls the whole change
     /// back. A character that is not a root refuses.
+    ///
+    /// `pointers` are the sheet's `root_ctx`, `console_ctx` and
+    /// `mcp_hub_ctx` as the caller read them before it ran their archive
+    /// lifecycles. A sheet whose pointers differ from them refuses, naming
+    /// the change, so the write archives only contexts whose lifecycles ran.
     pub fn demote_person(
         &self,
         principal_id: PrincipalId,
+        pointers: [Option<ContextId>; 3],
         rc_dir: Option<&str>,
         judges: Option<&[String]>,
         by: PrincipalId,
@@ -475,6 +489,21 @@ impl KernelDb {
                 .ok_or_else(|| KernelDbError::NotFound(format!("character {}", principal_id.short())))?;
             if !sheet.root {
                 return Err(KernelDbError::Validation(format!("{} is not a root character", sheet.name)));
+            }
+            let now = [sheet.root_ctx, sheet.console_ctx, sheet.mcp_hub_ctx];
+            if now != pointers {
+                let name = |ctx: Option<ContextId>| ctx.map_or_else(|| "none".to_string(), |ctx| db.context_name(ctx));
+                let moved = ["root console", "console", "MCP hub"]
+                    .into_iter()
+                    .zip(pointers.into_iter().zip(now))
+                    .filter(|(_, (was, is))| was != is)
+                    .map(|(what, (was, is))| format!("its {what} moved from {} to {}", name(was), name(is)))
+                    .collect::<Vec<_>>()
+                    .join(", and ");
+                return Err(KernelDbError::Validation(format!(
+                    "{}: {moved} after the archive lifecycles ran, so nothing was archived; run --no-root again",
+                    sheet.name
+                )));
             }
             if let Some(why) = db.demote_refusal(&sheet, by)? {
                 return Err(KernelDbError::Validation(why));
@@ -575,6 +604,22 @@ impl KernelDb {
 
         if archived_at.is_some() {
             if self.senpai_of(id)?.is_none() && !self.is_root_console(id)? {
+                // Only a live root performs a context with no senpai, so one
+                // whose performer is now an ordinary character was its root
+                // console, and `--root` makes a new one instead.
+                let former = match self.get_context(id)?.and_then(|row| row.performer) {
+                    Some(performer) => self.get_character(performer)?.filter(|sheet| !sheet.root && sheet.retired_at.is_none()),
+                    None => None,
+                };
+                if let Some(sheet) = former {
+                    return Err(KernelDbError::Validation(format!(
+                        "context {} has no senpai: it was {name}'s root console while {name} was a person, and \
+                         promote does not make a root console; `kj character set {name} --root` makes {name} a \
+                         person again, with a new root console",
+                        self.context_name(id),
+                        name = sheet.name,
+                    )));
+                }
                 return Err(KernelDbError::Validation(format!(
                     "context {} has no senpai, and a live context answers to one; \
                      give it one with `kj context set <ctx> --senpai <ctx>` before promoting it",

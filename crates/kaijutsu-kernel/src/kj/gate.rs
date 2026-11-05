@@ -3133,7 +3133,7 @@ mod tests {
         }
     }
 
-    // ── The two acts that always ask (`docs/character.md`, "Gate") ──
+    // ── The acts that always ask (`docs/character.md`, "Gate") ──
 
     /// `amy`'s root console, a console `con` performed by `banto` that
     /// answers to it, an ordinary lane, and a caller acting as `amy` in her
@@ -3249,6 +3249,97 @@ mod tests {
         }
         let lane = verdict_of(&d, &amy, "kj context archive lane", "").await;
         assert_eq!(lane.verdict, GateVerdict::Allowed, "the family rule still covers a lane: {}", lane.reason);
+    }
+
+    /// `kj character retire <name>` always asks when `<name>` is a person or
+    /// performs a live console, whatever the config allows, and a deny key
+    /// still refuses; retiring another character follows the layers.
+    /// Falsified by dropping the retirement case from the arm.
+    #[tokio::test]
+    async fn retiring_a_person_or_a_console_s_performer_always_asks() {
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        d.kernel_db.lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()),
+            console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id: kaijutsu_types::PrincipalId::new(),
+            name: "plain".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let allow = "[global]\nallow = [\"kj character retire\"]\n";
+        for source in ["kj character retire amy --confirm", "kj character retire banto --confirm"] {
+            let outcome = verdict_of(&d, &amy, source, allow).await;
+            assert_eq!(outcome.verdict, GateVerdict::Pending, "{source}: {}", outcome.reason);
+            cancel_pending(&d);
+        }
+        let plain = verdict_of(&d, &amy, "kj character retire plain --confirm", allow).await;
+        assert_eq!(plain.verdict, GateVerdict::Allowed, "another character follows the layers: {}", plain.reason);
+        let denied = verdict_of(&d, &amy, "kj character retire banto --confirm", "[global]\ndeny = [\"kj character retire\"]\n").await;
+        assert_eq!(denied.verdict, GateVerdict::Denied, "{}", denied.reason);
+    }
+
+    /// Step `ctx` down the demote ladder until its next step archives it.
+    fn demote_until_archiving(d: &crate::kj::KjDispatcher, ctx: kaijutsu_types::ContextId) {
+        let db = d.kernel_db.lock();
+        while db.get_context(ctx).unwrap().unwrap().demoted_at.is_none() {
+            db.demote_context(ctx).unwrap();
+        }
+    }
+
+    /// `kj context demote` whose next step archives a console always asks,
+    /// and a deny key still refuses; a step that only demotes the console,
+    /// or that archives a lane, follows the layers. Falsified by dropping
+    /// the demote case from the arm.
+    #[tokio::test]
+    async fn a_demote_that_archives_a_console_always_asks() {
+        let d = gate_dispatcher().await;
+        let (amy, con) = always_ask_fixture(&d);
+        let allow = "[global]\nallow = [\"kj context demote\"]\n";
+        let first = verdict_of(&d, &amy, "kj context demote con", allow).await;
+        assert_eq!(first.verdict, GateVerdict::Allowed, "a step that keeps the console live: {}", first.reason);
+
+        let lane = d.kernel_db.lock().find_context_by_label("lane").unwrap().unwrap().context_id;
+        demote_until_archiving(&d, con);
+        demote_until_archiving(&d, lane);
+        let archiving = verdict_of(&d, &amy, "kj context demote con --confirm", allow).await;
+        assert_eq!(archiving.verdict, GateVerdict::Pending, "{}", archiving.reason);
+        cancel_pending(&d);
+        let lane = verdict_of(&d, &amy, "kj context demote lane --confirm", allow).await;
+        assert_eq!(lane.verdict, GateVerdict::Allowed, "archiving a lane follows the layers: {}", lane.reason);
+        let denied = verdict_of(&d, &amy, "kj context demote con --confirm", "[global]\ndeny = [\"kj context demote\"]\n").await;
+        assert_eq!(denied.verdict, GateVerdict::Denied, "{}", denied.reason);
+    }
+
+    /// The arm raises no ask for a caller the verb refuses whoever answers
+    /// it: a model's `--no-root`, a model's retirement of a person, and a
+    /// model's archive or demote of a person's console follow the layers,
+    /// and the verb refuses at once with its own message. Falsified by
+    /// asking before reading the caller.
+    #[tokio::test]
+    async fn no_ask_for_an_act_the_verb_refuses_the_caller() {
+        let d = gate_dispatcher().await;
+        let (_amy, con) = always_ask_fixture(&d);
+        let banto = d.kernel_db.lock().get_character_by_name("banto").unwrap().unwrap().principal_id;
+        let mut model = caller_with_context(con);
+        model.principal_id = banto;
+        model.actor_id = banto;
+        demote_until_archiving(&d, con);
+        let allow = "[global]\nallow = [\"kj character set\", \"kj character retire\", \"kj context archive\", \
+                     \"kj context demote\"]\n";
+        for (source, refusal) in [
+            ("kj character set amy --no-root --rc coder", "only a live person"),
+            ("kj character retire amy", "only a live person"),
+            ("kj context archive con", "only amy may"),
+            ("kj context demote con", "only amy may"),
+        ] {
+            let outcome = verdict_of(&d, &model, source, allow).await;
+            assert_eq!(outcome.verdict, GateVerdict::Allowed, "{source}: {}", outcome.reason);
+            let pending = approval_ledger::ask::list_pending(d.kernel_db.lock().conn_for_ledger()).unwrap();
+            assert!(pending.is_empty(), "{source} raised an ask: {pending:?}");
+            let argv: Vec<String> = source.split_whitespace().skip(1).map(String::from).collect();
+            let mut confirmed = model.clone();
+            confirmed.confirmed = true;
+            let refused = d.dispatch(&argv, &confirmed).await;
+            let crate::kj::KjResult::Err(message) = refused else { panic!("{source}: expected the verb's refusal, got {refused:?}") };
+            assert!(message.contains(refusal), "{source}: {message}");
+        }
     }
 
     /// Settle every pending ask, so the next submission raises its own.

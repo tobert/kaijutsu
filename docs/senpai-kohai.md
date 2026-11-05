@@ -441,9 +441,10 @@ context it cannot map in `context_character_migration_report`, which `kj context
   console is refused.
 - A root console cannot be forked or archived; rotating it moves `root_ctx` at the commit, and `kj character set
   <person> --no-root` archives it with the console and the hub in one transaction.
-- Archiving the console, and `kj character set <person> --no-root`, always ask: an allow key, a learned rule or
-  the uncovered tier does not skip the ask, and a deny key refuses. Only the console's person archives it, checked
-  again inside the write.
+- Archiving the console (with `kj context archive` or the demote step that archives it), `kj character set
+  <person> --no-root`, and `kj character retire` of a person or of the console's performer always ask: an allow
+  key, a learned rule or the uncovered tier does not skip the ask, and a deny key refuses. An allow runs the
+  command as confirmed. Only the console's person archives it, checked again inside the write.
 - Archiving a context archives no other context and moves no other context; a push to an archived senpai refuses;
   `kj context list --senpai` shows the contexts of an archived senpai. The `.senpai` reference chains with
   `.parent` in any order, and a step with nothing to follow names the context and the step.

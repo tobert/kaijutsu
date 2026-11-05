@@ -97,8 +97,9 @@ enum CharacterCommand {
         /// their pointers, in one step. Refuses while the character performs
         /// any other live context or the hub has live sessions, and for the
         /// last live person. Only a person runs it, and the gate always asks
-        /// first. A character whose rc directory is `person` names another
-        /// with `--rc` in the same call.
+        /// first. A character whose rc directory is `person`, or that has
+        /// none, names one with `--rc` in the same call. `set --root` makes
+        /// it a person again, with a new root console.
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
         /// The directory under `/config/rc/` whose lifecycle scripts this
@@ -127,7 +128,10 @@ enum CharacterCommand {
     #[command(subcommand)]
     Slot(super::slot::CharacterSlotCommand),
     /// Retire a character and conclude and archive every live context it plays.
-    /// The contexts retain their performer assignment.
+    /// The contexts retain their performer assignment. Only a live person
+    /// retires a person, and the last live person is not retired. The gate
+    /// always asks first when the character is a person or performs a live
+    /// console.
     Retire {
         /// The character's name.
         name: String,
@@ -475,13 +479,16 @@ impl KjDispatcher {
                 None => created.push(self.ensure_root_context(row.principal_id, &startup_caller).await?),
                 Some(ctx) => self.rebind_root_context_if_unbound(&row, ctx, &startup_caller).await?,
             }
-            // A live console that answered to a root console since archived
-            // answers to the live one, so the person's new contexts still
-            // find their console (`KernelDb::default_console_for`).
-            if let Some(console) = row.console_ctx
-                && self.live_context(console)?
-            {
-                self.move_console_to_root_console(&row, console)?;
+            // A live console or MCP hub that answered to a root console since
+            // archived answers to the live one, so the person's new contexts
+            // still find their console (`KernelDb::default_console_for`) and
+            // the hub answers to a live root console.
+            for (pointer, what) in [(row.console_ctx, "console"), (row.mcp_hub_ctx, "MCP hub")] {
+                if let Some(ctx) = pointer
+                    && self.live_context(ctx)?
+                {
+                    self.move_to_root_console(&row, ctx, what)?;
+                }
             }
             // The console is minted by bootstrap, not here; a stale pointer
             // is cleared so nothing treats an archived context as the console.
@@ -513,28 +520,29 @@ impl KjDispatcher {
         Ok(created)
     }
 
-    /// Point the live `console` of the root `sheet` at the sheet's live root
-    /// console when its senpai is an archived or missing context, with a
-    /// warning naming both. A senpai that is live is left as it is.
-    fn move_console_to_root_console(&self, sheet: &CharacterRow, console: ContextId) -> Result<(), String> {
+    /// Point `ctx`, the live console or MCP hub (`what`) of the root `sheet`,
+    /// at the sheet's live root console when its senpai is an archived or
+    /// missing context, with a warning naming both. A senpai that is live is
+    /// left as it is.
+    fn move_to_root_console(&self, sheet: &CharacterRow, ctx: ContextId, what: &str) -> Result<(), String> {
         let db = self.kernel_db().lock();
         let moved = (|| -> crate::kernel_db::KernelDbResult<Option<(ContextId, ContextId)>> {
             let Some(root_ctx) = db.root_console(sheet.principal_id)? else { return Ok(None) };
-            let Some(old) = db.senpai_of(console)? else { return Ok(None) };
+            let Some(old) = db.senpai_of(ctx)? else { return Ok(None) };
             if old == root_ctx || db.get_context(old)?.is_some_and(|row| !row.is_archived()) {
                 return Ok(None);
             }
-            db.set_context_senpai(console, Some(root_ctx))?;
+            db.set_context_senpai(ctx, Some(root_ctx))?;
             Ok(Some((old, root_ctx)))
         })()
-        .map_err(|e| format!("could not move {}'s console {} to its root console: {e}", sheet.name, console.short()))?;
+        .map_err(|e| format!("could not move {}'s {what} {} to its root console: {e}", sheet.name, ctx.short()))?;
         if let Some((old, root_ctx)) = moved {
             tracing::warn!(
                 character = %sheet.name,
-                console = %console.short(),
+                context = %ctx.short(),
                 from = %old.short(),
                 to = %root_ctx.short(),
-                "the console answered to an archived root console; it now answers to the live one",
+                "the {what} answered to an archived root console; it now answers to the live one",
             );
         }
         Ok(())
@@ -980,13 +988,25 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj character set: {e}")),
         };
         // `person` belongs to roots, so a character that stops being one
-        // names its next directory in the same call.
+        // names its next directory in the same call, as a root with none
+        // does: an ordinary character runs a directory.
         let person_dir = kaijutsu_types::paths::PERSON_RC_DIR;
-        if no_root && rc_dir.is_none() && current.rc_dir.as_deref() == Some(person_dir) {
-            return KjResult::Err(format!(
-                "kj character set: {name} runs rc directory '{person_dir}', which only a root runs; \
-                 name its next directory in the same call: --no-root --rc <dir>"
-            ));
+        if no_root && rc_dir.is_none() {
+            match current.rc_dir.as_deref() {
+                Some(dir) if dir == person_dir => {
+                    return KjResult::Err(format!(
+                        "kj character set: {name} runs rc directory '{person_dir}', which only a root runs; \
+                         name its next directory in the same call: --no-root --rc <dir>"
+                    ));
+                }
+                None if current.root => {
+                    return KjResult::Err(format!(
+                        "kj character set: {name} has no rc directory, and an ordinary character runs one; \
+                         name it in the same call: --no-root --rc <dir>"
+                    ));
+                }
+                _ => {}
+            }
         }
         // A root's rc directory is `person` unless `--rc` names one in the
         // same call. The directory is checked before anything commits.
@@ -1120,12 +1140,14 @@ impl KjDispatcher {
     ///
     /// [`crate::kernel_db::KernelDb::demote_refusal`] is checked before the
     /// archive lifecycles of the root console and the console run, for its
-    /// message, and again inside the write. The drift router follows the
-    /// commit, as for a retirement.
+    /// message, and again inside the write. The write is handed the three
+    /// pointers read before the lifecycles and refuses if they moved. The
+    /// drift router follows the commit, as for a retirement.
     async fn character_no_root(&self, name: &str, rc_dir: Option<&str>, caller: &KjCaller) -> KjResult {
-        let lifecycles = {
+        let (lifecycles, pointers) = {
             let db = self.kernel_db().lock();
-            let read = || -> crate::kernel_db::KernelDbResult<Result<Vec<ContextId>, String>> {
+            type Read = (Vec<ContextId>, [Option<ContextId>; 3]);
+            let read = || -> crate::kernel_db::KernelDbResult<Result<Read, String>> {
                 let Some(sheet) = db.get_character_by_name(name)? else {
                     return Ok(Err(format!("no character named '{name}'")));
                 };
@@ -1138,10 +1160,10 @@ impl KjDispatcher {
                         live.push(ctx);
                     }
                 }
-                Ok(Ok(live))
+                Ok(Ok((live, [sheet.root_ctx, sheet.console_ctx, sheet.mcp_hub_ctx])))
             };
             match read() {
-                Ok(Ok(live)) => live,
+                Ok(Ok(read)) => read,
                 Ok(Err(why)) => return KjResult::Err(format!("kj character set: {why}")),
                 Err(e) => return KjResult::Err(format!("kj character set: {e}")),
             }
@@ -1160,7 +1182,9 @@ impl KjDispatcher {
                 Ok(None) => return KjResult::Err(format!("kj character set: {name} vanished")),
                 Err(e) => return KjResult::Err(format!("kj character set: {e}")),
             };
-            let demotion = match db.demote_person(principal_id, rc_dir, judges.as_deref(), caller.actor_id) {
+            // The transaction archives what the lifecycles ran for, or
+            // refuses naming the pointer that moved.
+            let demotion = match db.demote_person(principal_id, pointers, rc_dir, judges.as_deref(), caller.actor_id) {
                 Ok(demotion) => demotion,
                 Err(e) => return KjResult::Err(format!("kj character set: {name} stays a root: {e}")),
             };
@@ -1266,7 +1290,8 @@ impl KjDispatcher {
 /// Why `caller` may not retire `sheet` now, or the live contexts it
 /// performs, which the retirement archives:
 ///
-/// - Only a live person retires a person (a root character).
+/// - Only a live person retires a person (a root character), and the last
+///   live person is not retired.
 /// - A character that performs a live person's console is retired only by
 ///   that person.
 /// - Each context it performs must be archivable
@@ -1282,6 +1307,9 @@ fn retire_refusal(
         return Ok(Err(format!(
             "{name} is a person (a root character), and only a live person may retire a person"
         )));
+    }
+    if sheet.root && let Some(why) = db.last_person_refusal(sheet)? {
+        return Ok(Err(why));
     }
     let live = db.contexts_played_by(sheet.principal_id)?;
     for ctx in &live {
@@ -3092,5 +3120,133 @@ mod tests {
         assert_ne!(fresh, old_root);
         assert_eq!(sheet(&d, "boss").console_ctx, Some(con), "the live console stays the console");
         assert_eq!(d.kernel_db().lock().senpai_of(con).unwrap(), Some(fresh), "the console answers to the fresh root console");
+    }
+
+    // ── M5f: what the M5e review found ──
+
+    /// Boot moves a live MCP hub whose senpai is an archived root console to
+    /// the fresh root console, as it moves the console. Falsified by moving
+    /// only the console.
+    #[tokio::test]
+    async fn boot_moves_a_live_hub_to_the_fresh_root_console() {
+        let d = rc_capable_dispatcher().await;
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &test_caller()).await.is_ok());
+        let boss = sheet(&d, "boss");
+        let old_root = boss.root_ctx.expect("boss has a root console");
+        let hub = boss.mcp_hub_ctx.expect("boss has an MCP hub");
+        assert_eq!(d.kernel_db().lock().senpai_of(hub).unwrap(), Some(old_root), "precondition: the hub answers to it");
+        {
+            let db = d.kernel_db().lock();
+            // No archive path takes a live root console; clear its pointer
+            // first and restore it, as a sheet from before archiving cleared
+            // pointers may hold it.
+            db.set_character_root_ctx(boss.principal_id, None).unwrap();
+            db.archive_context(old_root).unwrap();
+            db.set_character_root_ctx(boss.principal_id, Some(old_root)).unwrap();
+        }
+        d.archived_in_router(std::iter::once(old_root));
+
+        d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+
+        let fresh = sheet(&d, "boss").root_ctx.expect("a fresh root console");
+        assert_ne!(fresh, old_root);
+        assert_eq!(sheet(&d, "boss").mcp_hub_ctx, Some(hub), "the live hub stays the hub");
+        assert_eq!(d.kernel_db().lock().senpai_of(hub).unwrap(), Some(fresh), "the hub answers to the fresh root console");
+    }
+
+    /// `--no-root` archives the set whose archive lifecycles ran: when a
+    /// lifecycle moves the console pointer, the transaction refuses, naming
+    /// the move, and archives nothing. Falsified by reading the pointers
+    /// again inside the transaction.
+    #[tokio::test]
+    async fn no_root_refuses_when_a_pointer_moved_after_its_lifecycles() {
+        let (d, [root_ctx, con, hub]) = demotion_fixture().await;
+        let boss = sheet(&d, "boss").principal_id;
+        let banto = sheet(&d, "banto").principal_id;
+        let con2 = register_context(&d, Some("con2"), None, banto);
+        d.kernel_db().lock().write_context_character(con2, banto, Some(root_ctx), None).unwrap();
+        // The console's archive lifecycle (banto's directory) moves the
+        // pointer after the verb read it.
+        super::super::test_helpers::install_rc_script_file(
+            &d,
+            "/config/rc/coder/archive/S99-move-console.kai",
+            "kj character set boss --console con2",
+        )
+        .await;
+
+        let refused = d.dispatch(&no_root("boss"), &caller_as(boss)).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains("console") && message.contains("con2"), "names the move: {message}");
+        let after = sheet(&d, "boss");
+        assert!(after.root && after.root_ctx == Some(root_ctx) && after.mcp_hub_ctx == Some(hub), "{after:?}");
+        assert_eq!(after.console_ctx, Some(con2), "the lifecycle's move stands");
+        assert_eq!(after.rc_dir.as_deref(), Some("person"));
+        for ctx in [root_ctx, con, con2, hub] {
+            assert!(!d.kernel_db().lock().get_context(ctx).unwrap().unwrap().is_archived(), "{} stays live", ctx.short());
+        }
+    }
+
+    /// `--no-root` leaves a directory the character may run: a root with no
+    /// rc directory refuses without `--rc`, naming it, before any archive
+    /// lifecycle runs, and changes nothing. Falsified by letting the
+    /// demotion keep no directory: the console's lifecycle runs first.
+    #[tokio::test]
+    async fn no_root_refuses_to_leave_no_rc_directory() {
+        let (d, contexts) = demotion_fixture().await;
+        let boss = sheet(&d, "boss").principal_id;
+        d.kernel_db().lock().set_character_rc_dir(boss, None).unwrap();
+
+        let refused = d.dispatch(&[s("character"), s("set"), s("boss"), s("--no-root")], &caller_as(boss)).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains("--no-root --rc <dir>"), "names --rc: {message}");
+        let ran = {
+            let db = d.kernel_db().lock();
+            approval_ledger::rc_runs::list_runs(db.conn_for_ledger()).unwrap().into_iter()
+                .any(|r| r.context_id == contexts[1].as_bytes().to_vec() && r.verb == crate::rc::VERB_ARCHIVE)
+        };
+        assert!(!ran, "the refusal ran no archive lifecycle");
+        let after = sheet(&d, "boss");
+        assert!(after.root && after.rc_dir.is_none(), "{after:?}");
+        for ctx in contexts {
+            assert!(!d.kernel_db().lock().get_context(ctx).unwrap().unwrap().is_archived(), "{} stays live", ctx.short());
+        }
+    }
+
+    /// After `--no-root`, `kj context promote` of the archived root console
+    /// refuses, naming `kj character set <name> --root`, which makes a new
+    /// one. Falsified by the senpai-only message.
+    #[tokio::test]
+    async fn promote_of_a_former_root_console_names_set_root() {
+        let (d, [root_ctx, _con, _hub]) = demotion_fixture().await;
+        let boss = sheet(&d, "boss").principal_id;
+        let demoted = d.dispatch(&no_root("boss"), &caller_as(boss)).await;
+        assert!(demoted.is_ok(), "{}", demoted.message());
+
+        let refused = d.dispatch(&[s("context"), s("promote"), root_ctx.to_hex()], &person_caller()).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains("kj character set boss --root"), "{message}");
+        assert!(d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap().is_archived(), "it stays archived");
+    }
+
+    /// Retiring the last live person refuses, naming the rule, as
+    /// `--no-root` does; with another person live, the retirement runs.
+    /// Falsified by dropping the count from retirement.
+    #[tokio::test]
+    async fn retire_refuses_the_last_live_person() {
+        let d = rc_capable_dispatcher().await;
+        let amy = super::super::test_helpers::test_reviewer_principal();
+        let name = d.kernel_db().lock().name_for(amy);
+        let mut caller = person_caller();
+        caller.confirmed = true;
+
+        let refused = d.dispatch(&[s("character"), s("retire"), name.clone()], &caller).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains("last live person"), "{message}");
+        assert!(sheet(&d, &name).retired_at.is_none(), "a refusal retires nobody");
+
+        assert!(d.dispatch(&[s("character"), s("create"), s("boss"), s("--root")], &test_caller()).await.is_ok());
+        let retired = d.dispatch(&[s("character"), s("retire"), name.clone()], &caller).await;
+        assert!(retired.is_ok(), "{}", retired.message());
+        assert!(sheet(&d, &name).retired_at.is_some());
     }
 }

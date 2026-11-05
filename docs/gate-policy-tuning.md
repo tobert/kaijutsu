@@ -497,13 +497,17 @@ database as the verb resolves them. Broker PreCall with a dispatcher wired and `
   "Senpai, the gate's model, and the director tier") or `kj context create` under the MCP hub of the caller's lineage root with that root's console as its
   senpai (`builtin allows kj context create under <hub>, the MCP hub of its lineage root`).
 - **Asks, over every layer but a deny** (`docs/character.md`, "Gate"). `kj context archive` whose target is a
-  console (a context a sheet's `console_ctx` names), or with `--children` whose selection holds one, and `kj
-  character set <name> --no-root` always ask (`builtin asks …, which always asks`). An allow key, the uncovered
-  tier, an exact or family rule and the council do not skip the ask; a deny from any layer refuses. Either verb
-  with an argument that is not a literal word, or with `--`, asks too, since the gate cannot read its target. A
-  person's uncovered statements run without an ask on the RPC shell paths, but these do not: the ask enters the
-  ledger through the ask-tier path, the person answers it in a context they perform, and an allow runs the
-  command in the approval worker.
+  console (a context a sheet's `console_ctx` names), or with `--children` whose selection holds one, `kj context
+  demote` whose next step archives a console, `kj character set <name> --no-root`, and `kj character retire
+  <name>` when `<name>` is a person or performs a live console always ask (`builtin asks …, which always asks`).
+  An allow key, the uncovered tier, an exact or family rule and the council do not skip the ask; a deny from any
+  layer refuses. Each of these verbs with an argument that is not a literal word, or with `--`, asks too, since the
+  gate cannot read its target. A caller the verb refuses whatever the answer raises no ask, and the layers decide:
+  `--no-root` or a person's retirement by a caller who is not a live person, a console's archive or demote by a
+  caller `console_archive_refusal` refuses, and a console performer's retirement by someone other than its live
+  person. A read that fails still asks. A person's uncovered statements run without an ask on the RPC shell
+  paths, but these do not: the ask enters the ledger through the ask-tier path, the person answers it in a
+  context they perform, and an allow runs the command in the approval worker, whose `kj` runs as confirmed.
 
 ## What gets deleted
 

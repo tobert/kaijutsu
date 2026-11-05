@@ -8,14 +8,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Type melt M5e: what the always-asking acts and `--no-root` leave open (2026-11-05)
 
-- The demote ladder's archive step (`kj context demote <console> --confirm` on a demoted console) archives the
-  console without the gate's always-ask; the spec names only `kj context archive`. It latches and checks the owner
-  inside the write.
+- Hook bodies (`kj hook add` with an inline kaish body, run by `run_kaish_hook` in an Internal context shell,
+  mcp/broker.rs ~2610) and rc scripts run `kj` ungated, as the matched call's actor, so the always-asking acts do
+  not ask there: a hook or an rc script archives a console, makes a person an ordinary character or retires one
+  with only `--confirm`. `kj hook add` checks no authority over `match_context` (kj/hook.rs ~292). Inside the one
+  trust boundary this is accepted (AGENTS.md, "Every player is inside one trust boundary"): the ask catches an
+  accident typed at a gated surface, not a script someone wrote. kaibo job-2 #4.
 - On the shell-gate path (`shell_write`) the ask's description is the statement, not the policy reason, so a
   reviewer does not read "a console, which always asks" there; the RPC ask-tier path names it.
 - A host command that wraps `kj` (`env kj …`) is not read by the always-ask arm (`gate_policy::always_asks`).
-- Boot moves a live console off an archived root console (`move_console_to_root_console`), but not a live MCP hub
-  whose senpai is the archived root console.
 - `kaijutsu-server init` sets `rc_dir = person` with no directory check: it runs with no kernel or VFS. The next
   start's root-console rebind refuses loudly if `person/create` binds nothing.
 - `docs/gate-policy-tuning.md` "Senpai, the gate's model, and the director tier" still says broker PreCall has no

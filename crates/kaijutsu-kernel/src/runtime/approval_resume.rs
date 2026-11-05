@@ -640,7 +640,7 @@ async fn act_on_executable_answer(
             requester: principal_id, performer: ask.actor, reviewer: Some(ask.reviewer),
             context: context_id, session: session_id,
         },
-        if ask.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+        if ask.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Approved },
         ShellCwd::Captured(ask.cwd.as_ref().map(std::path::PathBuf::from)),
         dispatcher.semantic_index(),
         dispatcher.block_source(),
