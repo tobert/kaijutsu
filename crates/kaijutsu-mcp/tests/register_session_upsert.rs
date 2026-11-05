@@ -97,7 +97,6 @@ async fn register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json::Valu
         let raw = mcp
             .register_session(Parameters(RegisterSessionRequest {
                 label: Some(label.to_string()),
-                context_type: None,
             }))
             .await;
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -136,11 +135,13 @@ fn a_new_session_is_created_under_the_only_root_context() {
     });
 }
 
-/// A session created from a root console is forked from that root's MCP hub,
-/// not from the console, and its reply still names the console as the parent
-/// it was created from.
+/// A session created from a root console is forked from the MCP hub the
+/// person's sheet names, not from the console, and the kernel reports it as
+/// an MCP session. Its reply still names the console as the parent it was
+/// created from.
 ///
-/// Falsified by registering without the hub.
+/// Falsified by registering without the hub, or by finding the hub other
+/// than through the sheet.
 #[test]
 fn a_new_session_is_forked_from_the_roots_mcp_hub() {
     run_local(async {
@@ -150,15 +151,17 @@ fn a_new_session_is_forked_from_the_roots_mcp_hub() {
         assert!(reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg}");
         let Backend::Remote(remote) = mcp.backend() else { panic!("expected Remote backend") };
         let contexts = remote.actor.list_contexts().await.unwrap();
-        let hub_label = format!("mcp/{}", SshServerConfig::EPHEMERAL_ROOT);
-        let hub = contexts
-            .iter()
-            .find(|c| c.label == hub_label)
-            .unwrap_or_else(|| panic!("the root has an MCP hub '{hub_label}'"));
-        assert_eq!(hub.context_type, "mcp-hub");
+        let console = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        let sheet = remote
+            .actor
+            .execute_kj_quiet(console, vec!["character".into(), "show".into(), SshServerConfig::EPHEMERAL_ROOT.into()])
+            .await
+            .unwrap();
+        let hub = sheet.data.as_ref().and_then(|d| d["mcp_hub_ctx"].as_str()).expect("the person's sheet names an MCP hub");
         let session = contexts.iter().find(|c| c.id.to_hex() == reg["context_id"].as_str().unwrap()).unwrap();
-        assert_eq!(session.forked_from, Some(hub.id), "{reg}");
-        assert_ne!(reg["parent"]["context_id"].as_str(), Some(hub.id.to_hex().as_str()), "the reply names the console: {reg}");
+        assert_eq!(session.forked_from.map(|id| id.to_hex()).as_deref(), Some(hub), "{reg}");
+        assert!(session.is_mcp_session, "the kernel reports the session as one: {reg}");
+        assert_ne!(reg["parent"]["context_id"].as_str(), Some(hub), "the reply names the console: {reg}");
     });
 }
 
@@ -174,7 +177,6 @@ fn a_root_session_without_a_character_refuses_and_names_the_option() {
             raw = mcp
                 .register_session(Parameters(RegisterSessionRequest {
                     label: Some("no-performer".to_string()),
-                    context_type: None,
                 }))
                 .await;
             if !raw.contains("not ready") {
@@ -236,7 +238,6 @@ fn several_roots_without_a_named_parent_refuse() {
             raw = other
                 .register_session(Parameters(RegisterSessionRequest {
                     label: Some("needs-a-parent".to_string()),
-                    context_type: None,
                 }))
                 .await;
             if !raw.contains("not ready") {
@@ -300,7 +301,6 @@ fn a_manual_register_racing_startup_registration_joins_once() {
 
         let manual = mcp.register_session(Parameters(RegisterSessionRequest {
             label: Some("chosen-by-the-model".to_string()),
-            context_type: None,
         }));
         let startup = mcp.register_when_connected("cc-startup-label", &[]);
         // `join!` polls the manual call first, so it takes the lock first.
@@ -316,17 +316,17 @@ fn a_manual_register_racing_startup_registration_joins_once() {
     });
 }
 
-/// A non-root character's `mcp` session registers with no ask and lands
-/// under its root's hub with the root console as senpai; a session of any
-/// other type created in Amy's root context still waits for her approval.
-/// The reply says the session is not joined and how to join, and once Amy
-/// allows the create, registering again with the same label joins the
-/// context the approved create made.
+/// A non-root character's session registers with no ask and lands under its
+/// root's hub with the root console as senpai. When Amy's gate layers ask
+/// before a create, the next session waits for her approval: the reply says
+/// the session is not joined and how to join, and once Amy allows the
+/// create, registering again with the same label joins the context the
+/// approved create made.
 ///
 /// Falsified by dropping the gate's rule that a create under the MCP hub of
 /// the caller's lineage root needs no ask.
 #[test]
-fn an_mcp_session_raises_no_ask_and_another_type_is_held_until_approval() {
+fn an_mcp_session_raises_no_ask_and_a_held_create_joins_after_approval() {
     run_local(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -373,11 +373,17 @@ fn an_mcp_session_raises_no_ask_and_another_type_is_held_until_approval() {
             assert_eq!(db.context_character(session).unwrap().unwrap().senpai_ctx, Some(console.context_id));
         }
 
-        // A second process: the first is already joined to its session.
+        // A host gate.toml that asks before any create from Amy's root
+        // console holds the next session's create for her: the layers decide
+        // before the MCP session rule. A second process, since the first is
+        // already joined to its session.
+        let mut text = std::fs::read_to_string(&gate).unwrap();
+        text.push_str("\n[character.amy]\nask = [\"kj context create\"]\n");
+        std::fs::write(&gate, text).unwrap();
         let mcp = connect("claude", claude_key.clone());
         wait_connected(&mcp).await;
         let held = mcp
-            .register_session(Parameters(RegisterSessionRequest { label: Some("held-seat".into()), context_type: Some("default".into()) }))
+            .register_session(Parameters(RegisterSessionRequest { label: Some("held-seat".into()) }))
             .await;
         let ask = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap_or_else(|| panic!("the create waits for Amy: {held}"));
         assert!(held.contains(&ask.request_id), "the reply names the ask: {held}");

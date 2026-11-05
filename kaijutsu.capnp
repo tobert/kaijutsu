@@ -1252,7 +1252,7 @@ struct ContextHandleInfo {
   keywords @9 :List(Text);        # Synthesis keywords (empty if not yet synthesized)
   topBlockPreview @10 :Text;      # Preview of most representative block (empty if none)
   contextState @11 :Text;         # "live"/"staging"/"concluded"/"archived" (default "live")
-  contextType @12 :Text;          # rc bucket / mode bundle (default "default")
+  contextType @12 :Text;          # Unused: the kernel leaves it empty. The facts below (performer @39 to isMcpSession @43) say what a context is
   concludedAt @13 :UInt64;        # 0 = not concluded, else Unix millis of the explicit `conclude` act
   liveStatus @14 :Status;         # live activity: running (working) / error (last turn failed) / else idle
   lastActivityAt @15 :UInt64;     # Unix millis of the most recent block append/mutation; 0 = never/unknown

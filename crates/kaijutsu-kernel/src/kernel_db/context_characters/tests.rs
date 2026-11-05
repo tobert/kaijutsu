@@ -1064,14 +1064,15 @@ fn an_uncommitted_root_successor_is_archived_and_nothing_else() {
     let model_top = w.ctx("model-top", "root", None, None);
     w.db.write_context_character(model_top.context_id, coder, None, None).unwrap();
 
-    let archived = w.db.archive_uncommitted_root_successors().unwrap();
+    let swept = w.db.archive_uncommitted_root_successors().unwrap();
 
-    assert_eq!(archived, vec![stray.context_id]);
+    assert_eq!(swept.archived, vec![stray.context_id]);
+    assert!(swept.failed.is_empty(), "{:?}", swept.failed);
     let live = |ctx: &ContextRow| w.db.get_context(ctx.context_id).unwrap().unwrap().archived_at.is_none();
     assert!(!live(&stray));
     assert!(live(&console) && live(&placed) && live(&unperformed) && live(&model_top), "only the stray goes");
     assert_eq!(w.db.root_console(amy).unwrap(), Some(console.context_id));
-    assert!(w.db.archive_uncommitted_root_successors().unwrap().is_empty(), "a second pass finds none");
+    assert_eq!(w.db.archive_uncommitted_root_successors().unwrap(), StraySweep::default(), "a second pass finds none");
 }
 
 #[test]
@@ -1652,4 +1653,114 @@ fn insert_new_context_rows_refuses_a_performer_with_no_sheet() {
     ).unwrap_err().to_string();
     assert!(start.contains("character"), "{start}");
     assert!(w.db.get_context(row.context_id).unwrap().is_none(), "nothing was written");
+}
+
+/// A context with no senpai must be performed by a LIVE root character: a
+/// retired root has no console to make. The root flag alone still makes a
+/// person for the wire facts. Falsified by checking the root flag alone.
+#[test]
+fn only_a_live_root_performs_a_context_with_no_senpai() {
+    let w = world();
+    let amy = w.character("amy");
+    w.db.update_character_root(amy, true).unwrap();
+    let top = w.ctx("amy-top", "default", None, None);
+    assert!(w.db.check_senpai_edge(top.context_id, Some(amy), None).is_ok(), "a live root may");
+
+    w.db.retire_character(amy, 2).unwrap();
+    let error = w.db.check_senpai_edge(top.context_id, Some(amy), None).unwrap_err().to_string();
+    assert!(error.contains("needs a senpai") && error.contains("live root"), "{error}");
+    assert!(w.db.is_person(amy).unwrap(), "a retired root is still a person for the facts");
+    assert!(!w.db.is_live_person(amy).unwrap());
+}
+
+/// The boot sweep leaves a retired root's contexts alone, and one stray
+/// that fails to archive is reported without stopping the rest.
+/// Falsified by selecting strays of retired roots, or by returning the
+/// first failure.
+#[test]
+fn the_stray_sweep_skips_retired_roots_and_reports_a_stray_it_cannot_archive() {
+    let w = world();
+    let [amy, old] = [w.character("amy"), w.character("old")];
+    for root in [amy, old] {
+        w.db.update_character_root(root, true).unwrap();
+    }
+    let console = w.ctx("amy-console", "root", None, None);
+    w.db.write_context_character(console.context_id, amy, None, None).unwrap();
+    w.db.set_character_root_ctx(amy, Some(console.context_id)).unwrap();
+    let [stuck, stray] = ["stuck", "stray"].map(|label| {
+        let row = w.ctx(label, "root", None, None);
+        w.db.write_context_character(row.context_id, amy, None, None).unwrap();
+        row
+    });
+    let old_top = w.ctx("old-top", "root", None, None);
+    w.db.write_context_character(old_top.context_id, old, None, None).unwrap();
+    w.db.retire_character(old, 2).unwrap();
+    w.exec(
+        "CREATE TEMP TRIGGER stuck_stays_live BEFORE UPDATE OF archived_at ON contexts
+         WHEN OLD.label = 'stuck' BEGIN SELECT RAISE(ABORT, 'injected archive fault'); END",
+        [],
+    );
+
+    let swept = w.db.archive_uncommitted_root_successors().unwrap();
+
+    assert_eq!(swept.archived, vec![stray.context_id]);
+    assert_eq!(swept.failed.len(), 1, "{:?}", swept.failed);
+    assert_eq!(swept.failed[0].0, stuck.context_id);
+    assert!(swept.failed[0].1.contains("injected archive fault"), "{:?}", swept.failed);
+    let live = |ctx: &ContextRow| w.db.get_context(ctx.context_id).unwrap().unwrap().archived_at.is_none();
+    assert!(!live(&stray) && live(&stuck) && live(&console));
+    assert!(live(&old_top), "a retired root's context is not a rotation's stray");
+}
+
+/// The facts are read for the contexts asked about, and only those.
+/// Falsified by reading every context, archived ones included.
+#[test]
+fn context_facts_are_read_for_the_listed_contexts_only() {
+    let w = world();
+    let amy = w.character("amy");
+    w.db.update_character_root(amy, true).unwrap();
+    let console = w.ctx("amy-console", "root", None, None);
+    w.db.write_context_character(console.context_id, amy, None, None).unwrap();
+    w.db.set_character_root_ctx(amy, Some(console.context_id)).unwrap();
+    let other = w.ctx("other", "default", None, None);
+    let gone = w.ctx("gone", "default", None, None);
+    w.archive(&gone);
+
+    let facts = w.db.context_facts_for(&[console.context_id, other.context_id]).unwrap();
+
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    assert!(facts[&console.context_id].is_root_console && facts[&console.context_id].performed_by_person);
+    assert_eq!(facts[&other.context_id], ContextFacts::default());
+    assert!(!facts.contains_key(&gone.context_id));
+    assert!(w.db.context_facts_for(&[]).unwrap().is_empty());
+}
+
+/// One context is the console of one sheet, and the MCP hub of one sheet.
+/// A second sheet's pointer refuses, naming the sheet that holds it; a
+/// database that already has two makes `console_owner` refuse, naming both,
+/// instead of picking one. Falsified by `ORDER BY principal_id LIMIT 1`, or
+/// by a setter that does not look at the other sheets.
+#[test]
+fn one_context_is_the_console_or_hub_of_one_sheet() {
+    let w = world();
+    let [amy, bob] = [w.character("amy"), w.character("bob")];
+    let shared = w.ctx("shared", "default", None, None);
+    w.db.set_character_console_ctx(amy, Some(shared.context_id)).unwrap();
+    w.db.set_character_console_ctx(amy, Some(shared.context_id)).unwrap();
+    let error = w.db.set_character_console_ctx(bob, Some(shared.context_id)).unwrap_err().to_string();
+    assert!(error.contains("amy") && error.contains("console"), "{error}");
+    w.db.set_character_mcp_hub_ctx(amy, Some(shared.context_id)).unwrap();
+    let error = w.db.set_character_mcp_hub_ctx(bob, Some(shared.context_id)).unwrap_err().to_string();
+    assert!(error.contains("amy") && error.contains("MCP hub"), "{error}");
+    assert_eq!(w.db.get_character(bob).unwrap().unwrap().console_ctx, None);
+    assert_eq!(w.db.get_character(bob).unwrap().unwrap().mcp_hub_ctx, None);
+    assert_eq!(w.db.console_owner(shared.context_id).unwrap(), Some(amy));
+
+    w.exec(
+        "UPDATE characters SET console_ctx = ?1 WHERE principal_id = ?2",
+        params![blob_param(shared.context_id.as_bytes()), blob_param(bob.as_bytes())],
+    );
+    let error = w.db.console_owner(shared.context_id).unwrap_err().to_string();
+    assert!(error.contains("amy") && error.contains("bob"), "{error}");
+    assert!(w.db.is_console(shared.context_id).is_err());
 }

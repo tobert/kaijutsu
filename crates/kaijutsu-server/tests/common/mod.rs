@@ -543,16 +543,16 @@ pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijut
     create_context_typed(kernel, label, "default").await
 }
 
-/// [`create_context`] with a `context_type`, performed by
-/// [`rc_performer`]`(context_type)`, so the context runs that type's rc.
+/// [`create_context`] performed by [`rc_performer`]`(dir)`, so the context
+/// runs `/config/rc/<dir>/`.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context_typed(
     kernel: &KernelHandle,
     label: &str,
-    context_type: &str,
+    dir: &str,
 ) -> Result<kaijutsu_types::ContextId, String> {
-    let performer = rc_performer(kernel, context_type).await?;
-    create_context_typed_as(kernel, label, context_type, &performer).await
+    let performer = rc_performer(kernel, dir).await?;
+    create_context_as(kernel, label, &performer).await
 }
 
 /// Make `context` of type `dir`, and point its performer at rc directory
@@ -586,24 +586,14 @@ pub async fn rc_performer(kernel: &KernelHandle, dir: &str) -> Result<String, St
     Ok(name)
 }
 
-/// Create `label` of type `default` as the live, non-root `character`.
+/// Create `label` performed by the live `character` through `kj context
+/// create`, run from the kernel's only root context. The context runs the
+/// character's rc directory.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context_as(kernel: &KernelHandle, label: &str, character: &str) -> Result<kaijutsu_types::ContextId, String> {
-    create_context_typed_as(kernel, label, "default", character).await
-}
-
-/// Create `label` of `context_type` as `character` through `kj context create`,
-/// run from the kernel's only root context.
-#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
-pub async fn create_context_typed_as(
-    kernel: &KernelHandle,
-    label: &str,
-    context_type: &str,
-    character: &str,
-) -> Result<kaijutsu_types::ContextId, String> {
     let contexts = kernel.list_contexts().await.map_err(|e| e.to_string())?;
     let parent = kaijutsu_client::choose_parent(None, &contexts)?;
-    let argv = kaijutsu_client::context_create_argv(label, context_type, character, None);
+    let argv = kaijutsu_client::context_create_argv(label, character, None);
     let result = kernel.execute_kj_quiet(parent.context_id, &argv).await.map_err(|e| e.to_string())?;
     kaijutsu_client::context_id_from_create_result(&result)
 }

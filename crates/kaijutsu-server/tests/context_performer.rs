@@ -170,9 +170,9 @@ fn context_listings_carry_the_person_console_and_session_facts() {
             }
         };
         let words = |line: &str| line.split(' ').map(String::from).collect::<Vec<_>>();
-        run(words(&format!("context create {PERFORMER} --name facts-console --type default"))).await;
+        run(words(&format!("context create {PERFORMER} --name facts-console"))).await;
         run(words(&format!("character set {person} --console facts-console"))).await;
-        run(words(&format!("context create {PERFORMER} --name facts-session --type default --parent mcp/{person}"))).await;
+        run(words(&format!("context create {PERFORMER} --name facts-session --parent mcp/{person}"))).await;
 
         let listed = kj.list_contexts().await.unwrap();
         let find = |label: &str| listed.iter().find(|c| c.label == label).unwrap_or_else(|| panic!("{label} is listed")).clone();

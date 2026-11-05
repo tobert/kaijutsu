@@ -68,7 +68,7 @@ pub struct Row {
     /// same seat).
     pub digit: Option<usize>,
     pub label: String,
-    pub context_type: String,
+    pub performer: String,
     /// `●` — a tail line landed within [`CHATTER_WINDOW_MS`].
     pub chatter: bool,
     /// `@` — activity since this context was last on screen (the same flag
@@ -128,7 +128,7 @@ fn row_from(info: &ContextInfo, digit: Option<usize>, activity: bool, tails: &Pi
         context_id: info.id,
         digit,
         label: if info.label.is_empty() { info.id.short() } else { info.label.clone() },
-        context_type: info.context_type.clone(),
+        performer: info.performer.clone().unwrap_or_else(|| crate::app::NO_PERFORMER.to_string()),
         chatter: tails.chatter(info.id, now_millis, CHATTER_WINDOW_MS),
         activity,
         running: info.live_status == Status::Running,
@@ -716,7 +716,7 @@ fn key_line(width: usize, palette: &Palette) -> Line<'static> {
     Line::from(Span::styled(text.to_string(), palette.divider()))
 }
 
-fn row_line(row: &Row, selected: bool, label_w: usize, ctype_w: usize, width: usize, palette: &Palette) -> Line<'static> {
+fn row_line(row: &Row, selected: bool, label_w: usize, performer_w: usize, width: usize, palette: &Palette) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
     let digit = row.digit.map(|d| d.to_string()).unwrap_or_else(|| " ".to_string());
     let flag = if row.chatter { "●" } else if row.activity { "@" } else { " " };
@@ -724,7 +724,7 @@ fn row_line(row: &Row, selected: bool, label_w: usize, ctype_w: usize, width: us
     let head = format!(
         "{marker}{digit} {} {flag} {} {:<7} {:>3}  ",
         pad(&row.label, label_w),
-        pad(&row.context_type, ctype_w),
+        pad(&row.performer, performer_w),
         state,
         format_age(row.age_ms),
     );
@@ -736,7 +736,7 @@ fn row_line(row: &Row, selected: bool, label_w: usize, ctype_w: usize, width: us
 
 fn horizon_row_line(row: &Row, selected: bool, label_w: usize, width: usize, palette: &Palette) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
-    let text = format!("{marker}{} {}  {}", pad(&row.label, label_w), pad(&row.context_type, 10), format_age(row.age_ms));
+    let text = format!("{marker}{} {}  {}", pad(&row.label, label_w), pad(&row.performer, 10), format_age(row.age_ms));
     Line::from(Span::styled(truncate_chars(&text, width), palette.status()))
 }
 
@@ -758,8 +758,8 @@ fn label_width(rows: &[&Row]) -> usize {
     rows.iter().map(|r| display_width(&r.label)).max().unwrap_or(0).clamp(8, 20)
 }
 
-fn ctype_width(rows: &[&Row]) -> usize {
-    rows.iter().map(|r| display_width(&r.context_type)).max().unwrap_or(0).clamp(6, 10)
+fn performer_width(rows: &[&Row]) -> usize {
+    rows.iter().map(|r| display_width(&r.performer)).max().unwrap_or(0).clamp(6, 10)
 }
 
 /// The picker's lines: the header, ACTIVE/RECENT/TRACKS or the horizon list,
@@ -789,17 +789,17 @@ pub fn render(model: &PickerModel, width: u16, palette: &Palette) -> Vec<Line<'s
     let active = model.visible_active();
     lines.push(Line::from(Span::styled("ACTIVE", palette.divider())));
     let label_w = label_width(&active.iter().chain(model.visible_recent().iter()).copied().collect::<Vec<_>>());
-    let ctype_w = ctype_width(&active.iter().chain(model.visible_recent().iter()).copied().collect::<Vec<_>>());
+    let performer_w = performer_width(&active.iter().chain(model.visible_recent().iter()).copied().collect::<Vec<_>>());
     for (i, row) in active.iter().enumerate() {
         let selected = model.section == Section::Active && i == model.index;
-        lines.push(row_line(row, selected, label_w, ctype_w, width, palette));
+        lines.push(row_line(row, selected, label_w, performer_w, width, palette));
     }
 
     let recent = model.visible_recent();
     lines.push(Line::from(Span::styled("RECENT", palette.divider())));
     for (i, row) in recent.iter().enumerate() {
         let selected = model.section == Section::Recent && i == model.index;
-        lines.push(row_line(row, selected, label_w, ctype_w, width, palette));
+        lines.push(row_line(row, selected, label_w, performer_w, width, palette));
     }
 
     let horizon_count = model.horizon.len();
@@ -841,7 +841,6 @@ mod tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: "coder".to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),

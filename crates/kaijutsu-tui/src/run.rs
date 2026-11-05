@@ -39,7 +39,7 @@ use kaijutsu_client::DraftEdit;
 use kaijutsu_client::draft_outbox::{self, Landed};
 use kaijutsu_client::editor_outbox;
 use crate::completion;
-use crate::ctrl_z::{self, SHELL_CONTEXT_TYPE, Toggle};
+use crate::ctrl_z::{self, Toggle};
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
 use crate::picker::{self, Outcome as PickerOutcome};
@@ -882,7 +882,7 @@ async fn event_loop(
                 // and the next tick starts the next one.
                 if refresh_task.is_none() {
                     refresh_wanted = false;
-                    refresh_task = Some(tokio::spawn(refresh::fetch(bridge.clone())));
+                    refresh_task = Some(tokio::spawn(refresh::fetch(bridge.clone(), app.listing_epoch())));
                 }
             }
             joined = async { refresh_task.as_mut().expect("guarded by is_some").await }, if refresh_task.is_some() => {
@@ -1744,8 +1744,9 @@ async fn remember_view(bridge: &KernelBridge, id: ContextId) {
 /// than carrying the old context's text along — `load_draft` keeps the `:`
 /// line's own history, which is this session's, not this draft's.
 ///
-/// `Ctrl+Z`'s toggle: a root to its live shell child (created on first use),
-/// a shell back to its parent, and a notice from anywhere else
+/// `Ctrl+Z`'s toggle: a root console or the console to the live context the
+/// person performs under it (created on first use), a person's context back
+/// to the context it was opened from, and a notice from anywhere else
 /// (`crate::ctrl_z::toggle`).
 ///
 /// The listing is asked for here rather than read from the app, so a shell
@@ -1777,7 +1778,7 @@ async fn toggle_shell(bridge: &KernelBridge, app: &mut App, feeds: &mut Feeds) {
                     }
                     // The app's listing predates the create; the screen,
                     // the submit and the next Ctrl+Z read the new context's
-                    // type from it before the next refresh lands.
+                    // facts from it before the next refresh lands.
                     let id = info.id;
                     let mut contexts = contexts;
                     contexts.push(info);
@@ -1909,7 +1910,8 @@ async fn compose_key(
         // "The submit verb").
         let edge = app.views.get(&ctx).and_then(|view| view.edge());
         let draft_id = app.current_draft_id();
-        let is_shell = app.current_info().is_some_and(|info| info.context_type == SHELL_CONTEXT_TYPE);
+        // A person's context runs its draft as shell and starts no turn.
+        let is_shell = app.current_info().is_some_and(|info| info.performed_by_person);
         // The kernel snapshots its own copy of the draft, so the submit queues
         // behind every keystroke still on the wire.
         match app.drafts.submit(ctx, edge).await {

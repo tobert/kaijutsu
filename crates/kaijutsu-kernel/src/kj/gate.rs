@@ -2976,7 +2976,7 @@ mod tests {
              [character.{name}]\ndeny = [\"kj fork\"]\n",
         ));
 
-        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create coder --name x --type default").unwrap();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create coder --name x").unwrap();
         let outcome =
             run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
@@ -2990,7 +2990,7 @@ mod tests {
         // Another context, performed by another character, gets the global allow.
         let other = registered_caller(&d);
         crate::kj::test_helpers::give_character(&d, &other);
-        for source in ["kj context create coder --name x --type default", "kj fork --name lane"] {
+        for source in ["kj context create coder --name x", "kj fork --name lane"] {
             let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
             let outcome =
                 run_gate(d.kernel(), &other, spec, d.kernel.ledger_flows(), &config).await;
@@ -2998,12 +2998,12 @@ mod tests {
         }
     }
 
-    /// The argv `kaijutsu-mcp` sends to create a session from a root
-    /// console (`kaijutsu_client::context_create_argv_under`): the
-    /// connection's character, a label, `--type mcp` (until the clients stop
-    /// sending it), the client's cwd, and `--parent` naming the root's MCP
-    /// hub.
-    const MCP_SESSION_ARGV: &str = "kj context create claude --name sess --type mcp --cwd /app --parent mcp/amy";
+    /// The shape of the argv `kaijutsu-mcp` sends to create a session from a
+    /// root console (`kaijutsu_client::context_create_argv_under`): the
+    /// connection's character, a label, the client's cwd, and `--parent`
+    /// naming the root's MCP hub. The client names the hub by id; a label
+    /// names it as well.
+    const MCP_SESSION_ARGV: &str = "kj context create claude --name sess --cwd /app --parent mcp/amy";
 
     /// The MCP hub of `root`, labeled `mcp/<name>`, with the sheet pointing
     /// at it as `ensure_mcp_hub` leaves it.
@@ -3025,23 +3025,23 @@ mod tests {
     }
 
     /// A context created under the MCP hub of the caller's lineage root
-    /// raises no ask, with the argv the client sends and without its `--type
-    /// mcp`. The same create under another root's hub, under no hub, or
-    /// with the parent in a variable asks.
+    /// raises no ask, with the hub named by label or by id. The same create
+    /// under another root's hub, under no hub, or with the parent in a
+    /// variable asks.
     ///
-    /// Falsified by keying the rule on `--type mcp`, by accepting any MCP
-    /// hub, or by dropping the rule.
+    /// Falsified by accepting any MCP hub, or by dropping the rule.
     #[tokio::test]
     async fn an_mcp_session_under_the_lineage_root_s_hub_raises_no_ask() {
         let d = gate_dispatcher().await;
         let console = crate::kj::test_helpers::register_root_context(&d);
         let amy = crate::kj::test_helpers::test_reviewer_principal();
-        mcp_hub(&d, amy, "amy");
+        let amy_hub = mcp_hub(&d, amy, "amy");
         let bob = crate::kj::test_helpers::root_character(&d);
         mcp_hub(&d, bob, "bob");
         let caller = mcp_connection(&d, console);
         let config = gate_config(crate::config_seed::DEFAULT_GATE_CONFIG);
-        for source in [MCP_SESSION_ARGV, "kj context create claude --name sess2 --parent mcp/amy"] {
+        let by_id = format!("kj context create claude --name sess6 --cwd /app --parent {}", amy_hub.to_hex());
+        for source in [MCP_SESSION_ARGV, "kj context create claude --name sess2 --parent mcp/amy", by_id.as_str()] {
             let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
             let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;
             assert_eq!(outcome.verdict, GateVerdict::Allowed, "{source}: {}", outcome.reason);
@@ -3060,9 +3060,9 @@ mod tests {
         let outcome = run_gate(d.kernel(), &in_lane, spec, d.kernel.ledger_flows(), &config).await;
         assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
         for source in [
-            "kj context create claude --name sess3 --type mcp --parent mcp/bob",
-            "kj context create claude --name sess4 --type mcp",
-            "kj context create claude --name sess5 --type mcp --parent $HUB",
+            "kj context create claude --name sess3 --parent mcp/bob",
+            "kj context create claude --name sess4",
+            "kj context create claude --name sess5 --parent $HUB",
         ] {
             let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
             let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &config).await;

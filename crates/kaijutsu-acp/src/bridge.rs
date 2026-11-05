@@ -64,7 +64,8 @@ pub fn peer_nick_for_client(name: &str) -> String {
 #[derive(Clone)]
 pub struct KernelBridge {
     actor: ActorHandle,
-    context_type: String,
+    /// The character that performs a context this bridge creates. `None`
+    /// is this connection's own character, which must not be a root.
     character: Option<String>,
     parent: Option<String>,
 }
@@ -79,7 +80,6 @@ impl KernelBridge {
     /// is the price.
     pub async fn connect(
         config: SshConfig,
-        context_type: String,
         character: Option<String>,
         parent: Option<String>,
         connect_timeout: std::time::Duration,
@@ -168,7 +168,6 @@ impl KernelBridge {
 
         Ok(Self {
             actor,
-            context_type,
             character,
             parent,
         })
@@ -176,10 +175,6 @@ impl KernelBridge {
 
     pub fn actor(&self) -> &ActorHandle {
         &self.actor
-    }
-
-    pub fn has_character(&self) -> bool {
-        self.character.is_some()
     }
 
     /// Advertise the ACP client process as one peer, independent of how many
@@ -343,11 +338,11 @@ impl KernelBridge {
     }
 
     /// Create a performer-assigned context through `kj` so the kernel validates
-    /// the character before inserting it and runs the selected context type's
-    /// rc create lifecycle with the correct identity and cwd already on the
-    /// row.
+    /// the character before inserting it and runs the character's rc create
+    /// lifecycle with the correct identity and cwd already on the row. The
+    /// character is `--character`, else this connection's own, which must not
+    /// be a root ([`NoPerformer`] otherwise).
     async fn create_context(&self, label: &str, cwd: &std::path::Path) -> Result<ContextId> {
-        let character = self.character.as_ref().expect("new-session path validates --character first");
         let cwd = cwd
             .to_str()
             .with_context(|| format!("ACP cwd is not valid UTF-8: {}", cwd.display()))?;
@@ -357,8 +352,17 @@ impl KernelBridge {
         if parent.source == kaijutsu_client::ParentSource::OnlyRoot {
             tracing::warn!(parent = %parent.label, "no --parent given; creating under the kernel's only root context");
         }
+        let character = self
+            .actor
+            .performer_for_new_contexts(parent.context_id, self.character.as_deref(), "--character <name>")
+            .await
+            .map_err(|e| match e {
+                kaijutsu_client::CreateContextError::Refused(why) => anyhow::Error::new(NoPerformer(why)),
+                other => anyhow::anyhow!("ACP session/new: {other}"),
+            })?;
+        let character = character.as_str();
         self.actor
-            .create_context_under(parent.context_id, label, &self.context_type, character, Some(cwd))
+            .create_context_under(parent.context_id, label, character, Some(cwd))
             .await
             .map_err(|e| {
                 if e.is_cwd_refusal() {
@@ -506,6 +510,19 @@ impl std::fmt::Display for CwdRefused {
 
 impl std::error::Error for CwdRefused {}
 
+/// No character to perform a new session's context: the connection is a
+/// person's and `--character` names none. The message names the option.
+#[derive(Debug)]
+pub struct NoPerformer(pub String);
+
+impl std::fmt::Display for NoPerformer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoPerformer {}
+
 /// What `open_or_create` did.
 #[derive(Debug, Clone)]
 pub struct OpenedContext {
@@ -547,7 +564,6 @@ mod tests {
             created_at: 0,
             trace_id: [0; 16],
             fork_kind: None,
-            context_type: "coder".into(),
             archived,
             concluded_at,
             keywords: Vec::new(),

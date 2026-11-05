@@ -186,7 +186,7 @@ outbox, so a submit always takes exactly what was typed before it
 | `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |
 | `Esc Esc` | Leave compose, when the second Esc lands in normal mode within 500 ms |
 | `Ctrl+C` | The interrupt ladder; the third press clears the surface |
-| `Ctrl+Z` | Toggle the root context and its shell child (`docs/character.md`, "The root console and its shell"); each context keeps its own chat draft |
+| `Ctrl+Z` | Toggle a root console or the console and the context the person performs under it (`docs/tui.md`, "Keys"); each context keeps its own chat draft |
 | `Ctrl+V` / middle click | Paste CLIPBOARD / PRIMARY at the cursor as one edit |
 | `Ctrl+A a` | A literal `Ctrl+A` for the vi engine |
 
@@ -262,7 +262,7 @@ folds · `V` visual-line · `y` yank to clipboard · `R` reload a stale view ·
 | `Ctrl+Shift+V` | Paste CLIPBOARD into the vi editor through `editor_insert` | editor; refused with a notice while the `:` line is open |
 | middle-click | Paste PRIMARY | in the editor through `editor_insert`, refused while the `:` line is open |
 | selection | Auto-copies to PRIMARY (mouse or vi visual) | |
-| `Ctrl+Z` | Root↔shell context toggle; in the editor: suspend to shell | unix suspend metaphor |
+| `Ctrl+Z` | Root console↔person's context toggle; in the editor: suspend to shell | unix suspend metaphor |
 | `Ctrl+D/U` | Half-page scroll | unchanged |
 | `Ctrl+6` | Previous-pane toggle | unchanged |
 | `Alt+hjkl/v/s/q/[/]` | Tiling | unchanged |

@@ -2411,7 +2411,6 @@ fn write_context_row_to_handle_info(
     info.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
     info.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_context_state(row.context_state.as_str());
-    info.set_context_type(&row.context_type);
     info.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_last_activity_at(row.last_activity_at.map(|ts| ts as u64).unwrap_or(0));
     info.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
@@ -3587,21 +3586,28 @@ impl kernel::Server for KernelImpl {
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
         Promise::from_future(
             async move {
-                // Build KernelDb lookup for fork_kind + archived_at (fields not on DriftRouter)
-                let db_map: HashMap<ContextId, ContextRow> = {
-                    let db = kernel_db_arc.lock();
-                    match db.list_all_contexts() {
-                        Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
-                        Err(_) => HashMap::new(),
-                    }
-                };
+                // The contexts listed are the drift router's, the runtime
+                // authority for live state; it holds archived contexts too.
+                let contexts: Vec<kaijutsu_kernel::ContextHandle> =
+                    kernel_arc.drift().read().list_contexts().into_iter().cloned().collect();
+                // Build KernelDb lookup for fork_kind + archived_at (fields not
+                // on DriftRouter). A read failure fails the listing rather than
+                // list every context with no metadata.
+                let db_map: HashMap<ContextId, ContextRow> = kernel_db_arc
+                    .lock()
+                    .list_all_contexts()
+                    .map_err(|e| capnp::Error::failed(format!("list_contexts: context rows unreadable: {e}")))?
+                    .into_iter()
+                    .map(|r| (r.context_id, r))
+                    .collect();
                 // Context → what it is, from its performer and the character
-                // pointers (one query for the whole kernel). Clients decide
+                // pointers (one query for the listed contexts). Clients decide
                 // from these facts; a read failure fails the listing rather
                 // than show a person's context as a model's.
+                let listed: Vec<ContextId> = contexts.iter().map(|ctx| ctx.id).collect();
                 let facts_by_ctx: HashMap<ContextId, kaijutsu_kernel::kernel_db::ContextFacts> = kernel_db_arc
                     .lock()
-                    .all_context_facts()
+                    .context_facts_for(&listed)
                     .map_err(|e| capnp::Error::failed(format!("list_contexts: context facts unreadable: {e}")))?;
                 // Context → track binding (one query for the whole kernel). The
                 // attachments table is transactional on attach/detach, so —
@@ -3677,9 +3683,6 @@ impl kernel::Server for KernelImpl {
                 // that identically to `BackgroundSummary::default()`.
                 let bg_by_ctx = kernel_arc.shell_operations().summary_by_context().map_err(capnp::Error::failed)?;
 
-                // Read from the kernel's drift router — runtime authority for live state
-                let drift = kernel_arc.drift().read();
-                let contexts = drift.list_contexts();
                 let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
 
                 for (i, ctx) in contexts.iter().enumerate() {
@@ -3701,16 +3704,16 @@ impl kernel::Server for KernelImpl {
                     c.set_trace_id(&ctx.trace_id);
 
                     c.set_context_state(ctx.state.as_str());
+                    // A context with no row has no facts, and every fact stays false.
+                    if let Some(facts) = facts_by_ctx.get(&ctx.id) {
+                        set_context_facts(c.reborrow(), facts);
+                    }
 
                     // Supplement with KernelDb metadata
                     if let Some(row) = db_map.get(&ctx.id) {
                         c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
                         c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
-                        c.set_context_type(&row.context_type);
-                        if let Some(facts) = facts_by_ctx.get(&ctx.id) {
-                            set_context_facts(c.reborrow(), facts);
-                        }
                         // Stage 1 (time-well) kernel truth: last block-op
                         // recency, stamped by BlockStore::journal_op via
                         // KernelDb::touch_context_activity. 0 = never/unknown

@@ -2,7 +2,7 @@
 //! I/O, no clock.
 //!
 //! Everything a block needs from outside itself — who is speaking, the
-//! context type, the wallclock stamp, whether it renders collapsed — arrives
+//! context's performer, the wallclock stamp, whether it renders collapsed — arrives
 //! in a [`BlockView`], so this module can be unit-tested without a kernel and
 //! without a terminal. `docs/tui.md`, "Shape: the ACP bridge minus the
 //! protocol".
@@ -265,8 +265,8 @@ pub struct BlockView<'a> {
     /// the model, or the tool. Resolved by the caller, which is the only
     /// side that knows the identity and the performer.
     pub speaker: &'a str,
-    /// The context's rc bucket, for the role divider.
-    pub context_type: &'a str,
+    /// The context's performer, for the role divider (`-` for none).
+    pub performer: &'a str,
     /// The block's wallclock, already formatted (`14:02:11`). The clock
     /// lives at the edge so this module stays pure.
     pub stamp: &'a str,
@@ -352,7 +352,7 @@ pub fn divider_text(view: &BlockView<'_>, width: u16) -> (String, bool) {
             }
         }
         (Some(tool), None) => (format!("─ {} · {} ", view.speaker, tool), false),
-        (None, _) => (format!("─ {} · {} ", view.speaker, view.context_type), false),
+        (None, _) => (format!("─ {} · {} ", view.speaker, view.performer), false),
     };
     let head_w = display_width(&head);
     let rule = width.saturating_sub(head_w + tail_w);
@@ -742,7 +742,7 @@ struct Entry {
 /// one key.
 ///
 /// The block's own version is not enough: the divider carries the speaker,
-/// the context type, the stamp and a tool call's argument, an `Error` block's
+/// the context's performer, the stamp and a tool call's argument, an `Error` block's
 /// provenance line reads the lineage, and a result's body reads `output`,
 /// `stderr` and `style_spans`. A performer rename or a rehydrate moves those with
 /// the block's own fields untouched, and a key that missed them would serve
@@ -761,7 +761,7 @@ fn render_key(block: &BlockSnapshot, view: &BlockView<'_>) -> u64 {
     block.stderr.as_deref().map(str::len).hash(&mut hasher);
     block.style_spans.len().hash(&mut hasher);
     view.speaker.hash(&mut hasher);
-    view.context_type.hash(&mut hasher);
+    view.performer.hash(&mut hasher);
     view.stamp.hash(&mut hasher);
     view.show_divider.hash(&mut hasher);
     view.tool.hash(&mut hasher);
@@ -1076,7 +1076,7 @@ mod tests {
     fn view<'a>() -> BlockView<'a> {
         BlockView {
             speaker: "claude",
-            context_type: "coder",
+            performer: "coder",
             stamp: "14:02:11",
             show_divider: false,
             tool: None,
@@ -1253,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn the_divider_names_speaker_context_type_and_wallclock() {
+    fn the_divider_names_speaker_performer_and_wallclock() {
         let line = divider_line(&view(), 60, &Palette::builtin());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text.chars().count(), 60, "the rule fills the width");

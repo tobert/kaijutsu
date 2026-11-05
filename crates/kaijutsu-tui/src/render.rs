@@ -178,12 +178,12 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     out
 }
 
-/// The context type the current context's blocks render under.
-fn context_type_of(app: &App) -> String {
+/// The performer the current context's blocks render under.
+fn performer_of(app: &App) -> String {
     app.current
         .and_then(|id| app.info(id))
-        .map(|c| c.context_type.clone())
-        .unwrap_or_else(|| "default".to_string())
+        .and_then(|c| c.performer.clone())
+        .unwrap_or_else(|| crate::app::NO_PERFORMER.to_string())
 }
 
 /// The one row a context with no view draws.
@@ -224,7 +224,7 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
     let Some(frame) = plan_rows(app, width) else {
         return Vec::new();
     };
-    let PlannedRows { plan, rows, context_type } = frame;
+    let PlannedRows { plan, rows, performer } = frame;
     let height = usize::from(height);
     let palette = app.palette;
 
@@ -247,7 +247,7 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
             row += block_rows;
             continue;
         }
-        let view = block_view(item, &context_type, block);
+        let view = block_view(item, &performer, block);
         let lineage = app.lineage_for(block);
         let view = crate::present::BlockView { lineage, ..view };
         let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
@@ -294,7 +294,7 @@ struct PlannedRows {
     /// inserted above it, or a tool call settling out of the in-flight
     /// strip, can do — leaves the reader on the same text.
     rows: Vec<crate::copy::RowBlock>,
-    context_type: String,
+    performer: String,
 }
 
 /// `None` when the current context has nothing to draw.
@@ -304,10 +304,10 @@ fn plan_rows(app: &mut App, width: u16) -> Option<PlannedRows> {
         return None;
     }
     let palette = app.palette;
-    let context_type = context_type_of(app);
+    let performer = performer_of(app);
     let mut rows: Vec<crate::copy::RowBlock> = Vec::with_capacity(plan.len());
     for (block, item) in &plan {
-        let view = block_view(item, &context_type, block);
+        let view = block_view(item, &performer, block);
         let lineage = app.lineage_for(block);
         let view = crate::present::BlockView { lineage, ..view };
         let counted = app.wrap.lines(block, &view, width, &palette).len();
@@ -320,7 +320,7 @@ fn plan_rows(app: &mut App, width: u16) -> Option<PlannedRows> {
             rows: usize::from(item.gap) + counted,
         });
     }
-    Some(PlannedRows { plan, rows, context_type })
+    Some(PlannedRows { plan, rows, performer })
 }
 
 /// Where every block of the transcript sits at `width`, so a key path that
@@ -339,13 +339,13 @@ pub fn row_index(app: &mut App, width: u16) -> crate::copy::RowIndex {
 /// every block is a keystroke's worth of work, not a frame's, so only `/`,
 /// `n`, `N` and `y` ask for it.
 pub fn transcript_all_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
-    let Some(PlannedRows { plan, rows, context_type }) = plan_rows(app, width) else {
+    let Some(PlannedRows { plan, rows, performer }) = plan_rows(app, width) else {
         return Vec::new();
     };
     let palette = app.palette;
     let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.iter().map(|r| r.rows).sum());
     for (block, item) in &plan {
-        let view = block_view(item, &context_type, block);
+        let view = block_view(item, &performer, block);
         let lineage = app.lineage_for(block);
         let view = crate::present::BlockView { lineage, ..view };
         let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
@@ -403,13 +403,13 @@ pub fn transcript_height(app: &mut App, width: u16) -> usize {
 /// mutable borrow that cannot overlap it.
 fn block_view<'a>(
     item: &'a BlockPlan,
-    context_type: &'a str,
+    performer: &'a str,
     block: &'a BlockSnapshot,
 ) -> crate::present::BlockView<'a> {
     let (tool, arg) = crate::app::tool_header(block);
     crate::present::BlockView {
         speaker: &item.speaker,
-        context_type,
+        performer,
         stamp: &item.stamp,
         show_divider: item.show_divider,
         tool,
@@ -554,11 +554,11 @@ fn thinking_pane(app: &mut App, width: u16) -> Vec<Line<'static>> {
         return Vec::new();
     };
     let palette = app.palette;
-    let context_type = context_type_of(app);
+    let performer = performer_of(app);
     let stamp = wallclock(block.created_at);
     let view = crate::present::BlockView {
         speaker: "",
-        context_type: &context_type,
+        performer: &performer,
         stamp: &stamp,
         show_divider: false,
         tool: None,
@@ -681,7 +681,6 @@ mod tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: "coder".to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),
@@ -708,7 +707,7 @@ mod tests {
             cache_ttl_secs: Some(300),
             input_tokens: Some(1_000),
             cost: None,
-            performer: None,
+            performer: Some("coder".to_string()),
             performed_by_person: false,
             is_root_console: false,
             is_console: false,
@@ -1494,7 +1493,7 @@ mod tests {
                         request_id: format!("p{i}"),
                         age: Some("1s".to_string()),
                         context_label: "kaijutsu".to_string(),
-                        context_type: "coder".to_string(),
+                        performer: "coder".to_string(),
                         hook: "shell_write".to_string(),
                         asker: None,
                         reviewer: None,

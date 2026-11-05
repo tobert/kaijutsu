@@ -721,7 +721,7 @@ fn the_window_title_follows_the_context_and_is_given_back() {
     // A second context with a label of its own, then a switch to its seat.
     // The probe is a coder seat, which holds no `operator`; creating needs it.
     support::grant_operator(&_server, "probe");
-    colon_line(&session, ":kj context create performer --name second --type default");
+    colon_line(&session, ":kj context create performer --name second");
     clear_status_notice(&session);
     let digit = seat_of(&session, "second");
     session.send(&format!("\x01{digit}")); // Ctrl+A <digit>
@@ -1667,9 +1667,10 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
 
 /// A root session with no `--character`, the way a person starts the client
 /// on a new install. `Ctrl+Z` in the root's console creates
-/// `<root-label>-shell`, performed by the human who pressed it: a shell child
-/// runs no model, so the rule that a root performs only its root console
-/// does not apply to it.
+/// `<root-label>-shell`, performed by the human who pressed it: a person's
+/// context runs no model, so `--character` does not apply to it. `Ctrl+Z`
+/// from it returns to the root console, even when the background refresh
+/// read its listing before the create.
 #[test]
 fn ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs() {
     let _serial = serial();
@@ -1691,7 +1692,7 @@ fn ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs() {
     let created = contexts.iter().find(|(label, _, _)| *label == shell).unwrap_or_else(|| {
         panic!("Ctrl+Z created no {shell}; contexts {contexts:?}: {}", session.dump("after Ctrl+Z"))
     });
-    assert_eq!(created.1, "shell", "{shell} has the wrong type: {contexts:?}");
+    assert!(created.1, "{shell} is not reported as a person's context: {contexts:?}");
     assert_eq!(created.2.as_deref(), Some(root), "the human plays the shell child: {contexts:?}");
 
     // The shell child runs the human's command; no model turn and no ask.

@@ -977,7 +977,7 @@ mod tests {
         );
         let res = kaish
             .execute_with_options(
-                "kj context create rc-rdtest --name rcdepth-e2e --type rdtest",
+                "kj context create rc-rdtest --name rcdepth-e2e",
                 ExecuteOptions::new().with_vars(vars),
             )
             .await
@@ -1045,14 +1045,14 @@ mod tests {
         install_rc_script_file(
             &dispatcher,
             "/config/rc/chaintest/create/S00-recreate.kai",
-            "kj context create rc-chaintest --name \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
+            "kj context create rc-chaintest --name \"chain-d$KJ_RC_DEPTH\"\n",
         )
         .await;
 
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
         let res = kaish
             .execute_with_options(
-                "kj context create rc-chaintest --name chain-d0 --type chaintest",
+                "kj context create rc-chaintest --name chain-d0",
                 ExecuteOptions::default(),
             )
             .await
@@ -1426,84 +1426,6 @@ mod tests {
             .await
             .expect("kaish exec (context list -t)");
         assert!(list.ok(), "context list -t (bool tree) failed: {list:?}");
-    }
-
-    /// `kj context create <label> --type <t>` must land the context_type on
-    /// the row for BOTH the space form (`--type toolie`) and the equals
-    /// form (`--type=toolie`). Regression: when `--type` is absent from the
-    /// kj tool schema, kaish parses the space form as a bool flag + a stray
-    /// positional, the value is divorced, and create silently falls back to
-    /// the permissive "default" context_type — a privilege-escalation-by-typo
-    /// (read-only `toolie` becomes the default loadout). The equals form is
-    /// the control: it binds regardless of the schema, so if both asserts
-    /// pass we know the space form genuinely round-tripped.
-    ///
-    /// Driving `kj context create` through kaish (rather than a direct
-    /// `dispatch` call) stacks the interpreter's own frames on top of the
-    /// rc lifecycle's, overflowing the default 2 MiB test stack; run it on
-    /// the production rc stack instead (see `self_recreating_rc_chain_
-    /// stops_at_guard` above for the pattern's origin).
-    #[test]
-    fn context_create_type_flag_binds_both_forms() {
-        crate::spawn_kaish_thread("rc-test-thread", || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build current-thread runtime")
-                .block_on(context_create_type_flag_binds_both_forms_body());
-        })
-        .expect("spawn rc-stack thread")
-        .join()
-        .expect("rc-stack thread panicked");
-    }
-
-    async fn context_create_type_flag_binds_both_forms_body() {
-        let dispatcher = Arc::new(test_dispatcher().await);
-        dispatcher.set_self_arc();
-        // The embedded shell performs as the system principal; `kj context create` needs a live character.
-        crate::kj::test_helpers::give_character(&dispatcher, &crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new()).with_actor(PrincipalId::system(), None));
-        let principal = PrincipalId::system();
-        let root = register_context(&dispatcher, Some("root"), None, principal);
-        dispatcher.kernel_db().lock().update_performer(root, Some(PrincipalId::system())).unwrap();
-        let kaish = embedded_with_kj(dispatcher.clone(), root).await;
-
-        // Space form.
-        let res = kaish
-            .execute_with_options(
-                "kj context create kohai-tester --name exp --type toolie",
-                ExecuteOptions::default(),
-            )
-            .await
-            .expect("kaish exec");
-        assert!(res.ok(), "create (space form) exit != 0: {res:?}");
-
-        // Equals form (control).
-        let res2 = kaish
-            .execute_with_options(
-                "kj context create kohai-tester --name exp2 --type=toolie",
-                ExecuteOptions::default(),
-            )
-            .await
-            .expect("kaish exec");
-        assert!(res2.ok(), "create (eq form) exit != 0: {res2:?}");
-
-        let db = dispatcher.kernel_db().lock();
-        let exp = db
-            .find_context_by_label("exp")
-            .unwrap()
-            .expect("exp context exists");
-        assert_eq!(
-            exp.context_type, "toolie",
-            "space-form `--type toolie` must set context_type, not silently default"
-        );
-        let exp2 = db
-            .find_context_by_label("exp2")
-            .unwrap()
-            .expect("exp2 context exists");
-        assert_eq!(
-            exp2.context_type, "toolie",
-            "eq-form `--type=toolie` must set context_type"
-        );
     }
 
     /// A newly-declared clap-subcommand value flag binds in the space form.

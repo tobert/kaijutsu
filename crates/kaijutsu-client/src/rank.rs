@@ -17,7 +17,7 @@
 //! ring 0's seats stable at the front (where the muscle memory lives) while
 //! still surfacing what you were just working on.
 
-use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, ContextId, ROOT_CONTEXT_TYPE};
+use kaijutsu_types::ContextId;
 use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_ring_seats};
 
 use crate::rpc::ContextInfo;
@@ -68,8 +68,9 @@ pub fn ranked_context_ids(contexts: &[ContextInfo]) -> Vec<ContextId> {
 }
 
 /// Which context a start with no `--context` opens: the last one this client
-/// viewed if it is still live, else the live root context. `None` leaves the
-/// choice to the ranked seats.
+/// viewed if it is still live, else the console, else the only live root
+/// console. `None` leaves the choice to the ranked seats. The wire facts
+/// decide, never a label.
 pub fn start_candidate(saved: Option<ContextId>, contexts: &[ContextInfo]) -> Option<ContextId> {
     let live = |c: &&ContextInfo| c.concluded_at.is_none() && !c.archived;
     if let Some(id) = saved
@@ -77,12 +78,13 @@ pub fn start_candidate(saved: Option<ContextId>, contexts: &[ContextInfo]) -> Op
     {
         return Some(id);
     }
-    // The console (type `console`) is where the person works. Without one, a
-    // single live root is unambiguous; several are not, so no candidate.
-    if let Some(console) = contexts.iter().filter(live).find(|c| c.context_type == CONSOLE_CONTEXT_TYPE) {
+    // The console, the context a person's sheet points at, is where the
+    // person works. Without one, a single live root console is unambiguous;
+    // several are not, so no candidate.
+    if let Some(console) = contexts.iter().filter(live).find(|c| c.is_console) {
         return Some(console.id);
     }
-    let roots: Vec<&ContextInfo> = contexts.iter().filter(live).filter(|c| c.context_type == ROOT_CONTEXT_TYPE).collect();
+    let roots: Vec<&ContextInfo> = contexts.iter().filter(live).filter(|c| c.is_root_console).collect();
     match roots.as_slice() {
         [only] => Some(only.id),
         _ => None,
@@ -103,7 +105,6 @@ mod tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: "coder".to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),
@@ -209,11 +210,25 @@ mod tests {
 #[cfg(test)]
 mod start_tests {
     use super::*;
-    use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, Status};
+    use kaijutsu_types::Status;
 
-    fn ctx(label: &str, context_type: &str) -> ContextInfo {
+    /// A context a model character performs.
+    fn ctx(label: &str) -> ContextInfo {
+        test_context_info(label)
+    }
+
+    /// A person's root console: the wire facts, whatever its label.
+    fn root(label: &str) -> ContextInfo {
         let mut info = test_context_info(label);
-        info.context_type = context_type.to_string();
+        info.is_root_console = true;
+        info.performed_by_person = true;
+        info
+    }
+
+    /// The console a person's sheet points at.
+    fn console(label: &str) -> ContextInfo {
+        let mut info = test_context_info(label);
+        info.is_console = true;
         info
     }
 
@@ -227,7 +242,6 @@ mod start_tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: "coder".to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),
@@ -264,8 +278,8 @@ mod start_tests {
 
     #[test]
     fn a_live_saved_context_wins_over_the_root() {
-        let root = ctx("amy", ROOT_CONTEXT_TYPE);
-        let kaijutsu = ctx("kaijutsu", "coder");
+        let root = root("amy");
+        let kaijutsu = ctx("kaijutsu");
         let saved = kaijutsu.id;
         let contexts = vec![root, kaijutsu];
         assert_eq!(start_candidate(Some(saved), &contexts), Some(saved));
@@ -273,9 +287,9 @@ mod start_tests {
 
     #[test]
     fn a_saved_context_that_is_archived_or_gone_falls_back_to_the_root() {
-        let root = ctx("amy", ROOT_CONTEXT_TYPE);
+        let root = root("amy");
         let root_id = root.id;
-        let mut archived = ctx("old", "coder");
+        let mut archived = ctx("old");
         archived.archived = true;
         let archived_id = archived.id;
         let contexts = vec![root, archived];
@@ -283,31 +297,40 @@ mod start_tests {
         assert_eq!(start_candidate(Some(ContextId::new()), &contexts), Some(root_id));
     }
 
+    /// The label decides nothing: a context labeled `console` that the
+    /// sheet does not point at is not the console, and a root console
+    /// labeled `console` is a root console.
     #[test]
-    fn a_root_labeled_console_does_not_win_by_its_label() {
-        let contexts = vec![ctx("banto", ROOT_CONTEXT_TYPE), ctx("console", ROOT_CONTEXT_TYPE)];
+    fn a_context_labeled_console_does_not_win_by_its_label() {
+        let contexts = vec![root("banto"), root("console")];
         assert_eq!(start_candidate(None, &contexts), None);
+        let human = root("amy");
+        let human_id = human.id;
+        assert_eq!(start_candidate(None, &[human, ctx("console")]), Some(human_id));
     }
 
     #[test]
     fn the_console_is_the_start_candidate_over_the_human_root() {
-        let human = ctx("amy", ROOT_CONTEXT_TYPE);
-        let console = ctx("console", CONSOLE_CONTEXT_TYPE);
+        let human = root("amy");
+        let console = console("banto");
         let console_id = console.id;
         assert_eq!(start_candidate(None, &[human, console]), Some(console_id));
     }
 
     #[test]
     fn with_several_roots_and_no_console_there_is_no_candidate() {
-        let contexts = vec![ctx("amy", ROOT_CONTEXT_TYPE), ctx("bob", ROOT_CONTEXT_TYPE)];
+        let contexts = vec![root("amy"), root("bob")];
         assert_eq!(start_candidate(None, &contexts), None);
     }
 
+    /// A person's other context (a `Ctrl+Z` child) is not a root console.
     #[test]
     fn a_single_root_is_the_candidate_when_there_is_nothing_saved() {
-        let root = ctx("amy", ROOT_CONTEXT_TYPE);
+        let root = root("amy");
         let root_id = root.id;
-        let contexts = vec![ctx("kaijutsu", "coder"), root];
+        let mut person_child = ctx("amy-shell");
+        person_child.performed_by_person = true;
+        let contexts = vec![ctx("kaijutsu"), person_child, root];
         assert_eq!(start_candidate(None, &contexts), Some(root_id));
     }
 }

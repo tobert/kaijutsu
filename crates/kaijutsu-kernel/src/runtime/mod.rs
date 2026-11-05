@@ -24,7 +24,7 @@ pub(crate) mod completion_notice;
 pub mod turn_state;
 pub mod interrupt;
 pub mod llm_stream;
-mod turn_identity;
+pub(crate) mod turn_identity;
 pub mod command;
 pub mod structured;
 pub mod interactive;

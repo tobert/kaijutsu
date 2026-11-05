@@ -26,8 +26,9 @@ use kaijutsu_viz::layout::{ALL_BANDS, Band, ContextLifecycle, WellPlacement, ass
 pub struct CardData {
     /// Display title — the context label, or the short id when unlabeled.
     pub title: String,
-    /// Accent bucket key (`context_type`, e.g. "coder"/"default") used to pick a
-    /// card accent color. Falls back to `provider` when `context_type` is empty.
+    /// Accent bucket key (the performer's name, e.g. "coder"/"banto") used to
+    /// pick a card accent color. Falls back to `provider` for a context with
+    /// no performer.
     pub accent: String,
     /// Model badge text, "provider/model" (or just one side if the other is
     /// empty; empty string if both are).
@@ -74,10 +75,9 @@ pub struct ClusterAssignment {
 pub fn card_from(info: &ContextInfo, band: Band, cluster_label: Option<String>) -> CardData {
     let title = info.id.display_or(Some(info.label.as_str()));
 
-    let accent = if info.context_type.is_empty() {
-        info.provider.clone()
-    } else {
-        info.context_type.clone()
+    let accent = match info.performer.as_deref().filter(|name| !name.is_empty()) {
+        Some(performer) => performer.to_string(),
+        None => info.provider.clone(),
     };
 
     let model_badge = match (info.provider.is_empty(), info.model.is_empty()) {
@@ -519,7 +519,6 @@ mod tests {
             created_at: 0,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: String::new(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),
@@ -603,13 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn accent_is_context_type_then_provider() {
+    fn accent_is_performer_then_provider() {
         let mut info = ctx(id_of(1), "x");
-        info.context_type = "coder".to_string();
+        info.performer = Some("coder".to_string());
         info.provider = "anthropic".to_string();
         assert_eq!(card_from(&info, Band::Active, None).accent, "coder");
 
-        info.context_type = String::new();
+        info.performer = None;
         assert_eq!(card_from(&info, Band::Active, None).accent, "anthropic");
     }
 

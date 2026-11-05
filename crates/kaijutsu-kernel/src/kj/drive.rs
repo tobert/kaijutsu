@@ -89,6 +89,12 @@ impl KjDispatcher {
             }
         };
 
+        // A context a person performs runs no model turns; refuse with the
+        // turn's own text before the seed is written.
+        if let Err(refusal) = crate::runtime::turn_identity::refuse_a_persons_context(&self.kernel_db().lock(), target) {
+            return KjResult::Err(format!("kj drive: {refusal}"));
+        }
+
         // Reserve, then admit, before the seed block write below
         // (`docs/resource-admission.md`, rule 1): a refused drive leaves no
         // seed, and archive cannot refuse the turn after the seed lands.
@@ -745,5 +751,30 @@ mod tests {
             "help should carry clap usage + the --prompt flag: {}",
             result.message()
         );
+    }
+
+    /// A context a person performs runs no model turns, so `kj drive
+    /// --prompt` into one refuses with the turn's own refusal before it
+    /// writes the seed or requests a turn. Falsified by checking only after
+    /// the seed lands.
+    #[tokio::test]
+    async fn drive_into_a_persons_context_refuses_before_writing() {
+        let d = test_dispatcher().await;
+        let root = register_root_context(&d);
+        let amy = test_reviewer_principal();
+        let lane = register_context(&d, Some("amy-lane"), Some(root), amy);
+        d.kernel_db().lock().assign_test_review(lane, Some(amy), None).unwrap();
+        seed_with_block(&d, lane, amy);
+        let before = d.block_store().block_snapshots(lane).unwrap().len();
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let c = KjCaller { actor_id: amy, ..caller_with_context(root) };
+        for argv in [vec![s("drive"), s("amy-lane"), s("--prompt"), s("hello")], vec![s("drive"), s("amy-lane")]] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "a person's context is not driven: {}", result.message());
+            assert_eq!(result.message(), format!("kj drive: {}", crate::runtime::turn_identity::person_refusal("amy")));
+        }
+        assert_eq!(d.block_store().block_snapshots(lane).unwrap().len(), before, "no seed was written");
+        assert!(sub.try_recv().is_none(), "no turn was requested");
     }
 }

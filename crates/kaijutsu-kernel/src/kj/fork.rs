@@ -403,6 +403,15 @@ impl KjDispatcher {
                 ),
                 Err(e) => return KjResult::Err(format!("kj fork: {e}")),
             }
+            // The child continues the source's performance, so `--prompt`
+            // from a context a person performs asks for a turn that would
+            // refuse; refuse before the child is made.
+            if args.prompt.is_some()
+                && !args.stage
+                && let Err(refusal) = crate::runtime::turn_identity::refuse_a_persons_context(&self.kernel_db().lock(), source)
+            {
+                return KjResult::Err(format!("kj fork: {refusal}"));
+            }
         }
 
         if args.compact {
@@ -2793,6 +2802,41 @@ mod tests {
             sub.try_recv().is_none(),
             "a staged child is awaiting curation — no autonomous turn yet"
         );
+    }
+
+    /// A fork continues its source's performance, so a fork of a context a
+    /// person performs is a person's context and runs no model turns.
+    /// `kj fork --prompt` from one refuses with the turn's own refusal
+    /// before it makes the child; `--compact` too, before it distills.
+    /// Falsified by checking only when the child's turn starts.
+    #[tokio::test]
+    async fn fork_prompt_from_a_persons_context_refuses_before_making_a_child() {
+        let d = test_dispatcher().await;
+        let root = register_root_context(&d);
+        let amy = test_reviewer_principal();
+        let lane = register_context(&d, Some("amy-lane"), Some(root), amy);
+        d.kernel_db().lock().assign_test_review(lane, Some(amy), None).unwrap();
+        d.block_store().create_document(lane, crate::DocumentKind::Conversation, None).unwrap();
+        let c = crate::kj::KjCaller { actor_id: amy, ..caller_with_context(lane) };
+        let before = d.kernel_db().lock().list_all_contexts().unwrap().len();
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        for argv in [
+            vec![s("fork"), s("--name"), s("child"), s("--prompt"), s("go explore")],
+            vec![s("fork"), s("--compact"), s("--name"), s("child"), s("--prompt"), s("go explore")],
+        ] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "a person's fork runs no turn: {}", result.message());
+            assert!(
+                result.message().ends_with(&crate::runtime::turn_identity::person_refusal("amy")),
+                "the turn's refusal: {}", result.message()
+            );
+        }
+        assert_eq!(d.kernel_db().lock().list_all_contexts().unwrap().len(), before, "no child was made");
+        assert!(sub.try_recv().is_none(), "no turn was requested");
+
+        let bare = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(bare.is_ok(), "a fork with no prompt still forks: {}", bare.message());
     }
 
     #[tokio::test]

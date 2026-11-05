@@ -18,6 +18,20 @@ pub(crate) fn person_refusal(person: &str) -> String {
     format!("{person} is a person, and a context a person performs runs no model turns; its draft runs as shell. Talk to a model in the console.")
 }
 
+/// Refuse, with [`person_refusal`], a model turn in a context a person
+/// performs. A verb that writes before it requests a turn (`kj drive
+/// --prompt`, `kj fork --prompt`) checks this first, so the refusal leaves
+/// nothing behind. A context with no row is the caller's to report.
+pub(crate) fn refuse_a_persons_context(db: &KernelDb, context_id: ContextId) -> Result<(), String> {
+    let row = db.get_context(context_id)
+        .map_err(|e| format!("Could not read performer assignment: {e}"))?;
+    let Some(performer) = row.and_then(|row| row.performer) else { return Ok(()) };
+    match db.get_character(performer).map_err(|e| format!("Could not resolve performer: {e}"))? {
+        Some(sheet) if sheet.root => Err(person_refusal(&sheet.name)),
+        _ => Ok(()),
+    }
+}
+
 /// The performer is checked before the reviewer resolves: the reviewer walk
 /// starts above the performer, so with none set it fails with a message
 /// about the reviewer, which is not the repair the caller needs.

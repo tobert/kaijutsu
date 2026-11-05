@@ -369,7 +369,7 @@ async fn list_senpai_lists_the_live_contexts_that_answer_to_a_context() {
 async fn context_create_makes_a_context_character_under_the_callers_context() {
     let d = test_dispatcher().await;
     let h = house(&d);
-    let made = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("fresh"), s("--type"), s("default")], &caller(h.banto, h.seat)).await;
+    let made = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("fresh")], &caller(h.banto, h.seat)).await;
     assert!(made.is_ok(), "{}", made.message());
 
     let db = d.kernel_db().lock();
@@ -630,7 +630,6 @@ async fn context_set_senpai_conflicts_with_the_other_set_options() {
     for extra in [
         vec!["--cwd", "/"],
         vec!["--env", "A=B"],
-        vec!["--type", "default"],
         vec!["--system-prompt", "x"],
         vec!["--egress-allow", "localhost"],
         vec!["--egress-deny", "localhost"],

@@ -47,6 +47,15 @@ pub struct ContextFacts {
     pub is_mcp_session: bool,
 }
 
+/// What [`KernelDb::archive_uncommitted_root_successors`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StraySweep {
+    /// The strays it archived, oldest first.
+    pub archived: Vec<ContextId>,
+    /// The strays it could not archive, with the error.
+    pub failed: Vec<(ContextId, String)>,
+}
+
 /// The facts columns, selected from `contexts c` left-joined to its
 /// performer's sheet `p`.
 const CONTEXT_FACTS_SELECT: &str = "SELECT c.context_id, p.name, COALESCE(p.root, 0),
@@ -304,8 +313,9 @@ impl KernelDb {
 
     /// The one Rust check on a senpai edge about to be written. `senpai`
     /// must exist and not be `context`; `None` is allowed only for a context
-    /// a root character performs, which is that character's root console
-    /// once `characters.root_ctx` is pointed at it after the row is written.
+    /// a live root character performs ([`Self::is_live_person`]), which is
+    /// that character's root console once `characters.root_ctx` is pointed
+    /// at it after the row is written.
     pub fn check_senpai_edge(
         &self,
         context: ContextId,
@@ -314,12 +324,12 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         let Some(senpai) = senpai else {
             let root = match performer {
-                Some(performer) => self.is_person(performer)?,
+                Some(performer) => self.is_live_person(performer)?,
                 None => false,
             };
             if !root {
                 return Err(KernelDbError::Validation(format!(
-                    "context {} needs a senpai: only a root character's console has none, \
+                    "context {} needs a senpai: only a live root character's console has none, \
                      and `kj character create --root` makes it",
                     self.context_name(context)
                 )));
@@ -618,10 +628,32 @@ impl KernelDb {
         )?)
     }
 
+    /// The live MCP sessions of `hub`, oldest first: the live contexts whose
+    /// parent (`forked_from`) it is, when some character's `mcp_hub_ctx`
+    /// names it. A context that is no sheet's hub has none.
+    pub fn live_mcp_sessions(&self, hub: ContextId) -> KernelDbResult<Vec<ContextId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT x.context_id FROM contexts x
+             WHERE x.forked_from = ?1 AND x.archived_at IS NULL
+               AND EXISTS (SELECT 1 FROM characters h WHERE h.mcp_hub_ctx = ?1)
+             ORDER BY x.created_at, x.context_id",
+        )?;
+        let rows = stmt.query_map(params![blob_param(hub.as_bytes())], |r| read_context_id(r, 0))?;
+        Ok(rows.collect::<SqliteResult<_>>()?)
+    }
+
     /// Whether `principal_id` is a person: a character whose sheet has the
-    /// `root` flag. A principal with no sheet is not one.
+    /// `root` flag, retired or not. What a context is (its wire facts, a
+    /// draft run as shell) reads this. A principal with no sheet is not one.
     pub fn is_person(&self, principal_id: PrincipalId) -> KernelDbResult<bool> {
         Ok(self.get_character(principal_id)?.is_some_and(|sheet| sheet.root))
+    }
+
+    /// Whether `principal_id` is a live person: a root character that is
+    /// not retired. What a person may still make or hold (a context with no
+    /// senpai, a console) reads this.
+    pub fn is_live_person(&self, principal_id: PrincipalId) -> KernelDbResult<bool> {
+        Ok(self.get_character(principal_id)?.is_some_and(|sheet| sheet.is_live_root()))
     }
 
     /// Whether a person performs `context`. Every context a person performs
@@ -635,13 +667,28 @@ impl KernelDb {
     }
 
     /// The character whose `console_ctx` names `context`: the person whose
-    /// console it is. `None` when no sheet points at it.
+    /// console it is. `None` when no sheet points at it. More than one sheet
+    /// naming it is corruption and refuses, naming them.
     pub fn console_owner(&self, context: ContextId) -> KernelDbResult<Option<PrincipalId>> {
-        Ok(self.conn.query_row(
-            "SELECT principal_id FROM characters WHERE console_ctx = ?1 ORDER BY principal_id LIMIT 1",
-            params![blob_param(context.as_bytes())],
-            |r| read_principal_id(r, 0),
-        ).optional()?)
+        let mut stmt = self.conn.prepare(
+            "SELECT principal_id, name FROM characters WHERE console_ctx = ?1 ORDER BY name",
+        )?;
+        let owners = stmt
+            .query_map(params![blob_param(context.as_bytes())], |r| Ok((read_principal_id(r, 0)?, r.get::<_, String>(1)?)))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        match owners.as_slice() {
+            [] => Ok(None),
+            [(owner, _)] => Ok(Some(*owner)),
+            many => {
+                let names = many.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>();
+                Err(KernelDbError::Corrupt(format!(
+                    "context {} is named as the console of {}, and a context is the console of one character; \
+                     `kj character set <name> --no-console` clears all but one",
+                    self.context_name(context),
+                    names.join(" and ")
+                )))
+            }
+        }
     }
 
     /// Whether `context` is a console: the context some character's
@@ -671,33 +718,48 @@ impl KernelDb {
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context.short())))
     }
 
-    /// [`Self::context_facts`] for every context, in one query.
-    pub fn all_context_facts(&self) -> KernelDbResult<std::collections::HashMap<ContextId, ContextFacts>> {
-        let mut stmt = self.conn.prepare(CONTEXT_FACTS_SELECT)?;
-        Ok(stmt.query_map([], read_context_facts)?.collect::<SqliteResult<_>>()?)
+    /// [`Self::context_facts`] for each of `contexts`, in one query per 500
+    /// ids. A context with no row has no entry.
+    pub fn context_facts_for(&self, contexts: &[ContextId]) -> KernelDbResult<std::collections::HashMap<ContextId, ContextFacts>> {
+        let mut facts = std::collections::HashMap::with_capacity(contexts.len());
+        for chunk in contexts.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            let mut stmt = self.conn.prepare(&format!("{CONTEXT_FACTS_SELECT} WHERE c.context_id IN ({marks})"))?;
+            let ids = chunk.iter().map(|id| id.as_bytes().to_vec());
+            for row in stmt.query_map(rusqlite::params_from_iter(ids), read_context_facts)? {
+                let (id, fact) = row?;
+                facts.insert(id, fact);
+            }
+        }
+        Ok(facts)
     }
 
-    /// Archive each live context a root character performs that has no
-    /// senpai and that no character's `root_ctx` names, and return them. A
-    /// root console's rotation inserts its successor before `commit_rotation`
-    /// moves `root_ctx`; a rotation that stopped between the two leaves such
-    /// a row, which no verb can place or promote. The predecessor is still
-    /// the console.
-    pub fn archive_uncommitted_root_successors(&self) -> KernelDbResult<Vec<ContextId>> {
+    /// Archive each live context a live root character performs that has no
+    /// senpai and that no character's `root_ctx` names. A root console's
+    /// rotation inserts its successor before `commit_rotation` moves
+    /// `root_ctx`; a rotation that stopped between the two leaves such a
+    /// row, which no verb can place or promote. The predecessor is still the
+    /// console. A stray that fails to archive is returned with its error and
+    /// the rest are still archived.
+    pub fn archive_uncommitted_root_successors(&self) -> KernelDbResult<StraySweep> {
         let strays: Vec<ContextId> = {
             let mut stmt = self.conn.prepare(
                 "SELECT c.context_id FROM contexts c JOIN characters p ON p.principal_id = c.performer
-                 WHERE p.root = 1 AND c.senpai_ctx IS NULL AND c.archived_at IS NULL
+                 WHERE p.root = 1 AND p.retired_at IS NULL AND c.senpai_ctx IS NULL AND c.archived_at IS NULL
                    AND c.context_id NOT IN (SELECT root_ctx FROM characters WHERE root_ctx IS NOT NULL)
                  ORDER BY c.created_at, c.context_id",
             )?;
             stmt.query_map([], |r| read_context_id(r, 0))?
                 .collect::<SqliteResult<_>>()?
         };
-        for stray in &strays {
-            self.archive_context(*stray)?;
+        let mut sweep = StraySweep::default();
+        for stray in strays {
+            match self.archive_context(stray) {
+                Ok(_) => sweep.archived.push(stray),
+                Err(error) => sweep.failed.push((stray, error.to_string())),
+            }
         }
-        Ok(strays)
+        Ok(sweep)
     }
 
     /// Point a character's `root_ctx` at its console, or clear it.

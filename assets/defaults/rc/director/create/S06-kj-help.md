@@ -41,7 +41,7 @@ kj character list
 Find the character who will perform a new piece of work. The `coder` character plays coder contexts; if it is missing, we ask the human.
 
 kj context create coder --name fix-login
-Start one piece of work as a new context for a character. Without --name the label is the character's name, and the type is the character's own; pass --type to pick another. It answers to us, so its asks come to us. Pick the type that fits the work; coder is one type.
+Start one piece of work as a new context for a character. Without --name the label is the character's name. The context runs the character's rc directory and model. It answers to us, so its asks come to us. Pick the character that fits the work; coder is one character.
 
 kj context list --senpai .
 See the live contexts that answer to us.

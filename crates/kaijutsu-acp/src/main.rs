@@ -59,19 +59,15 @@ struct Cli {
     #[command(flatten)]
     key: KeyArgs,
 
-    /// rc bundle for contexts this bridge creates.
+    /// Character that performs each new ACP context, such as `coder`: its rc
+    /// directory and model shape the context.
     ///
-    /// `coder` by default: over ACP, kaijutsu *is* the agent and the client is
-    /// the connected player's seat, so a new session should get the model-facing stance —
-    /// unlike kaijutsu-mcp, where kaijutsu is the tool and `mcp` is right.
-    #[arg(long, default_value = "coder")]
-    context_type: String,
-
-    /// Character that performs work in each new ACP context.
-    ///
-    /// The connected character requests the context and this one performs
-    /// it. The reviewer is the character of the new context's senpai.
-    /// The named character must already exist and be live.
+    /// Default: this connection's own character. A person's key (a root
+    /// character) must name one, since a person's context runs no model;
+    /// without it `session/new` is refused. The connected character requests
+    /// the context and this one performs it. The reviewer is the character
+    /// of the new context's senpai. The named character must already exist
+    /// and be live.
     #[arg(long)]
     character: Option<String>,
 
@@ -238,14 +234,12 @@ async fn run(cli: Cli) -> Result<()> {
         host = %config.host,
         port = config.port,
         user = %config.username,
-        context_type = %cli.context_type,
         character = ?cli.character,
         "kaijutsu-acp starting"
     );
 
     let kernel = KernelBridge::connect(
         config,
-        cli.context_type,
         cli.character,
         cli.parent,
         std::time::Duration::from_secs(cli.connect_timeout),

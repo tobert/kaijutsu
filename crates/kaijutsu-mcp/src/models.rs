@@ -62,16 +62,32 @@ mod shell_request_tests {
 
 /// Register this agent session and create a context.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterSessionRequest {
     /// Human-readable label for the context (auto-generated if omitted).
     #[schemars(description = "Human-readable label for the context (auto-generated if omitted)")]
     pub label: Option<String>,
-    /// Context mode bundle (context_type). Selects which rc lifecycle scripts
-    /// and tool policy the new context is born with. Defaults to "mcp".
-    #[schemars(
-        description = "Context mode (context_type) — selects rc lifecycle + tool policy. Defaults to \"mcp\""
-    )]
-    pub context_type: Option<String>,
+}
+
+#[cfg(test)]
+mod register_session_request_tests {
+    use super::RegisterSessionRequest;
+
+    /// The tool takes a label and nothing else: the connection's character,
+    /// not a requested type, decides what the context runs. A retired
+    /// `context_type` argument is refused rather than ignored.
+    ///
+    /// Falsified by keeping `context_type`, or by accepting it silently.
+    #[test]
+    fn register_session_takes_only_a_label_and_refuses_a_context_type() {
+        let schema = serde_json::to_value(schemars::schema_for!(RegisterSessionRequest)).unwrap();
+        println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+        let properties: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(properties, ["label"], "{schema}");
+        assert!(serde_json::from_value::<RegisterSessionRequest>(serde_json::json!({
+            "label": "s", "context_type": "coder",
+        })).is_err());
+    }
 }
 
 // ============================================================================

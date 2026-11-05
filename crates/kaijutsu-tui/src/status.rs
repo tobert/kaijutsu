@@ -457,7 +457,6 @@ mod tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: "coder".to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),

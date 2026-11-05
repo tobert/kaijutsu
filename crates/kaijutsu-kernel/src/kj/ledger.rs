@@ -3561,7 +3561,7 @@ mod tests {
         use crate::kj::gate::GateVerdict::{Allowed, Pending};
         let d = test_dispatcher().await;
         let house = character_house(&d);
-        let first = gate_once(&d, &house.banto, planned_shell_spec("kj context create coder --name c1 --type coder")).await;
+        let first = gate_once(&d, &house.banto, planned_shell_spec("kj context create coder --name c1")).await;
         assert_eq!(first.verdict, Pending, "{}", first.reason);
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
         let learned = d
@@ -3574,11 +3574,11 @@ mod tests {
         assert!(d.kernel_db().lock().redeem_ask(&request_id).unwrap());
 
         for (source, expected) in [
-            ("kj context create coder --name c2 --type coder", Allowed),
-            ("kj context create coder --name c3 --senpai banto-seat --type default", Allowed),
-            ("kj context create coder --name c4 --parent amy-lane --type default", Allowed),
-            ("kj context create coder --name c5 --senpai amy-lane --type default", Pending),
-            ("kj context create coder --name c6 --senpai lane-b --type default", Pending),
+            ("kj context create coder --name c2", Allowed),
+            ("kj context create coder --name c3 --senpai banto-seat", Allowed),
+            ("kj context create coder --name c4 --parent amy-lane", Allowed),
+            ("kj context create coder --name c5 --senpai amy-lane", Pending),
+            ("kj context create coder --name c6 --senpai lane-b", Pending),
         ] {
             let outcome = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
             assert_eq!(outcome.verdict, expected, "{source}: {}", outcome.reason);
@@ -4607,7 +4607,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest")), s("--name"), s("ledger-runs-ctx"), s("--type"), s("ledgertest")],
+                &[s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest")), s("--name"), s("ledger-runs-ctx")],
                 &c,
             )
             .await;
@@ -4644,7 +4644,7 @@ mod tests {
         let created = d
             .dispatch(
                 &[
-                    s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest2")), s("--name"), s("ledger-run-show-ctx"), s("--type"), s("ledgertest2")],
+                    s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest2")), s("--name"), s("ledger-run-show-ctx")],
                 &c,
             )
             .await;
@@ -4691,7 +4691,7 @@ mod tests {
 
         let created = d
             .dispatch(
-                &[s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest3")), s("--name"), s("ledger-run-count-ok"), s("--type"), s("ledgertest3")],
+                &[s("context"), s("create"), s(&crate::kj::test_helpers::rc_performer(&d, "ledgertest3")), s("--name"), s("ledger-run-count-ok")],
                 &c,
             )
             .await;

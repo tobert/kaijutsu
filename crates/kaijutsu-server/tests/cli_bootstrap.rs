@@ -40,10 +40,11 @@ fn bootstrap_finds_the_key_and_the_provider_in_home() {
         "ran: kj backend set deepseek --kind deepseek",
         "ran: kj backend model set deepseek deepseek-flash --context-window 1000000 --max-tokens 65536 --effort high",
         "ran: kj character create root --rc console --model deepseek/deepseek-flash --max-tokens 16384",
-        "ran: kj context create root --name console --type console",
+        "ran: kj context create root --name console --parent ",
     ] {
         assert!(first.contains(line), "missing {line:?} in:\n{first}");
     }
+    assert!(!first.contains("--type"), "a context is created without a type:\n{first}");
 
     let second = run(home.path(), &["bootstrap"]);
     assert!(second.status.success(), "second bootstrap failed: {}", text(&second));

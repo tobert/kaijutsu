@@ -69,7 +69,7 @@ transport.
 | Tool | Does |
 |---|---|
 | `shell` | Submit a kaish command in the current kernel context. Waits for completion by default (default timeout 300s, max 600s); set `run_in_background: true` to get an operation receipt for long-running work. Requires `--connect` and a registered session. |
-| `register_session` | Register this agent session and join a context. Must run before `shell`. Upserts on the session's label: attaches to an existing live context of that label, or creates a fresh one if the label names a concluded or archived context. |
+| `register_session` | Register this agent session and join a context. Must run before `shell`. Takes an optional `label`. Upserts on the session's label: attaches to an existing live context of that label, or creates a fresh one if the label names a concluded or archived context. A new context is performed by this connection's character, or the one `--character` (`KAIJUTSU_CHARACTER`) names, and runs that character's rc directory; from a root console it lands under the person's MCP hub. |
 | `whoami` | This connection's identity: authenticated user, joined context id and label, agent session info. |
 | `list_kernel_tools` | List broker tools visible to the joined context (name, description, category, input schema). Requires `--connect`. |
 | `invoke_peer` | Call an action on another named RPC peer attached to the kernel (for example `kaijutsu-app`'s `switch_context`), for drift navigation. Requires `--connect`. |

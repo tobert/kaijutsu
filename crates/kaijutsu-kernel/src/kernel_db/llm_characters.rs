@@ -31,9 +31,8 @@ pub struct CharacterRow {
     /// kj requests always need approval (`docs/character.md`, "Roots and
     /// rotation").
     pub root: bool,
-    /// The context type this character usually plays, which `kj context
-    /// create <character>` takes when `--type` is absent. `None` for no
-    /// type, and always for a root.
+    /// A context type stored by an earlier kernel. No verb sets it and
+    /// nothing reads it.
     pub context_type: Option<String>,
     /// The directory under `/config/rc/` whose lifecycle scripts this
     /// character's contexts run. `None` until the slice that reads it
@@ -367,14 +366,44 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Set (or clear) a root character's console pointer.
+    /// Set (or clear) a root character's console pointer. A context is the
+    /// console of one sheet: a context another sheet's `console_ctx` names
+    /// refuses, naming that sheet.
     pub fn set_character_console_ctx(&self, principal_id: PrincipalId, ctx: Option<ContextId>) -> KernelDbResult<()> {
+        self.refuse_pointer_held_elsewhere("console_ctx", "console", principal_id, ctx)?;
         self.set_character_column("console_ctx", principal_id, ctx.map(|c| c.as_bytes().to_vec()))
     }
 
-    /// Set (or clear) a root character's MCP hub pointer.
+    /// Set (or clear) a root character's MCP hub pointer. A context is the
+    /// hub of one sheet, as for [`Self::set_character_console_ctx`].
     pub fn set_character_mcp_hub_ctx(&self, principal_id: PrincipalId, ctx: Option<ContextId>) -> KernelDbResult<()> {
+        self.refuse_pointer_held_elsewhere("mcp_hub_ctx", "MCP hub", principal_id, ctx)?;
         self.set_character_column("mcp_hub_ctx", principal_id, ctx.map(|c| c.as_bytes().to_vec()))
+    }
+
+    /// Refuse to point `principal_id`'s `column` at `ctx` while another
+    /// sheet's `column` names it, naming the sheets (`what` names the
+    /// pointer in the refusal).
+    fn refuse_pointer_held_elsewhere(&self, column: &str, what: &str, principal_id: PrincipalId, ctx: Option<ContextId>) -> KernelDbResult<()> {
+        let Some(ctx) = ctx else { return Ok(()) };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT name FROM characters WHERE {column} = ?1 AND principal_id != ?2 ORDER BY name"
+        ))?;
+        let holders = stmt
+            .query_map(params![blob_param(ctx.as_bytes()), blob_param(principal_id.as_bytes())], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if holders.is_empty() {
+            return Ok(());
+        }
+        let fix = match column {
+            "console_ctx" => format!("; `kj character set {} --no-console` frees it", holders[0]),
+            _ => String::new(),
+        };
+        Err(KernelDbError::Validation(format!(
+            "context {} is already the {what} of {}, and a context is the {what} of one character{fix}",
+            self.context_name(ctx),
+            holders.join(", ")
+        )))
     }
 
     fn set_character_column<V: rusqlite::ToSql>(&self, column: &str, principal_id: PrincipalId, value: Option<V>) -> KernelDbResult<()> {

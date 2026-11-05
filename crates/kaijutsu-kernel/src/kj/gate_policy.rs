@@ -2300,9 +2300,9 @@ mod tests {
         assert_eq!(target("context archive lane"), Context(Some("lane".into())));
         assert_eq!(target("--confirm context archive"), Context(None));
         assert_eq!(target("context archive --children lane"), Unread);
-        assert_eq!(target("context create coder --name child --type coder"), NewChild);
-        assert_eq!(target("context create coder --name child --parent lane --type default"), NewChild, "--parent is provenance only");
-        assert_eq!(target("context create coder --name child --senpai lane --type default"), NewUnder("lane".into()));
+        assert_eq!(target("context create coder --name child"), NewChild);
+        assert_eq!(target("context create coder --name child --parent lane"), NewChild, "--parent is provenance only");
+        assert_eq!(target("context create coder --name child --senpai lane"), NewUnder("lane".into()));
         assert_eq!(target("context create"), Unread, "the character is required, so a bare create does not parse");
         assert_eq!(target("context create coder"), NewChild, "the character alone parses");
         assert_eq!(target("context set lane --model m"), Unread);
@@ -2318,7 +2318,7 @@ mod tests {
     fn a_character_allow_is_refused_where_the_target_cannot_be_read() {
         let refusal = |source: &str| character_rule_refusal(&plan(source));
         assert_eq!(refusal("kj drive lane --prompt go && git log"), None);
-        assert_eq!(refusal("kj context create coder --name child --type coder"), None);
+        assert_eq!(refusal("kj context create coder --name child"), None);
         assert!(refusal("for x in lane-a; do kj drive $x; done").is_some(), "a loop variable is not a literal target");
         assert!(refusal("kj drive ${LANE}").is_some());
         assert!(refusal("./kj drive amy-lane").is_some());
@@ -2352,7 +2352,7 @@ mod tests {
     fn env_argument_keeps_the_rc_allow() {
         let cfg = config("[rc.mcp]\nallow = [\"kj context create\"]\n");
         let v = first_verdict(
-            "kj context create banto --name banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=console",
+            "kj context create banto --name banto-probe --env KJ_CHARACTER=banto --env ROTATED_FROM=console",
             &cfg,
             Some("mcp"),
         );
@@ -2405,20 +2405,18 @@ mod tests {
         assert_eq!(e.verdict(), AskVerdict::Escalate);
     }
 
-    /// `--type mcp` allows no create: the MCP session rule reads the
+    /// The argv alone allows no create: the MCP session rule reads the
     /// parent against the caller's MCP hub, which needs the database
     /// ([`mcp_session_create`]; `kj/gate.rs` tests it through the gate), so
     /// the planned layers alone leave every create uncovered.
     ///
-    /// Falsified by an argv-only arm in `builtin_key` keyed on `--type mcp`
-    /// or on `--parent`.
+    /// Falsified by an argv-only arm in `builtin_key` keyed on `--parent`.
     #[test]
-    fn the_planned_layers_allow_no_context_create_by_its_type() {
+    fn the_planned_layers_allow_no_context_create_by_its_argv() {
         for source in [
-            "kj context create claude --name sess --type mcp",
-            "kj context create claude --name sess --type=mcp --parent mcp/amy",
+            "kj context create claude --name sess",
             "kj context create claude --name sess --parent mcp/amy",
-            "kj ctx create claude --name sess --cwd /tmp --cwd-optional --type mcp",
+            "kj ctx create claude --name sess --cwd /tmp --cwd-optional",
         ] {
             assert_eq!(unconfigured(source).per_statement[0], PolicyVerdict::Uncovered, "{source}");
         }
@@ -2453,7 +2451,7 @@ mod tests {
             assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, played_by)), "kj context --help",
                 "{played_by:?}");
         }
-        assert_eq!(first_verdict("kj context create coder --name x --type default > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
+        assert_eq!(first_verdict("kj context create coder --name x > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
             "a redirect still keeps the allow from covering, and no builtin covers it");
         let asks = config("[global]\nask = [\"kj context create\"]\n");
         assert!(matches!(first_verdict("kj context create --help", &asks, None), PolicyVerdict::Ask(_)),
@@ -2777,16 +2775,16 @@ deny = ["kj context create"]
              [rc.explorer]\nallow = [\"kj context create\"]\n",
         );
         // Within global: the specific deny beats the general allow.
-        assert!(matches!(first_verdict("kj context create coder --name x --type default", &cfg, None), PolicyVerdict::Deny(_)));
+        assert!(matches!(first_verdict("kj context create coder --name x", &cfg, None), PolicyVerdict::Deny(_)));
         assert!(matches!(first_verdict("kj context list", &cfg, None), PolicyVerdict::Allow(_)));
         // The rc layer sits above global.
-        let v = first_verdict("kj context create coder --name x --type default", &cfg, Some("explorer"));
+        let v = first_verdict("kj context create coder --name x", &cfg, Some("explorer"));
         assert_eq!(
             allow_keys(&v),
             vec![(Layer::Config(Section::Rc("explorer".into())), "kj context create".to_string())]
         );
         assert!(matches!(
-            first_verdict("kj context create coder --name x --type default", &cfg, Some("coder")),
+            first_verdict("kj context create coder --name x", &cfg, Some("coder")),
             PolicyVerdict::Deny(_)
         ));
     }
@@ -3081,7 +3079,7 @@ uncovered = "allow"
     fn the_shipped_default_lets_a_director_create_and_drive_a_lane() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         for source in [
-            "kj context create coder --name count-kj-rs --type coder",
+            "kj context create coder --name count-kj-rs",
             "kj fork --name lane --prompt \"count the files\"",
             "kj drive count-kj-rs --prompt \"count the files\"",
         ] {

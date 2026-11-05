@@ -562,7 +562,6 @@ mod tests {
             trace_id: [0u8; 16],
             origin_host: None,
             fork_kind: None,
-            context_type: String::new(),
             archived,
             concluded_at: None,
             keywords: Vec::new(),

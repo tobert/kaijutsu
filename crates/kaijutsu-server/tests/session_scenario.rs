@@ -41,7 +41,7 @@
 //!   seat that forked it — see the assertions below and
 //!   `docs/character.md`, "Roots and rotation".
 //! - **Each lane runs its coder's model.** A lane is `kj context create <coder>
-//!   --name <lane> --type coder`, so its `model` slot is copied from its
+//!   --name <lane>`, so its `model` slot is copied from its
 //!   coder character's model (`kj character model set <coder>`), which gives
 //!   it `mock-coder-a` or `mock-coder-b`.
 //! - **banto starts its own lanes.** `kj context create <coder> --name <lane>`
@@ -345,7 +345,7 @@ fn kaijutsu_session_scenario() {
         s.kj("kj character model set coder-a mock/mock-coder-a --max-tokens 4096").await;
         s.kj("kj character model set coder-b mock/mock-coder-b --max-tokens 4096").await;
 
-        s.kj("kj context create banto --name banto --type director").await;
+        s.kj("kj context create banto --name banto").await;
         let banto_ctx = s.context_by_label("banto");
         let banto_principal = s.character_principal("banto");
         let coder_a_principal = s.character_principal("coder-a");

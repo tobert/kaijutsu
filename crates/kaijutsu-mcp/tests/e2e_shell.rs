@@ -97,7 +97,6 @@ async fn register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json::Valu
         let raw = mcp
             .register_session(Parameters(RegisterSessionRequest {
                 label: Some(label.to_string()),
-                context_type: None,
             }))
             .await;
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {

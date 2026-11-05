@@ -47,7 +47,7 @@ pub use context_feed::{
     ContextChange, ContextDelivery, ContextMirror, FeedEvent, MirrorError, VersionedChange,
     context_feed_channel,
 };
-pub use context_create::{CreateContextError, CreatedContext, ParentChoice, ParentSource, archive_runs_from, choose_parent, context_archive_argv, context_create_argv, context_create_argv_under, context_id_from_create_result, mcp_hub_label};
+pub use context_create::{CreateContextError, CreatedContext, ParentChoice, ParentSource, archive_runs_from, choose_parent, context_archive_argv, context_create_argv, context_create_argv_under, context_id_from_create_result, live_mcp_hub};
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
 pub use draft_outbox::{DraftEdit, DraftOutbox, DraftSink};
 pub use editor_outbox::{EditorOutbox, EditorSink};

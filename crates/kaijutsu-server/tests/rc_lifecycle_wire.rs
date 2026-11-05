@@ -16,7 +16,7 @@ async fn install_nested_lifecycle(server: &SharedKernel, child_label: &str) {
         vfs.mkdir(Path::new(path), 0o755).await.unwrap();
     }
     vfs.write_all(Path::new("/config/rc/nested-parent/create/S00-child.kai"),
-        format!("kj context create rc-nested-child --name {child_label} --type nested-child").as_bytes()).await.unwrap();
+        format!("kj context create rc-nested-child --name {child_label}").as_bytes()).await.unwrap();
     vfs.write_all(Path::new("/config/rc/nested-child/create/S00-wait.kai"),
         b"kj block create --role system --kind text --content child-entered\nwhile test ! -e /config/rc/release; do sleep 0.01; done\nkj block create --role system --kind text --content child-finished").await.unwrap();
     vfs.write_all(Path::new("/config/rc/nested-child/create/S10-later.kai"),
@@ -62,7 +62,7 @@ fn shutdown_joins_nested_rc_before_settling_the_command() {
         for dir in ["nested-parent", "nested-child"] {
             rc_performer(&kernel, dir).await.unwrap();
         }
-        let submission = kernel.shell_submit("kj context create rc-nested-parent --name nested-outer --type nested-parent", parent, false).await.unwrap();
+        let submission = kernel.shell_submit("kj context create rc-nested-parent --name nested-outer", parent, false).await.unwrap();
         assert!(submission.refusal.is_none());
         let child = wait_child(&server, "shutdown-child").await;
 
@@ -93,7 +93,7 @@ fn accepted_nested_rc_survives_disconnect_and_archive() {
         for dir in ["nested-parent", "nested-child"] {
             rc_performer(&kernel, dir).await.unwrap();
         }
-        let submission = kernel.shell_submit("kj context create rc-nested-parent --name nested-outer --type nested-parent", parent, false).await.unwrap();
+        let submission = kernel.shell_submit("kj context create rc-nested-parent --name nested-outer", parent, false).await.unwrap();
         assert!(submission.refusal.is_none());
         let child = wait_child(&server, "disconnect-child").await;
         drop(kernel);
@@ -147,7 +147,6 @@ fn client_reads_complete_rc_output_from_successful_and_failed_scripts() {
             let performer = rc_performer(&kernel, label).await.unwrap();
             let result = kernel.execute_kj(parent, &[
                 "context".into(), "create".into(), performer, "--name".into(), label.into(),
-                "--type".into(), label.into(),
             ]).await.unwrap();
             assert_eq!(result.exit_code, 0, "ordinary script failure retains the context: {}", result.stderr);
             let context = kernel.list_contexts().await.unwrap().into_iter()

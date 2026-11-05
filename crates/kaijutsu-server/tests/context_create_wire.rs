@@ -23,7 +23,7 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
 
         let parent_blocks = kernel.documents.block_snapshots(parent.context_id).unwrap().len();
         let result = kj
-            .execute_kj_quiet(parent.context_id, &context_create_argv("lane", "coder", PERFORMER, None))
+            .execute_kj_quiet(parent.context_id, &context_create_argv("lane", PERFORMER, None))
             .await
             .unwrap();
         let lane = context_id_from_create_result(&result).expect("kj context create succeeds");
@@ -33,8 +33,8 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
         assert_eq!(row.forked_from, Some(parent.context_id));
         assert_eq!(row.created_by, root.principal_id);
         assert_eq!(kernel.kernel_db.lock().senpai_of(lane).unwrap(), Some(parent.context_id), "the context it was created from is its senpai");
-        assert_eq!(row.context_type, "coder");
         let performer = kernel.kernel_db.lock().get_character_by_name(PERFORMER).unwrap().unwrap();
+        assert_eq!(Some(row.context_type.as_str()), performer.rc_dir.as_deref(), "the row is stamped with the performer's rc directory");
         assert_eq!(row.performer, Some(performer.principal_id), "the context is performed by the named character");
         let db = kernel.kernel_db.lock();
         let character = db.context_character(lane).unwrap().expect("the new context has a context character");
@@ -57,9 +57,9 @@ fn a_duplicate_label_is_refused_with_a_label_conflict() {
         let (kj, _) = client.bind_kernel().await.unwrap();
         let parent = choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap();
 
-        let first = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", "coder", PERFORMER, None)).await.unwrap();
+        let first = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", PERFORMER, None)).await.unwrap();
         context_id_from_create_result(&first).expect("first create succeeds");
-        let second = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", "coder", PERFORMER, None)).await.unwrap();
+        let second = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", PERFORMER, None)).await.unwrap();
         let error = context_id_from_create_result(&second).expect_err("a live label cannot be reused");
         assert!(error.contains("label conflict"), "clients retry on this text: {error}");
     });

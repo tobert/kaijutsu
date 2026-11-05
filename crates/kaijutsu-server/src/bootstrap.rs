@@ -374,7 +374,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         None => match read(shared, |db| db.find_context_by_label(CONSOLE_LABEL))? {
             None => {
                 let argv = words(&[
-                    "context", "create", performer, "--name", CONSOLE_LABEL, "--type", "console",
+                    "context", "create", performer, "--name", CONSOLE_LABEL,
                     "--parent", &root_console.to_string(), "--senpai", &root_console.to_string(),
                 ]);
                 dispatch(shared, caller, argv, &mut report).await?;

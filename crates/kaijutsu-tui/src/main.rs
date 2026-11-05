@@ -54,19 +54,16 @@ struct Cli {
     #[arg(long)]
     context: Option<String>,
 
-    /// rc bundle for a context this client creates.
-    #[arg(long, default_value = "coder")]
-    context_type: String,
-
     /// Parent, by label or id, for a context `--context` creates. Default:
     /// the kernel's only live root context.
     #[arg(long)]
     parent: Option<String>,
 
-    /// The live, non-root character that performs a context `--context`
-    /// creates. Default: this session's own character. A root character
-    /// performs only its root console, so a root's session must pass this; without it the
-    /// create refuses.
+    /// The live character that performs a context `--context` creates: its
+    /// rc directory and model shape the context. Default: this session's own
+    /// character. A person's session (a root character's key) must pass
+    /// this; without it the create refuses. `Ctrl+Z` contexts are always the
+    /// person's own.
     #[arg(long)]
     character: Option<String>,
 
@@ -170,7 +167,6 @@ async fn run(cli: Cli) -> Result<()> {
 
     let bridge = KernelBridge::connect(
         config,
-        cli.context_type,
         cli.parent,
         cli.character,
         std::time::Duration::from_secs(cli.connect_timeout),

@@ -9,7 +9,7 @@ The server binary runs any `kj` verb against a stopped kernel:
 systemctl --user stop kaijutsu-server
 kaijutsu-server kj -- character create bob --root
 kaijutsu-server kj -- backend set deepseek --api-key-file ~/.deepseek-key
-kaijutsu-server kj --as amy -- context create banto --type director
+kaijutsu-server kj --as amy -- context create banto
 systemctl --user start kaijutsu-server
 ```
 
@@ -54,7 +54,7 @@ result is missing:
    the model character that plays the console (`--console-as` names another), running the `console` rc directory. A character that exists and has
    no model gets `kj character model set root ...` instead. A character that already has a model is left alone,
    and the report says so.
-4. `kj context create root --name console --type console`, a kohai of the root
+4. `kj context create root --name console`, a kohai of the root
    character's own context. The context copies the character's model under `model`, and under `distill` when
    the character has no `distill` slot.
    When the console exists, its `model` slot does not resolve to a chat model (it has none, it names a council
@@ -130,7 +130,7 @@ stored keys can tie. The logic is `kaijutsu_kernel::order_repair`.
   MCP servers do not start (`start_external_mcp_servers` is a serving-path
   step), the SSH listener does not open, and the beat scheduler does not
   run. An unreachable embedding service warns, as it does at boot. A
-  beat-bearing `context_type` (musician and similar) is therefore created
+  beat-bearing context (a musician's, and similar) is therefore created
   unarmed: its create-lifecycle `kj transport attach` needs the live
   scheduler and leaves an Error block instead. It arms at the next serving
   boot, or by hand with `kj transport attach` once the service is running.

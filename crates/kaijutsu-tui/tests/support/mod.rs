@@ -172,9 +172,15 @@ pub fn cast_a_performer(server: &EphemeralServer) {
     with_kernel(server, async |kernel| {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
+        // The hub is the context the root's sheet names.
+        let sheet = kernel
+            .execute_kj_quiet(root, &["character".to_string(), "show".to_string(), kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT.to_string()])
+            .await
+            .expect("run kj character show");
+        let hub = sheet.data.as_ref().and_then(|data| data.get("mcp_hub_ctx")).and_then(|hub| hub.as_str()).map(str::to_string);
         let played = contexts
             .iter()
-            .filter(|info| info.id != root && info.context_type != kaijutsu_types::MCP_HUB_CONTEXT_TYPE);
+            .filter(|info| info.id != root && Some(info.id.to_hex()) != hub);
         for info in played {
             let result = kernel
                 .execute_kj_quiet(root, &["context".to_string(), "info".to_string(), info.id.to_hex()])
@@ -192,10 +198,11 @@ pub fn cast_a_performer(server: &EphemeralServer) {
     })
 }
 
-/// Every live context as `(label, context_type, performer_name)`, read
-/// from the kernel with `kj context info`.
+/// Every live context as `(label, performed_by_person, performer_name)`:
+/// the wire fact from the listing, and the performer read from the kernel
+/// with `kj context info`.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
-pub fn contexts_and_performers(server: &EphemeralServer) -> Vec<(String, String, Option<String>)> {
+pub fn contexts_and_performers(server: &EphemeralServer) -> Vec<(String, bool, Option<String>)> {
     with_kernel(server, async |kernel| {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
@@ -212,7 +219,7 @@ pub fn contexts_and_performers(server: &EphemeralServer) -> Vec<(String, String,
                 .and_then(|data| data.get("performer_name"))
                 .and_then(|name| name.as_str())
                 .map(str::to_string);
-            out.push((info.label.clone(), info.context_type.clone(), performer));
+            out.push((info.label.clone(), info.performed_by_person, performer));
         }
         out
     })
@@ -241,7 +248,7 @@ pub fn drift_into_a_root_console(server: &EphemeralServer, text: &str) {
         let contexts = kernel.list_contexts().await.expect("list contexts");
         let root = kaijutsu_client::choose_parent(None, &contexts).expect("a root seat").context_id;
         for argv in [
-            vec!["context", "create", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER, "--name", "console", "--type", "console"],
+            vec!["context", "create", kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER, "--name", "console"],
             // The console is the context the root's sheet points at.
             vec!["character", "set", kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT, "--console", "console"],
             vec!["drift", "push", "console", text],

@@ -25,6 +25,10 @@ use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 /// `Ctrl+A Ctrl+A` (`docs/input.md`, the app's `Esc Esc` pattern).
 pub const DOUBLE_TAP: Duration = Duration::from_millis(500);
 
+/// What a display shows for a context with no performer (the handoff log,
+/// an MCP hub) where it shows the performer.
+pub const NO_PERFORMER: &str = "-";
+
 /// Where one context's transcript view sits over its blocks.
 ///
 /// One per context, held on its [`ContextView`], so switching seats switches
@@ -125,6 +129,9 @@ pub struct App {
     pub identity: String,
     /// The last `list_contexts` answer.
     pub contexts: Vec<ContextInfo>,
+    /// Counts the listings [`Self::set_contexts`] has stored, so a refresh
+    /// round read before a newer one can be told apart from it.
+    listing_epoch: u64,
     /// The rank, recomputed from `contexts` — the same seats the app and an
     /// ACP session list, in the same order.
     pub seats: Vec<RankedSeat>,
@@ -263,6 +270,7 @@ impl App {
         Self {
             identity: identity.into(),
             contexts: Vec::new(),
+            listing_epoch: 0,
             seats: Vec::new(),
             current: None,
             previous: None,
@@ -308,6 +316,12 @@ impl App {
     pub fn set_contexts(&mut self, contexts: Vec<ContextInfo>) {
         self.seats = ranked_seats(&contexts);
         self.contexts = contexts;
+        self.listing_epoch += 1;
+    }
+
+    /// Which listing the app holds: it changes at every [`Self::set_contexts`].
+    pub fn listing_epoch(&self) -> u64 {
+        self.listing_epoch
     }
 
     /// The contexts carrying the `@` activity flag — the set the picker's
@@ -553,10 +567,10 @@ impl App {
         let (tool, arg) = tool_header(block);
         BlockView {
             speaker,
-            context_type: self
+            performer: self
                 .info(ctx)
-                .map(|c| c.context_type.as_str())
-                .unwrap_or("default"),
+                .and_then(|c| c.performer.as_deref())
+                .unwrap_or(NO_PERFORMER),
             stamp,
             show_divider,
             tool,
@@ -906,7 +920,6 @@ mod tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: "coder".to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),
@@ -971,7 +984,7 @@ mod tests {
         let blk = block(context, 1, BlockKind::Text, Role::Model);
         let view = BlockView {
             speaker: "claude",
-            context_type: "coder",
+            performer: "coder",
             stamp: "14:02:11",
             show_divider: false,
             tool: None,

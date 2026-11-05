@@ -384,14 +384,33 @@ impl KjDispatcher {
     /// the console's performer. Resolving for the sender instead would find
     /// the console's model, which plays the console. Refuses when that is
     /// not a live root character, since a model would then decide what
-    /// the console's model reads.
+    /// the console's model reads. A console whose sheet names a person who
+    /// is no longer a live root refuses first, naming both repairs.
     fn drift_reviewer(&self, target_ctx: ContextId) -> Result<PrincipalId, String> {
         let db = self.kernel_db().lock();
+        if let Some(owner) = db.console_owner(target_ctx).map_err(|e| format!("could not read whose console it is: {e}"))? {
+            let sheet = db.get_character(owner).map_err(|e| format!("could not read the console's person: {e}"))?;
+            if !sheet.as_ref().is_some_and(|sheet| sheet.is_live_root()) {
+                let label = db.get_context(target_ctx).ok().flatten().and_then(|row| row.label)
+                    .unwrap_or_else(|| target_ctx.short());
+                let why = match sheet {
+                    Some(sheet) if sheet.retired_at.is_some() => "is retired",
+                    Some(_) => "is no longer a root",
+                    None => "has no character sheet",
+                };
+                return Err(format!(
+                    "{label} is the console of {}, who {why}, so nobody releases a drift into it; \
+                     `kj character set <person> --console {label}` gives it to a live person, \
+                     or `kj context archive {label} --confirm` archives it",
+                    db.name_for(owner)
+                ));
+            }
+        }
         let performer = db.context_character(target_ctx)
             .map_err(|e| format!("could not read the console's character: {e}"))?
             .ok_or_else(|| format!(
                 "The console has no performer, so nobody answers for it and a drift into it has no reviewer; \
-                 `kj context create <character> --name console --type console` makes one"
+                 `kj context create <character> --name console` and `kj character set <person> --console console` make one"
             ))?
             .principal_id;
         let reviewer = db.route_review(crate::kernel_db::ReviewQuery::ask(target_ctx, performer))
@@ -1772,6 +1791,31 @@ mod tests {
         let error = outcome.expect_err("a console with no character has no reviewer");
         assert!(error.contains("no performer") && error.contains("kj context create"), "names the repair: {error}");
         assert!(!error.contains("validation error"), "not a flattened routing error: {error}");
+    }
+
+    /// A drift into a console whose sheet names a person who is no longer a
+    /// live root is refused before anything is written, naming both
+    /// repairs: re-own it with `kj character set <person> --console`, or
+    /// archive it. Falsified by letting the reviewer walk refuse with a
+    /// reason that names neither.
+    #[tokio::test]
+    async fn a_drift_into_a_console_whose_person_retired_names_the_fix() {
+        let h = root_house().await;
+        {
+            let db = h.d.kernel_db().lock();
+            db.retire_character(h.amy, 2).unwrap();
+            db.set_character_console_ctx(h.amy, Some(h.console)).unwrap();
+        }
+        let result = h.d.dispatch(&[s("drift"), s("push"), s("console"), s("anyone there?")], &seat(h.lane, h.coder)).await;
+        assert!(!result.is_ok(), "the drift is refused: {}", result.message());
+        let message = result.message();
+        assert!(message.contains("house-amy") && message.contains("retired"), "{message}");
+        assert!(message.contains("kj character set <person> --console console"), "names the re-own: {message}");
+        assert!(message.contains("kj context archive console"), "names the archive: {message}");
+        assert!(
+            h.d.block_store().block_snapshots(h.console).unwrap().iter().all(|b| b.kind != kaijutsu_types::BlockKind::Drift),
+            "a refused drift writes nothing"
+        );
     }
 
     /// Settling refuses a block that is not a held drift.

@@ -1,5 +1,5 @@
-//! A root character performs only its root console, so a root's session
-//! names the character that plays the contexts it creates (`--character`).
+//! A person's context runs no model, so a person's session names the
+//! character that plays the contexts it creates (`--character`).
 //! Each test stands up an ephemeral kernel and drives `KernelBridge::open`,
 //! the path `kaijutsu-tui --context <label>` takes.
 
@@ -30,7 +30,7 @@ fn with_bridge<T>(
             key_source: KeySource::InMemory(server.root_key.clone()),
             insecure: true,
         };
-        let bridge = KernelBridge::connect(config, "coder".into(), None, character.map(String::from), Duration::from_secs(10))
+        let bridge = KernelBridge::connect(config, None, character.map(String::from), Duration::from_secs(10))
             .await
             .expect("connect the bridge");
         with(bridge).await

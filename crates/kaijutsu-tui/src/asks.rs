@@ -182,7 +182,7 @@ pub struct AskCard<'a> {
     /// this the ask's "hook" in the figure; the field it reads is `tool`.
     pub hook: &'a str,
     pub context_label: &'a str,
-    pub context_type: &'a str,
+    pub performer: &'a str,
     pub statement: &'a str,
     pub asker: Option<&'a str>,
     pub reviewer: Option<&'a str>,
@@ -210,7 +210,7 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
             card.request_id,
             card.hook,
             card.context_label,
-            card.context_type,
+            card.performer,
             card.asker.map(|name| format!("  asker {name}")).unwrap_or_default(),
             card.reviewer.map(|name| format!("  reviewer {name}")).unwrap_or_default(),
         ),
@@ -287,7 +287,7 @@ pub struct PendingRow {
     /// `created_at`, or `None` when the ask has no stamp.
     pub age: Option<String>,
     pub context_label: String,
-    pub context_type: String,
+    pub performer: String,
     pub hook: String,
     pub asker: Option<String>,
     pub reviewer: Option<String>,
@@ -437,7 +437,7 @@ pub fn render_ledger(
                 r.request_id,
                 r.age.as_deref().unwrap_or("—"),
                 clip(&r.context_label, 12),
-                clip(&r.context_type, 10),
+                clip(&r.performer, 10),
                 clip(&r.hook, 14),
                 clip(r.asker.as_deref().unwrap_or("—"), 12),
                 clip(r.reviewer.as_deref().unwrap_or("—"), 12),
@@ -582,7 +582,7 @@ pub fn render_ask_detail(detail: &AskDetailView<'_>, width: u16, palette: &Palet
         Line::from(Span::styled(format!("status:     {}", detail.status), palette.status())),
         Line::from(Span::styled(format!("origin:     {}", detail.origin), palette.status())),
         Line::from(Span::styled(
-            format!("context:    {} ({})", detail.context_label, detail.context_type),
+            format!("context:    {} ({})", detail.context_label, detail.performer),
             palette.status(),
         )),
     ];
@@ -642,7 +642,7 @@ pub struct AskDetailView<'a> {
     pub origin: &'a str,
     pub hook: Option<&'a str>,
     pub context_label: &'a str,
-    pub context_type: &'a str,
+    pub performer: &'a str,
     pub requester: Option<&'a str>,
     pub asker: Option<&'a str>,
     pub reviewer: Option<&'a str>,
@@ -795,17 +795,18 @@ impl LedgerViewState {
     }
 }
 
-/// A context's label/type, defaulting to its short id and `"default"` when
-/// [`crate::app::App`] has no [`kaijutsu_client::ContextInfo`] for it (an
-/// ask can outlive the context it named — `docs/gate-resume.md`, "Archived
-/// contexts are inert").
+/// A context's label and performer, defaulting to its short id and
+/// [`crate::app::NO_PERFORMER`] when [`crate::app::App`] has no
+/// [`kaijutsu_client::ContextInfo`] for it (an ask can outlive the context
+/// it named — `docs/gate-resume.md`, "Archived contexts are inert") or the
+/// context has no performer.
 pub fn context_facts(app: &crate::app::App, ctx: kaijutsu_types::ContextId) -> (String, String) {
     match app.info(ctx) {
         Some(info) => (
             if info.label.is_empty() { ctx.short() } else { info.label.clone() },
-            info.context_type.clone(),
+            info.performer.clone().unwrap_or_else(|| crate::app::NO_PERFORMER.to_string()),
         ),
-        None => (ctx.short(), "default".to_string()),
+        None => (ctx.short(), crate::app::NO_PERFORMER.to_string()),
     }
 }
 
@@ -814,14 +815,14 @@ pub fn context_facts(app: &crate::app::App, ctx: kaijutsu_types::ContextId) -> (
 /// (`crate::render::overlay_lines`). `None` when neither is open.
 pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'static>>> {
     if let Some(card) = &app.ask_card {
-        let (context_label, context_type) = context_facts(app, card.context_id);
+        let (context_label, performer) = context_facts(app, card.context_id);
         let summary = &card.detail.summary;
         let statement = summary.statements.first().map(String::as_str).unwrap_or(summary.description.as_str());
         let view = AskCard {
             request_id: &card.request_id,
             hook: card.detail.tool.as_deref().unwrap_or("-"),
             context_label: &context_label,
-            context_type: &context_type,
+            performer: &performer,
             statement,
             asker: summary.performer.as_ref().map(|who| who.name.as_str()),
             reviewer: summary.reviewer.as_ref().map(|who| who.name.as_str()),
@@ -833,10 +834,10 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
     if let Some(view) = &app.ledger_view {
         if let Some(detail) = &view.detail {
             let summary = &detail.summary;
-            let (context_label, context_type) = summary
+            let (context_label, performer) = summary
                 .context_id
                 .map(|ctx| context_facts(app, ctx))
-                .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+                .unwrap_or_else(|| ("(unknown)".to_string(), crate::app::NO_PERFORMER.to_string()));
             let env: Vec<(String, Option<String>)> = detail
                 .env
                 .iter()
@@ -848,7 +849,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
                 origin: summary.origin.as_str(),
                 hook: detail.tool.as_deref(),
                 context_label: &context_label,
-                context_type: &context_type,
+                performer: &performer,
                 requester: summary.requester.as_ref().map(|who| who.name.as_str()),
                 asker: summary.performer.as_ref().map(|who| who.name.as_str()),
                 reviewer: summary.reviewer.as_ref().map(|who| who.name.as_str()),
@@ -1292,17 +1293,17 @@ pub fn land_ledger(app: &mut App, reads: Result<LedgerReads, CallError>, now_ms:
 /// `now_ms`.
 fn pending_row(app: &App, detail: &AskDetail, now_ms: u64) -> PendingRow {
     let summary = &detail.summary;
-    let (context_label, context_type) = summary
+    let (context_label, performer) = summary
         .context_id
         .map(|ctx| context_facts(app, ctx))
-        .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+        .unwrap_or_else(|| ("(unknown)".to_string(), crate::app::NO_PERFORMER.to_string()));
     PendingRow {
         request_id: summary.request_id.clone(),
         age: Some(crate::status::format_age(std::time::Duration::from_millis(
             now_ms.saturating_sub(summary.created_at_ms.max(0) as u64),
         ))),
         context_label,
-        context_type,
+        performer,
         hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
         asker: summary.performer.as_ref().map(|who| who.name.clone()),
         reviewer: summary.reviewer.as_ref().map(|who| who.name.clone()),
@@ -1320,7 +1321,7 @@ fn answered_row(app: &App, detail: &AskDetail) -> AnsweredRow {
     let (context_label, _context_type) = summary
         .context_id
         .map(|ctx| context_facts(app, ctx))
-        .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+        .unwrap_or_else(|| ("(unknown)".to_string(), crate::app::NO_PERFORMER.to_string()));
     let redeemed = match detail.redeemed_at_ms {
         Some(at) => RedeemedMark::At(crate::render::wallclock(at as u64)),
         None => RedeemedMark::Never,
@@ -1599,7 +1600,7 @@ mod tests {
             request_id: "01a04eb6",
             hook: "shell_write",
             context_label: "kaijutsu",
-            context_type: "coder",
+            performer: "coder",
             statement: "rm -rf ~/src/wt/kaish-arith",
             asker: Some("coder"),
             reviewer: Some("amy"),
@@ -1620,7 +1621,7 @@ mod tests {
     fn a_disarmed_ask_card_says_so_instead_of_offering_keys() {
         for can_review in [true, false] {
             let card = AskCard {
-                request_id: "01a04eb6", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
+                request_id: "01a04eb6", hook: "shell_write", context_label: "kaijutsu", performer: "coder",
                 statement: "rm -rf ~/src/wt/kaish-arith", asker: None, reviewer: None, offer: if can_review { REVIEWER } else { Offer::default() }, armed: false,
             };
             let text: Vec<String> = render_ask_card(&card, 80, &Palette::builtin()).iter().map(line_text).collect();
@@ -1637,7 +1638,7 @@ mod tests {
             request_id: "id",
             hook: "shell_write",
             context_label: "kaijutsu",
-            context_type: "coder",
+            performer: "coder",
             statement: "one two three four five six seven eight nine ten",
             asker: None,
             reviewer: None,
@@ -1651,7 +1652,7 @@ mod tests {
 
     fn key_rows(offer: Offer, width: u16, armed: bool) -> Vec<String> {
         let card = AskCard {
-            request_id: "id", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
+            request_id: "id", hook: "shell_write", context_label: "kaijutsu", performer: "coder",
             statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), offer, armed,
         };
         render_ask_card(&card, width, &Palette::builtin()).iter().map(line_text).skip(2).collect()
@@ -1726,7 +1727,7 @@ mod tests {
             request_id: "id",
             hook: "shell_write",
             context_label: "kaijutsu",
-            context_type: "coder",
+            performer: "coder",
             statement: "one two three four five six seven eight nine ten eleven twelve",
             asker: None,
             reviewer: None,
@@ -1760,7 +1761,7 @@ mod tests {
             request_id: id.to_string(),
             age: Some("12s".to_string()),
             context_label: ctx.to_string(),
-            context_type: "coder".to_string(),
+            performer: "coder".to_string(),
             hook: "shell_write".to_string(),
             asker: Some("coder".to_string()),
             reviewer: Some("amy".to_string()),
@@ -1878,7 +1879,7 @@ mod tests {
             origin: "shell_gate",
             hook: Some("shell_write"),
             context_label: "kaijutsu",
-            context_type: "coder",
+            performer: "coder",
             requester: Some("amy"),
             asker: Some("coder"),
             reviewer: Some("amy"),
@@ -2319,7 +2320,7 @@ mod ledger_tests {
                         request_id: id.to_string(),
                         age: None,
                         context_label: "kaijutsu".into(),
-                        context_type: "coder".into(),
+                        performer: "coder".into(),
                         hook: "shell_write".into(),
                         asker: None,
                         reviewer: None,
@@ -2404,7 +2405,7 @@ mod ledger_tests {
             request_id: id.to_string(),
             age: None,
             context_label: "kaijutsu".into(),
-            context_type: "coder".into(),
+            performer: "coder".into(),
             hook: "shell_write".into(),
             asker: Some("coder".into()),
             reviewer: Some("amy".into()),

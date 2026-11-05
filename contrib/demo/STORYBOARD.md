@@ -33,7 +33,7 @@ makes a local/tenchi coder viable).
 1. `kj character slot list <coder-char>` — confirm the coder character runs the fast model (ds4/deepseek or qwen-flash).
 2. Give the coder character a slot on the fast model (`kj character slot set <coder-char> coder BACKEND/MODEL`),
    then create it from Amy's console: `kj context create <coder-char>`
-   (check `kj context create --help` for the cwd / context-type flags; scope cwd
+   (check `kj context create --help` for the cwd flag; scope cwd
    to demo/). Performer = coder, senpai = Amy's console, so Amy reviews → the
    sheet's decision keys are LIVE for Amy (unlike a self-performed ask).
 3. Prompt the coder: "write demo/hello.py that prints hello, then delete it,

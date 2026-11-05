@@ -107,7 +107,7 @@ async fn auto_register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json:
     let mut last = String::new();
     for _ in 0..100 {
         let raw = mcp
-            .register_session_auto(Some(label.to_string()), None)
+            .register_session_auto(Some(label.to_string()))
             .await;
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             return v;

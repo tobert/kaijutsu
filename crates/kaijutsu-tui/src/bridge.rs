@@ -16,7 +16,6 @@ use kaijutsu_client::{
 use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use crate::ctrl_z::SHELL_CONTEXT_TYPE;
 
 /// Per-process subscription identity.
 ///
@@ -47,7 +46,6 @@ fn client_cwd() -> Option<String> {
 #[derive(Clone)]
 pub struct KernelBridge {
     actor: ActorHandle,
-    context_type: String,
     parent: Option<String>,
     /// The character that performs a context this client creates. `None` is
     /// this seat's own character, which must not be a root.
@@ -65,7 +63,6 @@ impl KernelBridge {
     /// is the price.
     pub async fn connect(
         config: SshConfig,
-        context_type: String,
         parent: Option<String>,
         character: Option<String>,
         connect_timeout: std::time::Duration,
@@ -143,7 +140,6 @@ impl KernelBridge {
 
         Ok(Self {
             actor,
-            context_type,
             parent,
             character,
             client_id: crate::client_id::load_or_seed(),
@@ -162,7 +158,7 @@ impl KernelBridge {
     #[cfg(test)]
     pub(crate) fn never_answers_for_test() -> Self {
         let (actor, _cmds) = ActorHandle::never_answers_for_test();
-        Self { actor, context_type: "default".to_string(), parent: None, character: None, client_id: Uuid::nil() }
+        Self { actor, parent: None, character: None, client_id: Uuid::nil() }
     }
 
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
@@ -190,7 +186,7 @@ impl KernelBridge {
         }
         let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &self.list_contexts().await?)
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        let (info, cwd_refused) = self.create_child(parent.context_id, target, &self.context_type).await?;
+        let (info, cwd_refused) = self.create_child(parent.context_id, target).await?;
         if let Some(refused) = &cwd_refused {
             // Printed before the screen is taken, so it stays in scrollback.
             eprintln!(
@@ -201,16 +197,11 @@ impl KernelBridge {
         Ok(info)
     }
 
-    /// Create `label` of `context_type` under `parent`, in this process's
-    /// working directory, and join it. Returns the new context and, when the
-    /// kernel refused the directory, its refusal (the context then takes the
-    /// parent's cwd). Used by `open` before the screen is taken.
-    pub async fn create_child(
-        &self,
-        parent: ContextId,
-        label: &str,
-        context_type: &str,
-    ) -> Result<(ContextInfo, Option<String>)> {
+    /// Create `label` under `parent`, in this process's working directory,
+    /// and join it. Returns the new context and, when the kernel refused the
+    /// directory, its refusal (the context then takes the parent's cwd).
+    /// Used by `open` before the screen is taken.
+    pub async fn create_child(&self, parent: ContextId, label: &str) -> Result<(ContextInfo, Option<String>)> {
         // A context is an instance of a character: the one named with
         // `--character`, else this seat's own, which must not be a root.
         let performer = self
@@ -218,29 +209,29 @@ impl KernelBridge {
             .performer_for_new_contexts(parent, self.character.as_deref(), "--character <name>")
             .await
             .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
-        self.create_child_as(parent, label, context_type, &performer).await
+        self.create_child_as(parent, label, &performer).await
     }
 
-    /// Create the `Ctrl+Z` shell child `label` under `parent` and join it.
-    /// The human at this seat performs it, root or not, and `--character`
-    /// does not apply: a shell child runs no model, and the person typing
-    /// in it is the one acting there. The caller must not print.
+    /// Create the `Ctrl+Z` context `label` from `parent` and join it: `kj
+    /// context create <person>`, performed by the person at this seat and
+    /// answering to `parent`. `--character` does not apply: a person's
+    /// context runs no model, and the person typing in it is the one acting
+    /// there. The caller must not print.
     pub async fn create_shell_child(&self, parent: ContextId, label: &str) -> Result<(ContextInfo, Option<String>)> {
         let me = self.actor.whoami().await.map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
-        self.create_child_as(parent, label, SHELL_CONTEXT_TYPE, &me.username).await
+        self.create_child_as(parent, label, &me.username).await
     }
 
     async fn create_child_as(
         &self,
         parent: ContextId,
         label: &str,
-        context_type: &str,
         performer: &str,
     ) -> Result<(ContextInfo, Option<String>)> {
         let cwd = client_cwd();
         let created = self
             .actor
-            .create_context_in_client_cwd(parent, label, context_type, performer, cwd.as_deref())
+            .create_context_in_client_cwd(parent, label, performer, cwd.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
         let id = created.id;

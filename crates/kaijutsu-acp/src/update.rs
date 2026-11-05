@@ -977,7 +977,6 @@ mod tests {
             created_at: 0,
             trace_id: [0; 16],
             fork_kind: None,
-            context_type: "coder".into(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),

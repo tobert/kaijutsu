@@ -158,8 +158,9 @@ impl KernelDb {
     }
 
     /// The archive of one context, with no shadows: the state, the ring
-    /// placement, the ask sweep, and the `console_ctx` and `mcp_hub_ctx`
-    /// pointers that name it, which are cleared.
+    /// placement, the ask sweep, and the `root_ctx`, `console_ctx` and
+    /// `mcp_hub_ctx` pointers that name it, which are cleared. A root whose
+    /// `root_ctx` is cleared gets a new root console at the next start.
     fn archive_one_context(&self, id: ContextId) -> KernelDbResult<bool> {
         if let Some(why) = self.held_drift_refusal(id)? {
             return Err(KernelDbError::Validation(why));
@@ -180,6 +181,10 @@ impl KernelDb {
         if swept > 0 {
             info!(context = %id.short(), swept, "archived context: swept unresolved asks");
         }
+        let roots = self.conn.execute(
+            "UPDATE characters SET root_ctx = NULL WHERE root_ctx = ?1",
+            params![blob_param(id.as_bytes())],
+        )?;
         let consoles = self.conn.execute(
             "UPDATE characters SET console_ctx = NULL WHERE console_ctx = ?1",
             params![blob_param(id.as_bytes())],
@@ -188,8 +193,8 @@ impl KernelDb {
             "UPDATE characters SET mcp_hub_ctx = NULL WHERE mcp_hub_ctx = ?1",
             params![blob_param(id.as_bytes())],
         )?;
-        if consoles + hubs > 0 {
-            info!(context = %id.short(), consoles, hubs, "archived context: cleared the character pointers that named it");
+        if roots + consoles + hubs > 0 {
+            info!(context = %id.short(), roots, consoles, hubs, "archived context: cleared the character pointers that named it");
         }
         Ok(updated > 0)
     }
@@ -200,8 +205,8 @@ impl KernelDb {
     /// `handoff_ctx` at the successor when it named the predecessor. A
     /// predecessor that is missing or already archived refuses. Moves a
     /// character's `root_ctx` and `console_ctx` the same way; the archived
-    /// root console then takes the successor as its senpai. The console
-    /// pointer moves before the archive, which would otherwise clear it. The
+    /// root console then takes the successor as its senpai. Both pointers
+    /// move before the archive, which would otherwise clear them. The
     /// kernel moves no other context that answers to the predecessor.
     pub fn commit_rotation(
         &self,
@@ -218,6 +223,10 @@ impl KernelDb {
                 "UPDATE characters SET console_ctx = ?1 WHERE console_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
+            let root_ctx_moved = db.conn.execute(
+                "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
+                params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
+            )?;
             let archived = db.archive_with_shadows(predecessor, judges)?;
             if !archived.context {
                 return Err(KernelDbError::Validation(format!(
@@ -231,10 +240,6 @@ impl KernelDb {
             )?;
             let moved = db.conn.execute(
                 "UPDATE characters SET handoff_ctx = ?1 WHERE handoff_ctx = ?2",
-                params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
-            )?;
-            let root_ctx_moved = db.conn.execute(
-                "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
             if root_ctx_moved > 0 {

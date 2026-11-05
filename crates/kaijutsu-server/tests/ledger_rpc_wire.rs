@@ -87,7 +87,7 @@ impl Rig {
         let (lead_kj, _) = lead_client.bind_kernel().await.unwrap();
         let parent = kaijutsu_client::choose_parent(None, &amy_kj.list_contexts().await.unwrap()).unwrap();
         let created = amy_kj
-            .execute_kj_quiet(parent.context_id, &kaijutsu_client::context_create_argv("ledger-rpc-work", "default", "coder", None))
+            .execute_kj_quiet(parent.context_id, &kaijutsu_client::context_create_argv("ledger-rpc-work", "coder", None))
             .await
             .unwrap();
         let work = kaijutsu_client::context_id_from_create_result(&created).unwrap();

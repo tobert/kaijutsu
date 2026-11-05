@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{run_local};
-use kaijutsu_client::{ActorHandle, CallError, KeySource, SshConfig, context_archive_argv, mcp_hub_label, spawn_actor};
+use kaijutsu_client::{ActorHandle, CallError, KeySource, SshConfig, context_archive_argv, spawn_actor};
 use kaijutsu_kernel::kernel_db::CharacterRow;
 use kaijutsu_types::PrincipalId;
 use russh::keys::{Algorithm, PrivateKey};
@@ -30,14 +30,16 @@ async fn connect(addr: std::net::SocketAddr, name: &str, key: Arc<PrivateKey>) -
 }
 
 /// Register `label` the way `register_session` does: from the kernel's only
-/// root console, `forked_from` the root's hub. Returns the new context's id.
+/// root console, `forked_from` the hub amy's sheet names. Returns the new
+/// context's id.
 async fn register(actor: &ActorHandle, label: &str, performer: &str) -> kaijutsu_types::ContextId {
     let contexts = actor.list_contexts().await.unwrap();
     let parent = kaijutsu_client::choose_parent(None, &contexts).unwrap();
-    let hub = mcp_hub_label(parent.context_id, &contexts).unwrap();
-    assert_eq!(hub.as_deref(), Some("mcp/amy"));
+    let hub = actor.mcp_hub_of(parent.context_id, &contexts).await.unwrap().expect("a root console has a hub");
+    let hub_label = contexts.iter().find(|c| c.id == hub).map(|c| c.label.as_str());
+    assert_eq!(hub_label, Some("mcp/amy"));
     actor
-        .create_context_in_client_cwd_under(parent.context_id, label, "mcp", performer, None, hub.as_deref())
+        .create_context_in_client_cwd_under(parent.context_id, label, performer, None, Some(&hub.to_hex()))
         .await
         .unwrap_or_else(|error| panic!("an mcp registration raises no ask and is not refused: {error}"))
         .id

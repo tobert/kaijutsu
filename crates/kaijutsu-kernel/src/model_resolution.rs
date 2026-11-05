@@ -23,10 +23,6 @@ pub const DISTILL: &str = "distill";
 /// model (`character_models`), not a slot.
 pub const CHARACTER_SLOT_ROLES: &[&str] = &[DISTILL, crate::council::gate::GATE];
 
-/// Names no context may take as its type: the slot roles, and `judge`, the
-/// type the gate writes on a judge shadow.
-pub const RESERVED_ROLES: &[&str] = &[MODEL, crate::council::gate::GATE, DISTILL, crate::council::shadow::JUDGE];
-
 /// The backend kind of a council server. A slot on such a backend names a
 /// served model, needs no `max_tokens`, and is never a chat model.
 pub const COUNCIL_BACKEND_KIND: &str = "mk";
@@ -34,24 +30,6 @@ pub const COUNCIL_BACKEND_KIND: &str = "mk";
 /// Whether a backend of `kind` is a council server.
 pub fn is_council_kind(kind: &str) -> bool {
     kind == COUNCIL_BACKEND_KIND
-}
-
-/// Refuses `context_type` when it names a reserved role.
-pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
-    if !RESERVED_ROLES.contains(&context_type) {
-        return Ok(());
-    }
-    if context_type == crate::council::shadow::JUDGE {
-        return Err(
-            "'judge' is the type of a judge shadow, which the gate makes for the judge character a council \
-             block names; choose another --type"
-                .to_string(),
-        );
-    }
-    Err(format!(
-        "'{context_type}' is a slot role, not a context type: a context's `{context_type}` slot holds \
-         its model, its distillation model or its council server; choose another --type"
-    ))
 }
 
 /// Refuses a character slot `role` other than [`CHARACTER_SLOT_ROLES`],
@@ -196,7 +174,7 @@ impl NoModel {
         match &self.reason {
             NoModelReason::NoContextCharacter => format!(
                 "{} has no performer, so it {what}. Start one: \
-                 `kj context create <character> [--name <label>] [--type <type>]`",
+                 `kj context create <character> [--name <label>]`",
                 self.context
             ),
             NoModelReason::CouncilServer if self.role == DISTILL => format!(

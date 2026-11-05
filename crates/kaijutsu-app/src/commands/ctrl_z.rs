@@ -1,6 +1,7 @@
-//! `Ctrl+Z`: the toggle between a root context and its shell child. The app
-//! twin of `kaijutsu-tui`'s `ctrl_z` (`docs/character.md`, "The root console
-//! and its shell").
+//! `Ctrl+Z`: the toggle between a person's root console (or the console) and
+//! a context the person performs under it. The app twin of `kaijutsu-tui`'s
+//! `ctrl_z` (`docs/character.md`, "A person, the console, MCP sessions, the
+//! judge"). The wire facts decide, never a label.
 //!
 //! [`toggle`] is pure: it turns the context on screen and the kernel's listing
 //! into a [`Toggle`]. The systems below run it on the kernel in an async
@@ -9,7 +10,7 @@
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
-use kaijutsu_types::{CONSOLE_CONTEXT_TYPE, ContextId, ROOT_CONTEXT_TYPE, SHELL_CONTEXT_TYPE};
+use kaijutsu_types::ContextId;
 
 use crate::cell::{ContextSwitchRequested, DocumentCache};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
@@ -84,15 +85,16 @@ async fn toggle_on_kernel(
             let cwd = std::env::current_dir()
                 .ok()
                 .and_then(|dir| dir.into_os_string().into_string().ok());
-            // The human at this seat performs the shell child, root or not:
-            // it runs no model, and the person typing there is the one acting.
+            // `kj context create <person>`: the person at this seat performs
+            // it, and it answers to the context it was opened from. A
+            // person's context runs no model.
             let performer = handle
                 .whoami()
                 .await
                 .map_err(|e| format!("cannot create {label}: {e}"))?
                 .username;
             let created = handle
-                .create_context_in_client_cwd(parent, &label, SHELL_CONTEXT_TYPE, &performer, cwd.as_deref())
+                .create_context_in_client_cwd(parent, &label, &performer, cwd.as_deref())
                 .await
                 .map_err(|e| format!("cannot create {label}: {e}"))?;
             if let Some(refused) = created.cwd_refused {
@@ -130,18 +132,21 @@ pub fn handle_shell_toggle_result(
 /// What one `Ctrl+Z` press asks the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Toggle {
-    /// Switch the screen to this context: a root's live shell child, or a
-    /// shell's parent.
+    /// Switch the screen to this context: the live context the person
+    /// performs under a root console or the console, or the context a
+    /// person's context was opened from.
     Switch(ContextId),
-    /// A root with no live shell child: create one under `parent`, labelled
-    /// `label`, and then switch to it.
+    /// A root console or the console with no live context the person
+    /// performs under it: create one from `parent`, labelled `label`, and
+    /// then switch to it.
     Create { parent: ContextId, label: String },
-    /// The context on screen is neither a root nor a shell. Say so; do not
-    /// move.
+    /// The context on screen is neither a root console, the console, nor a
+    /// context a person performs. Say so; do not move.
     Refuse(&'static str),
 }
 
-/// The label a root's shell child is created with: `<root-label>-shell`.
+/// The label a person's `Ctrl+Z` context is created with:
+/// `<parent-label>-shell`.
 pub fn shell_label(root_label: &str) -> String {
     format!("{root_label}-shell")
 }
@@ -149,37 +154,39 @@ pub fn shell_label(root_label: &str) -> String {
 /// Decide what `Ctrl+Z` does from the context on screen and the kernel's
 /// listing.
 ///
-/// From a root: its live shell child, else a create. A child under the same
-/// root with the predictable label is preferred, so two shell children (one
-/// made by hand) resolve the same way every time. From a shell: its parent.
-/// From any other type: refuse.
+/// From a root console or the console: the live context a person performs
+/// that was opened from it, else a create. A child with the predictable
+/// label is preferred, so two such children (one made by hand) resolve the
+/// same way every time. From any other context a person performs: the
+/// context it was opened from. From anything else: refuse.
 pub fn toggle(current: &ContextInfo, contexts: &[ContextInfo]) -> Toggle {
-    match current.context_type.as_str() {
-        ROOT_CONTEXT_TYPE | CONSOLE_CONTEXT_TYPE => {
-            let children: Vec<&ContextInfo> = contexts
-                .iter()
-                .filter(|c| {
-                    c.context_type == SHELL_CONTEXT_TYPE
-                        && c.forked_from == Some(current.id)
-                        && is_live(c)
-                })
-                .collect();
-            let want = shell_label(&current.label);
-            match children.iter().find(|c| c.label == want).or(children.first()) {
-                Some(child) => Toggle::Switch(child.id),
-                None => Toggle::Create { parent: current.id, label: want },
-            }
-        }
-        SHELL_CONTEXT_TYPE => match current.forked_from {
-            Some(parent) => Toggle::Switch(parent),
-            None => Toggle::Refuse("Ctrl+Z: this shell has no root to return to"),
-        },
-        _ => Toggle::Refuse("Ctrl+Z toggles a root and its shell; this context is neither"),
+    if current.is_root_console || current.is_console {
+        let children: Vec<&ContextInfo> = contexts
+            .iter()
+            .filter(|c| {
+                c.performed_by_person
+                    && !c.is_root_console
+                    && c.forked_from == Some(current.id)
+                    && is_live(c)
+            })
+            .collect();
+        let want = shell_label(&current.label);
+        return match children.iter().find(|c| c.label == want).or(children.first()) {
+            Some(child) => Toggle::Switch(child.id),
+            None => Toggle::Create { parent: current.id, label: want },
+        };
     }
+    if current.performed_by_person {
+        return match current.forked_from {
+            Some(parent) => Toggle::Switch(parent),
+            None => Toggle::Refuse("Ctrl+Z: this context has no context it was opened from to return to"),
+        };
+    }
+    Toggle::Refuse("Ctrl+Z toggles a root console or the console and a context you perform under it; this context is neither")
 }
 
-/// Archived and concluded contexts are not reused: a live shell child is the
-/// one `Ctrl+Z` returns to.
+/// Archived and concluded contexts are not reused: a live child is the one
+/// `Ctrl+Z` returns to.
 fn is_live(context: &ContextInfo) -> bool {
     !context.archived && context.concluded_at.is_none()
 }
@@ -189,7 +196,8 @@ mod tests {
     use super::*;
     use kaijutsu_types::Status;
 
-    fn ctx(label: &str, context_type: &str, forked_from: Option<ContextId>) -> ContextInfo {
+    /// A context a model character performs.
+    fn ctx(label: &str, forked_from: Option<ContextId>) -> ContextInfo {
         ContextInfo {
             id: ContextId::new(),
             label: label.to_string(),
@@ -199,7 +207,6 @@ mod tests {
             created_at: 1_000,
             trace_id: [0u8; 16],
             fork_kind: None,
-            context_type: context_type.to_string(),
             archived: false,
             concluded_at: None,
             keywords: Vec::new(),
@@ -234,12 +241,47 @@ mod tests {
         }
     }
 
+    /// A person's root console.
     fn root(label: &str) -> ContextInfo {
-        ctx(label, ROOT_CONTEXT_TYPE, None)
+        let mut info = ctx(label, None);
+        info.performed_by_person = true;
+        info.is_root_console = true;
+        info
     }
 
+    /// A context the person performs, opened from `parent`.
     fn shell_of(parent: &ContextInfo, label: &str) -> ContextInfo {
-        ctx(label, SHELL_CONTEXT_TYPE, Some(parent.id))
+        let mut info = ctx(label, Some(parent.id));
+        info.performed_by_person = true;
+        info
+    }
+
+    /// The console toggles as a root console does; its label decides
+    /// nothing.
+    #[test]
+    fn a_console_toggles_to_its_shell_child_and_creates_one_when_missing() {
+        let mut console = ctx("banto", Some(ContextId::new()));
+        console.is_console = true;
+        let child = shell_of(&console, "banto-shell");
+        assert_eq!(toggle(&console, &[console.clone(), child.clone()]), Toggle::Switch(child.id));
+        assert_eq!(
+            toggle(&console, &[console.clone()]),
+            Toggle::Create { parent: console.id, label: "banto-shell".into() },
+        );
+    }
+
+    /// A model's context under the root, even one labelled like the shell,
+    /// is not the person's.
+    ///
+    /// Falsified by matching children by label or by parent alone.
+    #[test]
+    fn a_model_s_child_under_the_root_is_not_the_person_s() {
+        let amy = root("amy");
+        let lane = ctx("amy-shell", Some(amy.id));
+        assert_eq!(
+            toggle(&amy, &[amy.clone(), lane]),
+            Toggle::Create { parent: amy.id, label: "amy-shell".to_string() }
+        );
     }
 
     #[test]
@@ -318,14 +360,16 @@ mod tests {
 
     #[test]
     fn a_shell_with_no_parent_refuses_rather_than_guessing() {
-        let orphan = ctx("orphan", SHELL_CONTEXT_TYPE, None);
+        let mut orphan = ctx("orphan", None);
+        orphan.performed_by_person = true;
         assert!(matches!(toggle(&orphan, &[orphan.clone()]), Toggle::Refuse(_)));
     }
 
-    /// Any other type does nothing: `Ctrl+Z` never creates under a coder.
+    /// A context a model performs does nothing: `Ctrl+Z` never creates under
+    /// a coder, whatever its label.
     #[test]
     fn any_other_context_refuses_and_creates_nothing() {
-        let lane = ctx("lane", "coder", None);
+        let lane = ctx("console", Some(ContextId::new()));
         let contexts = vec![lane.clone()];
         assert!(matches!(toggle(&lane, &contexts), Toggle::Refuse(_)));
     }

@@ -725,7 +725,7 @@ fn a_persons_context_chat_submit_runs_the_draft_as_shell() {
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
         let person = kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT;
-        let context_id = common::create_context_typed_as(&kernel, "draft-shell-repl", "shell", person).await.unwrap();
+        let context_id = common::create_context_as(&kernel, "draft-shell-repl", person).await.unwrap();
         // The type is not what makes it a REPL.
         server.kernel_db.lock().update_context_type(context_id, "default").unwrap();
         kernel.join_context(context_id, "draft-test").await.unwrap();

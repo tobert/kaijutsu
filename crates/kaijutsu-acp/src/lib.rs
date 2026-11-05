@@ -15,8 +15,9 @@
 //!
 //! **Which way does the agency point?** In MCP, kaijutsu is a *tool* another
 //! agent calls. In ACP, kaijutsu is the *agent* and the ACP client is the
-//! connected player's seat. So a session's context is created with `context_type=coder`
-//! by default — the model-facing stance bundle — not `mcp`.
+//! connected player's seat. So a session's context is performed by a model
+//! character, such as `coder`, named with `--character` or by the
+//! connection's own key, and runs that character's rc directory.
 //!
 //! ## Version stance
 //!
@@ -308,17 +309,17 @@ async fn handle_new_session(
     if let Err(e) = validate_acp_cwd(&req.cwd) {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
-    if !bridge.kernel.has_character() {
-        return responder.respond_with_error(Error::invalid_params().data(serde_json::json!({
-            "reason": "ACP session/new needs --character <name>; load or resume an existing session instead",
-        })));
-    }
     bridge.note_client_cwd(&req.cwd);
     let label = new_session_label(&req.cwd);
     let opened = match bridge.kernel.open_or_create(&label, &req.cwd).await {
         Ok(o) => o,
         Err(e) if e.downcast_ref::<bridge::CwdRefused>().is_some() => {
             return responder.respond_with_error(invalid_cwd(&req.cwd, e));
+        }
+        Err(e) if e.downcast_ref::<bridge::NoPerformer>().is_some() => {
+            return responder.respond_with_error(Error::invalid_params().data(serde_json::json!({
+                "reason": format!("{e}; or load or resume an existing session instead"),
+            })));
         }
         Err(e) => return responder.respond_with_error(internal(e)),
     };

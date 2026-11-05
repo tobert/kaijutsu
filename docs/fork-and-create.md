@@ -9,14 +9,14 @@ Two verbs mint context rows, and each means one thing.
 - **`kj fork` continues the same performance.** The child copies the
   parent's performer, cast, workspace, shell, and env, and a selection of
   its block log (`docs/fork-filters.md`). The forking context is the child's
-  senpai. Fork never changes who plays or what type the seat is; that is
+  senpai. Fork never changes who plays the context; that is
   what `--compact`, `--include`, `--exclude`, and `--preset` are for:
   rotation, KV reuse, a windowed continuation.
 - **`kj context create` begins a new performance.** It takes the
-  character that performs, then `--name`, `--type`, `--cwd`, `--env`,
-  `--parent` and `--senpai`, and carries no history. The label defaults to
-  the character's name (`<name>-2` when a live context holds it), and the
-  type to the character's own. Without `--cwd` it starts in the current context's cwd,
+  character that performs, then `--name`, `--cwd`, `--env`, `--parent` and
+  `--senpai`, and carries no history. The label defaults to the character's
+  name (`<name>-2` when a live context holds it). The context runs the
+  character's rc directory and model; there is no `--type`. Without `--cwd` it starts in the current context's cwd,
   as fork does; a current cwd that no longer resolves refuses the create and
   names `--cwd`. A lane gets its brief from the prompt it is driven with. This
   is how a director makes a coder: `kj context create coder --name <label>`.

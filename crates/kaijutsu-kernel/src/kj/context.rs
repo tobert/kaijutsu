@@ -38,10 +38,6 @@ pub(crate) struct ContextConfigArgs {
     /// Set an env var as KEY=VALUE. Repeat the flag for more than one
     #[arg(long)]
     env: Vec<String>,
-    /// Context type selecting the /config/rc lifecycle bundle. `create`
-    /// defaults to the character's type and refuses when it has none
-    #[arg(long = "type")]
-    type_: Option<String>,
 }
 
 impl From<ContextConfigArgs> for ContextConfig {
@@ -50,7 +46,6 @@ impl From<ContextConfigArgs> for ContextConfig {
             system_prompt: a.system_prompt,
             cwd_spec: a.cwd,
             env_spec: a.env,
-            type_spec: a.type_,
             egress: None,
         }
     }
@@ -60,11 +55,11 @@ impl From<ContextConfigArgs> for ContextConfig {
 enum ContextCommand {
     /// Make a new context performed by a character, that answers to this
     /// context: `kj context create coder`. The label is the character's name,
-    /// or `<name>-2`, `-3` and so on when a live context holds it; the type is
-    /// the character's own. The new context runs the character's model,
-    /// copied now under `model`; the output says when the character has
-    /// none. Needs the operator capability and a live character
-    /// caller.
+    /// or `<name>-2`, `-3` and so on when a live context holds it. The new
+    /// context runs the character's rc directory and its model, copied now
+    /// under `model`; the output says when the character has none. A
+    /// person's context runs no model. Needs the operator capability and a
+    /// live character caller.
     #[command(alias = "new")]
     Create {
         /// The live character that performs the new context. Its senpai's
@@ -184,7 +179,7 @@ enum ContextCommand {
         #[arg(
             long,
             value_name = "CONTEXT",
-            conflicts_with_all = ["egress_allow", "egress_deny", "system_prompt", "cwd", "env", "type_"]
+            conflicts_with_all = ["egress_allow", "egress_deny", "system_prompt", "cwd", "env"]
         )]
         senpai: Option<String>,
         #[command(flatten)]
@@ -250,9 +245,6 @@ enum ContextCommand {
         /// each through its own `archive` lifecycle.
         #[arg(long)]
         children: bool,
-        /// With `--children`, archive only children of this context type.
-        #[arg(long = "type", value_name = "TYPE", requires = "children")]
-        context_type: Option<String>,
         /// With `--children`, archive only children this character performs,
         /// such as `"$KJ_CHARACTER"` in an rc script.
         #[arg(long, value_name = "CHARACTER", requires = "children")]
@@ -338,16 +330,14 @@ enum ContextCommand {
 /// Settable context configuration shared by `create` and `set`.
 ///
 /// These are the knobs that can be applied to an existing context row:
-/// system prompt, working directory, an env var, and the rc-dispatch
-/// `context_type`. `create` reuses the same surface so a context can be born
-/// fully configured (fork-parity) instead of needing a follow-up
-/// `kj context set`.
+/// system prompt, working directory, and an env var. `create` reuses the
+/// same surface so a context can be born fully configured (fork-parity)
+/// instead of needing a follow-up `kj context set`.
 #[derive(Default)]
 struct ContextConfig {
     system_prompt: Option<String>,
     cwd_spec: Option<String>,
     env_spec: Vec<String>,
-    type_spec: Option<String>,
     egress: Option<EgressAssignment>,
 }
 
@@ -485,9 +475,9 @@ fn context_bindings<'a>(
 
 impl KjDispatcher {
     /// Validate user-supplied config BEFORE any mutation: the `--env
-    /// KEY=VALUE` shape, a context type that is not a reserved slot role, and
-    /// a `--cwd` the shell enters. No writes, so callers can bail out cleanly
-    /// without leaving a half-configured (or orphan) context behind.
+    /// KEY=VALUE` shape and a `--cwd` the shell enters. No writes, so callers
+    /// can bail out cleanly without leaving a half-configured (or orphan)
+    /// context behind.
     async fn resolve_context_config(
         &self,
         cfg: &ContextConfig,
@@ -496,10 +486,6 @@ impl KjDispatcher {
     ) -> Result<(), String> {
         if let Some(env) = cfg.env_spec.iter().find(|e| !e.contains('=')) {
             return Err(format!("--env requires KEY=VALUE format, got '{env}'"));
-        }
-
-        if let Some(context_type) = &cfg.type_spec {
-            crate::model_resolution::refuse_reserved_role(context_type)?;
         }
 
         if let Some(cwd) = &cfg.cwd_spec {
@@ -568,11 +554,6 @@ impl KjDispatcher {
                         db.set_context_env(target_id, key, value)?;
                         changes.push(format!("env {key}={value}"));
                     }
-                }
-
-                if let Some(ref t) = cfg.type_spec {
-                    db.update_context_type(target_id, t)?;
-                    changes.push(format!("type={t}"));
                 }
 
                 if let Some(egress) = &cfg.egress {
@@ -694,8 +675,8 @@ impl KjDispatcher {
                     "kj context archive: name the context to archive, or pass --children".to_string(),
                 ),
             },
-            ContextCommand::Archive { context, children: true, context_type, performer } => {
-                Box::pin(self.context_archive_children(context.as_deref(), context_type.as_deref(), performer.as_deref(), caller)).await
+            ContextCommand::Archive { context, children: true, performer } => {
+                Box::pin(self.context_archive_children(context.as_deref(), performer.as_deref(), caller)).await
             }
             ContextCommand::Create { character, name, parent, senpai, cwd_optional, config } => {
                 Box::pin(self.context_create(
@@ -1484,11 +1465,10 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         }
 
-        // The performer, its label, its type and the rc directory it runs
-        // are fixed before any mutation: `--name`, else the character's name
-        // (suffixed while a live context holds it), `--type`, else the
-        // character's type, and the character's `rc_dir`.
-        let (performer, label, context_type, rc_dir) = {
+        // The performer, its label and the rc directory it runs are fixed
+        // before any mutation: `--name`, else the character's name (suffixed
+        // while a live context holds it), and the character's `rc_dir`.
+        let (performer, label, rc_dir) = {
             let db = self.kernel_db().lock();
             let sheet = match db.get_character_by_name(character) {
                 Ok(Some(row)) if row.retired_at.is_some() => return KjResult::Err(format!(
@@ -1509,21 +1489,11 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj context create: {e}")),
                 },
             };
-            let context_type = match cfg.type_spec.take().or(sheet.context_type.clone()) {
-                Some(context_type) => context_type,
-                None if sheet.root => return KjResult::Err(format!(
-                    "kj context create: {character} is a root and has no context type; name one with --type <type>"
-                )),
-                None => return KjResult::Err(format!(
-                    "kj context create: {character} has no context type; name one with --type <type>, \
-                     or run `kj character set {character} --type <type>`"
-                )),
-            };
             let rc_dir = match crate::rc::performer_rc_dir(&sheet) {
                 Ok(dir) => dir,
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             };
-            (sheet.principal_id, label, context_type, rc_dir)
+            (sheet.principal_id, label, rc_dir)
         };
         let default_label_of = (!label_named).then(|| character.to_string());
         let mut label = label;
@@ -1589,16 +1559,9 @@ impl KjDispatcher {
             context
         };
 
-        // The type lands on the row up front; the gate, slots and clients read
-        // it. The rc lifecycle runs the performer's directory,
+        // The rc lifecycle runs the performer's directory,
         // /config/rc/<rc_dir>/<verb>/. The rest of the config is applied
         // after the context exists.
-
-        // Refuse an unlisted type before any mutation, so a typo'd --type
-        // never lands on a row.
-        if let Err(e) = super::rc::check_context_type(self.kernel().vfs(), &context_type).await {
-            return KjResult::Err(format!("kj context create: {e}"));
-        }
 
         // Refuse a performer whose rc directory's `create` bucket is missing
         // or holds no candidate script, also before any mutation.
@@ -1631,10 +1594,9 @@ impl KjDispatcher {
 
         // The beat is no longer a Rust special-case here: arming a musician is an
         // rc step (`musician/create/S20-arm.kai` runs `kj transport arm`), so a
-        // context is a beat participant exactly when its directory's `create/` rc arms it
-        // — no `context_type == "musician"` branch, and new beat-bearing roles
-        // (funkMusician, …) need no kernel edit. `docs/chameleon.md`,
-        // "context_type is an rc bundle of features".
+        // context is a beat participant exactly when its directory's `create/`
+        // rc arms it, and new beat-bearing roles (funkMusician, …) need no
+        // kernel edit.
 
         // `--cwd-optional` drops a `--cwd` the kernel cannot use, and the
         // create continues as if it had not been given.
@@ -1702,7 +1664,9 @@ impl KjDispatcher {
                 label: Some(label.clone()),
                 system_prompt: None,
                 context_state: ContextState::Live,
-                context_type,
+                // The type column holds the performer's rc directory; no
+                // decision reads it.
+                context_type: rc_dir.clone(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: parent_id,
@@ -2074,7 +2038,7 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj context set <ctx> [--system-prompt text] [--cwd path] [--env KEY=VALUE] [--type t]`
+    /// `kj context set <ctx> [--system-prompt text] [--cwd path] [--env KEY=VALUE]`
     async fn context_set(
         &self,
         target_arg: Option<&str>,
@@ -2325,23 +2289,30 @@ impl KjDispatcher {
             };
             (target_id, label)
         };
-        match self.kernel_db().lock().is_root_console(target_id) {
-            Ok(false) => {}
-            Ok(true) => return KjResult::Err(format!(
-                "kj context archive: {target_label} is a root console, and archiving it would leave its \
-                 character with none; `kj context rotate {target_label}` replaces it"
-            )),
-            Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+        if let Err(why) = self.archive_refusal(target_id, &target_label) {
+            return KjResult::Err(format!("kj context archive: {why}"));
         }
-        // Only the person whose console it is archives the console, and the
+        let person = match self.caller_is_live_root(caller) {
+            Ok(person) => person,
+            Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+        };
+        // Only the person whose console it is archives the console, while
+        // that person is a live root; after that, any live person may. The
         // archive clears the pointer.
         let owner = {
             let db = self.kernel_db().lock();
-            db.console_owner(target_id).map(|owner| owner.map(|owner| (owner, db.name_for(owner))))
+            (|| -> KernelDbResult<Option<(PrincipalId, String, bool)>> {
+                let Some(owner) = db.console_owner(target_id)? else { return Ok(None) };
+                Ok(Some((owner, db.name_for(owner), db.is_live_person(owner)?)))
+            })()
         };
         match owner {
-            Ok(Some((owner, name))) if owner != caller.actor_id => return KjResult::Err(format!(
+            Ok(Some((owner, name, true))) if owner != caller.actor_id => return KjResult::Err(format!(
                 "kj context archive: refused — {target_label} is {name}'s console, and only {name} may archive it"
+            )),
+            Ok(Some((_, name, false))) if !person => return KjResult::Err(format!(
+                "kj context archive: refused — {target_label} is the console of {name}, who is not a live root, \
+                 and only a live person may archive it"
             )),
             Ok(_) => {}
             Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
@@ -2355,6 +2326,16 @@ impl KjDispatcher {
             self.require_lifecycle_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive)
         } else {
             self.require_authority(target_id, caller, crate::kernel_db::GovernedAct::Archive).map(|_| ())
+        };
+        // A lineage whose root is retired has nobody above it to archive
+        // it, so any live person may.
+        let authority = match authority {
+            Err(refusal) if person && !in_rc_lifecycle => match self.kernel_db().lock().lineage_root(target_id) {
+                Err(crate::kernel_db::KernelDbError::Validation(_)) => Ok(()),
+                Ok(_) => Err(refusal),
+                Err(e) => Err(format!("could not read the lineage root of {target_label}: {e}")),
+            },
+            other => other,
         };
         if let Err(refusal) = authority {
             return KjResult::Err(format!("kj context archive: {refusal}"));
@@ -2396,6 +2377,29 @@ impl KjDispatcher {
         KjResult::ok(msg)
     }
 
+    /// Why `target` may not be archived by any verb, whoever asks: a root
+    /// console (its character would have none), and an MCP hub that live
+    /// sessions have as their parent. `kj context archive` and the demote
+    /// ladder's archive step both check it before they run anything.
+    fn archive_refusal(&self, target: ContextId, label: &str) -> Result<(), String> {
+        let db = self.kernel_db().lock();
+        if db.is_root_console(target).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "{label} is a root console, and archiving it would leave its character with none; \
+                 `kj context rotate {label}` replaces it"
+            ));
+        }
+        let sessions = db.live_mcp_sessions(target).map_err(|e| e.to_string())?;
+        if !sessions.is_empty() {
+            let names = sessions.iter().map(|id| db.context_name(*id)).collect::<Vec<_>>().join(", ");
+            return Err(format!(
+                "{label} is an MCP hub, and its live sessions {names} have it as their parent; \
+                 end them first (`kj context archive <session> --confirm`)"
+            ));
+        }
+        Ok(())
+    }
+
     /// Run `target`'s `archive` rc lifecycle while it is still live. An
     /// already archived context admits no work and runs nothing. Script
     /// failures are recorded by the lifecycle and are not errors here;
@@ -2417,14 +2421,13 @@ impl KjDispatcher {
         lifecycle.map_err(|e| format!("its archive lifecycle could not settle: {e}"))
     }
 
-    /// `kj context archive --children [<parent>] [--type <type>] [--performer
-    /// <character>]`: archive each live child of the parent (a context forked
-    /// from it), optionally only those of one type or one performer, each
-    /// through [`Self::context_archive`].
+    /// `kj context archive --children [<parent>] [--performer <character>]`:
+    /// archive each live child of the parent (a context forked from it),
+    /// optionally only those one character performs, each through
+    /// [`Self::context_archive`].
     async fn context_archive_children(
         &self,
         parent_ref: Option<&str>,
-        context_type: Option<&str>,
         performer: Option<&str>,
         caller: &KjCaller,
     ) -> KjResult {
@@ -2448,9 +2451,7 @@ impl KjDispatcher {
             }
         };
         let mut archived = Vec::new();
-        for child in children.into_iter().filter(|c| {
-            context_type.is_none_or(|t| c.context_type == t) && performer.is_none_or(|p| c.performer == Some(p))
-        }) {
+        for child in children.into_iter().filter(|c| performer.is_none_or(|p| c.performer == Some(p))) {
             let result = Box::pin(self.context_archive(&child.context_id.to_hex(), caller)).await;
             if !result.is_ok() {
                 return result;
@@ -2770,7 +2771,8 @@ impl KjDispatcher {
     /// - A person may act on any context, except that nobody concludes a
     ///   root console (`characters.root_ctx`), and only the person whose
     ///   console it is (`characters.console_ctx`) concludes or demotes the
-    ///   console.
+    ///   console while that person is a live root; after that, any person
+    ///   may.
     /// - A caller in the console may act on any context, but may not demote
     ///   or conclude a root console or the console.
     /// - Any other seat may act on any context that is not a root console,
@@ -2779,10 +2781,13 @@ impl KjDispatcher {
     fn require_placement_authority(&self, verb: &str, target_id: ContextId, caller: &KjCaller) -> Result<(), KjResult> {
         let (row, target_is_root, console_owner, in_console) = {
             let db = self.kernel_db().lock();
-            let read = || -> KernelDbResult<Option<(ContextRow, bool, Option<(PrincipalId, String)>, bool)>> {
+            let read = || -> KernelDbResult<Option<(ContextRow, bool, Option<(PrincipalId, String, bool)>, bool)>> {
                 let Some(row) = db.get_context(target_id)? else { return Ok(None) };
                 let target_is_root = db.is_root_console(target_id)?;
-                let owner = db.console_owner(target_id)?.map(|owner| (owner, db.name_for(owner)));
+                let owner = match db.console_owner(target_id)? {
+                    Some(owner) => Some((owner, db.name_for(owner), db.is_live_person(owner)?)),
+                    None => None,
+                };
                 let in_console = match caller.context_id {
                     Some(context) => db.is_console(context)?,
                     None => false,
@@ -2804,7 +2809,7 @@ impl KjDispatcher {
         let what = if target_is_root {
             Some(format!("{name} is a root console"))
         } else {
-            console_owner.as_ref().map(|(_, owner)| format!("{name} is {owner}'s console"))
+            console_owner.as_ref().map(|(_, owner, _)| format!("{name} is {owner}'s console"))
         };
 
         if !human && !in_console {
@@ -2834,10 +2839,16 @@ impl KjDispatcher {
             ));
         }
         if verb != "promote" {
-            if let Some((owner, owner_name)) = &console_owner
-                && caller.actor_id != *owner
-            {
-                return refuse(format!("{name} is {owner_name}'s console, and only {owner_name} may {verb} it"));
+            match &console_owner {
+                Some((owner, owner_name, true)) if caller.actor_id != *owner => {
+                    return refuse(format!("{name} is {owner_name}'s console, and only {owner_name} may {verb} it"));
+                }
+                Some((_, owner_name, false)) if !human => {
+                    return refuse(format!(
+                        "{name} is the console of {owner_name}, who is not a live root, and only a person may {verb} it"
+                    ));
+                }
+                _ => {}
             }
             if !human && target_is_root {
                 return refuse(format!("{name} is a root console, and only a person may {verb} it"));
@@ -2975,10 +2986,15 @@ impl KjDispatcher {
                 "kj context demote {ctx_ref} archives it, because it is already demoted; re-run with --confirm"
             ),
         };
-        let archiving = match self.kernel_db().lock().get_context(target_id) {
-            Ok(row) => archives(&row),
+        let (archiving, label) = match self.kernel_db().lock().get_context(target_id) {
+            Ok(row) => (archives(&row), row.and_then(|row| row.label).unwrap_or_else(|| target_id.short())),
             Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
         };
+        // That step refuses whatever `kj context archive` refuses for every
+        // caller, before it latches.
+        if archiving && let Err(why) = self.archive_refusal(target_id, &label) {
+            return KjResult::Err(format!("kj context demote: {why}"));
+        }
         if archiving {
             match self.kernel_db().lock().held_drift_refusal(target_id) {
                 Ok(None) => {}
@@ -4275,7 +4291,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let refused = d.dispatch(&[s("context"), s("create"), s("sovereign"), s("--name"), s("sovereign-lane"), s("--type"), s("default")], &banto_caller).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("sovereign"), s("--name"), s("sovereign-lane")], &banto_caller).await;
         assert!(refused.is_ok(), "a root can be assigned: {}", refused.message());
         let lane = d.kernel_db().lock().find_context_by_label("sovereign-lane").unwrap()
             .expect("the kohai exists");
@@ -4305,7 +4321,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        let created = d.dispatch(&[s("context"), s("create"), s("owner"), s("--name"), s("owner-lane"), s("--type"), s("default")], &caller).await;
+        let created = d.dispatch(&[s("context"), s("create"), s("owner"), s("--name"), s("owner-lane")], &caller).await;
         assert!(created.is_ok(), "a person performs a context under their root console: {}", created.message());
         let lane = d.kernel_db().lock().find_context_by_label("owner-lane").unwrap().expect("the context exists");
         assert_eq!(d.kernel_db().lock().context_character(lane.context_id).unwrap().unwrap().principal_id, amy);
@@ -4332,12 +4348,11 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
         let created = d.dispatch(
-            &[s("context"), s("create"), s("owner"), s("--name"), s("owner-root-shell"), s("--type"), s(kaijutsu_types::SHELL_CONTEXT_TYPE)],
+            &[s("context"), s("create"), s("owner"), s("--name"), s("owner-root-shell")],
             &caller,
         ).await;
         assert!(created.is_ok(), "a root performs its own shell child: {}", created.message());
         let shell = d.kernel_db().lock().find_context_by_label("owner-root-shell").unwrap().expect("the shell exists");
-        assert_eq!(shell.context_type, kaijutsu_types::SHELL_CONTEXT_TYPE);
         assert_eq!(d.kernel_db().lock().context_character(shell.context_id).unwrap().unwrap().principal_id, amy);
         // The shell child runs the person's own directory, and so carries
         // the person's whole loadout, the shell facades among it.
@@ -4362,9 +4377,9 @@ mod tests {
         assert!(help.contains("Usage: create [OPTIONS] <CHARACTER>"), "{help}");
         assert!(!help.contains("--as"), "{help}");
         assert!(help.contains("Its senpai's character reviews its asks"), "{help}");
-        assert!(help.contains("--name <NAME>") && help.contains("--type <TYPE>"), "{help}");
+        assert!(help.contains("--name <NAME>") && !help.contains("--type"), "{help}");
         assert!(help.contains("Default: the character's name"), "{help}");
-        assert!(help.contains("defaults to the character's type"), "{help}");
+        assert!(help.contains("runs the character's rc directory"), "{help}");
         assert!(help.contains("--senpai <SENPAI>") && help.contains("--parent <PARENT>"), "{help}");
         assert!(!help.contains("--top"), "{help}");
     }
@@ -4992,7 +5007,7 @@ mod tests {
             std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
         ).await.unwrap();
         let result = shell.execute_with_options(
-            "kj context create banto --name operator --type director --env 'KJ_CHARACTER=obsolete-name'",
+            "kj context create banto --name operator --env 'KJ_CHARACTER=obsolete-name'",
             kaish_kernel::ExecuteOptions::default(),
         ).await.unwrap();
         assert!(result.ok(), "{result:?}");
@@ -5063,7 +5078,7 @@ mod tests {
             let note = d.dispatch(&[s("handoff"), s("note"), s("--for"), s(name), s("name-specific-history")], &caller).await;
             assert!(note.is_ok(), "{}", note.message());
             let label = format!("named-{index}");
-            let create = d.dispatch(&[s("context"), s("create"), s(name), s("--name"), s(&label), s("--type"), s("director")], &caller).await;
+            let create = d.dispatch(&[s("context"), s("create"), s(name), s("--name"), s(&label)], &caller).await;
             assert!(create.is_ok(), "{}", create.message());
             let id = d.kernel_db().lock().resolve_context(&label).unwrap();
             let blocks = d.block_store().block_snapshots(id).unwrap();
@@ -5117,7 +5132,7 @@ mod tests {
             }, ws).unwrap();
         }
         let caller = caller_with_context(bare).with_actor(amy, None);
-        let refused = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("assign-lane"), s("--parent"), s("assign-parent"), s("--type"), s("default")], &caller).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("assign-lane"), s("--parent"), s("assign-parent")], &caller).await;
         assert!(!refused.is_ok(), "{}", refused.message());
         assert!(refused.message().contains("operator"), "{}", refused.message());
         assert!(d.kernel_db().lock().resolve_context("assign-lane").is_err(), "a refusal creates nothing");
@@ -5143,18 +5158,18 @@ mod tests {
         d.kernel_db().lock().update_performer(parent, Some(amy)).unwrap();
         let mut caller = test_caller();
         caller.context_id = Some(parent);
-        let characterless = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("ghost-lane"), s("--type"), s("default")], &caller).await;
+        let characterless = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("ghost-lane")], &caller).await;
         assert!(!characterless.is_ok(), "{}", characterless.message());
         assert!(characterless.message().contains("character sheet"), "{}", characterless.message());
 
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: ghost, name: s("ghost"), created_at: 1, retired_at: Some(2), handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        let retired = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("ghost-lane"), s("--type"), s("default")], &caller.clone().with_actor(ghost, None)).await;
+        let retired = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("ghost-lane")], &caller.clone().with_actor(ghost, None)).await;
         assert!(!retired.is_ok() && retired.message().contains("retired"), "{}", retired.message());
         assert!(d.kernel_db().lock().resolve_context("ghost-lane").is_err(), "a refusal creates nothing");
 
-        let assigned = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("amy-lane"), s("--type"), s("default")], &caller.with_actor(amy, None)).await;
+        let assigned = d.dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("amy-lane")], &caller.with_actor(amy, None)).await;
         assert!(assigned.is_ok(), "a live character directs what it assigns: {}", assigned.message());
     }
 
@@ -5357,14 +5372,14 @@ mod tests {
         d.kernel_db().lock().update_performer(seat, Some(owner)).unwrap();
         d.kernel_db().lock().set_context_senpai(seat, Some(root)).unwrap();
         let visiting = crate::kj::KjCaller { principal_id: visitor, actor_id: visitor, context_id: Some(seat), privileged: true, ..test_caller() };
-        let refused = d.dispatch(&[s("context"), s("create"), s("performer-x"), s("--name"), s("visited"), s("--type"), s("default")], &visiting).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s("performer-x"), s("--name"), s("visited")], &visiting).await;
         assert!(!refused.is_ok(), "a visitor placed a kohai under the owner's context");
         assert!(d.kernel_db().lock().find_context_by_label("visited").unwrap().is_none(), "nothing was written");
     }
 
     /// A fixture for the character-positional create: a caller in a context
-    /// with a character, and live characters `typed` (type `coder`) and
-    /// `untyped` (no type), both ready to be created.
+    /// with a character, and live characters `typed` (a stored type `coder`
+    /// that nothing reads) and `untyped` (none), both running `default/`.
     async fn create_fixture() -> (std::sync::Arc<crate::kj::KjDispatcher>, crate::kj::KjCaller) {
         let d = std::sync::Arc::new(test_dispatcher().await);
         let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
@@ -5389,17 +5404,19 @@ mod tests {
         message[start..].split('\'').next().unwrap().to_string()
     }
 
-    /// The character's type and name fill in the type and label.
+    /// The character's name fills in the label, and the row's type column is
+    /// stamped with the character's rc directory, never the character's
+    /// stored type.
     ///
-    /// Falsified by defaulting the type to `default` or the label to the
-    /// parent's.
+    /// Falsified by stamping the character's stored type or the label from
+    /// the parent's.
     #[tokio::test]
-    async fn context_create_takes_the_characters_type_and_label() {
+    async fn context_create_takes_the_characters_label_and_stamps_its_rc_dir() {
         let (d, c) = create_fixture().await;
         let result = d.dispatch(&[s("context"), s("create"), s("typed")], &c).await;
         assert_eq!(created_label(&result), "typed");
         let row = d.kernel_db().lock().find_context_by_label("typed").unwrap().unwrap();
-        assert_eq!(row.context_type, "coder");
+        assert_eq!(row.context_type, "default", "the stamp is the performer's rc directory");
         let performer = d.kernel_db().lock().get_character_by_name("typed").unwrap().unwrap().principal_id;
         assert_eq!(d.kernel_db().lock().context_character(row.context_id).unwrap().unwrap().principal_id, performer);
     }
@@ -5447,15 +5464,32 @@ mod tests {
         assert_eq!(created_label(&created), "typed");
     }
 
-    /// `--name` and `--type` win over the character's name and type.
+    /// `--name` wins over the character's name.
     #[tokio::test]
-    async fn context_create_name_and_type_win_over_the_character() {
+    async fn context_create_name_wins_over_the_character() {
         let (d, c) = create_fixture().await;
-        let result = d.dispatch(&[s("context"), s("create"), s("typed"), s("--name"), s("other"), s("--type"), s("default")], &c).await;
+        let result = d.dispatch(&[s("context"), s("create"), s("typed"), s("--name"), s("other")], &c).await;
         assert_eq!(created_label(&result), "other");
-        let row = d.kernel_db().lock().find_context_by_label("other").unwrap().unwrap();
-        assert_eq!(row.context_type, "default");
         assert!(d.kernel_db().lock().find_context_by_label("typed").unwrap().is_none());
+    }
+
+    /// A context has no type to choose: `--type` on `create`, `set` and
+    /// `archive --children` is an unknown argument, and nothing changes.
+    ///
+    /// Falsified by keeping any of the three flags.
+    #[tokio::test]
+    async fn context_verbs_take_no_type_flag() {
+        let (d, c) = create_fixture().await;
+        for argv in [
+            vec!["context", "create", "typed", "--name", "other", "--type", "default"],
+            vec!["context", "set", ".", "--type", "default"],
+            vec!["context", "archive", "--children", "--type", "default"],
+        ] {
+            let result = d.dispatch(&argv.iter().map(|a| s(a)).collect::<Vec<_>>(), &c).await;
+            let KjResult::Err(message) = result else { panic!("{argv:?}: expected a refusal, got {result:?}") };
+            assert!(message.contains("--type"), "{argv:?}: {message}");
+        }
+        assert!(d.kernel_db().lock().find_context_by_label("other").unwrap().is_none(), "nothing was created");
     }
 
     /// A `--name` a live context holds refuses; it does not suffix.
@@ -5469,34 +5503,23 @@ mod tests {
         assert!(d.kernel_db().lock().find_context_by_label("lane-2").unwrap().is_none(), "--name never suffixes");
     }
 
-    /// A character with no type and no `--type` refuses, naming the fix;
-    /// nothing is created.
+    /// A character with no stored type creates, and so does a person: the
+    /// performer's rc directory is all a create needs.
     ///
-    /// Falsified by letting `default` stand in for the missing type.
+    /// Falsified by refusing a create for want of a type.
     #[tokio::test]
-    async fn context_create_with_no_type_anywhere_names_the_fix() {
+    async fn context_create_needs_no_type_for_a_character_or_a_person() {
         let (d, c) = create_fixture().await;
-        let result = d.dispatch(&[s("context"), s("create"), s("untyped")], &c).await;
-        let KjResult::Err(message) = result else { panic!("expected a refusal, got {result:?}") };
-        assert!(message.contains("kj character set untyped --type"), "{message}");
-        assert!(d.kernel_db().lock().find_context_by_label("untyped").unwrap().is_none(), "nothing was created");
-        // `--type` alone is enough.
-        let typed = d.dispatch(&[s("context"), s("create"), s("untyped"), s("--type"), s("default")], &c).await;
-        assert_eq!(created_label(&typed), "untyped");
-    }
-
-    /// A root has no type to set, so its refusal names only `--type`.
-    #[tokio::test]
-    async fn context_create_of_a_root_with_no_type_names_only_the_flag() {
-        let (d, c) = create_fixture().await;
+        let untyped = d.dispatch(&[s("context"), s("create"), s("untyped")], &c).await;
+        assert_eq!(created_label(&untyped), "untyped");
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: PrincipalId::new(), name: s("boss"), created_at: 1, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: true, context_type: None,
         }).unwrap();
-        let result = d.dispatch(&[s("context"), s("create"), s("boss")], &c).await;
-        let KjResult::Err(message) = result else { panic!("expected a refusal, got {result:?}") };
-        assert!(message.contains("is a root") && message.contains("--type"), "{message}");
-        assert!(!message.contains("kj character set"), "a root cannot take a type: {message}");
+        let person = d.dispatch(&[s("context"), s("create"), s("boss")], &c).await;
+        assert_eq!(created_label(&person), "boss");
+        let row = d.kernel_db().lock().find_context_by_label("boss").unwrap().unwrap();
+        assert_eq!(row.context_type, "root", "a person's context is stamped with the person's rc directory");
     }
 
     /// `--as` is gone; the character is the positional.
@@ -5516,40 +5539,6 @@ mod tests {
         let result = d.dispatch(&[s("context"), s("create"), s("--name"), s("lane")], &c).await;
         let KjResult::Err(message) = result else { panic!("expected a refusal, got {result:?}") };
         assert!(message.to_uppercase().contains("CHARACTER") && message.contains("required"), "{message}");
-    }
-
-    /// `--type` with no matching rc bucket is refused before any row lands
-    /// — `test_dispatcher()`'s rc tree is the full embedded seed, so
-    /// "codr" (a typo of "coder") has no bucket to run.
-    #[tokio::test]
-    async fn context_create_refuses_an_unknown_type() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-
-        let c = caller_with_context(parent);
-
-        crate::kj::test_helpers::give_character(&d, &c);
-        let result = d
-            .dispatch(
-                &[s("context"), s("create"), s("kohai-tester"), s("--name"), s("x"), s("--type"), s("codr")],
-                &c,
-            )
-            .await;
-        assert!(!result.is_ok(), "expected error, got: {}", result.message());
-        assert!(
-            result.message().contains("codr"),
-            "error should name the rejected type: {}",
-            result.message()
-        );
-
-        // No orphan row left behind.
-        let db = d.kernel_db().lock();
-        let contexts = db.list_active_contexts().unwrap();
-        assert!(
-            !contexts.iter().any(|r| r.label.as_deref() == Some("x")),
-            "a refused create must not leave a row"
-        );
     }
 
     /// A performer that names no rc directory refuses the create before any
@@ -5577,11 +5566,10 @@ mod tests {
     }
 
     /// The pre-commit create-bucket check reads the performer's rc
-    /// directory, not `--type`: a directory with no create script refuses,
-    /// naming it, even when the type has one; a directory that has one
-    /// creates a context of a type whose bucket is empty.
+    /// directory: a directory with no create script refuses, naming it; a
+    /// directory that has one creates, and its create lifecycle runs.
     ///
-    /// Falsified by a check that reads the type.
+    /// Falsified by a check that skips the directory.
     #[tokio::test]
     async fn context_create_checks_the_performers_create_bucket() {
         let d = std::sync::Arc::new(test_dispatcher().await);
@@ -5594,7 +5582,7 @@ mod tests {
         let hollow = crate::kj::test_helpers::rc_dir_performer(&d.kernel_db().lock(), "hollow");
         let filled = crate::kj::test_helpers::rc_dir_performer(&d.kernel_db().lock(), "filled");
 
-        let refused = d.dispatch(&[s("context"), s("create"), s(&hollow), s("--name"), s("h"), s("--type"), s("default")], &c).await;
+        let refused = d.dispatch(&[s("context"), s("create"), s(&hollow), s("--name"), s("h")], &c).await;
         assert!(!refused.is_ok(), "expected error, got: {}", refused.message());
         assert!(refused.message().contains("/config/rc/hollow/create"), "{}", refused.message());
         assert!(
@@ -5602,41 +5590,12 @@ mod tests {
             "a refused create must not leave a row"
         );
 
-        let made = d.dispatch(&[s("context"), s("create"), s(&filled), s("--name"), s("f"), s("--type"), s("hollow")], &c).await;
+        let made = d.dispatch(&[s("context"), s("create"), s(&filled), s("--name"), s("f")], &c).await;
         assert!(made.is_ok(), "{}", made.message());
         let ctx = d.kernel_db().lock().find_context_by_label("f").unwrap().unwrap();
-        assert_eq!(ctx.context_type, "hollow", "--type still writes the context's type");
+        assert_eq!(ctx.context_type, "filled", "the row is stamped with the performer's rc directory");
         let ran = d.block_store().block_snapshots(ctx.context_id).unwrap().iter().any(|b| b.content.contains("filled-ran"));
         assert!(ran, "the performer's create lifecycle ran");
-    }
-
-    /// `gate` is a slot role, not a context type: creating or setting a
-    /// context of that type is refused with a message that says so, and no
-    /// row changes.
-    ///
-    /// Falsified by accepting `gate` as an ordinary type, or by refusing it
-    /// only as an unknown rc bucket.
-    #[tokio::test]
-    async fn context_create_and_set_refuse_the_reserved_gate_role() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let c = caller_with_context(parent);
-        crate::kj::test_helpers::give_character(&d, &c);
-
-        let created = d.dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("g"), s("--type"), s("gate")], &c).await;
-        assert!(!created.is_ok(), "expected error, got: {}", created.message());
-        assert!(created.message().contains("is a slot role, not a context type"), "{}", created.message());
-        assert!(
-            !d.kernel_db().lock().list_active_contexts().unwrap().iter().any(|r| r.label.as_deref() == Some("g")),
-            "a refused create must not leave a row"
-        );
-
-        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--type"), s("gate")], &c).await;
-        assert!(!set.is_ok(), "expected error, got: {}", set.message());
-        assert!(set.message().contains("is a slot role, not a context type"), "{}", set.message());
-        let row = d.kernel_db().lock().get_context(parent).unwrap().unwrap();
-        assert_ne!(row.context_type, "gate", "a refused set changes nothing");
     }
 
     #[tokio::test]
@@ -6523,6 +6482,138 @@ mod tests {
         }
         assert!(placement_row(&f, f.console).is_archived());
         assert_eq!(f.d.kernel_db().lock().get_character(f.amy).unwrap().unwrap().console_ctx, None, "the archive cleared the pointer");
+    }
+
+    /// The demote step that would archive a root console refuses as
+    /// `kj context archive` does, for the person whose root console it is
+    /// and for another person, with or without `--confirm`. Falsified by
+    /// dropping the root-console check from the demote's archive step.
+    #[tokio::test]
+    async fn the_demote_step_that_archives_refuses_a_root_console() {
+        let f = placement_fixture().await;
+        let amy = placement_caller(f.lane, f.amy);
+        let mut confirmed = amy.clone();
+        confirmed.confirmed = true;
+        for (target, id) in [("amy", f.root), ("bob", f.bob_root)] {
+            let demoted = f.d.dispatch(&[s("context"), s("demote"), s(target)], &amy).await;
+            assert!(demoted.is_ok() && demoted.message().contains("demoted"), "{}", demoted.message());
+            for caller in [&amy, &confirmed] {
+                let refused = f.d.dispatch(&[s("context"), s("demote"), s(target)], caller).await;
+                assert!(matches!(refused, KjResult::Err(_)), "demote must not archive root console {target}: {refused:?}");
+                assert!(
+                    refused.message().contains(&format!("{target} is a root console"))
+                        && refused.message().contains(&format!("kj context rotate {target}")),
+                    "the refusal is archive's: {}", refused.message()
+                );
+                assert!(!placement_row(&f, id).is_archived(), "{target} stays live");
+            }
+        }
+        let db = f.d.kernel_db().lock();
+        assert_eq!(db.get_character(f.amy).unwrap().unwrap().root_ctx, Some(f.root));
+        assert_eq!(db.get_character(f.bob).unwrap().unwrap().root_ctx, Some(f.bob_root));
+    }
+
+    /// Retiring a person clears every pointer on their sheet, so their
+    /// former console is an ordinary context in a lineage with no live
+    /// root, and another person archives it. Falsified by leaving
+    /// `console_ctx` set at retirement, or by holding the archive to the
+    /// retired lineage root.
+    #[tokio::test]
+    async fn another_person_archives_the_console_of_a_retired_person() {
+        let f = placement_fixture().await;
+        let hub = f.d.ensure_mcp_hub(f.amy).unwrap();
+        let mut retire = test_caller();
+        retire.confirmed = true;
+        let retired = f.d.dispatch(&[s("character"), s("retire"), s("placement-amy")], &retire).await;
+        assert!(retired.is_ok(), "{}", retired.message());
+        let sheet = f.d.kernel_db().lock().get_character(f.amy).unwrap().unwrap();
+        assert_eq!((sheet.console_ctx, sheet.mcp_hub_ctx, sheet.root_ctx), (None, None, None), "retirement clears the pointers");
+        assert!(!placement_row(&f, f.console).is_archived(), "banto performs the console, so retirement leaves it");
+        assert!(!placement_row(&f, hub).is_archived(), "the hub has no performer, so retirement leaves it");
+
+        let mut bob = placement_caller(f.bob_root, f.bob);
+        bob.confirmed = true;
+        let archived = f.d.dispatch(&[s("context"), s("archive"), s("console")], &bob).await;
+        assert!(archived.is_ok(), "another person archives the former console: {}", archived.message());
+        assert!(placement_row(&f, f.console).is_archived());
+    }
+
+    /// A console whose sheet names a person who is no longer a live root
+    /// (a pointer from before retirement cleared it) is no longer held to
+    /// that person: another live person demotes, concludes and archives it.
+    /// A model seat is still refused. Falsified by keeping the owner-only
+    /// rule for a retired owner.
+    #[tokio::test]
+    async fn a_console_whose_person_is_retired_is_placed_by_any_person() {
+        let f = placement_fixture().await;
+        {
+            let db = f.d.kernel_db().lock();
+            db.retire_character(f.amy, 2).unwrap();
+            db.set_character_console_ctx(f.amy, Some(f.console)).unwrap();
+        }
+        let banto = placement_caller(f.seat, f.banto);
+        let refused = f.d.dispatch(&[s("context"), s("demote"), s("console")], &banto).await;
+        assert!(!refused.is_ok(), "a model seat still may not demote the console: {}", refused.message());
+
+        let mut bob = placement_caller(f.bob_root, f.bob);
+        bob.confirmed = true;
+        for verb in ["demote", "conclude", "archive"] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s("console")], &bob).await;
+            assert!(result.is_ok(), "bob may {verb} a console whose person is retired: {}", result.message());
+        }
+        assert!(placement_row(&f, f.console).is_archived());
+    }
+
+    /// Two sheets that name one console are corruption: the placement and
+    /// archive checks refuse, naming both sheets, rather than pick one.
+    /// Falsified by `console_owner` picking a row.
+    #[tokio::test]
+    async fn a_console_two_sheets_name_refuses_naming_both() {
+        let f = placement_fixture().await;
+        f.d.kernel_db().lock().conn_for_test_mut().execute(
+            "UPDATE characters SET console_ctx = ?1 WHERE principal_id = ?2",
+            rusqlite::params![f.console.as_bytes().to_vec(), f.bob.as_bytes().to_vec()],
+        ).unwrap();
+        let mut amy = placement_caller(f.lane, f.amy);
+        amy.confirmed = true;
+        for verb in ["demote", "conclude", "archive"] {
+            let result = f.d.dispatch(&[s("context"), s(verb), s("console")], &amy).await;
+            assert!(!result.is_ok(), "two owners refuse {verb}: {}", result.message());
+            assert!(
+                result.message().contains("placement-amy") && result.message().contains("placement-bob"),
+                "the refusal names both sheets: {}", result.message()
+            );
+        }
+        assert!(placement_unchanged(&placement_row(&f, f.console)));
+    }
+
+    /// An MCP hub is not archived while live sessions have it as their
+    /// parent: the refusal names them. Once they end, the hub archives.
+    /// Falsified by archiving the hub with its sessions live.
+    #[tokio::test]
+    async fn an_mcp_hub_with_live_sessions_is_not_archived() {
+        let f = placement_fixture().await;
+        let hub = f.d.ensure_mcp_hub(f.amy).unwrap();
+        let session = register_context(&f.d, Some("mcp-session"), Some(hub), f.amy);
+        f.d.kernel_db().lock().update_performer(session, Some(f.coder)).unwrap();
+        let mut amy = placement_caller(f.root, f.amy);
+        amy.confirmed = true;
+        for verb in ["archive", "demote"] {
+            if verb == "demote" {
+                let demoted = f.d.dispatch(&[s("context"), s("demote"), s("mcp/placement-amy")], &amy).await;
+                assert!(demoted.is_ok(), "{}", demoted.message());
+            }
+            let refused = f.d.dispatch(&[s("context"), s(verb), s("mcp/placement-amy")], &amy).await;
+            assert!(matches!(refused, KjResult::Err(_)), "{verb} must not archive a hub with live sessions: {refused:?}");
+            assert!(refused.message().contains("mcp-session"), "the refusal names the session: {}", refused.message());
+            assert!(!placement_row(&f, hub).is_archived());
+        }
+
+        let ended = f.d.dispatch(&[s("context"), s("archive"), s("mcp-session")], &amy).await;
+        assert!(ended.is_ok(), "{}", ended.message());
+        let archived = f.d.dispatch(&[s("context"), s("archive"), s("mcp/placement-amy")], &amy).await;
+        assert!(archived.is_ok(), "a hub with no live session archives: {}", archived.message());
+        assert_eq!(f.d.kernel_db().lock().get_character(f.amy).unwrap().unwrap().mcp_hub_ctx, None);
     }
 
     /// The demote step that archives a context latches like
@@ -7706,7 +7797,7 @@ mod tests {
 
         // Another type runs the same model.
         let coder = d
-            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("coder-child"), s("--type"), s("coder")], &c)
+            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("coder-child")], &c)
             .await;
         assert!(coder.is_ok(), "create failed: {}", coder.message());
         assert!(!coder.message().contains("has no model"), "{}", coder.message());
@@ -7740,7 +7831,7 @@ mod tests {
         assert!(r.is_ok(), "{}", r.message());
 
         let create = d
-            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("modeled"), s("--type"), s("coder")], &c)
+            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("modeled")], &c)
             .await;
         assert!(create.is_ok(), "{}", create.message());
         assert!(!create.message().contains("has no model"), "{}", create.message());
@@ -7757,7 +7848,7 @@ mod tests {
         assert_eq!(model_of(modeled), "claude-opus-5", "a model edit moves no running context");
 
         let later = d
-            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("later"), s("--type"), s("coder")], &c)
+            .dispatch(&[s("context"), s("create"), s("kohai-tester"), s("--name"), s("later")], &c)
             .await;
         assert!(later.is_ok(), "{}", later.message());
         let later = d.kernel_db().lock().find_context_by_label("later").unwrap().unwrap().context_id;
@@ -7781,7 +7872,7 @@ mod tests {
         crate::kj::test_helpers::give_character(&d, &c);
         let performer = rc_performer(&d, "mcp");
         let create = d
-            .dispatch(&[s("context"), s("create"), s(&performer), s("--name"), s("session"), s("--type"), s("mcp")], &c)
+            .dispatch(&[s("context"), s("create"), s(&performer), s("--name"), s("session")], &c)
             .await;
         assert!(create.is_ok(), "{}", create.message());
         assert!(!create.message().contains("has no model"), "{}", create.message());
@@ -7794,7 +7885,7 @@ mod tests {
 
         let stray = d
             .dispatch(
-                &[s("context"), s("create"), s(&performer), s("--name"), s("stray"), s("--type"), s("mcp"), s("--parent"), elsewhere.to_hex()],
+                &[s("context"), s("create"), s(&performer), s("--name"), s("stray"), s("--parent"), elsewhere.to_hex()],
                 &c,
             )
             .await;
@@ -8050,7 +8141,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
         let created = d
-            .dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("bench"), s("--type"), s("coder")], &solo_call)
+            .dispatch(&[s("context"), s("create"), s("coder"), s("--name"), s("bench")], &solo_call)
             .await;
         assert!(created.is_ok(), "{}", created.message());
         let kid = d.kernel_db().lock().resolve_context("bench").expect("the coder context exists");
@@ -8161,7 +8252,7 @@ mod tests {
         // Musician type: arms, with a track derived from the label.
         let r = d
             .dispatch(
-                &[s("context"), s("create"), s(&rc_performer(&d, "musician")), s("--name"), s("bassline"), s("--type"), s("musician")],
+                &[s("context"), s("create"), s(&rc_performer(&d, "musician")), s("--name"), s("bassline")],
                 &c,
             )
             .await;
@@ -8245,7 +8336,7 @@ mod tests {
         }
         d.kernel_db().lock().update_performer(parent, Some(create_caller.actor_id)).unwrap();
         let create = d
-            .dispatch(&[s("context"), s("create"), s("banto"), s("--name"), s("banto-seat"), s("--type"), s("director")], &create_caller)
+            .dispatch(&[s("context"), s("create"), s("banto"), s("--name"), s("banto-seat")], &create_caller)
             .await;
         assert!(create.is_ok(), "create failed: {}", create.message());
         let ctx = d.kernel_db().lock().resolve_context("banto-seat").expect("banto-seat exists");
@@ -8305,7 +8396,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("context"), s("create"), s(&rc_performer(&d, "coder")), s("--name"), s("c1"), s("--type"), s("coder")],
+                &[s("context"), s("create"), s(&rc_performer(&d, "coder")), s("--name"), s("c1")],
                 &create_caller,
             )
             .await;
@@ -8352,7 +8443,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("context"), s("create"), s(&rc_performer(&d, "musician")), s("--name"), s("m1"), s("--type"), s("musician")],
+                &[s("context"), s("create"), s(&rc_performer(&d, "musician")), s("--name"), s("m1")],
                 &create_caller,
             )
             .await;
@@ -8397,7 +8488,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("context"), s("create"), s(&rc_performer(&d, "coder")), s("--name"), s("before"), s("--type"), s("coder")],
+                &[s("context"), s("create"), s(&rc_performer(&d, "coder")), s("--name"), s("before")],
                 &caller,
             )
             .await;
@@ -8439,7 +8530,7 @@ mod tests {
 
         let create = d
             .dispatch(
-                &[s("context"), s("create"), s(&rc_performer(&d, "coder")), s("--name"), s("after"), s("--type"), s("coder")],
+                &[s("context"), s("create"), s(&rc_performer(&d, "coder")), s("--name"), s("after")],
                 &caller,
             )
             .await;

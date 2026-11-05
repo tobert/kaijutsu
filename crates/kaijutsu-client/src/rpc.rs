@@ -397,9 +397,6 @@ pub struct ContextInfo {
     pub trace_id: [u8; 16],
     /// How this context was forked (e.g. "full", "filtered", "compact").
     pub fork_kind: Option<String>,
-    /// rc bucket / mode bundle that drives lifecycle-script dispatch (e.g.
-    /// "default", "coder"). Empty on the wire is normalized to "default".
-    pub context_type: String,
     /// Whether this context has been archived.
     pub archived: bool,
     /// Unix-millis of the explicit `conclude` act, or `None` if still open.
@@ -3441,13 +3438,6 @@ fn parse_context_info(
         ts => Some(ts),
     };
 
-    let context_type_str = reader.get_context_type()?.to_str().unwrap_or("");
-    let context_type = if context_type_str.is_empty() {
-        "default".to_string()
-    } else {
-        context_type_str.to_string()
-    };
-
     // Parse synthesis keywords
     let keywords = if reader.has_keywords() {
         reader
@@ -3549,7 +3539,7 @@ fn parse_context_info(
     };
 
     // Empty = uncast (Track D) — same "absence is the wire sentinel"
-    // convention as `context_type`/`track_id` above.
+    // convention as `track_id` above.
     // Empty = unknown (old client, no client to ask, or pre-migration row) —
     // the "absence is the wire sentinel" convention.
     let origin_host_str = reader.get_origin_host()?.to_str().unwrap_or("");
@@ -3609,7 +3599,6 @@ fn parse_context_info(
         created_at: reader.get_created_at(),
         trace_id,
         fork_kind,
-        context_type,
         archived,
         concluded_at,
         keywords,

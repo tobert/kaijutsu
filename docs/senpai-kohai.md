@@ -328,16 +328,16 @@ asks, and no model.
   nothing. It exists so `kj context list --tree` shows every session of that root in one place.
 - **Registration.** When the parent is a root console (none named and the kernel has one root, or an explicit
   parent that is a root console), the client runs, from the root console:
-  `kj context create <character> --name <label> --type mcp --parent mcp/<root name>`. The root console is the
-  session's senpai, so its asks go to the root character. The hub is its `forked_from` (`--parent` sets nothing
-  else, and takes a label with `/`). `<character>` is the connection's own character, or the one `--character`
-  (`KAIJUTSU_CHARACTER`) names for a root connection. A client that names a `--parent` (`KAIJUTSU_PARENT`) that is
-  not a root console creates under that context instead. A root console with no live hub refuses registration,
-  naming the hub. Other context types requested through `register_session` keep the gate's ask.
+  `kj context create <character> --name <label> --parent <hub id>`, where the hub is the `mcp_hub_ctx` the
+  person's sheet names (`kj character show <person>`). The root console is the session's senpai, so its asks go to
+  the root character. The hub is its `forked_from` (`--parent` sets nothing else). `<character>` is the
+  connection's own character, or the one `--character` (`KAIJUTSU_CHARACTER`) names for a root connection. A client
+  that names a `--parent` (`KAIJUTSU_PARENT`) that is not a root console creates under that context instead. A
+  root console whose sheet names no live hub refuses registration, naming the hub. `register_session` takes no
+  context type.
 - **No ask.** The gate's builtin layer allows `kj context create <character> --parent <hub>` when `--parent`
   resolves to the MCP hub of the caller's lineage root (`characters.mcp_hub_ctx`), the senpai the create sets
-  (`--senpai`, else the calling context) is that root's console, and every argument is a literal word; `--type`
-  plays no part. A create from a kohai of the root console takes the ordinary layers and asks. The decision reads `builtin allows kj context create under mcp/<root
+  (`--senpai`, else the calling context) is that root's console, and every argument is a literal word. A create from a kohai of the root console takes the ordinary layers and asks. The decision reads `builtin allows kj context create under mcp/<root
   name>, the MCP hub of its lineage root`. Creating a context runs no turn. A `gate.toml` ask or deny key on `kj
   context create`, in any of the caller's layers, still wins.
 - **No model.** The client brings its own model, so the session's character has none and the session gets no

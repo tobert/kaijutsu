@@ -1,7 +1,7 @@
 //! Slice 5: toolie/director role bundles seeded via rc.
 //!
 //! These exercise the full path the capability-policy work delivers:
-//! `kj context create --type toolie` runs the seeded rc `create` scripts,
+//! `kj context create toolie` runs the seeded rc `create` scripts,
 //! whose `S10-binding.kai` calls `kj binding allow …` to narrow the new
 //! context to a read-only allow-set — and that allow-set is then enforced at
 //! `call_tool`. Running the real kaish scripts is the point: a malformed
@@ -145,7 +145,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
             .unwrap();
         }
     }
-    let argv: Vec<String> = ["context", "create", performer.as_str(), "--name", label, "--type", context_type]
+    let argv: Vec<String> = ["context", "create", performer.as_str(), "--name", label]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -380,9 +380,8 @@ async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
 /// The model console is a `console` context under it, with the stance.
 ///
 /// A root context is minted at boot (`ensure_root_contexts`) or by `kj
-/// character create --root` — never by `kj context create --type root`,
-/// which would hang a "root"-typed context off another context as a plain
-/// child instead of minting the parentless console the type means. This
+/// character create --root` — never by `kj context create`, which makes a
+/// context that answers to another instead of the parentless console. This
 /// exercises the real path via `ensure_root`, the same `ensure_root_context`
 /// internals boot runs.
 #[test]

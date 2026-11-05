@@ -493,6 +493,31 @@ fn promoting_an_archived_context_with_no_senpai_refuses() {
     assert!(error.contains("has no senpai"), "{error}");
     assert!(db.get_context(bare.context_id).unwrap().unwrap().is_archived(), "it stays archived");
 
+    // An archived root console is no root console: archiving cleared its
+    // `root_ctx`, so it too has no senpai to come back under.
     db.archive_context(console).unwrap();
-    assert!(matches!(db.promote_context(console).unwrap(), PromoteOutcome::Resurrected { .. }));
+    let error = db.promote_context(console).unwrap_err().to_string();
+    assert!(error.contains("has no senpai"), "{error}");
+}
+
+/// Archiving a root console, by `archive_context` or by the demote
+/// ladder's last step, clears the `root_ctx` that names it in the same
+/// transaction, so no sheet names an archived root console. Falsified by
+/// dropping the clearing from `archive_one_context`.
+#[test]
+fn archiving_a_root_console_clears_its_root_ctx() {
+    let db = KernelDb::temporary().unwrap();
+    setup_test_db(&db);
+    let (amy, console) = db.seed_test_root_console().unwrap();
+    db.archive_context(console).unwrap();
+    assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, None, "archive clears root_ctx");
+    assert!(!db.is_root_console(console).unwrap());
+
+    let (bob, bob_console) = db.seed_test_root_console().unwrap();
+    assert_ne!(bob, amy, "a sheet with no root_ctx is not reused");
+    for _ in 0..2 {
+        db.demote_context(bob_console).unwrap();
+    }
+    assert!(db.get_context(bob_console).unwrap().unwrap().is_archived());
+    assert_eq!(db.get_character(bob).unwrap().unwrap().root_ctx, None, "the demote ladder clears root_ctx");
 }

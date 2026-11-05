@@ -19,7 +19,7 @@ async fn house_rules_block(label: &str, cwd: &Path) -> Option<BlockSnapshot> {
     let (kj, _) = client.bind_kernel().await.unwrap();
     let parent = choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap();
     let performer = common::rc_performer(&kj, "coder").await.unwrap();
-    let argv = context_create_argv(label, "coder", &performer, Some(cwd.to_str().unwrap()));
+    let argv = context_create_argv(label, &performer, Some(cwd.to_str().unwrap()));
     let result = kj.execute_kj_quiet(parent.context_id, &argv).await.unwrap();
     let coder = context_id_from_create_result(&result).expect("kj context create succeeds");
     kj.get_blocks(coder, &BlockQuery::All).await.unwrap()

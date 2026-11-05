@@ -93,8 +93,15 @@ impl Kernel {
         self.dir.path().join("root_key")
     }
 
-    /// Spawn `kaijutsu-acp` against this kernel and run `initialize`.
+    /// Spawn `kaijutsu-acp` against this kernel with `--character
+    /// PERFORMER` and run `initialize`.
     fn connect(&self) -> AcpClient {
+        self.connect_as(Some(PERFORMER))
+    }
+
+    /// [`Self::connect`] with `--character` set to `character`, or absent.
+    /// The bridge connects with the person's key.
+    fn connect_as(&self, character: Option<&str>) -> AcpClient {
         let home = self.dir.path().join("home");
         std::fs::create_dir_all(&home).expect("create the bridge's HOME");
         let mut command = Command::new(ACP_BIN);
@@ -103,7 +110,11 @@ impl Kernel {
             .arg(self.port.to_string())
             .arg("--key-file")
             .arg(self.key_path())
-            .args(["--insecure", "--character", PERFORMER, "--user", ROOT])
+            .args(["--insecure", "--user", ROOT]);
+        if let Some(character) = character {
+            command.args(["--character", character]);
+        }
+        command
             .env("HOME", &home)
             .env_remove("KAIJUTSU_KEY_FINGERPRINT")
             .env_remove("KAIJUTSU_KEY_FILE")
@@ -464,6 +475,25 @@ fn permission_title(params: &Value) -> String {
 /// read-write, so the model's `mkdir` lands where the test can look.
 fn workspace() -> tempfile::TempDir {
     tempfile::Builder::new().prefix("kaijutsu-acp-e2e-").tempdir_in("/tmp").expect("create the session directory")
+}
+
+/// A person's key with no `--character` has nobody to perform a new
+/// session, since a person's context runs no model: `session/new` is
+/// refused as invalid params, naming the option and the person.
+///
+/// Falsified by creating the session for the person, or by failing it as
+/// an internal error.
+#[test]
+fn a_person_s_session_with_no_character_is_refused_and_names_the_option() {
+    let kernel = Kernel::start(Vec::new());
+    let mut client = kernel.connect_as(None);
+    let cwd = workspace();
+    let error = client
+        .request("session/new", json!({"cwd": cwd.path(), "mcpServers": []}))
+        .expect_err("a person performs no ACP session");
+    assert_eq!(error.code, -32602, "invalid params: {error}");
+    let reason = error.error["data"]["reason"].as_str().unwrap_or_default().to_string();
+    assert!(reason.contains("--character") && reason.contains(ROOT), "{error}");
 }
 
 // ---------------------------------------------------------------------------

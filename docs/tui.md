@@ -11,10 +11,10 @@ ssh seat: `ssh -t zorak kaijutsu-tui` and play. It is **not** a kernel
 subsystem, and it is **not** a Bevy frontend — see "Roads not taken" for both.
 
 `--context <label>` joins that context or creates it, as a child of `--parent` or of the kernel's only live
-root context. A context is played by a character. The default is the session's own character; a root character
-performs only its root console, so a root's session names another with `--character <name>`, and without it the
-create refuses with an error that names the option. The `Ctrl+Z` shell child is the exception: the human at the
-seat performs it.
+root context. A context is played by a character, whose rc directory and model shape it; there is no
+`--context-type`. The default is the session's own character; a person's context runs no model, so a person's
+session (a root character's key) names another with `--character <name>`, and without it the create refuses with an
+error that names the option. The `Ctrl+Z` context is the exception: the person at the seat performs it.
 
 ```text
 terminal (wezterm, Blink, a plain xterm)
@@ -384,7 +384,8 @@ other change does.
 
 Rules the figure carries:
 
-- The role divider names principal, `context_type` and the block's wallclock.
+- The role divider names principal, the context's performer (`-` for a context with none) and the block's
+  wallclock.
   One blank row sits above it when the speaker changes (none above the first
   speaker), and one blank row sits above the `❯` line: air between what is
   read and what is typed, never a border.
@@ -770,12 +771,18 @@ seat toggle.** `shell.rs`, `Intent::ShellToggle`, `CtrlZ::Toggled` and
 `app.shell` are gone — deleted, not deprecated (`CLAUDE.md`, "Kaijutsu is the
 learning space"). `:kj` and `:!` both always act on the context on screen, so
 the bar draws no context label at all. `Ctrl+Z` now moves the screen between a
-root context and its shell child (`crate::ctrl_z`): from a root it switches to
-the root's live child of type `shell`, labelled `<root-label>-shell`, and
-creates that child under the root the first time, performed by the human at
-the seat; from a shell it switches to its parent; from any other context it does nothing and says so on the status
-line. It goes through the seat switch, so the draft and the place in the
-transcript travel with the context.
+person's root console, or the console, and a context the person performs under
+it (`crate::ctrl_z`). The wire facts decide (`isRootConsole`, `isConsole`,
+`performedByPerson`), never a label: from a root console or the console it
+switches to the live child the person performs, preferring the one labelled
+`<label>-shell`, and the first time creates it with `kj context create
+<person> --name <label>-shell`, answering to the context it was opened from
+(`docs/character.md`, "A person, the console, MCP sessions, the judge"); from
+any other context a person performs it switches to the context that one was
+opened from; from a context a model performs it does nothing and says so on
+the status line. A person's context runs its draft as shell and starts no turn.
+It goes through the seat switch, so the draft and the place in the transcript
+travel with the context.
 
 A double `Ctrl+Z` suspends. The first press always acts (the toggle happens
 at once, and cannot be taken back). A second press within the 500 ms window
@@ -1411,7 +1418,7 @@ compose row while a prefix is pending — never the status line, whose seat digi
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
-`Ctrl+Z` toggles a root context and its shell child (below). A second
+`Ctrl+Z` toggles a root console or the console and the person's context under it (below). A second
 `Ctrl+Z` within 500 ms suspends the process (`raise SIGTSTP`; `fg` or
 `SIGCONT` brings it back). `:q` (warns first if a turn is known
 running) and `:q!` (quits regardless) are the only quits. Amy, on the
@@ -1437,7 +1444,10 @@ ledger) ends with its own key line for the same reason.
 
 **A key never waits on the kernel.** The rank and the tracks are fetched
 on their own task (`refresh.rs`) and folded into the app when the result
-lands; the open asks arrive on the ledger watch. Every ask call runs on
+lands. A round whose listing was read before the client stored a newer one,
+such as the listing with the context a `Ctrl+Z` create just made, leaves the
+newer listing alone, and the next round reads it. The open asks arrive on the
+ledger watch. Every ask call runs on
 its own task: an ask key only records its work (`App::ask_work`), and the
 loop runs it and folds the result in when it lands — the card's record,
 an answer, the ledger view's rows, `Enter` on a ledger row. The event loop

@@ -78,7 +78,7 @@ mod test_support;
 #[cfg(test)]
 use test_support::*;
 pub use model_prices::{CostGroup, ModelPriceRow, NewModelPrice};
-pub use context_characters::{ContextCharacterMigrationNote, ContextCharacterRow, ContextFacts, ContextSlotRow};
+pub use context_characters::{ContextCharacterMigrationNote, ContextCharacterRow, ContextFacts, ContextSlotRow, StraySweep};
 pub use kernel_meta::QuiesceState;
 pub use presets::{PresetRow, PresetArg};
 pub use hooks::{HookRow, HookScriptRow};

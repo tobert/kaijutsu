@@ -39,7 +39,7 @@ fn a_client_directory_the_kernel_sees_becomes_the_cwd_and_one_it_cannot_is_repor
         let here = dir.path().to_str().unwrap();
 
         let created = actor
-            .create_context_in_client_cwd(parent.context_id, "in-client-cwd", "default", PERFORMER, Some(here))
+            .create_context_in_client_cwd(parent.context_id, "in-client-cwd", PERFORMER, Some(here))
             .await
             .unwrap();
         assert_eq!(created.cwd_refused, None);
@@ -51,7 +51,7 @@ fn a_client_directory_the_kernel_sees_becomes_the_cwd_and_one_it_cannot_is_repor
         let elsewhere = dir.path().join("only-on-the-client");
         let elsewhere = elsewhere.to_str().unwrap();
         let created = actor
-            .create_context_in_client_cwd(parent.context_id, "elsewhere", "default", PERFORMER, Some(elsewhere))
+            .create_context_in_client_cwd(parent.context_id, "elsewhere", PERFORMER, Some(elsewhere))
             .await
             .unwrap();
         let refused = created.cwd_refused.expect("the refusal is reported");
@@ -60,7 +60,7 @@ fn a_client_directory_the_kernel_sees_becomes_the_cwd_and_one_it_cannot_is_repor
 
         // Any other refusal is still an error.
         let error = actor
-            .create_context_in_client_cwd(parent.context_id, "elsewhere", "default", PERFORMER, Some(here))
+            .create_context_in_client_cwd(parent.context_id, "elsewhere", PERFORMER, Some(here))
             .await
             .expect_err("a label conflict is not a cwd refusal");
         assert!(error.is_label_conflict(), "{error}");
@@ -123,7 +123,7 @@ fn a_held_create_drops_a_directory_the_kernel_cannot_see_when_it_runs() {
         let elsewhere = elsewhere.to_str().unwrap();
 
         let held = claude_actor
-            .create_context_in_client_cwd(parent.context_id, "held", "default", "claude", Some(elsewhere))
+            .create_context_in_client_cwd(parent.context_id, "held", "claude", Some(elsewhere))
             .await
             .expect_err("Amy's root context holds a model's create for her");
         let ask_id = match &held {

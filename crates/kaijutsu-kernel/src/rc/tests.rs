@@ -130,7 +130,7 @@
                 principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            let created = d.dispatch(&argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", "prompt-test", "--type", context_type]), &caller).await;
+            let created = d.dispatch(&argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", "prompt-test"]), &caller).await;
             assert!(created.is_ok(), "{context_type}: {}", created.message());
             let ctx = lookup_context_id(&d, "prompt-test");
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
@@ -368,7 +368,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         install_rc_script_file(&d, "/config/rc/test/create/S00-prompt.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'You are a test context. Be terse.'"#).await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-md", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-md"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -409,7 +409,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-link", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-link"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -444,7 +444,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-broken-link", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-broken-link"]),
                 &caller,
             )
             .await;
@@ -484,7 +484,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-kai", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-kai"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -508,7 +508,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-echo", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-echo"]),
                 &caller,
             )
             .await;
@@ -700,7 +700,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let performer = rc_dir_performer(&d.kernel_db().lock(), "test");
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", &performer, "--name", "ctx-vars", "--type", "default"]), &caller)
+            .dispatch(&argv(&["context", "create", &performer, "--name", "ctx-vars"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -844,7 +844,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             "echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"").await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-color", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-color"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -903,7 +903,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         .await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-tick", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-tick"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-tick");
@@ -951,7 +951,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         .await;
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-novars", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-novars"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-novars");
@@ -990,7 +990,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let owner = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-owned-kai", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-owned-kai"]),
                 &owner,
             )
             .await;
@@ -1036,7 +1036,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     async fn rc_nested_context_answers_to_the_lead_and_the_lead_reviews_it_body() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/create/S00-spawn-coder.kai", "kj context create coder --name child-work --type child")
+        install_rc_script_file(&d, "/config/rc/test/create/S00-spawn-coder.kai", "kj context create coder --name child-work")
         .await;
         install_rc_script_file(&d, "/config/rc/child/create/S00-noop.kai", "true")
         .await;
@@ -1067,7 +1067,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let result = d
             .dispatch(
-                &argv(&["context", "create", "lead", "--name", "lead-work", "--type", "test"]),
+                &argv(&["context", "create", "lead", "--name", "lead-work"]),
                 &caller,
             )
             .await;
@@ -1110,7 +1110,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let owner = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-owned-fail", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-owned-fail"]),
                 &owner,
             )
             .await;
@@ -1245,7 +1245,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-silent", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-silent"]),
                 &caller,
             )
             .await;
@@ -1271,7 +1271,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-hidden", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-hidden"]),
                 &caller,
             )
             .await;
@@ -1326,7 +1326,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let started = std::time::Instant::now();
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-slow", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-slow"]),
                 &caller,
             )
             .await;
@@ -1396,7 +1396,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-kj", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-kj"]),
                 &caller,
             )
             .await;
@@ -1430,7 +1430,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "nonexistent").as_str(), "--name", "ctx-empty", "--type", "nonexistent"]),
+                &argv(&["context", "create", rc_performer(&d, "nonexistent").as_str(), "--name", "ctx-empty"]),
                 &caller,
             )
             .await;
@@ -1473,7 +1473,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "counted").as_str(), "--name", "ctx-counted", "--type", "counted"]),
+                &argv(&["context", "create", rc_performer(&d, "counted").as_str(), "--name", "ctx-counted"]),
                 &caller,
             )
             .await;
@@ -1509,7 +1509,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "nothinghere").as_str(), "--name", "ctx-zero", "--type", "nothinghere"]),
+                &argv(&["context", "create", rc_performer(&d, "nothinghere").as_str(), "--name", "ctx-zero"]),
                 &caller,
             )
             .await;
@@ -1547,7 +1547,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "stray").as_str(), "--name", "ctx-stray", "--type", "stray"]),
+                &argv(&["context", "create", rc_performer(&d, "stray").as_str(), "--name", "ctx-stray"]),
                 &caller,
             )
             .await;
@@ -1582,7 +1582,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "inert").as_str(), "--name", "ctx-inert", "--type", "inert"]),
+                &argv(&["context", "create", rc_performer(&d, "inert").as_str(), "--name", "ctx-inert"]),
                 &caller,
             )
             .await;
@@ -1609,7 +1609,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-mixed", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-mixed"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -1700,7 +1700,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         // Construct a fresh context manually via the dispatch path.
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-recur", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-recur"]),
                 &caller,
             )
             .await;
@@ -1929,7 +1929,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "parent", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "parent"]),
                 &caller,
             )
             .await;
@@ -2029,7 +2029,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "parent", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "parent"]),
                 &caller,
             )
             .await;
@@ -2109,7 +2109,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "solo", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "solo"]),
                 &caller,
             )
             .await;
@@ -2133,7 +2133,7 @@ esac
 
         // Step 1: create parent (CREATE-MARKER appears in parent).
         let caller = console_caller(&d);
-        d.dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "parent", "--type", "test"]), &caller)
+        d.dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "parent"]), &caller)
             .await;
         let parent_id = lookup_context_id(&d, "parent");
         let parent_contents = block_contents_in(&d, parent_id);
@@ -2267,7 +2267,7 @@ esac
         install_rc_script_file(
             &d,
             "/config/rc/nested-cancel-outer/create/S00-create-child.kai",
-            "kj context create rc-nested-cancel-child --name nested-cancel-child --type nested-cancel-child",
+            "kj context create rc-nested-cancel-child --name nested-cancel-child",
         )
         .await;
         install_rc_script_file(
@@ -2350,7 +2350,7 @@ esac
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-default-kills", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-default-kills"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
 
@@ -2448,7 +2448,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "coder").as_str(), "--name", "c1", "--type", "coder"]),
+                &argv(&["context", "create", rc_performer(&d, "coder").as_str(), "--name", "c1"]),
                 &caller,
             )
             .await;
@@ -2534,7 +2534,7 @@ esac
             let label = format!("c-{context_type}");
             let r = d
                 .dispatch(
-                    &argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", &label, "--type", context_type]),
+                    &argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", &label]),
                     &caller,
                 )
                 .await;
@@ -2563,7 +2563,7 @@ esac
             let label = format!("c-{context_type}");
             let r = d
                 .dispatch(
-                    &argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", &label, "--type", context_type]),
+                    &argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", &label]),
                     &caller,
                 )
                 .await;
@@ -2612,7 +2612,7 @@ esac
         vfs.write_all(std::path::Path::new("/config/rc/storyteller/cards/kotone.reminder.md"),
             b"Kotone speaks softly and never hurries.").await.unwrap();
 
-        let r = d.dispatch(&argv(&["context", "create", "kotone", "--name", "tale", "--type", "storyteller"]), &caller).await;
+        let r = d.dispatch(&argv(&["context", "create", "kotone", "--name", "tale"]), &caller).await;
         assert!(r.is_ok(), "create failed: {}", r.message());
         let ctx = lookup_context_id(&d, "tale");
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
@@ -2682,7 +2682,7 @@ esac
         }
         // The server seeds the factory fork presets at boot; the tick forks with `spawn`.
         crate::seed_presets::ensure_factory_presets(&mut d.kernel_db().lock(), PrincipalId::system()).unwrap();
-        let r = d.dispatch(&argv(&["context", "create", "kaiten", "--name", "main", "--type", "companion"]), &caller).await;
+        let r = d.dispatch(&argv(&["context", "create", "kaiten", "--name", "main"]), &caller).await;
         assert!(r.is_ok(), "create failed: {}", r.message());
         let main = lookup_context_id(&d, "main");
         d.kernel_db().lock().assign_test_review(main, Some(kaiten), Some(caller.principal_id)).unwrap();
@@ -3030,7 +3030,7 @@ esac
         let caller = console_caller(&d);
         let r = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "coder").as_str(), "--name", "parent", "--type", "coder"]),
+                &argv(&["context", "create", rc_performer(&d, "coder").as_str(), "--name", "parent"]),
                 &caller,
             )
             .await;
@@ -3097,7 +3097,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-fail", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-fail"]),
                 &caller,
             )
             .await;
@@ -3130,7 +3130,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-ok", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-ok"]),
                 &caller,
             )
             .await;
@@ -3158,7 +3158,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-scripts", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-scripts"]),
                 &caller,
             )
             .await;
@@ -3204,7 +3204,7 @@ esac
 
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-guarded", "--type", "test"]),
+                &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-run-guarded"]),
                 &caller,
             )
             .await;
@@ -3236,7 +3236,7 @@ esac
         let caller = console_caller(&d);
         let result = d
             .dispatch(
-                &argv(&["context", "create", rc_performer(&d, "emptytype").as_str(), "--name", "ctx-run-empty", "--type", "emptytype"]),
+                &argv(&["context", "create", rc_performer(&d, "emptytype").as_str(), "--name", "ctx-run-empty"]),
                 &caller,
             )
             .await;
@@ -3275,7 +3275,7 @@ esac
         }
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-order", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-order"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-order");
@@ -3327,7 +3327,7 @@ esac
 
         let caller = console_caller(&d);
         let result = d
-            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-link-id", "--type", "test"]), &caller)
+            .dispatch(&argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "ctx-link-id"]), &caller)
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-link-id");
@@ -3386,7 +3386,7 @@ esac
             VERB_CREATE => {
                 let r = d
                     .dispatch(
-                        &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "wired-create", "--type", "test"]),
+                        &argv(&["context", "create", rc_performer(&d, "test").as_str(), "--name", "wired-create"]),
                         &console_caller(&d),
                     )
                     .await;
@@ -3573,7 +3573,7 @@ esac
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let args: Vec<String> = ["context", "create", rc_performer(&d, "coder").as_str(), "--name", "loadout", "--type", "coder"].map(String::from).to_vec();
+            let args: Vec<String> = ["context", "create", rc_performer(&d, "coder").as_str(), "--name", "loadout"].map(String::from).to_vec();
             let r = d.dispatch(&args, &caller).await;
             assert!(r.is_ok(), "create failed: {}", r.message());
             let ctx = lookup_context_id(&d, "loadout");
@@ -3590,7 +3590,7 @@ esac
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let args: Vec<String> = ["context", "create", rc_performer(&d, "council").as_str(), "--name", "council-chat", "--type", "council"].map(String::from).to_vec();
+            let args: Vec<String> = ["context", "create", rc_performer(&d, "council").as_str(), "--name", "council-chat"].map(String::from).to_vec();
             let r = d.dispatch(&args, &caller).await;
             assert!(r.is_ok(), "create failed: {}", r.message());
             let ctx = lookup_context_id(&d, "council-chat");
@@ -3648,7 +3648,7 @@ esac
             .await;
         d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
         let caller = console_caller(&d);
-        let mut args = vec!["context".to_string(), "create".into(), rc_performer(&d, "coder"), "--name".into(), "orient".into(), "--type".into(), "coder".into()];
+        let mut args = vec!["context".to_string(), "create".into(), rc_performer(&d, "coder"), "--name".into(), "orient".into()];
         if let Some(cwd) = cwd {
             args.push("--cwd".into());
             args.push(cwd.display().to_string());
@@ -3953,26 +3953,6 @@ esac
         assert!(r.is_ok(), "archive failed: {}", r.message());
         assert!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().archived_at.is_some());
         assert!(block_kinds_in(&d, ctx).contains(&kaijutsu_types::BlockKind::Error), "the failure is recorded");
-    }
-
-    /// `--children --type` archives the context's live children of that
-    /// type, each through its own archive lifecycle, and leaves the others.
-    #[tokio::test]
-    async fn archive_children_of_a_type_runs_each_child_s_lifecycle() {
-        let d = archive_dispatcher().await;
-        install_rc_script_file(&d, "/config/rc/judge/archive/S00-noop.kai", "true").await;
-        let seat = archivable(&d, "seat", None, "test");
-        let judge = archivable(&d, "judge-seat", Some(seat), "judge");
-        let other = archivable(&d, "other-child", Some(seat), "test");
-        let caller = KjCaller { context_id: Some(seat), ..root_archiver(&d) };
-        let r = d.dispatch(&argv(&["context", "archive", "--children", "--type", "judge"]), &caller).await;
-        assert!(r.is_ok(), "archive --children failed: {}", r.message());
-        let db = d.kernel_db().lock();
-        assert!(db.get_context(judge).unwrap().unwrap().archived_at.is_some());
-        assert!(db.get_context(other).unwrap().unwrap().archived_at.is_none(), "another type stays live");
-        assert!(db.get_context(seat).unwrap().unwrap().archived_at.is_none(), "the parent stays live");
-        drop(db);
-        assert!(find_run_for_context(&d, judge, VERB_ARCHIVE).is_some(), "the child's own archive lifecycle ran");
     }
 
     /// `--children --performer` archives the context's live children that
