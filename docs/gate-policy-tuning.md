@@ -4,19 +4,21 @@ Status: designed 2026-09-08; slices 1–3 (the evaluator seam, the config
 layer, learned family rules — `kj/gate_policy.rs`,
 `assets/defaults/gate.toml`, `approval_rule_families`) shipped 2026-09-10,
 slice 5 unbuilt, slice 4 retired by the verb class; slice 6, the uncovered
-tier, shipped 2026-09-18. Amy's rulings of the same day are quoted
-where they decide a shape. Reviewed against the live tree by kaibo (cast
+tier, shipped 2026-09-18; slice 7, the performer layers, shipped 2026-11-04.
+Amy's guidance is quoted where it decides a shape. Reviewed against the live tree by kaibo (cast
 `crusoe`) the same day; the revision absorbs its findings. This doc is
 canonical for the gate-policy evaluator; `docs/gate-resume.md`
 remains canonical for the gate itself.
 
-## The rulings this design sits on (Amy, 2026-09-08)
+## The guidance this design sits on (Amy, 2026-09-08)
 
 1. **The explicit list from the user overrides the builtin and generated
    lists.** A human decision recorded in the ledger outranks everything
    shipped or configured.
-2. **`context_type` is another layer on top of global.** Config composes
-   global first, then one section per context type.
+2. **The performer's layers sit on top of global.** Config composes global
+   first, then the sections for the context's performer: its rc directory,
+   whether it is a root, and the character itself ("Character + directory",
+   Amy, 2026-11-04; §Performer layers).
 3. **Start with `kj`; add a few non-`kj` entries to test the key space.**
 
 ## The problem: three checkers, three sources, no one path
@@ -107,7 +109,7 @@ Uncovered otherwise — today's behavior, stated rather than discovered.
 | 3. Performer config | same file: `[rc.<dir>]`, then `[root]`, then `[character.<name>]` (§Performer layers) | same | Amy, per rc directory and per character |
 | 4. User explicit | `approval_rules` (digest) + family rules (§Learned family rules) | `kj ledger allow --remember` at answer time | a human decision, attributed and revocable |
 
-Top wins (ruling 1). A learned human allow overrides a config deny; a
+Top wins (guidance 1). A learned human allow overrides a config deny; a
 config deny overrides the builtin allow tier. Every auto-decision leaves the
 durable row it leaves today, with `auto_reason` naming the winning layer and
 key — `gate policy: rc config (coder) allows kj handoff note` — so `kj
@@ -239,6 +241,7 @@ deny = [
 allow = [
   "kj context create",     # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
+  "kj context archive",  # a session ends itself; recoverable: `kj context promote`
 ]
 
 [rc.banto]
@@ -255,7 +258,8 @@ a policy file that silently half-parses is the failure shape this repo does
 not ship.
 
 `[context_type.<type>]` fails the load, naming the section and its
-replacements, `[rc.<type>]` or `[character.<name>]`.
+replacements, `[rc.<type>]` or `[character.<name>]`, as a section the kernel
+does not read does.
 
 ### Performer layers
 
@@ -273,9 +277,8 @@ They compose in that order, each later one reading over the earlier ones,
 so the narrowest section decides.
 A context with no performer reads `[global]` alone; a performer with no
 `rc_dir` reads no `[rc.<dir>]`. A performer with no character sheet, or a
-sheet that does not read, refuses the submission (gate unavailable). "Reads
-over" is the rule `[context_type.<type>]` had over `[global]`, extended one
-level at a time:
+sheet that does not read, refuses the submission (gate unavailable). Reading
+over works at three levels:
 
 - **Key lists**: the tables are walked latest first (`[character.<name>]`,
   `[root]`, `[rc.<dir>]`, then `[global]`), and the first deny, ask or
@@ -305,7 +308,7 @@ sections differs from the previous load's (the first load always logs it),
 so a steady state logs once, not at each of the two or three loads a
 submission makes. The file still loads: a failed load refuses every gated statement, including the
 `kj character create` that would fix it. An rc tree that lists nothing
-names every directory, the rule `kj::rc::check_context_type` states. An rc
+names every directory, the rule `KjDispatcher::check_rc_dir` states. An rc
 tree that cannot be listed (`/config/rc` is a file, say) skips the check
 for `[rc.<dir>]` sections with a warning naming the rc tree; it does not
 refuse the load. A character sheet that cannot be read does refuse it, and
@@ -494,7 +497,7 @@ database as the verb resolves them. Broker PreCall with a dispatcher wired and `
 
 - **Allows, below every key.** A command no user rule, family rule or `gate.toml` key decided is allowed, before
   the uncovered tier, when it is `kj drift push` along the caller's senpai edge (the `senpai edge` layer, under
-  "Senpai, the gate's model, and the director tier") or `kj context create` under the MCP hub of the caller's lineage root with that root's console as its
+  "Senpai, the gate's model, and the banto tier") or `kj context create` under the MCP hub of the caller's lineage root with that root's console as its
   senpai (`builtin allows kj context create under <hub>, the MCP hub of its lineage root`).
 - **Asks, over every layer but a deny** (`docs/character.md`, "Gate"). `kj context archive` whose target is a
   console (a context a sheet's `console_ctx` names), or with `--children` whose selection holds one, `kj context
@@ -532,8 +535,9 @@ unreleased one:
    and digest rules behind `evaluate`, consulted from both broker PreCall
    and `run_gate`.
 2. **Config layer — shipped.** `assets/defaults/gate.toml`, the
-   `[global]`/`[context_type.<type>]` layers, the `KJ_TOOL_PLAN` `tier`
-   field, and the `--help` structural rule.
+   `[global]` layer and one layer above it (slice 7 made that the performer
+   layers), the `KJ_TOOL_PLAN` `tier` field, and the `--help` structural
+   rule.
 3. **Learned family rules — shipped.** `approval_rule_families`,
    `--family` at answer time, `family_coverage()` beside `redeem()`, and
    `kj ledger rules`/`forget` over both digest and family rules.
@@ -547,16 +551,13 @@ unreleased one:
    (`crates/kaijutsu-server/tests/gate_scenarios_wire.rs`) keeps the tier
    order around a hook. `kj handoff note` sits in the global allow tier.
 6. **The uncovered tier — shipped.** `uncovered = "ask" | "allow"` on
-   `[global]` and each `[context_type.<type>]` (§The uncovered tier), decided
-   last and reported as its own layer in `kj ledger rules`; a
-   `[context_type.<name>]` section naming no live context type fails the
-   load (§The file).
-7. **Performer layers — shipped** (`docs/character.md`, "Rollout", M4).
-   `[rc.<dir>]`, `[character.<name>]` and `[root]` replace
-   `[context_type.<type>]` (§Performer layers); a section that applies to
-   nobody warns instead of failing the load; the MCP session create rule
-   reads the parent against the caller's MCP hub and the senpai the create
-   sets against the lineage root's console.
+   `[global]` and each performer section (§The uncovered tier), decided
+   last and reported as its own layer in `kj ledger rules`.
+7. **Performer layers — shipped** (`docs/character.md`, "Gate").
+   `[rc.<dir>]`, `[root]` and `[character.<name>]` (§Performer layers); a
+   section that applies to nobody warns instead of failing the load; the MCP
+   session create rule reads the parent against the caller's MCP hub and the
+   senpai the create sets against the lineage root's console.
 
 ### Tests each slice must land with
 
@@ -577,15 +578,14 @@ The repo's own standard — a test that cannot fail is not a test:
    digest-rule test that pins the opposite (`rules.rs:526`).
 6. The uncovered tier (slice 6), in `kj/gate_policy.rs` unless noted:
    absent by default and absent from the shipped file; the tier reaching
-   only the section that sets it and a context type's setting outranking
+   only the section that sets it and a performer section's setting outranking
    `[global]`; an unknown `uncovered` word failing the load; deny and ask
    outranking the tier, and an allow-list entry the structural veto drops
    falling through to it while a plain allow-list hit still reads as one;
    the per-command `tier` word; which constructs plan a commandless
-   statement, beside the branch that decides one; an unknown
-   `[context_type.<name>]` section failing the load, with the fail-open
-   scenario it prevents and the shipped file loading against the shipped rc
-   tree; and through the gate itself (`kj/ledger.rs`) a whole program
+   statement, beside the branch that decides one; a section that applies to
+   nobody loading, listed and warned, and the shipped file loading against
+   the shipped rc tree; and through the gate itself (`kj/ledger.rs`) a whole program
    auto-allowing with the tier named in its durable row, a remembered
    family deny and a remembered exact-statement deny each still winning,
    and `kj ledger rules` stating the posture.
@@ -685,28 +685,29 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   that `redeem` already pays, plus an mtime-cached file read). A per-context
   materialized cache is a follow-up if measurement ever asks for it.
 
-## Senpai, the gate's model, and the director tier (senpai/kohai stack)
+## Senpai, the gate's model, and the banto tier
 
-`docs/senpai-kohai.md` changes three things around the gate.
+Three things around the gate follow from `docs/senpai-kohai.md`.
 
 - **Drift along the senpai edge needs no ask.** `kj drift push` from a context to its senpai (`kj drift push .senpai "<text>"`), or from a
   senpai to a context that answers to it, runs with no ask. This replaces
   the per-context `kj ledger allow --remember session --family` rule that the 2026-10-18 nagaya run had to
   teach by hand. Any other drift target keeps the tier it has here; a drift to a sibling still asks.
-  Shipped in step 3 as the `senpai edge` layer of `gate_policy::evaluate`: it allows a command that no
+  It is the `senpai edge` layer of `gate_policy::evaluate`: it allows a command that no
   user rule, family rule or `gate.toml` key decided, before the uncovered tier, so an `ask` or `deny` key
   on `kj drift push` stays firm. The target is read from the arguments as the verb resolves it, so every
   argument must be a literal word and the command plain (no redirect, background flag or heredoc). Broker
-  PreCall has no database and sees no edge: the pre_call hooks still run, then the gate allows. The
-  decision reads `gate policy: senpai edge allows kj drift push to <ctx>, its senpai` (or `which answers to it`).
-- **The gate's own model setup** (step 7). Today the `gate` slot of a character names the council server and
-  served model that decide its gate (`docs/council.md`, "Configuration"). The plan is for the gate to get a
-  setup of its own, as kaibo's config does. To be decided in step 7: the config shape (a key in `gate.toml`
-  or a separate setup), and whether one serves every seat or one is chosen per `[rc.<dir>]` or
-  `[character.<name>]`.
-- **The banto tier** is `[rc.banto]` above, keyed by the rc directory banto runs (`director/` before it was
-  renamed). A host `gate.toml` that still has `[rc.director]` lists it as applying to nobody until it is
-  renamed by hand.
+  PreCall evaluates it too when a dispatcher is wired, with the ledger and the database, so a program the
+  edge allows outright skips the pre_call hooks there; with no dispatcher, PreCall reads no edge and the
+  hooks run. The decision reads `gate policy: senpai edge allows kj drift push to <ctx>, its senpai` (or
+  `which answers to it`).
+- **The gate's own model setup** is open. The `gate` slot of a character names the council server and
+  served model that decide its gate (`docs/council.md`, "Configuration"). The gate may get a setup of its
+  own, as kaibo's config does. Undecided: the config shape (a key in `gate.toml` or a separate setup), and
+  whether one serves every seat or one is chosen per `[rc.<dir>]` or `[character.<name>]`.
+- **The banto tier** is `[rc.banto]` above, keyed by the rc directory banto runs. A host `gate.toml` with a
+  section for a directory the seed no longer ships, such as `[rc.director]`, lists it as applying to nobody
+  until it is renamed by hand.
 
 ## Out of scope
 

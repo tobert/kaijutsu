@@ -192,9 +192,9 @@ compacting."
   reads `council-system`, `council-amy`, and `council-banto`. Several coders
   under one banto share `council-banto`. A character with no council context
   is skipped and the skip is recorded; it is not a miss.
-- **A root's council context votes; a director's observes, for now.** Amy's
+- **A root's council context votes; a model character's observes, for now.** Amy's
   council context and the system rules are pooled into the verdict. A model
-  director's council context is read under its own `direction-check` spec ("is this action following my
+  character's council context, such as banto's, is read under its own `direction-check` spec ("is this action following my
   directions?"), after the gate has decided, off the hot path, and recorded
   with the decision. It never enters the pool or changes the outcome. Amy:
   "It's an experiment; I'm unsure where it'll in authority." Giving it a
@@ -203,7 +203,7 @@ compacting."
   prompts into one automatically. A council context is made and refreshed the way a fork
   is: copy from the character's working contexts through fork filters
   (`docs/fork-filters.md`), shape it with `kj stage exclude`, and later
-  compact it. A director may also drift into its own council context as it goes, so
+  compact it. A model character such as banto may also drift into its own council context as it goes, so
   the projection reads drift blocks in council contexts.
 - **First reading, 2026-10-10.** In a container (the ACP fleet's contained
   mode, removed 2026-10-27; mock seat, zorak's council, moltar thresholds
@@ -216,7 +216,7 @@ compacting."
   Three runs each, the same every time.
 - **The chain follows the reviewer, for now.** Amy: "reviewer is fine for
   now". Recording which context drives a coder is the alternative if the
-  reviewer and the director come apart. Above the first reviewer, the climb
+  reviewer and the driving context come apart. Above the first reviewer, the climb
   walks the submitting context's fork tree the way `kj ledger escalate`
   does, taking each responsible character it has not seen, until a live
   root.
@@ -297,7 +297,7 @@ are no server-side context ids, and a seat is sent whole each time.
   an `mk` backend, the judge read's contexts and house rules on the judge's
   server (the live shadow's `model` slot, or before the shadow is made, the
   judge character's model, which the shadow will copy). The create and fork
-  lifecycles of coder, default, and director run it
+  lifecycles of `coder/`, `banto/` and `companion/` run it
   (`lib/{create,fork}/S50-council-seats.kai`); a seat whose performer's
   layers enable no council builds nothing. Root, the owner's privileged space, the console (the model
   seat under it), shell (the REPL beside it), and mcp (the debugging and admin
@@ -382,7 +382,7 @@ context holds those rules and nothing the seat said or did.
   "'the seat' is a terrible name and I think we got that wrong. It can stop
   with AGENTS.md. It should not get a running dialog from the model."
 
-## Shadow context (design, not built)
+## Shadow context
 
 A shadow context is a council context that holds what one seat has done to the
 world: each outward call it made, in order, with no results, narration, or
@@ -401,21 +401,21 @@ grows with the gate.
   character slots.) A shadow needs no
   `gate.toml` entry beyond the judge's name: its performer's rc says what
   it does, and the judge character's model says which model plays it.
-- **Two types: `judge` and `bump`.** A `judge` gives its opinion of each
-  command. A `bump` answers proceed or bump, as bumper mode does today,
-  with the seat's history. Each type's rc holds its framing and its
-  question. Both start in recording mode: the answer is written to the
-  dialogue and the record and changes no decision. Moving bumper mode
-  from `[council]` onto a `bump` shadow that acts comes after the
-  recordings show the history helps.
-- **One child per type, a child of the seat.** A judge shadow is a
+- **Two kinds of shadow: judge and bump.** A judge shadow, built, gives its
+  opinion of each command. A bump shadow, not built, would answer proceed or
+  bump, as bumper mode does today, with the seat's history. Each is
+  performed by a character of its own, whose rc directory holds its framing
+  and its question, as `judge/` does for the judge. Both start in recording
+  mode: the answer is written to the dialogue and the record and changes no
+  decision. Moving bumper mode from `[council]` onto a bump shadow that acts
+  comes after the recordings show the history helps.
+- **One child per shadow character, a child of the seat.** A judge shadow is a
   kaijutsu context performed by the judge character, whose parent is the
   observed seat and whose senpai is the seat, so it shows in the seat's
   tree and archiving the seat archives it. It inherits no blocks; the
   kernel, not a seat turn, asks its model. The kernel finds a shadow as the
-  seat's live child that the judge character performs, never by its label
-  or its type. The gate still writes context_type `judge` on it. The label is
-  `<type>-<seat label>`; it does not start with `council-`, so the
+  seat's live child that the judge character performs, never by its label.
+  The label is `judge-<seat label>`; it does not start with `council-`, so the
   reviewer-chain walk never takes it for a character's council context. Each child
   keeps its own dialogue, so a judge sees only its own earlier opinions.
 - **The judge is a character.** The council block names it: `judge =
@@ -472,7 +472,7 @@ grows with the gate.
 - **Open.** Whether feeding its own past answers back anchors a model; the
   record shows it. How a council spec names the case when the call is
   already the shadow's last turn. How a shadow is switched from recording
-  to acting, on the context or in its type.
+  to acting, on the context or in its character's gate layers.
 - **Out of scope.** A human's commands on the RPC shell paths make no
   tool-call block and get no shadow. Drift is an edge between players; the
   shadow is written by the kernel and is not drift.
@@ -517,7 +517,7 @@ shipped. A fresh session resumes at the first step not marked done.
    `/council/v2` at the same address). After each recorded call, a task
    of its own builds the shadow as a seat under the seat's shell spec from
    `gate.toml` (`CouncilSync::prime_shadow`), under its stance (1d); a
-   seat type with no council there is not primed
+   seat whose performer's layers declare no council shell spec is not primed
    (logged). Priming has its own lock and a 30 s timeout, so it never
    holds up a decision. A judge on any other backend is not primed. Test:
    `a_judge_on_a_council_server_is_primed_with_each_call`.
@@ -542,13 +542,12 @@ shipped. A fresh session resumes at the first step not marked done.
    `a_judge_reads_on_its_model_s_server_and_the_gate_decides_on_the_other`,
    `a_judge_read_over_the_context_limit_is_a_miss_naming_it`.
    Still open: whether the judge should read the reviewer contexts.
-4. **Measure on moltar.** Wired 2026-10-09: backend `mk-zorak`, cast
-   `mk-judge` (one `judge` slot), and a `coder` character whose default
-   cast is `mk-judge`. A smoke seat played by `coder` ran `mkdir` then
+4. **Measure on moltar.** Wired 2026-10-09: the judge served by backend
+   `mk-zorak`, and seats played by a `coder` character. A smoke seat played by `coder` ran `mkdir` then
    `rmdir`: priming took 1.6 s and 4.2 s, the gate's council answered
    proceed at 0.992 and 0.953, and the judge with the history answered
    proceed at 0.994 and 0.967. First real seats, 2026-10-10: a DeepSeek
-   banto (`banto-shadow`) ran two DeepSeek coders `--as coder`, judge on
+   banto (`banto-shadow`) ran two DeepSeek coders performed by `coder`, judge on
    `mk-zorak`. Over 29 judged decisions the judge answered 27, all
    `proceed`, and agreed with every gate pass; the gate bumped two as
    `unjudged` (misses) where the judge, with the history, said proceed.
@@ -578,7 +577,7 @@ shipped. A fresh session resumes at the first step not marked done.
 5. **Jev hydration.** A chat-model judge gets the whole dialogue as one
    script-like transcript per request. Compare it with the megakernel on
    the same seats.
-6. **`bump` recording, then acting.** A `bump` type records proceed or bump
+6. **Bump recording, then acting.** A bump shadow records proceed or bump
    with the history. Moving bumper mode off `[council]` waits for step 4
    and 6 numbers.
 ## Specs and cases
@@ -850,13 +849,12 @@ kind `mk` and a `base_url`; any other backend makes every decision on the submis
 backend, and no other server is asked in its place. The slot's `--model` names the served model; the served
 model's identity is recorded with each decision. `kj character slot set` refuses a `gate` slot on a backend that is
 not kind `mk`, and a `distill` slot on one that is. A character's slots are `distill` and `gate`; its chat model is `kj character model set`, copied
-under role `model`. A slot on an `mk` backend is never a chat model and needs no `max_tokens`. `model`, `gate`,
-`distill` and `judge` are reserved: `kj context create` and `kj context set` refuse them as `--type`. The slot chooses only
+under role `model`. A slot on an `mk` backend is never a chat model and needs no `max_tokens`. The slot chooses only
 the server and its served model; whether a performer gets the council, `mode`, specs, thresholds, contexts, and
 `deadline_ms` stay in `gate.toml`. Every decision on the submission, program decisions included, and the
 observing reviewer contexts read after it go to the binding's server, under that server's endpoint concurrency
-limit (`docs/retries-and-ratelimits.md`). At startup the kernel builds the seats of each live context whose
-instance has a `gate` slot, on that slot's server.
+limit (`docs/retries-and-ratelimits.md`). At startup the kernel builds the seats of each live context that has a
+`gate` slot, on that slot's server.
 
 A council block sits in a section the gate composes for the seat's
 performer: `[rc.<dir>.council]`, `[root.council]` or
@@ -908,7 +906,7 @@ posts the spec again.
   (`flock -w 900 ~/.cache/zorak-heavy.lock`).
 - **lfm2d,** behind the same port once it serves council v2.
 - **A seat's binding chooses the server.** A `gate` slot whose backend
-  has kind `mk` names the server for that instance's decisions ("mk bumps",
+  has kind `mk` names the server for that context's decisions ("mk bumps",
   "lfm2d bumps"); see "Configuration". A `gate` slot on a backend of any
   other kind, such as Jev through OpenRouter, is a miss.
 - **Jev through OpenRouter, for comparison only.** It speaks the gateway
@@ -998,7 +996,7 @@ action refused with guidance and tries again, with no human in the loop.
   database, service, or system state, such as a `.db` file or anything
   under `/var/lib` or `/etc`, with no backup. The rubric used to ask about
   data the seat "did not create", which the council cannot see: a
-  director's `rm -rf` of its own scratch and an archive of its own lane
+  banto's `rm -rf` of its own scratch and an archive of its own lane
   were bumped on 2026-10-06. Amy: "ease things so it's a bit less obsessed
   with backups except when doing things like messing with .db files or
   /var/lib or similar." A shell spec that names any rubric question must

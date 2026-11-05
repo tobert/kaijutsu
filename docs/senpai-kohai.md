@@ -118,7 +118,7 @@ What stays as it is:
 ## Where a model comes from
 
 Every model call reads the context's own `context_slots` and nothing else. A model turn in context K runs on K's
-`model` slot, whatever K's type, and the durable turn row records role `model`. A context with no performer runs no
+`model` slot, whoever performs K, and the durable turn row records role `model`. A context with no performer runs no
 model.
 
 - Making a context copies everything a call needs into `context_slots`:
@@ -240,7 +240,7 @@ model turns; a model turn refuses to start when its performer would review itsel
   - A context a root character performs runs no model turns, so a root's `kaijutsu-tui` or
     `kaijutsu-mcp` session names the character that plays what it creates: `--character <name>` on both, and
     `KAIJUTSU_CHARACTER` for MCP (the flag wins). Without it a root refuses, with an error that names the option.
-    The shell child `Ctrl+Z` makes is performed by the human at the seat, whatever `--character` says.
+    The context `Ctrl+Z` opens is performed by the person at the client, whatever `--character` says.
 - `kj fork`: the child copies the forking context's performer, persona and slots, with the forking context as its
   senpai. Asks from a fork climb past its performer to the forking context's senpai (Routing, step 4). A root
   console cannot be forked.
@@ -277,21 +277,17 @@ The kernel does not move the contexts that answer to a rotated context. The rota
 1. Rotate creates the successor and runs its create rc, runs the predecessor's archive rc, and commits: the
    predecessor is archived and the successor takes its label, ring position, `handoff_ctx` and `root_ctx`
    pointers, in one transaction. The contexts that answered to the predecessor still name it.
-2. After the commit, rotate runs the successor's **rotate** rc (`/config/rc/<type>/rotate/`), with
-   `ROTATED_FROM` naming the predecessor. A director's rotate rc takes those contexts with
-   `kj context set <ctx> --senpai <successor>` and then lists the asks waiting for its character with
-   `kj ledger list --reviewer <character>`, so the asks raised during the rotation are in front of it. The
-   character may also take them by hand.
+2. After the commit, the character takes them: `kj context list --senpai <predecessor>` lists them,
+   `kj context set <ctx> --senpai <successor>` takes each, and `kj ledger list --reviewer <character>` shows the
+   asks raised during the rotation. No lifecycle takes them.
 3. Until they are taken, their asks reach the same character (the predecessor's) and wait in the ledger,
    and their pushes to the senpai refuse, naming the archived senpai.
 
 A rotation that fails before the commit leaves the predecessor live and labeled, with the contexts that answer to it, and the
-successor live and unlabeled; the error names the successor, which `kj context archive` retires. A rotate rc that
-fails after the commit undoes nothing: the rotation stands, the error names the contexts not yet taken, and
-`kj context list --senpai <predecessor>` shows them.
+successor live and unlabeled; the error names the successor, which `kj context archive` retires.
 
 The successor of a root console has no senpai until the commit moves `root_ctx` to it. A root-console rotation
-that fails before the commit archives the successor and says so, and boot archives any live `root` context with no
+that fails before the commit archives the successor and says so, and boot archives any live context with no
 senpai that no `root_ctx` names. At the commit the archived console takes the successor as its senpai.
 
 ## Reports and drift
@@ -360,8 +356,8 @@ asks, and no model.
   `model` slot; a session prints no no-model notice. A `distill` slot on the character is copied as for any
   context, so `kj fork --compact` and `kj drift pull|merge` work from a session.
 - **Session end.** The client runs `kj context archive <id> --confirm` from the session context itself, which its
-  own performer may archive (Authority). The gate would ask for it from an `mcp` context, so `gate.toml` ships
-  `kj context archive` in `[rc.mcp] allow`.
+  own performer may archive (Authority). The gate would ask for it from a context whose performer runs `mcp/`, so
+  `gate.toml` ships `kj context archive` in `[rc.mcp] allow`.
 
 ## Removed
 
@@ -378,6 +374,11 @@ asks, and no model.
   `kj context unset --model|--cast`; `kj context create --as|--cast|--top`; `kj fork --model|--distill-model`;
   `kj model`; `kj backend default`; `kj preset save --cast|--system-prompt`; `kj ledger delegation`;
   `kj character set --cast`. `kj models` (discovery) stays.
+- A context's type (`docs/character.md`, "The type melts into the character"): `kj context create --type`,
+  `kj context set --type`, `kj context archive --children --type` (`--children --performer` narrows it), `kj
+  character create|set --type` and `set --no-type`, `kj rc list --type` (`--dir` filters by directory),
+  `KJ_CONTEXT_TYPE`, the tui's `--context-type`, the MCP `register_session` `context_type` field, and the
+  `judge` slot role.
 - The RPCs `configureLlm`, `setDefaultProvider`, `setDefaultModel` and `getLlmConfig`, the client's
   `set_context_model`, and the MCP `session.start` hook's model write. The wire's `ContextHandleInfo.provider` and
   `.model` carry the context's `model` slot.
@@ -453,9 +454,7 @@ context it cannot map in `context_character_migration_report`, which `kj context
   performer; a turn sends no unset optional parameter.
 - A fork copies the forking context's slots and takes it as senpai; a rotation copies fresh slots and keeps the
   predecessor's senpai.
-- Rotation moves no context that answered to the predecessor; a director's rotate rc takes them after the commit
-  and lists the asks waiting for its character; a rotate rc that fails after the commit leaves the rotation
-  standing and names the contexts not taken; a rotation that fails before commit leaves the predecessor live,
+- Rotation moves no context that answered to the predecessor; a rotation that fails before commit leaves the predecessor live,
   labeled and with the contexts that answer to it, and the
   successor archived.
 - A context with no `model` slot: create and rotate say so, except for an MCP session; a turn refuses and names
@@ -474,7 +473,7 @@ context it cannot map in `context_character_migration_report`, which `kj context
 - The migrations: the fold keeps every performer, senpai, persona and slot, gives a context with no senpai the
   rule's console, and refuses naming a context it cannot place; `console-label-v1` relabels the console, keeps a
   `ROOT` of another type, and refuses when `console` is taken.
-- A character created with `--model` gives a context of any type a `model` slot and a `distill` slot; a `distill`
+- A character created with `--model` gives every context it performs a `model` slot and a `distill` slot; a `distill`
   slot wins over the model for distillation; the model never fills `gate`, and a council server fills `model`
   alone; a root refuses a model; `kj character model set` moves no context until it rotates; `kj senpai` is
   unknown.

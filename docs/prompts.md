@@ -24,14 +24,13 @@ rc, and a performer that names no directory fails the lifecycle and refuses
 shadow is performed by the judge character, so it runs that character's
 directory, `judge/` when shipped. Scripts read `KJ_CHARACTER` (the
 performer's name) and `KJ_RC_DIR` (the directory that runs); see
-`docs/character.md`, "The type melts into the character".
+`docs/character.md`, "rc".
 
 The shipped directories are the characters': `person/` for every root
 character, `banto/` for banto, and `coder/`, `companion/`, `musician/`,
 `storyteller/`, `toolie/`, `assistant/`, `council/`, `judge/` and `mcp/` for
 the character of the same name (`mcp/` for each MCP connection's character).
-`person/` absorbed `root/` and `shell/`, and `banto/` absorbed `director/` and
-`console/`; a character on `default/` runs `coder/`. `lib/` holds the shared
+`lib/` holds the shared
 bodies the directories link to, the hook bodies, and `lib/recipes/`, scripts a
 player runs on demand (`docs/senpai-kohai.md`, "Composing senpai and kohai").
 
@@ -74,15 +73,15 @@ amounts of 日本語 (nihongo) mixed in. A person's
 own prompts may use any language. No stance branches on the model name;
 per-model specializations wait for comparative evidence.
 
-The kernel adds runtime facts in a `<situation>` block, including the performing
-character, the context's character instance and its senpai:
-`<instance label="<label>" character="<name>"/>` and
-`<senpai instance="<label>" character="<name>"/>`, where a label is the instance's
-conversation's label. The reviewer of the context's own asks is the senpai's
+The kernel adds runtime facts in a `<situation>` block, including the performer
+and the senpai: `<performer id="<principal id>" name="<name>"/>`,
+`<character name="<name>"/>` and `<senpai id="<short id>" context="<label>"
+character="<name>"/>`, where `context` is the senpai's label and is left out
+when it has none; a root console has no `<senpai>`. The reviewer of the context's own asks is the senpai's
 character, or the climb past it; `kj context info` prints it. rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
 
-banto is the operator, and it performs the console. `banto/create/S00-stance.kai`
+banto is the operator, and it performs the console by default. `banto/create/S00-stance.kai`
 writes one line naming the system, the character that performs it and the
 senpai from the kernel fact, then reads its companion, which says "our senpai".
 The companion carries banto's character and the console's system-administrator
@@ -227,17 +226,18 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 `kj context create banto` starts a context performed by
 banto, while `created_by` remains the requester. The character is
 the positional and is required; it must exist and be live, and unknown or retired names
-fail before creating a context. The caller's instance becomes its senpai, and
+fail before creating a context. The caller's context becomes its senpai, and
 the reviewer follows that edge
 (`docs/approval-identity.md`). Model output and tools use the performer;
-the model turn refuses missing or self-reviewing identities. This does not
-load a character rc bundle. See `docs/character.md`, "Current implementation".
+the model turn refuses missing or self-reviewing identities. The context runs
+the character's rc directory. See `docs/character.md`, "Current implementation".
 
 banto's stance and the shared `S16-handoff.kai` read `performer_name` from
-context metadata. The handoff script reads that character's log, or the caller's
-log when no performer is recorded. `KJ_CHARACTER` was an environment bridge;
-new create instructions no longer use it. Existing stored instructions are
-unchanged until edited or replaced with a new context.
+`kj context info --json`. The handoff script reads that character's log, or the
+caller's log when no performer is recorded. rc also gets the performer's name
+as `KJ_CHARACTER`, which the companion's tick uses to select its own children.
+Existing stored instructions are unchanged until edited or replaced with a new
+context.
 
 Handoff, memory recall, datetime, and predecessor text are changing observations.
 Their scripts emit `(System, Notification)` blocks, which hydrate into the
@@ -340,11 +340,11 @@ and follows the successor. Rotation never prompts: the successor runs
 note, the successor still has the predecessor excerpt below, and a senpai
 may read the archived context's blocks.
 
-`kj context rotate` creates a successor conversation in the predecessor's
-character instance, on the instance's next binding, read fresh from the
-character's cast. It copies the system prompt, workspace, env, and cwd,
-sets `ROTATED_FROM` to the predecessor's id, and runs the `create` lifecycle.
-The senpai and the kohai point at the instance, so they do not move. The hydration window is not
+`kj context rotate` creates a successor context with the predecessor's
+performer and senpai, its slots read fresh from the character's own. It
+copies the system prompt, workspace, env, and cwd, sets `ROTATED_FROM` to the predecessor's
+id, and runs the `create` lifecycle. The kohai point at the predecessor, so
+they do not move (`docs/senpai-kohai.md`, "Rotation hands off its contexts"). The hydration window is not
 copied; a musician's create lifecycle sets its own. When the successor has a
 usable loadout, the predecessor's `archive` lifecycle runs, then one
 transaction archives the predecessor and gives the
@@ -378,9 +378,8 @@ metadata and runs the fork lifecycle, not creation.
 Keep `AGENTS.md` to repository work rules and essential invariants. Put task
 procedure and collaboration guidance in the character's directory's stance, and syntax
 in emitted help and tool schemas. A character's enduring
-commitments and memory sources belong with that character; the planned rc
-union is not yet implemented. Detailed writing rules and terms live in
-`docs/writing.md`.
+commitments and memory sources belong with that character, in its rc
+directory. Detailed writing rules and terms live in `docs/writing.md`.
 
 Write the rule before its reason and show correct examples. Preserve the user's
 objective, corrections, and unresolved work. Report observations, inferences,
@@ -510,9 +509,10 @@ input. `submitInput` does not wait for it.
 
 A submit either commits or is refused with nothing changed
 (`prompt::submit`). A context with no performer or no reviewer is refused
-before the draft commits, so the draft stays as typed. The human root runs
-no model turns, so a chat submit there is refused with a reason that points
-to the console and `Ctrl+Z`. Turn identity refusals reach the client
+before the draft commits, so the draft stays as typed. A context a person
+performs runs no model turns, so a chat submit there is refused with a reason
+that says its draft runs as shell and points to the console; clients run that
+draft as shell. Turn identity refusals reach the client
 as `submitInput`'s refused outcome, not as an RPC failure. Once the input
 commits, `submitInput` returns its block at once, and the `submit` scripts
 and turn startup run after the reply. A turn that then fails to start is
@@ -538,15 +538,9 @@ The storyteller ships its own `submit/S10-reminder.kai`. Other directories run n
 `submit` script; a directory opts in by symlink, the way any rc verb does.
 `assets/defaults/rc/lib/submit/S10-edge.kai` is the shipped shared script: it
 emits a `(System, Notification)` excerpt of the edge block, but only when the
-player was looking at an older point in the conversation than the log tail. See `docs/prompts.md`, "The submit verb" for the design this verb implements.
+player was looking at an older point in the conversation than the log tail.
 
-## Migration and comparison
-
-Deploy the character-positional implementation and metadata-reading banto/handoff scripts
-together, and the `kj context create` verbs with the rc and contrib scripts that call them. A kernel that lacks the flag cannot create the intended performer
-relationship. Replace contexts using the old `KJ_CHARACTER` bridge with verified
-successors as described above; changing the seed does not rewrite their stored
-instructions or assign their performer retroactively.
+## Deploying and comparison
 
 Deploy code and rc together. The old `/config/kernel/system.md` is no longer
 read or seeded. Do not keep a hidden compatibility prepend.

@@ -3614,7 +3614,7 @@ since no caller waits to retry. Every drift kind holds except
 is refused and the ask stays open. Amy's idea for later is to divert a
 remembered drift allow to the judge model's context, which can wait.
 
-## A context ready to roll (November 1)
+## A context ready to roll (November 1–5)
 
 Bringing up a clean senpai and kohai on zorak took a stuck approval and a slot
 per role, and Amy asked "why is it so much work?" The contributing factors were
@@ -3644,3 +3644,26 @@ console became `console` (Amy: "oh, I like console"), keyed on its type. The
 fold migration was rehearsed on a copy of zorak's backup before it shipped;
 `kernel_db.rs` was split into 30 modules first, by Haiku lanes working from a
 verified step list, which made the fold reviewable.
+
+The fold left a context with two things that said what it was: its type and
+its performer. Amy chose to melt the type into the character ("yeah A all the
+way", "having banto absorb director will be nice, no more dichotomy", "yep, one
+coder character"). A context now has no type; its performer's rc directory,
+gate layers and one model shape it, and a person is a root character whose
+contexts are all alike. A kaibo inventory of every `context_type` consumer
+found fourteen the first draft missed, and a review of the spec found the
+rollout could not stay green, so the slices were reordered: each backfill
+moved to the slice that reads it, and the directory renames came after the
+gate stopped validating sections against the rc tree, which would otherwise
+have refused every gated statement. Six slices landed on November 4–5: the
+sheet's `rc_dir` and pointers (M1), rc following the performer (M2), one model
+per character and the judge as a character (M3), gate layers by `[rc.<dir>]`,
+`[root]` and `[character.<name>]` ("Character + directory", M4), persons and
+pointers with wire facts in place of the type (M5), and the directory merges,
+the shipped characters and the dropped columns (M6). One lesson came from M6: moving test characters
+off `default/` narrowed their loadouts and silently turned off the council
+rig's council, which showed up as 40 failures and two hangs; fixtures now give
+each test character the directory its role runs. For the three acts that
+always ask, Amy chose "Verb raises a ledger ask" over a flag, and "last-person
+refusal is fine". The migrations and the current rules are in
+`docs/character.md`; the zorak deploy is open in `docs/issues.md`.

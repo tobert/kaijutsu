@@ -6,6 +6,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Type melt M8: the zorak deploy (2026-11-05)
+
+- Retire stale characters by hand, rehearse the boot migrations (`docs/character.md`, "Migrations") on a copy of
+  zorak's `kernel.db`, rewrite the host `gate.toml` by hand with a backup beside it, deploy, and check every shipped
+  character and the console live.
+
 ## Type melt M5e: what the always-asking acts and `--no-root` leave open (2026-11-05)
 
 - Hook bodies (`kj hook add` with an inline kaish body, run by `run_kaish_hook` in an Internal context shell,
@@ -19,8 +25,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - A host command that wraps `kj` (`env kj …`) is not read by the always-ask arm (`gate_policy::always_asks`).
 - `kaijutsu-server init` sets `rc_dir = person` with no directory check: it runs with no kernel or VFS. The next
   start's root-console rebind refuses loudly if `person/create` binds nothing.
-- `docs/gate-policy-tuning.md` "Senpai, the gate's model, and the director tier" still says broker PreCall has no
-  database and sees no edge; with a dispatcher wired it evaluates with the ledger and the database.
+
+## Type melt M7: what the docs pass leaves open (2026-11-05)
+
+- "seat" still names a context or a character in docs/container.md, docs/mk.md, the companion, storyteller,
+  toolie and assistant stances, and the assistant `S00` comment; docs/writing.md Terms keep "seat" for the
+  council. The stances are published prose: rewrite them together, read the composed prompt after.
+- A rotation moves no context that answered to the predecessor; the character takes them by hand
+  (docs/senpai-kohai.md, "Rotation hands off its contexts"). A `rotate` lifecycle that takes them after the commit
+  was described and never built; `rotate` today is the beat scheduler's page-turn verb (rc/mod.rs ~136-142).
+- docs/council.md says the console is not put under a council, but banto performs the console and banto/ runs
+  `S50-council-seats.kai`, so a `[rc.banto.council]` block puts it under one. Open question for Amy.
+- `contexts.persona` is never read (docs/senpai-kohai.md says it is NULL "until characters carry a persona";
+  stances live in rc directories). Decide whether the column goes.
 
 ## Type melt M5d: what retirement in one transaction leaves open (2026-11-05)
 
@@ -63,19 +80,12 @@ the character"). Open, outside M2:
   named judge's shadow. The archive takes the old ones with their seat only
   while the old judge's model is on a council server; otherwise they outlive
   their seats.
-- docs/council.md build-order item 4 (measurement notes) and "Two types: judge
-  and bump" still speak in types; M7 rewrites them.
 - The test `KjDispatcher` builds its own drift router, apart from `kernel.drift()`; a shadow
   `council/shadow.rs` registers is absent from it, so router-sync assertions live in `kj/edge_tests.rs`
   rather than `council/gate_e2e.rs`.
 - Bootstrap's console rotation on a NULL-`max_tokens` `model` slot has no test of its own.
 - Read-only pipes (`kj ... | head`, `| jq`) through the MCP shell raise asks
   for Amy; a probe should run the bare verb.
-
-## Type melt M5a: what persons and pointers leave open (2026-11-04)
-
-- docs/writing.md Terms define "root console" and "console" by type, and docs/character.md "Roots and rotation"
-  says "The console is a type, not a label"; M7 rewrites both.
 
 ## Type melt M4: what gate layers by directory and character leave open (2026-11-04)
 
@@ -856,7 +866,7 @@ the model under observation has tried."
   rules dropped the seat's narration because it changed every few decisions
   and forced re-sends (29 in 18 minutes); an append-only command list only
   extends, so a held snapshot stays useful.
-- **Design.** `docs/council.md`, "Shadow context (design, not built)". Amy,
+- **Design.** `docs/council.md`, "Shadow context". Amy,
   2026-10-09: start with shell calls, then every tool call; the shadow is a
   fork child of the seat; get it flowing into a megakernel context and
   measure before doing more. Amy, later that day: the judge rides on the
