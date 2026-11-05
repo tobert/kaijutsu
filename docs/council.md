@@ -300,12 +300,13 @@ are no server-side context ids, and a seat is sent whole each time.
   lifecycles of `coder/`, `banto/` and `companion/` run it
   (`lib/{create,fork}/S50-council-seats.kai`); a seat whose performer's
   layers enable no council builds nothing. `person/` and `mcp/` do not run
-  it. The console, the context a sheet's `console_ctx` names, is never under
-  a council, whatever its performer's layers say: the gate consults no
-  council for it and builds, pins and shadows no seat for it (Amy,
+  it. The console, the context a sheet's `console_ctx` names, and a person's
+  root console, the context a sheet's `root_ctx` names, are never under a
+  council, whatever their performer's layers say: the gate consults no
+  council for them and builds, pins and shadows no seat for them (Amy,
   2026-11-05: "Never under a council"; 2026-10-25: "the root is where Amy
-  goes when the council is failing"). The other contexts its performer
-  plays are judged as their layers say. A seat with no
+  goes when the council is failing"). The other contexts their performer
+  plays, `[root.council]` included, are judged as their layers say. A seat with no
   performer or an unresolved chain builds without the chain, and its first
   decision builds the rest. What changes
   later, such as an edited `AGENTS.md`, a new reviewer, or a `cd`, is

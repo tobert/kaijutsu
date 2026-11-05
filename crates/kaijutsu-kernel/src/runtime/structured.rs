@@ -24,7 +24,7 @@ pub struct ExecutedKj {
 
 // Source execution supplies per-call cancellation; kaish's execute_argv has
 // no ExecuteOptions argument. Backticks are literal inside kaish double quotes.
-fn kaish_quote(word: &str) -> String {
+pub(super) fn kaish_quote(word: &str) -> String {
     let escaped = word.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$");

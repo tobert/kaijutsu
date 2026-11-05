@@ -100,7 +100,7 @@ pub(crate) fn settle_outcome(
     ask_owner: Option<crate::PairOwner>,
 ) -> Result<(), String> {
     let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
-    settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, ask_owner, operation.as_ref().map(|state| &state.receipt))
+    settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, ask_owner, operation.as_ref().map(|state| &state.receipt), None)
 }
 
 /// Settle a command using the receipt retained from admission, without a lookup.
@@ -109,12 +109,25 @@ pub(crate) fn settle_operation(
     outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>,
 ) -> Result<(), String> {
     settle_known_outcome(kernel, receipt.context_id, &receipt.command_block_id, &receipt.output_block_id,
-        outcome, ask_owner, Some(receipt))
+        outcome, ask_owner, Some(receipt), None)
+}
+
+/// [`settle_operation`] that also spends the answer to ask `redeem` in the
+/// same acceptance as the projection, so no reader sees the pair settled
+/// while its answer is still undelivered. A failed redemption rolls the
+/// projection back, and the retry settles again.
+pub(crate) fn settle_operation_redeeming(
+    kernel: &Kernel, receipt: &crate::shell_operations::ShellOperationReceipt,
+    outcome: &CommandOutcome, redeem: &str,
+) -> Result<(), String> {
+    settle_known_outcome(kernel, receipt.context_id, &receipt.command_block_id, &receipt.output_block_id,
+        outcome, None, Some(receipt), Some(redeem))
 }
 
 fn settle_known_outcome(
     kernel: &Kernel, context_id: ContextId, command_block_id: &BlockId, output_block_id: &BlockId,
     outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>, operation: Option<&crate::shell_operations::ShellOperationReceipt>,
+    redeem: Option<&str>,
 ) -> Result<(), String> {
     if operation.is_some_and(|operation| operation.command_block_id != *command_block_id) {
         return Err("shell operation command block does not match its receipt".into());
@@ -182,6 +195,9 @@ fn settle_known_outcome(
                     crate::shell_operations::ShellOperationRegistry::complete_outcome_in(db, id, output_block_id, outcome).map(|_| ())
                 };
                 result.map_err(crate::kernel_db::KernelDbError::Validation)?;
+            }
+            if let Some(ask) = redeem {
+                db.redeem_ask(ask)?;
             }
             if status == Status::Waiting { db.release_approval_pair(envelope.ask_id.as_deref().expect("validated waiting ask"))?; }
             else if let Some(ask) = envelope.ask_id.as_deref() {

@@ -1151,12 +1151,6 @@ impl GateConfig {
         enabled.then_some(council)
     }
 
-    /// Whether the council reads for a context `performer` plays
-    /// ([`Self::council_for`]).
-    pub(crate) fn council_enabled_for(&self, performer: Option<&GatePerformer>) -> bool {
-        self.council_for(performer).is_some()
-    }
-
     fn table_from(tier: &TierToml, section: &Section, council: Option<&CouncilConfig>) -> Result<TierTable, GateConfigError> {
         let header = section.header();
         let mut entries = Vec::new();
@@ -1441,29 +1435,34 @@ impl Layers<'_> {
     }
 }
 
-/// The performer of a context, as the gate's layers key on it: its name,
-/// rc directory and root flag off the character sheet. `Ok(None)` for a
-/// caller with no context or a known context with no performer, which
-/// reads `[global]` alone. A context id with no row, a performer with no
-/// sheet, or a read that fails, is an error the caller refuses on.
 /// The council a context's gate decisions read: the one its performer's
-/// layers compose ([`GateConfig::council_for`]), except that the console, the
-/// context a sheet's `console_ctx` names, is never under a council,
-/// whatever its performer's layers say (`docs/council.md`, "Council v2
-/// seats"). The gate's consult, seat planning and the judge shadow all read
-/// it. `Err` is a fault reading the console pointers.
+/// layers compose ([`GateConfig::council_for`]), except that the console,
+/// the context a sheet's `console_ctx` names, and a person's root console,
+/// the context a sheet's `root_ctx` names, are never under a council,
+/// whatever their performer's layers say: the root is where the person goes
+/// when the council is failing (`docs/council.md`, "Council v2 seats"). The
+/// gate's consult, the ask's council flag, seat planning and the judge
+/// shadow all read it. `Err` is a fault reading the console pointers.
 pub(crate) fn council_for_context(
     db: &KernelDb,
     config: &GateConfig,
     context: ContextId,
     performer: Option<&GatePerformer>,
 ) -> Result<Option<CouncilConfig>, String> {
-    let console = db.is_console(context).map_err(|e| {
-        format!("the gate could not read whether context {} is a console: {e} (fail-closed)", context.short())
-    })?;
-    Ok(if console { None } else { config.council_for(performer) })
+    let unread = |what: &str, e: crate::kernel_db::KernelDbError| {
+        format!("the gate could not read whether context {} is {what}: {e} (fail-closed)", context.short())
+    };
+    if db.is_console(context).map_err(|e| unread("a console", e))? || db.is_root_console(context).map_err(|e| unread("a root console", e))? {
+        return Ok(None);
+    }
+    Ok(config.council_for(performer))
 }
 
+/// The performer of a context, as the gate's layers key on it: its name,
+/// rc directory and root flag off the character sheet. `Ok(None)` for a
+/// caller with no context or a known context with no performer, which
+/// reads `[global]` alone. A context id with no row, a performer with no
+/// sheet, or a read that fails, is an error the caller refuses on.
 pub(crate) fn performer_of(db: &KernelDb, context_id: Option<ContextId>) -> Result<Option<GatePerformer>, String> {
     let Some(id) = context_id else { return Ok(None) };
     let row = db
@@ -3990,20 +3989,20 @@ enabled = false
     fn council_absent_means_off_everywhere() {
         let cfg = config("[global]\nallow = [\"rg\"]\n");
         assert!(cfg.council().is_none());
-        assert!(!cfg.council_enabled_for(None));
-        assert!(!cfg.council_enabled_for(Some(&dir("coder"))));
+        assert!(cfg.council_for(None).is_none());
+        assert!(cfg.council_for(Some(&dir("coder"))).is_none());
         let shipped = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         assert!(shipped.council().is_none(), "the shipped default is council-off");
-        assert!(!shipped.council_enabled_for(Some(&dir("coder"))));
+        assert!(shipped.council_for(Some(&dir("coder"))).is_none());
     }
 
     #[test]
     fn council_is_enabled_per_rc_directory() {
         let cfg = config(COUNCIL_FULL);
-        assert!(cfg.council_enabled_for(Some(&dir("coder"))));
-        assert!(!cfg.council_enabled_for(Some(&dir("toolie"))), "enabled = false");
-        assert!(!cfg.council_enabled_for(Some(&dir("banto"))), "unmentioned directory");
-        assert!(!cfg.council_enabled_for(None), "no performer");
+        assert!(cfg.council_for(Some(&dir("coder"))).is_some());
+        assert!(cfg.council_for(Some(&dir("toolie"))).is_none(), "enabled = false");
+        assert!(cfg.council_for(Some(&dir("banto"))).is_none(), "unmentioned directory");
+        assert!(cfg.council_for(None).is_none(), "no performer");
     }
 
     #[test]
@@ -4287,7 +4286,7 @@ enabled = true
         assert_eq!(c.specs[1].contexts, ["council-code"]);
         assert!(c.require_agree_for("shell-bump") && !c.require_agree_for("program-gate"));
         assert!(c.threshold_for("shell-bump").is_some() && c.threshold_for("program-gate").is_some());
-        assert!(cfg.council_enabled_for(Some(&dir("coder"))));
+        assert!(cfg.council_for(Some(&dir("coder"))).is_some());
         assert!(c.house_rules);
         for verb in ["kj ledger show 01a1", "kj ledger list --history", "kj rc list", "kj binding list"] {
             assert!(matches!(first_verdict(verb, &cfg, Some("coder")), PolicyVerdict::Deny(_)), "{verb}");

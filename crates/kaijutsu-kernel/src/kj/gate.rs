@@ -3441,6 +3441,20 @@ mod tests {
         assert!(refusal.contains("only bea may retire banto"), "{refusal}");
     }
 
+    /// The policy reason `source` asks for, as the RPC ask-tier path
+    /// describes it: the shell-gate ask's own description is the statement,
+    /// so the console a decision names shows only here.
+    fn asking_policy(d: &crate::kj::KjDispatcher, caller: &KjCaller, source: &str, config: &str) -> String {
+        let config = crate::kj::gate_policy::GateConfig::parse(config).expect("test config parses");
+        let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+        let db = d.kernel_db.lock();
+        let performer = crate::kj::gate_policy::performer_of(&db, caller.context_id).unwrap();
+        let layers = crate::kj::gate_policy::Layers { config: &config, performer: performer.as_ref() };
+        let policy = crate::kj::gate_policy::evaluate(&db, &spec, crate::kj::gate_policy::RuleCaller::of(caller), layers).unwrap();
+        let planned = kaish_kernel::ast::plan::plan_program(source).unwrap();
+        policy.describe_asks_planned(&planned, true).unwrap_or_else(|| panic!("{source} asks for nothing"))
+    }
+
     /// `kj context archive --children` archives the children in order and
     /// stops at the first it may not archive. When that is another person's
     /// console and no console the caller may archive comes before it, the
@@ -3461,7 +3475,10 @@ mod tests {
         assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
         let id = pending_id(&d);
         let description = d.kernel_db.lock().get_approval(&id).unwrap().unwrap().description;
-        assert!(description.contains("con") && !description.contains("bea-con"), "{description}");
+        let policy = asking_policy(&d, &amy, source, allow);
+        assert!(description.contains(source), "the description carries the statement: {description}");
+        assert!(policy.contains("whose child con ("), "names the console the verb archives: {policy}");
+        assert!(!policy.contains("bea-con"), "does not name the one it refuses: {policy}");
 
         // bea's console is the first child: the verb refuses before it
         // archives anything, so no ask.

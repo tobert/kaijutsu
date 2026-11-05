@@ -44,17 +44,19 @@ pub struct KjBuiltin {
     /// The `kj` statements an allowed ask's plan contained, in the shell that
     /// runs its source (`ShellPolicy::Approved`). Each runs as confirmed,
     /// because the approval confirmed it; any other `kj` there runs
-    /// unconfirmed.
+    /// unconfirmed, and runs as confirmed only when it spells `--confirm`.
     approved: Option<ApprovedKj>,
 }
 
 /// The `kj` statements an approval confirms: each planned `kj` command of the
 /// approved source whose every argument is a literal word, as its argv
 /// without `--confirm` and `--json`. A `kj` invocation is confirmed when its
-/// argv, read the same way, equals one of them. A `kj` the plan did not
-/// contain as a literal statement (one a sourced file, a substitution or an
-/// expanded argument reaches) is not confirmed, so a `Destroy` verb latches
-/// there. See `docs/character.md`, "Gate".
+/// argv, read the same way, equals one of them. A literal `$(kj ...)` in the
+/// source is planned as its own command, so it is confirmed. A `kj` the plan
+/// did not contain as a literal statement (one a sourced file or an expanded
+/// argument reaches) is not confirmed, so a `Destroy` verb latches there
+/// unless the invocation spells `--confirm` itself. See `docs/character.md`,
+/// "Gate".
 #[derive(Clone, Debug, Default)]
 pub struct ApprovedKj(Arc<Vec<Vec<String>>>);
 
@@ -615,7 +617,7 @@ impl Tool for KjBuiltin {
                 target,
                 message,
             } => {
-                let hint = format!("kj {} --confirm", argv.join(" "));
+                let hint = confirm_hint(&argv);
                 latch_result(&command, &target, &message, hint)
             }
         };
@@ -624,6 +626,21 @@ impl Tool for KjBuiltin {
         // and any context switch already applied above.
         exec
     }
+}
+
+/// The command that confirms a latched `kj`: its argv with `--confirm`, each
+/// word quoted when it is empty or holds anything the shell would split or
+/// expand, so the re-run is the command that latched.
+fn confirm_hint(argv: &[String]) -> String {
+    let words: Vec<String> = argv
+        .iter()
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c));
+            if plain { word.clone() } else { super::structured::kaish_quote(word) }
+        })
+        .collect();
+    format!("kj {} --confirm", words.join(" "))
 }
 
 /// Read the rc recursion depth from the shell scope's `KJ_RC_DEPTH`.
@@ -803,6 +820,73 @@ mod tests {
     use kaijutsu_types::{PrincipalId, SessionId};
     use kaish_kernel::ast::Value;
     use kaish_kernel::ExecuteOptions;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// The approval confirms a planned `kj` and ignores `--confirm` and
+    /// `--json` on either side.
+    ///
+    /// Falsified by a `comparable` that keeps either flag.
+    #[test]
+    fn an_approval_ignores_confirm_and_json_on_both_sides() {
+        let approved = ApprovedKj::planned_in("kj context archive con --confirm --json");
+        assert!(approved.confirms(&argv(&["context", "archive", "con"])), "flags removed from the plan");
+        assert!(approved.confirms(&argv(&["context", "archive", "con", "--confirm"])));
+        assert!(approved.confirms(&argv(&["context", "archive", "--json", "con"])), "and from the invocation");
+        let bare = ApprovedKj::planned_in("kj context archive con");
+        assert!(bare.confirms(&argv(&["context", "archive", "con", "--confirm", "--json"])));
+    }
+
+    /// A planned `kj` with an argument that expands confirms nothing: the
+    /// plan does not know what the argument becomes.
+    ///
+    /// Falsified by keeping non-literal arguments in the plan.
+    #[test]
+    fn a_planned_kj_with_a_non_literal_argument_confirms_nothing() {
+        let approved = ApprovedKj::planned_in("X=con; kj context archive $X");
+        assert!(!approved.confirms(&argv(&["context", "archive", "con"])));
+        assert!(!approved.confirms(&argv(&["context", "archive"])), "not the literal prefix either");
+        assert!(!approved.confirms(&argv(&["context", "archive", "$X"])));
+    }
+
+    /// A literal `$(kj ...)` in the source is planned as its own command, so
+    /// the approval confirms it.
+    #[test]
+    fn a_literal_kj_in_a_substitution_is_confirmed() {
+        let approved = ApprovedKj::planned_in("echo $(kj context archive con)");
+        assert!(approved.confirms(&argv(&["context", "archive", "con"])));
+    }
+
+    /// A different argv is not confirmed, and a statement with no `kj`, or
+    /// source that does not plan, confirms nothing.
+    #[test]
+    fn a_different_argv_or_no_kj_confirms_nothing() {
+        let approved = ApprovedKj::planned_in("kj context archive con");
+        assert!(!approved.confirms(&argv(&["context", "archive", "other"])));
+        assert!(!approved.confirms(&argv(&["context", "archive", "con", "extra"])), "not a prefix match");
+        assert!(!approved.confirms(&argv(&["context", "archive"])));
+        assert!(!approved.confirms(&argv(&["context", "demote", "con"])));
+        for source in ["echo kj context archive con", "ls", "if then"] {
+            let approved = ApprovedKj::planned_in(source);
+            assert!(!approved.confirms(&argv(&["context", "archive", "con"])), "{source}");
+        }
+        assert!(!ApprovedKj::default().confirms(&argv(&["context", "archive", "con"])));
+    }
+
+    /// The latch hint re-runs the command that latched: a word with a space
+    /// stays one word.
+    ///
+    /// Falsified by joining the words with spaces and no quoting.
+    #[test]
+    fn the_latch_hint_quotes_a_word_with_a_space() {
+        assert_eq!(confirm_hint(&argv(&["context", "archive", "con"])), "kj context archive con --confirm");
+        assert_eq!(
+            confirm_hint(&argv(&["context", "archive", "my ctx", "", "a\"$b"])),
+            "kj context archive \"my ctx\" \"\" \"a\\\"\\$b\" --confirm"
+        );
+    }
 
     /// Build an `EmbeddedKaish` wired to a `KjBuiltin` rooted at the given
     /// dispatcher. Mirrors the rc-lifecycle wiring in `rc/mod.rs`

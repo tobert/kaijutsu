@@ -364,9 +364,10 @@ pub enum ShellHookVerdict {
 struct AskTier {
     /// The ask's description: each asking statement's layer and key.
     description: String,
-    /// The council reads the submission before the ask: `gate.toml`
-    /// enables it for the caller's performer and the actor is not a live
-    /// root character.
+    /// The council reads the submission before the ask: the context is
+    /// under a council (`gate.toml` enables it for the caller's performer
+    /// and the context is neither a console nor a root console) and the
+    /// actor is not a live root character.
     council: bool,
 }
 
@@ -3049,8 +3050,24 @@ impl Broker {
             return Ok(None);
         }
         let root = self.actor_is_root(ctx).await?;
-        let council = !root && config.council_enabled_for(performer.as_ref());
+        let council = !root && self.council_applies(config, ctx, performer.as_ref()).await?;
         Ok(policy.describe_asks_planned(&statements, !root).map(|description| AskTier { description, council }))
+    }
+
+    /// Whether the council reads `ctx`'s decisions: the rule `consult`,
+    /// seat planning and the judge shadow read
+    /// ([`crate::kj::gate_policy::council_for_context`]), so a console and a
+    /// root console are not under it. With no dispatcher wired there is no
+    /// council. `Err` when the pointers do not read.
+    async fn council_applies(
+        &self,
+        config: &crate::kj::gate_policy::GateConfig,
+        ctx: &CallContext,
+        performer: Option<&crate::kj::gate_policy::GatePerformer>,
+    ) -> Result<bool, String> {
+        let Some(dispatcher) = self.kj_dispatcher().await else { return Ok(false) };
+        let db = dispatcher.kernel_db().lock();
+        Ok(crate::kj::gate_policy::council_for_context(&db, config, ctx.context_id, performer)?.is_some())
     }
 
     /// Whether `ctx`'s actor is a live root character: a person's hands, so

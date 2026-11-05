@@ -93,9 +93,12 @@ struct Judge {
     shadow_label: String,
     /// The seat's label, or its short id when it has none.
     seat_name: String,
-    /// The seat's performer, whose layers name the council the judge is
-    /// read under.
-    seat_performer: Option<crate::kj::gate_policy::GatePerformer>,
+    /// The name of the seat's performer, for logs.
+    seat_performer: String,
+    /// The shell spec of the council the seat reads, resolved once with the
+    /// judge's name: the spec the judge is primed under. `None` when the
+    /// council declares no shell spec.
+    spec_name: Option<String>,
     /// The council server that holds the shadow: its `model` slot's backend
     /// address and model when its kind is `mk`, or why it names none. `None`
     /// for a chat backend.
@@ -135,7 +138,7 @@ pub(crate) async fn record_call(
             return None;
         }
     };
-    spawn_prime(kernel, &judge, config);
+    spawn_prime(kernel, &judge);
     let read = judge.server.clone().map(|server| JudgeRead {
         seat,
         seat_name: judge.seat_name.clone(),
@@ -148,17 +151,12 @@ pub(crate) async fn record_call(
 }
 
 /// Primes a council-server judge on a task of its own. The judge is read
-/// under the seat's shell spec from `gate.toml`; a seat whose performer's
-/// layers enable no council there is not primed.
-fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLoad) {
+/// under the shell spec of the council the seat read when the judge was
+/// named; a council with no shell spec primes nothing.
+fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge) {
     let Some(Ok(SlotServer { server, model })) = judge.server.clone() else { return };
-    let spec_name = config
-        .as_ref()
-        .ok()
-        .and_then(|c| c.council_for(judge.seat_performer.as_ref()))
-        .and_then(|c| super::gate::shell_spec(&c).map(|s| s.name.clone()));
-    let Some(spec_name) = spec_name else {
-        let performer = judge.seat_performer.as_ref().map_or("none", |p| p.name.as_str());
+    let Some(spec_name) = judge.spec_name.clone() else {
+        let performer = &judge.seat_performer;
         tracing::warn!(shadow = %judge.shadow, %performer, "shadow: not primed: gate.toml declares no council shell spec for the seat's performer");
         return;
     };
@@ -458,19 +456,23 @@ async fn run_create_lifecycle(kernel: &crate::Kernel, shadow: ContextId) {
     }
 }
 
-/// The judge character `config` names for `seat`, which `performer` plays:
-/// the `judge` of the council the seat reads
-/// ([`crate::kj::gate_policy::council_for_context`]). `None` when it has no
-/// council or the council names no judge, or the config did not load.
+/// The judge character `config` names for `seat`, which `performer` plays,
+/// and the name of the shell spec it is primed under: the `judge` of the
+/// council the seat reads ([`crate::kj::gate_policy::council_for_context`]),
+/// resolved once. `None` when it has no council or the council names no
+/// judge, or the config did not load.
 fn judge_name(
     db: &crate::kernel_db::KernelDb,
     config: &GateConfigLoad,
     seat: ContextId,
     performer: Option<&crate::kj::gate_policy::GatePerformer>,
-) -> KernelDbResult<Option<String>> {
+) -> KernelDbResult<Option<(String, Option<String>)>> {
     let Ok(config) = config.as_ref() else { return Ok(None) };
     let council = crate::kj::gate_policy::council_for_context(db, config, seat, performer).map_err(KernelDbError::Validation)?;
-    Ok(council.and_then(|council| council.judge))
+    Ok(council.and_then(|council| {
+        let spec_name = super::gate::shell_spec(&council).map(|s| s.name.clone());
+        council.judge.map(|judge| (judge, spec_name))
+    }))
 }
 
 /// The live character named `name`, or why there is none.
@@ -509,13 +511,14 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
         let performer = crate::kj::gate_policy::performer_of(&db, Some(seat)).map_err(KernelDbError::Validation)?;
-        let Some(name) = judge_name(&db, config, seat, performer.as_ref())? else { return Ok(None) };
+        let Some((name, spec_name)) = judge_name(&db, config, seat, performer.as_ref())? else { return Ok(None) };
         let sheet = judge_character(&db, &name)?;
         let mut judge = Judge {
             shadow: seat,
             shadow_label: String::new(),
             seat_name: name_of(&seat_row),
-            seat_performer: performer,
+            seat_performer: performer.as_ref().map_or_else(|| "none".to_owned(), |p| p.name.clone()),
+            spec_name,
             server: None,
         };
         if let Some(existing) = live_shadow(&db, seat, sheet.principal_id)? {

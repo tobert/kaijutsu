@@ -215,11 +215,15 @@ fn settle_operation_error(
     kernel: &Arc<Kernel>,
     receipt: &crate::shell_operations::ShellOperationReceipt,
     reason: String,
+    redeem: Option<&str>,
 ) -> Result<(), String> {
     let mut outcome = crate::runtime::command_outcome::CommandOutcome::new(
         crate::runtime::command_outcome::CommandExecution::NotRun, 0);
     outcome.settlement_error = Some(reason);
-    crate::runtime::command::settle_operation(kernel, receipt, &outcome, None)?;
+    match redeem {
+        Some(ask) => crate::runtime::command::settle_operation_redeeming(kernel, receipt, &outcome, ask)?,
+        None => crate::runtime::command::settle_operation(kernel, receipt, &outcome, None)?,
+    }
     // The pair may already be cached from an earlier turn as `Waiting`;
     // this settles it in place, so the next turn must hydrate cold to see
     // it (see `crate::runtime::turn_state::ConversationCache::evict`).
@@ -429,7 +433,7 @@ impl Drop for ApprovalPreparation<'_> {
         if !self.armed || !std::thread::panicking() { return; }
         let reason = "Approved action preparation panicked; nothing was run. The approval is spent.";
         if let Some(receipt) = &self.receipt {
-            if let Err(error) = settle_operation_error(self.kernel, receipt, reason.into()) {
+            if let Err(error) = settle_operation_error(self.kernel, receipt, reason.into(), None) {
                 tracing::error!(%error, "could not persist approved preparation panic");
             }
         } else {
@@ -564,19 +568,19 @@ async fn act_on_executable_answer(
         let Some((_, output_block_id, owner)) = linked else {
             return ExecAction::FallThrough;
         };
-        if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"), ask.denial.clone()) {
+        // A session or a holding turn reads its pair directly, so settling
+        // the pair delivers the refusal, and the same acceptance spends the
+        // answer: no reader sees the pair settled with its answer still
+        // undelivered. A turn's refusal seed spends it in the same
+        // acceptance as the seed block.
+        let turn_seeded = owner == crate::PairOwner::Turn && held.is_none();
+        let redeem = (!turn_seeded).then_some(answer.request_id.as_str());
+        if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"), ask.denial.clone(), redeem) {
             tracing::error!(ask = %answer.request_id, %error, "refusal settlement failed; retaining the answer");
             return ExecAction::Deferred;
         }
-        if owner == crate::PairOwner::Turn && held.is_none() {
+        if turn_seeded {
             return ExecAction::Tell(unrun_turn_seed(who, answer.status, &answer.description, &output_block_id));
-        }
-        // A session or a holding turn reads its pair directly, so settling
-        // the pair delivered the refusal; spend the answer here. (A turn's refusal seed spends
-        // it in the same acceptance as the seed block.)
-        if let Err(error) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
-            tracing::error!(ask = %answer.request_id, %error, "refusal settled but redemption failed");
-            return ExecAction::Deferred;
         }
         if held.is_some() { kernel.held_asks().release(&answer.request_id); }
         return ExecAction::Settled;
@@ -607,7 +611,7 @@ async fn act_on_executable_answer(
     if performer_changed {
         let reason = "The context's performer changed after this ask was raised; nothing was run.".to_string();
         if let Some((_, output, _)) = linked {
-            if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"), reason.clone()) {
+            if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"), reason.clone(), None) {
                 return ExecAction::Tell(format!("{reason} Its result could not be persisted: {error}. Inspect block {}.", output.to_key()));
             }
         }
@@ -659,7 +663,7 @@ async fn act_on_executable_answer(
             );
             if let Some((_, output_block_id, _owner)) = linked {
                 if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"),
-                    format!("approved, but no shell could be built to run it: {e}")) {
+                    format!("approved, but no shell could be built to run it: {e}"), None) {
                     return ExecAction::Tell(format!("The approved action did not run because no shell could be built: {e}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
                 }
             }
@@ -714,7 +718,7 @@ async fn act_on_executable_answer(
     // spends the approval but settles its pair without running the source.
     if let Err(why) = prepare_while_running(stop, seed_ask_env(&kaish, &answer.request_id, kernel)).await {
         let reason = format!("approved, but not run: {why}");
-        if let Err(error) = settle_operation_error(kernel, &receipt, reason.clone()) {
+        if let Err(error) = settle_operation_error(kernel, &receipt, reason.clone(), None) {
             return ExecAction::Tell(format!("{reason}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
         }
         if held.is_some() {
@@ -1901,6 +1905,87 @@ mod lifetime_tests {
             assert_eq!(kernel.kernel_db().lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == request),
                 owner == crate::PairOwner::Turn, "a model denial still needs its durable notification");
         }
+    }
+
+    /// A denied ask whose pair a session owns, waiting: the ask, its pair,
+    /// the undelivered answer and the ask as the worker reads it.
+    fn denied_session_pair(
+        dispatcher: &Arc<crate::kj::KjDispatcher>, label: &str,
+    ) -> (ContextId, PrincipalId, String, BlockId, crate::UndeliveredAnswer, ExecutableAsk) {
+        use crate::kj::test_helpers::register_context;
+        use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        let kernel = dispatcher.kernel();
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context = register_context(dispatcher, Some(label), None, actor);
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let (command, output) = test_pair(kernel, context, actor, "echo must-not-run");
+        for block in [&command, &output] { kernel.blocks().set_status(context, block, Status::Waiting).unwrap(); }
+        let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+            context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+            reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+            origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+            description: "run captured source".into(), statements: vec![], authorized_label: None,
+            rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+            exec_source: Some("echo must-not-run".into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+        }).unwrap();
+        kernel.kernel_db().lock().link_ask_blocks(&request, &command, &output, crate::PairOwner::Session).unwrap();
+        decide(kernel.kernel_db().lock().conn_for_ledger(), &request, DecideInput {
+            allow: false, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+            ..Default::default()
+        }).unwrap();
+        let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+        let ask = ExecutableAsk { source: "echo must-not-run".into(), stdin: None, cwd: None, actor, reviewer, read_only: false,
+            denial: "denied; nothing ran".into() };
+        (context, actor, request, output, answer, ask)
+    }
+
+    /// A denial settles its pair and spends its answer in one acceptance: a
+    /// redemption that fails leaves the pair's operation incomplete and the
+    /// answer retained, so no reader sees the pair settled with its answer
+    /// undelivered. (A failed acceptance poisons its document until a
+    /// restart, so the blocks are not read after the fault.)
+    ///
+    /// Falsified by redeeming after the settlement: the operation completes
+    /// before the redemption fails.
+    #[tokio::test]
+    async fn a_denial_settles_its_pair_and_spends_its_answer_together() {
+        use approval_ledger::ask::redeemed_at;
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
+        let kernel = dispatcher.kernel();
+        let (context, actor, request, output, answer, ask) = denied_session_pair(&dispatcher, "denial-together");
+        let stop = tokio_util::sync::CancellationToken::new();
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch("CREATE TRIGGER reject_redemption BEFORE INSERT ON approval_redemptions
+            BEGIN SELECT RAISE(FAIL, 'injected redemption fault'); END;").unwrap();
+        let first = act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+        assert!(matches!(first, ExecAction::Deferred), "the failed redemption retains the answer");
+        assert!(redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+        let operation = kernel.shell_operations().get_by_output(&output, context).unwrap().unwrap();
+        assert!(operation.completed_at.is_none(), "the operation did not complete without its answer spent");
+    }
+
+    /// The state a settlement that committed without its redemption would
+    /// leave, a pair settled by this denial with its answer unspent, is
+    /// settled and spent by the next scan.
+    ///
+    /// Falsified by a settlement that refuses an already settled pair, which
+    /// would defer the answer forever.
+    #[tokio::test]
+    async fn a_pair_settled_by_its_denial_with_the_answer_unspent_converges() {
+        use approval_ledger::ask::redeemed_at;
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
+        let kernel = dispatcher.kernel();
+        let (context, actor, request, output, answer, ask) = denied_session_pair(&dispatcher, "denial-converges");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let status = || kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap().status;
+        let receipt = kernel.shell_operations().get_by_output(&output, context).unwrap().unwrap().receipt;
+        settle_operation_error(kernel, &receipt, ask.denial.clone(), None).unwrap();
+        assert_eq!(status(), Status::Error);
+        assert!(redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+        let converged = act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+        assert!(matches!(converged, ExecAction::Settled), "a settled pair with an unspent answer converges");
+        assert!(redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_some());
+        assert_eq!(status(), Status::Error);
     }
 
     #[tokio::test]

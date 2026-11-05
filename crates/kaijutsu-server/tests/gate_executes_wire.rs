@@ -1444,8 +1444,12 @@ fn shell_box_pair_fills_when_its_own_ask_is_allowed() {
 /// The denied half of the same path: the pair the shell box left `Waiting`
 /// settles `Error`, and nothing runs.
 ///
-/// Falsified by settling only the output block, or by running the command
-/// before reading the answer.
+/// A denial settles its pair and spends its answer in one acceptance, so the
+/// answer is already redeemed when the pair is seen settled.
+///
+/// Falsified by settling only the output block, by running the command
+/// before reading the answer, or by spending the answer after the pair
+/// settles.
 #[test]
 fn shell_box_pair_settles_error_when_its_own_ask_is_denied() {
     run_local(async {

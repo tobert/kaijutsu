@@ -148,24 +148,32 @@ sheet, live or retired, is listed by `kj ledger rules` as applying to nobody and
 such sections changes between loads. It does not fail the load: a failed load refuses every gated statement,
 including the `kj character create` that would fix it. An rc tree that cannot be listed skips the `[rc.<dir>]` check
 with a warning naming the tree. The council's case carries the performer's name, and the council contexts a context
-consults are composed from its performer's layers. The console is never under a council, whatever its performer's
-layers say: the gate consults none for it and builds no seat for it, while banto's other contexts are judged as
-their layers say ("Never under a council", Amy, 2026-11-05, because "the root is where Amy goes when the council
-is failing").
+consults are composed from its performer's layers. The console and a person's root console (the context a sheet's
+`root_ctx` names) are never under a council, whatever their performer's layers say: the gate consults none for them,
+raises no council-read ask for them and builds no seat for them, while the other contexts the same character plays,
+banto's or a person's, are judged as their layers say, `[root.council]` included ("Never under a council", Amy,
+2026-11-05, because "the root is where Amy goes when the council is failing").
 
 Three acts always ask: archiving a console (a context a sheet's `console_ctx` names), with `kj context archive`
 or the `kj context demote` step that archives it; `kj character set <name> --no-root`; and `kj character retire
 <name>` when `<name>` is a person or performs a live console. The gate decides them by their target, as it decides
 `kj context create` by its parent. An allow key, a learned rule or the council does not skip the ask, and a deny
-key still refuses. The gate raises no ask that the verb refuses for its caller whatever the answer: `--no-root` or
-a person's retirement by a caller who is not a live person, a console's archive by a caller who may not archive
-it, and the retirement of a character that performs any live person's console but the caller's. `kj context
-archive --children` archives the children in order and stops at the first it may not archive, so it asks naming
-the consoles it archives before that child, and raises no ask when another person's console comes before any
-console the caller may archive. The ask is answered in the ledger like any other, and a person answers one raised
-in a context they perform. Allowing it runs each `kj` statement the ask showed as confirmed, because an approval is
-a stronger confirmation than `--confirm`; a `kj` the source reaches another way (a file it runs with `source`, a
-command substitution, an argument that expands) runs unconfirmed, and a permanent verb there latches. `kj context
+key still refuses. The gate mirrors the verbs' authority refusals for the caller, not every refusal. It raises no
+ask for `--no-root` or a person's retirement by a caller who is not a live person, for a console's archive by a caller who may not
+archive it, or for the retirement of a character that performs any live person's console but the caller's. It
+does not model the refusals that do not depend on the caller: retire's last-person refusal, a context that no
+verb archives (`archive_refusal`), a held drift, a root console, or an MCP hub with live sessions. The gate can
+therefore ask for an act the verb then refuses, which over-asks and is safe. `kj context archive --children`
+archives the children in order and stops at the first it may not archive, so it asks naming the consoles it
+archives before that child and raises no ask when another person's console comes before any console the caller
+may archive; it models the console rule alone, so it can name a console the verb never reaches because it stops
+first at a child it refuses for another reason. The ask is answered in the ledger like any other, and a person
+answers one raised in a context they perform. Allowing it runs each `kj` statement the ask showed as confirmed,
+because an approval is a stronger confirmation than `--confirm`. That includes a literal `$(kj ...)` in the
+approved source, which the plan holds as its own command, so the reviewer saw it. A `kj` the plan did not hold as a
+literal command (one in a file the source runs with `source`, or one with an argument that expands) is not
+confirmed by the approval, and a permanent verb there latches; one that spells `--confirm` itself runs, as any
+`kj` with `--confirm` does. `kj context
 promote <console>` brings back an archived console. A promote whose senpai is archived refuses, naming `kj context
 promote <senpai>` and `kj context set <ctx> --senpai <ctx>`. `kj character set <name> --root` makes the character
 a person again, with a new root console and MCP hub; the old root console stays archived, and `kj context promote`

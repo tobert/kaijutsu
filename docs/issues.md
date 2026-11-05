@@ -33,6 +33,22 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   position does not reach the gate at all, because kaish refuses to parse it (pinned by
   `a_command_name_is_always_a_literal_word` in kj/gate_policy.rs). An approval does not confirm the aliased `kj`
   (runtime/kj_builtin.rs `ApprovedKj`), so a `Destroy` verb there latches unless the alias text carries `--confirm`.
+- `source <file>` hides an always-asking act from the gate's arm: `always_asks` reads the statement, which names
+  `source` and a path, not the file. The gate has no rule for `source`, so it asks as an uncovered statement for a
+  model, and runs it for a root actor or a config that allows `source`; the file's `kj` then runs with only its own
+  `--confirm`, and the approval confirms none of it (`ApprovedKj` holds literal statements of the approved source).
+- The gate's refusal mirror models the caller's authority alone: over a console (`console_archive_refusal`), and for
+  a person's `--no-root` and retirement. It does not model retire's last-person refusal, `archive_refusal`, a
+  held drift, a root console or an MCP hub with live sessions, so `kj context archive --children`, retire and single
+  archive or demote can ask for an act the verb then refuses, and `--children` can name a console the verb never
+  reaches. That over-asks, which is safe. kaibo job-4.
+- `kj context promote` checks the active ring's capacity before the archived-senpai refusal
+  (kernel_db/context_ring.rs ~594-645), so a promote that has a remedy reports "active ring full" first. Reorder
+  the checks so the remedy comes first.
+- A failed acceptance poisons its block document until a restart (`BlockStore::get` asserts). A denial now spends its
+  answer inside the settlement's acceptance (`settle_operation_redeeming`), so a ledger fault there poisons the
+  context's document where a failed second write would only have deferred the answer. A ledger fault is already
+  a P1; this widens what one costs.
 
 ## Type melt M7: what the docs pass leaves open (2026-11-05)
 
@@ -471,6 +487,13 @@ Clarity:
   that keys sent faster than the kernel answers land in order, holds only
   once the buffer has loaded; decide whether the client should queue keys
   until the first state arrives (`docs/vi.md`).
+- `kaijutsu-acp` `tests/kernel_e2e.rs`: in one full `-p kaijutsu-acp` run on 2026-11-05 (M5h tree), five of eight
+  kernels started within ~130 µs refused at start, "kernel.lock is held by another kaijutsu-server or kj", on their
+  own fresh test directories (the server's `KernelLock::acquire`, ssh.rs ~614, after `bootstrap` took and dropped
+  the same lock, bootstrap.rs ~209). The same binary passed alone in that run and in a full rerun. Hypothesis, not
+  verified: a `flock` lock belongs to the open file description, so a child that another test spawns (the tests
+  spawn `kaijutsu-acp`) holds a sibling's lock between its fork and its exec, across the drop and re-take. If it
+  recurs, have `bootstrap` hand its lock to the server it precedes, or retry the server's acquire briefly.
 - `kaijutsu-kernel` `runtime::llm_stream::lifetime_tests::a_note_whose_inference_fails_gets_a_turn_of_its_own`
   failed once in a full-suite lib run on 2026-10-30 (`8467dc40` plus the
   embedding change) at `llm_stream.rs:9690`, and passed three times alone.

@@ -2,6 +2,6 @@
 # chain, its house rules, and its judge's (docs/council.md, "Council v2
 # seats"). They build in the background, so the first decision finds them
 # held instead of building them on its deadline. A context whose performer's
-# layers enable no council builds nothing, and so does the console, which is
-# never under a council.
+# layers enable no council builds nothing, and so does the console and a
+# person's root console, which are never under a council.
 kj council build

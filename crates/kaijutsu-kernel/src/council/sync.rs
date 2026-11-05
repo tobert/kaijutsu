@@ -1494,9 +1494,11 @@ mod tests {
     }
 
     /// The console is never under a council, whatever its performer's layers
-    /// say. With `[rc.banto.council]` enabled and a `gate` slot on banto,
-    /// banto's lane plans seats and the gate consults the council for it;
-    /// the console banto plays plans none and the gate consults none.
+    /// say; a person's root console is not either
+    /// (`a_root_console_is_never_under_a_council`). With
+    /// `[rc.banto.council]` enabled and a `gate` slot on banto, banto's lane
+    /// plans seats and the gate consults the council for it; the console
+    /// banto plays plans none and the gate consults none.
     ///
     /// Falsified by composing the console's council from its performer's
     /// layers alone.
@@ -1542,6 +1544,65 @@ mod tests {
             consulted.as_ref().map(Option::is_some));
         let consulted = crate::council::gate::consult(&r.kernel, &caller(lane), &spec, &config).await;
         assert!(!matches!(consulted, Ok(None)), "the gate consults the council for banto's lane");
+    }
+
+    /// A person's root console, the context a sheet's `root_ctx` names, is
+    /// never under a council, whatever `[root.council]` says; the person's
+    /// other contexts still are. The same context is judged until `root_ctx`
+    /// names it (the positive control), then plans no seat, is consulted for
+    /// none, and reads no council from `council_for_context`.
+    ///
+    /// Falsified by composing a root console's council from its performer's
+    /// layers alone.
+    #[tokio::test]
+    async fn a_root_console_is_never_under_a_council() {
+        let r = rig().await;
+        let gate = "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"linear\", weights = \"uniform\" }\ndeadline_ms = 5000\n\n[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
+                    [[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.98\nmass_floor = -0.05\n\n\
+                    [root.council]\nenabled = true\n";
+        std::fs::write(r.config.path().join("gate.toml"), gate).unwrap();
+        let other = coder_on_the_mock_council(&r);
+        let person = r.kernel.kernel_db().lock().get_context(other).unwrap().unwrap().performer.unwrap();
+        let root = live_context(&r.kernel, "root-console");
+        {
+            let db = r.kernel.kernel_db().lock();
+            // Assigned before the person is a root, so the fixture does not name it the root console.
+            db.assign_stand_in_character(root, person).unwrap();
+            db.update_character_root(person, true).unwrap();
+        }
+        let config = crate::kj::gate_policy::load_config(r.kernel.vfs(), r.kernel.kernel_db()).await;
+        let council_of = |context: ContextId| {
+            let db = r.kernel.kernel_db().lock();
+            let performer = crate::kj::gate_policy::performer_of(&db, Some(context)).unwrap();
+            crate::kj::gate_policy::council_for_context(&db, config.as_ref().unwrap(), context, performer.as_ref()).unwrap().is_some()
+        };
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("echo root-probe").unwrap();
+        let caller = |context: ContextId| {
+            let mut caller = crate::kj::test_helpers::caller_with_context(context);
+            caller.principal_id = person;
+            caller.actor_id = person;
+            caller
+        };
+
+        // Control: until `root_ctx` names it, the context is judged like the person's other one.
+        assert!(council_of(root) && council_of(other), "[root.council] reaches both contexts");
+        let (seats, _) = plan_context_seats(&r.kernel, root).await.unwrap();
+        assert!(!seats.is_empty(), "the context is judged before it is the root console");
+        let consulted = crate::council::gate::consult(&r.kernel, &caller(root), &spec, &config).await;
+        assert!(!matches!(consulted, Ok(None)), "the gate consults the council before it is the root console");
+
+        r.kernel.kernel_db().lock().set_character_root_ctx(person, Some(root)).unwrap();
+        assert!(r.kernel.kernel_db().lock().is_root_console(root).unwrap());
+        assert!(!council_of(root), "no council is read for the root console");
+        let (seats, _) = plan_context_seats(&r.kernel, root).await.unwrap();
+        assert!(seats.is_empty(), "no seat is built for the root console");
+        let consulted = crate::council::gate::consult(&r.kernel, &caller(root), &spec, &config).await;
+        assert!(matches!(consulted, Ok(None)), "the gate consults no council for the root console: {:?}",
+            consulted.as_ref().map(Option::is_some));
+
+        assert!(council_of(other), "the person's other context is still under the council");
+        let (seats, _) = plan_context_seats(&r.kernel, other).await.unwrap();
+        assert!(!seats.is_empty(), "the person's other context still plans seats");
     }
 
     /// A failed identity is a miss. A 404, from a server without council
