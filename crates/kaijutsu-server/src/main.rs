@@ -150,8 +150,11 @@ enum RcCommand {
     /// absent, and names files that differ from their default and retired
     /// defaults still installed, files and whole directories, leaving both
     /// alone. --force overwrites the first, removes a retired file, and moves
-    /// a retired directory, with everything in it, to <dir>.retired-<UTC
-    /// timestamp> beside it; it deletes no directory. A path with a
+    /// a retired directory, with the files inside it, to <dir>.retired-<UTC
+    /// timestamp> beside it; it deletes no directory. A retired directory
+    /// that is a symlink moves as the link, and its target stays; a move
+    /// that fails is named with its error, the rest finishes, and the exit
+    /// status is a failure. A path with a
     /// <path>.keep file beside it is left as it is, present, edited, or
     /// absent, even with --force.
     Reseed {
@@ -453,9 +456,10 @@ fn cmd_rc_reseed(
                     }
                 }
                 println!(
-                    "\nPass --force to remove retired files and move retired directories, with \
-                     everything in them, to <dir>.retired-<UTC timestamp> beside them; nothing in \
-                     a directory is deleted. A name ending in / is a directory. Create <path>.keep \
+                    "\nPass --force to remove retired files and move retired directories, with the \
+                     files inside them, to <dir>.retired-<UTC timestamp> beside them; nothing in \
+                     a directory is deleted, and a retired directory that is a link moves as the \
+                     link. A name ending in / is a directory. Create <path>.keep \
                      beside one to keep it where it is."
                 );
             }
@@ -465,11 +469,24 @@ fn cmd_rc_reseed(
                     println!("  {path}");
                 }
             }
+            if !r.linked.is_empty() {
+                println!("\n{} retired directory(ies) are symlinks; a reseed moves the link and never follows it to its target:", r.linked.len());
+                for (dir, target) in &r.linked {
+                    println!("  {dir} -> {target}");
+                }
+            }
             if !r.moved.is_empty() {
                 println!("\n{} retired directory(ies) moved aside, nothing deleted:", r.moved.len());
                 for (from, to) in &r.moved {
                     println!("  {from} -> {to}/");
                 }
+            }
+            if !r.failed.is_empty() {
+                eprintln!("\n{} retired directory(ies) could not be moved and stay where they are:", r.failed.len());
+                for (dir, err) in &r.failed {
+                    eprintln!("  {dir}: {err}");
+                }
+                return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }

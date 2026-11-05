@@ -888,7 +888,7 @@ Shipped directories in `assets/defaults/rc/`:
 | `mcp/` | `mcp/` | each MCP connection's character |
 
 `default/`, `director/`, `console/`, `root/` and `shell/` are retired; `kaijutsu-server rc reseed` names them and
-`--force` removes them.
+`--force` moves them aside to `<dir>.retired-<UTC timestamp>` and deletes nothing.
 
 #### Gate
 
@@ -968,7 +968,9 @@ boot migration copies the database aside first and records itself, as the fold d
    recreates the never-changed triggers inside its own transaction; no verb changes a slot. Live judge shadows are
    archived, and the next gate call makes one performed by judge.
 3. **M6a, `rc-dir-rename-v1`.** `rc_dir` values move to the renamed directories (`director` and `console` to
-   `banto`, `root` and `shell` to `person`, `default` to `coder`).
+   `banto`, `root` and `shell` to `person` for a root character, `default` to `coder`). `person/` belongs to roots,
+   so a character that is not a root and is on `root` or `shell` gets NULL instead, its report says so and names
+   `kj character set <name> --rc <dir>`, and a create for it refuses until a directory is set.
 4. **M6b, `type-melt-v1`.** `contexts.context_type` and `characters.context_type` are dropped, with their
    schema defaults, so a fresh database never creates them. The approval ledger's `rc_runs.context_type` is
    renamed `rc_dir`; an old row keeps the name the directory had when it ran.

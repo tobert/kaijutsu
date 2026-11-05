@@ -174,9 +174,15 @@ the link and create its `.keep`.
 A file or directory the seed no longer ships is named as a retired default and
 left alone. For a retired directory, a plain reseed also names the files in it
 that are not links to the shared `lib/` scripts, which may be yours. `--force`
-removes a retired file, and moves a retired directory, with everything in it,
+removes a retired file, and moves a retired directory, with the files inside it,
 to `<dir>.retired-<UTC timestamp>` beside it and prints the new name; it
-deletes no directory, so scripts of your own survive at the new path. A name
+deletes no directory, so scripts of your own survive at the new path. A
+retired directory that is a symlink moves as the link: the reseed does not
+follow it, does not list its target's files, names the link and its target,
+and leaves the target where it is. The move never replaces a name that
+exists. A move that fails (another filesystem, a busy mount) is printed with
+its error and the directory stays; the rest of the reseed finishes and the
+command exits with a failure status. A name
 ending in `/` is a directory. The retired directories are `console/`,
 `default/`, `director/`, `root/` and `shell/`: `banto/` absorbed `director/`
 and `console/`, `person/` absorbed `root/` and `shell/`, and a `default/`

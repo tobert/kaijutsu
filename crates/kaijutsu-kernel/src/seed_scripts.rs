@@ -168,6 +168,15 @@ pub struct RcSeedReport {
     /// `(directory with a trailing "/", new name beside it)`. Nothing in
     /// them is deleted.
     pub moved: Vec<(String, String)>,
+    /// Retired directories that are symlinks, as `(directory with a trailing
+    /// "/", link target as written)`. A reseed never follows the link: the
+    /// target's files are not listed in `unshipped`, and `force` moves the
+    /// link itself and leaves the target where it is.
+    pub linked: Vec<(String, String)>,
+    /// Retired directories `force` could not move, as `(directory with a
+    /// trailing "/", the error)`. Each stays where it is; the rest of the
+    /// reseed finished.
+    pub failed: Vec<(String, String)>,
     /// Seed and retired paths with a `<path>.keep` file beside them, left as
     /// they are (present, edited, or absent), even with `force`.
     pub kept: Vec<String>,
@@ -233,8 +242,12 @@ pub const RETIRED_RC_DIRS: &[&str] = &["console", "default", "director", "root",
 /// ([`RETIRED_RC_DIRS`]) still present is named in [`RcSeedReport::retired`]
 /// and left alone. With `force` a retired seed is removed and named in
 /// [`RcSeedReport::removed`]; a retired directory is renamed to
-/// `<dir>.retired-<UTC timestamp>` beside it, with everything in it, and
-/// named in [`RcSeedReport::moved`]. `force` deletes no directory and nothing
+/// `<dir>.retired-<UTC timestamp>` beside it, with the files inside it, and
+/// named in [`RcSeedReport::moved`]. A retired directory that is a symlink
+/// moves as the link: its target is not followed, listed, or moved, and the
+/// link is named in [`RcSeedReport::linked`]. A move that fails (another
+/// filesystem, a busy mount) is named in [`RcSeedReport::failed`] with its
+/// error and the reseed finishes. The move never replaces an existing name. `force` deletes no directory and nothing
 /// you added, so a script of yours under a retired name survives at the new
 /// path, and a script under any other path is never touched.
 ///
@@ -248,6 +261,16 @@ pub const RETIRED_RC_DIRS: &[&str] = &["console", "default", "director", "root",
 pub fn reseed_rc_files(
     root: &std::path::Path,
     force: bool,
+) -> std::io::Result<RcSeedReport> {
+    reseed_rc_files_with(root, force, &rename_noreplace)
+}
+
+/// [`reseed_rc_files`] with the directory mover chosen by the caller, so a
+/// test can make a move fail. `mover(from, to)` must not replace `to`.
+fn reseed_rc_files_with(
+    root: &std::path::Path,
+    force: bool,
+    mover: &dyn Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<RcSeedReport> {
     let seeds = seed_files();
     let known: std::collections::HashSet<String> =
@@ -330,13 +353,26 @@ pub fn reseed_rc_files(
             report.kept.push(named);
             continue;
         }
+        if std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+            let link = std::fs::read_link(&dest).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
+            report.linked.push((named.clone(), link));
+        }
         if force {
-            let target = aside_target(root, dir, &crate::llm::request_dump::utc_stamp(now_ms()));
-            std::fs::rename(&dest, &target)?;
-            let moved_to = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            report.moved.push((named, moved_to));
+            let stamp = crate::llm::request_dump::utc_stamp(now_ms());
+            // A failed move is a reported skip, not an abort: this loop runs
+            // after the seed writes, so stopping here would leave a partly
+            // reseeded tree with no report. The directory stays where it is.
+            match move_aside(root, dir, &stamp, mover) {
+                Ok(target) => {
+                    let moved_to = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    report.moved.push((named, moved_to));
+                }
+                Err(e) => report.failed.push((named, e.to_string())),
+            }
         } else {
-            report.unshipped.extend(unshipped_files(root, dir));
+            if !report.linked.iter().any(|(n, _)| *n == named) {
+                report.unshipped.extend(unshipped_files(root, dir));
+            }
             report.retired.push(named);
         }
     }
@@ -346,6 +382,37 @@ pub fn reseed_rc_files(
     report.moved.sort();
     report.kept.sort();
     Ok(report)
+}
+
+/// Move retired directory `dir` aside to a name nothing holds. A name taken
+/// between choosing it and moving makes the mover fail with `AlreadyExists`;
+/// the next name is tried.
+fn move_aside(
+    root: &std::path::Path,
+    dir: &str,
+    stamp: &str,
+    mover: &dyn Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<std::path::PathBuf> {
+    let from = root.join(dir);
+    let mut last = None;
+    for _ in 0..16 {
+        let target = aside_target(root, dir, stamp);
+        match mover(&from, &target) {
+            Ok(()) => return Ok(target),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("the loop ran"))
+}
+
+/// `rename(2)` that fails with `AlreadyExists` instead of replacing `to`
+/// (`renameat2` with `RENAME_NOREPLACE`, through `rustix`). A plain rename
+/// would replace an empty directory or a file that appeared after the name
+/// was chosen.
+fn rename_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(rustix::fs::CWD, from, rustix::fs::CWD, to, rustix::fs::RenameFlags::NOREPLACE)
+        .map_err(std::io::Error::from)
 }
 
 fn now_ms() -> u64 {
@@ -1289,7 +1356,7 @@ mod tests {
     /// A directory the seed no longer has is named, with a trailing `/`, and
     /// left alone, and the files in it that are not links to the shared lib
     /// are named; `--force` moves it to `<dir>.retired-<UTC timestamp>` beside
-    /// it with everything in it and names the new path, deleting nothing; a
+    /// it with the files inside it and names the new path, deleting nothing; a
     /// `.keep` beside it keeps it through `--force`. A directory the seed
     /// never named is never touched.
     #[test]
@@ -1348,6 +1415,94 @@ mod tests {
         let mut names: Vec<_> = moved.iter().flat_map(|m| std::fs::read_dir(m.join("create")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned())).collect();
         names.sort();
         assert_eq!(names, ["S10-again.kai", "S10-mine.kai"]);
+    }
+
+    /// A retired directory that is itself a symlink moves as the link; its
+    /// target is neither listed as the person's files nor touched, and the
+    /// report names the link and where it points.
+    #[test]
+    fn reseed_does_not_follow_a_symlinked_retired_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        ensure_rc_seed_files(root).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/create")).unwrap();
+        std::fs::write(root.join("elsewhere/create/S10-theirs.kai"), "theirs\n").unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.join("shell")).unwrap();
+
+        let report = reseed_rc_files(root, false).unwrap();
+        assert_eq!(report.retired, vec!["shell/".to_string()], "{report:?}");
+        assert!(report.unshipped.is_empty(), "the link target's files are not listed: {report:?}");
+        assert_eq!(report.linked, vec![("shell/".to_string(), "elsewhere".to_string())], "{report:?}");
+
+        let forced = reseed_rc_files(root, true).unwrap();
+        assert_eq!(forced.linked, vec![("shell/".to_string(), "elsewhere".to_string())], "{forced:?}");
+        let moved = aside(root, "shell");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(std::fs::symlink_metadata(&moved[0]).unwrap().file_type().is_symlink(), "the link itself moved");
+        assert!(root.join("elsewhere/create/S10-theirs.kai").exists(), "the target stays");
+    }
+
+    /// A move that fails is a reported skip, named with its error; the rest of
+    /// the reseed finishes, so no run stops half-written without a report.
+    #[test]
+    fn a_failed_directory_move_is_reported_and_the_reseed_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("shell/create")).unwrap();
+        std::fs::write(root.join("shell/create/S10-mine.kai"), "mine\n").unwrap();
+        std::fs::create_dir_all(root.join("director/create")).unwrap();
+
+        let refuse = |from: &std::path::Path, _to: &std::path::Path| -> std::io::Result<()> {
+            if from.ends_with("shell") {
+                Err(std::io::Error::from_raw_os_error(18))
+            } else {
+                rename_noreplace(from, _to)
+            }
+        };
+        let report = reseed_rc_files_with(root, true, &refuse).unwrap();
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, "shell/");
+        assert!(report.failed[0].1.contains("os error 18"), "{report:?}");
+        assert!(root.join("shell/create/S10-mine.kai").exists(), "the directory stays where it was");
+        assert_eq!(report.moved.len(), 1, "the other directory still moved: {report:?}");
+        assert!(report.written > 0, "the seed loop ran: {report:?}");
+    }
+
+    /// The move never replaces what is already at the target, even a name
+    /// taken after the name was chosen.
+    #[test]
+    fn the_directory_move_does_not_replace_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("from")).unwrap();
+        std::fs::create_dir(root.join("to")).unwrap();
+        std::fs::write(root.join("to/theirs"), "x").unwrap();
+        let err = rename_noreplace(&root.join("from"), &root.join("to")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(root.join("to/theirs").exists() && root.join("from").exists());
+    }
+
+    /// A name taken in the gap between choosing and moving makes the move pick
+    /// the next name; the taker's entry is untouched.
+    #[test]
+    fn a_name_taken_in_the_gap_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("shell/create")).unwrap();
+        let first = std::cell::Cell::new(true);
+        let racer = |from: &std::path::Path, to: &std::path::Path| -> std::io::Result<()> {
+            if first.replace(false) {
+                std::fs::create_dir(to).unwrap();
+                std::fs::write(to.join("racer"), "x").unwrap();
+            }
+            rename_noreplace(from, to)
+        };
+        let report = reseed_rc_files_with(root, true, &racer).unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        let moved = aside(root, "shell");
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        assert!(moved.iter().any(|m| m.join("racer").exists()), "the racer's entry survives");
+        assert!(moved.iter().any(|m| m.join("create").exists()), "the directory moved to the next name");
     }
 
     /// A name already taken is never reused: the move gets a numeric suffix.

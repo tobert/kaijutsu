@@ -420,10 +420,12 @@ fn the_rename_moves_each_retired_directory_and_reports_it() {
 
     r.rename();
 
-    for (name, dir) in [("amy", "person"), ("banto", "banto"), ("console-player", "banto"), ("shell-player", "person"),
-                        ("plain", "coder"), ("coder", "coder"), ("bassist", "bassist")] {
+    for (name, dir) in [("amy", "person"), ("banto", "banto"), ("console-player", "banto"), ("plain", "coder"), ("coder", "coder"), ("bassist", "bassist")] {
         assert_eq!(r.rc_dir(name).as_deref(), Some(dir), "{name}");
     }
+    // `person/` belongs to roots: a non-root on `shell` is left with no
+    // directory rather than handed the root loadout.
+    assert_eq!(r.rc_dir("shell-player"), None);
     let moved = r.report_principals("rc_dir_renamed");
     assert_eq!(moved.len(), 5, "{moved:?}");
     for id in [r.amy, banto, console, shell, plain] {
@@ -441,6 +443,32 @@ fn the_rename_moves_each_retired_directory_and_reports_it() {
     assert_eq!(r.notes("rc_dir_renamed").len(), 5);
 }
 
+/// `person/` is the merge of `root/` and `shell/`, so a root moving from
+/// either to it gets wider bindings; a non-root on either gets no directory.
+#[test]
+fn only_roots_move_to_person() {
+    let r = rig();
+    r.db.set_character_rc_dir(r.amy, Some("shell")).unwrap();
+    named(&r.db, "root-player", "root");
+    named(&r.db, "shell-player", "shell");
+    let second = character(&r.db, "second-root", true, None);
+    r.db.set_character_rc_dir(second, Some("root")).unwrap();
+    r.rename();
+    assert_eq!(r.rc_dir("amy").as_deref(), Some("person"));
+    assert_eq!(r.rc_dir("second-root").as_deref(), Some("person"));
+    assert_eq!(r.rc_dir("root-player"), None);
+    assert_eq!(r.rc_dir("shell-player"), None);
+    let notes = r.notes("rc_dir_renamed");
+    assert_eq!(notes.len(), 4, "every move is reported: {notes:?}");
+    let note = |name: &str| notes.iter().map(|(_, n)| n).find(|n| n.starts_with(name)).unwrap_or_else(|| panic!("{name}: {notes:?}"));
+    let left = note("shell-player");
+    assert!(left.contains("no rc directory") && left.contains("'shell'") && !left.contains("moved from"), "{left}");
+    assert!(left.contains("kj character set shell-player --rc <dir>") && left.contains("refuses"), "{left}");
+    let widened = note("second-root");
+    assert!(widened.contains("'root'") && widened.contains("'person'") && widened.contains("wider than"), "{widened}");
+    assert!(!widened.contains("possibly"), "{widened}");
+}
+
 /// The note says the character's contexts now run the new directory's
 /// bindings, wider for `shell` and `director`, narrower for `default`, and
 /// names the commands that check and change it.
@@ -448,18 +476,19 @@ fn the_rename_moves_each_retired_directory_and_reports_it() {
 fn the_rename_note_says_the_bindings_widen_or_narrow() {
     let r = rig();
     named(&r.db, "plain", "default");
-    named(&r.db, "shell-player", "shell");
+    named(&r.db, "banto-player", "director");
     r.rename();
     let notes = r.notes("rc_dir_renamed");
     let note = |name: &str| notes.iter().map(|(_, n)| n).find(|n| n.starts_with(name)).unwrap_or_else(|| panic!("{name}: {notes:?}"));
     let narrowed = note("plain");
     assert!(narrowed.contains("narrower") && narrowed.contains("'coder'") && narrowed.contains("bindings"), "{narrowed}");
     assert!(!narrowed.contains("wider"), "{narrowed}");
-    let widened = note("shell-player");
-    assert!(widened.contains("wider") && widened.contains("'person'") && widened.contains("bindings"), "{widened}");
+    let widened = note("banto-player");
+    assert!(widened.contains("wider") && widened.contains("'banto'") && widened.contains("bindings"), "{widened}");
     assert!(!widened.contains("narrower"), "{widened}");
     for n in [narrowed, widened] {
         assert!(n.contains("kj binding show") && n.contains("kj character set") && n.contains("--rc"), "{n}");
+        assert!(!n.contains("in one of them"), "the check must hold with no live context: {n}");
     }
 }
 

@@ -348,7 +348,10 @@ impl KernelDb {
 
     /// Move every character on a retired rc directory to the directory that
     /// absorbed it, once, in one transaction: `director` and `console` to
-    /// `banto`, `root` and `shell` to `person`, `default` to `coder`. Each
+    /// `banto`, `root` and `shell` to `person` for a root character, `default`
+    /// to `coder`. A character that is not a root and is on `root` or `shell`
+    /// is left with no directory (`person/` belongs to roots), and its report
+    /// says so. Each
     /// move is listed in `context_character_migration_report` (kind
     /// `rc_dir_renamed`, naming the character by `principal_id`) and logged.
     /// Every other directory stays. Runs after `rc-dir-backfill-v1`, so a
@@ -367,27 +370,35 @@ impl KernelDb {
         let recorded_at = now_millis();
         let mut moved = 0usize;
         for (from, to) in RC_DIR_RENAMES {
-            let characters: Vec<(PrincipalId, String)> = {
-                let mut stmt = tx.prepare("SELECT principal_id, name FROM characters WHERE rc_dir = ?1 ORDER BY name")?;
-                stmt.query_map([from], |r| Ok((read_principal_id(r, 0)?, r.get(1)?)))?
+            let characters: Vec<(PrincipalId, String, bool)> = {
+                let mut stmt = tx.prepare("SELECT principal_id, name, root FROM characters WHERE rc_dir = ?1 ORDER BY name")?;
+                stmt.query_map([from], |r| Ok((read_principal_id(r, 0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<SqliteResult<_>>()?
             };
-            for (id, name) in characters {
+            for (id, name, root) in characters {
+                // `person/` is the root loadout: a character that is not a root
+                // gets no directory rather than a grant, and a context create
+                // for it refuses until `kj character set --rc` names one.
+                let withheld = *to == "person" && !root;
                 tx.execute(
                     "UPDATE characters SET rc_dir = ?1 WHERE principal_id = ?2",
-                    params![to, blob_param(id.as_bytes())],
+                    params![if withheld { None } else { Some(*to) }, blob_param(id.as_bytes())],
                 )?;
-                let effect = match *from {
-                    "console" | "director" | "shell" => "wider than",
-                    "default" => "narrower than",
-                    _ => "possibly different from",
+                let note = if withheld {
+                    format!(
+                        "{name}'s rc directory '{from}' was retired into 'person', which belongs to root characters and \
+                         {name} is not one, so {name} now has no rc directory and `kj context create` refuses for it; \
+                         `kj character set {name} --rc <dir>` names one"
+                    )
+                } else {
+                    let effect = if *from == "default" { "narrower than" } else { "wider than" };
+                    format!(
+                        "{name}'s rc directory moved from '{from}' to '{to}', which absorbed it; \
+                         {name}'s contexts now run '{to}' bindings, {effect} the '{from}' bindings they ran; \
+                         `kj binding show` in any context {name} plays checks them, \
+                         and `kj character set {name} --rc <dir>` names another directory"
+                    )
                 };
-                let note = format!(
-                    "{name}'s rc directory moved from '{from}' to '{to}', which absorbed it; \
-                     {name}'s contexts now run '{to}' bindings, {effect} the '{from}' bindings they ran; \
-                     `kj binding show` in one of them checks, \
-                     and `kj character set {name} --rc <dir>` names another directory"
-                );
                 info!(character = %name, from, to, "renamed a retired rc directory");
                 tx.execute(
                     "INSERT INTO context_character_migration_report (kind, context_id, principal_id, note, recorded_at)
