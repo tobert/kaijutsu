@@ -160,6 +160,24 @@ never runs. To turn a stock script off locally, remove it and create its
 `.keep`. To replace a composed link with your own script, write the file over
 the link and create its `.keep`.
 
+```
+./rc: 0 written, 0 replaced, 115 unchanged
+
+2 retired default(s) are still installed and were left alone:
+  coder/create/S15-recall.kai
+  director/
+```
+
+A file or directory the seed no longer ships is named as a retired default and
+left alone; `--force` removes it, and a name ending in `/` is a directory that
+`--force` removes with everything in it, scripts of your own included. The
+retired directories are `console/`, `default/`, `director/`, `root/` and
+`shell/`: `banto/` absorbed `director/` and `console/`, `person/` absorbed
+`root/` and `shell/`, and a `default/` character runs `coder/`
+(`docs/character.md`, "rc"). A `<dir>.keep` beside a retired directory keeps
+it through `--force`. A directory the seed never shipped, such as one a
+character of your own runs, is never named or removed.
+
 An untouched tree says nothing, so the warning stays worth reading. `--force`
 is then an ordinary deliberate act by a player who has been told exactly what
 it will take — which is the house stance (`docs/instrument-design.md`, "Many

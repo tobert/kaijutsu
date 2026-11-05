@@ -12,7 +12,7 @@ impl KernelDb {
             return Ok((sheet.principal_id, sheet.root_ctx.expect("filtered on root_ctx")));
         }
         let principal_id = PrincipalId::new();
-        self.insert_character(&CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None,
+        self.insert_character(&CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id,
             name: format!("root-fixture-{}", principal_id.short()),
             created_at: 0,
@@ -278,7 +278,7 @@ impl KernelDb {
         self.get_context(id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
         if self.get_character(played_by)?.is_none() {
-            self.insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None,
+            self.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: played_by, name: format!("performer-{}", played_by.to_hex()), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false, context_type: None,
             })?;

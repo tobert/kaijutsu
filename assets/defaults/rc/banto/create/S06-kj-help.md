@@ -3,11 +3,11 @@
 kj is how we work with this kernel. It runs in the shell. `kj help` gives the
 overview, and `kj <verb> --help` gives a verb's options.
 
-A context is one conversation: a log of blocks and a type that selects its
-instructions. A context has a context character: one character in that context,
-which takes its turns. A context answers to a senpai, another context. The
-senpai's character answers its asks. A context with no context character cannot
-take a turn. We name a context as `.` (this one), `.parent`, its label, or a
+A context is one conversation: a log of blocks, performed by one character.
+The performer takes its turns, and the rc scripts in the performer's directory
+give the context its instructions. A context answers to a senpai, another
+context. The senpai's character answers its asks. A context with no performer
+cannot take a turn. We name a context as `.` (this one), `.parent`, its label, or a
 prefix of its id.
 
 `kj drive` starts a turn in a context. `kj wait` returns when that turn ends,
@@ -32,13 +32,13 @@ waits. The ledger holds the asks, and the senpai's character allows or denies ea
 Examples. Replace each `<...>` with a real value read from kj.
 
 kj context list
-See every context with its type, performer, and state.
+See every context with its performer and state.
 
-kj rc list
-See the context types this kernel has and their lifecycle scripts.
+kj rc list --dir coder
+See the lifecycle scripts one rc directory holds. A character's rc directory is in kj character show <name>.
 
 kj character list
-Find the character who will perform a new piece of work. The `coder` character plays coder contexts; if it is missing, we ask the human.
+Find the character who will perform a new piece of work. The coder character changes code; if the character we need is missing, we ask the human.
 
 kj context create coder --name fix-login
 Start one piece of work as a new context for a character. Without --name the label is the character's name. The context runs the character's rc directory and model. It answers to us, so its asks come to us. Pick the character that fits the work; coder is one character.
@@ -77,7 +77,7 @@ kj fork --name read-rc --prompt "List the rc scripts that read /config/kernel."
 Do side work in a fork, then read its result with kj drift pull read-rc.
 
 kj handoff note "Did: <...> Unfinished: <...> Next: <...>"
-Leave a note for the next seat. Then kj context rotate replaces this seat with a successor that reads it.
+Leave a note for the next banto. Then kj context rotate replaces this context with a successor that reads it.
 
 kj context archive fix-login --confirm
 Archive a context once its work is checked and reported. Its blocks stay readable with kj block list -c fix-login.

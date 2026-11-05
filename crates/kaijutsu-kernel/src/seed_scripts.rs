@@ -5,18 +5,17 @@
 //! symlink, not as a file holding that text — this is the init.d composition
 //! format, and `include_dir!` cannot carry a link. See `docs/rc-on-disk.md`.
 //!
-//! These are the defaults a fresh kernel bootstraps with. Two purposes:
+//! These are the defaults a fresh kernel bootstraps with:
 //!
-//! - `/config/rc/default/{create,fork,drift}/*-cache.kai` — the prompt-cache
-//!   recipe (`kj cache --help`),
-//!   applied to every context that doesn't opt into a different
-//!   `context_type`. Without this seed, fresh kernels miss all cache
-//!   breakpoints until the user installs them by hand.
-//! - `/config/rc/<type>/**` — the worked examples of real context_types
-//!   (coder, mcp, toolie, director, musician, council). Most ship an `S00-stance`
-//!   `.kai` script that authors instructions, reading `.md` data when needed, so the
+//! - `/config/rc/<dir>/**` — the directories the shipped characters run
+//!   (`person`, `banto`, `coder`, `mcp`, `toolie`, `musician`, `council`, and
+//!   the rest; `docs/character.md`, "rc"). Most ship an `S00-stance` `.kai`
+//!   script that authors instructions, reading `.md` data when needed, so the
 //!   kernel-side contract is self-contained (independent of any per-client
-//!   CLAUDE.md), a binding loadout, and the cache recipe.
+//!   CLAUDE.md), a binding loadout, and the prompt-cache recipe
+//!   (`kj cache --help`).
+//! - `/config/rc/lib/**` — the shared bodies those directories link to, the
+//!   hook bodies, and `lib/recipes/`, scripts a player runs on demand.
 //!
 //! ## Storage
 //!
@@ -153,10 +152,12 @@ pub struct RcSeedReport {
     /// which is exactly the question worth answering when an rc root is
     /// pointed somewhere other than its default.
     pub diverged: Vec<String>,
-    /// Retired seed paths ([`RETIRED_RC_SEEDS`]) still present and left
-    /// alone. Always empty with `force`, which removes them instead.
+    /// Retired seed paths ([`RETIRED_RC_SEEDS`]) and retired directories
+    /// ([`RETIRED_RC_DIRS`], named with a trailing `/`) still present and
+    /// left alone. Always empty with `force`, which removes them instead.
     pub retired: Vec<String>,
-    /// Retired seed paths this reseed removed. Always empty without `force`.
+    /// Retired seed paths and directories this reseed removed. Always empty
+    /// without `force`.
     pub removed: Vec<String>,
     /// Seed and retired paths with a `<path>.keep` file beside them, left as
     /// they are (present, edited, or absent), even with `force`.
@@ -179,31 +180,28 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
     "lib/create/S00-base.md",
     "coder/create/S00-base.kai",
     "coder/create/S00-base.md",
-    "default/create/S00-base.kai",
-    "default/create/S00-base.md",
-    "director/create/S00-base.kai",
-    "director/create/S00-base.md",
     "mcp/create/S00-stance.kai",
     "mcp/create/S00-stance.md",
     "coder/create/S05-kaish.kai",
     "coder/create/S11-done.kai",
-    "default/create/S05-kaish.kai",
-    "director/create/S05-kaish.kai",
     "lib/create/S05-kaish.kai",
     "mcp/create/S05-kaish.kai",
     "toolie/create/S05-kaish.kai",
     "coder/create/S50-lfm2d.kai",
-    "default/create/S50-lfm2d.kai",
-    "director/create/S50-lfm2d.kai",
-    "director/create/S51-lfm2d-observe.kai",
     "lib/create/S50-lfm2d.kai",
     "lib/hooks/lfm2d.kai",
     "mcp/create/S50-lfm2d.kai",
-    "root/create/S50-lfm2d.kai",
-    "root/create/S51-lfm2d-observe.kai",
     "toolie/create/S50-lfm2d.kai",
     "toolie/create/S45-shell-guard.kai",
 ];
+
+/// Directories, relative to the rc root, that earlier seeds installed and the
+/// embedded set no longer carries: the characters' directories absorbed them
+/// (`person/` took `root/` and `shell/`, `banto/` took `director/` and
+/// `console/`, and `default/` contexts run `coder/`). [`reseed_rc_files`]
+/// names each one still present, with a trailing `/`, and removes it and
+/// everything in it under `force`. Sorted.
+pub const RETIRED_RC_DIRS: &[&str] = &["console", "default", "director", "root", "shell"];
 
 /// Write the embedded seed tree into `root` (the host directory mounted at
 /// `/config/rc`).
@@ -222,10 +220,11 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
 /// removed and recreated rather than written through, because writing through
 /// a link would edit the shared body instead of restoring the link.
 ///
-/// A retired seed ([`RETIRED_RC_SEEDS`]) still present is named in
-/// [`RcSeedReport::retired`] and left alone; with `force` it is removed and
-/// named in [`RcSeedReport::removed`]. `force` deletes nothing else, so a
-/// script you added under any other path is never touched. Use `git diff` to see what a
+/// A retired seed ([`RETIRED_RC_SEEDS`]) or retired directory
+/// ([`RETIRED_RC_DIRS`]) still present is named in [`RcSeedReport::retired`]
+/// and left alone; with `force` it is removed, a directory with everything in
+/// it, and named in [`RcSeedReport::removed`]. `force` deletes nothing else,
+/// so a script you added under any other path is never touched. Use `git diff` to see what a
 /// forced reseed changed.
 ///
 /// A seed or retired path with a `<path>.keep` file beside it is left exactly
@@ -308,6 +307,27 @@ pub fn reseed_rc_files(
             report.removed.push(rel.to_string());
         } else {
             report.retired.push(rel.to_string());
+        }
+    }
+    for dir in RETIRED_RC_DIRS {
+        let dest = root.join(dir);
+        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
+            continue;
+        };
+        let named = format!("{dir}/");
+        if is_kept(root, dir) {
+            report.kept.push(named);
+            continue;
+        }
+        if force {
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&dest)?;
+            } else {
+                std::fs::remove_file(&dest)?;
+            }
+            report.removed.push(named);
+        } else {
+            report.retired.push(named);
         }
     }
     report.retired.sort();
@@ -437,30 +457,30 @@ mod tests {
     #[test]
     fn reseed_adds_instruction_scripts_without_overwriting_custom_data() {
         let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("default/create/S00-stance.md");
+        let data = dir.path().join("coder/create/S00-stance.md");
         std::fs::create_dir_all(data.parent().unwrap()).unwrap();
         std::fs::write(&data, "custom instructions\n").unwrap();
         let report = reseed_rc_files(dir.path(), false).unwrap();
-        assert!(report.diverged.contains(&"default/create/S00-stance.md".to_string()));
+        assert!(report.diverged.contains(&"coder/create/S00-stance.md".to_string()));
         assert_eq!(std::fs::read_to_string(&data).unwrap(), "custom instructions\n");
-        assert!(read(dir.path(), "default/create/S00-stance.kai").unwrap().contains("kj block create"));
-        assert!(dir.path().join("default/create/S20-cache.kai").is_symlink());
+        assert!(read(dir.path(), "coder/create/S00-stance.kai").unwrap().contains("kj block create"));
+        assert!(dir.path().join("coder/create/S20-cache.kai").is_symlink());
         reseed_rc_files(dir.path(), true).unwrap();
-        assert_eq!(std::fs::read_to_string(data).unwrap(), seed_body("/config/rc/default/create/S00-stance.md").unwrap());
+        assert_eq!(std::fs::read_to_string(data).unwrap(), seed_body("/config/rc/coder/create/S00-stance.md").unwrap());
     }
 
     #[test]
-    fn fresh_tree_gets_default_and_coder_seeds() {
+    fn fresh_tree_gets_the_shared_and_coder_seeds() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let n = ensure_rc_seed_files(dir.path()).expect("seed");
         assert_eq!(n, seed_files().len(), "every seed file should be written");
 
         for rel in [
-            "default/create/S20-cache.kai",
-            "default/fork/S30-cache.kai",
-            "default/drift/S40-cache.kai",
-            "coder/create/S00-stance.kai",
             "coder/create/S20-cache.kai",
+            "coder/fork/S30-cache.kai",
+            "coder/drift/S40-cache.kai",
+            "coder/create/S00-stance.kai",
+            "banto/create/S20-cache.kai",
             // The init.d-style canonical bodies the per-type scripts link to.
             "lib/create/S20-cache.kai",
             "lib/create/S10-binding.kai",
@@ -475,7 +495,7 @@ mod tests {
         // reaches the same body. `composed_seeds_become_real_symlinks` pins
         // the link-ness; this pins that the composition resolves.
         assert_eq!(
-            read(dir.path(), "default/create/S20-cache.kai"),
+            read(dir.path(), "coder/create/S20-cache.kai"),
             read(dir.path(), "lib/create/S20-cache.kai"),
             "composed seed must read as its canonical body"
         );
@@ -495,7 +515,7 @@ mod tests {
         assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
         assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
-        for context_type in ["coder", "default", "director", "council", "judge", "storyteller", "companion"] {
+        for context_type in ["coder", "banto", "council", "judge", "storyteller", "companion"] {
             let path = format!("/config/rc/{context_type}/create/S00-stance.md");
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -516,8 +536,7 @@ mod tests {
     fn shipped_stances_are_plain_ascii_english() {
         for path in [
             "/config/rc/coder/create/S00-stance.md",
-            "/config/rc/default/create/S00-stance.md",
-            "/config/rc/director/create/S00-stance.md",
+            "/config/rc/banto/create/S00-stance.md",
             "/config/rc/council/create/S00-stance.md",
             "/config/rc/judge/create/S00-stance.md",
             "/config/rc/storyteller/create/S00-stance.md",
@@ -526,9 +545,9 @@ mod tests {
             "/config/rc/companion/fork/S20-stance.md",
             "/config/rc/companion/tick/S10-checkin.md",
             "/config/rc/companion/tick/S10-wrapup.md",
-            "/config/rc/director/create/S00-stance.kai",
+            "/config/rc/banto/create/S00-stance.kai",
             "/config/rc/assistant/create/S00-stance.kai",
-            "/config/rc/director/create/S06-kj-help.md",
+            "/config/rc/banto/create/S06-kj-help.md",
         ] {
             let body = seed_body(path).unwrap_or_else(|| panic!("missing {path}"));
             let trimmed = body.trim_end();
@@ -583,7 +602,7 @@ mod tests {
         // Diverge a real script, and replace a composed link with a file.
         let script = root.join("lib/create/S20-cache.kai");
         std::fs::write(&script, "# diverged\n").expect("diverge");
-        let link = root.join("default/create/S20-cache.kai");
+        let link = root.join("coder/create/S20-cache.kai");
         std::fs::remove_file(&link).expect("remove link");
         std::fs::write(&link, "# not a link any more\n").expect("clobber");
 
@@ -688,17 +707,17 @@ mod tests {
         std::fs::write(&script, "# mine\n").expect("diverge");
         std::fs::write(root.join("lib/create/S20-cache.kai.keep"), "").expect("keep");
         // A composed link replaced by a local file is kept the same way.
-        let link = root.join("default/create/S20-cache.kai");
+        let link = root.join("coder/create/S20-cache.kai");
         std::fs::remove_file(&link).expect("remove link");
         std::fs::write(&link, "# local, not a link\n").expect("clobber");
-        std::fs::write(root.join("default/create/S20-cache.kai.keep"), "").expect("keep");
+        std::fs::write(root.join("coder/create/S20-cache.kai.keep"), "").expect("keep");
 
         for force in [false, true] {
             let report = reseed_rc_files(root, force).expect("reseed");
             assert_eq!(
                 report.kept,
                 vec![
-                    "default/create/S20-cache.kai".to_string(),
+                    "coder/create/S20-cache.kai".to_string(),
                     "lib/create/S20-cache.kai".to_string()
                 ],
                 "force={force}: {report:?}"
@@ -773,7 +792,7 @@ mod tests {
 
         // The per-type copy is a composed link, not a file whose body is a
         // path. Reading through it reaches the canonical body in lib/.
-        let link = root.join("default/create/S20-cache.kai");
+        let link = root.join("coder/create/S20-cache.kai");
         let md = std::fs::symlink_metadata(&link).expect("stat link");
         assert!(
             md.file_type().is_symlink(),
@@ -862,7 +881,7 @@ mod tests {
         ensure_rc_seed_files(dir.path()).expect("seed");
         let root = dir.path();
 
-        std::fs::write(root.join("default/create/S20-cache.kai"), "# edited\n")
+        std::fs::write(root.join("banto/create/S20-cache.kai"), "# edited\n")
             .expect("write through link");
 
         assert_eq!(
@@ -876,7 +895,7 @@ mod tests {
             "and every other linking type sees it"
         );
         assert!(
-            std::fs::symlink_metadata(root.join("default/create/S20-cache.kai"))
+            std::fs::symlink_metadata(root.join("banto/create/S20-cache.kai"))
                 .unwrap()
                 .file_type()
                 .is_symlink(),
@@ -889,7 +908,7 @@ mod tests {
         let paths: Vec<String> = seed_files().into_iter().map(|(p, _)| p).collect();
         // Spot-check the roles the embedded tree ships.
         for expected in [
-            "/config/rc/default/create/S20-cache.kai",
+            "/config/rc/coder/create/S20-cache.kai",
             "/config/rc/coder/create/S00-stance.kai",
             "/config/rc/musician/tick/S10-drive.kai",
             "/config/rc/musician/create/S00-stance.md",
@@ -912,7 +931,7 @@ mod tests {
         // …and a per-type path's seed body is just the link target (a seed
         // symlink — reconstructed into an actual link by `reseed_rc_files`).
         assert_eq!(
-            seed_body("/config/rc/default/create/S20-cache.kai").unwrap().trim(),
+            seed_body("/config/rc/coder/create/S20-cache.kai").unwrap().trim(),
             "/config/rc/lib/create/S20-cache.kai"
         );
         // …and a path with no embedded seed is None, which is what marks it
@@ -947,11 +966,12 @@ mod tests {
     /// installed.
     #[test]
     fn no_seat_seeds_a_kaish_primer() {
-        for ty in ["coder", "default", "mcp", "director", "toolie", "musician", "lib"] {
+        for ty in ["coder", "default", "mcp", "director", "banto", "toolie", "musician", "lib"] {
             let rel = format!("{ty}/create/S05-kaish.kai");
             assert!(seed_body(&format!("/config/rc/{rel}")).is_none(), "{rel} is still seeded");
-            if ty != "musician" {
-                assert!(RETIRED_RC_SEEDS.contains(&rel.as_str()), "{rel} is not retired");
+            let retired = RETIRED_RC_SEEDS.contains(&rel.as_str()) || RETIRED_RC_DIRS.contains(&ty);
+            if !["musician", "banto"].contains(&ty) {
+                assert!(retired, "{rel} is not retired");
             }
         }
     }
@@ -1082,11 +1102,10 @@ mod tests {
     /// Every seat that ships the shell guard can run `shell_write`, so the
     /// council may gate it: its create lifecycle, and its fork lifecycle
     /// when it has one, ship `S50-council-seats.kai`, which builds the
-    /// seat's council seats ahead of its first decision. Root, console, shell,
-    /// and mcp are the exceptions: root is the owner's privileged space, the
-    /// console is the model seat under it, shell is the REPL beside it, and mcp
-    /// is the debugging and admin seat, and none is put under a council. No
-    /// other seat ships it.
+    /// seat's council seats ahead of its first decision. person and mcp are
+    /// the exceptions: person is every root character's own space, and mcp
+    /// is the debugging and admin seat, and neither is put under a council.
+    /// No other seat ships it.
     #[test]
     fn the_gated_seats_build_their_council_seats_at_create_and_fork() {
         let seeds = seed_files();
@@ -1101,7 +1120,7 @@ mod tests {
         types.dedup();
         let mut wrong = Vec::new();
         for ty in types {
-            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai")) && !["root", "console", "shell", "mcp"].contains(&ty);
+            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai")) && !["person", "mcp"].contains(&ty);
             let forks = seeds.iter().any(|(p, _)| p.starts_with(&format!("{RC_VFS_ROOT}/{ty}/fork/")));
             for (verb, wanted) in [("create", gated), ("fork", gated && forks)] {
                 let path = format!("{RC_VFS_ROOT}/{ty}/{verb}/S50-council-seats.kai");
@@ -1132,30 +1151,100 @@ mod tests {
         assert!(reaching.is_empty(), "seeds that reach the network: {reaching:#?}");
     }
 
-    /// The root seat is a model context, so it ships a stance: a system
-    /// block that opens on the cybernetic system, names the seat as
-    /// privileged, and names the accountable human, and a Markdown companion.
+    /// banto performs the console, so its one stance carries the operator's
+    /// character and the console's system-administrator duties, and it
+    /// speaks of characters and their rc directories, not of types.
     #[test]
-    fn the_root_seat_ships_its_privileged_stance() {
-        let seeds = seed_files();
-        let body = |path: &str| {
-            seeds
-                .iter()
-                .find(|(p, _)| p == &format!("{RC_VFS_ROOT}/{path}"))
-                .map(|(_, body)| *body)
-                .unwrap_or_else(|| panic!("{path} is not seeded"))
-        };
-        let script = body("console/create/S00-stance.kai");
-        assert!(script.contains("kj block create --role system"), "{script}");
-        assert!(script.contains("text/markdown"), "{script}");
+    fn banto_carries_the_operator_and_the_administrator_stance() {
+        let script = seed_body("/config/rc/banto/create/S00-stance.kai").expect("banto stance script");
+        assert!(script.contains("kj block create --role system") && script.contains("text/markdown"), "{script}");
         assert!(script.contains("cybernetic system"), "{script}");
-        for needle in ["privileged", "Amy"] {
-            assert!(script.contains(needle), "root stance must say {needle:?}: {script}");
+        let stance = seed_body("/config/rc/banto/create/S00-stance.md").expect("banto stance");
+        let flat = stance.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "番頭 (banto)",
+            "keep the kernel healthy",
+            "careful with that power",
+            "without reading their content, unless the human asks us to look",
+            "`kj character list` shows the characters",
+            "`kj character create <name> --rc <dir> --model <backend>/<model>`",
+            "`kj context create <character>`",
+        ] {
+            assert!(flat.contains(needle), "banto's stance must say {needle:?}: {stance}");
         }
-        let stance = body("console/create/S00-stance.md");
-        assert!(stance.contains("頑張って"), "the companion closes with 頑張って: {stance}");
-        assert!(stance.chars().filter(|c| !c.is_ascii()).all(|c| "頑張って".contains(c)),
-            "only the closing Japanese may be non-ASCII: {stance}");
+        let help = seed_body("/config/rc/banto/create/S06-kj-help.md").expect("banto kj help");
+        let help_flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (body, text) in [(&flat, "stance"), (&help_flat, "kj help")] {
+            for stale in ["/config/rc/<type>", "each in the type", "context types", "context character", "a type that selects", "seat"] {
+                assert!(!body.contains(stale), "banto's {text} still speaks of {stale:?}: {body}");
+            }
+        }
+        assert!(stance.trim_end().ends_with("\n\n頑張って"), "the stance closes with 頑張って");
+    }
+
+    /// The five directories the characters replaced ship nothing; the
+    /// person and banto directories that absorbed them carry their bindings.
+    #[test]
+    fn the_retired_directories_ship_nothing_and_their_successors_bind() {
+        assert_eq!(RETIRED_RC_DIRS, ["console", "default", "director", "root", "shell"]);
+        for (path, _) in seed_files() {
+            let rel = rc_relpath(&path).unwrap();
+            let dir = rel.split('/').next().unwrap();
+            assert!(!RETIRED_RC_DIRS.contains(&dir), "{path} ships under a retired directory");
+        }
+        let person = seed_body("/config/rc/person/create/S10-binding.kai").expect("person binding");
+        let banto = seed_body("/config/rc/banto/create/S10-binding.kai").expect("banto binding");
+        for grant in ["admin", "house", "operator", "system", "exec", "facade:shell_write", "facade:submit_input"] {
+            let line = format!("kj binding allow \"{grant}\"\n");
+            assert!(person.contains(&line), "person grants {grant}");
+            assert!(banto.contains(&line), "banto grants {grant}");
+        }
+        assert!(banto.contains("kj binding allow \"drive\"\n"), "banto drives the contexts it starts");
+        assert!(!person.contains("kj binding allow \"drive\"\n"), "a person refuses drives");
+        for script in ["S06-kj-help.kai", "S16-handoff.kai", "S17-predecessor.kai", "S20-cache.kai", "S25-datetime.kai",
+                       "S45-shell-guard.kai", "S50-council-seats.kai"] {
+            assert!(seed_body(&format!("/config/rc/banto/create/{script}")).is_some(), "banto/create/{script}");
+        }
+        assert!(seed_body("/config/rc/person/create/S45-shell-guard.kai").is_some());
+    }
+
+    /// Plant `director/` as an older seed left it, with a script of the
+    /// person's own inside it.
+    fn plant_retired_dir(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("director/create")).unwrap();
+        std::os::unix::fs::symlink("../../lib/create/S20-cache.kai", root.join("director/create/S20-cache.kai")).unwrap();
+        std::fs::write(root.join("director/create/S60-mine.kai"), "kj context set . --env MINE=1\n").unwrap();
+    }
+
+    /// A directory the seed no longer has is named, with a trailing `/`, and
+    /// left alone; `--force` removes it and everything in it; a `.keep`
+    /// beside it keeps it through `--force`. A directory the seed never
+    /// named is never touched.
+    #[test]
+    fn reseed_names_a_retired_directory_and_force_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        ensure_rc_seed_files(root).unwrap();
+        plant_retired_dir(root);
+        std::fs::create_dir_all(root.join("bassist/create")).unwrap();
+        std::fs::write(root.join("bassist/create/S00-stance.kai"), "kj block create --content bass\n").unwrap();
+
+        let report = reseed_rc_files(root, false).unwrap();
+        assert_eq!(report.retired, vec!["director/".to_string()], "{report:?}");
+        assert!(root.join("director/create/S60-mine.kai").exists(), "left alone without --force");
+
+        let forced = reseed_rc_files(root, true).unwrap();
+        assert_eq!(forced.removed, vec!["director/".to_string()], "{forced:?}");
+        assert!(std::fs::symlink_metadata(root.join("director")).is_err(), "--force removes the directory");
+        assert!(root.join("bassist/create/S00-stance.kai").exists(), "a directory the seed never named stays");
+        assert!(reseed_rc_files(root, false).unwrap().retired.is_empty());
+
+        plant_retired_dir(root);
+        std::fs::write(root.join("director.keep"), "").unwrap();
+        let kept = reseed_rc_files(root, true).unwrap();
+        assert!(kept.removed.is_empty() && kept.retired.is_empty(), "{kept:?}");
+        assert_eq!(kept.kept, vec!["director/".to_string()]);
+        assert!(root.join("director/create/S60-mine.kai").exists());
     }
 
     /// Plant every retired seed path: a link where the seed shipped one, a

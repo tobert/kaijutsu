@@ -101,7 +101,7 @@ impl Held {
         let mut config = SshServerConfig::ephemeral(addr.port());
         // Setup runs as non-root principals, whose uncovered statements ask;
         // only the model's own calls should reach a reviewer here.
-        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "cd"]);
+        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "kj binding allow", "cd"]);
         config.auth_db_path = Some(auth_db_path);
         common::bootstrap_mock(&config, "mock-model").await;
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
@@ -112,7 +112,7 @@ impl Held {
         {
             let db = server.kernel_db.lock();
             for (principal_id, name) in [(performer, "held-performer"), (reviewer, "held-reviewer")] {
-                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id, name: name.into(), created_at: kaijutsu_types::now_millis() as i64,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -147,6 +147,14 @@ impl Held {
     /// A pre_call hook that asks before any `tool` call in this context. Its
     /// ask stores no command: allowing it lets the call itself proceed.
     async fn ask_before(&self, tool: &str) {
+        // banto reads files but holds no `glob`; the reviewer's context, which
+        // administers bindings, grants this context the whole file instance.
+        if tool == "glob" {
+            self.reviewer_kj.join_context(self.reviewer_context, "held-review").await.unwrap();
+            let granted = self.reviewer_kj.execute_kj_quiet(self.reviewer_context,
+                &["binding".into(), "allow".into(), "builtin.file".into(), self.context.to_string()]).await.unwrap();
+            assert_eq!(granted.exit_code, 0, "{}", granted.stderr);
+        }
         self.server.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
             id: HookId(format!("held-ask-{tool}")),
             match_instance: None,

@@ -499,7 +499,7 @@ mod tests {
         let run = rc_runs::start_run(conn, context.as_bytes(), "default", "create").unwrap();
         rc_runs::set_run_script_count(conn, &run, 1).unwrap();
         assert_eq!(rc_runs::begin_run_script(
-            conn, &run, "/config/rc/default/create/S00-test.kai", "echo once", now_millis(),
+            conn, &run, "/config/rc/coder/create/S00-test.kai", "echo once", now_millis(),
         ).unwrap(), 0);
         run
     }
@@ -540,7 +540,7 @@ mod tests {
         let mut result = kaish_kernel::interpreter::ExecResult::success_bytes(vec![0xff, 0xfe, 0xfd]);
         result.err = "warning from rc\n".into();
         let projected = projection(
-            "/config/rc/default/create/S00-binary.kai",
+            "/config/rc/coder/create/S00-binary.kai",
             &ScriptExecution::Completed { result, cancelled: false },
         ).unwrap();
         assert_eq!(projected.content_type, ContentType::Plain);
@@ -727,7 +727,7 @@ mod tests {
             ).unwrap();
             conn.execute(
                 "INSERT INTO rc_run_scripts(run_id,seq,path,body_sha256,exit_code,started_at,finished_at)
-                 VALUES(?1,0,'/config/rc/default/create/S00-legacy.kai',?2,7,?3,?4)",
+                 VALUES(?1,0,'/config/rc/coder/create/S00-legacy.kai',?2,7,?3,?4)",
                 rusqlite::params![run, body, finished_at - 5, finished_at],
             ).unwrap();
             (run, finished_at)

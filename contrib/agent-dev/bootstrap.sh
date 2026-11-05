@@ -86,7 +86,7 @@ kj backend model set anthropic claude-haiku-5-5 --max-tokens 64000
 
 kj character create senpai --rc mcp
 run add-key /keys/senpai.pub --as senpai
-kj character create banto --rc director
+kj character create banto --rc banto
 kj character create "$project-coder" --rc coder
 
 # A character's model and slots go to its contexts, copied when a context is made. banto runs Haiku; the coder

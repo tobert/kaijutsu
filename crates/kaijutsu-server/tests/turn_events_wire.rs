@@ -40,7 +40,7 @@ fn assign_turn_identity(
     let reviewer = PrincipalId::new();
     let db = server.kernel_db.lock();
     if db.get_character(actor).unwrap().is_none() {
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id: actor,
             name: "turn-actor".into(),
             created_at: 0,
@@ -49,7 +49,7 @@ fn assign_turn_identity(
         })
         .unwrap();
     }
-    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: reviewer,
         name: "turn-reviewer".into(),
         created_at: 0,

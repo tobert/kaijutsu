@@ -265,8 +265,9 @@ fn set_ephemeral_host_exec(rc_root: &Path, enabled: bool) {
     for (canonical, body) in kaijutsu_kernel::seed_scripts::seed_files() {
         if !matches!(
             canonical.as_str(),
-            "/config/rc/root/create/S10-binding.kai"
-                | "/config/rc/director/create/S10-binding.kai"
+            "/config/rc/person/create/S10-binding.kai"
+                | "/config/rc/banto/create/S10-binding.kai"
+                | "/config/rc/coder/create/S10-binding.kai"
                 | "/config/rc/lib/create/S10-binding.kai"
         ) {
             continue;
@@ -294,7 +295,8 @@ impl SshServerConfig {
 
     /// The name of the live, non-root character `ephemeral()` also creates. A
     /// root performs only its root console, so a test that makes a context
-    /// with `kj context create <character>` names this one.
+    /// with `kj context create <character>` names this one. It runs the
+    /// `banto` rc directory: the lead that creates, drives, and answers asks.
     pub const EPHEMERAL_PERFORMER: &'static str = "performer";
 
     /// Create [`Self::EPHEMERAL_PERFORMER`] in `kernel_db` unless it exists.
@@ -307,7 +309,7 @@ impl SshServerConfig {
             return;
         }
         kernel_db
-            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: PrincipalId::new(),
                 name: Self::EPHEMERAL_PERFORMER.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -1373,7 +1375,7 @@ mod tests {
                 use kaijutsu_kernel::mcp::{CallContext, Capability, ContextToolBinding, InstanceId, KernelCallParams};
                 let principal = PrincipalId::new();
                 let db = kaijutsu_kernel::KernelDb::open(dir.join("kernel.db")).unwrap();
-                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: principal, name: "signal-test".into(), created_at: 1,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();

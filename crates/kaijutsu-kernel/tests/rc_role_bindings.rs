@@ -1,4 +1,4 @@
-//! Slice 5: toolie/director role bundles seeded via rc.
+//! Slice 5: toolie/banto role bundles seeded via rc.
 //!
 //! These exercise the full path the capability-policy work delivers:
 //! `kj context create toolie` runs the seeded rc `create` scripts,
@@ -282,47 +282,47 @@ async fn toolie_role_seeds_one_read_only_shell_and_refuses_writes_body() {
 }
 
 #[test]
-fn director_role_seeds_block_tooling_but_not_file_writes() {
+fn banto_role_seeds_block_tooling_but_not_file_writes() {
     run_on_rc_stack(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build current-thread runtime")
-            .block_on(director_role_seeds_block_tooling_but_not_file_writes_body());
+            .block_on(banto_role_seeds_block_tooling_but_not_file_writes_body());
     });
 }
 
-async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
+async fn banto_role_seeds_block_tooling_but_not_file_writes_body() {
     let h = harness().await;
-    let ctx = create_typed(&h, "dir", "director").await;
+    let ctx = create_typed(&h, "dir", "banto").await;
 
     let binding = h
         .kernel
         .broker()
         .binding(&ctx)
         .await
-        .expect("director rc must seed a binding");
+        .expect("banto rc must seed a binding");
     let file = InstanceId::new("builtin.file");
     let block = InstanceId::new("builtin.block");
 
     // Whole block instance granted — including mutating block tools.
     assert!(
         binding.allows_tool(&block, "block_create"),
-        "director should allow block_create (whole-instance grant)"
+        "banto should allow block_create (whole-instance grant)"
     );
     assert!(binding.allows_tool(&block, "block_read"));
-    // File access: read + the write tools. A director owns the rc lifecycle
+    // File access: read + the write tools. A banto owns the rc lifecycle
     // scripts, so it gets file:write/edit for governance artifacts — general
     // code edits still delegate to a coder context. See
-    // assets/defaults/rc/director/create/S10-binding.kai.
-    assert!(binding.allows_tool(&file, "read"), "director should allow file read");
+    // assets/defaults/rc/banto/create/S10-binding.kai.
+    assert!(binding.allows_tool(&file, "read"), "banto should allow file read");
     assert!(
         binding.allows_tool(&file, "write"),
-        "director should allow file write (rc-lifecycle governance)"
+        "banto should allow file write (rc-lifecycle governance)"
     );
     assert!(
         binding.allows_tool(&file, "edit"),
-        "director should allow file edit (rc-lifecycle governance)"
+        "banto should allow file edit (rc-lifecycle governance)"
     );
     // `/config/rc` carries no capability of its own — the file:write grant above
     // is what reaches it, enforced at the call path exactly like any other
@@ -337,7 +337,7 @@ async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
                 instance: file.clone(),
                 tool: "write".into(),
                 arguments: serde_json::json!({
-                    "path": "/config/rc/director/create/S99-write-test.kai",
+                    "path": "/config/rc/banto/create/S99-write-test.kai",
                     "content": "true\n",
                 }),
             },
@@ -347,30 +347,30 @@ async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
         .await;
     assert!(
         written.is_ok(),
-        "director's file:write must reach /config/rc with no extra capability: {written:?}"
+        "banto's file:write must reach /config/rc with no extra capability: {written:?}"
     );
 
     // Director is a binding admin — may write any context's loadout.
-    assert!(binding.is_admin(), "director should hold binding-admin");
+    assert!(binding.is_admin(), "banto should hold binding-admin");
 
     // Director holds the interactive editor's write capability alongside
-    // the file-tool writes above (assets/defaults/rc/director/create/
+    // the file-tool writes above (assets/defaults/rc/banto/create/
     // S10-binding.kai grants it directly — not via the S10-lib symlink, so
     // this harness's host `LocalBackend` mount does exercise it).
     assert!(
         binding.allows(&Capability::Editor),
-        "director should hold the editor write capability"
+        "banto should hold the editor write capability"
     );
 
-    // Facades: director gets the full (collapsed) interaction surface.
+    // Facades: banto gets the full (collapsed) interaction surface.
     for facade in ["shell", "edit_input", "submit_input"] {
         assert!(
             binding.allows(&Capability::Facade(facade.to_string())),
-            "director should allow facade {facade}"
+            "banto should allow facade {facade}"
         );
         assert!(
             fx_broker_check(&h, &ctx, facade).await.is_ok(),
-            "director facade {facade} should pass the gate"
+            "banto facade {facade} should pass the gate"
         );
     }
 }
@@ -602,7 +602,7 @@ async fn only_house_seats_hold_the_house_capability_body() {
     let h = harness().await;
     let root = ensure_root(&h, "amy").await;
     let mut seats = vec![("root", root)];
-    for ty in ["default", "mcp", "director", "coder", "toolie", "musician"] {
+    for ty in ["mcp", "banto", "coder", "toolie", "musician"] {
         let ctx = create_typed(&h, &format!("seat-{ty}"), ty).await;
         seats.push((ty, ctx));
     }

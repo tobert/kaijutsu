@@ -1,7 +1,7 @@
-# root: every context a root character performs, its root console and the
-# shell children it opens with Ctrl-Z alike. The human root has no model and
-# composes no stance; the model console is a `console` context under it
-# (assets/defaults/rc/console). The root refuses drives.
+# person: every context a root character performs, its root console and the
+# contexts it opens with Ctrl-Z alike. A person runs no model and composes no
+# stance; the console is banto's context under the root console
+# (assets/defaults/rc/banto). A person refuses drives.
 set -e
 kj binding allow "builtin.block"
 kj binding allow "builtin.file:read"
@@ -16,8 +16,8 @@ kj binding allow "admin"
 # `kj backend`, `kj character slot`, `kj alias`, `kj hook`, and `kj mcp reload`.
 kj binding allow "config-write"
 # Context and workspace lifecycle, and the verbs that move work between
-# contexts. The root has no `drive`: it refuses every autonomous turn that
-# another seat would clock on it.
+# contexts. A person has no `drive`: it refuses every autonomous turn that
+# another context would clock on it.
 kj binding allow "operator"
 kj binding allow "fork"
 kj binding allow "drift"

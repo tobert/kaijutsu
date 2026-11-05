@@ -1,5 +1,5 @@
 //! `kaijutsu-server bootstrap`: set up a kernel so its console can
-//! answer (`docs/server-cli.md`, "bootstrap").
+//! answer, with the shipped characters (`docs/server-cli.md`, "bootstrap").
 //!
 //! The root character and its key are written directly, as `init` writes
 //! them. Everything else is a `kj` verb, dispatched as that root on a kernel
@@ -19,8 +19,19 @@ use crate::ssh::SshServerConfig;
 
 /// The label of the model console.
 const CONSOLE_LABEL: &str = "console";
-/// The response budget bootstrap gives the performer's model.
+/// The rc directory the console's performer runs.
+const CONSOLE_RC_DIR: &str = "banto";
+/// The response budget bootstrap gives each model it sets.
 const DEFAULT_MAX_TOKENS: u64 = 16384;
+
+/// The chat characters bootstrap creates when they are missing, each running
+/// the rc directory of its name and given bootstrap's model
+/// (`docs/character.md`, "Shipped characters").
+pub const SHIPPED_CHARACTERS: &[&str] =
+    &["banto", "coder", "companion", "musician", "storyteller", "toolie", "assistant", "council"];
+/// The shipped character created with no model: its model is a council
+/// server, set by hand before the council is enabled.
+pub const SHIPPED_JUDGE: &str = "judge";
 
 
 /// One backend row, and the model the kernel defaults to on it.
@@ -277,14 +288,16 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
         }
     }
 
+    let first = opts.backends.first();
+    create_shipped_characters(shared, caller, opts, first, &mut report).await?;
+
     let performer = &opts.console_performer;
     // A new performer is created with its model. An existing one with neither
     // a model nor a slot gets the model; one that has either is left alone.
-    let first = opts.backends.first();
     match read(shared, |db| db.get_character_by_name(performer))? {
         None => {
-            // The console's performer runs the console's rc directory.
-            let mut argv = words(&["character", "create", performer, "--rc", "console"]);
+            // The console's performer runs banto's rc directory.
+            let mut argv = words(&["character", "create", performer, "--rc", CONSOLE_RC_DIR]);
             if let Some(backend) = first {
                 argv.extend(words(&[
                     "--model", &format!("{}/{}", backend.name, backend.model), "--max-tokens",
@@ -302,7 +315,7 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
             ));
         }
         Some(row) => {
-            if row.rc_dir.as_deref() != Some("console") {
+            if row.rc_dir.as_deref() != Some(CONSOLE_RC_DIR) {
                 // Every live context the performer plays but the root's console.
                 let others: Vec<String> = read(shared, |db| {
                     let console = db.get_character_by_name(&opts.root)?.and_then(|sheet| sheet.console_ctx);
@@ -315,12 +328,12 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
                 let current = row.rc_dir.as_deref().unwrap_or("(none)");
                 report.notes.push(if others.is_empty() {
                     format!(
-                        "{performer} runs rc directory {current}, not console, so the console it plays runs that directory; \
-                         `kj character set {performer} --rc console` changes it, and changes the directory of every context {performer} plays"
+                        "{performer} runs rc directory {current}, not {CONSOLE_RC_DIR}, so the console it plays runs that directory; \
+                         `kj character set {performer} --rc {CONSOLE_RC_DIR}` changes it, and changes the directory of every context {performer} plays"
                     )
                 } else {
                     format!(
-                        "{performer} runs rc directory {current}, not console, so the console it plays runs that directory. \
+                        "{performer} runs rc directory {current}, not {CONSOLE_RC_DIR}, so the console it plays runs that directory. \
                          It also plays {}, whose lifecycles would change with the directory, so bootstrap does not \
                          recommend changing the directory; name another performer with --console-as",
                         others.join(", ")
@@ -425,6 +438,55 @@ async fn run_plan(shared: &SharedKernel, caller: &KjCaller, opts: &BootstrapOpti
     }
 
     Ok(report)
+}
+
+/// Create each shipped character that does not exist, with `--rc <its
+/// name>`: a chat character with bootstrap's first model, the judge with
+/// none. An existing character is left alone and named in one note. With no
+/// model, a note names the verb that gives each created chat character one.
+/// The console's performer, when it is a shipped character, is created here
+/// and given its model by the console step if it has none.
+async fn create_shipped_characters(
+    shared: &SharedKernel,
+    caller: &KjCaller,
+    opts: &BootstrapOptions,
+    model: Option<&BackendChoice>,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    let mut existing = Vec::new();
+    let mut without_model = Vec::new();
+    for &name in SHIPPED_CHARACTERS.iter().chain(&[SHIPPED_JUDGE]) {
+        if name == opts.root {
+            existing.push(format!("{name} (the root character)"));
+            continue;
+        }
+        if read(shared, |db| db.get_character_by_name(name))?.is_some() {
+            existing.push(name.to_string());
+            continue;
+        }
+        let mut argv = words(&["character", "create", name, "--rc", name]);
+        match model {
+            Some(backend) if name != SHIPPED_JUDGE => argv.extend(words(&[
+                "--model", &format!("{}/{}", backend.name, backend.model), "--max-tokens", &DEFAULT_MAX_TOKENS.to_string(),
+            ])),
+            None if name != SHIPPED_JUDGE => without_model.push(name),
+            _ => {}
+        }
+        dispatch(shared, caller, argv, report).await?;
+    }
+    if !existing.is_empty() {
+        let verb = if existing.len() == 1 { "already exists" } else { "already exist" };
+        report.notes.push(format!(
+            "{} {verb}; bootstrap leaves an existing character as it is, its rc directory and model included",
+            existing.join(", ")
+        ));
+    }
+    if !without_model.is_empty() {
+        let verbs: Vec<String> =
+            without_model.iter().map(|name| format!("`kj character model set {name} <backend>/<model>`")).collect();
+        report.notes.push(format!("These characters have no model yet: {}", verbs.join(", ")));
+    }
+    Ok(())
 }
 
 /// Whether `performer` has a model a console can run: one on a backend that

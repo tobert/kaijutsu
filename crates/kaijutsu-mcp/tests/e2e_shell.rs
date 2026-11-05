@@ -48,11 +48,22 @@ fn root_keys() -> &'static Mutex<HashMap<SocketAddr, KeySource>> {
     ROOT_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The character every MCP session in this file plays; its rc directory is `mcp`.
+const MCP_CHARACTER: &str = "mcp-session";
+
 /// Start an ephemeral SSH server on a random port; return its address.
 async fn start_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = SshServerConfig::ephemeral(addr.port());
+    // An MCP session's character runs the `mcp` rc directory, as in production.
+    kaijutsu_kernel::kernel_db::KernelDb::open(config.data_dir.as_ref().expect("an ephemeral config has a data dir").join("kernel.db"))
+        .expect("open the ephemeral kernel.db")
+        .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            principal_id: kaijutsu_types::PrincipalId::new(), name: MCP_CHARACTER.to_string(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: false,
+        })
+        .expect("seed the mcp session character");
     root_keys()
         .lock()
         .unwrap()
@@ -85,7 +96,7 @@ async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
         key_source,
         insecure: true,
     };
-    KaijutsuMcp::connect_with_config(config, "e2e-test", Some("e2e-session")).with_character(Some(SshServerConfig::EPHEMERAL_PERFORMER.to_string()))
+    KaijutsuMcp::connect_with_config(config, "e2e-test", Some("e2e-session")).with_character(Some(MCP_CHARACTER.to_string()))
 }
 
 /// Register a session, retrying while the freshly-spawned actor is still

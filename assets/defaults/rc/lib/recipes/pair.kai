@@ -1,0 +1,34 @@
+# pair <senpai-character> <kohai-character>: create a context performed by
+# the first character, answering to the context this runs in, then a context
+# performed by the second, answering to the first. Prints both. A recipe runs
+# on demand; no lifecycle runs it:
+#   PATH="/config/rc/lib/recipes:$PATH" pair banto coder
+set -e
+senpai="$1"
+kohai="$2"
+case "$kohai" in
+  "")
+    echo "usage: pair <senpai-character> <kohai-character>" >&2
+    exit 2
+    ;;
+esac
+# Capture kj's reply before jq reads it: a failed create must stop the
+# recipe, not hand jq an empty reply.
+created="$(kj context create "$senpai" --json)"
+first="$(echo "$created" | jq -r '.context_id')"
+case "$first" in
+  ""|null)
+    echo "pair: kj context create $senpai made no context: $created" >&2
+    exit 1
+    ;;
+esac
+created="$(kj context create "$kohai" --senpai "$first" --json)"
+second="$(echo "$created" | jq -r '.context_id')"
+case "$second" in
+  ""|null)
+    echo "pair: kj context create $kohai made no context, and $senpai's context $first stays: $created" >&2
+    exit 1
+    ;;
+esac
+echo "senpai: $senpai $first"
+echo "kohai: $kohai $second"

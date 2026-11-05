@@ -81,7 +81,11 @@ A refusal names the rule: "only <ctx>'s senpai (<character>) or its lineage root
 - A person (a root character) may perform any context; every context a person performs runs no model turns,
   and its draft runs as shell.
 - A live person may archive a context whose lineage has no live root, such as the former console of a retired
-  person: nobody above it is left to archive it.
+  person: nobody above it is left to archive it. A broken lineage, such as a senpai cycle, refuses, naming it.
+- Only a live person retires a person (`kj character retire`). A character that performs a live person's console
+  is retired only by that person; anyone else is refused, naming the console, `kj character set <person> --console
+  <ctx>` or `--no-console`, and archiving the console first. Retirement archives every context the character
+  performs in one transaction, and a person's own root console with them.
 - `kj context create <character>` needs the Operator capability and a live character caller, and raises no ask. The new
   instance's senpai is the caller's instance, or the `--senpai <ctx>` instance the caller has authority over.
 - A model-played context holds no authority over itself, so it cannot widen its own egress list or move its own

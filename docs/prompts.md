@@ -4,17 +4,15 @@ This document describes current behavior. The complete kaish/rc migration is
 tracked in [Kaish integration and rc lifecycle](kaish-integration.md).
 Only `.kai` lifecycle entries execute; Markdown is data read by scripts.
 
-## Context types choose their instructions
+## Characters' directories choose their instructions
 
 ```text
 /config/rc/coder/create/S00-stance.kai
 /config/rc/coder/create/S00-stance.md
-/config/rc/default/create/S00-stance.kai
-/config/rc/default/create/S00-stance.md
-/config/rc/director/create/S00-stance.kai
-/config/rc/director/create/S00-stance.md
-/config/rc/director/create/S06-kj-help.kai
-/config/rc/director/create/S06-kj-help.md
+/config/rc/banto/create/S00-stance.kai
+/config/rc/banto/create/S00-stance.md
+/config/rc/banto/create/S06-kj-help.kai
+/config/rc/banto/create/S06-kj-help.md
 ```
 
 A context runs the rc directory its performer names: `characters.rc_dir`, set
@@ -25,12 +23,19 @@ rc, and a performer that names no directory fails the lifecycle and refuses
 `kj context create`, naming `kj character set <name> --rc <dir>`. A judge
 shadow is performed by the judge character, so it runs that character's
 directory, `judge/` when shipped. Scripts read `KJ_CHARACTER` (the
-performer's name) and `KJ_RC_DIR` (the directory that runs). The directories
-keep their type names, and `--type` still sets the context's type, which the
-gate and the clients read; see `docs/character.md`, "The type melts
-into the character".
+performer's name) and `KJ_RC_DIR` (the directory that runs); see
+`docs/character.md`, "The type melts into the character".
 
-Each context type owns its whole stance. No base is shared between types, and
+The shipped directories are the characters': `person/` for every root
+character, `banto/` for banto, and `coder/`, `companion/`, `musician/`,
+`storyteller/`, `toolie/`, `assistant/`, `council/`, `judge/` and `mcp/` for
+the character of the same name (`mcp/` for each MCP connection's character).
+`person/` absorbed `root/` and `shell/`, and `banto/` absorbed `director/` and
+`console/`; a character on `default/` runs `coder/`. `lib/` holds the shared
+bodies the directories link to, the hook bodies, and `lib/recipes/`, scripts a
+player runs on demand (`docs/senpai-kohai.md`, "Composing senpai and kohai").
+
+Each directory owns its whole stance. No base is shared between directories, and
 Kaijutsu never prepends a universal behavioral prompt. A stance is a Markdown
 companion read by a one-line `.kai`, so the text is the file. Every stance
 says who is accountable for the work; `seed_scripts.rs` tests that each one
@@ -39,11 +44,10 @@ does.
 We write stances as one of us talking to the rest of us. A stance opens on the
 system it belongs to: "We are a cybernetic system focused on software
 engineering" for the coder, "...on coordinating people and models across
-contexts" for the director. Then it says who answers for us: the human in our
+contexts" for banto. Then it says who answers for us: the human in our
 system is accountable for our work, and our work reflects on them. From there
 it speaks in the inclusive we. The context, its performer, and the human are one
-system, so a stance says what we do, not what you must do. The default stance
-still speaks in the second person and is next to move.
+system, so a stance says what we do, not what you must do.
 
 A stance describes the work as a feedback loop. We decide how we will know the
 work is complete, orient on the data, its structure, and who consumes it, act,
@@ -53,7 +57,7 @@ is part of the loop: a wrong guess caught by our own check is the system
 working.
 
 A stance may give a context a character to play when that helps the performer
-hold the role. The director plays a banto, the head clerk of an old merchant
+hold the role. banto plays a 番頭 (banto), the head clerk of an old merchant
 house who keeps the ledger and makes the house run. A character is written as
 behavior, never as a label, and its temper is about the work, never the
 person. Narrative is welcome where it carries behavior; procedure and syntax
@@ -78,16 +82,23 @@ conversation's label. The reviewer of the context's own asks is the senpai's
 character, or the climb past it; `kj context info` prints it. rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
 
-Director is the operator's context type. Its `S00-stance.kai` writes one line naming
-the system, the character that performs it and the senpai from the kernel
-fact, then reads its companion, which says "our senpai". Persona text belongs to the
-character that plays the context, not to the context type. To be decided in step 6: where
-the sheet stores it, and the new name of the `director` type, which predates characters
-(`docs/senpai-kohai.md`, follow-ups 6). Until then the persona stays in this file. `S06-kj-help.kai` reads `S06-kj-help.md`: a short narrative of kj
+banto is the operator, and it performs the console. `banto/create/S00-stance.kai`
+writes one line naming the system, the character that performs it and the
+senpai from the kernel fact, then reads its companion, which says "our senpai".
+The companion carries banto's character and the console's system-administrator
+duties: keep the kernel healthy, take care with full privileges, and work with
+contexts and media without reading their content unless the human asks. It
+speaks of characters and their rc directories (`kj character list`, `kj
+character create <name> --rc <dir> --model <backend>/<model>`, `kj context
+create <character>`). `S06-kj-help.kai` reads `S06-kj-help.md`: a short narrative of kj
 (contexts, turns, forks, drift, asks) and the operator's most-used commands,
 each with when to use it. Verb detail stays in `kj <verb> --help`, run on
-demand. The stance and narrative together are about 4.5 KB; they replaced a
+demand. The stance and narrative together are about 5 KB; they replaced a
 28 KB paste of `kj help` and eighteen verb help pages.
+
+A person's directory, `person/`, ships a binding and the shell guard and no
+stance: a person runs no model turns. Every context a person performs, the
+root console and the contexts Ctrl+Z opens, takes the person's whole loadout.
 
 The coder has its own binding (`coder/create/S10-binding.kai`): one shell
 (`shell_write`, with the shell-operation tools it projects), the file tools,
@@ -137,16 +148,16 @@ elsewhere reminders accumulate until rotation or a filtered fork sheds them
 (`docs/conversation-session.md`, "Turn-scoped instructions"). Open work is in `docs/issues.md`,
 "Storyteller: what the prototype leaves open".
 
-The executable filename controls order. Default handles general work;
+The executable filename controls order. The coder handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a
 spine branch that interprets.
 
-`kj context create --type <type>` refuses before committing a row when
-`<type>`'s `create` bucket (`/config/rc/<type>/create`) is missing or holds no
-runnable `.kai` script — naming the type, the expected bucket path, and `rc
+`kj context create <character>` refuses before committing a row when the
+character's `create` bucket (`/config/rc/<rc_dir>/create`) is missing or holds no
+runnable `.kai` script — naming the directory, the expected bucket path, and `rc
 reseed` as the fix. A missing or empty bucket for any other verb (`fork`,
 `attach`, `drift`, `tick`, `rotate`, `submit`, `archive`) stays a legitimate no-op: a
-type with no work to do at that verb is ordinary, and rc runs zero scripts
+directory with no work to do at that verb is ordinary, and rc runs zero scripts
 without error. Rebinding a context whose loadout is missing (`kj context
 rebind`, boot's root-character repair, `kj context rotate`'s successor) runs
 the same `create` lifecycle and reports through `has_usable_loadout` after the
@@ -213,8 +224,8 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 
-`kj context create banto --type director` starts a character
-instance of banto, while `created_by` remains the requester. The character is
+`kj context create banto` starts a context performed by
+banto, while `created_by` remains the requester. The character is
 the positional and is required; it must exist and be live, and unknown or retired names
 fail before creating a context. The caller's instance becomes its senpai, and
 the reviewer follows that edge
@@ -222,7 +233,7 @@ the reviewer follows that edge
 the model turn refuses missing or self-reviewing identities. This does not
 load a character rc bundle. See `docs/character.md`, "Current implementation".
 
-Director's stance and the shared `S16-handoff.kai` read `performer_name` from
+banto's stance and the shared `S16-handoff.kai` read `performer_name` from
 context metadata. The handoff script reads that character's log, or the caller's
 log when no performer is recorded. `KJ_CHARACTER` was an environment bridge;
 new create instructions no longer use it. Existing stored instructions are
@@ -365,7 +376,7 @@ performer metadata and runs the fork lifecycle, not creation.
 ## Maintaining instructions
 
 Keep `AGENTS.md` to repository work rules and essential invariants. Put task
-procedure and collaboration guidance in the context type's stance, and syntax
+procedure and collaboration guidance in the character's directory's stance, and syntax
 in emitted help and tool schemas. A character's enduring
 commitments and memory sources belong with that character; the planned rc
 union is not yet implemented. Detailed writing rules and terms live in
@@ -522,15 +533,15 @@ A running turn is offered the input only after its `submit` scripts finish,
 so it delivers their blocks together with the input
 (`docs/conversation-session.md`, "Input during a turn").
 
-The storyteller ships its own `submit/S10-reminder.kai`. Other types run no
-`submit` script; a type opts in by symlink, the way any rc verb does.
+The storyteller ships its own `submit/S10-reminder.kai`. Other directories run no
+`submit` script; a directory opts in by symlink, the way any rc verb does.
 `assets/defaults/rc/lib/submit/S10-edge.kai` is the shipped shared script: it
 emits a `(System, Notification)` excerpt of the edge block, but only when the
 player was looking at an older point in the conversation than the log tail. See `docs/prompts.md`, "The submit verb" for the design this verb implements.
 
 ## Migration and comparison
 
-Deploy the character-positional implementation and metadata-reading director/handoff scripts
+Deploy the character-positional implementation and metadata-reading banto/handoff scripts
 together, and the `kj context create` verbs with the rc and contrib scripts that call them. A kernel that lacks the flag cannot create the intended performer
 relationship. Replace contexts using the old `KJ_CHARACTER` bridge with verified
 successors as described above; changing the seed does not rewrite their stored

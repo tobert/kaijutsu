@@ -1,4 +1,4 @@
 # The kj narrative and the operator's most-used commands, as one durable
-# instruction block. Verb detail stays in `kj <verb> --help`, which the seat
-# runs on demand.
+# instruction block. Verb detail stays in `kj <verb> --help`, which the
+# performer runs on demand.
 kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"

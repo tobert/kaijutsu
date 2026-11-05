@@ -217,7 +217,7 @@ async fn boot() -> Scenario {
     bootstrap_mock(&config, "mock-model").await;
 
     // `gate.toml`'s shipped default (`assets/defaults/gate.toml`) allow-lists
-    // "kj handoff note" globally and gives `[rc.director]` create,
+    // "kj handoff note" globally and gives `[rc.banto]` create,
     // fork, and drive, but banto's own `context set`/`wait`/`handoff signoff`
     // /`drift push` tool calls would each raise their own ask (`Uncovered`
     // falls to `ask`, `crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s
@@ -237,13 +237,13 @@ async fn boot() -> Scenario {
         "/../../assets/defaults/gate.toml"
     ))
     .expect("read shipped gate.toml");
-    let director_tier = "[rc.director]\nallow = [\n";
-    assert_eq!(shipped.matches(director_tier).count(), 1, "the shipped gate.toml carries one director allow tier");
+    let banto_tier = "[rc.banto]\nallow = [\n";
+    assert_eq!(shipped.matches(banto_tier).count(), 1, "the shipped gate.toml carries one banto allow tier");
     std::fs::write(
         &gate_toml_path,
         shipped.replacen(
-            director_tier,
-            "[rc.director]\nallow = [\n  \"kj context set\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n",
+            banto_tier,
+            "[rc.banto]\nallow = [\n  \"kj context set\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n",
             1,
         ),
     )
@@ -262,11 +262,11 @@ async fn boot() -> Scenario {
 
     let amy_client = connect_with_key(addr, amy_key, "amy").await;
     let (amy, _) = amy_client.bind_kernel().await.expect("bind_kernel");
-    // `director` rc grants `config-write` (character/slot administration)
+    // `banto` rc grants `config-write` (character/slot administration)
     // and the `drive`/`fork`/`drift` verb authorities — amy's own admin
-    // seat needs the same loadout banto's seat gets, not the bare "default"
-    // type's narrower grant (`assets/defaults/rc/director/create/S10-binding.kai`).
-    let amy_home = create_context_typed(&amy, "amy-home", "director")
+    // seat needs the loadout banto's seat gets, not a coder's narrower grant
+    // (`assets/defaults/rc/banto/create/S10-binding.kai`).
+    let amy_home = create_context_typed(&amy, "amy-home", "banto")
         .await
         .expect("create amy-home");
     amy.join_context(amy_home, "amy").await.expect("join amy-home");
@@ -335,7 +335,7 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Setup: characters, slots, banto's seat.
         // ------------------------------------------------------------
-        s.kj("kj character create banto --rc director").await;
+        s.kj("kj character create banto --rc banto").await;
         s.kj("kj character create coder-a --rc coder").await;
         s.kj("kj character create coder-b --rc coder").await;
 
@@ -521,7 +521,7 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Turn 3: banto's gated statement raises an ask. `echo` names no
         // `kj` verb, so no tier in `gate.toml` — not even the
-        // `[rc.director]` one this scenario just wrote — ever
+        // `[rc.banto]` one this scenario just wrote — ever
         // covers it; it is `Uncovered` and falls to the default `ask`
         // (`crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s module doc).
         // No hook install needed: this is the kernel's real default gate
@@ -651,7 +651,7 @@ fn kaijutsu_session_scenario() {
             assert!(db.get_context(banto_ctx).unwrap().unwrap().archived_at.is_some(), "the predecessor is archived");
             let successor = db.get_context(banto_next_ctx).unwrap().unwrap();
             assert_eq!(successor.performer, Some(banto_principal));
-            assert_eq!(successor.context_type, "director");
+            assert_eq!(successor.context_type, "banto");
         }
 
         // `S16-handoff.kai` injects the handoff tail as a `Notification`

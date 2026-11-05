@@ -241,11 +241,11 @@ allow = [
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
 
-[rc.director]
+[rc.banto]
 allow = [
-  "kj context create",     # a director creates the lanes that answer to it, `kj context create coder --name <lane>`
-  "kj fork",             # a fork copies this seat's own performer
-  "kj drive",            # runs a turn on a lane this seat directs
+  "kj context create",     # banto creates its lanes, `kj context create coder --name <lane>`
+  "kj fork",             # a fork copies this context's own performer
+  "kj drive",            # runs a turn on a lane banto directs
 ]
 ```
 
@@ -682,9 +682,9 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   setup of its own, as kaibo's config does. To be decided in step 7: the config shape (a key in `gate.toml`
   or a separate setup), and whether one serves every seat or one is chosen per `[rc.<dir>]` or
   `[character.<name>]`.
-- **The director tier** is `[rc.director]` above, keyed by the rc directory banto runs. The directory is
-  renamed `banto/` with the type melt (`docs/character.md`, "Rollout", M6), and the section with it. The
-  tier's contents (allow `kj context create`, `kj fork`, `kj drive`) do not change.
+- **The banto tier** is `[rc.banto]` above, keyed by the rc directory banto runs (`director/` before it was
+  renamed). A host `gate.toml` that still has `[rc.director]` lists it as applying to nobody until it is
+  renamed by hand.
 
 ## Out of scope
 

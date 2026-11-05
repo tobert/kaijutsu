@@ -8029,7 +8029,7 @@ mod lifetime_tests {
         {
             let db = kernel.kernel_db().lock();
             for (id, name) in [(actor, "performer"), (reviewer, "reviewer")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();

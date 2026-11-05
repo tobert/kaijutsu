@@ -493,31 +493,86 @@ fn promoting_an_archived_context_with_no_senpai_refuses() {
     assert!(error.contains("has no senpai"), "{error}");
     assert!(db.get_context(bare.context_id).unwrap().unwrap().is_archived(), "it stays archived");
 
-    // An archived root console is no root console: archiving cleared its
-    // `root_ctx`, so it too has no senpai to come back under.
+    // A root console whose `root_ctx` was cleared, as retirement clears it,
+    // is no root console once archived, so it too has no senpai to come
+    // back under.
+    let (amy, _) = db.seed_test_root_console().unwrap();
+    db.set_character_root_ctx(amy, None).unwrap();
     db.archive_context(console).unwrap();
     let error = db.promote_context(console).unwrap_err().to_string();
     assert!(error.contains("has no senpai"), "{error}");
 }
 
-/// Archiving a root console, by `archive_context` or by the demote
-/// ladder's last step, clears the `root_ctx` that names it in the same
-/// transaction, so no sheet names an archived root console. Falsified by
-/// dropping the clearing from `archive_one_context`.
+/// No archive path archives a root console: `archive_context` and the
+/// demote ladder's last step refuse it inside the write, naming `kj context
+/// rotate`, and the console stays live with its `root_ctx`. Falsified by
+/// dropping the root console check from `archive_one_context`.
 #[test]
-fn archiving_a_root_console_clears_its_root_ctx() {
+fn archiving_a_root_console_refuses_inside_the_write() {
     let db = KernelDb::temporary().unwrap();
     setup_test_db(&db);
     let (amy, console) = db.seed_test_root_console().unwrap();
-    db.archive_context(console).unwrap();
-    assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, None, "archive clears root_ctx");
-    assert!(!db.is_root_console(console).unwrap());
+    let error = db.archive_context(console).unwrap_err().to_string();
+    assert!(error.contains("root console") && error.contains("kj context rotate"), "{error}");
+    assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, Some(console), "the refusal keeps root_ctx");
+    assert!(!db.get_context(console).unwrap().unwrap().is_archived());
 
-    let (bob, bob_console) = db.seed_test_root_console().unwrap();
-    assert_ne!(bob, amy, "a sheet with no root_ctx is not reused");
-    for _ in 0..2 {
-        db.demote_context(bob_console).unwrap();
-    }
-    assert!(db.get_context(bob_console).unwrap().unwrap().is_archived());
-    assert_eq!(db.get_character(bob).unwrap().unwrap().root_ctx, None, "the demote ladder clears root_ctx");
+    assert_eq!(db.demote_context(console).unwrap(), DemoteOutcome::Demoted);
+    let error = db.demote_context(console).unwrap_err().to_string();
+    assert!(error.contains("root console"), "the demote ladder refuses too: {error}");
+    let row = db.get_context(console).unwrap().unwrap();
+    assert!(!row.is_archived() && row.demoted_at.is_some(), "the refused step changes nothing");
+    assert_eq!(db.get_character(amy).unwrap().unwrap().root_ctx, Some(console));
+}
+
+/// The demote write takes the step its caller decided. A step decided as a
+/// demote does not archive a context another demote reached first, and a
+/// step decided as the archive does not demote a context that was not
+/// demoted. Falsified by deciding the step from the row alone.
+#[test]
+fn a_demote_refuses_a_step_that_changed_after_its_caller_decided_it() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let row = make_context_row(Some("raced"));
+    let cid = row.context_id;
+    insert_kohai_with_doc(&db, &row, ws_id);
+
+    let error = db.demote_context_with_shadows(cid, None, true).unwrap_err().to_string();
+    assert!(error.contains("kj context demote"), "{error}");
+    assert_eq!(db.get_context(cid).unwrap().unwrap().demoted_at, None, "a stale archive decision demotes nothing");
+
+    assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Demoted);
+    let error = db.demote_context_with_shadows(cid, None, false).unwrap_err().to_string();
+    assert!(error.contains("kj context demote") && error.contains("--confirm"), "{error}");
+    assert!(!db.get_context(cid).unwrap().unwrap().is_archived(), "a stale demote decision archives nothing");
+
+    let (outcome, _) = db.demote_context_with_shadows(cid, None, true).unwrap();
+    assert_eq!(outcome, DemoteOutcome::Archived);
+}
+
+/// An MCP hub with a live session refuses its archive inside the write,
+/// naming the session, so a session made after a verb's check is not left
+/// without its hub. Once the session is archived, the hub archives and its
+/// pointer clears. Falsified by dropping the hub check from
+/// `archive_one_context`.
+#[test]
+fn archiving_a_hub_with_a_live_session_refuses_inside_the_write() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let (amy, _) = db.seed_test_root_console().unwrap();
+    let hub = make_context_row(Some("mcp/amy"));
+    insert_kohai_with_doc(&db, &hub, ws_id);
+    db.set_character_mcp_hub_ctx(amy, Some(hub.context_id)).unwrap();
+    let mut session = make_context_row(Some("session"));
+    session.forked_from = Some(hub.context_id);
+    insert_kohai_with_doc(&db, &session, ws_id);
+
+    let error = db.archive_context(hub.context_id).unwrap_err().to_string();
+    assert!(error.contains("MCP hub") && error.contains("session"), "{error}");
+    assert!(!db.get_context(hub.context_id).unwrap().unwrap().is_archived());
+    assert_eq!(db.get_character(amy).unwrap().unwrap().mcp_hub_ctx, Some(hub.context_id));
+
+    assert!(db.archive_context(session.context_id).unwrap());
+    assert!(db.archive_context(hub.context_id).unwrap());
+    assert_eq!(db.get_character(amy).unwrap().unwrap().mcp_hub_ctx, None, "the archive clears the pointer");
 }

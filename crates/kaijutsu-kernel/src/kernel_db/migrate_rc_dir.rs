@@ -1,6 +1,7 @@
 //! Migration `rc-dir-backfill-v1`: every character gets the rc directory its
 //! contexts run, and every root its console pointer, where the database can
-//! say which (`docs/character.md`, "Migrations").
+//! say which; then `rc-dir-rename-v1` moves the retired directories to the
+//! ones that absorbed them (`docs/character.md`, "Migrations").
 
 use super::*;
 
@@ -273,6 +274,111 @@ impl KernelDb {
                 unset = unset.len(),
                 "backfilled the characters' rc directories and console pointers"
             );
+        }
+        Ok(())
+    }
+}
+
+/// The rc directories the characters' directories absorbed, and where each
+/// moved (`docs/character.md`, "Migrations").
+const RC_DIR_RENAMES: &[(&str, &str)] = &[
+    ("console", "banto"),
+    ("default", "coder"),
+    ("director", "banto"),
+    ("root", "person"),
+    ("shell", "person"),
+];
+
+impl KernelDb {
+    pub(super) const RC_DIR_RENAME_MIGRATION: &'static str = "rc-dir-rename-v1";
+
+    /// Where a database is copied before `rc-dir-rename-v1` changes it:
+    /// `kernel.db.pre-rc-dir-rename`.
+    pub(super) fn pre_rc_dir_rename_backup_path(path: &Path) -> std::path::PathBuf {
+        let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".pre-rc-dir-rename");
+        path.with_file_name(name)
+    }
+
+    /// Copy a database that `rc-dir-rename-v1` is about to change aside
+    /// first: the migration is not recorded and a character names a retired
+    /// directory, or the database is older than `characters.rc_dir` and has
+    /// characters, which the backfill gives the retired names. An existing
+    /// copy stays as it is, and a copy that cannot be made fails the open.
+    pub(super) fn back_up_before_rc_dir_rename(conn: &Connection, path: &Path) -> KernelDbResult<()> {
+        if !Self::has_table(conn, "characters")? {
+            return Ok(());
+        }
+        if Self::has_table(conn, "kernel_migrations")? {
+            let done: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
+                [Self::RC_DIR_RENAME_MIGRATION],
+                |r| r.get(0),
+            )?;
+            if done {
+                return Ok(());
+            }
+        }
+        let changes: bool = if Self::has_column(conn, "characters", "rc_dir")? {
+            let retired = RC_DIR_RENAMES.iter().map(|(from, _)| format!("'{from}'")).collect::<Vec<_>>().join(", ");
+            conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM characters WHERE rc_dir IN ({retired}))"), [], |r| r.get(0))?
+        } else {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM characters)", [], |r| r.get(0))?
+        };
+        if !changes {
+            return Ok(());
+        }
+        Self::back_up_aside(conn, &Self::pre_rc_dir_rename_backup_path(path), "the characters' rc directories are renamed")
+    }
+
+    /// Move every character on a retired rc directory to the directory that
+    /// absorbed it, once, in one transaction: `director` and `console` to
+    /// `banto`, `root` and `shell` to `person`, `default` to `coder`. Each
+    /// move is listed in `context_character_migration_report` (kind
+    /// `rc_dir_renamed`, naming the character by `principal_id`) and logged.
+    /// Every other directory stays. Runs after `rc-dir-backfill-v1`, so a
+    /// directory the backfill gave from an old type moves in the same open.
+    /// The migration never refuses.
+    pub(super) fn migrate_rc_dir_rename(conn: &Connection) -> KernelDbResult<()> {
+        let done: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
+            [Self::RC_DIR_RENAME_MIGRATION],
+            |r| r.get(0),
+        )?;
+        if done {
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        let recorded_at = now_millis();
+        let mut moved = 0usize;
+        for (from, to) in RC_DIR_RENAMES {
+            let characters: Vec<(PrincipalId, String)> = {
+                let mut stmt = tx.prepare("SELECT principal_id, name FROM characters WHERE rc_dir = ?1 ORDER BY name")?;
+                stmt.query_map([from], |r| Ok((read_principal_id(r, 0)?, r.get(1)?)))?
+                    .collect::<SqliteResult<_>>()?
+            };
+            for (id, name) in characters {
+                tx.execute(
+                    "UPDATE characters SET rc_dir = ?1 WHERE principal_id = ?2",
+                    params![to, blob_param(id.as_bytes())],
+                )?;
+                let note = format!(
+                    "{name}'s rc directory moved from '{from}' to '{to}', which absorbed it; \
+                     `kj character set {name} --rc <dir>` names another"
+                );
+                info!(character = %name, from, to, "renamed a retired rc directory");
+                tx.execute(
+                    "INSERT INTO context_character_migration_report (kind, context_id, principal_id, note, recorded_at)
+                     VALUES ('rc_dir_renamed', NULL, ?1, ?2, ?3)",
+                    params![blob_param(id.as_bytes()), note, recorded_at],
+                )?;
+                moved += 1;
+            }
+        }
+        tx.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [Self::RC_DIR_RENAME_MIGRATION])?;
+        tx.commit()?;
+        if moved > 0 {
+            info!(moved, "moved the characters on retired rc directories");
         }
         Ok(())
     }

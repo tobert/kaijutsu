@@ -6,6 +6,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Type melt M5d: what retirement in one transaction leaves open (2026-11-05)
+
+- `kj character retire` runs each archive lifecycle outside the lock, then `retire_with_contexts` re-derives the set
+  inside its transaction (kj/character.rs ~1067-1124, kernel_db/context_ring.rs ~324-329): a context created in that
+  window is archived without its `archive` rc running. And `retire_refusal` checks only contexts the character
+  performs, so a judge shadow archived with one can refuse at commit, after every lifecycle ran (spec: "refuses the
+  retirement before any archive lifecycle runs"). Both roll back; kaibo job-1 2026-11-05 #10.
+
 ## Type melt M2: what rc-follows-the-performer leaves open (2026-11-04)
 
 rc runs the performer's `rc_dir` (`docs/character.md`, "The type melts into
@@ -857,7 +865,7 @@ contexts whose senpai that character holds (`docs/approval-identity.md`,
 - `cd <dir>` keys on its directory, so each new workspace path asks once
   more even under a family rule. Whether `cd` belongs in `[global] allow`
   is undecided.
-- The shipped `[rc.director]` allow in `assets/defaults/gate.toml`
+- The shipped `[rc.banto]` allow in `assets/defaults/gate.toml`
   covers `kj drive` on any target, which is wider than a character rule.
   Moltar's host `gate.toml` has no director section, which is why
   banto-shadow asked. Decide whether to narrow the default to the
@@ -2341,7 +2349,7 @@ another lane's this week.
 ## Split admin grants between `root` and `director` (2026-09-16)
 
 `director` is banto's model seat and still carries the whole operator grant
-set (`assets/defaults/rc/director/create/S10-binding.kai`), which `root`
+set (`assets/defaults/rc/banto/create/S10-binding.kai`), which `root`
 now also holds. Decide which grants banto keeps (likely drive, fork, drift,
 operator) and which belong to roots only (likely `admin`, `config-write`,
 `system`). Amy chose the split on 2026-09-16 and left the grant list open.
@@ -4562,7 +4570,7 @@ still mixes `Instance`/`Tool{instance,tool}`/`Facade` (granular), `Admin`/
 (`Drive`/`Fork`/`Drift`/`Transport`/`Operator`/`ConfigWrite`/`Exec`/
 `Editor`/`System`/`House`) — three different shapes, grown ad-hoc as gaps were found. Amy:
 "Director should only get `shell` as long as it has `kj`" — director's
-broad facade/exec grants (`assets/defaults/rc/director/create/S10-binding.kai`)
+broad facade/exec grants (`assets/defaults/rc/banto/create/S10-binding.kai`)
 are worth revisiting once `kj` itself can reach what a shell used to be
 for. "We'll do a cap redesign sweep soon so it's a good time to
 experiment" — treat `Editor` as provisional until that sweep.

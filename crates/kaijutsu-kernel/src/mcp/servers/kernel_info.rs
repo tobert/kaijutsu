@@ -187,7 +187,7 @@ mod tests {
             .unwrap();
             let performer = performer.map(|name| {
                 let principal_id = PrincipalId::new();
-                g.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None,
+                g.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();

@@ -162,7 +162,7 @@ async fn serve_kernel(
         root_key: config.root_key().public_key().clone(),
         key_comment: None,
         backends: vec![BackendChoice::mock("mock-model")],
-        console_performer: "root".to_string(),
+        console_performer: "banto".to_string(),
     };
     bootstrap(&config, &opts).await.expect("bootstrap");
 
@@ -190,21 +190,12 @@ async fn serve_kernel(
     let shared = kernel_rx.await.expect("the server hands back its kernel");
 
     {
-        let performer = PrincipalId::new();
+        // Bootstrap creates the shipped coder with the mock model; a session
+        // runs its character's one model, copied under `model`.
         let db = shared.kernel_db.lock();
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
-            principal_id: performer,
-            name: PERFORMER.into(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            retired_at: None,
-            handoff_ctx: None,
-            root_ctx: None,
-            root: false,
-        })
-        .expect("create the performer");
-        // A session runs its character's one model, copied under `model`.
-        db.seed_test_slot_entries(performer, &[("model", "mock", "mock-model")])
-            .expect("give the performer its model");
+        let coder = db.get_character_by_name(PERFORMER).unwrap().expect("bootstrap creates the coder");
+        assert_eq!(coder.rc_dir.as_deref(), Some("coder"));
+        assert_eq!(db.get_character_model(coder.principal_id).unwrap().expect("the coder has a model").model, "mock-model");
     }
     let mock = MockClient::new("").with_scripted_stream(script);
     shared.kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(mock)));
@@ -668,12 +659,8 @@ fn deleting_a_session_archives_its_context_and_its_judge_shadow() {
             created_at: kaijutsu_types::now_millis() as i64,
         })
         .expect("seat the shadow under the session");
-        let judge = PrincipalId::new();
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None,
-            mcp_hub_ctx: None, context_type: None, principal_id: judge, name: "judge".into(), created_at: 0, retired_at: None,
-            handoff_ctx: None, root_ctx: None, root: false,
-        })
-        .expect("create the judge character");
+        // Bootstrap creates the judge character with no model.
+        let judge = db.get_character_by_name("judge").unwrap().expect("bootstrap creates the judge").principal_id;
         // A character whose model is on a council server is a judge.
         let mk = db
             .upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {

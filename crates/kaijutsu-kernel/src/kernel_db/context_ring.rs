@@ -64,6 +64,15 @@ pub struct RotationCommit {
     pub shadows: Vec<ContextId>,
 }
 
+/// What [`KernelDb::retire_with_contexts`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retirement {
+    /// The contexts the character performed, concluded and archived.
+    pub archived: Vec<ContextId>,
+    /// Their judge shadows, archived with them.
+    pub shadows: Vec<ContextId>,
+}
+
 impl KernelDb {
     /// Archive a context while retaining its history. Returns true if it was
     /// active. Its live judge shadows are archived with it, told by their
@@ -123,6 +132,31 @@ impl KernelDb {
         )))
     }
 
+    /// Why `id` may not be archived by any path, whoever asks: it is a root
+    /// console, which its character would be left without, or an MCP hub
+    /// that live sessions have as their parent. Verbs check this before
+    /// they run anything, for their message; [`Self::archive_context_writes`]
+    /// checks it again inside the write. A rotation and a retirement move or
+    /// clear `root_ctx` first, in the transaction that archives.
+    pub(crate) fn archive_refusal(&self, id: ContextId) -> KernelDbResult<Option<String>> {
+        let label = self.get_context(id)?.and_then(|row| row.label).unwrap_or_else(|| id.short());
+        if self.is_root_console(id)? {
+            return Ok(Some(format!(
+                "{label} is a root console, and archiving it would leave its character with none; \
+                 `kj context rotate {label}` replaces it"
+            )));
+        }
+        let sessions = self.live_mcp_sessions(id)?;
+        if !sessions.is_empty() {
+            let names = sessions.iter().map(|id| self.context_name(*id)).collect::<Vec<_>>().join(", ");
+            return Ok(Some(format!(
+                "{label} is an MCP hub, and its live sessions {names} have it as their parent; \
+                 end them first (`kj context archive <session> --confirm`)"
+            )));
+        }
+        Ok(None)
+    }
+
     /// Whether `row` is a judge shadow: its parent is the context it answers
     /// to, and its performer is a judge. A character whose model is on a
     /// council server (a backend of kind `mk`) is a judge, since a council
@@ -158,10 +192,14 @@ impl KernelDb {
     }
 
     /// The archive of one context, with no shadows: the state, the ring
-    /// placement, the ask sweep, and the `root_ctx`, `console_ctx` and
-    /// `mcp_hub_ctx` pointers that name it, which are cleared. A root whose
-    /// `root_ctx` is cleared gets a new root console at the next start.
+    /// placement, the ask sweep, and the `console_ctx` and `mcp_hub_ctx`
+    /// pointers that name it, which are cleared. A context that
+    /// [`Self::archive_refusal`] or [`Self::held_drift_refusal`] refuses
+    /// stays live.
     fn archive_one_context(&self, id: ContextId) -> KernelDbResult<bool> {
+        if let Some(why) = self.archive_refusal(id)? {
+            return Err(KernelDbError::Validation(why));
+        }
         if let Some(why) = self.held_drift_refusal(id)? {
             return Err(KernelDbError::Validation(why));
         }
@@ -181,10 +219,6 @@ impl KernelDb {
         if swept > 0 {
             info!(context = %id.short(), swept, "archived context: swept unresolved asks");
         }
-        let roots = self.conn.execute(
-            "UPDATE characters SET root_ctx = NULL WHERE root_ctx = ?1",
-            params![blob_param(id.as_bytes())],
-        )?;
         let consoles = self.conn.execute(
             "UPDATE characters SET console_ctx = NULL WHERE console_ctx = ?1",
             params![blob_param(id.as_bytes())],
@@ -193,8 +227,8 @@ impl KernelDb {
             "UPDATE characters SET mcp_hub_ctx = NULL WHERE mcp_hub_ctx = ?1",
             params![blob_param(id.as_bytes())],
         )?;
-        if roots + consoles + hubs > 0 {
-            info!(context = %id.short(), roots, consoles, hubs, "archived context: cleared the character pointers that named it");
+        if consoles + hubs > 0 {
+            info!(context = %id.short(), consoles, hubs, "archived context: cleared the character pointers that named it");
         }
         Ok(updated > 0)
     }
@@ -206,7 +240,8 @@ impl KernelDb {
     /// predecessor that is missing or already archived refuses. Moves a
     /// character's `root_ctx` and `console_ctx` the same way; the archived
     /// root console then takes the successor as its senpai. Both pointers
-    /// move before the archive, which would otherwise clear them. The
+    /// move before the archive, which would otherwise refuse a root console
+    /// and clear the console pointer. The
     /// kernel moves no other context that answers to the predecessor.
     pub fn commit_rotation(
         &self,
@@ -251,6 +286,48 @@ impl KernelDb {
                 )?;
             }
             Ok(RotationCommit { handoffs_moved: moved, shadows: archived.shadows })
+        })
+    }
+
+    /// Retire `principal_id` in one transaction: stamp `retired_at`, clear
+    /// its `root_ctx`, `console_ctx` and `mcp_hub_ctx`, then conclude and
+    /// archive each live context it performs, with that context's judge
+    /// shadows ([`Self::archive_with_shadows`], with `judges`). For a root
+    /// character, any `root_ctx` naming a context it performs clears first,
+    /// so its root consoles are archived with it. Any refusal or fault rolls
+    /// the whole retirement back. `None` when the character was already
+    /// retired; an unknown character refuses.
+    pub fn retire_with_contexts(
+        &self,
+        principal_id: PrincipalId,
+        at: i64,
+        judges: Option<&[String]>,
+    ) -> KernelDbResult<Option<Retirement>> {
+        self.in_transaction(|db| {
+            let sheet = db.get_character(principal_id)?
+                .ok_or_else(|| KernelDbError::NotFound(format!("character {}", principal_id.short())))?;
+            if sheet.retired_at.is_some() {
+                return Ok(None);
+            }
+            db.retire_character(principal_id, at)?;
+            db.set_character_root_ctx(principal_id, None)?;
+            db.set_character_console_ctx(principal_id, None)?;
+            db.set_character_mcp_hub_ctx(principal_id, None)?;
+            if sheet.root {
+                db.conn.execute(
+                    "UPDATE characters SET root_ctx = NULL
+                     WHERE root_ctx IN (SELECT context_id FROM contexts WHERE performer = ?1 AND archived_at IS NULL)",
+                    params![blob_param(principal_id.as_bytes())],
+                )?;
+            }
+            let mut retirement = Retirement::default();
+            for ctx in db.contexts_played_by(principal_id)? {
+                db.conclude_context(ctx.context_id)?;
+                let archived = db.archive_with_shadows(ctx.context_id, judges)?;
+                retirement.archived.push(ctx.context_id);
+                retirement.shadows.extend(archived.shadows);
+            }
+            Ok(Some(retirement))
         })
     }
 
@@ -380,16 +457,21 @@ impl KernelDb {
     /// instead of no-op-looping through unpromote while the card sits in
     /// ring 3.
     pub fn demote_context(&self, id: ContextId) -> KernelDbResult<DemoteOutcome> {
-        Ok(self.demote_context_with_shadows(id, None)?.0)
+        let archives = self.get_context(id)?.is_some_and(|row| row.demoted_at.is_some());
+        Ok(self.demote_context_with_shadows(id, None, archives)?.0)
     }
 
     /// [`Self::demote_context`], whose archive step archives the context's
     /// judge shadows with it ([`Self::archive_with_shadows`], with `judges`)
-    /// and returns them.
+    /// and returns them. `archives` is the step the caller decided on and
+    /// prepared for: true for the archive step, whose checks and archive
+    /// lifecycle the caller ran. A row whose next step is no longer that one
+    /// refuses and changes nothing.
     pub fn demote_context_with_shadows(
         &self,
         id: ContextId,
         judges: Option<&[String]>,
+        archives: bool,
     ) -> KernelDbResult<(DemoteOutcome, Vec<ContextId>)> {
         let (promoted_at, demoted_at, archived_at): (Option<i64>, Option<i64>, Option<i64>) = self
             .conn
@@ -405,6 +487,20 @@ impl KernelDb {
             return Err(KernelDbError::Validation(
                 "cannot demote an archived context".to_string(),
             ));
+        }
+        if demoted_at.is_some() != archives {
+            let name = self.context_name(id);
+            return Err(KernelDbError::Validation(if archives {
+                format!(
+                    "context {name} is no longer demoted, so its next step does not archive it; \
+                     run `kj context demote <ctx>` again"
+                )
+            } else {
+                format!(
+                    "context {name} was demoted while this demote ran, so its next step archives it; \
+                     run `kj context demote <ctx> --confirm` to archive it"
+                )
+            }));
         }
 
         if demoted_at.is_some() {

@@ -2446,8 +2446,8 @@ mod tests {
     /// the structural check, skipping the builtin layer.
     #[test]
     fn a_config_allow_does_not_take_help_away() {
-        let cfg = config("[global]\nallow = [\"kj context create\"]\n[rc.director]\nallow = [\"kj context create\"]\n");
-        for played_by in [None, Some("director")] {
+        let cfg = config("[global]\nallow = [\"kj context create\"]\n[rc.banto]\nallow = [\"kj context create\"]\n");
+        for played_by in [None, Some("banto")] {
             assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, played_by)), "kj context --help",
                 "{played_by:?}");
         }
@@ -3033,7 +3033,7 @@ uncovered = "allow"
             )]
         );
         assert_eq!(
-            first_verdict("OUT=log", &cfg, Some("director")),
+            first_verdict("OUT=log", &cfg, Some("banto")),
             PolicyVerdict::Uncovered,
             "with the tier off, a commandless statement escalates as it does today"
         );
@@ -3071,30 +3071,30 @@ uncovered = "allow"
         assert_eq!(first_verdict("python3 build.py", &cfg, None), PolicyVerdict::Uncovered);
     }
 
-    /// A director's routine lane work runs without an ask: it creates a
+    /// A banto's routine lane work runs without an ask: it creates a
     /// coder and drives it (`docs/character.md`, "A session, inside
     /// kaijutsu", step 3). Repair of a running lane, such as recasting its
-    /// performer, still meets the director's reviewer.
+    /// performer, still meets the banto's reviewer.
     #[test]
-    fn the_shipped_default_lets_a_director_create_and_drive_a_lane() {
+    fn the_shipped_default_lets_a_banto_create_and_drive_a_lane() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
         for source in [
             "kj context create coder --name count-kj-rs",
             "kj fork --name lane --prompt \"count the files\"",
             "kj drive count-kj-rs --prompt \"count the files\"",
         ] {
-            let v = first_verdict(source, &cfg, Some("director"));
+            let v = first_verdict(source, &cfg, Some("banto"));
             let keys = allow_keys(&v);
             assert_eq!(keys.len(), 1, "{source}: {v:?}");
-            assert_eq!(keys[0].0, Layer::Config(Section::Rc("director".into())), "{source}: {v:?}");
+            assert_eq!(keys[0].0, Layer::Config(Section::Rc("banto".into())), "{source}: {v:?}");
             assert_eq!(
                 first_verdict(source, &cfg, Some("coder")),
                 PolicyVerdict::Uncovered,
-                "{source} is the director's work, not a coder's"
+                "{source} is the banto's work, not a coder's"
             );
         }
         assert_eq!(
-            first_verdict("kj context set count-kj-rs --cwd /tmp", &cfg, Some("director")),
+            first_verdict("kj context set count-kj-rs --cwd /tmp", &cfg, Some("banto")),
             PolicyVerdict::Uncovered
         );
     }
@@ -3125,8 +3125,8 @@ uncovered = "allow"
     #[test]
     fn the_shipped_default_leaves_the_uncovered_tier_at_ask() {
         let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
-        let person = GatePerformer { name: "amy".into(), rc_dir: Some("root".into()), root: true };
-        let performers = [None, Some(dir("coder")), Some(dir("mcp")), Some(dir("director")), Some(person)];
+        let person = GatePerformer { name: "amy".into(), rc_dir: Some("person".into()), root: true };
+        let performers = [None, Some(dir("coder")), Some(dir("mcp")), Some(dir("banto")), Some(person)];
         for performer in &performers {
             assert_eq!(
                 cfg.uncovered_for(performer.as_ref()),
@@ -3214,10 +3214,10 @@ uncovered = "allow"
     /// a global sandbox can be withheld from one role.
     #[test]
     fn an_rc_setting_outranks_the_global_one() {
-        let cfg = config("[global]\nuncovered = \"allow\"\n[rc.director]\nuncovered = \"ask\"\n");
+        let cfg = config("[global]\nuncovered = \"allow\"\n[rc.banto]\nuncovered = \"ask\"\n");
         let v = first_verdict("cat x", &cfg, Some("coder"));
         assert_eq!(allow_keys(&v), vec![(Layer::UncoveredAllow(Section::Global), "cat x".to_string())]);
-        assert_eq!(first_verdict("cat x", &cfg, Some("director")), PolicyVerdict::Uncovered);
+        assert_eq!(first_verdict("cat x", &cfg, Some("banto")), PolicyVerdict::Uncovered);
     }
 
     /// The uncovered posture reads over the same way the key lists do: the
@@ -3757,22 +3757,22 @@ enabled = false
         let cfg = config(COUNCIL_FULL);
         assert!(cfg.council_enabled_for(Some(&dir("coder"))));
         assert!(!cfg.council_enabled_for(Some(&dir("toolie"))), "enabled = false");
-        assert!(!cfg.council_enabled_for(Some(&dir("director"))), "unmentioned directory");
+        assert!(!cfg.council_enabled_for(Some(&dir("banto"))), "unmentioned directory");
         assert!(!cfg.council_enabled_for(None), "no performer");
     }
 
     #[test]
     fn an_rc_directory_can_replace_the_council_contexts() {
-        let cfg = config(&format!("{COUNCIL_FULL}\n[rc.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n"));
-        let director = cfg.council_for(Some(&dir("director"))).unwrap();
-        assert_eq!(director.contexts, ["council-amy", "council-banto"]);
+        let cfg = config(&format!("{COUNCIL_FULL}\n[rc.banto.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n"));
+        let banto = cfg.council_for(Some(&dir("banto"))).unwrap();
+        assert_eq!(banto.contexts, ["council-amy", "council-banto"]);
         let coder = cfg.council_for(Some(&dir("coder"))).unwrap();
         assert_eq!(coder.contexts, ["reviewer", "system-rules"]);
         // Everything but the list is inherited: mode, deadline, house rules,
         // reviewer contexts, agreement, specs, and thresholds.
         let mut inherited = coder.clone();
-        inherited.contexts = director.contexts.clone();
-        assert_eq!(director, inherited);
+        inherited.contexts = banto.contexts.clone();
+        assert_eq!(banto, inherited);
         assert!(cfg.council_for(Some(&dir("toolie"))).is_none());
         assert!(cfg.council_for(None).is_none());
     }
@@ -3826,8 +3826,8 @@ enabled = false
             ("[\"examples\"]", "already in spec"),
         ] {
             let base = council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"examples\"]");
-            let m = council_err(&format!("{base}\n[rc.director.council]\nenabled = true\ncontexts = {contexts}\n"));
-            assert!(m.contains("[rc.director.council]") && m.contains(why), "{contexts}: {m}");
+            let m = council_err(&format!("{base}\n[rc.banto.council]\nenabled = true\ncontexts = {contexts}\n"));
+            assert!(m.contains("[rc.banto.council]") && m.contains(why), "{contexts}: {m}");
             let m = council_err(&format!("{base}\n[character.banto.council]\nenabled = true\ncontexts = {contexts}\n"));
             assert!(m.contains("[character.banto.council]") && m.contains(why), "{contexts}: {m}");
         }
@@ -3837,8 +3837,8 @@ enabled = false
     /// the file says something it does not do. The load refuses it.
     #[test]
     fn a_disabled_section_council_cannot_name_contexts() {
-        let m = council_err(&format!("{COUNCIL_FULL}\n[rc.director.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
-        assert!(m.contains("[rc.director.council]") && m.contains("enabled = false"), "{m}");
+        let m = council_err(&format!("{COUNCIL_FULL}\n[rc.banto.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
+        assert!(m.contains("[rc.banto.council]") && m.contains("enabled = false"), "{m}");
         let m = council_err(&format!("{COUNCIL_FULL}\n[root.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
         assert!(m.contains("[root.council]") && m.contains("enabled = false"), "{m}");
     }
@@ -3854,7 +3854,7 @@ enabled = false
              [character.banto.council]\nenabled = true\njudge = \"banto-judge\"\n"
         ));
         assert_eq!(cfg.council_for(Some(&dir("director"))).unwrap().judge.as_deref(), Some("judge"));
-        let banto = GatePerformer { name: "banto".into(), rc_dir: Some("director".into()), root: false };
+        let banto = GatePerformer { name: "banto".into(), rc_dir: Some("banto".into()), root: false };
         assert_eq!(cfg.council_for(Some(&banto)).unwrap().judge.as_deref(), Some("banto-judge"));
         assert_eq!(cfg.council_for(Some(&dir("coder"))).unwrap().judge, None, "no judge key, no judge");
         for section in ["rc.director", "character.banto", "root"] {

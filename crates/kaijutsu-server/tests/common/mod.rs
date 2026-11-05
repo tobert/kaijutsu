@@ -185,7 +185,7 @@ pub async fn bootstrap_mock(config: &SshServerConfig, model: &str) {
         root_key: config.root_key().public_key().clone(),
         key_comment: None,
         backends: vec![kaijutsu_server::bootstrap::BackendChoice::mock(model)],
-        console_performer: "root".to_string(),
+        console_performer: "banto".to_string(),
     };
     kaijutsu_server::bootstrap::bootstrap(config, &opts).await.expect("bootstrap the test kernel");
     // A test's contexts are made by the ephemeral performer, whose slots run
@@ -241,7 +241,7 @@ pub fn seed_turn_identity(
     context: kaijutsu_types::ContextId,
 ) -> kaijutsu_types::PrincipalId {
     use kaijutsu_kernel::kernel_db::CharacterRow;
-    let sheet = |name: &str| CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    let sheet = |name: &str| CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: kaijutsu_types::PrincipalId::new(),
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
@@ -536,11 +536,11 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub const PERFORMER: &str = kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER;
 
-/// Create `label` of type `default` as [`PERFORMER`] through `kj context create`,
+/// Create `label` as [`PERFORMER`], whose rc directory is `banto`, through `kj context create`,
 /// run from the kernel's only root context (`kaijutsu_client::choose_parent`).
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijutsu_types::ContextId, String> {
-    create_context_typed(kernel, label, "default").await
+    create_context_typed(kernel, label, "banto").await
 }
 
 /// [`create_context`] performed by [`rc_performer`]`(dir)`, so the context
@@ -567,12 +567,12 @@ pub fn perform_with_rc_dir(server: &kaijutsu_server::SharedKernel, context: kaij
 }
 
 /// The live, non-root character whose rc directory is `dir`: [`PERFORMER`]
-/// for `default`, else `rc-<dir>`, created on first use with `kj character
+/// for `banto`, else `rc-<dir>`, created on first use with `kj character
 /// create rc-<dir> --rc <dir>` from the kernel's only root context. The
 /// directory needs a runnable `create` script when the character is made.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn rc_performer(kernel: &KernelHandle, dir: &str) -> Result<String, String> {
-    if dir == "default" {
+    if dir == "banto" {
         return Ok(PERFORMER.to_string());
     }
     let name = format!("rc-{dir}");

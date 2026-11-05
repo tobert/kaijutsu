@@ -461,7 +461,7 @@ allow_at = 0.98
 mass_floor = -0.05
 
 {programs}
-[rc.default.council]
+[rc.coder.council]
 enabled = {enabled}
 {judge}
 "#,
@@ -549,7 +549,7 @@ fn bind_seat(
     chat: bool,
 ) {
     use crate::kernel_db::{CharacterModelRow, CharacterSlotRow};
-    db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id: character, name: name.into(), created_at: 0, retired_at: None,
         handoff_ctx: None, root_ctx: None, root: false,
     })
@@ -770,7 +770,7 @@ impl Rig {
             if gate {
                 bind_seat(&db, actor, &format!("{label}-performer"), &self.gate_server, None, false);
             } else {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id: actor, name: format!("{label}-performer"), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 })
@@ -1592,7 +1592,7 @@ async fn a_seat_s_create_lifecycle_builds_its_dependent_seats_before_the_first_d
     rig.write("/work/AGENTS.md", "Back up data before changing it.\n").await;
     crate::kj::test_helpers::install_rc_script_file(
         &rig.d,
-        "/config/rc/default/create/S50-council-seats.kai",
+        "/config/rc/coder/create/S50-council-seats.kai",
         include_str!("../../../../assets/defaults/rc/lib/create/S50-council-seats.kai"),
     )
     .await;
@@ -3402,7 +3402,7 @@ fn shadows_of(rig: &Rig, seat: kaijutsu_types::ContextId) -> Vec<crate::kernel_d
 /// Rotating a judged seat archives its judge shadow in the rotation's
 /// commit, and the successor's first gated call makes it a shadow of its
 /// own under the same label. It holds for a seat running the shipped
-/// `coder/` directory and for one running `default/`; neither has an
+/// `coder/` directory and for one running `banto/`; neither has an
 /// archive script that names the judge. The judge is on a chat backend, so
 /// only gate.toml names it.
 ///
@@ -3412,12 +3412,12 @@ fn shadows_of(rig: &Rig, seat: kaijutsu_types::ContextId) -> Vec<crate::kernel_d
 #[tokio::test]
 async fn rotating_a_judged_seat_archives_its_shadow_and_the_successor_gets_its_own() {
     use kaijutsu_types::Role::{Model, User};
-    for rc_dir in ["default", "coder"] {
+    for rc_dir in ["coder", "banto"] {
         let setup = Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), chain: true, ..Setup::default() };
         let rig = rig(Via::Tool, setup.clone()).await;
         rig.d.kernel_db().lock().set_character_rc_dir(rig.ctx.actor_id, Some(rc_dir)).unwrap();
         // The council block follows the seat's rc directory.
-        let toml = gate_toml(&setup).replace("[rc.default.council]", &format!("[rc.{rc_dir}.council]"));
+        let toml = gate_toml(&setup).replace("[rc.coder.council]", &format!("[rc.{rc_dir}.council]"));
         crate::vfs::VfsOps::write_all(rig.d.kernel().vfs().as_ref(), std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
         rig.submit("echo before").await.unwrap();
         let old = shadows_of(&rig, rig.ctx.context_id);

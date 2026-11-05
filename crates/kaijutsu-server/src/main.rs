@@ -88,8 +88,11 @@ struct PathArgs {
 enum Command {
     /// Set up a kernel so its console can answer: the root character
     /// and its key, a backend for each provider key found, the default
-    /// model, the console's performer, and the console. Run with the service stopped. A
-    /// second run adds only what is missing.
+    /// model, the shipped characters (banto, coder, companion, musician,
+    /// storyteller, toolie, assistant and council with the model, judge
+    /// without one), and the console, performed by banto. Run with the
+    /// service stopped. A second run adds only what is missing and leaves an
+    /// existing character as it is.
     Bootstrap(BootstrapArgs),
     /// Create the kernel's root character and bind its public key. Run once,
     /// with the service stopped, before the first start.
@@ -145,12 +148,13 @@ enum Command {
 enum RcCommand {
     /// Install the embedded rc scripts into the rc tree. Installs anything
     /// absent, and names files that differ from their default and retired
-    /// defaults still installed, leaving both alone; --force overwrites the
-    /// first and removes the second. A path with a <path>.keep file beside it
-    /// is left as it is, present, edited, or absent, even with --force.
+    /// defaults still installed, files and whole directories, leaving both
+    /// alone; --force overwrites the first and removes the second. A path
+    /// with a <path>.keep file beside it is left as it is, present, edited,
+    /// or absent, even with --force.
     Reseed {
         /// Also overwrite files that differ from their embedded default and
-        /// remove retired defaults.
+        /// remove retired defaults, a retired directory with everything in it.
         #[arg(long, short = 'f')]
         force: bool,
         /// Seed this directory instead of the /config/rc tree the path
@@ -195,7 +199,8 @@ struct BootstrapArgs {
     #[arg(long, value_name = "KIND")]
     backend: Option<String>,
 
-    /// The default model. Default: claude-sonnet-5-5 or deepseek-flash.
+    /// The model each shipped chat character is created with. Default:
+    /// claude-sonnet-5-5 or deepseek-flash.
     #[arg(long, value_name = "ID")]
     model: Option<String>,
 
@@ -209,8 +214,9 @@ struct BootstrapArgs {
     #[arg(long, conflicts_with_all = ["backend", "model"])]
     no_model: bool,
 
-    /// The model character that plays the console.
-    #[arg(long = "console-as", value_name = "NAME", default_value = "root")]
+    /// The model character that performs the console, created with `--rc
+    /// banto` when it is missing.
+    #[arg(long = "console-as", value_name = "NAME", default_value = "banto")]
     console_as: String,
 }
 
@@ -433,7 +439,10 @@ fn cmd_rc_reseed(
                 for path in &r.retired {
                     println!("  {path}");
                 }
-                println!("\nPass --force to remove them, or delete them by hand.");
+                println!(
+                    "\nPass --force to remove them, or delete them by hand. A name ending in / is a \
+                     directory, and --force removes everything in it; create <dir>.keep beside it to keep it."
+                );
             }
             if !r.removed.is_empty() {
                 println!("\n{} retired default(s) removed:", r.removed.len());

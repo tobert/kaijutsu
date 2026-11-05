@@ -1764,14 +1764,21 @@ async fn toggle_shell(bridge: &KernelBridge, app: &mut App, feeds: &mut Feeds) {
             return;
         }
     };
-    let target = match ctrl_z::toggle(&current, &contexts) {
+    let me = match bridge.identity().await {
+        Ok(me) => me.username,
+        Err(e) => {
+            app.note(format!("cannot read who this seat is: {e:#}"));
+            return;
+        }
+    };
+    let target = match ctrl_z::toggle(&current, &contexts, &me) {
         Toggle::Switch(id) => id,
         Toggle::Refuse(why) => {
             app.note(why);
             return;
         }
         Toggle::Create { parent, label } => {
-            match bridge.create_shell_child(parent, &label).await {
+            match bridge.create_shell_child(parent, &label, &me).await {
                 Ok((info, cwd_refused)) => {
                     if let Some(refused) = cwd_refused {
                         tracing::warn!(%refused, "the shell took the parent's cwd; the kernel refused this one");

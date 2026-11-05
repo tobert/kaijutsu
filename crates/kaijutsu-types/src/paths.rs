@@ -41,9 +41,13 @@
 pub const CONFIG_NAMESPACE_ROOT: &str = "/config";
 
 /// Root of the rc lifecycle-script tree
-/// (`/config/rc/<context_type>/<verb>/SXX-name.{kai,md}`). An ordinary host
+/// (`/config/rc/<rc_dir>/<verb>/SXX-name.{kai,md}`). An ordinary host
 /// directory reached through `LocalBackend` — see `docs/rc-on-disk.md`.
 pub const RC_ROOT: &str = "/config/rc";
+
+/// The rc directory a root character runs unless it names another
+/// (`docs/character.md`, "rc").
+pub const PERSON_RC_DIR: &str = "person";
 
 /// Root of the kernel-global config tree. A flat namespace:
 /// `/config/kernel/<name>` (e.g. `theme.toml`, `mcp.toml`, `gate.toml`) —

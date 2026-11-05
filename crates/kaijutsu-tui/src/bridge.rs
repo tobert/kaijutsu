@@ -213,13 +213,12 @@ impl KernelBridge {
     }
 
     /// Create the `Ctrl+Z` context `label` from `parent` and join it: `kj
-    /// context create <person>`, performed by the person at this seat and
-    /// answering to `parent`. `--character` does not apply: a person's
-    /// context runs no model, and the person typing in it is the one acting
-    /// there. The caller must not print.
-    pub async fn create_shell_child(&self, parent: ContextId, label: &str) -> Result<(ContextInfo, Option<String>)> {
-        let me = self.actor.whoami().await.map_err(|e| anyhow::anyhow!("create context {label}: {e}"))?;
-        self.create_child_as(parent, label, &me.username).await
+    /// context create <person>`, performed by `person`, the person at this
+    /// seat (`whoami`), and answering to `parent`. `--character` does not
+    /// apply: a person's context runs no model, and the person typing in it
+    /// is the one acting there. The caller must not print.
+    pub async fn create_shell_child(&self, parent: ContextId, label: &str, person: &str) -> Result<(ContextInfo, Option<String>)> {
+        self.create_child_as(parent, label, person).await
     }
 
     async fn create_child_as(

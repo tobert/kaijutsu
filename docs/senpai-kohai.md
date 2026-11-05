@@ -28,15 +28,15 @@ A new install, end to end:
 
 ```
 kaijutsu-server bootstrap --as amy --backend deepseek --model deepseek-flash
-kj character create senpai --type director --rc director --model deepseek/deepseek-flash
-kj character create kohai --type coder --model deepseek/deepseek-flash
-kj context create senpai
-kj context create kohai --senpai senpai
+kj context create banto --name lead
+kj context create coder --senpai lead
 ```
 
-Run from the `senpai` context, the last line is `kj context create kohai`.
+Bootstrap creates the shipped characters, banto and coder among them, each with the model it was given. Run from
+the `lead` context, the last line is `kj context create coder`. The recipe in "Composing senpai and kohai" does
+both lines at once.
 
-Each `kj context create` is ready for a turn: the context copies the character's model for its type and for
+Each `kj context create` is ready for a turn: the context copies the character's model under `model` and
 `distill`. A Claude Code session connects with `kaijutsu-mcp --connect` and gets an `mcp` context under the hub,
 with no ask.
 
@@ -311,7 +311,20 @@ senpai that no `root_ctx` names. At the commit the archived console takes the su
 - The `<situation>` block names the context's performer and its senpai: `<character name="<name>"/>` and
   `<senpai id="<short id>" context="<label>" character="<name>"/>`. `character` is named even when retired,
   `context` is left out when the senpai has no label, and a root console has no `<senpai>`.
-- The rc persona text (director S00-stance) says "our senpai" and reads the name from the kernel fact.
+- The rc persona text (banto's S00-stance) says "our senpai" and reads the name from the kernel fact.
+
+## Composing senpai and kohai
+
+```sh
+PATH="/config/rc/lib/recipes:$PATH" pair banto coder
+```
+
+`/config/rc/lib/recipes/` holds kaish scripts that compose characters and contexts. `pair <senpai-character>
+<kohai-character>` creates a context performed by the first character, answering to the context it runs in, then
+a context performed by the second, answering to the first, and prints both context ids. It is two `kj context
+create` calls, so each create is gated and refused as that verb is, and a refused second create leaves the first
+context in place. A recipe runs on demand, by name from `PATH`; no lifecycle runs one, and `kj rc list` does not
+list `lib/recipes/`. Test: `crates/kaijutsu-server/tests/pair_recipe_wire.rs`.
 
 ## MCP sessions
 

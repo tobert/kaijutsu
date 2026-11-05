@@ -832,7 +832,7 @@ mass_floor = -0.05             # each read's verdict mass, a log probability
 enabled = true
 judge = "judge"                # the character that performs each seat's judge shadow
 
-[rc.director.council]
+[rc.banto.council]
 enabled = true
 contexts = ["council-amy", "council-banto"]
 

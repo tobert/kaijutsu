@@ -607,7 +607,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
         {
             let db = shared_kernel.kernel_db.lock();
             for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
-                db.insert_character(&CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                     principal_id,
                     name: name.into(),
                     created_at: 0,
@@ -757,14 +757,14 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
 }
 
 #[test]
-fn test_rpc_default_context_type_is_default() {
+fn test_rpc_plain_context_does_not_get_the_coder_stance() {
     run_local(async {
         let addr = start_server_with_mock_llm().await;
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        // Plain create_context (empty context_type on the wire) must still
-        // land as "default" — no coder stance leaks in.
+        // Plain create_context makes a context performed by the ephemeral
+        // performer (rc directory banto) — no coder stance leaks in.
         let ctx = create_context(&kernel, "plain").await.unwrap();
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
@@ -774,7 +774,7 @@ fn test_rpc_default_context_type_is_default() {
         // phrase would pass regardless.
         assert!(
             !blocks.iter().any(|b| b.content.contains("We are a cybernetic system focused on software engineering.")),
-            "default context must not get the coder stance; got {} blocks: {:#?}",
+            "a banto-performed context must not get the coder stance; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
@@ -827,9 +827,9 @@ fn test_rpc_created_context_runs_its_slots_model() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = create_context_typed(&kernel, "rpc-unstamped", "default")
+        let ctx = create_context(&kernel, "rpc-unstamped")
             .await
-            .expect("create_context_typed");
+            .expect("create_context");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let (_, output, status) =

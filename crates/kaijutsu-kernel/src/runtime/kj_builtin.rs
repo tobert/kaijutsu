@@ -1221,7 +1221,7 @@ mod tests {
         let alpha = register_context(&dispatcher, Some("alpha"), None, principal);
         let made = dispatcher
             .dispatch(
-                &["character", "create", "hajime", "--rc", "default"].map(String::from),
+                &["character", "create", "hajime", "--rc", "coder"].map(String::from),
                 &crate::kj::test_helpers::test_caller(),
             )
             .await;
@@ -1358,26 +1358,26 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
 
         let res = kaish
-            .execute_with_options("kj rc list --dir default", ExecuteOptions::default())
+            .execute_with_options("kj rc list --dir coder", ExecuteOptions::default())
             .await
             .expect("kaish exec");
         assert!(res.ok(), "kj rc list exit != 0: {res:?}");
         let stdout = res.text_out();
 
         assert!(
-            stdout.contains("/config/rc/default/"),
-            "filtered list should include default paths: {stdout}"
+            stdout.contains("/config/rc/coder/"),
+            "filtered list should include coder paths: {stdout}"
         );
         // The filter must EXCLUDE other directories — the whole point of --dir.
         for other in [
-            "/config/rc/coder/",
+            "/config/rc/companion/",
             "/config/rc/mcp/",
-            "/config/rc/director/",
+            "/config/rc/banto/",
             "/config/rc/toolie/",
         ] {
             assert!(
                 !stdout.contains(other),
-                "--dir default must exclude {other}, got: {stdout}"
+                "--dir coder must exclude {other}, got: {stdout}"
             );
         }
     }

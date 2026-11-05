@@ -85,7 +85,7 @@ pub fn init_root(
     let (character, changed_character) = match existing {
         Some(row) if row.root => (row, false),
         Some(row) => {
-            let root_dir = kaijutsu_types::ROOT_CONTEXT_TYPE;
+            let root_dir = kaijutsu_types::paths::PERSON_RC_DIR;
             kernel_db
                 .in_transaction(|db| {
                     db.update_character_root(row.principal_id, true)?;
@@ -95,7 +95,7 @@ pub fn init_root(
             (CharacterRow { root: true, rc_dir: Some(root_dir.to_string()), ..row }, true)
         }
         None => {
-            let row = CharacterRow { rc_dir: Some(kaijutsu_types::ROOT_CONTEXT_TYPE.to_string()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            let row = CharacterRow { rc_dir: Some(kaijutsu_types::paths::PERSON_RC_DIR.to_string()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: PrincipalId::new(),
                 name: name.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -150,9 +150,9 @@ mod tests {
         let key = PublicKey::from_openssh(KEY).unwrap();
         let report = init_root(&kernel_db, &auth_db, "amy", &key, None).unwrap();
         assert!(report.character.root);
-        assert_eq!(report.character.rc_dir.as_deref(), Some("root"));
+        assert_eq!(report.character.rc_dir.as_deref(), Some("person"));
         let stored = kernel_db.get_character_by_name("amy").unwrap().unwrap();
         assert!(stored.root);
-        assert_eq!(stored.rc_dir.as_deref(), Some("root"));
+        assert_eq!(stored.rc_dir.as_deref(), Some("person"));
     }
 }

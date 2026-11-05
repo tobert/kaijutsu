@@ -22,7 +22,7 @@ fn options(config: &SshServerConfig, backend: Option<BackendChoice>) -> Bootstra
         root_key: config.root_key().public_key().clone(),
         key_comment: None,
         backends: backend.into_iter().collect(),
-        console_performer: "root".to_string(),
+        console_performer: "banto".to_string(),
     }
 }
 
@@ -49,8 +49,8 @@ fn a_bootstrapped_kernel_answers_in_root() {
         let root_ctx = {
             let db = kernel_db(&config);
             let row = db.find_context_by_label("console").unwrap().expect("bootstrap creates the console");
-            assert_eq!(row.context_type, "console");
-            let performer = db.get_character_by_name("root").unwrap().expect("the console performer exists");
+            assert_eq!(row.context_type, "banto", "the console is stamped with its performer's rc directory");
+            let performer = db.get_character_by_name("banto").unwrap().expect("the console performer exists");
             assert_eq!(row.performer, Some(performer.principal_id), "the console is played by its model character");
             let model = db.get_character_model(performer.principal_id).unwrap().expect("the performer holds a model");
             assert_eq!(model.model, "mock-model");
@@ -122,9 +122,9 @@ fn without_a_backend_root_waits_for_one() {
         {
             let db = kernel_db(&config);
             assert!(db.find_context_by_label("console").unwrap().is_some(), "the console exists without a model");
-            let root = db.get_character_by_name("root").unwrap().expect("the console performer exists");
-            assert!(db.list_character_slots(root.principal_id).unwrap().is_empty(), "no slot without a backend");
-            assert!(db.get_character_model(root.principal_id).unwrap().is_none(), "no model without a backend");
+            let banto = db.get_character_by_name("banto").unwrap().expect("the console performer exists");
+            assert!(db.list_character_slots(banto.principal_id).unwrap().is_empty(), "no slot without a backend");
+            assert!(db.get_character_model(banto.principal_id).unwrap().is_none(), "no model without a backend");
         }
 
         let filled = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
@@ -134,10 +134,10 @@ fn without_a_backend_root_waits_for_one() {
             filled.ran,
             [
                 "kj backend set mock --kind mock --key-optional",
-                "kj character model set root mock/mock-model --max-tokens 16384",
+                "kj character model set banto mock/mock-model --max-tokens 16384",
                 "kj context rotate console",
             ],
-            "the backend, the performer's model, and a rotated the console that takes it"
+            "the backend, the performer's model, and a rotated console that takes it; the other shipped characters are left alone"
         );
         let again = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
             .await
@@ -158,18 +158,18 @@ fn a_performer_with_only_a_distill_slot_gets_a_model() {
         bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
         {
             let db = kernel_db(&config);
-            let root = db.get_character_by_name("root").unwrap().unwrap();
-            db.seed_test_slot_entries(root.principal_id, &[("distill", "mock", "mock-model")]).unwrap();
+            let banto = db.get_character_by_name("banto").unwrap().unwrap();
+            db.seed_test_slot_entries(banto.principal_id, &[("distill", "mock", "mock-model")]).unwrap();
         }
         let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model"))))
             .await
             .expect("bootstrap with a backend");
-        assert!(report.ran.iter().any(|line| line.contains("character model set root")), "{report:?}");
+        assert!(report.ran.iter().any(|line| line.contains("character model set banto")), "{report:?}");
         assert!(report.ran.iter().any(|line| line.contains("context rotate console")), "{report:?}");
         let db = kernel_db(&config);
-        let root = db.get_character_by_name("root").unwrap().unwrap();
-        assert!(db.get_character_model(root.principal_id).unwrap().is_some());
-        assert!(db.get_character_slot(root.principal_id, "distill").unwrap().is_some(), "the slot stays");
+        let banto = db.get_character_by_name("banto").unwrap().unwrap();
+        assert!(db.get_character_model(banto.principal_id).unwrap().is_some());
+        assert!(db.get_character_slot(banto.principal_id, "distill").unwrap().is_some(), "the slot stays");
         let console = db.find_context_by_label("console").unwrap().unwrap();
         assert!(db.context_slot(console.context_id, "model").unwrap().is_some(), "the rotated console has a model");
     });
@@ -246,8 +246,8 @@ fn a_refused_console_rotation_is_reported_and_bootstrap_goes_on() {
         assert!(note.contains("drift") && note.contains("`kj context rotate console`"), "the refusal and the rotation: {note}");
         let db = kernel_db(&config);
         assert_eq!(db.find_context_by_label("console").unwrap().unwrap().context_id, console, "the console stays");
-        let root = db.get_character_by_name("root").unwrap().unwrap();
-        assert!(db.get_character_model(root.principal_id).unwrap().is_some(), "the steps before it ran");
+        let banto = db.get_character_by_name("banto").unwrap().unwrap();
+        assert!(db.get_character_model(banto.principal_id).unwrap().is_some(), "the steps before it ran");
     });
 }
 
@@ -354,7 +354,7 @@ fn bootstrap_adopts_an_existing_console_the_sheet_does_not_point_at() {
     });
 }
 
-/// The note about a performer whose directory is not `console` says that the
+/// The note about a performer whose directory is not `banto` says that the
 /// change moves every context the character plays, and does not recommend it
 /// when the character plays a context of another type: it names that context.
 #[test]
@@ -365,17 +365,17 @@ fn the_rc_note_warns_that_the_change_moves_every_context_the_character_plays() {
         bootstrap(&config, &opts).await.expect("bootstrap");
         {
             let db = kernel_db(&config);
-            let root = db.get_character_by_name("root").unwrap().unwrap();
-            db.set_character_rc_dir(root.principal_id, Some("coder")).unwrap();
+            let banto = db.get_character_by_name("banto").unwrap().unwrap();
+            db.set_character_rc_dir(banto.principal_id, Some("coder")).unwrap();
         }
         let only_console = bootstrap(&config, &opts).await.expect("bootstrap again");
         let note = only_console.notes.iter().find(|n| n.contains("runs rc directory coder")).expect("rc note");
-        assert!(note.contains("kj character set root --rc console"), "{note}");
-        assert!(note.contains("every context root plays"), "{note}");
+        assert!(note.contains("kj character set banto --rc banto"), "{note}");
+        assert!(note.contains("every context banto plays"), "{note}");
 
         {
             let db = kernel_db(&config);
-            let root = db.get_character_by_name("root").unwrap().unwrap();
+            let banto = db.get_character_by_name("banto").unwrap().unwrap();
             let console = db.find_context_by_label("console").unwrap().unwrap();
             let mut row = console.clone();
             row.context_id = kaijutsu_types::ContextId::new();
@@ -385,12 +385,12 @@ fn the_rc_note_warns_that_the_change_moves_every_context_the_character_plays() {
             row.senpai_ctx = console.senpai_ctx;
             let ws = db.get_or_create_default_workspace(row.created_by).unwrap();
             db.insert_placed_context(&row, ws).unwrap();
-            db.write_context_character(row.context_id, root.principal_id, console.senpai_ctx, None).unwrap();
+            db.write_context_character(row.context_id, banto.principal_id, console.senpai_ctx, None).unwrap();
         }
         let with_coder = bootstrap(&config, &opts).await.expect("bootstrap with a coder context");
         let note = with_coder.notes.iter().find(|n| n.contains("runs rc directory coder")).expect("rc note");
         assert!(note.contains("side-coder"), "the note names the context of another type: {note}");
-        assert!(!note.contains("kj character set root --rc console"), "and does not recommend the change: {note}");
+        assert!(!note.contains("kj character set banto --rc banto"), "and does not recommend the change: {note}");
     });
 }
 
@@ -435,8 +435,95 @@ fn bootstrap_leaves_a_console_label_it_does_not_accept_alone() {
         other.console_performer = "other".to_string();
         let again = bootstrap(&config, &other).await.expect("bootstrap as another performer");
         let note = again.notes.iter().find(|n| n.contains("holds the label console")).unwrap_or_else(|| panic!("{again:?}"));
-        assert!(note.contains(&console.short()) && note.contains("performed by root"), "{note}");
+        assert!(note.contains(&console.short()) && note.contains("performed by banto"), "{note}");
         assert!(!again.ran.iter().any(|l| l.contains("context create") || l.contains("--console")), "{again:?}");
         assert_eq!(kernel_db(&config).get_character_by_name("amy").unwrap().unwrap().console_ctx, None);
+    });
+}
+
+/// The chat characters bootstrap ships, each with the rc directory of its name.
+const SHIPPED: [&str; 8] = ["banto", "coder", "companion", "musician", "storyteller", "toolie", "assistant", "council"];
+
+/// A fresh bootstrap creates every shipped character with its directory and
+/// the model it was given, and judge with its directory and no model. A
+/// second run creates nothing and names each character it left alone.
+#[test]
+fn a_fresh_bootstrap_creates_the_shipped_characters() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let opts = options(&config, Some(BackendChoice::mock("mock-model")));
+        let first = bootstrap(&config, &opts).await.expect("bootstrap");
+        for name in SHIPPED {
+            let line = format!("kj character create {name} --rc {name} --model mock/mock-model --max-tokens 16384");
+            assert!(first.ran.contains(&line), "missing {line:?}: {first:?}");
+        }
+        assert!(first.ran.iter().any(|l| l == "kj character create judge --rc judge"), "{first:?}");
+        {
+            let db = kernel_db(&config);
+            for name in SHIPPED {
+                let sheet = db.get_character_by_name(name).unwrap().unwrap_or_else(|| panic!("{name} exists"));
+                assert_eq!(sheet.rc_dir.as_deref(), Some(name));
+                assert!(!sheet.root, "{name} is no root");
+                assert_eq!(db.get_character_model(sheet.principal_id).unwrap().expect("a model").model, "mock-model", "{name}");
+            }
+            let judge = db.get_character_by_name("judge").unwrap().expect("judge exists");
+            assert_eq!(judge.rc_dir.as_deref(), Some("judge"));
+            assert!(db.get_character_model(judge.principal_id).unwrap().is_none(), "judge is given no model");
+        }
+
+        let again = bootstrap(&config, &opts).await.expect("bootstrap again");
+        assert!(again.ran.is_empty(), "{again:?}");
+        let note = again.notes.iter().find(|n| n.contains("already exist")).unwrap_or_else(|| panic!("{again:?}"));
+        for name in SHIPPED.iter().chain(&["judge"]) {
+            assert!(note.contains(name), "{name} is named: {note}");
+        }
+    });
+}
+
+/// With no model, the shipped chat characters are created without one, and
+/// the report names the verb that gives each its model.
+#[test]
+fn without_a_model_the_report_names_each_model_set() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        let report = bootstrap(&config, &options(&config, None)).await.expect("bootstrap");
+        assert!(report.ran.iter().any(|l| l == "kj character create coder --rc coder"), "{report:?}");
+        for name in SHIPPED {
+            let verb = format!("kj character model set {name} <backend>/<model>");
+            assert!(report.notes.iter().any(|n| n.contains(&verb)), "missing {verb:?}: {report:?}");
+        }
+        assert!(!report.notes.iter().any(|n| n.contains("kj character model set judge <backend>")), "{report:?}");
+        let db = kernel_db(&config);
+        let coder = db.get_character_by_name("coder").unwrap().unwrap();
+        assert!(db.get_character_model(coder.principal_id).unwrap().is_none());
+    });
+}
+
+/// On a kernel that already has some of the characters, bootstrap creates
+/// only the missing ones; an existing character keeps its directory and its
+/// model and is named in the report.
+#[test]
+fn an_existing_kernel_gets_only_the_missing_characters() {
+    run_local(async {
+        let config = SshServerConfig::ephemeral_with_root(0, "amy");
+        {
+            let db = kernel_db(&config);
+            for (name, dir) in [("coder", "toolie"), ("toolie", "toolie")] {
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                    principal_id: kaijutsu_types::PrincipalId::new(), name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root: false, root_ctx: None, context_type: None, rc_dir: Some(dir.into()),
+                    console_ctx: None, mcp_hub_ctx: None,
+                }).unwrap();
+            }
+        }
+        let report = bootstrap(&config, &options(&config, Some(BackendChoice::mock("mock-model")))).await.expect("bootstrap");
+        assert!(!report.ran.iter().any(|l| l.starts_with("kj character create coder") || l.starts_with("kj character create toolie")), "{report:?}");
+        assert!(report.ran.iter().any(|l| l.starts_with("kj character create companion --rc companion")), "{report:?}");
+        let note = report.notes.iter().find(|n| n.contains("already exist")).unwrap_or_else(|| panic!("{report:?}"));
+        assert!(note.contains("coder") && note.contains("toolie") && !note.contains("companion"), "{note}");
+        let db = kernel_db(&config);
+        let coder = db.get_character_by_name("coder").unwrap().unwrap();
+        assert_eq!(coder.rc_dir.as_deref(), Some("toolie"), "an existing character keeps its directory");
+        assert!(db.get_character_model(coder.principal_id).unwrap().is_none(), "and gets no model it did not have");
     });
 }

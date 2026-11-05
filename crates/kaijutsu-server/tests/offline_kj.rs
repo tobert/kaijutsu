@@ -150,7 +150,7 @@ fn a_held_lock_makes_kj_refuse_without_touching_the_database() {
 
     let _held = KernelLock::acquire(&home.kernel_dir()).expect("test process takes the lock first");
 
-    let out = home.run(&["kj", "--", "character", "create", "carol", "--rc", "default"]);
+    let out = home.run(&["kj", "--", "character", "create", "carol", "--rc", "coder"]);
     assert!(!out.status.success(), "kj must refuse while the lock is held");
     assert!(stderr(&out).contains("kernel.lock"), "the refusal should name the lock path: {}", stderr(&out));
 
@@ -199,7 +199,7 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
 
     // The human root refuses `drive`, so the lane is created and driven
     // from a director context, as a person would.
-    let banto = home.run(&["kj", "--", "character", "create", "banto", "--rc", "director"]);
+    let banto = home.run(&["kj", "--", "character", "create", "banto", "--rc", "banto"]);
     assert!(banto.status.success(), "{}", stderr(&banto));
     let boss = home.run(&["kj", "--", "context", "create", "banto", "--name", "boss"]);
     assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));
@@ -244,7 +244,7 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     ]);
     assert!(slot.status.success(), "{}", stderr(&slot));
     // The human root refuses `drive`; see the test above.
-    let banto = home.run(&["kj", "--", "character", "create", "banto", "--rc", "director"]);
+    let banto = home.run(&["kj", "--", "character", "create", "banto", "--rc", "banto"]);
     assert!(banto.status.success(), "{}", stderr(&banto));
     let boss = home.run(&["kj", "--", "context", "create", "banto", "--name", "boss"]);
     assert!(boss.status.success(), "kj context create boss failed: {}", stderr(&boss));

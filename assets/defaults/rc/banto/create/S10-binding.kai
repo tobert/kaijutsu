@@ -1,4 +1,5 @@
-# director: block/coordination allow-set.
+# banto: the operator's allow-set, for the console and every other context
+# banto performs.
 set -e
 kj binding allow "builtin.block"
 kj binding allow "builtin.file:read"
@@ -8,7 +9,7 @@ kj binding allow "builtin.kernel_info"
 kj binding allow "builtin.bindings"
 # Binding administration: may write any context's loadout.
 kj binding allow "admin"
-# rc-lifecycle governance: a director owns the rc scripts. file:write/edit
+# rc-lifecycle governance: banto owns the rc scripts. file:write/edit
 # reach both /config/rc and general workspace files — rc carries no capability
 # of its own, same as /config/kernel. General code edits still delegate to a
 # coder context — this is for lifecycle / governance artifacts.
@@ -19,7 +20,7 @@ kj binding allow "builtin.file:edit"
 # model config surfaces (`kj backend`, `kj character slot`, `kj alias`) — i.e. which
 # model runs. Dedicated, not implied by the grants above.
 kj binding allow "config-write"
-# kj verb authorities: a director coordinates contexts end-to-end — drives and
+# kj verb authorities: banto coordinates contexts end-to-end — drives and
 # forks them, merges drift, runs the transport, and performs context/workspace
 # lifecycle. Explicit grants (NOT implied by any of the above).
 kj binding allow "drive"
@@ -30,19 +31,19 @@ kj binding allow "operator"
 # system: see and stop the running kernel (`kj system ps/status`, and the
 # stopping verbs). Its own authority, not implied by `operator` -- what it
 # gates is not "may mutate durable structure" but "may stop the instrument",
-# and a director is the seat that coordinates, so it holds it. A coder or
+# and banto is the character that coordinates, so it holds it. A coder or
 # musician does not, and drifts the question instead (docs/system-verbs.md).
 kj binding allow "system"
 # house: the kj administration verbs (ledger, rc, binding, config, ...).
-# A director runs the house; worker seats (coder, toolie, musician) do not
+# banto runs the house; worker characters (coder, toolie, musician) do not
 # hold it and do not see these verbs in `kj help`.
 kj binding allow "house"
-# Host subprocess exec from the context shell — the director's operational
+# Host subprocess exec from the context shell — banto's operational
 # reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
 # the VFS, so it's a dedicated authority, not implied by anything above.
 kj binding allow "exec"
 # The kernel-owned interactive editor's WRITE path (kj vi save, and a
-# `keys` batch that submits :w/:w!/:wq/:x/ZZ) — a director already holds
+# `keys` batch that submits :w/:w!/:wq/:x/ZZ) — banto already holds
 # file:write/edit above for governance artifacts, so it also gets the
 # editor's write surface. Dedicated authority, not implied by anything above
 # (docs/vi.md; Amy, 2026-08-20 — experiment ahead of a capability-names
@@ -52,14 +53,14 @@ kj binding allow "editor"
 # the safe, unmarked shell (ExternalExec::Deny; kept explicit rather than
 # implied). `facade:shell_write` is the hot, mutating twin
 # (ExternalExec::Allow) —
-# JUDGMENT CALL (Amy should confirm): granted here because director is the
+# JUDGMENT CALL (Amy should confirm): granted here because banto performs the
 # operator's console and wants the safe tool available by default AND the hot
-# one on hand, not because "director" is inherently a write-shell role.
+# one on hand, not because coordination is inherently a write-shell role.
 # `edit_input` covers write_input too.
 kj binding allow "facade:shell"
 kj binding allow "facade:shell_write"
 kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
-# The app's MIDI ear commits capture batches against its seat (docs/midi.md
-# M2); a director seat can host the ear. Musician/toolie stay capture-mute.
+# The app's MIDI ear commits capture batches against its context
+# (docs/midi.md M2); a banto context can host the ear. Musician/toolie stay capture-mute.
 kj binding allow "facade:commit_capture"

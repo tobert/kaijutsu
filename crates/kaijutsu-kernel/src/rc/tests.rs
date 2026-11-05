@@ -18,10 +18,10 @@
             .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
             .await;
         let context = register_context(&d, Some("no-host-exec"), None, PrincipalId::new());
-        perform_with_rc_dir(&d, context, "default");
+        perform_with_rc_dir(&d, context, "coder");
         install_rc_script_file(
             &d,
-            "/config/rc/default/create/S99-host-exec.kai",
+            "/config/rc/coder/create/S99-host-exec.kai",
             "/usr/bin/printf unexpected",
         )
         .await;
@@ -47,10 +47,10 @@
             .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
             .await;
         let context = register_context(&d, Some("host-exec"), None, PrincipalId::new());
-        perform_with_rc_dir(&d, context, "default");
+        perform_with_rc_dir(&d, context, "coder");
         install_rc_script_file(
             &d,
-            "/config/rc/default/create/S99-host-exec.kai",
+            "/config/rc/coder/create/S99-host-exec.kai",
             "/usr/bin/printf expected",
         )
         .await;
@@ -113,7 +113,7 @@
 
     async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt_body() {
         use crate::vfs::VfsOps;
-        for context_type in ["default", "coder", "director", "toolie", "musician", "council"] {
+        for context_type in ["coder", "banto", "toolie", "musician", "council"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let prefix = format!("/config/rc/{context_type}/create/");
@@ -126,7 +126,7 @@
             assert!(!expected.is_empty(), "{context_type} must exercise companion data");
             let mut caller = console_caller(&d);
             caller.actor_id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                 principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -312,7 +312,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
         // A person at a console is a live root character, which `kj context
         // create` needs and whose console anyone may create under.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
@@ -746,7 +746,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     async fn a_context_with_no_performer_runs_no_rc() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/default/create/S99-must-not-run.kai", "echo ran-without-a-performer").await;
+        install_rc_script_file(&d, "/config/rc/coder/create/S99-must-not-run.kai", "echo ran-without-a-performer").await;
         let ctx = register_context(&d, Some("nobody"), None, PrincipalId::new());
         assert_eq!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().performer, None);
 
@@ -2527,7 +2527,7 @@ esac
     }
 
     async fn create_seeds_datetime_notification_for_time_aware_types_body() {
-        for context_type in ["coder", "director", "mcp", "default"] {
+        for context_type in ["coder", "banto", "mcp"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
@@ -3441,7 +3441,7 @@ esac
                     let db = d.kernel_db().lock();
                     let (performer, reviewer) = (PrincipalId::new(), PrincipalId::new());
                     for (id, name) in [(performer, "performer"), (reviewer, "reviewer")] {
-                        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("default".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
                             principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                             handoff_ctx: None, root_ctx: None, root: false,
                         }).unwrap();
@@ -4093,7 +4093,7 @@ esac
         let d = archive_dispatcher().await;
         install_rc_script_file(&d, "/config/rc/test/archive/S00-noop.kai", "true").await;
         let caller = KjCaller { confirmed: true, ..console_caller(&d) };
-        assert!(d.dispatch(&argv(&["character", "create", "retiree", "--rc", "default"]), &caller).await.is_ok());
+        assert!(d.dispatch(&argv(&["character", "create", "retiree", "--rc", "coder"]), &caller).await.is_ok());
         let retiree = d.kernel_db().lock().get_character_by_name("retiree").unwrap().unwrap().principal_id;
         let ctx = archivable_by(&d, "retiree-seat", None, "test", retiree);
         let r = d.dispatch(&argv(&["character", "retire", "retiree"]), &caller).await;

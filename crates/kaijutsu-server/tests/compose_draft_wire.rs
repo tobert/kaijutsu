@@ -230,7 +230,7 @@ fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
             .kernel
             .vfs()
             .write_all(
-                std::path::Path::new("/config/rc/default/submit/S10-facts.kai"),
+                std::path::Path::new("/config/rc/banto/submit/S10-facts.kai"),
                 b"set -e\nkj block create --role system --kind notification --content \"input=$KJ_INPUT_BLOCK edge=$KJ_EDGE_BLOCK shown=$KJ_EDGE_SHOWN tail=$KJ_LOG_TAIL live=$KJ_TURN_LIVE\"\n",
             )
             .await
@@ -313,7 +313,7 @@ fn a_submit_script_and_its_turn_reach_a_feed_follower() {
             .kernel
             .vfs()
             .write_all(
-                std::path::Path::new("/config/rc/default/submit/S10-reminder.kai"),
+                std::path::Path::new("/config/rc/banto/submit/S10-reminder.kai"),
                 b"set -e\nkj block create --role system --kind notification --turn-scoped --content \"stay in the lane\"\n",
             )
             .await
@@ -378,7 +378,7 @@ async fn plant_facts_script(live_kernel: &kaijutsu_server::SharedKernel) {
         .kernel
         .vfs()
         .write_all(
-            std::path::Path::new("/config/rc/default/submit/S10-facts.kai"),
+            std::path::Path::new("/config/rc/banto/submit/S10-facts.kai"),
             b"set -e\nkj block create --role system --kind notification --content \"input=$KJ_INPUT_BLOCK edge=$KJ_EDGE_BLOCK shown=$KJ_EDGE_SHOWN tail=$KJ_LOG_TAIL live=$KJ_TURN_LIVE\"\n",
         )
         .await
@@ -509,7 +509,7 @@ fn chat_submit_survives_a_failing_submit_script() {
             .kernel
             .vfs()
             .write_all(
-                std::path::Path::new("/config/rc/default/submit/S10-broken.kai"),
+                std::path::Path::new("/config/rc/banto/submit/S10-broken.kai"),
                 b"set -e\nexit 3\n",
             )
             .await
@@ -553,7 +553,7 @@ fn chat_submit_example_script_renders_the_edge_excerpt() {
             .read_all(std::path::Path::new("/config/rc/lib/submit/S10-edge.kai"))
             .await
             .expect("the shipped example is seeded");
-        vfs.write_all(std::path::Path::new("/config/rc/default/submit/S10-edge.kai"), &body)
+        vfs.write_all(std::path::Path::new("/config/rc/banto/submit/S10-edge.kai"), &body)
             .await
             .expect("link the example into the default type");
         let client = connect_client(addr).await;
@@ -617,7 +617,7 @@ fn chat_submit_example_script_is_silent_at_the_tail() {
             .read_all(std::path::Path::new("/config/rc/lib/submit/S10-edge.kai"))
             .await
             .expect("the shipped example is seeded");
-        vfs.write_all(std::path::Path::new("/config/rc/default/submit/S10-edge.kai"), &body)
+        vfs.write_all(std::path::Path::new("/config/rc/banto/submit/S10-edge.kai"), &body)
             .await
             .expect("link the example into the default type");
         let client = connect_client(addr).await;
@@ -1030,7 +1030,7 @@ fn a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge() {
         let vfs = live_kernel.kernel.vfs();
         let body = vfs.read_all(std::path::Path::new("/config/rc/lib/submit/S10-edge.kai")).await
             .expect("the shipped example is seeded");
-        vfs.write_all(std::path::Path::new("/config/rc/default/submit/S10-edge.kai"), &body).await
+        vfs.write_all(std::path::Path::new("/config/rc/banto/submit/S10-edge.kai"), &body).await
             .expect("link the example into the default type");
         let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![

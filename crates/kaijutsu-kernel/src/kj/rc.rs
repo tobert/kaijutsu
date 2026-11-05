@@ -677,16 +677,37 @@ mod tests {
         use crate::kj::test_helpers::*;
         let d = test_dispatcher_rc().await;
         let caller = test_caller();
-        let path = "/config/rc/default/create/S00-stance.md";
+        let path = "/config/rc/coder/create/S00-stance.md";
         let shown = d.dispatch(&["rc", "show", path].map(String::from), &caller).await;
         assert!(shown.is_ok(), "{}", shown.message());
         assert!(shown.message().contains("kind:       data"));
-        let listed = d.dispatch(&["rc", "list", "--dir", "default"].map(String::from), &caller).await;
+        let listed = d.dispatch(&["rc", "list", "--dir", "coder"].map(String::from), &caller).await;
         assert!(listed.is_ok(), "{}", listed.message());
         assert!(listed.message().contains(&format!("{path} [in-sync] [data]")));
         assert!(matches!(parse_rc_entry(path).unwrap(), RcEntry::Data(_)));
         assert!(!crate::rc::is_rc_script_filename("S00-stance.md"));
         assert!(crate::rc::is_rc_script_filename("S00-stance.kai"));
+    }
+
+    /// `lib/recipes/` holds scripts a player runs on demand, not lifecycle
+    /// verbs: `kj rc list` shows no `recipes` bucket, with or without
+    /// `--dir lib`, and the recipe is no rc path.
+    #[tokio::test]
+    async fn rc_list_does_not_treat_recipes_as_lifecycle_verbs() {
+        use crate::kj::test_helpers::*;
+        let recipe = "/config/rc/lib/recipes/pair.kai";
+        assert!(crate::seed_scripts::seed_body(recipe).is_some(), "the pair recipe ships");
+        let d = test_dispatcher_rc().await;
+        let caller = test_caller();
+        for args in [&["rc", "list"][..], &["rc", "list", "--dir", "lib"][..]] {
+            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let listed = d.dispatch(&argv, &caller).await;
+            assert!(listed.is_ok(), "{args:?}: {}", listed.message());
+            assert!(!listed.message().contains("recipes"), "{args:?}: {}", listed.message());
+        }
+        assert!(parse_rc_entry(recipe).is_err());
+        let dirs = known_context_types(d.kernel().vfs()).await.unwrap();
+        assert!(!dirs.iter().any(|d| d == "lib" || d == "recipes"), "{dirs:?}");
     }
 
     #[test]
@@ -1277,14 +1298,14 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--dir"), s("default"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
         match result {
             KjResult::Ok { message, .. } => assert!(
                 message.contains(
-                    "/config/rc/default/create/S20-cache.kai → ../../lib/create/S20-cache.kai [in-sync]"
+                    "/config/rc/coder/create/S20-cache.kai → ../../lib/create/S20-cache.kai [in-sync]"
                 ),
                 "expected in-sync symlink marker: {message}"
             ),
@@ -1310,7 +1331,7 @@ mod tests {
         // `unlink_removes_the_link_not_its_target` in `vfs/backends/local.rs`).
         let removed = d
             .dispatch(
-                &[s("rc"), s("rm"), s("/config/rc/default/create/S20-cache.kai")],
+                &[s("rc"), s("rm"), s("/config/rc/coder/create/S20-cache.kai")],
                 &c,
             )
             .await;
@@ -1323,7 +1344,7 @@ mod tests {
             &[
                 s("rc"),
                 s("add"),
-                s("/config/rc/default/create/S20-cache.kai"),
+                s("/config/rc/coder/create/S20-cache.kai"),
                 s("--content"),
                 s("# diverged, no longer a link"),
             ],
@@ -1333,18 +1354,18 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("list"), s("--dir"), s("default"), s("--verb"), s("create")],
+                &[s("rc"), s("list"), s("--dir"), s("coder"), s("--verb"), s("create")],
                 &c,
             )
             .await;
         match result {
             KjResult::Ok { message, .. } => {
                 assert!(
-                    message.contains("/config/rc/default/create/S20-cache.kai [differs from seed]"),
+                    message.contains("/config/rc/coder/create/S20-cache.kai [differs from seed]"),
                     "expected differs marker: {message}"
                 );
                 assert!(
-                    !message.contains("/config/rc/default/create/S20-cache.kai →"),
+                    !message.contains("/config/rc/coder/create/S20-cache.kai →"),
                     "should no longer show a symlink annotation: {message}"
                 );
             }

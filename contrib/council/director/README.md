@@ -1,11 +1,11 @@
-# Director council
+# banto's council
 
-The director reads `council-amy` and `council-banto` in place of the shared
+banto's rc directory reads `council-amy` and `council-banto` in place of the shared
 `council-system` context. Shell and program worked examples and workspace
 house rules still join each decision. Coder keeps its shared council.
 
 `amy.md` is Amy's `/home/atobey/AGENTS.md` as loaded on October 6, 2026.
-`banto.md` is the shipped director stance as loaded that day. Each opens
+`banto.md` is the shipped banto stance as loaded that day. Each opens
 with one line telling the council what the text is. These are
 starting guidance; chat, edits, and exclusions in Kaijutsu evolve it.
 Editing these seed files does not rewrite live contexts.
@@ -23,10 +23,10 @@ error anywhere else. A context that already exists is skipped, never
 reseeded, so its chat is retained; edit it in Kaijutsu instead. Running a
 script by its path in a context shell does nothing, so do not run it that way.
 
-Add this to the director's existing council section in `gate.toml`:
+Add this to banto's existing council section in `gate.toml`:
 
 ```toml
-[rc.director.council]
+[rc.banto.council]
 enabled = true
 contexts = ["council-amy", "council-banto"]
 ```

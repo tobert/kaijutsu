@@ -50,11 +50,16 @@ result is missing:
    kernel finds the key wherever it runs.
 2. `kj backend model set` with the context window of a model it knows. For
    a model it does not know, the report names the model and this verb.
-3. `kj character create root --rc console --model <b>/<m> --max-tokens 16384` on the first provider's model, for
-   the model character that plays the console (`--console-as` names another), running the `console` rc directory. A character that exists and has
-   no model gets `kj character model set root ...` instead. A character that already has a model is left alone,
-   and the report says so.
-4. `kj context create root --name console`, a kohai of the root
+3. `kj character create <name> --rc <name> --model <b>/<m> --max-tokens 16384` on the first provider's model,
+   for each shipped character that does not exist: banto, coder, companion, musician, storyteller, toolie,
+   assistant and council. judge is created with `--rc judge` and no model; `kj character model set judge
+   <council-backend>/<model>` gives it one before the council is enabled. With no model, the report names
+   `kj character model set <name> <backend>/<model>` for each character it created. An existing character is
+   left alone, its rc directory and model included, and the report names it. banto performs the console
+   (`--console-as` names another performer, created with `--rc banto` when it is missing). A console performer
+   that exists and has no model gets `kj character model set banto ...`; one that runs another rc directory is
+   named in the report.
+4. `kj context create banto --name console`, a kohai of the root
    character's own context. The context copies the character's model under `model`, and under `distill` when
    the character has no `distill` slot.
    When the console exists, its `model` slot does not resolve to a chat model (it has none, it names a council
@@ -71,8 +76,9 @@ result is missing:
    the console clears it.
 
 It prints each line it ran. A second run runs nothing once every step is in place, and a kernel set up
-by hand is completed rather than overwritten. With no key found, it still
-creates the console and prints the two `kj backend` lines that give it a model.
+by hand is completed rather than overwritten: on an existing kernel it creates only the shipped characters
+that are missing. With no key found, it still creates the characters and the console and prints the two `kj
+backend` lines that give them a model.
 
 Run it with the service stopped: it takes the same lock as the service and
 `kj`. The defaults are `--as $USER` and `--key ~/.ssh/id_ed25519.pub`. It

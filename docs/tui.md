@@ -772,15 +772,18 @@ seat toggle.** `shell.rs`, `Intent::ShellToggle`, `CtrlZ::Toggled` and
 learning space"). `:kj` and `:!` both always act on the context on screen, so
 the bar draws no context label at all. `Ctrl+Z` now moves the screen between a
 person's root console, or the console, and a context the person performs under
-it (`crate::ctrl_z`). The wire facts decide (`isRootConsole`, `isConsole`,
-`performedByPerson`), never a label: from a root console or the console it
-switches to the live child the person performs, preferring the one labelled
+it (`crate::ctrl_z`). The wire facts and the seat's character (`whoami`)
+decide (`isRootConsole`, `isConsole`, `performedByPerson`, `performer`),
+never a label: from a root console or the console it switches to the live
+child the seat's person performs, preferring the one labelled
 `<label>-shell`, and the first time creates it with `kj context create
 <person> --name <label>-shell`, answering to the context it was opened from
 (`docs/character.md`, "A person, the console, MCP sessions, the judge"); from
-any other context a person performs it switches to the context that one was
-opened from; from a context a model performs it does nothing and says so on
-the status line. A person's context runs its draft as shell and starts no turn.
+any other context the seat's person performs it switches to the context that
+one was opened from; from a context a model performs it does nothing and says
+so on the status line. A seat whose character is not a person (no live root
+console the listing names it the performer of), and a person on another
+person's root console, are refused with the reason, and nothing is created. A person's context runs its draft as shell and starts no turn.
 It goes through the seat switch, so the draft and the place in the transcript
 travel with the context.
 

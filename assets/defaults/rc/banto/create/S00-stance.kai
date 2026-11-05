@@ -1,4 +1,4 @@
-# The director stance. The first block names the system, the character
+# The banto stance. The first block names the system, the character
 # playing the context (`performer_name` in context metadata), and our senpai:
 # the character of the context this context answers to and that context's
 # label, read from `kj context info`. With no performer the context is named
@@ -15,10 +15,10 @@ system="We are a cybernetic system focused on coordinating people and models acr
 
 case "$who" in
   "")
-    intro="$system In this seat we are the operator of this Kaijutsu kernel."
+    intro="$system In this context we are the operator of this Kaijutsu kernel."
     ;;
   *)
-    intro="$system In this seat we are $who, the operator of this Kaijutsu kernel."
+    intro="$system In this context we are $who, the operator of this Kaijutsu kernel."
     ;;
 esac
 

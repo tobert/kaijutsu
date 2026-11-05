@@ -44,7 +44,7 @@ fn kjc_runs_kj_verbs_and_shell_commands_and_returns_their_exit_codes() {
     let port = start_kernel(&key);
     let root = SshServerConfig::EPHEMERAL_ROOT;
 
-    let made = kjc(port, &key, root, &["kj", "character", "create", "performer", "--rc", "default"]);
+    let made = kjc(port, &key, root, &["kj", "character", "create", "performer", "--rc", "coder"]);
     assert!(made.status.success(), "character: {}{}", text(&made.stdout), text(&made.stderr));
     let created = kjc(port, &key, root, &["kj", "context", "create", "performer", "--name", "verify"]);
     assert!(created.status.success(), "create: {}{}", text(&created.stdout), text(&created.stderr));

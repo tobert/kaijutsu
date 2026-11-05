@@ -83,7 +83,7 @@
 #                                           # the judge's council server. No judge key, no judge. The kernel
 #                                           # archives a seat's judge shadows with the seat
 #
-#   [rc.director.council]
+#   [rc.banto.council]
 #   enabled = true
 #   contexts = ["council-amy", "council-banto"]  # replaces the shared contexts for this directory; spec contexts still join
 
@@ -119,11 +119,11 @@ allow = [
   "kj context archive",  # a session ends itself; recoverable: `kj context promote`
 ]
 
-[rc.director]
+[rc.banto]
 allow = [
-  "kj context create",     # a director creates its lanes, `kj context create coder --name <lane>`
-  "kj fork",             # a fork copies this seat's own performer
-  "kj drive",            # runs a turn on a lane this seat directs
+  "kj context create",     # banto creates its lanes, `kj context create coder --name <lane>`
+  "kj fork",             # a fork copies this context's own performer
+  "kj drive",            # runs a turn on a lane banto directs
   "kj price set",        # appends a price row; a correction is a later row
 ]
 

@@ -97,7 +97,7 @@ pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
-pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, PromoteOutcome, RotationCommit};
+pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, PromoteOutcome, Retirement, RotationCommit};
 use schema::SCHEMA;
 
 // ============================================================================
@@ -500,6 +500,7 @@ impl KernelDb {
         Self::back_up_before_character_slots(&conn, path)?;
         Self::back_up_before_context_fold(&conn, path)?;
         Self::back_up_before_rc_dir_backfill(&conn, path)?;
+        Self::back_up_before_rc_dir_rename(&conn, path)?;
         Self::back_up_before_slot_roles(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;

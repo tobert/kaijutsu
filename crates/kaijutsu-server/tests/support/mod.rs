@@ -3,7 +3,7 @@
 pub fn init_root(data_dir: &std::path::Path, name: &str) -> kaijutsu_types::PrincipalId {
     let principal_id = kaijutsu_types::PrincipalId::new();
     let db = kaijutsu_kernel::KernelDb::open(data_dir.join("kernel.db")).unwrap();
-    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("root".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
         principal_id,
         name: name.to_string(),
         created_at: 1,
