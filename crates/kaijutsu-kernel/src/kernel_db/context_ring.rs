@@ -73,6 +73,16 @@ pub struct Retirement {
     pub shadows: Vec<ContextId>,
 }
 
+/// What [`KernelDb::demote_person`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Demotion {
+    /// The live contexts the sheet's `root_ctx`, `console_ctx` and
+    /// `mcp_hub_ctx` named, archived in that order.
+    pub archived: Vec<ContextId>,
+    /// Their judge shadows, archived with them.
+    pub shadows: Vec<ContextId>,
+}
+
 impl KernelDb {
     /// Archive a context while retaining its history. Returns true if it was
     /// active. Its live judge shadows are archived with it, told by their
@@ -94,11 +104,25 @@ impl KernelDb {
     /// that loaded name, or `None` when it did not load
     /// ([`Self::is_judge_shadow`]).
     pub fn archive_with_shadows(&self, id: ContextId, judges: Option<&[String]>) -> KernelDbResult<Archived> {
+        self.archive_with_shadows_by(id, judges, None)
+    }
+
+    /// [`Self::archive_with_shadows`] on behalf of `by`, a verb's caller:
+    /// the write also refuses what [`Self::console_archive_refusal`] refuses
+    /// for `by`, so a console pointer that moved after the verb's check
+    /// cannot let `by` archive a console it may not. `None` names no caller
+    /// and checks no console owner.
+    pub fn archive_with_shadows_by(
+        &self,
+        id: ContextId,
+        judges: Option<&[String]>,
+        by: Option<PrincipalId>,
+    ) -> KernelDbResult<Archived> {
         if self.conn.is_autocommit() {
-            return self.in_transaction(|db| db.archive_context_writes(id, judges));
+            return self.in_transaction(|db| db.archive_context_writes(id, judges, by));
         }
         self.conn.execute_batch("SAVEPOINT archive_context")?;
-        let result = self.archive_context_writes(id, judges);
+        let result = self.archive_context_writes(id, judges, by);
         match result {
             Ok(archived) => {
                 self.conn.execute_batch("RELEASE SAVEPOINT archive_context")?;
@@ -157,6 +181,29 @@ impl KernelDb {
         Ok(None)
     }
 
+    /// Why `by` may not archive `id`, a console (a context a sheet's
+    /// `console_ctx` names): only the person whose console it is archives it
+    /// while that person is a live root, and after that only a live person
+    /// may. `None` when `id` is no console or `by` may archive it. `kj
+    /// context archive` checks this before it runs anything, for its message,
+    /// and the demote ladder checks the same rule with its placement
+    /// authority; the archive write checks it again
+    /// ([`Self::archive_with_shadows_by`]).
+    pub(crate) fn console_archive_refusal(&self, id: ContextId, by: PrincipalId) -> KernelDbResult<Option<String>> {
+        let Some(owner) = self.console_owner(id)? else { return Ok(None) };
+        let label = self.context_name(id);
+        let person = self.name_for(owner);
+        if self.is_live_person(owner)? {
+            return Ok((owner != by).then(|| format!("{label} is {person}'s console, and only {person} may archive it")));
+        }
+        if self.is_live_person(by)? {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{label} is the console of {person}, who is not a live root, and only a live person may archive it"
+        )))
+    }
+
     /// Whether `row` is a judge shadow: its parent is the context it answers
     /// to, and its performer is a judge. A character whose model is on a
     /// council server (a backend of kind `mk`) is a judge, since a council
@@ -177,7 +224,17 @@ impl KernelDb {
         Ok(self.get_character(performer)?.is_some_and(|sheet| judges.contains(&sheet.name)))
     }
 
-    pub(super) fn archive_context_writes(&self, id: ContextId, judges: Option<&[String]>) -> KernelDbResult<Archived> {
+    pub(super) fn archive_context_writes(
+        &self,
+        id: ContextId,
+        judges: Option<&[String]>,
+        by: Option<PrincipalId>,
+    ) -> KernelDbResult<Archived> {
+        if let Some(by) = by
+            && let Some(why) = self.console_archive_refusal(id, by)?
+        {
+            return Err(KernelDbError::Validation(why));
+        }
         let context = self.archive_one_context(id)?;
         let mut shadows = Vec::new();
         for child in self.fork_children(id)? {
@@ -331,6 +388,117 @@ impl KernelDb {
         })
     }
 
+    /// Why `by` may not make the person `sheet` an ordinary character now
+    /// (`kj character set <name> --no-root`, `docs/character.md`, "Gate"):
+    ///
+    /// - Only a live person does it.
+    /// - The character performs no live context but its root console.
+    /// - Its MCP hub has no live sessions.
+    /// - Another live person remains.
+    /// - The contexts it archives hold no drifts waiting for an ask, and `by`
+    ///   may archive the console ([`Self::console_archive_refusal`]).
+    ///
+    /// [`Self::demote_person`] checks it inside its write; the verb checks it
+    /// first, for its message, before any archive lifecycle runs.
+    pub(crate) fn demote_refusal(&self, sheet: &CharacterRow, by: PrincipalId) -> KernelDbResult<Option<String>> {
+        let name = &sheet.name;
+        if !self.is_live_person(by)? {
+            return Ok(Some(format!(
+                "{name} is a person (a root character), and only a live person may make a person an ordinary character"
+            )));
+        }
+        let others: Vec<ContextId> = self
+            .character_live_contexts(sheet.principal_id)?
+            .into_iter()
+            .filter(|ctx| Some(*ctx) != sheet.root_ctx)
+            .collect();
+        if !others.is_empty() {
+            let names = others.iter().map(|ctx| self.context_name(*ctx)).collect::<Vec<_>>().join(", ");
+            return Ok(Some(format!(
+                "{name} performs the live contexts {names} besides its root console, and --no-root archives \
+                 only the root console, the console and the MCP hub; archive them first"
+            )));
+        }
+        if let Some(hub) = sheet.mcp_hub_ctx {
+            let sessions = self.live_mcp_sessions(hub)?;
+            if !sessions.is_empty() {
+                let names = sessions.iter().map(|ctx| self.context_name(*ctx)).collect::<Vec<_>>().join(", ");
+                return Ok(Some(format!(
+                    "{name}'s MCP hub {} has the live sessions {names}; end them first \
+                     (`kj context archive <session> --confirm`)",
+                    self.context_name(hub)
+                )));
+            }
+        }
+        let another = self
+            .list_characters(false)?
+            .into_iter()
+            .any(|other| other.root && other.principal_id != sheet.principal_id);
+        if !another {
+            return Ok(Some(format!(
+                "{name} is the last live person, and a kernel keeps one to answer its asks; \
+                 make another with `kj character create <name> --root` first"
+            )));
+        }
+        for ctx in [sheet.root_ctx, sheet.console_ctx, sheet.mcp_hub_ctx].into_iter().flatten() {
+            if let Some(why) = self.held_drift_refusal(ctx)? {
+                return Ok(Some(why));
+            }
+        }
+        if let Some(console) = sheet.console_ctx
+            && let Some(why) = self.console_archive_refusal(console, by)?
+        {
+            return Ok(Some(why));
+        }
+        Ok(None)
+    }
+
+    /// Make the person `principal_id` an ordinary character on behalf of
+    /// `by`, in one transaction: archive each live context its `root_ctx`,
+    /// `console_ctx` and `mcp_hub_ctx` name, with their judge shadows
+    /// ([`Self::archive_with_shadows_by`], with `judges`), clear the three
+    /// pointers and the `root` flag, and set `rc_dir` when one is given. The
+    /// `root_ctx` pointer clears first, so the root console archives; every
+    /// other archive refusal still applies. [`Self::demote_refusal`] is
+    /// checked inside the write. Any refusal or fault rolls the whole change
+    /// back. A character that is not a root refuses.
+    pub fn demote_person(
+        &self,
+        principal_id: PrincipalId,
+        rc_dir: Option<&str>,
+        judges: Option<&[String]>,
+        by: PrincipalId,
+    ) -> KernelDbResult<Demotion> {
+        self.in_transaction(|db| {
+            let sheet = db
+                .get_character(principal_id)?
+                .ok_or_else(|| KernelDbError::NotFound(format!("character {}", principal_id.short())))?;
+            if !sheet.root {
+                return Err(KernelDbError::Validation(format!("{} is not a root character", sheet.name)));
+            }
+            if let Some(why) = db.demote_refusal(&sheet, by)? {
+                return Err(KernelDbError::Validation(why));
+            }
+            db.set_character_root_ctx(principal_id, None)?;
+            let mut demotion = Demotion::default();
+            for ctx in [sheet.root_ctx, sheet.console_ctx, sheet.mcp_hub_ctx].into_iter().flatten() {
+                if demotion.archived.contains(&ctx) || !db.get_context(ctx)?.is_some_and(|row| !row.is_archived()) {
+                    continue;
+                }
+                let archived = db.archive_with_shadows_by(ctx, judges, Some(by))?;
+                demotion.archived.push(ctx);
+                demotion.shadows.extend(archived.shadows);
+            }
+            db.set_character_console_ctx(principal_id, None)?;
+            db.set_character_mcp_hub_ctx(principal_id, None)?;
+            if let Some(dir) = rc_dir {
+                db.set_character_rc_dir(principal_id, Some(dir))?;
+            }
+            db.update_character_root(principal_id, false)?;
+            Ok(demotion)
+        })
+    }
+
     /// Update the lifecycle state of a context.
     pub fn update_context_state(
         &self,
@@ -458,20 +626,23 @@ impl KernelDb {
     /// ring 3.
     pub fn demote_context(&self, id: ContextId) -> KernelDbResult<DemoteOutcome> {
         let archives = self.get_context(id)?.is_some_and(|row| row.demoted_at.is_some());
-        Ok(self.demote_context_with_shadows(id, None, archives)?.0)
+        Ok(self.demote_context_with_shadows(id, None, archives, None)?.0)
     }
 
     /// [`Self::demote_context`], whose archive step archives the context's
-    /// judge shadows with it ([`Self::archive_with_shadows`], with `judges`)
-    /// and returns them. `archives` is the step the caller decided on and
-    /// prepared for: true for the archive step, whose checks and archive
-    /// lifecycle the caller ran. A row whose next step is no longer that one
-    /// refuses and changes nothing.
+    /// judge shadows with it ([`Self::archive_with_shadows_by`], with
+    /// `judges` and `by`) and returns them. `archives` is the step the caller
+    /// decided on and prepared for: true for the archive step, whose checks
+    /// and archive lifecycle the caller ran. A row whose next step is no
+    /// longer that one refuses and changes nothing. `by` is the verb's
+    /// caller, whose right to archive a console the archive step checks
+    /// again.
     pub fn demote_context_with_shadows(
         &self,
         id: ContextId,
         judges: Option<&[String]>,
         archives: bool,
+        by: Option<PrincipalId>,
     ) -> KernelDbResult<(DemoteOutcome, Vec<ContextId>)> {
         let (promoted_at, demoted_at, archived_at): (Option<i64>, Option<i64>, Option<i64>) = self
             .conn
@@ -504,7 +675,7 @@ impl KernelDb {
         }
 
         if demoted_at.is_some() {
-            let archived = self.archive_with_shadows(id, judges)?;
+            let archived = self.archive_with_shadows_by(id, judges, by)?;
             Ok((DemoteOutcome::Archived, archived.shadows))
         } else if promoted_at.is_some() {
             self.conn.execute(

@@ -6,6 +6,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Type melt M5e: what the always-asking acts and `--no-root` leave open (2026-11-05)
+
+- The demote ladder's archive step (`kj context demote <console> --confirm` on a demoted console) archives the
+  console without the gate's always-ask; the spec names only `kj context archive`. It latches and checks the owner
+  inside the write.
+- On the shell-gate path (`shell_write`) the ask's description is the statement, not the policy reason, so a
+  reviewer does not read "a console, which always asks" there; the RPC ask-tier path names it.
+- A host command that wraps `kj` (`env kj …`) is not read by the always-ask arm (`gate_policy::always_asks`).
+- Boot moves a live console off an archived root console (`move_console_to_root_console`), but not a live MCP hub
+  whose senpai is the archived root console.
+- `kaijutsu-server init` sets `rc_dir = person` with no directory check: it runs with no kernel or VFS. The next
+  start's root-console rebind refuses loudly if `person/create` binds nothing.
+- `docs/gate-policy-tuning.md` "Senpai, the gate's model, and the director tier" still says broker PreCall has no
+  database and sees no edge; with a dispatcher wired it evaluates with the ledger and the database.
+
 ## Type melt M5d: what retirement in one transaction leaves open (2026-11-05)
 
 - `kj character retire` runs each archive lifecycle outside the lock, then `retire_with_contexts` re-derives the set
@@ -448,6 +463,11 @@ Clarity:
   in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for
   `cd sub` (`shell_write: 1 statement(s) — cd sub`), and passed three times
   alone. Load-dependent; cause not found.
+  On 2026-11-05 (`ffb36a26` plus M5e) it failed again in a full-suite run, and
+  `a_contained_model_commits_with_real_git` in the same binary failed once in
+  four runs of the binary alone with the same shape: "the turn held on an
+  unexpected ask" for an allowed `git commit`. Two tests, one symptom (an
+  extra ask under load) points at one cause in the gate or its loadout read.
 - `kaijutsu-kernel` `council::gate_e2e::a_council_miss_asks_and_records_its_cause`
   failed once in a full-suite lib run on 2026-10-29 (`f3d46123` plus the
   cost-note change) at its `started.elapsed() < 3s` deadline check, and

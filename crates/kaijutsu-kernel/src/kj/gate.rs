@@ -3133,6 +3133,142 @@ mod tests {
         }
     }
 
+    // ── The two acts that always ask (`docs/character.md`, "Gate") ──
+
+    /// `amy`'s root console, a console `con` performed by `banto` that
+    /// answers to it, an ordinary lane, and a caller acting as `amy` in her
+    /// root console.
+    fn always_ask_fixture(d: &crate::kj::KjDispatcher) -> (KjCaller, kaijutsu_types::ContextId) {
+        let console = crate::kj::test_helpers::register_root_context(d);
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let banto = kaijutsu_types::PrincipalId::new();
+        let db = d.kernel_db.lock();
+        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None,
+            mcp_hub_ctx: None, context_type: None, principal_id: banto, name: "banto".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        drop(db);
+        let con = crate::kj::test_helpers::register_context(d, Some("con"), Some(console), banto);
+        let db = d.kernel_db.lock();
+        db.write_context_character(con, banto, Some(console), None).unwrap();
+        db.set_character_console_ctx(amy, Some(con)).unwrap();
+        drop(db);
+        crate::kj::test_helpers::register_rooted_context(d, Some("lane"), kaijutsu_types::PrincipalId::new());
+        let mut caller = crate::kj::test_helpers::caller_with_context(console);
+        caller.principal_id = amy;
+        caller.actor_id = amy;
+        caller.reviewer_id = Some(amy);
+        (caller, con)
+    }
+
+    async fn verdict_of(d: &crate::kj::KjDispatcher, caller: &KjCaller, source: &str, config: &str) -> GateOutcome {
+        let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+        run_gate(d.kernel(), caller, spec, d.kernel.ledger_flows(), &gate_config(config)).await
+    }
+
+    /// Archiving a console asks whatever the config allows: an allow key in
+    /// `[root]` or `[global]`, or the uncovered tier, does not skip it. A deny
+    /// key still refuses. Archiving an
+    /// ordinary lane follows the layers. Falsified by dropping the
+    /// always-ask arm: the allow key allows the console's archive.
+    #[tokio::test]
+    async fn archiving_a_console_always_asks() {
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        for config in [
+            "[root]\nallow = [\"kj context archive\"]\n",
+            "[global]\nallow = [\"kj context archive\"]\n",
+            "[root]\nuncovered = \"allow\"\n",
+        ] {
+            for source in ["kj context archive con --confirm", "kj context archive --children amy"] {
+                let outcome = verdict_of(&d, &amy, source, config).await;
+                assert_eq!(outcome.verdict, GateVerdict::Pending, "{config} {source}: {}", outcome.reason);
+                cancel_pending(&d);
+            }
+            let lane = verdict_of(&d, &amy, "kj context archive lane --confirm", config).await;
+            assert_eq!(lane.verdict, GateVerdict::Allowed, "an ordinary lane follows the layers: {config}: {}", lane.reason);
+        }
+        let denied = verdict_of(&d, &amy, "kj context archive con --confirm", "[root]\ndeny = [\"kj context archive\"]\n").await;
+        assert_eq!(denied.verdict, GateVerdict::Denied, "{}", denied.reason);
+    }
+
+    /// `kj character set <name> --no-root` asks whatever the config allows,
+    /// and a deny key still refuses; another `kj character set` follows the
+    /// layers. Falsified by dropping the arm.
+    #[tokio::test]
+    async fn no_root_always_asks() {
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        let allow = "[root]\nallow = [\"kj character set\"]\n";
+        let outcome = verdict_of(&d, &amy, "kj character set amy --no-root --rc coder", allow).await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
+        let id = pending_id(&d);
+        let description = d.kernel_db.lock().get_approval(&id).unwrap().unwrap().description;
+        assert!(description.contains("--no-root"), "{description}");
+        cancel_pending(&d);
+        let other = verdict_of(&d, &amy, "kj character set amy --rc person", allow).await;
+        assert_eq!(other.verdict, GateVerdict::Allowed, "{}", other.reason);
+        let denied = verdict_of(&d, &amy, "kj character set amy --no-root", "[global]\ndeny = [\"kj character set\"]\n").await;
+        assert_eq!(denied.verdict, GateVerdict::Denied, "{}", denied.reason);
+    }
+
+    /// An argument the gate cannot read could name a console or carry
+    /// `--no-root`, so the two verbs ask with one. Falsified by reading only
+    /// literal arguments.
+    #[tokio::test]
+    async fn an_unreadable_argument_to_either_act_asks() {
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        let allow = "[root]\nallow = [\"kj context archive\", \"kj character set\"]\n";
+        for source in ["kj context archive $TARGET --confirm", "kj character set amy $FLAG", "kj context archive -- con"] {
+            let outcome = verdict_of(&d, &amy, source, allow).await;
+            assert_eq!(outcome.verdict, GateVerdict::Pending, "{source}: {}", outcome.reason);
+            cancel_pending(&d);
+        }
+    }
+
+    /// A learned always-allow rule, exact or family, does not skip either
+    /// act. Falsified by letting the user-rule layer decide first.
+    #[tokio::test]
+    async fn a_learned_allow_does_not_skip_either_act() {
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        for source in ["kj context archive con --confirm", "kj character set amy --no-root --rc coder"] {
+            let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+            let digest = statement_digest(Origin::ShellGate, &spec.statements[0].rendered);
+            seed_allow_rule(&d.kernel_db, &digest, &spec.authorized_label);
+            let outcome = verdict_of(&d, &amy, source, "").await;
+            assert_eq!(outcome.verdict, GateVerdict::Pending, "an exact rule: {source}: {}", outcome.reason);
+            cancel_pending(&d);
+        }
+        seed_family_allow(&d.kernel_db, &["kj context archive", "kj character set"]);
+        for source in ["kj context archive con", "kj character set amy --no-root"] {
+            let outcome = verdict_of(&d, &amy, source, "").await;
+            assert_eq!(outcome.verdict, GateVerdict::Pending, "a family rule: {source}: {}", outcome.reason);
+            cancel_pending(&d);
+        }
+        let lane = verdict_of(&d, &amy, "kj context archive lane", "").await;
+        assert_eq!(lane.verdict, GateVerdict::Allowed, "the family rule still covers a lane: {}", lane.reason);
+    }
+
+    /// Settle every pending ask, so the next submission raises its own.
+    fn cancel_pending(d: &crate::kj::KjDispatcher) {
+        let db = d.kernel_db.lock();
+        let conn = db.conn_for_ledger();
+        for row in approval_ledger::ask::list_pending(conn).unwrap() {
+            approval_ledger::decide::abandon(conn, &row.request_id, Some("test: the next case raises its own")).unwrap();
+        }
+    }
+
+    fn seed_family_allow(db: &Arc<parking_lot::Mutex<KernelDb>>, keys: &[&str]) {
+        let request_id = seed_allow_rule(db, "family-fixture-digest", "(family fixture)");
+        let db = db.lock();
+        let conn = db.conn_for_ledger();
+        approval_ledger::rules::learn_family_from_approval(
+            conn, &request_id, keys, approval_ledger::types::RuleScope::Always, true, Some(&[1, 2, 3]),
+        ).unwrap();
+    }
+
     /// A file that does not load is a fault, not a decision: the gate is
     /// unavailable, nothing runs, and the reason names the remedy.
     #[tokio::test]
@@ -3153,7 +3289,9 @@ mod tests {
         );
     }
 
-    fn seed_allow_rule(db: &Arc<parking_lot::Mutex<KernelDb>>, digest: &str, label: &str) {
+    /// Learn an always-allow rule for `digest` from a fixture ask, and return
+    /// the ask's id.
+    fn seed_allow_rule(db: &Arc<parking_lot::Mutex<KernelDb>>, digest: &str, label: &str) -> String {
         let seed = approval_ledger::types::NewAsk {
             context_id: vec![],
             actor_id: vec![9, 9, 9],
@@ -3214,5 +3352,6 @@ mod tests {
             Some(&[1, 2, 3]),
         )
         .unwrap();
+        request_id
     }
 }

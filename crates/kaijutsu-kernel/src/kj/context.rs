@@ -2298,23 +2298,10 @@ impl KjDispatcher {
         };
         // Only the person whose console it is archives the console, while
         // that person is a live root; after that, any live person may. The
-        // archive clears the pointer.
-        let owner = {
-            let db = self.kernel_db().lock();
-            (|| -> KernelDbResult<Option<(PrincipalId, String, bool)>> {
-                let Some(owner) = db.console_owner(target_id)? else { return Ok(None) };
-                Ok(Some((owner, db.name_for(owner), db.is_live_person(owner)?)))
-            })()
-        };
-        match owner {
-            Ok(Some((owner, name, true))) if owner != caller.actor_id => return KjResult::Err(format!(
-                "kj context archive: refused — {target_label} is {name}'s console, and only {name} may archive it"
-            )),
-            Ok(Some((_, name, false))) if !person => return KjResult::Err(format!(
-                "kj context archive: refused — {target_label} is the console of {name}, who is not a live root, \
-                 and only a live person may archive it"
-            )),
-            Ok(_) => {}
+        // archive write checks it again and clears the pointer.
+        match self.kernel_db().lock().console_archive_refusal(target_id, caller.actor_id) {
+            Ok(None) => {}
+            Ok(Some(why)) => return KjResult::Err(format!("kj context archive: refused — {why}")),
             Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
         }
         // A nested archive from an rc lifecycle (an archive bucket retiring
@@ -2354,7 +2341,7 @@ impl KjDispatcher {
         let judges = self.council_judges().await;
         let (archived, shadows) = {
             let db = self.kernel_db().lock();
-            match db.archive_with_shadows(target_id, judges.as_deref()) {
+            match db.archive_with_shadows_by(target_id, judges.as_deref(), Some(caller.actor_id)) {
                 Ok(v) => {
                     let shadows: Vec<String> = v.shadows.iter().map(|id| db.context_name(*id)).collect();
                     (v, shadows)
@@ -3012,7 +2999,7 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
                 }
             }
-            match db.demote_context_with_shadows(target_id, judges.as_deref(), archiving) {
+            match db.demote_context_with_shadows(target_id, judges.as_deref(), archiving, Some(caller.actor_id)) {
                 Ok(v) => v,
                 Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
             }

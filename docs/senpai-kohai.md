@@ -48,8 +48,9 @@ with no ask.
   performed by them, and has no senpai.
 - **The console**: the model console a person talks to, the context `characters.console_ctx` names on the
   person's sheet; bootstrap labels it `console`. A non-root character performs it and the person's root console
-  is its senpai. `kaijutsu-server bootstrap` makes it. Archiving it clears the pointer. Drifts into it wait for
-  the person ("Reports and drift").
+  is its senpai. `kaijutsu-server bootstrap` makes it. Only its person archives it while that person is a live
+  root, and the gate always asks first; the archive clears the pointer. Drifts into it wait for the person
+  ("Reports and drift").
 - **Performer**: the character that plays a context. **Senpai**: the context a context answers to. **Kohai**: a word for the
   relationship only. The kj surface says "the contexts that answer to X" and lists them with `kj context list
   --senpai X`.
@@ -95,9 +96,11 @@ turns                           turn_id, context_id, provider, model, raw tokens
   that would close one is refused.
 - **The root console** of a root character is `characters.root_ctx`, a pointer like `handoff_ctx`. Rotating the
   root console moves the pointer at the commit, as it moves `handoff_ctx`. A root console cannot be forked,
-  moved under a senpai, or archived; `kj context rotate` replaces it. A context with no senpai must be performed
-  by a root character, whatever its type; boot archives a live one that no `root_ctx` names (a rotation that
-  never committed).
+  moved under a senpai, or archived; `kj context rotate` replaces it, and `kj character set <person> --no-root`
+  archives it with the console and the MCP hub when the person stops being one. A context with no senpai must be
+  performed by a root character, whatever its type; boot archives a live one that no `root_ctx` names (a rotation
+  that never committed), and when it mints a fresh root console for an archived one, the live console that
+  answered to the old one answers to the new one.
 - **Live** means not archived. A concluded context is live; verbs that refuse a concluded target say so.
 - **The contexts that answer to** a context (its kohai) are the live contexts whose `senpai_ctx` is that context.
 - **The handoff log** belongs to the character: `characters.handoff_ctx`. Every context of the character writes
@@ -436,7 +439,11 @@ context it cannot map in `context_character_migration_report`, which `kj context
   stays the same. `kj context create --senpai` and `kj context set --senpai` use the same rule over the new senpai.
 - A context with no performer answers to a senpai; an insert or update that leaves a NULL senpai outside a root
   console is refused.
-- A root console cannot be forked or archived; rotating it moves `root_ctx` at the commit.
+- A root console cannot be forked or archived; rotating it moves `root_ctx` at the commit, and `kj character set
+  <person> --no-root` archives it with the console and the hub in one transaction.
+- Archiving the console, and `kj character set <person> --no-root`, always ask: an allow key, a learned rule or
+  the uncovered tier does not skip the ask, and a deny key refuses. Only the console's person archives it, checked
+  again inside the write.
 - Archiving a context archives no other context and moves no other context; a push to an archived senpai refuses;
   `kj context list --senpai` shows the contexts of an archived senpai. The `.senpai` reference chains with
   `.parent` in any order, and a step with nothing to follow names the context and the step.

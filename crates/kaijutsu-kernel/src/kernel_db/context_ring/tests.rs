@@ -537,16 +537,16 @@ fn a_demote_refuses_a_step_that_changed_after_its_caller_decided_it() {
     let cid = row.context_id;
     insert_kohai_with_doc(&db, &row, ws_id);
 
-    let error = db.demote_context_with_shadows(cid, None, true).unwrap_err().to_string();
+    let error = db.demote_context_with_shadows(cid, None, true, None).unwrap_err().to_string();
     assert!(error.contains("kj context demote"), "{error}");
     assert_eq!(db.get_context(cid).unwrap().unwrap().demoted_at, None, "a stale archive decision demotes nothing");
 
     assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Demoted);
-    let error = db.demote_context_with_shadows(cid, None, false).unwrap_err().to_string();
+    let error = db.demote_context_with_shadows(cid, None, false, None).unwrap_err().to_string();
     assert!(error.contains("kj context demote") && error.contains("--confirm"), "{error}");
     assert!(!db.get_context(cid).unwrap().unwrap().is_archived(), "a stale demote decision archives nothing");
 
-    let (outcome, _) = db.demote_context_with_shadows(cid, None, true).unwrap();
+    let (outcome, _) = db.demote_context_with_shadows(cid, None, true, None).unwrap();
     assert_eq!(outcome, DemoteOutcome::Archived);
 }
 
@@ -575,4 +575,75 @@ fn archiving_a_hub_with_a_live_session_refuses_inside_the_write() {
     assert!(db.archive_context(session.context_id).unwrap());
     assert!(db.archive_context(hub.context_id).unwrap());
     assert_eq!(db.get_character(amy).unwrap().unwrap().mcp_hub_ctx, None, "the archive clears the pointer");
+}
+
+/// A person, `amy`, with a root console and a console `con` performed by a
+/// model character, and a second live person, `bob`.
+fn console_fixture(db: &KernelDb, ws_id: WorkspaceId) -> (PrincipalId, ContextId, PrincipalId) {
+    let (amy, root) = db.seed_test_root_console().unwrap();
+    let banto = PrincipalId::new();
+    let bob = PrincipalId::new();
+    for (principal_id, name, root) in [(banto, "banto", false), (bob, "bob", true)] {
+        db.insert_character(&CharacterRow { rc_dir: Some(name.into()), console_ctx: None, mcp_hub_ctx: None,
+            context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root,
+        }).unwrap();
+    }
+    let con = make_context_row(Some("con"));
+    insert_context_with_doc(db, &con, ws_id);
+    db.write_context_character(con.context_id, banto, Some(root), None).unwrap();
+    db.set_character_console_ctx(amy, Some(con.context_id)).unwrap();
+    (amy, con.context_id, bob)
+}
+
+/// The console-owner rule holds inside the archive write: a caller who is
+/// not the console's person cannot archive it, even when the console
+/// pointer was set after the verb checked; the person can. Falsified by
+/// dropping the owner check from `archive_context_writes`.
+#[test]
+fn archiving_a_console_checks_its_person_inside_the_write() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let (amy, con, bob) = console_fixture(&db, ws_id);
+
+    let error = db.archive_with_shadows_by(con, None, Some(bob)).unwrap_err().to_string();
+    assert!(error.contains("con") && error.contains("console") && error.contains("only"), "{error}");
+    assert!(!db.get_context(con).unwrap().unwrap().is_archived(), "the refused write archives nothing");
+    assert_eq!(db.get_character(amy).unwrap().unwrap().console_ctx, Some(con));
+
+    assert!(db.archive_with_shadows_by(con, None, Some(amy)).unwrap().context);
+    assert_eq!(db.get_character(amy).unwrap().unwrap().console_ctx, None);
+}
+
+/// Once the console's person is no longer a live root, the write lets any
+/// live person archive it and still refuses a caller who is not one.
+/// Falsified by checking the owner alone.
+#[test]
+fn a_console_whose_person_is_retired_is_archived_by_a_person_only() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let (amy, con, bob) = console_fixture(&db, ws_id);
+    db.retire_character(amy, 1).unwrap();
+    let model = PrincipalId::new();
+
+    let error = db.archive_with_shadows_by(con, None, Some(model)).unwrap_err().to_string();
+    assert!(error.contains("live person"), "{error}");
+    assert!(!db.get_context(con).unwrap().unwrap().is_archived());
+    assert!(db.archive_with_shadows_by(con, None, Some(bob)).unwrap().context);
+}
+
+/// The demote ladder's archive step checks the console's person inside
+/// the write too. Falsified by archiving there without the caller.
+#[test]
+fn a_demote_that_archives_a_console_checks_its_person_inside_the_write() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let (amy, con, bob) = console_fixture(&db, ws_id);
+    assert_eq!(db.demote_context(con).unwrap(), DemoteOutcome::Demoted);
+
+    let error = db.demote_context_with_shadows(con, None, true, Some(bob)).unwrap_err().to_string();
+    assert!(error.contains("console"), "{error}");
+    assert!(!db.get_context(con).unwrap().unwrap().is_archived());
+    let (outcome, _) = db.demote_context_with_shadows(con, None, true, Some(amy)).unwrap();
+    assert_eq!(outcome, DemoteOutcome::Archived);
 }

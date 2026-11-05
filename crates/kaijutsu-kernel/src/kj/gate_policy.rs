@@ -1544,20 +1544,37 @@ pub(crate) fn evaluate(
         senpai_edge_drift(db, cmd, &caller).or_else(|| mcp_session_create(db, cmd, &caller))
     };
     let lower = lower_layers_per_gated_statement(spec, layers, &edge);
+    // The acts that always ask, per gated statement: decided over every
+    // layer but a deny.
+    let firm: Vec<Option<Decision>> = (0..spec.statements.len())
+        .map(|i| {
+            let group = groups.as_ref()?.get(i)?;
+            group.iter().flat_map(|s| s.plan.commands.iter()).find_map(|cmd| always_asks(db, cmd, &caller))
+        })
+        .collect();
     let per_statement = exact
         .iter()
         .zip(family)
         .zip(lower)
-        .map(|((rule, family), lower)| match rule {
-            StatementVerdict::Allow(row) => PolicyVerdict::Allow(vec![Decision {
-                layer: Layer::UserRule,
-                key: rule_key(row),
-            }]),
-            StatementVerdict::Deny(row) => PolicyVerdict::Deny(Decision {
+        .zip(firm)
+        .map(|(((rule, family), lower), firm)| match (firm, rule) {
+            (Some(_), StatementVerdict::Deny(row)) => PolicyVerdict::Deny(Decision {
                 layer: Layer::UserRule,
                 key: rule_key(row),
             }),
-            StatementVerdict::Uncovered => match family {
+            (Some(ask), _) => match (family, lower) {
+                (PolicyVerdict::Deny(deny), _) | (_, PolicyVerdict::Deny(deny)) => PolicyVerdict::Deny(deny),
+                _ => PolicyVerdict::Ask(ask),
+            },
+            (None, StatementVerdict::Allow(row)) => PolicyVerdict::Allow(vec![Decision {
+                layer: Layer::UserRule,
+                key: rule_key(row),
+            }]),
+            (None, StatementVerdict::Deny(row)) => PolicyVerdict::Deny(Decision {
+                layer: Layer::UserRule,
+                key: rule_key(row),
+            }),
+            (None, StatementVerdict::Uncovered) => match family {
                 PolicyVerdict::Uncovered => lower,
                 decided => decided,
             },
@@ -2162,6 +2179,104 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
         key.push_str(sub.get_name());
     }
     Some(key)
+}
+
+/// Whether `cmd` is one of the two acts that always ask (`docs/character.md`,
+/// "Gate"), and the ask it raises: `kj context archive` whose target is a
+/// console (a context a sheet's `console_ctx` names), or with `--children`
+/// whose children include one, and `kj character set <name> --no-root`.
+/// [`evaluate`] decides the ask over every layer but a deny, so an allow key,
+/// a learned rule, the uncovered tier and the council do not skip it. The
+/// target is resolved as the verb resolves it. Either verb with an argument
+/// that is not a literal word, or with `--`, asks, and so does a target
+/// whose read fails: the gate cannot tell that it is not one of the two.
+/// `None` for anything else, including a target that does not resolve,
+/// which the verb refuses.
+fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
+    use kaish_types::plan::PlannedValue;
+    if cmd.name != "kj" {
+        return None;
+    }
+    let ask = |key: String| Some(Decision { layer: Layer::Builtin, key });
+    let literal: Vec<String> = cmd
+        .args
+        .iter()
+        .map_while(|arg| match arg {
+            PlannedValue::Literal { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    let readable = literal.len() == cmd.args.len() && !literal.iter().any(|a| a == "--");
+    let mut head = literal;
+    super::parse::strip_flag(&mut head, &["--confirm", "--json"]);
+    let root = super::kj_command();
+    let verb = match head.first() {
+        Some(word) => root.find_subcommand(word)?,
+        None if readable => return None,
+        None => return ask("kj with a verb the gate cannot read, which may archive a console".to_string()),
+    };
+    let sub = match head.get(1) {
+        Some(word) => verb.find_subcommand(word)?,
+        None if readable => return None,
+        None => return ask(format!("kj {} with a subcommand the gate cannot read", verb.get_name())),
+    };
+    let act = match (verb.get_name(), sub.get_name()) {
+        ("context", "archive") => "kj context archive",
+        ("character", "set") => "kj character set",
+        _ => return None,
+    };
+    if !readable {
+        return ask(format!("{act} with an argument the gate cannot read, which may name an act that always asks"));
+    }
+    let matches = super::effect::cached_kj_args_command().try_get_matches_from(&head).ok()?;
+    let unread = |what: &str| ask(format!("{act}, whose {what} the gate could not read"));
+    let (_, m) = matches.subcommand()?;
+    let (_, m) = m.subcommand()?;
+    if act == "kj character set" {
+        let name = m.try_get_one::<String>("name").ok().flatten().cloned().unwrap_or_default();
+        return match m.try_get_one::<bool>("no_root") {
+            Ok(Some(true)) => ask(format!("kj character set {name} --no-root, which always asks")),
+            Ok(_) => None,
+            Err(_) => unread("--no-root flag"),
+        };
+    }
+    let (Ok(target), Ok(children)) = (m.try_get_one::<String>("context"), m.try_get_one::<bool>("children")) else {
+        return unread("target");
+    };
+    let Ok(target) = super::refs::resolve_context_arg_from(target.map(String::as_str), caller.context_id, db) else {
+        return None;
+    };
+    if !children.copied().unwrap_or(false) {
+        return match db.is_console(target) {
+            Ok(true) => ask(format!("kj context archive of {}, a console, which always asks", db.context_name(target))),
+            Ok(false) => None,
+            Err(_) => unread("console pointer"),
+        };
+    }
+    let performer = match m.try_get_one::<String>("performer") {
+        Ok(None) => None,
+        Ok(Some(name)) => match db.get_character_by_name(name) {
+            Ok(Some(sheet)) => Some(sheet.principal_id),
+            Ok(None) => return None,
+            Err(_) => return unread("--performer"),
+        },
+        Err(_) => return unread("--performer"),
+    };
+    let Ok(children) = db.fork_children(target) else { return unread("children") };
+    for child in children.into_iter().filter(|c| performer.is_none_or(|p| c.performer == Some(p))) {
+        match db.is_console(child.context_id) {
+            Ok(true) => {
+                return ask(format!(
+                    "kj context archive --children of {}, whose child {} is a console, which always asks",
+                    db.context_name(target),
+                    db.context_name(child.context_id)
+                ));
+            }
+            Ok(false) => {}
+            Err(_) => return unread("children's console pointers"),
+        }
+    }
+    None
 }
 
 /// Whether `cmd` creates a context under the caller's own MCP hub, which
