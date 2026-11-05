@@ -772,12 +772,14 @@ seat toggle.** `shell.rs`, `Intent::ShellToggle`, `CtrlZ::Toggled` and
 learning space"). `:kj` and `:!` both always act on the context on screen, so
 the bar draws no context label at all. `Ctrl+Z` now moves the screen between a
 person's root console, or the console, and a context the person performs under
-it (`crate::ctrl_z`). The wire facts and the seat's character (`whoami`)
+it (`kaijutsu_client::shell_toggle`, shared with the GUI; the double tap is `crate::ctrl_z`). The wire facts and the seat's character (`whoami`)
 decide (`isRootConsole`, `isConsole`, `performedByPerson`, `performer`),
 never a label: from a root console or the console it switches to the live
 child the seat's person performs, preferring the one labelled
 `<label>-shell`, and the first time creates it with `kj context create
-<person> --name <label>-shell`, answering to the context it was opened from
+<person> --name <label>-shell`, or `-shell-2`, `-shell-3` when a live context
+holds the name (the kernel refuses an explicit `--name` a live context holds
+and has no first-free fallback for it), answering to the context it was opened from
 (`docs/character.md`, "A person, the console, MCP sessions, the judge"); from
 any other context the seat's person performs it switches to the context that
 one was opened from; from a context a model performs it does nothing and says

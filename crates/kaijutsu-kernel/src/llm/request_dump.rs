@@ -163,7 +163,7 @@ struct SummaryJson {
 }
 
 /// `YYYYMMDDTHHMMSS.mmmZ` for a Unix time in milliseconds.
-fn utc_stamp(ms: u64) -> String {
+pub(crate) fn utc_stamp(ms: u64) -> String {
     let secs = ms / 1000;
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;

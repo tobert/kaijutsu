@@ -303,8 +303,10 @@ impl KernelDb {
     /// Copy a database that `rc-dir-rename-v1` is about to change aside
     /// first: the migration is not recorded and a character names a retired
     /// directory, or the database is older than `characters.rc_dir` and has
-    /// characters, which the backfill gives the retired names. An existing
-    /// copy stays as it is, and a copy that cannot be made fails the open.
+    /// characters, which the backfill gives the retired names, or the
+    /// backfill has not run and a character has no directory for it to fill.
+    /// An existing copy stays as it is, and a copy that cannot be made fails
+    /// the open.
     pub(super) fn back_up_before_rc_dir_rename(conn: &Connection, path: &Path) -> KernelDbResult<()> {
         if !Self::has_table(conn, "characters")? {
             return Ok(());
@@ -321,7 +323,20 @@ impl KernelDb {
         }
         let changes: bool = if Self::has_column(conn, "characters", "rc_dir")? {
             let retired = RC_DIR_RENAMES.iter().map(|(from, _)| format!("'{from}'")).collect::<Vec<_>>().join(", ");
-            conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM characters WHERE rc_dir IN ({retired}))"), [], |r| r.get(0))?
+            // Until the backfill has run, a row with no directory may get a
+            // retired name from it in the same open.
+            let backfill_pending = !Self::has_table(conn, "kernel_migrations")?
+                || !conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
+                    [Self::RC_DIR_BACKFILL_MIGRATION],
+                    |r| r.get::<_, bool>(0),
+                )?;
+            let unset = if backfill_pending { " OR rc_dir IS NULL OR rc_dir = ''" } else { "" };
+            conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM characters WHERE rc_dir IN ({retired}){unset})"),
+                [],
+                |r| r.get(0),
+            )?
         } else {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM characters)", [], |r| r.get(0))?
         };
@@ -362,9 +377,16 @@ impl KernelDb {
                     "UPDATE characters SET rc_dir = ?1 WHERE principal_id = ?2",
                     params![to, blob_param(id.as_bytes())],
                 )?;
+                let effect = match *from {
+                    "console" | "director" | "shell" => "wider than",
+                    "default" => "narrower than",
+                    _ => "possibly different from",
+                };
                 let note = format!(
                     "{name}'s rc directory moved from '{from}' to '{to}', which absorbed it; \
-                     `kj character set {name} --rc <dir>` names another"
+                     {name}'s contexts now run '{to}' bindings, {effect} the '{from}' bindings they ran; \
+                     `kj binding show` in one of them checks, \
+                     and `kj character set {name} --rc <dir>` names another directory"
                 );
                 info!(character = %name, from, to, "renamed a retired rc directory");
                 tx.execute(

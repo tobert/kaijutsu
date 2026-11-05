@@ -441,6 +441,28 @@ fn the_rename_moves_each_retired_directory_and_reports_it() {
     assert_eq!(r.notes("rc_dir_renamed").len(), 5);
 }
 
+/// The note says the character's contexts now run the new directory's
+/// bindings, wider for `shell` and `director`, narrower for `default`, and
+/// names the commands that check and change it.
+#[test]
+fn the_rename_note_says_the_bindings_widen_or_narrow() {
+    let r = rig();
+    named(&r.db, "plain", "default");
+    named(&r.db, "shell-player", "shell");
+    r.rename();
+    let notes = r.notes("rc_dir_renamed");
+    let note = |name: &str| notes.iter().map(|(_, n)| n).find(|n| n.starts_with(name)).unwrap_or_else(|| panic!("{name}: {notes:?}"));
+    let narrowed = note("plain");
+    assert!(narrowed.contains("narrower") && narrowed.contains("'coder'") && narrowed.contains("bindings"), "{narrowed}");
+    assert!(!narrowed.contains("wider"), "{narrowed}");
+    let widened = note("shell-player");
+    assert!(widened.contains("wider") && widened.contains("'person'") && widened.contains("bindings"), "{widened}");
+    assert!(!widened.contains("narrower"), "{widened}");
+    for n in [narrowed, widened] {
+        assert!(n.contains("kj binding show") && n.contains("kj character set") && n.contains("--rc"), "{n}");
+    }
+}
+
 /// A database from before the backfill (characters with a type and no
 /// directory) gets the backfill's directories and their renames in the same
 /// open: a root ends on `person`, a director on `banto`.
@@ -462,6 +484,27 @@ fn an_old_shaped_database_ends_on_the_renamed_directories() {
 
 fn renamed_backup(path: &Path) -> bool {
     KernelDb::pre_rc_dir_rename_backup_path(path).exists()
+}
+
+/// A database whose `rc_dir` column exists but whose rows are NULL gets the
+/// retired names from the backfill in the same open, so the rename's copy is
+/// made before either migration changes it.
+#[test]
+fn the_rename_copy_counts_the_rows_the_backfill_will_fill() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel.db");
+    {
+        let db = KernelDb::open(&path).unwrap();
+        character(&db, "banto", false, Some("director"));
+        for name in [KernelDb::RC_DIR_BACKFILL_MIGRATION, KernelDb::RC_DIR_RENAME_MIGRATION] {
+            db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [name]).unwrap();
+        }
+    }
+    let db = KernelDb::open(&path).unwrap();
+    assert_eq!(db.get_character_by_name("banto").unwrap().unwrap().rc_dir.as_deref(), Some("banto"), "both migrations ran in the open");
+    assert!(renamed_backup(&path), "the rename's copy exists");
+    let copy = KernelDb::open_read_only(KernelDb::pre_rc_dir_rename_backup_path(&path)).unwrap();
+    assert_eq!(copy.get_character_by_name("banto").unwrap().unwrap().rc_dir, None, "the copy is the database before either migration");
 }
 
 /// A fresh database records the rename and makes no copy. A database with a

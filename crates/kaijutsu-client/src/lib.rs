@@ -7,6 +7,7 @@ pub mod actor;
 pub mod ask_arming;
 pub mod constants;
 pub mod context_create;
+pub mod shell_toggle;
 pub mod context_feed;
 pub mod document_store;
 pub mod draft_ledger;
@@ -48,6 +49,7 @@ pub use context_feed::{
     context_feed_channel,
 };
 pub use context_create::{CreateContextError, CreatedContext, ParentChoice, ParentSource, archive_runs_from, choose_parent, context_archive_argv, context_create_argv, context_create_argv_under, context_id_from_create_result, live_mcp_hub};
+pub use shell_toggle::{ShellToggle, shell_label, shell_toggle};
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
 pub use draft_outbox::{DraftEdit, DraftOutbox, DraftSink};
 pub use editor_outbox::{EditorOutbox, EditorSink};

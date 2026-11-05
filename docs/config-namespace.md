@@ -166,17 +166,24 @@ the link and create its `.keep`.
 2 retired default(s) are still installed and were left alone:
   coder/create/S15-recall.kai
   director/
+
+1 file(s) in those directories are not links to the shared lib scripts; they may be yours:
+  director/create/S60-mine.kai
 ```
 
 A file or directory the seed no longer ships is named as a retired default and
-left alone; `--force` removes it, and a name ending in `/` is a directory that
-`--force` removes with everything in it, scripts of your own included. The
-retired directories are `console/`, `default/`, `director/`, `root/` and
-`shell/`: `banto/` absorbed `director/` and `console/`, `person/` absorbed
-`root/` and `shell/`, and a `default/` character runs `coder/`
-(`docs/character.md`, "rc"). A `<dir>.keep` beside a retired directory keeps
-it through `--force`. A directory the seed never shipped, such as one a
-character of your own runs, is never named or removed.
+left alone. For a retired directory, a plain reseed also names the files in it
+that are not links to the shared `lib/` scripts, which may be yours. `--force`
+removes a retired file, and moves a retired directory, with everything in it,
+to `<dir>.retired-<UTC timestamp>` beside it and prints the new name; it
+deletes no directory, so scripts of your own survive at the new path. A name
+ending in `/` is a directory. The retired directories are `console/`,
+`default/`, `director/`, `root/` and `shell/`: `banto/` absorbed `director/`
+and `console/`, `person/` absorbed `root/` and `shell/`, and a `default/`
+character runs `coder/` (`docs/character.md`, "rc"). A `<dir>.keep` beside a
+retired directory keeps it in place through `--force`. A directory the seed
+never shipped, such as one a character of your own runs, is never named or
+moved.
 
 An untouched tree says nothing, so the warning stays worth reading. `--force`
 is then an ordinary deliberate act by a player who has been told exactly what

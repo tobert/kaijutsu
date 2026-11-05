@@ -149,12 +149,15 @@ enum RcCommand {
     /// Install the embedded rc scripts into the rc tree. Installs anything
     /// absent, and names files that differ from their default and retired
     /// defaults still installed, files and whole directories, leaving both
-    /// alone; --force overwrites the first and removes the second. A path
-    /// with a <path>.keep file beside it is left as it is, present, edited,
-    /// or absent, even with --force.
+    /// alone. --force overwrites the first, removes a retired file, and moves
+    /// a retired directory, with everything in it, to <dir>.retired-<UTC
+    /// timestamp> beside it; it deletes no directory. A path with a
+    /// <path>.keep file beside it is left as it is, present, edited, or
+    /// absent, even with --force.
     Reseed {
-        /// Also overwrite files that differ from their embedded default and
-        /// remove retired defaults, a retired directory with everything in it.
+        /// Also overwrite files that differ from their embedded default,
+        /// remove retired default files, and move retired directories aside
+        /// to <dir>.retired-<UTC timestamp>.
         #[arg(long, short = 'f')]
         force: bool,
         /// Seed this directory instead of the /config/rc tree the path
@@ -439,15 +442,33 @@ fn cmd_rc_reseed(
                 for path in &r.retired {
                     println!("  {path}");
                 }
+                if !r.unshipped.is_empty() {
+                    println!(
+                        "\n{} file(s) in those directories are not links to the shared lib scripts; \
+                         they may be yours:",
+                        r.unshipped.len()
+                    );
+                    for path in &r.unshipped {
+                        println!("  {path}");
+                    }
+                }
                 println!(
-                    "\nPass --force to remove them, or delete them by hand. A name ending in / is a \
-                     directory, and --force removes everything in it; create <dir>.keep beside it to keep it."
+                    "\nPass --force to remove retired files and move retired directories, with \
+                     everything in them, to <dir>.retired-<UTC timestamp> beside them; nothing in \
+                     a directory is deleted. A name ending in / is a directory. Create <path>.keep \
+                     beside one to keep it where it is."
                 );
             }
             if !r.removed.is_empty() {
                 println!("\n{} retired default(s) removed:", r.removed.len());
                 for path in &r.removed {
                     println!("  {path}");
+                }
+            }
+            if !r.moved.is_empty() {
+                println!("\n{} retired directory(ies) moved aside, nothing deleted:", r.moved.len());
+                for (from, to) in &r.moved {
+                    println!("  {from} -> {to}/");
                 }
             }
             ExitCode::SUCCESS

@@ -39,7 +39,8 @@ use kaijutsu_client::DraftEdit;
 use kaijutsu_client::draft_outbox::{self, Landed};
 use kaijutsu_client::editor_outbox;
 use crate::completion;
-use crate::ctrl_z::{self, Toggle};
+use crate::ctrl_z;
+use kaijutsu_client::{ShellToggle, shell_toggle};
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
 use crate::picker::{self, Outcome as PickerOutcome};
@@ -1747,7 +1748,7 @@ async fn remember_view(bridge: &KernelBridge, id: ContextId) {
 /// `Ctrl+Z`'s toggle: a root console or the console to the live context the
 /// person performs under it (created on first use), a person's context back
 /// to the context it was opened from, and a notice from anywhere else
-/// (`crate::ctrl_z::toggle`).
+/// (`kaijutsu_client::shell_toggle`).
 ///
 /// The listing is asked for here rather than read from the app, so a shell
 /// child made a moment ago is found and not created twice. The switch goes
@@ -1771,13 +1772,13 @@ async fn toggle_shell(bridge: &KernelBridge, app: &mut App, feeds: &mut Feeds) {
             return;
         }
     };
-    let target = match ctrl_z::toggle(&current, &contexts, &me) {
-        Toggle::Switch(id) => id,
-        Toggle::Refuse(why) => {
+    let target = match shell_toggle(&current, &contexts, &me) {
+        ShellToggle::Switch(id) => id,
+        ShellToggle::Refuse(why) => {
             app.note(why);
             return;
         }
-        Toggle::Create { parent, label } => {
+        ShellToggle::Create { parent, label } => {
             match bridge.create_shell_child(parent, &label, &me).await {
                 Ok((info, cwd_refused)) => {
                     if let Some(refused) = cwd_refused {

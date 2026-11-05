@@ -174,3 +174,28 @@ fn reseed_names_a_retired_seed_and_force_removes_it() {
     assert!(stdout(&out).contains("removed") && stdout(&out).contains(rel), "{}", stdout(&out));
     assert!(!retired.exists(), "--force removes a retired seed");
 }
+
+/// A retired directory is named with the files in it that may be the
+/// player's; `--force` moves it aside, says where, and deletes nothing.
+#[test]
+fn reseed_force_moves_a_retired_directory_aside_and_says_where() {
+    let xdg = Xdg::new();
+    let dir = xdg.path().join("rc");
+    let dir_arg = dir.to_str().unwrap();
+    std::fs::create_dir_all(dir.join("shell/create")).unwrap();
+    std::fs::write(dir.join("shell/create/S60-mine.kai"), "mine\n").unwrap();
+
+    let out = xdg.run(&["rc", "reseed", "--dir", dir_arg]);
+    assert!(out.status.success(), "reseed failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("shell/create/S60-mine.kai") && stdout(&out).contains("may be yours"), "{}", stdout(&out));
+    assert!(dir.join("shell/create/S60-mine.kai").exists());
+
+    let out = xdg.run(&["rc", "reseed", "--force", "--dir", dir_arg]);
+    assert!(out.status.success(), "reseed --force failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("shell/ -> shell.retired-"), "{}", stdout(&out));
+    assert!(!dir.join("shell").exists());
+    let moved: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("shell.retired-")).collect();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(std::fs::read_to_string(moved[0].join("create/S60-mine.kai")).unwrap(), "mine\n");
+}

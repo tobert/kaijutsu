@@ -154,11 +154,20 @@ pub struct RcSeedReport {
     pub diverged: Vec<String>,
     /// Retired seed paths ([`RETIRED_RC_SEEDS`]) and retired directories
     /// ([`RETIRED_RC_DIRS`], named with a trailing `/`) still present and
-    /// left alone. Always empty with `force`, which removes them instead.
+    /// left alone. Always empty with `force`, which removes retired seed
+    /// paths and moves retired directories aside instead.
     pub retired: Vec<String>,
-    /// Retired seed paths and directories this reseed removed. Always empty
-    /// without `force`.
+    /// Paths, relative to the rc root, inside the retired directories named
+    /// in `retired` that are not links to the shared `lib/` seeds: files a
+    /// player may have written, which `force` moves aside with the rest of
+    /// the directory. Always empty with `force`.
+    pub unshipped: Vec<String>,
+    /// Retired seed paths this reseed removed. Always empty without `force`.
     pub removed: Vec<String>,
+    /// Retired directories this reseed moved aside with `force`, as
+    /// `(directory with a trailing "/", new name beside it)`. Nothing in
+    /// them is deleted.
+    pub moved: Vec<(String, String)>,
     /// Seed and retired paths with a `<path>.keep` file beside them, left as
     /// they are (present, edited, or absent), even with `force`.
     pub kept: Vec<String>,
@@ -200,7 +209,7 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
 /// (`person/` took `root/` and `shell/`, `banto/` took `director/` and
 /// `console/`, and `default/` contexts run `coder/`). [`reseed_rc_files`]
 /// names each one still present, with a trailing `/`, and removes it and
-/// everything in it under `force`. Sorted.
+/// moves it aside under `force`. Sorted.
 pub const RETIRED_RC_DIRS: &[&str] = &["console", "default", "director", "root", "shell"];
 
 /// Write the embedded seed tree into `root` (the host directory mounted at
@@ -222,10 +231,12 @@ pub const RETIRED_RC_DIRS: &[&str] = &["console", "default", "director", "root",
 ///
 /// A retired seed ([`RETIRED_RC_SEEDS`]) or retired directory
 /// ([`RETIRED_RC_DIRS`]) still present is named in [`RcSeedReport::retired`]
-/// and left alone; with `force` it is removed, a directory with everything in
-/// it, and named in [`RcSeedReport::removed`]. `force` deletes nothing else,
-/// so a script you added under any other path is never touched. Use `git diff` to see what a
-/// forced reseed changed.
+/// and left alone. With `force` a retired seed is removed and named in
+/// [`RcSeedReport::removed`]; a retired directory is renamed to
+/// `<dir>.retired-<UTC timestamp>` beside it, with everything in it, and
+/// named in [`RcSeedReport::moved`]. `force` deletes no directory and nothing
+/// you added, so a script of yours under a retired name survives at the new
+/// path, and a script under any other path is never touched.
 ///
 /// A seed or retired path with a `<path>.keep` file beside it is left exactly
 /// as it is, present, edited, or absent, with or without `force`, and named in
@@ -311,29 +322,76 @@ pub fn reseed_rc_files(
     }
     for dir in RETIRED_RC_DIRS {
         let dest = root.join(dir);
-        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
+        if std::fs::symlink_metadata(&dest).is_err() {
             continue;
-        };
+        }
         let named = format!("{dir}/");
         if is_kept(root, dir) {
             report.kept.push(named);
             continue;
         }
         if force {
-            if meta.is_dir() {
-                std::fs::remove_dir_all(&dest)?;
-            } else {
-                std::fs::remove_file(&dest)?;
-            }
-            report.removed.push(named);
+            let target = aside_target(root, dir, &crate::llm::request_dump::utc_stamp(now_ms()));
+            std::fs::rename(&dest, &target)?;
+            let moved_to = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            report.moved.push((named, moved_to));
         } else {
+            report.unshipped.extend(unshipped_files(root, dir));
             report.retired.push(named);
         }
     }
     report.retired.sort();
+    report.unshipped.sort();
     report.removed.sort();
+    report.moved.sort();
     report.kept.sort();
     Ok(report)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `<dir>.retired-<stamp>` under `root`; with that name taken, `-2`, `-3`, ...
+/// after it. A move never lands on an earlier one.
+fn aside_target(root: &std::path::Path, dir: &str, stamp: &str) -> std::path::PathBuf {
+    let base = format!("{dir}.retired-{stamp}");
+    let mut candidate = root.join(&base);
+    let mut n = 2;
+    while std::fs::symlink_metadata(&candidate).is_ok() {
+        candidate = root.join(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Every file under the retired directory `dir` (paths relative to `root`)
+/// except a symlink whose target runs through `lib/`, which is how seeds
+/// installed shared scripts. A file an old seed wrote as a regular file is
+/// named too: the walk cannot tell it from a player's, and naming too much is
+/// the safe side.
+fn unshipped_files(root: &std::path::Path, dir: &str) -> Vec<String> {
+    fn walk(root: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(root.join(rel)) else { return };
+        for entry in entries.flatten() {
+            let child = format!("{rel}/{}", entry.file_name().to_string_lossy());
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+            if meta.is_dir() {
+                walk(root, &child, out);
+            } else if meta.file_type().is_symlink()
+                && std::fs::read_link(entry.path()).is_ok_and(|t| t.components().any(|c| c.as_os_str() == "lib"))
+            {
+                continue;
+            } else {
+                out.push(child);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, dir, &mut out);
+    out
 }
 
 /// True if `<rel>.keep` exists beside a seed path: the player owns that entry,
@@ -1216,12 +1274,26 @@ mod tests {
         std::fs::write(root.join("director/create/S60-mine.kai"), "kj context set . --env MINE=1\n").unwrap();
     }
 
+    /// The one directory beside `root` that moved aside from `dir`.
+    fn aside(root: &std::path::Path, dir: &str) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{dir}.retired-");
+        let mut found: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+            .collect();
+        found.sort();
+        found
+    }
+
     /// A directory the seed no longer has is named, with a trailing `/`, and
-    /// left alone; `--force` removes it and everything in it; a `.keep`
-    /// beside it keeps it through `--force`. A directory the seed never
-    /// named is never touched.
+    /// left alone, and the files in it that are not links to the shared lib
+    /// are named; `--force` moves it to `<dir>.retired-<UTC timestamp>` beside
+    /// it with everything in it and names the new path, deleting nothing; a
+    /// `.keep` beside it keeps it through `--force`. A directory the seed
+    /// never named is never touched.
     #[test]
-    fn reseed_names_a_retired_directory_and_force_removes_it() {
+    fn reseed_names_a_retired_directory_and_force_moves_it_aside() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         ensure_rc_seed_files(root).unwrap();
@@ -1231,20 +1303,63 @@ mod tests {
 
         let report = reseed_rc_files(root, false).unwrap();
         assert_eq!(report.retired, vec!["director/".to_string()], "{report:?}");
+        assert_eq!(report.unshipped, vec!["director/create/S60-mine.kai".to_string()], "only the person's own file is named: {report:?}");
         assert!(root.join("director/create/S60-mine.kai").exists(), "left alone without --force");
 
         let forced = reseed_rc_files(root, true).unwrap();
-        assert_eq!(forced.removed, vec!["director/".to_string()], "{forced:?}");
-        assert!(std::fs::symlink_metadata(root.join("director")).is_err(), "--force removes the directory");
+        assert!(forced.removed.is_empty(), "nothing is deleted: {forced:?}");
+        let moved = aside(root, "director");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(forced.moved.len(), 1, "{forced:?}");
+        assert_eq!(forced.moved[0].0, "director/");
+        assert_eq!(forced.moved[0].1, moved[0].file_name().unwrap().to_string_lossy());
+        assert!(std::fs::symlink_metadata(root.join("director")).is_err(), "the name is free");
+        assert_eq!(
+            std::fs::read_to_string(moved[0].join("create/S60-mine.kai")).unwrap(),
+            "kj context set . --env MINE=1\n",
+            "the person's file survives at the new path"
+        );
         assert!(root.join("bassist/create/S00-stance.kai").exists(), "a directory the seed never named stays");
         assert!(reseed_rc_files(root, false).unwrap().retired.is_empty());
 
         plant_retired_dir(root);
         std::fs::write(root.join("director.keep"), "").unwrap();
         let kept = reseed_rc_files(root, true).unwrap();
-        assert!(kept.removed.is_empty() && kept.retired.is_empty(), "{kept:?}");
+        assert!(kept.moved.is_empty() && kept.removed.is_empty() && kept.retired.is_empty(), "{kept:?}");
         assert_eq!(kept.kept, vec!["director/".to_string()]);
         assert!(root.join("director/create/S60-mine.kai").exists());
+        assert_eq!(aside(root, "director").len(), 1, "no second copy");
+    }
+
+    /// A person's own directory that shares a retired name is moved, not
+    /// deleted, and a name already taken by an earlier move is not reused.
+    #[test]
+    fn reseed_force_moves_a_users_own_retired_name_without_overwriting_an_earlier_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("shell/create")).unwrap();
+        std::fs::write(root.join("shell/create/S10-mine.kai"), "mine\n").unwrap();
+        reseed_rc_files(root, true).unwrap();
+        std::fs::create_dir_all(root.join("shell/create")).unwrap();
+        std::fs::write(root.join("shell/create/S10-again.kai"), "again\n").unwrap();
+        reseed_rc_files(root, true).unwrap();
+        let moved = aside(root, "shell");
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        let mut names: Vec<_> = moved.iter().flat_map(|m| std::fs::read_dir(m.join("create")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned())).collect();
+        names.sort();
+        assert_eq!(names, ["S10-again.kai", "S10-mine.kai"]);
+    }
+
+    /// A name already taken is never reused: the move gets a numeric suffix.
+    #[test]
+    fn the_aside_name_is_never_one_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(aside_target(root, "shell", "S"), root.join("shell.retired-S"));
+        std::fs::create_dir(root.join("shell.retired-S")).unwrap();
+        assert_eq!(aside_target(root, "shell", "S"), root.join("shell.retired-S-2"));
+        std::fs::create_dir(root.join("shell.retired-S-2")).unwrap();
+        assert_eq!(aside_target(root, "shell", "S"), root.join("shell.retired-S-3"));
     }
 
     /// Plant every retired seed path: a link where the seed shipped one, a
