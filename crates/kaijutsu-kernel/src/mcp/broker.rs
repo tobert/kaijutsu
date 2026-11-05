@@ -1578,7 +1578,7 @@ impl Broker {
     /// (D-20). Updates the sticky `name_map` side-effectfully with
     /// freshly-resolved names, and persists the binding when it gains any.
     /// A fault reading or persisting the binding is this call's error, and
-    /// nothing is cached for it.
+    /// nothing is cached for it. The list is sorted by visible name.
     pub async fn list_visible_tools(
         &self,
         context_id: ContextId,
@@ -1672,6 +1672,11 @@ impl Broker {
                 out.push((visible_name.clone(), kt));
             }
         }
+        // Sorted by visible name: a model request carries this list near
+        // the top of its prompt, and the instance map's order changes with
+        // registration and restarts, which would break a provider's prefix
+        // cache.
+        out.sort_by(|(a, _), (b, _)| a.cmp(b));
         Ok(out)
     }
 
@@ -11478,6 +11483,25 @@ mod tests {
 
     /// The sticky names `list_visible_tools` resolves reach the kernel DB,
     /// so a restart reads the same visible names back.
+    #[tokio::test]
+    async fn list_visible_tools_is_sorted_by_visible_name() {
+        let (kernel_db, ctx) = kernel_db_with_context();
+        let broker = Arc::new(Broker::new());
+        broker.set_db(kernel_db.clone()).await;
+        for name in ["zeta", "alpha", "mid"] {
+            let server = Arc::new(MockServer::new(name).with_tool(&format!("{name}_tool")).with_tool("b_shared"));
+            broker.register_silently(server, InstancePolicy::default()).await.unwrap();
+            broker.bind(ctx, InstanceId::new(name)).await.unwrap();
+        }
+        let visible = broker.list_visible_tools(ctx, &CallContext::system_for_context(ctx)).await.unwrap();
+        let names: Vec<&str> = visible.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["alpha__b_shared", "alpha_tool", "mid__b_shared", "mid_tool", "zeta__b_shared", "zeta_tool"],
+            "a model request's tool list is the same whatever order instances were registered or bound"
+        );
+    }
+
     #[tokio::test]
     async fn list_visible_tools_persists_the_names_it_resolves() {
         let (kernel_db, ctx) = kernel_db_with_context();
