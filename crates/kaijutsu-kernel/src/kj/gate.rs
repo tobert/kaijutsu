@@ -3181,13 +3181,7 @@ mod tests {
     fn always_ask_fixture(d: &crate::kj::KjDispatcher) -> (KjCaller, kaijutsu_types::ContextId) {
         let console = crate::kj::test_helpers::register_root_context(d);
         let amy = crate::kj::test_helpers::test_reviewer_principal();
-        let banto = kaijutsu_types::PrincipalId::new();
-        let db = d.kernel_db.lock();
-        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None,
-            mcp_hub_ctx: None, principal_id: banto, name: "banto".into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-        }).unwrap();
-        drop(db);
+        let banto = banto(d);
         let con = crate::kj::test_helpers::register_context(d, Some("con"), Some(console), banto);
         let db = d.kernel_db.lock();
         db.write_context_character(con, banto, Some(console), None).unwrap();
@@ -3199,6 +3193,20 @@ mod tests {
         caller.actor_id = amy;
         caller.reviewer_id = Some(amy);
         (caller, con)
+    }
+
+    /// The `banto` character, inserted unless it exists.
+    fn banto(d: &crate::kj::KjDispatcher) -> kaijutsu_types::PrincipalId {
+        let db = d.kernel_db.lock();
+        if let Some(sheet) = db.get_character_by_name("banto").unwrap() {
+            return sheet.principal_id;
+        }
+        let banto = kaijutsu_types::PrincipalId::new();
+        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None,
+            mcp_hub_ctx: None, principal_id: banto, name: "banto".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        banto
     }
 
     async fn verdict_of(d: &crate::kj::KjDispatcher, caller: &KjCaller, source: &str, config: &str) -> GateOutcome {
@@ -3380,6 +3388,94 @@ mod tests {
             let crate::kj::KjResult::Err(message) = refused else { panic!("{source}: expected the verb's refusal, got {refused:?}") };
             assert!(message.contains(refusal), "{source}: {message}");
         }
+    }
+
+    /// A second person, `bea`, with a root console, and `bea-con`, bea's
+    /// console: performed by banto, a child of amy's root console, answering
+    /// to bea's. Each context is made a few milliseconds after the one
+    /// before, so `fork_children` lists them in the order they were made.
+    fn second_person_console(d: &crate::kj::KjDispatcher) -> kaijutsu_types::ContextId {
+        let amy_root = crate::kj::test_helpers::register_root_context(d);
+        let banto = banto(d);
+        let bea = kaijutsu_types::PrincipalId::new();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let bea_root = crate::kj::test_helpers::register_context(d, Some("bea"), None, bea);
+        d.kernel_db.lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()),
+            console_ctx: None, mcp_hub_ctx: None, principal_id: bea, name: "bea".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: Some(bea_root), root: true,
+        }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let con = crate::kj::test_helpers::register_context(d, Some("bea-con"), Some(amy_root), banto);
+        let db = d.kernel_db.lock();
+        db.write_context_character(con, banto, Some(bea_root), None).unwrap();
+        db.set_character_console_ctx(bea, Some(con)).unwrap();
+        con
+    }
+
+    /// The verb's refusal of `source`, run as `caller` with `--confirm`.
+    async fn verb_refusal(d: &crate::kj::KjDispatcher, caller: &KjCaller, source: &str) -> String {
+        let argv: Vec<String> = source.split_whitespace().skip(1).map(String::from).collect();
+        let mut confirmed = caller.clone();
+        confirmed.confirmed = true;
+        match d.dispatch(&argv, &confirmed).await {
+            crate::kj::KjResult::Err(message) => message,
+            other => panic!("{source}: expected the verb's refusal, got {other:?}"),
+        }
+    }
+
+    /// The retirement of a character that performs any live person's
+    /// console but the caller's raises no ask: `retire_refusal` refuses it
+    /// before anything runs, whatever other consoles the character performs.
+    /// Falsified by asking at the first console the caller may retire.
+    #[tokio::test]
+    async fn no_ask_for_a_retirement_the_verb_refuses_for_another_person_s_console() {
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        second_person_console(&d);
+        let source = "kj character retire banto";
+        let outcome = verdict_of(&d, &amy, source, "[global]\nallow = [\"kj character retire\"]\n").await;
+        assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);
+        let pending = approval_ledger::ask::list_pending(d.kernel_db.lock().conn_for_ledger()).unwrap();
+        assert!(pending.is_empty(), "{source} raised an ask: {pending:?}");
+        let refusal = verb_refusal(&d, &amy, source).await;
+        assert!(refusal.contains("only bea may retire banto"), "{refusal}");
+    }
+
+    /// `kj context archive --children` archives the children in order and
+    /// stops at the first it may not archive. When that is another person's
+    /// console and no console the caller may archive comes before it, the
+    /// verb archives no console, and the gate raises no ask; when one comes
+    /// before it, the ask names the consoles the verb archives. Falsified by
+    /// asking for any console the caller may archive, wherever it sits.
+    #[tokio::test]
+    async fn an_archive_of_children_asks_only_for_the_consoles_it_reaches() {
+        let allow = "[global]\nallow = [\"kj context archive\"]\n";
+        let source = "kj context archive --children amy";
+
+        // amy's console `con` is made before bea's: the verb archives con,
+        // then refuses at bea-con.
+        let d = gate_dispatcher().await;
+        let (amy, _con) = always_ask_fixture(&d);
+        second_person_console(&d);
+        let outcome = verdict_of(&d, &amy, source, allow).await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
+        let id = pending_id(&d);
+        let description = d.kernel_db.lock().get_approval(&id).unwrap().unwrap().description;
+        assert!(description.contains("con") && !description.contains("bea-con"), "{description}");
+
+        // bea's console is the first child: the verb refuses before it
+        // archives anything, so no ask.
+        let d = gate_dispatcher().await;
+        second_person_console(&d);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let (amy, con) = always_ask_fixture(&d);
+        let outcome = verdict_of(&d, &amy, source, allow).await;
+        assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);
+        let pending = approval_ledger::ask::list_pending(d.kernel_db.lock().conn_for_ledger()).unwrap();
+        assert!(pending.is_empty(), "{source} raised an ask: {pending:?}");
+        let refusal = verb_refusal(&d, &amy, source).await;
+        assert!(refusal.contains("only bea may archive it"), "{refusal}");
+        assert!(!d.kernel_db.lock().get_context(con).unwrap().unwrap().is_archived(), "the verb archived no console");
     }
 
     /// Settle every pending ask, so the next submission raises its own.

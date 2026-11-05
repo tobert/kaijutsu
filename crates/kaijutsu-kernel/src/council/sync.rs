@@ -833,7 +833,9 @@ pub(crate) async fn plan_context_seats(
         .map_err(|e| format!("context {} cannot be read: {e}", context.short()))?
         .ok_or_else(|| format!("context {} has no row", context.short()))?;
     let performer = crate::kj::gate_policy::performer_of(&db, Some(context))?;
-    let Some(council) = config.council_for(performer.as_ref()) else { return Ok((Vec::new(), None)) };
+    let Some(council) = crate::kj::gate_policy::council_for_context(&db, &config, context, performer.as_ref())? else {
+        return Ok((Vec::new(), None));
+    };
     let (routed, chain) = match super::gate::seat_route(&db, &council, context, row.performer)? {
         super::gate::SeatRoute::NoCouncil => return Ok((Vec::new(), None)),
         super::gate::SeatRoute::Council(routed, chain) => (routed, chain),
@@ -1489,6 +1491,57 @@ mod tests {
         build_seats(&r.kernel).await;
         assert_eq!(r.mock.bodies("/council/v2/contexts").len(), 1, "{:?}", r.mock.calls("POST"));
         assert_eq!(pin_puts(&r, 1).await.len(), 1);
+    }
+
+    /// The console is never under a council, whatever its performer's layers
+    /// say. With `[rc.banto.council]` enabled and a `gate` slot on banto,
+    /// banto's lane plans seats and the gate consults the council for it;
+    /// the console banto plays plans none and the gate consults none.
+    ///
+    /// Falsified by composing the console's council from its performer's
+    /// layers alone.
+    #[tokio::test]
+    async fn the_console_is_never_under_a_council() {
+        use crate::kernel_db::CharacterRow;
+        use kaijutsu_types::PrincipalId;
+        let r = rig().await;
+        let gate = "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"linear\", weights = \"uniform\" }\ndeadline_ms = 5000\n\n[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
+                    [[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.98\nmass_floor = -0.05\n\n\
+                    [rc.banto.council]\nenabled = true\n";
+        std::fs::write(r.config.path().join("gate.toml"), gate).unwrap();
+        let lane = coder_on_the_mock_council(&r);
+        let banto = r.kernel.kernel_db().lock().get_context(lane).unwrap().unwrap().performer.unwrap();
+        r.kernel.kernel_db().lock().set_character_rc_dir(banto, Some("banto")).unwrap();
+        let console = live_context(&r.kernel, "console");
+        let amy = PrincipalId::new();
+        {
+            let db = r.kernel.kernel_db().lock();
+            db.assign_stand_in_character(console, banto).unwrap();
+            db.insert_character(&CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
+                principal_id: amy, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+                root_ctx: None, root: true,
+            }).unwrap();
+            db.set_character_console_ctx(amy, Some(console)).unwrap();
+        }
+
+        let (lane_seats, _) = plan_context_seats(&r.kernel, lane).await.unwrap();
+        assert!(!lane_seats.is_empty(), "banto's lane is judged");
+        let (console_seats, _) = plan_context_seats(&r.kernel, console).await.unwrap();
+        assert!(console_seats.is_empty(), "no seat is built for the console");
+
+        let config = crate::kj::gate_policy::load_config(r.kernel.vfs(), r.kernel.kernel_db()).await;
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("echo console-probe").unwrap();
+        let caller = |context: ContextId| {
+            let mut caller = crate::kj::test_helpers::caller_with_context(context);
+            caller.principal_id = banto;
+            caller.actor_id = banto;
+            caller
+        };
+        let consulted = crate::council::gate::consult(&r.kernel, &caller(console), &spec, &config).await;
+        assert!(matches!(consulted, Ok(None)), "the gate consults no council for the console: {:?}",
+            consulted.as_ref().map(Option::is_some));
+        let consulted = crate::council::gate::consult(&r.kernel, &caller(lane), &spec, &config).await;
+        assert!(!matches!(consulted, Ok(None)), "the gate consults the council for banto's lane");
     }
 
     /// A failed identity is a miss. A 404, from a server without council

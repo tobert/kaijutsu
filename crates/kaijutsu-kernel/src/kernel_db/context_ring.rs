@@ -626,6 +626,23 @@ impl KernelDb {
                     self.context_name(id)
                 )));
             }
+            // A live context answers to a live senpai, as `kj context set
+            // --senpai` requires.
+            // The remedies name both by full id, which reaches an archived
+            // context.
+            if let Some(senpai) = self.senpai_of(id)?
+                && self.get_context(senpai)?.is_some_and(|row| row.is_archived())
+            {
+                return Err(KernelDbError::Validation(format!(
+                    "context {name} answers to {senpai_name}, which is archived, and a live context answers to a \
+                     live senpai; bring {senpai_name} back first with `kj context promote {senpai_id}`, or move \
+                     {name} under a live one with `kj context set {id_hex} --senpai <ctx>`",
+                    name = self.context_name(id),
+                    senpai_name = self.context_name(senpai),
+                    senpai_id = senpai.to_hex(),
+                    id_hex = id.to_hex(),
+                )));
+            }
             // Resurrection: unarchive + a FRESH promoted_at in one write.
             // `archive_context` clears promoted_at, so an archived row
             // shouldn't still carry one — but stamp unconditionally anyway:

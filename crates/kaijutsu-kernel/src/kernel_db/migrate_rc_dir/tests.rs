@@ -302,6 +302,25 @@ fn setting_the_rc_dir_clears_the_unset_note() {
     assert!(r.report_principals("rc_dir_unset").is_empty());
 }
 
+/// Naming a directory clears the character's rename note, which named the
+/// directory the rename chose or withheld. Falsified by clearing only the
+/// unset note.
+#[test]
+fn setting_the_rc_dir_clears_the_rename_note() {
+    let r = rig();
+    let left = named(&r.db, "shell-player", "shell");
+    let moved = named(&r.db, "plain", "default");
+    r.rename();
+    let reported = r.report_principals("rc_dir_renamed");
+    assert!(reported.contains(&Some(left)) && reported.contains(&Some(moved)), "{reported:?}");
+
+    r.db.set_character_rc_dir(left, Some("coder")).unwrap();
+
+    let reported = r.report_principals("rc_dir_renamed");
+    assert!(!reported.contains(&Some(left)), "the named character's note goes: {reported:?}");
+    assert!(reported.contains(&Some(moved)), "another character's note stays: {reported:?}");
+}
+
 fn backed_up(path: &Path) -> bool {
     KernelDb::pre_rc_dir_backup_path(path).exists()
 }
@@ -465,6 +484,9 @@ fn only_roots_move_to_person() {
     let left = note("shell-player");
     assert!(left.contains("no rc directory") && left.contains("'shell'") && !left.contains("moved from"), "{left}");
     assert!(left.contains("kj character set shell-player --rc <dir>") && left.contains("refuses"), "{left}");
+    // The whole consequence: no lifecycle of a context it already performs
+    // runs, archive included.
+    assert!(left.contains("kj context archive") && left.contains("no rc lifecycle"), "{left}");
     let widened = note("second-root");
     assert!(widened.contains("'root'") && widened.contains("'person'") && widened.contains("wider than"), "{widened}");
     assert!(!widened.contains("possibly"), "{widened}");

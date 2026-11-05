@@ -470,7 +470,11 @@ fn cmd_rc_reseed(
                 }
             }
             if !r.linked.is_empty() {
-                println!("\n{} retired directory(ies) are symlinks; a reseed moves the link and never follows it to its target:", r.linked.len());
+                if force {
+                    println!("\n{} retired directory(ies) are symlinks; --force moved the link and left its target where it is:", r.linked.len());
+                } else {
+                    println!("\n{} retired directory(ies) are symlinks; --force moves the link aside and leaves its target where it is:", r.linked.len());
+                }
                 for (dir, target) in &r.linked {
                     println!("  {dir} -> {target}");
                 }

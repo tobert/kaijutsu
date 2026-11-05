@@ -807,14 +807,14 @@ CREATE TABLE IF NOT EXISTS characters (
     -- archived context is retained work, not a reason to disown the sheet
     -- row that points at it.
     handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    -- A root character is a model context like any other, and its kj
-    -- requests always need approval. Accountability itself is a relation
-    -- between contexts, not a column here — see docs/character.md, "Roots
-    -- and rotation".
+    -- A root character is a person: the contexts it performs run no model
+    -- turns, and the gate layers decide its kj requests as they decide any
+    -- performer's. Accountability itself is a relation between contexts, not
+    -- a column here — see docs/character.md, "Roots and rotation".
     root             INTEGER NOT NULL DEFAULT 0,
-    -- A root character's console: the one context of it with no senpai
-    -- (docs/senpai-kohai.md, "The model"). A rotation of the console moves the
-    -- pointer in the commit, as it moves `handoff_ctx`.
+    -- A root character's root console: the one context of it with no senpai
+    -- (docs/senpai-kohai.md, "The model"). A rotation of the root console
+    -- moves the pointer in the commit, as it moves `handoff_ctx`.
     root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
     -- The directory under /config/rc/ whose lifecycle scripts this
     -- character's contexts run. NULL until set.

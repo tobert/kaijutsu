@@ -25,6 +25,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - A host command that wraps `kj` (`env kj …`) is not read by the always-ask arm (`gate_policy::always_asks`).
 - `kaijutsu-server init` sets `rc_dir = person` with no directory check: it runs with no kernel or VFS. The next
   start's root-console rebind refuses loudly if `person/create` binds nothing.
+- The gate's "no ask the verb refuses" (`gate_policy::always_asks`) reads the caller's state when it decides, and the
+  verb reads it again when it runs. A caller made a person between the two skips the ask: the act runs on the
+  verb's own `--confirm` check with no reviewer. Narrow, and accepted for now. kaibo job-3 #6.
+- An alias reaches `kj` under a literal command name the gate does not read (`alias k='kj context archive con
+  --confirm'; k`), as `env kj` does: the always-ask arm sees `alias` and `k`. A substitution or variable in command
+  position does not reach the gate at all, because kaish refuses to parse it (pinned by
+  `a_command_name_is_always_a_literal_word` in kj/gate_policy.rs). An approval does not confirm the aliased `kj`
+  (runtime/kj_builtin.rs `ApprovedKj`), so a `Destroy` verb there latches unless the alias text carries `--confirm`.
 
 ## Type melt M7: what the docs pass leaves open (2026-11-05)
 
@@ -34,8 +42,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - A rotation moves no context that answered to the predecessor; the character takes them by hand
   (docs/senpai-kohai.md, "Rotation hands off its contexts"). A `rotate` lifecycle that takes them after the commit
   was described and never built; `rotate` today is the beat scheduler's page-turn verb (rc/mod.rs ~136-142).
-- docs/council.md says the console is not put under a council, but banto performs the console and banto/ runs
-  `S50-council-seats.kai`, so a `[rc.banto.council]` block puts it under one. Open question for Amy.
 - `contexts.persona` is never read (docs/senpai-kohai.md says it is NULL "until characters carry a persona";
   stances live in rc directories). Decide whether the column goes.
 

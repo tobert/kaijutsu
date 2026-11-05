@@ -41,10 +41,59 @@ pub struct KjBuiltin {
     /// setter can tell rc-assigned loadouts from agent-issued ones. Trusted
     /// because the agent cannot influence how its `KjBuiltin` was built.
     privileged: bool,
-    /// True only in the shell that runs an allowed ask's source
-    /// (`ShellPolicy::Approved`): every `kj` there runs as confirmed, because
-    /// the approval confirmed it.
-    approved: bool,
+    /// The `kj` statements an allowed ask's plan contained, in the shell that
+    /// runs its source (`ShellPolicy::Approved`). Each runs as confirmed,
+    /// because the approval confirmed it; any other `kj` there runs
+    /// unconfirmed.
+    approved: Option<ApprovedKj>,
+}
+
+/// The `kj` statements an approval confirms: each planned `kj` command of the
+/// approved source whose every argument is a literal word, as its argv
+/// without `--confirm` and `--json`. A `kj` invocation is confirmed when its
+/// argv, read the same way, equals one of them. A `kj` the plan did not
+/// contain as a literal statement (one a sourced file, a substitution or an
+/// expanded argument reaches) is not confirmed, so a `Destroy` verb latches
+/// there. See `docs/character.md`, "Gate".
+#[derive(Clone, Debug, Default)]
+pub struct ApprovedKj(Arc<Vec<Vec<String>>>);
+
+impl ApprovedKj {
+    /// The literal `kj` statements kaish plans in `source`. Source that does
+    /// not plan confirms nothing.
+    pub fn planned_in(source: &str) -> Self {
+        use kaish_types::plan::PlannedValue;
+        let Ok(statements) = kaish_kernel::plan_program(source) else { return Self::default() };
+        let planned = statements
+            .iter()
+            .flat_map(|statement| statement.plan.commands.iter())
+            .filter(|command| command.name == "kj")
+            .filter_map(|command| {
+                command
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        PlannedValue::Literal { value, .. } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<String>>>()
+            })
+            .map(Self::comparable)
+            .collect();
+        Self(Arc::new(planned))
+    }
+
+    /// Whether the approval confirms a `kj` invocation with this argv.
+    pub fn confirms(&self, argv: &[String]) -> bool {
+        let argv = Self::comparable(argv.to_vec());
+        self.0.iter().any(|planned| *planned == argv)
+    }
+
+    /// `argv` without the flags kaish or the builtin lifts before dispatch.
+    fn comparable(mut argv: Vec<String>) -> Vec<String> {
+        crate::kj::parse::strip_flag(&mut argv, &["--confirm", "--json"]);
+        argv
+    }
 }
 
 impl KjBuiltin {
@@ -52,7 +101,8 @@ impl KjBuiltin {
     pub fn new(
         dispatcher: Arc<KjDispatcher>, session_contexts: SessionContextMap,
         identity: ShellIdentity, semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
-        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool, read_only: bool, approved: bool,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool, read_only: bool,
+        approved: Option<ApprovedKj>,
     ) -> Self {
         Self { dispatcher, session_contexts, identity, semantic_index, block_source, privileged, read_only, approved }
     }
@@ -413,9 +463,11 @@ impl Tool for KjBuiltin {
         }
 
         // Extract the bare --confirm flag before dispatch. Presence of the flag
-        // IS the confirmation; no nonce store or cross-call state exists. An
-        // approved ask's source is confirmed by its approval.
-        let confirmed = self.approved || crate::kj::parse::has_flag(&argv, &["--confirm"]);
+        // IS the confirmation; no nonce store or cross-call state exists. In
+        // an approved ask's source, a statement its plan contained is
+        // confirmed by the approval.
+        let confirmed = crate::kj::parse::has_flag(&argv, &["--confirm"])
+            || self.approved.as_ref().is_some_and(|approved| approved.confirms(&argv));
         crate::kj::parse::strip_flag(&mut argv, &["--confirm"]);
 
         // kaish lifts a global `--json` out of the argv and renders `.data`.
@@ -781,7 +833,7 @@ mod tests {
                         reviewer: None, context: ctx, session: sid },
                     index,
                     source,
-                    false, false, false,
+                    false, false, None,
                 ));
             };
 

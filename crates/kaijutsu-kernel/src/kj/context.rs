@@ -263,15 +263,16 @@ enum ContextCommand {
         context: String,
     },
     /// Promote a context into ring 0 ("active"). Not latched. Needs the
-    /// operator capability, or a person's live root character, which acts
-    /// as a human root from any context. A seat other than the console may not
-    /// promote its own context, a human root, or the console; it asks the
-    /// console. First promote wins the timestamp —
+    /// operator capability, or a person, from any context. A context other
+    /// than the console may not promote its own context, a root console, or
+    /// the console; it asks the console. First promote wins the timestamp —
     /// re-promoting an already-promoted context is a no-op.
     Promote {
         /// Context to promote. An archived context (reachable by full id)
-        /// is resurrected rather than refused. Ids and labels come from
-        /// `kj context list`.
+        /// is resurrected, unless its senpai is archived: promote the senpai
+        /// first, or move the context under a live senpai with `kj context
+        /// set <ctx> --senpai <ctx>`. Ids and labels come from `kj context
+        /// list`.
         context: String,
     },
     /// Push a context outward one step on the demote ladder: promoted →
@@ -2751,6 +2752,25 @@ impl KjDispatcher {
     /// - Any other seat may act on any context that is not a root console,
     ///   the console, or its own. Its own is the context the call runs in,
     ///   or any context its character plays.
+    /// Whom a context asks to act for it, as a clause ending in "or ": the
+    /// character that performs its senpai and its lineage root
+    /// ([`crate::kernel_db::KernelDb::context_authority`]), each when it has
+    /// one. Empty when it has neither.
+    fn who_answers_for(&self, caller: &KjCaller) -> String {
+        let Some(here) = caller.context_id else { return String::new() };
+        let db = self.kernel_db().lock();
+        let holder = db.senpai_holder(here).ok().flatten().map(|(_, performer)| performer);
+        let root = db.lineage_root(here).ok();
+        let mut names = Vec::new();
+        if let Some(holder) = holder {
+            names.push(format!("{}, who performs this context's senpai", db.name_for(holder)));
+        }
+        if let Some(root) = root.filter(|root| Some(*root) != holder) {
+            names.push(format!("{}, this context's lineage root", db.name_for(root)));
+        }
+        names.into_iter().map(|name| format!("{name}, or ")).collect()
+    }
+
     fn require_placement_authority(&self, verb: &str, target_id: ContextId, caller: &KjCaller) -> Result<(), KjResult> {
         let (row, target_is_root, console_owner, in_console) = {
             let db = self.kernel_db().lock();
@@ -2791,7 +2811,7 @@ impl KjDispatcher {
             }
             if caller.context_id == Some(target_id) || row.performer == Some(caller.actor_id) {
                 return refuse(format!(
-                    "{name} is this seat's own context, and no seat may {verb} itself. \
+                    "{name} is this context or one its performer plays, and no performer may {verb} its own context. \
                      To have it done, ask the console, for example: kj drift push console \"please {verb} {name}\""
                 ));
             }
@@ -2799,9 +2819,9 @@ impl KjDispatcher {
         if !human {
             self.require_cap(caller, crate::mcp::Capability::Operator, &format!("context {verb}")).map_err(|denied| {
                 KjResult::Err(format!(
-                    "{}\nWithout the 'operator' capability a seat may not {verb} any context. \
-                     Ask your director, or ask the console.",
-                    denied.message()
+                    "{}\nWithout the 'operator' capability a context may not {verb} any context. Ask {}the console.",
+                    denied.message(),
+                    self.who_answers_for(caller),
                 ))
             })?;
         }
@@ -6256,7 +6276,8 @@ mod tests {
     }
 
     /// A worker without Operator moves nothing. Another context's refusal
-    /// names the capability and says to go through its director or the console;
+    /// names the capability and the characters that answer for the worker's
+    /// context, its senpai's performer and its lineage root, or the console;
     /// its own context's refusal says to ask the console.
     #[tokio::test]
     async fn a_worker_without_operator_places_nothing() {
@@ -6266,7 +6287,9 @@ mod tests {
             let other = f.d.dispatch(&[s("context"), s(verb), s("elsewhere")], &coder).await;
             assert!(!other.is_ok(), "coder may not {verb} elsewhere: {}", other.message());
             assert!(other.message().contains("'operator'"), "the refusal names the capability: {}", other.message());
-            assert!(other.message().contains("director") && other.message().contains("console"), "{}", other.message());
+            assert!(other.message().contains("placement-banto, who performs this context's senpai, or placement-amy, this context's lineage root, \
+                or the console"), "the refusal names who answers for the lane: {}", other.message());
+            assert!(!other.message().contains("director"), "{}", other.message());
 
             let own = f.d.dispatch(&[s("context"), s(verb), s("lane")], &coder).await;
             assert!(!own.is_ok(), "coder may not {verb} its own lane: {}", own.message());

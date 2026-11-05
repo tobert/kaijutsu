@@ -984,7 +984,7 @@ impl KjDispatcher {
         // does: an ordinary character runs a directory.
         let person_dir = kaijutsu_types::paths::PERSON_RC_DIR;
         if no_root && rc_dir.is_none() {
-            match current.rc_dir.as_deref() {
+            match current.rc_dir.as_deref().filter(|dir| !dir.is_empty()) {
                 Some(dir) if dir == person_dir => {
                     return KjResult::Err(format!(
                         "kj character set: {name} runs rc directory '{person_dir}', which only a root runs; \
@@ -3191,6 +3191,53 @@ mod tests {
         let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
         assert!(message.contains("kj character set boss --root"), "{message}");
         assert!(d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap().is_archived(), "it stays archived");
+    }
+
+    /// A promote whose senpai is archived refuses, naming `kj context
+    /// promote <senpai>` and `kj context set <ctx> --senpai <ctx>`: after
+    /// `--no-root`, the console answers to the archived root console. After
+    /// `--root` makes a new root console, the person moves the console under
+    /// it and promotes it. Falsified by resurrecting the console under its
+    /// archived senpai.
+    #[tokio::test]
+    async fn promote_onto_an_archived_senpai_refuses_naming_the_remedies() {
+        let (d, [root_ctx, con, _hub]) = demotion_fixture().await;
+        let boss = sheet(&d, "boss").principal_id;
+        let demoted = d.dispatch(&no_root("boss"), &caller_as(boss)).await;
+        assert!(demoted.is_ok(), "{}", demoted.message());
+
+        let refused = d.dispatch(&[s("context"), s("promote"), con.to_hex()], &person_caller()).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains(&format!("kj context promote {}", root_ctx.to_hex())), "{message}");
+        assert!(message.contains(&format!("kj context set {} --senpai <ctx>", con.to_hex())), "{message}");
+        assert!(d.kernel_db().lock().get_context(con).unwrap().unwrap().is_archived(), "it stays archived");
+
+        let root = d.dispatch(&[s("character"), s("set"), s("boss"), s("--root")], &test_caller()).await;
+        assert!(root.is_ok(), "{}", root.message());
+        let new_root = sheet(&d, "boss").root_ctx.expect("--root makes a new root console");
+        let moved = d.dispatch(&[s("context"), s("set"), con.to_hex(), s("--senpai"), new_root.to_hex()], &caller_as(boss)).await;
+        assert!(moved.is_ok(), "{}", moved.message());
+        let promoted = d.dispatch(&[s("context"), s("promote"), con.to_hex()], &caller_as(boss)).await;
+        assert!(promoted.is_ok(), "{}", promoted.message());
+        assert!(!d.kernel_db().lock().get_context(con).unwrap().unwrap().is_archived(), "the console is back");
+    }
+
+    /// `--no-root` treats an empty rc directory as unset: the character
+    /// names its next directory in the same call. Falsified by checking only
+    /// for `person` and NULL.
+    #[tokio::test]
+    async fn no_root_treats_an_empty_rc_directory_as_unset() {
+        let (d, contexts) = demotion_fixture().await;
+        let boss = sheet(&d, "boss").principal_id;
+        d.kernel_db().lock().set_character_rc_dir(boss, Some("")).unwrap();
+        let refused = d.dispatch(&[s("character"), s("set"), s("boss"), s("--no-root")], &caller_as(boss)).await;
+        let KjResult::Err(message) = refused else { panic!("expected a refusal, got {refused:?}") };
+        assert!(message.contains("--no-root --rc <dir>"), "{message}");
+        let after = sheet(&d, "boss");
+        assert!(after.root, "a refusal keeps the flag");
+        for ctx in contexts {
+            assert!(!d.kernel_db().lock().get_context(ctx).unwrap().unwrap().is_archived(), "{} stays live", ctx.short());
+        }
     }
 
     /// Retiring the last live person refuses, naming the rule, as

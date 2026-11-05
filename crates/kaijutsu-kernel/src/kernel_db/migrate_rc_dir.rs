@@ -395,8 +395,9 @@ impl KernelDb {
                 let note = if withheld {
                     format!(
                         "{name}'s rc directory '{from}' was retired into 'person', which belongs to root characters and \
-                         {name} is not one, so {name} now has no rc directory and `kj context create` refuses for it; \
-                         `kj character set {name} --rc <dir>` names one"
+                         {name} is not one, so {name} now has no rc directory: no rc lifecycle of a context {name} \
+                         performs runs, so `kj context create` refuses for it and so does `kj context archive` of a \
+                         context it already performs; `kj character set {name} --rc <dir>` names one"
                     )
                 } else {
                     let effect = if *from == "default" { "narrower than" } else { "wider than" };

@@ -148,7 +148,10 @@ sheet, live or retired, is listed by `kj ledger rules` as applying to nobody and
 such sections changes between loads. It does not fail the load: a failed load refuses every gated statement,
 including the `kj character create` that would fix it. An rc tree that cannot be listed skips the `[rc.<dir>]` check
 with a warning naming the tree. The council's case carries the performer's name, and the council contexts a context
-consults are composed from its performer's layers.
+consults are composed from its performer's layers. The console is never under a council, whatever its performer's
+layers say: the gate consults none for it and builds no seat for it, while banto's other contexts are judged as
+their layers say ("Never under a council", Amy, 2026-11-05, because "the root is where Amy goes when the council
+is failing").
 
 Three acts always ask: archiving a console (a context a sheet's `console_ctx` names), with `kj context archive`
 or the `kj context demote` step that archives it; `kj character set <name> --no-root`; and `kj character retire
@@ -156,12 +159,19 @@ or the `kj context demote` step that archives it; `kj character set <name> --no-
 `kj context create` by its parent. An allow key, a learned rule or the council does not skip the ask, and a deny
 key still refuses. The gate raises no ask that the verb refuses for its caller whatever the answer: `--no-root` or
 a person's retirement by a caller who is not a live person, a console's archive by a caller who may not archive
-it, and the retirement of a console's performer by anyone but the console's live person. The ask is answered in
-the ledger like any other, and a person answers one raised in a context they perform. Allowing it runs the
-command as confirmed, because an approval is a stronger confirmation than `--confirm`. `kj context promote
-<console>` brings back an archived console. `kj character set <name> --root` makes the character a person again,
-with a new root console and MCP hub; the old root console stays archived, and `kj context promote` refuses it,
-naming that command. A retirement is not undone. The ask catches an accident without blocking a choice (Amy,
+it, and the retirement of a character that performs any live person's console but the caller's. `kj context
+archive --children` archives the children in order and stops at the first it may not archive, so it asks naming
+the consoles it archives before that child, and raises no ask when another person's console comes before any
+console the caller may archive. The ask is answered in the ledger like any other, and a person answers one raised
+in a context they perform. Allowing it runs each `kj` statement the ask showed as confirmed, because an approval is
+a stronger confirmation than `--confirm`; a `kj` the source reaches another way (a file it runs with `source`, a
+command substitution, an argument that expands) runs unconfirmed, and a permanent verb there latches. `kj context
+promote <console>` brings back an archived console. A promote whose senpai is archived refuses, naming `kj context
+promote <senpai>` and `kj context set <ctx> --senpai <ctx>`. `kj character set <name> --root` makes the character
+a person again, with a new root console and MCP hub; the old root console stays archived, and `kj context promote`
+refuses it, naming that command. The console `--no-root` archived answers to that old root console, so the person
+moves it under the new one with `kj context set <console> --senpai <root console>` and then promotes it. A
+retirement is not undone. The ask catches an accident without blocking a choice (Amy,
 2026-11-05). Archiving a root console still refuses, because `kj context rotate` replaces one, and retiring the
 last live person refuses, as `--no-root` does.
 
@@ -206,7 +216,9 @@ itself, and copies the database aside first when it would change a row: `kernel.
 2. **`rc-dir-rename-v1`.** `rc_dir` values move to the directories that absorbed them (`director` and `console` to
    `banto`, `root` and `shell` to `person` for a root character, `default` to `coder`). `person/` belongs to roots,
    so a character that is not a root and is on `root` or `shell` gets NULL instead, its report says so and names
-   `kj character set <name> --rc <dir>`, and a create for it refuses until a directory is set.
+   `kj character set <name> --rc <dir>`. Until a directory is set, no rc lifecycle of a context it performs
+   runs, so a create for it refuses and so does `kj context archive` of a context it already performs. Setting a
+   directory clears the character's `rc_dir_unset` and `rc_dir_renamed` reports.
 3. **`slot-roles-v1`.** In each `context_slots` row the role that is the context's type becomes `model`; `judge` and
    other type-keyed rows are dropped. `character_slots` keeps `distill` and `gate`, and a character with no model takes its own-type slot as
    its model. The migration drops and

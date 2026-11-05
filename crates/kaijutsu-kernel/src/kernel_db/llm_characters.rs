@@ -27,9 +27,9 @@ pub struct CharacterRow {
     /// ordinary character, and briefly for a root whose context the kernel
     /// has not created yet (`docs/character.md`, "Roots and rotation").
     pub root_ctx: Option<ContextId>,
-    /// A root character is a model context: a model can play it, and its
-    /// kj requests always need approval (`docs/character.md`, "Roots and
-    /// rotation").
+    /// A root character is a person: the contexts it performs run no model
+    /// turns, and the gate layers decide its `kj` requests as they decide
+    /// any performer's (`docs/character.md`, "Roots and rotation").
     pub root: bool,
     /// The directory under `/config/rc/` whose lifecycle scripts this
     /// character's contexts run. `None` when unset: a context create for the
@@ -350,12 +350,14 @@ impl KernelDb {
     }
 
     /// Set (or clear) a character's `rc_dir`. Naming a directory clears the
-    /// character's `rc_dir_unset` migration note.
+    /// character's `rc_dir_unset` and `rc_dir_renamed` migration notes, which
+    /// describe a directory the migration chose or withheld.
     pub fn set_character_rc_dir(&self, principal_id: PrincipalId, rc_dir: Option<&str>) -> KernelDbResult<()> {
         self.set_character_column("rc_dir", principal_id, rc_dir.map(str::to_string))?;
         if rc_dir.is_some_and(|dir| !dir.is_empty()) {
             self.conn.execute(
-                "DELETE FROM context_character_migration_report WHERE kind = 'rc_dir_unset' AND principal_id = ?1",
+                "DELETE FROM context_character_migration_report
+                 WHERE kind IN ('rc_dir_unset', 'rc_dir_renamed') AND principal_id = ?1",
                 params![blob_param(principal_id.as_bytes())],
             )?;
         }

@@ -640,7 +640,11 @@ async fn act_on_executable_answer(
             requester: principal_id, performer: ask.actor, reviewer: Some(ask.reviewer),
             context: context_id, session: session_id,
         },
-        if ask.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Approved },
+        if ask.read_only {
+            ShellPolicy::ReadOnly
+        } else {
+            ShellPolicy::Approved(crate::runtime::kj_builtin::ApprovedKj::planned_in(source))
+        },
         ShellCwd::Captured(ask.cwd.as_ref().map(std::path::PathBuf::from)),
         dispatcher.semantic_index(),
         dispatcher.block_source(),
@@ -1313,6 +1317,78 @@ mod lifetime_tests {
         assert_eq!(runs_read_only(Origin::ShellGate, None), Ok(false));
         assert!(runs_read_only(Origin::Hook, Some("write")).is_err(), "an unknown tool with a source is refused");
         kernel.shutdown_runtime_worker().await.ok();
+    }
+
+    /// Run `source` as an allowed shell-gate ask in amy's root console, as
+    /// amy, and return what the driver did. `/approved-kj` is mounted on
+    /// `dir`.
+    async fn run_allowed_as_amy(
+        dispatcher: &Arc<crate::kj::KjDispatcher>, dir: &std::path::Path, source: &str,
+    ) -> ExecAction {
+        use approval_ledger::{ask::create_ask, decide::{decide, DecideInput}, types::{NewAsk, Origin}};
+        let kernel = dispatcher.kernel();
+        kernel.mount("/approved-kj", crate::vfs::LocalBackend::new(dir)).await;
+        let context = crate::kj::test_helpers::register_root_context(dispatcher);
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let reviewer = PrincipalId::new();
+        let _ = kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None);
+        let db = kernel.kernel_db().clone();
+        let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
+            context_id: context.as_bytes().to_vec(), actor_id: amy.as_bytes().to_vec(),
+            reviewer_id: reviewer.as_bytes().to_vec(), principal_id: amy.as_bytes().to_vec(),
+            origin: Origin::ShellGate, instance: Some("builtin.shell_write".into()), tool: Some("shell_write".into()),
+            hook_id: None, description: "an act that always asks".into(), statements: vec![], authorized_label: None,
+            rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+            exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+        }).unwrap();
+        decide(db.lock().conn_for_ledger(), &request, DecideInput { allow: true, ..Default::default() }).unwrap();
+        let answer = db.lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+        let ask = ExecutableAsk {
+            source: source.into(), stdin: None, cwd: None, actor: amy, reviewer, read_only: false, denial: "not denied".into(),
+        };
+        let stop = tokio_util::sync::CancellationToken::new();
+        act_on_executable_answer(kernel, context, amy, &answer, &ask, "reviewer", &stop).await
+    }
+
+    /// An approval confirms the `kj` statements the reviewer saw, not every
+    /// `kj` the source reaches. A retirement in a file the approved source
+    /// runs with `source` latches and retires nothing. Falsified by
+    /// confirming every `kj` in the approved shell.
+    #[tokio::test]
+    async fn an_approval_does_not_confirm_a_kj_the_plan_did_not_contain() {
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
+        dispatcher.set_self_arc();
+        dispatcher.kernel().broker().set_kj_dispatcher(&dispatcher).await;
+        let victim = PrincipalId::new();
+        dispatcher.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: victim, name: "victim".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+            root: false, root_ctx: None, rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
+        }).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("retire.kai"), "kj character retire victim\n").unwrap();
+        run_allowed_as_amy(&dispatcher, dir.path(), "source /approved-kj/retire.kai").await;
+        let sheet = dispatcher.kernel_db().lock().get_character(victim).unwrap().unwrap();
+        assert!(sheet.retired_at.is_none(), "a kj the plan did not contain runs unconfirmed and latches");
+        dispatcher.kernel().shutdown_runtime_worker().await.ok();
+    }
+
+    /// Each `kj` statement the approved plan contains runs confirmed: two
+    /// planned archives, neither with `--confirm`, both archive. Falsified
+    /// by confirming only the first planned statement.
+    #[tokio::test]
+    async fn an_approval_confirms_every_planned_kj_statement() {
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
+        dispatcher.set_self_arc();
+        dispatcher.kernel().broker().set_kj_dispatcher(&dispatcher).await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let first = crate::kj::test_helpers::register_rooted_context(&dispatcher, Some("first-lane"), amy);
+        let second = crate::kj::test_helpers::register_rooted_context(&dispatcher, Some("second-lane"), amy);
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("kj context archive {}\nkj context archive {}", first.to_hex(), second.to_hex());
+        run_allowed_as_amy(&dispatcher, dir.path(), &source).await;
+        let archived = |ctx: ContextId| dispatcher.kernel_db().lock().get_context(ctx).unwrap().unwrap().is_archived();
+        assert!(archived(first) && archived(second), "both planned archives run confirmed");
+        dispatcher.kernel().shutdown_runtime_worker().await.ok();
     }
 
     #[tokio::test]

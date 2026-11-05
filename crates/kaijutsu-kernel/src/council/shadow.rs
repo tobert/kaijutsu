@@ -458,11 +458,19 @@ async fn run_create_lifecycle(kernel: &crate::Kernel, shadow: ContextId) {
     }
 }
 
-/// The judge character `config` names for a seat `performer` plays: the
-/// `judge` of the council its layers compose. `None` when they enable no
-/// council, name no judge, or the config did not load.
-fn judge_name(config: &GateConfigLoad, performer: Option<&crate::kj::gate_policy::GatePerformer>) -> Option<String> {
-    config.as_ref().ok()?.council_for(performer)?.judge
+/// The judge character `config` names for `seat`, which `performer` plays:
+/// the `judge` of the council the seat reads
+/// ([`crate::kj::gate_policy::council_for_context`]). `None` when it has no
+/// council or the council names no judge, or the config did not load.
+fn judge_name(
+    db: &crate::kernel_db::KernelDb,
+    config: &GateConfigLoad,
+    seat: ContextId,
+    performer: Option<&crate::kj::gate_policy::GatePerformer>,
+) -> KernelDbResult<Option<String>> {
+    let Ok(config) = config.as_ref() else { return Ok(None) };
+    let council = crate::kj::gate_policy::council_for_context(db, config, seat, performer).map_err(KernelDbError::Validation)?;
+    Ok(council.and_then(|council| council.judge))
 }
 
 /// The live character named `name`, or why there is none.
@@ -501,7 +509,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
         let performer = crate::kj::gate_policy::performer_of(&db, Some(seat)).map_err(KernelDbError::Validation)?;
-        let Some(name) = judge_name(config, performer.as_ref()) else { return Ok(None) };
+        let Some(name) = judge_name(&db, config, seat, performer.as_ref())? else { return Ok(None) };
         let sheet = judge_character(&db, &name)?;
         let mut judge = Judge {
             shadow: seat,

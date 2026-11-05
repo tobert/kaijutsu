@@ -1446,6 +1446,24 @@ impl Layers<'_> {
 /// caller with no context or a known context with no performer, which
 /// reads `[global]` alone. A context id with no row, a performer with no
 /// sheet, or a read that fails, is an error the caller refuses on.
+/// The council a context's gate decisions read: the one its performer's
+/// layers compose ([`GateConfig::council_for`]), except that the console, the
+/// context a sheet's `console_ctx` names, is never under a council,
+/// whatever its performer's layers say (`docs/council.md`, "Council v2
+/// seats"). The gate's consult, seat planning and the judge shadow all read
+/// it. `Err` is a fault reading the console pointers.
+pub(crate) fn council_for_context(
+    db: &KernelDb,
+    config: &GateConfig,
+    context: ContextId,
+    performer: Option<&GatePerformer>,
+) -> Result<Option<CouncilConfig>, String> {
+    let console = db.is_console(context).map_err(|e| {
+        format!("the gate could not read whether context {} is a console: {e} (fail-closed)", context.short())
+    })?;
+    Ok(if console { None } else { config.council_for(performer) })
+}
+
 pub(crate) fn performer_of(db: &KernelDb, context_id: Option<ContextId>) -> Result<Option<GatePerformer>, String> {
     let Some(id) = context_id else { return Ok(None) };
     let row = db
@@ -2199,7 +2217,11 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
 /// not a live person, for `--no-root` and a person's retirement; one
 /// [`KernelDb::console_archive_refusal`] refuses, for a console's archive or
 /// demote; and one who is not the console's live person, for the retirement
-/// of its performer (`retire_refusal` in `kj/character.rs`).
+/// of a character that performs any live person's console
+/// (`retire_refusal` in `kj/character.rs`). `kj context archive --children`
+/// archives the children in order and stops at the first it may not archive,
+/// so its ask names the consoles before the first console the caller may
+/// not archive, and there is none when no console comes before it.
 fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Option<Decision> {
     use kaish_types::plan::PlannedValue;
     if cmd.name != "kj" {
@@ -2268,22 +2290,29 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
                 return if not_a_person() { None } else { ask(format!("kj character retire {name}, a person, which always asks")) };
             }
             let Ok(live) = db.contexts_played_by(sheet.principal_id) else { return unread("contexts") };
+            let mut consoles = Vec::new();
             for ctx in live {
                 let owner = match db.console_owner(ctx.context_id) {
                     Ok(Some(owner)) => owner,
                     Ok(None) => continue,
                     Err(_) => return unread("console pointers"),
                 };
-                // Only the console's live person retires its performer.
-                if owner != caller.actor_id && matches!(db.is_live_person(owner), Ok(true)) {
-                    continue;
+                // Only the console's live person retires its performer, and
+                // the verb refuses before anything runs.
+                match db.is_live_person(owner) {
+                    Ok(true) if owner != caller.actor_id => return None,
+                    Ok(_) => consoles.push(db.context_name(ctx.context_id)),
+                    Err(_) => return unread("console owners"),
                 }
-                return ask(format!(
-                    "kj character retire {name}, who performs the console {}, which always asks",
-                    db.context_name(ctx.context_id)
-                ));
             }
-            return None;
+            return match consoles.as_slice() {
+                [] => None,
+                [one] => ask(format!("kj character retire {name}, who performs the console {one}, which always asks")),
+                many => ask(format!(
+                    "kj character retire {name}, who performs the consoles {}, which always asks",
+                    many.join(", ")
+                )),
+            };
         }
         "kj context demote" => {
             let Ok(Some(target)) = m.try_get_one::<String>("context") else { return unread("target") };
@@ -2334,22 +2363,30 @@ fn always_asks(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> Opti
         },
         Err(_) => return unread("--performer"),
     };
+    // The verb archives the children in this order and stops at the first
+    // it may not archive (`context_archive_children` in `kj/context.rs`).
     let Ok(children) = db.fork_children(target) else { return unread("children") };
+    let mut consoles = Vec::new();
     for child in children.into_iter().filter(|c| performer.is_none_or(|p| c.performer == Some(p))) {
         match db.is_console(child.context_id) {
-            Ok(true) if refused_console(child.context_id) => {}
-            Ok(true) => {
-                return ask(format!(
-                    "kj context archive --children of {}, whose child {} is a console, which always asks",
-                    db.context_name(target),
-                    db.context_name(child.context_id)
-                ));
-            }
+            Ok(true) if refused_console(child.context_id) => break,
+            Ok(true) => consoles.push(db.context_name(child.context_id)),
             Ok(false) => {}
             Err(_) => return unread("children's console pointers"),
         }
     }
-    None
+    match consoles.as_slice() {
+        [] => None,
+        [one] => ask(format!(
+            "kj context archive --children of {}, whose child {one} is a console, which always asks",
+            db.context_name(target)
+        )),
+        many => ask(format!(
+            "kj context archive --children of {}, whose children {} are consoles, which always asks",
+            db.context_name(target),
+            many.join(", ")
+        )),
+    }
 }
 
 /// Whether `cmd` creates a context under the caller's own MCP hub, which
@@ -2775,6 +2812,26 @@ mod tests {
             };
             let ours = PolicyEvaluation { per_statement: per_statement.clone() };
             assert_eq!(ours.verdict(), ledger.verdict(), "{per_statement:?}");
+        }
+    }
+
+    /// kaish plans a command name only as a literal word. A substitution, a
+    /// variable or a quoted word in command position does not parse, and the
+    /// shell gate refuses source that does not parse, so `always_asks` never
+    /// meets a command name it cannot read. If this goes red, kaish now plans
+    /// a non-literal command name: before taking that kaish, make
+    /// `always_asks` ask for one, since it may be `kj` reaching an act that
+    /// always asks.
+    #[test]
+    fn a_command_name_is_always_a_literal_word() {
+        for source in [
+            "$(echo kj) context archive con",
+            "$K context archive con",
+            "${K} context archive con",
+            "\"kj\" context archive con",
+        ] {
+            assert!(kaish_kernel::ast::plan::plan_program(source).is_err(), "{source} plans");
+            assert!(crate::kj::shell_gate::build_shell_gate_spec(source).is_err(), "{source} reaches the gate");
         }
     }
 

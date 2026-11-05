@@ -500,17 +500,19 @@ database as the verb resolves them. Broker PreCall with a dispatcher wired and `
   "Senpai, the gate's model, and the banto tier") or `kj context create` under the MCP hub of the caller's lineage root with that root's console as its
   senpai (`builtin allows kj context create under <hub>, the MCP hub of its lineage root`).
 - **Asks, over every layer but a deny** (`docs/character.md`, "Gate"). `kj context archive` whose target is a
-  console (a context a sheet's `console_ctx` names), or with `--children` whose selection holds one, `kj context
+  console (a context a sheet's `console_ctx` names), or with `--children` that reaches one before it stops, `kj context
   demote` whose next step archives a console, `kj character set <name> --no-root`, and `kj character retire
   <name>` when `<name>` is a person or performs a live console always ask (`builtin asks …, which always asks`).
   An allow key, the uncovered tier, an exact or family rule and the council do not skip the ask; a deny from any
   layer refuses. Each of these verbs with an argument that is not a literal word, or with `--`, asks too, since the
   gate cannot read its target. A caller the verb refuses whatever the answer raises no ask, and the layers decide:
   `--no-root` or a person's retirement by a caller who is not a live person, a console's archive or demote by a
-  caller `console_archive_refusal` refuses, and a console performer's retirement by someone other than its live
-  person. A read that fails still asks. A person's uncovered statements run without an ask on the RPC shell
+  caller `console_archive_refusal` refuses, the retirement of a character that performs any live person's console
+  but the caller's, and `--children` whose first console is one the caller may not archive (the verb archives the
+  children in order and stops at the first it may not archive). A read that fails still asks. A person's uncovered statements run without an ask on the RPC shell
   paths, but these do not: the ask enters the ledger through the ask-tier path, the person answers it in a
-  context they perform, and an allow runs the command in the approval worker, whose `kj` runs as confirmed.
+  context they perform, and an allow runs the command in the approval worker, where each `kj` statement the ask
+  showed runs as confirmed and any other `kj` the source reaches runs unconfirmed.
 
 ## What gets deleted
 

@@ -1856,7 +1856,7 @@ pub(crate) async fn consult(
     let (performer, council, cwd) = {
         let db = kernel.kernel_db().lock();
         let performer = crate::kj::gate_policy::performer_of(&db, Some(context_id))?;
-        let Some(council) = config.council_for(performer.as_ref()) else {
+        let Some(council) = crate::kj::gate_policy::council_for_context(&db, config, context_id, performer.as_ref())? else {
             return Ok(None);
         };
         let layers = Layers { config, performer: performer.as_ref() };

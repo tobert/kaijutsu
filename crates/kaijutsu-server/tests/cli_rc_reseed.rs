@@ -199,3 +199,29 @@ fn reseed_force_moves_a_retired_directory_aside_and_says_where() {
     assert_eq!(moved.len(), 1);
     assert_eq!(std::fs::read_to_string(moved[0].join("create/S60-mine.kai")).unwrap(), "mine\n");
 }
+
+/// A retired directory that is a symlink is named with its target. A plain
+/// reseed says what `--force` will do and moves nothing; `--force` says
+/// what it did, moves the link, and leaves the target where it is.
+/// Falsified by printing the same line for both runs.
+#[test]
+fn reseed_says_what_force_does_to_a_retired_symlink() {
+    let xdg = Xdg::new();
+    let dir = xdg.path().join("rc");
+    let dir_arg = dir.to_str().unwrap();
+    let target = xdg.path().join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("shell")).unwrap();
+
+    let out = xdg.run(&["rc", "reseed", "--dir", dir_arg]);
+    assert!(out.status.success(), "reseed failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("--force moves the link aside and leaves its target where it is"), "{}", stdout(&out));
+    assert!(std::fs::symlink_metadata(dir.join("shell")).unwrap().file_type().is_symlink(), "a plain reseed moves nothing");
+
+    let out = xdg.run(&["rc", "reseed", "--force", "--dir", dir_arg]);
+    assert!(out.status.success(), "reseed --force failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("--force moved the link and left its target where it is"), "{}", stdout(&out));
+    assert!(std::fs::symlink_metadata(dir.join("shell")).is_err(), "--force moved the link");
+    assert!(target.is_dir(), "the target stays where it is");
+}
