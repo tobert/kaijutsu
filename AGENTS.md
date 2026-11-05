@@ -71,63 +71,22 @@ publicly or to repositories we do not own.
 ## Characters and prompts
 
 A **character** is the persistent someone a name resolves to, human or model.
-Its identity is a `PrincipalId`; its sheet lives in `kernel.db` and holds
-static settings: name, root flag, creation/retirement timestamps, its cast,
-and its handoff log. `auth.db` binds credentials to principals; it does not
-own character names. `kj character` manages sheets, and `kj handoff
-note|tail` accesses their logs. Retirement archives the contexts the
-character plays.
+A context is played by one character, its **performer**, which never changes,
+and answers to one **senpai** context, except a root console. A context has no
+type: its performer's rc directory and gate layers shape it.
 
-A context carries its **performer**, the character that plays it, and its
-**senpai**: `kj context create <character> [--name] [--type] [--senpai]` makes
-the context, and its performer never changes. The character holds **slots**,
-one per role (a context type, or `distill`, `gate`, `judge`), set with `kj
-character slot set`. A context copies its character's slots when it is made;
-every model call reads the context's own slot for its type and nothing else,
-so editing a character's slots moves no running context until `kj context
-rotate`. A fork continues its source's performance; rotation starts a new
-conversation with slots read fresh. Every context answers to one **senpai**
-context, except a root console: asks, reports and escalations go to the
-senpai's performer, and the senpai's performer or the lineage root moves,
-rotates and archives it (a context's own performer may also archive it).
-`kj context info` shows the senpai. The person's root console and **the
-console**, the model console (type `console`), are two different contexts.
+We keep requester, performer, and connection distinct. `created_by` names who
+asked for a context, the performer plays it, a connection keeps its own
+identity, and `forked_from` is provenance only.
 
-We keep requester, performer, and context type distinct. `created_by`
-names the requester who created a context; the performer is the character
-that plays it. A `context_type` selects the context's rc bundle, gate tier and
-slot. Model turns require a live performer and a distinct reviewer.
-Provider output and tools carry the performer; the connection keeps its own
-identity. `forked_from` is provenance only. See `docs/senpai-kohai.md` and
-`docs/approval-identity.md`.
-Composition with character rc remains planned. An rc directory is a planned
-sheet field. Persona text moves onto the character in the
-senpai/kohai stack (step 6); see `docs/character.md`, "Current implementation"
-and "Rollout, smallest first".
+We read the doc that owns an area before changing it:
 
-Banto is a character that plays the `director` type, which is reworked in that
-stack. Its context is created with `kj context create banto`; director instructions and handoff
-injection read the performer metadata. The old `KJ_CHARACTER` environment
-bridge did not set identity and is no longer read by the shipped scripts.
-`kj context rotate` replaces a conversation and sets `ROTATED_FROM`, which loads
-predecessor prose. See `docs/prompts.md`, "Rotating a context".
-
-Each context type owns its whole stance through rc, with no shared base and no
-mandatory behavioral prepend. Rc creates durable `(System, Text)` instruction
-blocks; the kernel adds runtime facts.
-
-We read `docs/prompts.md` before changing prompt composition or rc
-instructions. It owns the implemented contract and the register;
-`docs/oss-comparisons.md` owns the research. Stances speak in our voice: they
-open on the cybernetic system the context belongs to, name the human who is
-accountable, and say what we do in the inclusive we. They stay plain and
-literal for readers who are not English-first, they are ASCII except Japanese terms glossed
-with romaji and a closing 頑張って, and they may give a context a character
-written as behavior.
-Collaboration guidance and task procedure live in the type, syntax in
-help/schema, and changing observations in notifications. Character-specific rc
-is a design direction, not an available loader feature. Per-model
-specializations wait for comparative evidence.
+| Area | Read |
+|---|---|
+| Character sheets, persons, rc directories, shipped characters | `docs/character.md` |
+| Senpai, kohai, and who asks, reports, moves, and archives | `docs/senpai-kohai.md` |
+| Turn identity and review | `docs/approval-identity.md` |
+| Prompt composition, rc instructions, rotation, and the stance register | `docs/prompts.md` |
 
 ## State and interfaces
 
