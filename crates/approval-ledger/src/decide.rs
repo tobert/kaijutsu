@@ -109,14 +109,21 @@ pub fn ensure_not_self_approval(
 /// as a `late_decision` row before returning
 /// [`LedgerError::AlreadyDecided`] — the history is recorded, never
 /// silently dropped and never silently applied (guarantee 6).
+///
+/// Participates in an existing transaction, so an ask can be created and
+/// decided in one commit and is never visible `pending` in between. Its
+/// caller must roll back on error, and a refusal or late answer made inside
+/// it commits its audit row only if that caller commits.
 pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result<ApprovalRow> {
+    let tx = if conn.is_autocommit() {
+        Some(Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?)
+    } else { None };
     let decided_by = input.decided_by.map(|a| a.principal);
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Re-check identity after acquiring the write lock. The pre-claim guard
     // above remains necessary to avoid a stranded claim, but a reviewer can
     // be escalated between that guard and this terminal mutation.
     if let Some(answerer) = input.decided_by {
-        let row = tx
+        let row = conn
             .query_row(
                 &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
                 params![request_id],
@@ -137,19 +144,19 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             _ => ("unresolved_identity", LedgerError::UnresolvedIdentity { request_id: request_id.to_string() }),
         };
         if !reason.is_empty() {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO approval_refusals (request_id, seq, reason, actor, actor_context)
                  VALUES (?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM approval_refusals WHERE request_id = ?1), ?2, ?3, ?4)",
                 params![request_id, reason, answerer.principal, answerer.context],
             )?;
-            tx.commit()?;
+            if let Some(tx) = tx { tx.commit()?; }
             return Err(error);
         }
     }
     let now = now_millis();
     let new_status = if input.allow { "allowed" } else { "denied" };
 
-    let decided = tx
+    let decided = conn
         .query_row(
             &format!(
                 "UPDATE approvals SET status = ?1, decided_at = ?2, decided_by = ?3,
@@ -172,7 +179,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
 
     if let Some(row) = decided {
         events::append(
-            &tx,
+            conn,
             request_id,
             EventKind::Decided,
             decided_by,
@@ -190,7 +197,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             && actor == reviewer
         {
             events::append(
-                &tx,
+                conn,
                 request_id,
                 EventKind::SelfConfirmation,
                 decided_by,
@@ -200,7 +207,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
                 None,
             )?;
         }
-        tx.commit()?;
+        if let Some(tx) = tx { tx.commit()?; }
         return Ok(row);
     }
 
@@ -208,7 +215,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
     // left pending/claimed. Read the current row inside the SAME
     // transaction (still holding the IMMEDIATE write lock) so this can't
     // race a concurrent decide of its own.
-    let existing = tx
+    let existing = conn
         .query_row(
             &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
             params![request_id],
@@ -220,7 +227,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
         None => Err(LedgerError::NotFound(request_id.to_string())),
         Some(row) => {
             events::append(
-                &tx,
+                conn,
                 request_id,
                 EventKind::LateDecision,
                 decided_by,
@@ -229,7 +236,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
                 input.auto_reason,
                 Some(&format!("rejected: already {}", row.status)),
             )?;
-            tx.commit()?;
+            if let Some(tx) = tx { tx.commit()?; }
             Err(LedgerError::AlreadyDecided {
                 request_id: request_id.to_string(),
                 status: row.status.to_string(),

@@ -469,16 +469,6 @@ Clarity:
   failed once in a full-suite lib run on 2026-10-30 (`8467dc40` plus the
   embedding change) at `llm_stream.rs:9690`, and passed three times alone.
   Load-dependent; cause not found.
-- `kaijutsu-server` `gate_scenarios_wire`:
-  `an_approved_shell_write_runs_with_the_cwd_and_env_it_showed` failed once
-  in a full-suite run on 2026-10-28 (`e1cbc8de`) with an extra ask for
-  `cd sub` (`shell_write: 1 statement(s) — cd sub`), and passed three times
-  alone. Load-dependent; cause not found.
-  On 2026-11-05 (`ffb36a26` plus M5e) it failed again in a full-suite run, and
-  `a_contained_model_commits_with_real_git` in the same binary failed once in
-  four runs of the binary alone with the same shape: "the turn held on an
-  unexpected ask" for an allowed `git commit`. Two tests, one symptom (an
-  extra ask under load) points at one cause in the gate or its loadout read.
 - `kaijutsu-kernel` `council::gate_e2e::a_council_miss_asks_and_records_its_cause`
   failed once in a full-suite lib run on 2026-10-29 (`f3d46123` plus the
   cost-note change) at its `started.elapsed() < 3s` deadline check, and

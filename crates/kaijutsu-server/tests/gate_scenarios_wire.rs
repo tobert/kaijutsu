@@ -216,7 +216,8 @@ impl Seat {
         sent.lock().clone()
     }
 
-    /// The asks this context's turns raised, in any status, oldest first.
+    /// The asks this context's turns raised that wait for the reviewer,
+    /// oldest first.
     fn asks(&self) -> Vec<approval_ledger::types::ApprovalRow> {
         let db = self.server.kernel_db.lock();
         let mut rows: Vec<_> = db.list_pending_asks().unwrap().into_iter()
@@ -225,9 +226,14 @@ impl Seat {
         rows
     }
 
+    /// The ids of the pending asks, read in the poll that first found `count`.
     async fn wait_for_asks(&self, count: usize) -> Vec<String> {
-        wait_for(&format!("{count} pending ask(s)"), || self.asks().len() >= count).await;
-        self.asks().into_iter().map(|row| row.request_id).collect()
+        let mut asks = Vec::new();
+        wait_for(&format!("{count} pending ask(s)"), || {
+            asks = self.asks();
+            asks.len() >= count
+        }).await;
+        asks.into_iter().map(|row| row.request_id).collect()
     }
 
     /// Answer with `verb` and any flags, e.g. `deny --remember always`, from
@@ -241,6 +247,8 @@ impl Seat {
             self.server.kernel_db.lock().get_approval(request_id).unwrap(),
             Some(row) if matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied)
         )).await;
+        let row = self.approval(request_id);
+        assert!(row.decided_by.is_some(), "the reviewer's answer decided {request_id}, not a rule: {:?}", row.auto_reason);
     }
 
     fn approval(&self, request_id: &str) -> approval_ledger::types::ApprovalRow {

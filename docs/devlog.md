@@ -3667,3 +3667,11 @@ each test character the directory its role runs. For the three acts that
 always ask, Amy chose "Verb raises a ledger ask" over a flag, and "last-person
 refusal is fine". The migrations and the current rules are in
 `docs/character.md`; the zorak deploy is open in `docs/issues.md`.
+
+The gate_scenarios flake that had been logged since October 28 as "load-dependent, cause not found" was a product
+race. The gate created a policy-decided ask in one transaction and decided it in a second, so for a moment the row
+read as pending: a poller counted it as an ask, and a reviewer answering in that window could overrule a config
+deny. A policy decision now commits with its row, pinned by a seam test that is red on the old code. The lesson:
+a flake that shows two opposite shapes (an extra ask, a missing ask) is a window someone else can see, not a slow
+box. Under six parallel copies on 32 cores it went from 9 of 96 runs failing to none; pinning to two cores never
+reproduced it, because the window needs two threads truly in parallel.

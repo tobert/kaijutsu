@@ -1090,7 +1090,17 @@ async fn run_gate_once(
         ask.description = format!("{}\n\n{}", ask.description, council.note());
     }
 
-    // 3. Durable before asked — the row commits before anyone is told.
+    // 3. Durable before asked — the row commits before anyone is told. A
+    //    policy decision commits with its row (`decided_by` None and
+    //    `auto_reason` mark it), so no reader ever sees that row pending
+    //    and no reviewer can answer it in place of the policy.
+    let decided = match verdict {
+        AskVerdict::Allow => Some(true),
+        AskVerdict::Deny => Some(false),
+        AskVerdict::Escalate => None,
+    };
+    let auto_reason = decided.map(|allow| policy.describe(&spec.statements, allow));
+    let mut decided_row = None;
     let request_id = {
         let db = db.lock();
         let context = match caller.context_id {
@@ -1127,13 +1137,25 @@ async fn run_gate_once(
             if let Some(council) = council {
                 decision_id = Some(council.insert_within(conn, Some(request))?);
             }
-            record(conn, request)
+            record(conn, request)?;
+            if let (Some(allow), Some(auto_reason)) = (decided, auto_reason.as_deref()) {
+                decided_row = Some(approval_ledger::decide::decide(conn, request, approval_ledger::decide::DecideInput {
+                    allow,
+                    decided_by: None,
+                    decided_option: None,
+                    remember_scope: None,
+                    auto_reason: Some(auto_reason),
+                })?);
+            }
+            Ok(())
         };
         match db.create_approval_ask_recorded(&ask, spec.publishes_pair, recorded) {
             Ok(id) => {
                 if let Some(decision) = decision_id {
                     council_recorded.set(decision).expect("the gate records one council decision per call");
                 }
+                #[cfg(test)]
+                tests::ASK_COMMITTED.with(|seam| if let Some(seam) = seam.borrow_mut().as_mut() { seam(&db, &id) });
                 id
             }
             Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),
@@ -1142,62 +1164,23 @@ async fn run_gate_once(
     approval_span.record("ask.id", request_id.as_str());
     tracing::info!(policy.verdict = ?verdict, "approval ask recorded");
 
-    // An auto decision still gets its durable row, decided immediately with
-    // no reviewer in the loop (`decided_by` None + `auto_reason` mark it).
-    if matches!(verdict, AskVerdict::Allow | AskVerdict::Deny) {
-        let allow = matches!(verdict, AskVerdict::Allow);
-        let auto_reason = policy.describe(&spec.statements, allow);
-        let auto_reason = auto_reason.as_str();
-        let row = {
-            let db = db.lock();
-            approval_ledger::decide::decide(
-                db.conn_for_ledger(),
-                &request_id,
-                approval_ledger::decide::DecideInput {
-                    allow,
-                    decided_by: None,
-                    decided_option: None,
-                    remember_scope: None,
-                    auto_reason: Some(auto_reason),
-                },
-            )
-        };
-        // Both the ask row and its auto-decision have committed by now.
-        announce_ledger_change(db, ledger_flows);
-        return match row {
-            // A rule decision runs against current context state, without
-            // redeeming a reviewer's captured directory.
-            Ok(row) => GateOutcome {
-                verdict: if row.status.is_allowed() {
-                    GateVerdict::Allowed
-                } else {
-                    GateVerdict::Denied
-                },
-                ask: Some(ask_ref(request_id, row.status)),
-                cwd: ShellCwd::Context,
-                reason: auto_reason.to_string(),
-                judged: Vec::new(),
-            },
-            // The ask committed and its decision did not, so the row exists
-            // and is still pending — a fault, and one that leaves something
-            // `kj ledger` can still be pointed at.
-            Err(e) => GateOutcome {
-                verdict: GateVerdict::Unavailable,
-                ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
-                cwd: ShellCwd::Context,
-                reason: format!(
-                    "approval gate could not record the rule decision: {e} (fail-closed — \
-                     this is a ledger fault, not a decision)"
-                ),
-                judged: Vec::new(),
-            },
+    // Both the ask row and any policy decision have committed by now.
+    announce_ledger_change(db, ledger_flows);
+    if let (Some(row), Some(auto_reason)) = (decided_row, auto_reason) {
+        // A rule decision runs against current context state, without
+        // redeeming a reviewer's captured directory.
+        return GateOutcome {
+            verdict: if row.status.is_allowed() { GateVerdict::Allowed } else { GateVerdict::Denied },
+            ask: Some(ask_ref(request_id, row.status)),
+            cwd: ShellCwd::Context,
+            reason: auto_reason,
+            judged: Vec::new(),
         };
     }
 
-    // 4. Escalate: record the question and return. Announce first, so a
-    //    client learns an answer is wanted the moment the row commits — an
-    //    ask nothing points at is answerable and undiscoverable at once.
-    announce_ledger_change(db, ledger_flows);
+    // 4. Escalate: return the question, announced above so a client learns
+    //    an answer is wanted the moment the row commits — an ask nothing
+    //    points at is answerable and undiscoverable at once.
     GateOutcome {
         verdict: GateVerdict::Pending,
         ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
@@ -1282,6 +1265,15 @@ mod tests {
         test_dispatcher_with_timeouts,
     };
     use kaijutsu_types::TimeoutPolicy;
+
+    type AskCommittedSeam = Box<dyn FnMut(&KernelDb, &str)>;
+
+    thread_local! {
+        /// Runs with the database guard held as soon as a gate's ask row
+        /// commits, the first moment another reader can see the row.
+        pub(super) static ASK_COMMITTED: std::cell::RefCell<Option<AskCommittedSeam>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     fn cc_spec(target: &str) -> GateSpec {
         GateSpec {
@@ -2918,6 +2910,54 @@ mod tests {
         assert!(outcome.reason.contains("global config denies dd"), "{}", outcome.reason);
         let ask = outcome.ask.as_ref().expect("an auto-deny leaves a durable row");
         assert_eq!(ask.status, AskStatus::Denied);
+    }
+
+    /// A policy decision commits with its ask row. No reader ever sees the
+    /// row pending, so a reviewer who answers at the first moment the row is
+    /// visible cannot overrule the policy: its answer is a late one, and the
+    /// gate returns the policy's verdict.
+    ///
+    /// Falsified by deciding in a second transaction after the ask commits
+    /// (the row is seen pending, the reviewer's answer wins, and the gate
+    /// reports a ledger fault).
+    #[tokio::test]
+    async fn a_policy_decision_commits_with_its_ask_row() {
+        for (config, verdict, status) in [
+            ("[global]\nallow = [\"mkdir\"]\n", GateVerdict::Allowed, ApprovalStatus::Allowed),
+            ("[global]\ndeny = [\"mkdir\"]\n", GateVerdict::Denied, ApprovalStatus::Denied),
+        ] {
+            let d = gate_dispatcher().await;
+            let caller = registered_caller(&d);
+            let spec = crate::kj::shell_gate::build_shell_gate_spec("mkdir made").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let record = seen.clone();
+            ASK_COMMITTED.with(|seam| *seam.borrow_mut() = Some(Box::new(move |db: &KernelDb, request_id: &str| {
+                let conn = db.conn_for_ledger();
+                let row = approval_ledger::ask::get_approval(conn, request_id).unwrap().expect("the ask row");
+                let pending = approval_ledger::ask::list_pending(conn).unwrap().len();
+                let reviewer = row.reviewer_id.clone().expect("new asks snapshot a reviewer");
+                let answer = approval_ledger::decide::decide(conn, request_id, approval_ledger::decide::DecideInput {
+                    allow: status != ApprovalStatus::Allowed,
+                    decided_by: Some(approval_ledger::decide::Answerer { principal: &reviewer, context: None }),
+                    decided_option: Some("allow_once"),
+                    remember_scope: None,
+                    auto_reason: None,
+                });
+                record.borrow_mut().push((row.status, pending, answer.map(|row| row.status).map_err(|e| e.to_string())));
+            })));
+            let outcome = run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &gate_config(config)).await;
+            ASK_COMMITTED.with(|seam| *seam.borrow_mut() = None);
+
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "one ask row commits: {seen:?}");
+            let (seen_status, pending, answer) = &seen[0];
+            assert_eq!((*seen_status, *pending), (status, 0), "the row is already decided when it becomes visible");
+            assert!(answer.as_ref().is_err_and(|e| e.contains("already reached terminal status")),
+                "the reviewer's answer is a late one: {answer:?}");
+            assert_eq!(outcome.verdict, verdict, "{}", outcome.reason);
+            let ask = outcome.ask.as_ref().expect("a policy decision leaves a durable row");
+            assert_eq!(d.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status, status);
+        }
     }
 
     /// An ask-tier key is firm: the builtin layer would allow `kj block
