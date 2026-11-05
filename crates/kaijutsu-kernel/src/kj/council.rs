@@ -8,7 +8,7 @@
 //! chain, its house rules, its judge's server) and builds them in the
 //! background with the prepare a decision runs, so the first decision finds
 //! them held (`docs/council.md`, "Council v2 seats"). The create and fork rc
-//! lifecycles of the gated context types call it.
+//! lifecycles of the gated rc directories call it.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
@@ -34,7 +34,7 @@ enum CouncilCommand {
     /// chain and house rules, and its judge's, on a council v2 server.
     /// Prints the plan and returns at once; the kernel log reports each
     /// build. Prints that there is nothing to build when the context's
-    /// type has no council.
+    /// performer has no council.
     Build,
 }
 
@@ -72,7 +72,7 @@ impl KjDispatcher {
         };
         if builds.is_empty() {
             return KjResult::ok_with_data(
-                "no council reads for this context's type; no seats to build".to_string(),
+                "no council reads for this context's performer; no seats to build".to_string(),
                 serde_json::json!([]),
             );
         }

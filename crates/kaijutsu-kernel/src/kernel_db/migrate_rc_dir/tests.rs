@@ -11,14 +11,15 @@ struct Rig {
     root_console: ContextRow,
 }
 
+/// A character with the legacy `characters.context_type` the backfill reads.
 fn character(db: &KernelDb, name: &str, root: bool, context_type: Option<&str>) -> PrincipalId {
     let principal_id = PrincipalId::new();
     db.insert_character(&CharacterRow {
         rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
-        context_type: context_type.map(str::to_string),
         principal_id, name: name.to_string(), created_at: 0,
         retired_at: None, handoff_ctx: None, root_ctx: None, root,
     }).unwrap();
+    set_legacy_character_type(db, principal_id, context_type);
     principal_id
 }
 
@@ -29,9 +30,9 @@ fn rig() -> Rig {
 fn rig_on(db: KernelDb) -> Rig {
     let ws = setup_test_db(&db);
     let amy = character(&db, "amy", true, None);
-    let mut root_console = make_context_row(Some("amy"));
-    root_console.context_type = "root".into();
+    let root_console = make_context_row(Some("amy"));
     insert_context_with_doc(&db, &root_console, ws);
+    set_legacy_context_type(&db, root_console.context_id, "root");
     db.update_performer(root_console.context_id, Some(amy)).unwrap();
     db.set_character_root_ctx(amy, Some(root_console.context_id)).unwrap();
     Rig { db, ws, amy, root_console }
@@ -41,9 +42,9 @@ impl Rig {
     /// A live context of `context_type` performed by `performer`, answering
     /// to the root console.
     fn context(&self, label: &str, context_type: &str, performer: Option<PrincipalId>) -> ContextRow {
-        let mut row = make_context_row(Some(label));
-        row.context_type = context_type.into();
+        let row = make_context_row(Some(label));
         insert_context_with_doc(&self.db, &row, self.ws);
+        set_legacy_context_type(&self.db, row.context_id, context_type);
         if let Some(performer) = performer {
             self.db.update_performer(row.context_id, Some(performer)).unwrap();
         }
@@ -362,14 +363,14 @@ fn a_root_with_no_console_to_point_at_needs_no_copy() {
     assert!(!backed_up(&path));
 }
 
-/// A database whose `contexts` and `characters` tables no longer have
+/// A database whose `contexts` and `characters` tables have no
 /// `context_type` opens, and the migrations that read it record themselves
 /// without work.
 #[test]
 fn migrations_that_read_context_type_record_themselves_when_the_column_is_gone() {
     let db = KernelDb::temporary().unwrap();
-    db.conn.execute("ALTER TABLE contexts DROP COLUMN context_type", []).unwrap();
-    db.conn.execute("ALTER TABLE characters DROP COLUMN context_type", []).unwrap();
+    assert!(!KernelDb::has_column(&db.conn, "contexts", "context_type").unwrap());
+    assert!(!KernelDb::has_column(&db.conn, "characters", "context_type").unwrap());
     let guarded = [KernelDb::HOUSE_MIGRATION, KernelDb::CONSOLE_LABEL_MIGRATION, KernelDb::RC_DIR_BACKFILL_MIGRATION];
     for name in guarded {
         db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [name]).unwrap();

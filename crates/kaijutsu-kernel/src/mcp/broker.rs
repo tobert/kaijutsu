@@ -365,7 +365,7 @@ struct AskTier {
     /// The ask's description: each asking statement's layer and key.
     description: String,
     /// The council reads the submission before the ask: `gate.toml`
-    /// enables it for the caller's context type and the actor is not a live
+    /// enables it for the caller's performer and the actor is not a live
     /// root character.
     council: bool,
 }
@@ -10853,7 +10853,7 @@ mod tests {
         let db = db.lock();
         match db.get_character(ctx.actor_id).unwrap() {
             Some(_) => db.update_character_root(ctx.actor_id, true).unwrap(),
-            None => db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            None => db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: ctx.actor_id, name: format!("root-{}", ctx.actor_id), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
             }).unwrap(),
@@ -11333,7 +11333,6 @@ mod tests {
                 label: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: "default".to_string(),
                 created_at: now_millis() as i64,
                 created_by: creator,
                 forked_from: None,
@@ -11412,7 +11411,6 @@ mod tests {
                 label: None,
                 system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: "default".to_string(),
                 created_at: now_millis() as i64,
                 created_by: creator,
                 forked_from: None,
@@ -11649,7 +11647,7 @@ mod tests {
         let context_id = crate::kj::test_helpers::register_context(kj, Some(label), None, actor);
         let db = kj.kernel_db();
         let db = db.lock();
-        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         db.assign_test_review(context_id, Some(actor), Some(reviewer)).unwrap();

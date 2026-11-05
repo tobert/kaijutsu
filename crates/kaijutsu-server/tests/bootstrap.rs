@@ -49,7 +49,6 @@ fn a_bootstrapped_kernel_answers_in_root() {
         let root_ctx = {
             let db = kernel_db(&config);
             let row = db.find_context_by_label("console").unwrap().expect("bootstrap creates the console");
-            assert_eq!(row.context_type, "banto", "the console is stamped with its performer's rc directory");
             let performer = db.get_character_by_name("banto").unwrap().expect("the console performer exists");
             assert_eq!(row.performer, Some(performer.principal_id), "the console is played by its model character");
             let model = db.get_character_model(performer.principal_id).unwrap().expect("the performer holds a model");
@@ -380,7 +379,6 @@ fn the_rc_note_warns_that_the_change_moves_every_context_the_character_plays() {
             let mut row = console.clone();
             row.context_id = kaijutsu_types::ContextId::new();
             row.label = Some("side-coder".to_string());
-            row.context_type = "coder".to_string();
             row.performer = None;
             row.senpai_ctx = console.senpai_ctx;
             let ws = db.get_or_create_default_workspace(row.created_by).unwrap();
@@ -389,25 +387,22 @@ fn the_rc_note_warns_that_the_change_moves_every_context_the_character_plays() {
         }
         let with_coder = bootstrap(&config, &opts).await.expect("bootstrap with a coder context");
         let note = with_coder.notes.iter().find(|n| n.contains("runs rc directory coder")).expect("rc note");
-        assert!(note.contains("side-coder"), "the note names the context of another type: {note}");
+        assert!(note.contains("side-coder"), "the note names the other context banto plays: {note}");
         assert!(!note.contains("kj character set banto --rc banto"), "and does not recommend the change: {note}");
     });
 }
 
-/// Bootstrap finds the console by the root's pointer and its performer, not
-/// by its type: a pointed console of another type is the console, and a
-/// second run changes nothing. Falsified by reading the type.
+/// Bootstrap finds the console by the root's pointer and its performer, and
+/// a second run changes nothing. Falsified by looking it up another way.
 #[test]
-fn bootstrap_finds_the_console_by_the_pointer_not_the_type() {
+fn bootstrap_finds_the_console_by_the_pointer() {
     run_local(async {
         let config = SshServerConfig::ephemeral_with_root(0, "amy");
         let opts = options(&config, Some(BackendChoice::mock("mock-model")));
         bootstrap(&config, &opts).await.expect("bootstrap");
         let console = {
             let db = kernel_db(&config);
-            let console = db.get_character_by_name("amy").unwrap().unwrap().console_ctx.expect("the root points at its console");
-            db.update_context_type(console, "coder").unwrap();
-            console
+            db.get_character_by_name("amy").unwrap().unwrap().console_ctx.expect("the root points at its console")
         };
         let again = bootstrap(&config, &opts).await.expect("bootstrap again");
         assert!(again.ran.is_empty(), "{again:?}");
@@ -511,7 +506,7 @@ fn an_existing_kernel_gets_only_the_missing_characters() {
             for (name, dir) in [("coder", "toolie"), ("toolie", "toolie")] {
                 db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
                     principal_id: kaijutsu_types::PrincipalId::new(), name: name.into(), created_at: 0, retired_at: None,
-                    handoff_ctx: None, root: false, root_ctx: None, context_type: None, rc_dir: Some(dir.into()),
+                    handoff_ctx: None, root: false, root_ctx: None, rc_dir: Some(dir.into()),
                     console_ctx: None, mcp_hub_ctx: None,
                 }).unwrap();
             }

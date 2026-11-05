@@ -15,11 +15,6 @@ use kaijutsu_types::{ContentType, ContextId, ContextState, PrincipalId, SessionI
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::kernel_db::{CharacterRow, ContextRow};
 
-/// The `context_type` a root console row is stored with; no rc reads it.
-pub use kaijutsu_types::ROOT_CONTEXT_TYPE;
-
-use kaijutsu_types::MCP_HUB_CONTEXT_TYPE;
-
 /// The label of a root's MCP hub is this prefix and the root's name.
 pub const MCP_HUB_LABEL_PREFIX: &str = "mcp/";
 
@@ -228,7 +223,7 @@ impl KjDispatcher {
                  with --root, or name another directory"
             ));
         }
-        let known = super::rc::known_context_types(self.kernel().vfs()).await?;
+        let known = super::rc::known_rc_dirs(self.kernel().vfs()).await?;
         if known.is_empty() {
             return Ok(());
         }
@@ -335,7 +330,6 @@ impl KjDispatcher {
                 retired_at: None,
                 handoff_ctx: None, root_ctx: None,
                 root,
-                context_type: None,
                 rc_dir: Some(rc_dir.unwrap_or(default_rc_dir).to_string()),
             };
             if let Err(e) = db.insert_character(&row) {
@@ -678,7 +672,6 @@ impl KjDispatcher {
                     label: Some(label.clone()),
                     system_prompt: None,
                     context_state: ContextState::Live,
-                    context_type: MCP_HUB_CONTEXT_TYPE.to_string(),
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: character,
                     forked_from: None,
@@ -726,8 +719,8 @@ impl KjDispatcher {
     }
 
     /// Return a live root character's root context, creating it when the
-    /// sheet has none, or names an archived or missing context: type `root`,
-    /// labeled with the character's name, played by it, with no parent.
+    /// sheet has none, or names an archived or missing context: labeled with
+    /// the character's name, played by it, with no parent.
     /// `requester` becomes `created_by`.
     async fn ensure_root_context(&self, character: PrincipalId, caller: &KjCaller) -> Result<ContextId, String> {
         let requester = caller.principal_id;
@@ -759,7 +752,6 @@ impl KjDispatcher {
                 label: Some(sheet.name.clone()),
                 system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: ROOT_CONTEXT_TYPE.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: requester,
                 forked_from: None,
@@ -1579,29 +1571,9 @@ mod tests {
             let KjResult::Err(message) = result else { panic!("{flag:?}: expected a refusal, got {result:?}") };
             assert!(message.contains(flag[0]), "{flag:?}: {message}");
         }
-        // A type stored before the melt is neither shown nor carried.
-        let worker = sheet(&d, "worker").principal_id;
-        d.kernel_db().lock().update_character_context_type(worker, Some("legacy")).unwrap();
         let shown = d.dispatch(&[s("character"), s("show"), s("worker")], &caller).await;
-        let KjResult::Ok { message, data: Some(data), .. } = shown else { panic!("expected Ok, got {shown:?}") };
-        assert!(!message.contains("Type:") && !message.contains("legacy"), "{message}");
-        assert!(data.get("context_type").is_none(), "{data}");
-    }
-
-    /// A character whose sheet still holds a type from before the melt can
-    /// become a root: nothing reads the stored type.
-    ///
-    /// Falsified by refusing `--root` for a stored type.
-    #[tokio::test]
-    async fn a_stored_type_does_not_block_set_root() {
-        let d = rc_capable_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("typed"), s("--rc"), s("coder")], &caller).await;
-        let typed = sheet(&d, "typed").principal_id;
-        d.kernel_db().lock().update_character_context_type(typed, Some("coder")).unwrap();
-        let to_root = d.dispatch(&[s("character"), s("set"), s("typed"), s("--root")], &caller).await;
-        assert!(to_root.is_ok(), "{}", to_root.message());
-        assert!(sheet(&d, "typed").root);
+        let KjResult::Ok { message, .. } = shown else { panic!("expected Ok, got {shown:?}") };
+        assert!(!message.contains("Type:"), "{message}");
     }
 
     /// `set` names the options it takes when given none.
@@ -1761,7 +1733,7 @@ mod tests {
         let caller = test_caller();
         let [lead, coder] = [PrincipalId::new(), PrincipalId::new()];
         for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
@@ -1791,7 +1763,7 @@ mod tests {
     async fn show_lists_the_characters_live_contexts() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let live = register_context(&d, Some("lane-live"), None, coder);
@@ -1879,8 +1851,7 @@ mod tests {
         assert_eq!(row("coder")["root"], serde_json::Value::Bool(false));
     }
 
-    /// `create --root` creates the character's root context: type `root`,
-    /// labeled with its name, played by it, with no parent, recorded on the
+    /// `create --root` creates the character's root context: labeled with its name, played by it, with no parent, recorded on the
     /// sheet. `tests/rc_role_bindings.rs` checks that its rc bundle binds it.
     #[tokio::test]
     async fn create_root_makes_its_root_context() {
@@ -1898,7 +1869,6 @@ mod tests {
         );
         let row = d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap();
         assert_eq!(row.label.as_deref(), Some("sovereign"));
-        assert_eq!(row.context_type, "root");
         assert_eq!(row.performer, Some(sheet.principal_id));
         assert_eq!(row.forked_from, None);
         assert_eq!(row.created_by, caller.principal_id, "the requester stays the creator");
@@ -1919,7 +1889,7 @@ mod tests {
         let again = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
         assert!(matches!(again, KjResult::Ok { .. }), "{again:?}");
         let live_roots = d.kernel_db().lock().list_all_contexts().unwrap()
-            .into_iter().filter(|c| c.context_type == "root" && c.archived_at.is_none()).count();
+            .into_iter().filter(|c| c.performer == Some(sheet.principal_id) && c.archived_at.is_none()).count();
         assert_eq!(live_roots, 1, "a repeated create must not make a second root context");
     }
 
@@ -1928,8 +1898,8 @@ mod tests {
         d.kernel_db().lock().find_context_by_label(&format!("mcp/{name}")).unwrap()
     }
 
-    /// `create --root` makes the root's MCP hub beside its console: type
-    /// `mcp-hub`, created by the root, no parent, no context character, and
+    /// `create --root` makes the root's MCP hub beside its console: labeled
+    /// `mcp/<name>`, created by the root, no parent, no context character, and
     /// registered with the drift router. Repeating the create makes no second.
     ///
     /// Falsified by dropping the hub from the create path.
@@ -1942,7 +1912,6 @@ mod tests {
 
         let sheet = d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap();
         let hub = hub_of(&d, "sovereign").expect("a root character has an MCP hub");
-        assert_eq!(hub.context_type, "mcp-hub");
         assert_eq!(hub.created_by, sheet.principal_id, "the root creates its own hub");
         assert_eq!(hub.forked_from, None);
         assert!(hub.archived_at.is_none());
@@ -1955,7 +1924,7 @@ mod tests {
         let again = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
         assert!(matches!(again, KjResult::Ok { .. }), "{again:?}");
         let hubs = d.kernel_db().lock().list_all_contexts().unwrap()
-            .into_iter().filter(|c| c.context_type == "mcp-hub" && c.archived_at.is_none()).count();
+            .into_iter().filter(|c| c.label.as_deref() == Some("mcp/sovereign") && c.archived_at.is_none()).count();
         assert_eq!(hubs, 1, "a repeated create must not make a second hub");
     }
 
@@ -1989,7 +1958,7 @@ mod tests {
             db.archive_context(old.context_id).unwrap();
             d.drift_router().write().set_state(old.context_id, kaijutsu_types::ContextState::Archived).unwrap();
             let row = crate::kernel_db::ContextRow {
-                context_id: hub, label: Some("mcp/sovereign".into()), context_type: "mcp-hub".into(),
+                context_id: hub, label: Some("mcp/sovereign".into()),
                 created_by: sheet.principal_id, senpai_ctx: sheet.root_ctx, ..old.clone()
             };
             let ws = db.get_or_create_default_workspace(sheet.principal_id).unwrap();
@@ -2067,14 +2036,12 @@ mod tests {
         assert!(hub_of(&d, "sovereign").is_some_and(|row| row.context_id == squatter), "the squatter is left alone");
     }
 
-    /// A live context with no performer on the hub's label is the hub,
-    /// whatever its type: it is adopted by setting the pointer. Falsified by
-    /// checking the type.
+    /// A live context with no performer on the hub's label is the hub: it is
+    /// adopted by setting the pointer.
     #[tokio::test]
     async fn create_root_adopts_a_performerless_context_on_the_hub_label() {
         let d = rc_capable_dispatcher().await;
         let found = super::super::test_helpers::register_context(&d, Some("mcp/sovereign"), None, PrincipalId::new());
-        d.kernel_db().lock().update_context_type(found, "default").unwrap();
         let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &test_caller()).await;
         assert!(created.is_ok(), "{}", created.message());
         assert_eq!(sheet(&d, "sovereign").mcp_hub_ctx, Some(found), "the performer-less context is adopted");
@@ -2093,7 +2060,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id, name: name.into(), created_at: 0, retired_at,
                     handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
@@ -2102,12 +2069,12 @@ mod tests {
         d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
         let amy_name = d.kernel_db().lock().get_character(super::super::test_helpers::test_reviewer_principal()).unwrap().unwrap().name;
         let hubs: Vec<_> = [amy_name.as_str(), "keeper"].map(|n| hub_of(&d, n).unwrap_or_else(|| panic!("{n} has a hub"))).into();
-        assert!(hubs.iter().all(|h| h.context_type == "mcp-hub" && h.forked_from.is_none()));
+        assert!(hubs.iter().all(|h| h.performer.is_none() && h.forked_from.is_none()));
         assert!(hub_of(&d, "old").is_none(), "a retired root gets no hub");
 
         d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
         let live_hubs = d.kernel_db().lock().list_all_contexts().unwrap()
-            .into_iter().filter(|c| c.context_type == "mcp-hub" && c.archived_at.is_none()).count();
+            .into_iter().filter(|c| c.label.as_deref().is_some_and(|l| l.starts_with("mcp/")) && c.archived_at.is_none()).count();
         assert_eq!(live_hubs, 2, "a second start makes no second hub");
         assert_eq!(hub_of(&d, "keeper").unwrap().context_id, hubs[1].context_id, "the hub is reused");
     }
@@ -2129,7 +2096,7 @@ mod tests {
         assert_ne!(made.context_id, hub.context_id);
     }
 
-    /// At start a live context of another type on the hub's label is
+    /// At start a live performed context on the hub's label is
     /// logged and left alone; boot continues and the other roots still get
     /// their hubs.
     #[tokio::test]
@@ -2192,7 +2159,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id, name: name.into(), created_at: 0, retired_at,
                     handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
@@ -2298,7 +2265,7 @@ mod tests {
         let character = PrincipalId::new();
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: character, name: "keeper".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: true,
             }).unwrap();
@@ -2306,7 +2273,6 @@ mod tests {
         let ctx = super::super::test_helpers::register_context(&d, Some("keeper"), None, character);
         {
             let db = d.kernel_db().lock();
-            db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
             db.update_performer(ctx, Some(character)).expect("update_performer");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
@@ -2348,7 +2314,6 @@ mod tests {
         let ctx = super::super::test_helpers::register_context(&d, Some("amy"), None, amy);
         {
             let db = d.kernel_db().lock();
-            db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
             db.update_performer(ctx, Some(amy)).expect("update_performer");
             db.delete_context_binding(ctx).expect("delete the binding row");
         }
@@ -2522,7 +2487,7 @@ mod tests {
         let d = rc_capable_dispatcher().await;
         let empty = tempfile::tempdir().unwrap();
         d.kernel().mount(kaijutsu_types::paths::RC_ROOT, crate::vfs::LocalBackend::new(empty.path())).await;
-        assert!(super::super::rc::known_context_types(d.kernel().vfs()).await.unwrap().is_empty(), "the fixture's rc tree is empty");
+        assert!(super::super::rc::known_rc_dirs(d.kernel().vfs()).await.unwrap().is_empty(), "the fixture's rc tree is empty");
         let caller = test_caller();
         let made = d.dispatch(&[s("character"), s("create"), s("loose"), s("--rc"), s("anything")], &caller).await;
         assert!(made.is_ok(), "{}", made.message());

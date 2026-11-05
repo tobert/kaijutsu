@@ -347,7 +347,7 @@ fn an_mcp_session_raises_no_ask_and_a_held_create_joins_after_approval() {
             SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
         });
         let kernel = kernel_rx.await.unwrap();
-        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        kernel.kernel_db.lock().insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: claude, name: "claude".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();

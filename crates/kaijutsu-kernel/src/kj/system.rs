@@ -341,7 +341,7 @@ mod tests {
     use crate::kj::test_helpers::*;
 
     /// `kj system ps` names each turn's context and its performer, in the
-    /// text and the JSON, and no type. Falsified by showing the type.
+    /// text and the JSON.
     #[tokio::test]
     async fn ps_names_the_performer_of_a_turn() {
         let d = test_dispatcher().await;
@@ -356,6 +356,5 @@ mod tests {
         assert!(message.contains("ps-lane") && message.contains(TEST_PERFORMER), "{message}");
         let row = rows.iter().find(|r| r["context"] == "ps-lane").expect("the turn row");
         assert_eq!(row["performer"], TEST_PERFORMER);
-        assert!(row.get("context_type").is_none(), "{row}");
     }
 }

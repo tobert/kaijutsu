@@ -149,7 +149,6 @@ mod tests {
             label: Some("ctx".to_string()),
             system_prompt: None,
             context_state: ContextState::Live,
-            context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,
@@ -188,7 +187,7 @@ mod tests {
             let performer = performer.map(|name| {
                 let principal_id = PrincipalId::new();
                 g.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
-                    context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None,
+                    principal_id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
                 principal_id
@@ -229,7 +228,6 @@ mod tests {
                 assert!(s.contains(&ctx.context_id.to_hex()));
                 // The DB-backed performer flows through the broker path.
                 assert!(s.contains("\"performer\": \"coder\""), "{s}");
-                assert!(!s.contains("context_type"), "whoami shows the performer, not a type: {s}");
             }
             other => panic!("expected text content, got {:?}", other),
         }

@@ -643,10 +643,8 @@ fn deleting_a_session_archives_its_context_and_its_judge_shadow() {
     {
         let db = kernel.db.lock();
         let mut row = db.get_context(seat).expect("read the seat").expect("the seat exists");
-        assert_eq!(row.context_type, "coder", "the bridge creates coder seats");
         row.context_id = shadow;
         row.label = Some("judge-shadow".into());
-        row.context_type = "judge".into();
         row.performer = None;
         row.forked_from = Some(seat);
         let workspace = db.get_or_create_default_workspace(row.created_by).expect("default workspace");

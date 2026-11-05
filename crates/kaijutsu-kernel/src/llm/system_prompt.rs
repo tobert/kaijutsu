@@ -1,6 +1,6 @@
 //! Per-call system-prompt assembly.
 //!
-//! Context types choose their system instructions through rc `.kai` scripts.
+//! A context's rc directory chooses its system instructions through `.kai` scripts.
 //! `build_system_prompt` joins their persisted sections and appends a
 //! structured per-call situational addendum. The kernel supplies facts; it
 //! does not prepend a mandatory instruction body.

@@ -4,11 +4,12 @@ use super::*;
 
 /// Give a fresh database the schema one written before context characters
 /// had: the columns and table `drop_pre_context_character_columns` removes,
-/// and the `context_characters` table `context-fold-v1` folds away.
-/// Idempotent. Rows in those columns are written with raw SQL, since no
-/// `KernelDb` method writes them.
+/// the `context_characters` table `context-fold-v1` folds away, and the type
+/// columns ([`add_legacy_type_columns`]). Idempotent. Rows in those columns
+/// are written with raw SQL, since no `KernelDb` method writes them.
 #[cfg(test)]
 pub(super) fn into_pre_context_character(db: &KernelDb) {
+    add_legacy_type_columns(db);
     let c = &db.conn;
     KernelDb::ensure_legacy_context_characters(c).unwrap();
     KernelDb::ensure_legacy_cast_tables(c).unwrap();
@@ -106,7 +107,6 @@ pub(super) fn make_context_row(label: Option<&str>) -> ContextRow {
         label: label.map(String::from),
         system_prompt: None,
         context_state: ContextState::Live,
-        context_type: "default".to_string(),
         created_at: now_millis(),
         created_by: PrincipalId::new(),
         forked_from: None,
@@ -202,7 +202,7 @@ pub(super) fn put_backends_back_on_its_pre_codex_shape(conn: &Connection) {
 pub(super) fn seed_characters(db: &KernelDb, names: &[&str]) -> Vec<PrincipalId> {
     names.iter().map(|name| {
         let principal_id = PrincipalId::new();
-        db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id, name: (*name).to_string(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -317,4 +317,51 @@ pub(super) fn make_attachment(track_id: &str, context_id: ContextId) -> Persiste
         rotate_every_phrases: None,
         ooda_armed: false,
     }
+}
+
+/// Give a database the type columns one written before `type-melt-v1` had:
+/// `contexts.context_type` with its default and `characters.context_type`.
+/// Idempotent. The migration stays recorded, so the columns survive later
+/// migration runs for the tests of the migrations that read them;
+/// [`into_pre_type_melt`] also forgets it. Rows in those columns are written
+/// with raw SQL ([`set_legacy_context_type`], [`set_legacy_character_type`]),
+/// since no `KernelDb` method writes them.
+#[cfg(test)]
+pub(super) fn add_legacy_type_columns(db: &KernelDb) {
+    let c = &db.conn;
+    for (table, definition) in [("contexts", "TEXT NOT NULL DEFAULT 'default'"), ("characters", "TEXT")] {
+        if !KernelDb::has_column(c, table, "context_type").unwrap() {
+            c.execute(&format!("ALTER TABLE {table} ADD COLUMN context_type {definition}"), []).unwrap();
+        }
+    }
+}
+
+/// [`add_legacy_type_columns`], and forget `type-melt-v1`, so the next
+/// `apply_additive_migrations` drops them.
+#[cfg(test)]
+pub(super) fn into_pre_type_melt(db: &KernelDb) {
+    add_legacy_type_columns(db);
+    db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::TYPE_MELT_MIGRATION]).unwrap();
+}
+
+/// Write the stored `contexts.context_type` of a context in a database with
+/// the legacy columns ([`add_legacy_type_columns`]).
+#[cfg(test)]
+pub(super) fn set_legacy_context_type(db: &KernelDb, ctx: ContextId, context_type: &str) {
+    add_legacy_type_columns(db);
+    db.conn.execute(
+        "UPDATE contexts SET context_type = ?1 WHERE context_id = ?2",
+        params![context_type, blob_param(ctx.as_bytes())],
+    ).unwrap();
+}
+
+/// Write the stored `characters.context_type` of a character in a database
+/// with the legacy columns ([`add_legacy_type_columns`]).
+#[cfg(test)]
+pub(super) fn set_legacy_character_type(db: &KernelDb, character: PrincipalId, context_type: Option<&str>) {
+    add_legacy_type_columns(db);
+    db.conn.execute(
+        "UPDATE characters SET context_type = ?1 WHERE principal_id = ?2",
+        params![context_type, blob_param(character.as_bytes())],
+    ).unwrap();
 }

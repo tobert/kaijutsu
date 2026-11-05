@@ -20,14 +20,13 @@ impl KernelDb {
             handoff_ctx: None,
             root: true,
             root_ctx: None,
-            context_type: None,
         })?;
         let workspace = self.get_or_create_default_workspace(principal_id)?;
         let console = ContextId::new();
         self.insert_context_with_document(
             &ContextRow {
                 context_id: console, label: Some(format!("root-fixture-{}", console.short())), system_prompt: None,
-                context_state: ContextState::Live, context_type: kaijutsu_types::ROOT_CONTEXT_TYPE.into(), created_at: now_millis(),
+                context_state: ContextState::Live, created_at: now_millis(),
                 created_by: principal_id, forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None, demoted_at: None,
                 paused_at: None, origin_host: None, performer: None, senpai_ctx: None, persona: None,
@@ -280,7 +279,7 @@ impl KernelDb {
         if self.get_character(played_by)?.is_none() {
             self.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: played_by, name: format!("performer-{}", played_by.to_hex()), created_at: 0,
-                retired_at: None, handoff_ctx: None, root_ctx: None, root: false, context_type: None,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             })?;
         }
         if let Some(existing) = self.context_character(id)? {
@@ -341,7 +340,7 @@ impl KernelDb {
                 let ws = self.get_or_create_default_workspace(reviewer)?;
                 let row = ContextRow {
                     context_id: seat, label: Some(label), system_prompt: None,
-                    context_state: ContextState::Live, context_type: "default".into(),
+                    context_state: ContextState::Live,
                     created_at: now_millis(), created_by: reviewer, forked_from: None, fork_kind: None,
                     archived_at: None, workspace_id: None, preset_id: None, concluded_at: None,
                     last_activity_at: None, promoted_at: None, demoted_at: None, paused_at: None,

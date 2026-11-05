@@ -1046,7 +1046,7 @@ mod tests {
 
     /// End-to-end for `assets/defaults/rc/lib/create/S45-shell-guard.kai`:
     /// run through the REAL `create`
-    /// rc lifecycle for a context type it's symlinked into (`default`), not
+    /// rc lifecycle for an rc directory it's symlinked into, not
     /// just its extracted body in isolation
     /// (`mcp::broker::tests::shell_guard_denies_sh_dash_c_and_allows_benign_shapes`
     /// covers the guard's own matching logic).

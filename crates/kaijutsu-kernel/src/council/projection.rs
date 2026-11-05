@@ -245,7 +245,6 @@ pub(super) mod fixtures {
             label: Some(label.to_string()),
             system_prompt: None,
             context_state: ContextState::Live,
-            context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,
@@ -356,7 +355,7 @@ pub(super) mod fixtures {
         kernel
             .kernel_db()
             .lock()
-            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "person" } else { "coder" }.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "person" } else { "coder" }.into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id,
                 name: name.to_string(),
                 created_at: 0,

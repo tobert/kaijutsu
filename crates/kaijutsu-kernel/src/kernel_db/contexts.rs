@@ -9,7 +9,6 @@ pub struct ContextRow {
     pub label: Option<String>,
     pub system_prompt: Option<String>,
     pub context_state: ContextState,
-    pub context_type: String,
     pub created_at: i64,
     pub created_by: PrincipalId,
     pub forked_from: Option<ContextId>,
@@ -144,25 +143,24 @@ impl KernelDb {
         conn.execute(
                 "INSERT INTO contexts (
                 context_id, label,
-                system_prompt, context_state, context_type,
+                system_prompt, context_state,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at,
                 origin_host, performer, senpai_ctx, persona
             ) VALUES (
                 ?1, ?2,
-                ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20, ?21
+                ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
                     row.label,
                     row.system_prompt,
                     row.context_state.as_str(),
-                    row.context_type,
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
                     row.forked_from.as_ref().map(|id| id.as_bytes().to_vec()),
@@ -195,7 +193,7 @@ impl KernelDb {
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label,
-                    system_prompt, context_state, context_type,
+                    system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
@@ -253,20 +251,6 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Update a context's `context_type` — selects which rc lifecycle
-    /// scripts run for this context's create / fork / attach / drift
-    /// moments.
-    pub fn update_context_type(&self, id: ContextId, context_type: &str) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE contexts SET context_type = ?1 WHERE context_id = ?2",
-            params![context_type, blob_param(id.as_bytes())],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
-        }
-        Ok(())
-    }
-
     /// Set (or clear) a context's advisory `origin_host` — the hostname the
     /// registering client self-reported. Deliberately NOT part of
     /// `write_context`'s own INSERT: it is set once, right after creation,
@@ -274,7 +258,7 @@ impl KernelDb {
     /// client to ask (genesis bootstrap, fork, tests) simply never call this
     /// and the row keeps `origin_host = NULL` ("-" on display). `host =
     /// None` clears an existing value. Unknown context id is a loud
-    /// `NotFound`, same convention as `update_label`/`update_context_type`.
+    /// `NotFound`, same convention as `update_label`.
     pub fn set_origin_host(&self, id: ContextId, host: Option<&str>) -> KernelDbResult<()> {
         let updated = self.conn.execute(
             "UPDATE contexts SET origin_host = ?1 WHERE context_id = ?2",
@@ -327,7 +311,7 @@ impl KernelDb {
     pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label,
-                    system_prompt, context_state, context_type,
+                    system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
@@ -344,7 +328,7 @@ impl KernelDb {
     pub fn list_all_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label,
-                    system_prompt, context_state, context_type,
+                    system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona
@@ -421,7 +405,7 @@ impl KernelDb {
     pub fn find_context_by_label(&self, label: &str) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label,
-                    system_prompt, context_state, context_type,
+                    system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, origin_host, performer, senpai_ctx, persona

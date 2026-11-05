@@ -4,7 +4,7 @@
 //! The gate is the shadow's only writer. [`record_call`] runs before the
 //! gate decides and appends the call as a user turn; [`record_outcome`] runs
 //! after and appends what the gate did as the model turn after it. A seat
-//! has a judge shadow when its type's council block names a judge character
+//! has a judge shadow when its performer's council block names a judge character
 //! (`judge = "<character>"`); the shadow is created on the first call the
 //! gate evaluates for that seat. The shadow is performed by the judge
 //! character, has the seat as its parent and its senpai, and copies its
@@ -42,8 +42,8 @@ use crate::kj::gate_policy::GateConfigLoad;
 
 use super::gate::SlotServer;
 
-/// The context_type of a judge shadow, and the name of the shipped judge
-/// character.
+/// The name of the shipped judge character, which performs every judge
+/// shadow.
 pub(crate) const JUDGE: &str = "judge";
 
 /// The most bytes of a call's input a shadow turn keeps; the rest is cut
@@ -618,7 +618,6 @@ fn shadow_row(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbRes
         label: Some(label),
         system_prompt: None,
         context_state: ContextState::Live,
-        context_type: JUDGE.into(),
         created_at: kaijutsu_types::now_millis() as i64,
         created_by: PrincipalId::system(),
         forked_from: Some(seat.context_id),

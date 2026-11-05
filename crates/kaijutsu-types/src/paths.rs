@@ -155,16 +155,16 @@ pub const KERNEL_ROOTS: [&str; 5] = [CONFIG_NAMESPACE_ROOT, RUN_ROOT, "/v", R_RO
 // Builders — replace scattered `format!` calls at mount/write sites.
 // ---------------------------------------------------------------------
 
-/// The directory a `(context_type, verb)` pair's rc scripts live in:
-/// `/config/rc/<context_type>/<verb>`.
-pub fn rc_dir(context_type: &str, verb: &str) -> String {
-    format!("{RC_ROOT}/{context_type}/{verb}")
+/// The directory an rc directory's scripts for `verb` live in:
+/// `/config/rc/<dir>/<verb>`.
+pub fn rc_dir(dir: &str, verb: &str) -> String {
+    format!("{RC_ROOT}/{dir}/{verb}")
 }
 
-/// One rc script's canonical path: `/config/rc/<context_type>/<verb>/<name>`.
+/// One rc script's canonical path: `/config/rc/<dir>/<verb>/<name>`.
 /// `name` is the full filename (`SXX-name.{kai,md}`).
-pub fn rc_script_path(context_type: &str, verb: &str, name: &str) -> String {
-    format!("{}/{name}", rc_dir(context_type, verb))
+pub fn rc_script_path(dir: &str, verb: &str, name: &str) -> String {
+    format!("{}/{name}", rc_dir(dir, verb))
 }
 
 /// One kernel-global config file's canonical path: `/config/kernel/<name>`.

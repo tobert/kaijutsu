@@ -31,13 +31,10 @@ pub struct CharacterRow {
     /// kj requests always need approval (`docs/character.md`, "Roots and
     /// rotation").
     pub root: bool,
-    /// A context type stored by an earlier kernel. No verb sets it and
-    /// nothing reads it.
-    pub context_type: Option<String>,
     /// The directory under `/config/rc/` whose lifecycle scripts this
-    /// character's contexts run. `None` until the slice that reads it
-    /// backfills existing rows (`docs/character.md`, "The type melts into
-    /// the character").
+    /// character's contexts run. `None` when unset: a context create for the
+    /// character refuses until `kj character set <name> --rc <dir>` names one
+    /// (`docs/character.md`, "What a context and a character carry").
     pub rc_dir: Option<String>,
     /// A root character's console: the model console a person talks to,
     /// performed by a non-root character and answering to the root console.
@@ -293,8 +290,8 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type, rc_dir, console_ctx, mcp_hub_ctx)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, rc_dir, console_ctx, mcp_hub_ctx)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
@@ -303,7 +300,6 @@ impl KernelDb {
                     row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                     row.root,
                     row.root_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
-                    row.context_type,
                     row.rc_dir,
                     row.console_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                     row.mcp_hub_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
@@ -318,7 +314,7 @@ impl KernelDb {
     /// Fetch a character by its kernel-owned name.
     pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type, rc_dir, console_ctx, mcp_hub_ctx
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, rc_dir, console_ctx, mcp_hub_ctx
              FROM characters WHERE name = ?1",
         )?;
         Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
@@ -329,7 +325,7 @@ impl KernelDb {
     /// `played_by` (e.g. resolving the name to display in `kj context info`).
     pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type, rc_dir, console_ctx, mcp_hub_ctx
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, rc_dir, console_ctx, mcp_hub_ctx
              FROM characters WHERE principal_id = ?1",
         )?;
         Ok(stmt
@@ -342,10 +338,10 @@ impl KernelDb {
     /// ones by default.
     pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
         let sql = if include_retired {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type, rc_dir, console_ctx, mcp_hub_ctx \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, rc_dir, console_ctx, mcp_hub_ctx \
              FROM characters ORDER BY name"
         } else {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, context_type, rc_dir, console_ctx, mcp_hub_ctx \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, rc_dir, console_ctx, mcp_hub_ctx \
              FROM characters WHERE retired_at IS NULL ORDER BY name"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -459,18 +455,6 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Set or clear the context type a character usually plays.
-    pub fn update_character_context_type(&self, principal_id: PrincipalId, context_type: Option<&str>) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE characters SET context_type = ?1 WHERE principal_id = ?2",
-            params![context_type, blob_param(principal_id.as_bytes())],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!("character {}", principal_id.short())));
-        }
-        Ok(())
-    }
-
     /// Retire a character: stamp `retired_at`, first time only. Returns
     /// `true` if this call newly retired it, `false` if it was unknown or
     /// already retired — idempotent re-retire is a no-op success, never an
@@ -515,7 +499,7 @@ impl KernelDb {
     pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label,
-                    system_prompt, context_state, context_type,
+                    system_prompt, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at,

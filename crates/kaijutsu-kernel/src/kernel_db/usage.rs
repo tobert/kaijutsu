@@ -56,7 +56,7 @@ pub struct TurnStart {
     pub context_id: ContextId,
     /// The character that performed the turn.
     pub performer: PrincipalId,
-    /// The context type the context slot was matched on.
+    /// The slot role the turn's model was read from.
     pub role: String,
     pub provider: String,
     pub model: String,

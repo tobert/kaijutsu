@@ -1280,7 +1280,6 @@ fn bootstrap_discovered_context(
         label: None,
         system_prompt: None,
         context_state: kaijutsu_types::ContextState::Live,
-        context_type: "default".to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
         created_by: PrincipalId::system(),
         forked_from: None,
@@ -1335,7 +1334,7 @@ mod context_bootstrap_tests {
     }
 
     /// A context the way a real one looks on disk: a human label, a real
-    /// principal, a non-default context_type, a birth timestamp in the past.
+    /// principal, a birth timestamp in the past.
     /// Nothing a cold-start placeholder would ever reproduce — which is the
     /// point: if bootstrap ever overwrites this row, the difference shows.
     fn persist_real_context(db: &KernelDb, label: &str) -> (ContextId, ContextRow) {
@@ -1345,7 +1344,6 @@ mod context_bootstrap_tests {
             label: Some(label.to_string()),
             system_prompt: None,
             context_state: kaijutsu_types::ContextState::Live,
-            context_type: "coder".to_string(),
             created_at: 1_700_000_000_000,
             created_by: PrincipalId::new(),
             forked_from: None,
@@ -1453,7 +1451,6 @@ mod context_bootstrap_tests {
         assert_eq!(after.label, original.label, "label must survive bootstrap");
         assert_eq!(after.created_by, original.created_by);
         assert_eq!(after.created_at, original.created_at);
-        assert_eq!(after.context_type, original.context_type);
     }
 
     /// Cold start runs on every restart; the second restart must be as quiet
@@ -10513,7 +10510,7 @@ mod semantic_search_tests {
             // themself") — seed one directly, the way `kaijutsu-server init`
             // would, since this test drives create_shared_kernel straight
             // off a hand-built kernel.db.
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: PrincipalId::new(),
                 name: "tester".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,

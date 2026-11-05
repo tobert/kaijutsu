@@ -430,7 +430,6 @@ impl BeatScheduler {
                 label: Some(label.clone()),
                 system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: "score".to_string(),
                 created_at: now_millis() as i64,
                 created_by: system,
                 forked_from: None,
@@ -4077,7 +4076,6 @@ mod tests {
                     label: Some("bass".to_string()),
                     system_prompt: None,
                     context_state: ContextState::Live,
-                    context_type: "musician".to_string(),
                     created_at: 0,
                     created_by: principal,
                     forked_from: None,
@@ -4105,12 +4103,12 @@ mod tests {
         (kernel, documents, db, ctx)
     }
 
-    /// A scheduler and one live context of `context_type`, with `body` mounted
-    /// as the only rc script at `/<context_type>/<verb>/`. A caller that passes
-    /// a type other than the musician shows the beat's rc lookup is not
-    /// musician-specific.
+    /// A scheduler and one live context whose performer runs rc directory
+    /// `dir`, with `body` mounted as the only rc script at `/<dir>/<verb>/`. A
+    /// caller that passes a directory other than the musician's shows the
+    /// beat's rc lookup is not musician-specific.
     async fn lifecycle_scheduler(
-        context_type: &str,
+        dir: &str,
         verb: &str,
         body: &str,
     ) -> (BeatScheduler, Arc<Kernel>, ContextId) {
@@ -4134,7 +4132,6 @@ mod tests {
                     label: Some("archived-tick".to_string()),
                     system_prompt: None,
                     context_state: ContextState::Live,
-                    context_type: context_type.to_string(),
                     created_at: 0,
                     created_by: principal,
                     forked_from: None,
@@ -4156,19 +4153,19 @@ mod tests {
             // The lifecycle runs the performer's rc directory.
             let performer = PrincipalId::new();
             db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
-                rc_dir: Some(context_type.to_string()), console_ctx: None, mcp_hub_ctx: None,
-                context_type: Some(context_type.to_string()), principal_id: performer,
-                name: format!("rc-{context_type}"), created_at: 0, retired_at: None,
+                rc_dir: Some(dir.to_string()), console_ctx: None, mcp_hub_ctx: None,
+                principal_id: performer,
+                name: format!("rc-{dir}"), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_performer(ctx, Some(performer)).unwrap();
         }
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
         let rc = MemoryBackend::new();
-        rc.mkdir(Path::new(&format!("/{context_type}")), 0o755).await.unwrap();
-        rc.mkdir(Path::new(&format!("/{context_type}/{verb}")), 0o755).await.unwrap();
+        rc.mkdir(Path::new(&format!("/{dir}")), 0o755).await.unwrap();
+        rc.mkdir(Path::new(&format!("/{dir}/{verb}")), 0o755).await.unwrap();
         rc.write_all(
-            Path::new(&format!("/{context_type}/{verb}/S00-marker.kai")),
+            Path::new(&format!("/{dir}/{verb}/S00-marker.kai")),
             body.as_bytes(),
         )
         .await
@@ -4472,9 +4469,10 @@ mod tests {
         let score = sched.tracks.get(&track).expect("track exists").score_context;
 
         // A real, viewable context: it has a `contexts` row (so `kj context list` /
-        // the app can see it), tagged `context_type = "score"`.
+        // the app can see it), with no performer, so it runs no turns. The app
+        // finds it through `TrackInfo.score_context_id`.
         let row = db.lock().get_context(score).unwrap().expect("score context has a row");
-        assert_eq!(row.context_type, "score", "score context is tagged for the app to recognize");
+        assert_eq!(row.performer, None, "a score context has no performer");
         assert_eq!(
             row.context_state,
             kaijutsu_types::ContextState::Live,
@@ -5121,7 +5119,7 @@ mod tests {
             db.insert_context_with_document(&ContextRow {
                 context_id: context, label: None, system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: "musician".into(), created_at: 0, created_by: performer,
+                created_at: 0, created_by: performer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
@@ -5650,7 +5648,6 @@ mod tests {
                     label: Some("lead".to_string()),
                     system_prompt: None,
                     context_state: ContextState::Live,
-                    context_type: "musician".to_string(),
                     created_at: 0,
                     created_by: PrincipalId::new(),
                     forked_from: None,

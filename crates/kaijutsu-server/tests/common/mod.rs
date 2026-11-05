@@ -241,7 +241,7 @@ pub fn seed_turn_identity(
     context: kaijutsu_types::ContextId,
 ) -> kaijutsu_types::PrincipalId {
     use kaijutsu_kernel::kernel_db::CharacterRow;
-    let sheet = |name: &str| CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    let sheet = |name: &str| CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
         principal_id: kaijutsu_types::PrincipalId::new(),
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
@@ -540,13 +540,13 @@ pub const PERFORMER: &str = kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORME
 /// run from the kernel's only root context (`kaijutsu_client::choose_parent`).
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijutsu_types::ContextId, String> {
-    create_context_typed(kernel, label, "banto").await
+    create_context_with_rc_dir(kernel, label, "banto").await
 }
 
 /// [`create_context`] performed by [`rc_performer`]`(dir)`, so the context
 /// runs `/config/rc/<dir>/`.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
-pub async fn create_context_typed(
+pub async fn create_context_with_rc_dir(
     kernel: &KernelHandle,
     label: &str,
     dir: &str,
@@ -555,13 +555,12 @@ pub async fn create_context_typed(
     create_context_as(kernel, label, &performer).await
 }
 
-/// Make `context` of type `dir`, and point its performer at rc directory
-/// `dir`, so its later lifecycles run `/config/rc/<dir>/`. Every context that
+/// Point the performer of `context` at rc directory `dir`, so its later
+/// lifecycles run `/config/rc/<dir>/`. Every context that
 /// character performs runs `dir` from then on.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn perform_with_rc_dir(server: &kaijutsu_server::SharedKernel, context: kaijutsu_types::ContextId, dir: &str) {
     let db = server.kernel_db.lock();
-    db.update_context_type(context, dir).unwrap();
     let performer = db.get_context(context).unwrap().expect("the context exists").performer.expect("the context has a performer");
     db.set_character_rc_dir(performer, Some(dir)).unwrap();
 }

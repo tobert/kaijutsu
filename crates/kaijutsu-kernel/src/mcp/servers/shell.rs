@@ -7,7 +7,7 @@
 //!
 //! The instances are facade projections: `facade:shell` and
 //! `facade:shell_write` govern visibility and dispatch without a second grant.
-//! Rc selects each context type's loadout.
+//! Each rc directory's rc selects its contexts' loadout.
 
 #[cfg(test)]
 use crate::runtime::command_result::shell_result_to_envelope;
@@ -936,7 +936,7 @@ mod tests {
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ledger-shw"), None, principal);
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().assign_test_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
@@ -2123,7 +2123,7 @@ mod tests {
                 let reviewer = PrincipalId::new();
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("tool-review"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
-                d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id: reviewer, name: "tool-reviewer".into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -2409,7 +2409,7 @@ mod tests {
         let reviewer = PrincipalId::new();
         let context = register_context(&d, Some("async-pending"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().assign_test_review(context, Some(principal), Some(reviewer)).unwrap();

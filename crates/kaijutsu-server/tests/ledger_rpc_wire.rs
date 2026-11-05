@@ -31,7 +31,7 @@ async fn connect(addr: std::net::SocketAddr, key: PrivateKey, name: &str) -> Rpc
 }
 
 fn add_character(kernel: &SharedKernel, id: PrincipalId, name: &str) {
-    kernel.kernel_db.lock().insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    kernel.kernel_db.lock().insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
         principal_id: id, name: name.to_string(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
     }).expect("insert character");
 }
@@ -250,11 +250,11 @@ fn a_drift_into_root_waits_on_the_wire_for_the_humans_allow() {
         let rig = Rig::new().await;
         let rootbot = PrincipalId::new();
         add_character(&rig.kernel, rootbot, "rootbot");
-        let console = common::create_context_typed(&rig.amy_kj, "console", "banto").await.unwrap();
+        let console = common::create_context_with_rc_dir(&rig.amy_kj, "console", "banto").await.unwrap();
         rig.kernel.kernel_db.lock().assign_test_review_recasting(console, Some(rootbot), None).unwrap();
         // The console is the context amy's sheet points at.
         rig.kernel.kernel_db.lock().set_character_console_ctx(rig.amy, Some(console)).unwrap();
-        let source = common::create_context_typed(&rig.amy_kj, "drift-source", "coder").await.unwrap();
+        let source = common::create_context_with_rc_dir(&rig.amy_kj, "drift-source", "coder").await.unwrap();
         rig.kernel.kernel_db.lock().assign_test_review_recasting(source, Some(rig.coder), None).unwrap();
 
         let argv: Vec<String> = ["drift", "push", "console", "please read this first"].map(String::from).to_vec();

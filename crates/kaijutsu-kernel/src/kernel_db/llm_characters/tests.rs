@@ -6,7 +6,7 @@ use super::*;
 fn character_crud_roundtrip() {
     let db = KernelDb::temporary().unwrap();
     let principal = PrincipalId::new();
-    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
         principal_id: principal,
         name: "hajime".to_string(),
         created_at: 1000,
@@ -44,7 +44,7 @@ fn character_crud_roundtrip() {
 #[test]
 fn character_duplicate_name_is_rejected() {
     let db = KernelDb::temporary().unwrap();
-    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
         principal_id: PrincipalId::new(),
         name: "hajime".to_string(),
         created_at: 1000,
@@ -53,7 +53,7 @@ fn character_duplicate_name_is_rejected() {
     })
     .unwrap();
     let err = db
-        .insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        .insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
             principal_id: PrincipalId::new(),
             name: "hajime".to_string(),
             created_at: 2000,
@@ -71,11 +71,11 @@ fn character_root_flag_round_trips_in_both_directions() {
     let db = KernelDb::temporary().unwrap();
     let amy = PrincipalId::new();
     let coder = PrincipalId::new();
-    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
         principal_id: amy, name: "amy".into(), created_at: 0,
         retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
     }).unwrap();
-    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
         principal_id: coder, name: "coder".into(), created_at: 0,
         retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
     }).unwrap();
@@ -127,7 +127,7 @@ fn name_for_resolves_sentinels_then_sheet_then_short_id() {
     assert_eq!(db.name_for(PrincipalId::beat()), "beat");
 
     let character = PrincipalId::new();
-    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
         principal_id: character,
         name: "hajime".to_string(),
         created_at: 1000,

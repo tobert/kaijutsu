@@ -29,7 +29,7 @@ fn house(d: &KjDispatcher) -> House {
     let amy = test_reviewer_principal();
     let [banto, coder, sibling, judge] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
     for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
     }
@@ -109,11 +109,10 @@ async fn context_move_moves_a_kohai_under_the_rule_and_reroutes_its_asks() {
 /// A root character's console is the top of its lineage, and a judge
 /// shadow answers to the context it shadows: `kj context set --senpai` moves
 /// neither, even for the lineage root. A judge shadow is a context performed
-/// by a character a council block names as judge, whose parent is its senpai;
-/// its type plays no part.
+/// by a character a council block names as judge, whose parent is its senpai.
 ///
-/// Falsified by telling a shadow by its type: the shadow here is of type
-/// `default`, and a context of type `judge` another character performs moves.
+/// Falsified by telling a shadow by its label: a context another character
+/// performs moves.
 #[tokio::test]
 async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
     use crate::vfs::VfsOps;
@@ -138,9 +137,8 @@ async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
     assert!(refused.message().contains("judge shadow"), "{}", refused.message());
     assert_eq!(d.kernel_db().lock().senpai_of(shadow).unwrap(), Some(h.lane));
 
-    d.kernel_db().lock().update_context_type(h.other, "judge").unwrap();
     let moved = d.dispatch(&[s("context"), s("set"), h.other.to_hex(), s("--senpai"), h.judge_seat.to_hex()], &caller(h.amy, h.root)).await;
-    assert!(moved.is_ok(), "a context of type judge that no judge performs moves: {}", moved.message());
+    assert!(moved.is_ok(), "a context no judge performs moves: {}", moved.message());
 }
 
 /// The judge names that tell a judge shadow come from every section's
@@ -344,7 +342,6 @@ async fn context_info_prints_the_context_character_migration_notes() {
 async fn list_senpai_lists_the_live_contexts_that_answer_to_a_context() {
     let d = test_dispatcher().await;
     let h = house(&d);
-    d.kernel_db().lock().update_context_type(h.other, "coder").unwrap();
     let gone = register_context(&d, Some("gone-lane"), Some(h.seat), h.amy);
     d.kernel_db().lock().archive_context(gone).unwrap();
     let listed = d.dispatch(&[s("context"), s("list"), s("--senpai"), s(".")], &caller(h.banto, h.seat)).await;

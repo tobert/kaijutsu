@@ -51,7 +51,7 @@ async fn house() -> House {
             (coder, "ret-coder", false, "coder"), (mcp, "ret-mcp", false, "mcp"),
         ] {
             db.insert_character(&CharacterRow { rc_dir: Some(rc_dir.into()), console_ctx: None, mcp_hub_ctx: None,
-                context_type: None, principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None,
+                principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None,
                 root_ctx: None, root,
             }).unwrap();
         }

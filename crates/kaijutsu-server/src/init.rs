@@ -95,7 +95,7 @@ pub fn init_root(
             (CharacterRow { root: true, rc_dir: Some(root_dir.to_string()), ..row }, true)
         }
         None => {
-            let row = CharacterRow { rc_dir: Some(kaijutsu_types::paths::PERSON_RC_DIR.to_string()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            let row = CharacterRow { rc_dir: Some(kaijutsu_types::paths::PERSON_RC_DIR.to_string()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: PrincipalId::new(),
                 name: name.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -142,7 +142,7 @@ mod tests {
         let auth_db = AuthDb::temporary().unwrap();
         kernel_db
             .insert_character(&CharacterRow {
-                rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: PrincipalId::new(), name: "amy".into(), created_at: 1, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             })

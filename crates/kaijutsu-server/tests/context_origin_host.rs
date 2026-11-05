@@ -77,7 +77,7 @@ fn set_context_origin_host_is_visible_in_list_contexts() {
 
 /// Clearing: `setContextOriginHost` with an empty string clears a
 /// previously-set value back to `None` (the server treats empty text as
-/// "unknown", same convention as `label`/`context_type` elsewhere on this
+/// "unknown", same convention as `label` elsewhere on this
 /// interface) — never "" masquerading as a real, empty-string hostname.
 #[test]
 fn set_context_origin_host_with_empty_string_clears_it() {

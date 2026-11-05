@@ -131,14 +131,9 @@ mod tests {
         }
     }
 
-    /// Make `ctx` a context of type `ty` whose performer runs rc directory `ty`.
-    fn set_context_type(d: &KjDispatcher, ctx: ContextId, ty: &str) {
-        crate::kj::test_helpers::perform_with_rc_dir(d, ctx, ty);
-    }
-
-    async fn install_attach_script(d: &KjDispatcher, ctx_type: &str, content: &str, ext: &str) {
+    async fn install_attach_script(d: &KjDispatcher, dir: &str, content: &str, ext: &str) {
         let path = kaijutsu_types::paths::rc_script_path(
-            ctx_type,
+            dir,
             "attach",
             &format!("S00-marker.{ext}"),
         );
@@ -167,7 +162,7 @@ mod tests {
         d.set_self_arc();
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("planner"), None, principal);
-        set_context_type(&d, target, "planner");
+        crate::kj::test_helpers::perform_with_rc_dir(&d, target, "planner");
 
         install_attach_script(&d, "planner", r#"kj block create --role system --kind text --content 'attach-marker'"#, "kai").await;
 
@@ -194,7 +189,7 @@ mod tests {
         d.set_self_arc();
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("archived-target"), None, principal);
-        set_context_type(&d, target, "archived-target");
+        crate::kj::test_helpers::perform_with_rc_dir(&d, target, "archived-target");
         install_attach_script(&d, "archived-target",
             r#"kj block create --role system --kind text --content 'must-not-run'"#, "kai").await;
         d.kernel_db().lock().archive_context(target).unwrap();
@@ -214,7 +209,7 @@ mod tests {
         d.set_self_arc();
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("watched"), None, principal);
-        set_context_type(&d, target, "watched");
+        crate::kj::test_helpers::perform_with_rc_dir(&d, target, "watched");
 
         install_attach_script(
             &d,

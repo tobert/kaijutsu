@@ -45,8 +45,8 @@ async fn start_creates_the_root_context_once() {
     let shared = start(tmp.path()).await.expect("a kernel with a root character starts");
     let contexts = shared.kernel_db.lock().list_active_contexts().unwrap();
     assert_eq!(contexts.len(), 2, "start creates the root context and its MCP hub");
-    let root = contexts.iter().find(|c| c.context_type == "root").expect("the root context");
-    let hub = contexts.iter().find(|c| c.context_type == "mcp-hub").expect("the root's MCP hub");
+    let root = contexts.iter().find(|c| c.performer == Some(amy)).expect("the root context");
+    let hub = contexts.iter().find(|c| c.label.as_deref() == Some("mcp/amy")).expect("the root's MCP hub");
     assert_eq!(hub.label.as_deref(), Some("mcp/amy"));
     assert_eq!(hub.created_by, amy, "the root creates its own hub");
     assert_eq!(hub.forked_from, None);

@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{connect_client, create_context, create_context_typed, run_local, shell_exec_wait,
+use common::{connect_client, create_context, create_context_with_rc_dir, run_local, shell_exec_wait,
     start_server};
 use kaijutsu_client::KernelHandle;
 use kaijutsu_types::{BlockKind, BlockQuery, ContextId, Status};
@@ -27,7 +27,7 @@ fn a_toolie_seat_rpc_shell_refuses_writes_while_a_writable_seat_writes() {
         let scratch = tempfile::tempdir().unwrap();
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let toolie = create_context_typed(&kernel, "toolie-rpc-shell", "toolie").await.unwrap();
+        let toolie = create_context_with_rc_dir(&kernel, "toolie-rpc-shell", "toolie").await.unwrap();
         let writer = create_context(&kernel, "writer-rpc-shell").await.unwrap();
 
         let write = format!("echo rpc-shell-probe > {}/probe", scratch.path().display());
@@ -81,7 +81,7 @@ fn the_streaming_execute_rpc_follows_the_shell_facade() {
         let scratch = tempfile::tempdir().unwrap();
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let toolie = create_context_typed(&kernel, "toolie-stream", "toolie").await.unwrap();
+        let toolie = create_context_with_rc_dir(&kernel, "toolie-stream", "toolie").await.unwrap();
         let writer = create_context(&kernel, "writer-stream").await.unwrap();
         let write = format!("echo stream-probe > {}/probe", scratch.path().display());
 

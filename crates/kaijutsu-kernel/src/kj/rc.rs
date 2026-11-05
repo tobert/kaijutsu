@@ -640,16 +640,16 @@ async fn rc_readdir_tolerant(
 /// The rc directories under `/config/rc`: the directory names one level
 /// below `RC_ROOT`, sorted. `lib` holds shared scripts linked into other
 /// directories; no character runs it, so it is excluded here.
-pub async fn known_context_types(vfs: &crate::vfs::MountTable) -> Result<Vec<String>, String> {
-    let mut types: Vec<String> = rc_readdir_tolerant(vfs, paths::RC_ROOT)
+pub async fn known_rc_dirs(vfs: &crate::vfs::MountTable) -> Result<Vec<String>, String> {
+    let mut dirs: Vec<String> = rc_readdir_tolerant(vfs, paths::RC_ROOT)
         .await?
         .into_iter()
         .filter(|e| e.kind.is_dir())
         .map(|e| e.name)
         .filter(|name| name != "lib")
         .collect();
-    types.sort();
-    Ok(types)
+    dirs.sort();
+    Ok(dirs)
 }
 
 // Verb class: kj/effect.rs
@@ -706,7 +706,7 @@ mod tests {
             assert!(!listed.message().contains("recipes"), "{args:?}: {}", listed.message());
         }
         assert!(parse_rc_entry(recipe).is_err());
-        let dirs = known_context_types(d.kernel().vfs()).await.unwrap();
+        let dirs = known_rc_dirs(d.kernel().vfs()).await.unwrap();
         assert!(!dirs.iter().any(|d| d == "lib" || d == "recipes"), "{dirs:?}");
     }
 
@@ -1248,7 +1248,7 @@ mod tests {
         }
     }
 
-    /// A live-only script with no embedded seed (user-authored context_type)
+    /// A live-only script with no embedded seed (a user-authored rc directory)
     /// is marked "no seed" — neither in-sync nor differing, since there's
     /// nothing to compare it against.
     #[tokio::test]
@@ -1494,7 +1494,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        // A fresh, unshipped context_type — `coder`/`musician`/etc. all ship
+        // A fresh, unshipped rc directory — `coder`/`musician`/etc. all ship
         // real seeded files under `create/` that would collide with this
         // test's "user-authored, no seed" setup.
         let target = "/config/rc/tmpuser/create/S05-chair.md";
@@ -1532,12 +1532,12 @@ mod tests {
         }
     }
 
-    // ── known_context_types ─────────────────────────────────────────────
+    // ── known_rc_dirs ─────────────────────────────────────────────
 
     /// A kernel with `/config/rc` mounted over a tempdir holding `coder/`
     /// and `mcp/` subdirectories — no full seed, just the two directories
     /// the listing reads.
-    async fn kernel_with_two_rc_types() -> (crate::kernel::Kernel, tempfile::TempDir) {
+    async fn kernel_with_two_rc_dirs() -> (crate::kernel::Kernel, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::create_dir_all(dir.path().join("coder/create")).expect("coder dir");
         std::fs::create_dir_all(dir.path().join("mcp/create")).expect("mcp dir");
@@ -1547,9 +1547,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_context_types_lists_rc_bucket_dirs() {
-        let (kernel, _dir) = kernel_with_two_rc_types().await;
-        let types = known_context_types(kernel.vfs()).await.expect("readdir ok");
-        assert_eq!(types, vec!["coder".to_string(), "mcp".to_string()]);
+    async fn known_rc_dirs_lists_the_rc_directories() {
+        let (kernel, _dir) = kernel_with_two_rc_dirs().await;
+        let dirs = known_rc_dirs(kernel.vfs()).await.expect("readdir ok");
+        assert_eq!(dirs, vec!["coder".to_string(), "mcp".to_string()]);
     }
 }

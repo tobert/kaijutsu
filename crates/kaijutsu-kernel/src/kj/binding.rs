@@ -1,7 +1,7 @@
 //! `kj binding` — read and write a context's tool-capability allow-set.
 //!
 //! This is the rc-native setter the capability-policy work hangs off: rc
-//! `.kai` create scripts call it to give a `context_type` its loadout, and
+//! `.kai` create scripts call it to give an rc directory's contexts their loadout, and
 //! external agents can call it through `shell`. It delegates to the
 //! broker's binding API (`binding`/`set_binding`/`clear_binding`), which both
 //! persists (`KernelDb`) and fires the per-tool add/remove notifications.

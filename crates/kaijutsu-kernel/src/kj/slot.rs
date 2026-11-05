@@ -722,7 +722,7 @@ mod tests {
 
         d.kernel_db()
             .lock()
-            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: "boss".into(),
                 created_at: 0,
@@ -885,7 +885,7 @@ mod tests {
 
     /// A character's slots are `distill` and `gate`. `slot set` and `slot
     /// unset` refuse any other role and name the verb that holds it: `kj
-    /// character model set` for a context type, the judge character for
+    /// character model set` for `model`, the judge character for
     /// `judge`. A `gate` slot names a council server, so a backend of
     /// another kind refuses. Nothing is written.
     ///

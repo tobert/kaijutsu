@@ -33,9 +33,10 @@ impl Rig {
         let principal_id = PrincipalId::new();
         self.db.insert_character(&CharacterRow {
             rc_dir: Some(name.into()), console_ctx: None, mcp_hub_ctx: None,
-            context_type: context_type.map(str::to_string), principal_id, name: name.into(), created_at: 0,
+            principal_id, name: name.into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
+        set_legacy_character_type(&self.db, principal_id, context_type);
         principal_id
     }
 
@@ -48,9 +49,9 @@ impl Rig {
     }
 
     fn context(&self, label: &str, context_type: &str) -> ContextRow {
-        let mut row = make_context_row(Some(label));
-        row.context_type = context_type.into();
+        let row = make_context_row(Some(label));
         insert_context_with_doc(&self.db, &row, self.ws);
+        set_legacy_context_type(&self.db, row.context_id, context_type);
         row
     }
 
@@ -262,8 +263,8 @@ fn the_database_is_copied_aside_only_when_the_migration_changes_it() {
     KernelDb::back_up_before_slot_roles(&r.db.conn, unwritable).expect("a migrated database needs no copy");
 }
 
-/// A database whose `contexts` and `characters` no longer have
-/// `context_type` opens: the migration drops the roles it can tell are not
+/// A database whose `contexts` and `characters` have no `context_type`
+/// opens: the migration drops the roles it can tell are not
 /// `model`, `distill` or `gate`, and records itself.
 #[test]
 fn the_migration_records_itself_when_context_type_is_gone() {

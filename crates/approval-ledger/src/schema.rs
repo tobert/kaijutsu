@@ -790,10 +790,11 @@ END;
 -- It stays NULL when discovery or its recording fails. `intended_outcome`
 -- freezes the requested finish while captured results or projections remain
 -- unsettled; `outcome` and `finished_at` require those dependencies to settle.
+-- `rc_dir` names the rc directory the run read, as it was named when it ran.
 CREATE TABLE IF NOT EXISTS rc_runs (
     run_id       TEXT    NOT NULL PRIMARY KEY,
     context_id   BLOB    NOT NULL,
-    context_type TEXT    NOT NULL,
+    rc_dir       TEXT    NOT NULL,
     verb         TEXT    NOT NULL,
     started_at   INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
@@ -1091,6 +1092,8 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
             ("council_observations", "voice_label", "reviewer_label"),
             ("council_observations", "voice_context_id", "reviewer_context_id"),
             ("council_reads", "rendered_sha256", "rendered_hash"),
+            // An old row keeps the directory name it ran under.
+            ("rc_runs", "context_type", "rc_dir"),
         ],
     )?;
     add_columns_if_missing(conn, "council_decisions", &[("house_rules_head", "TEXT"), ("bump_flavor", "TEXT")])?;
@@ -1342,7 +1345,7 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
         legacy_check: "CHECK (outcome IS NULL OR outcome IN (",
         body: "run_id       TEXT    NOT NULL PRIMARY KEY,
             context_id   BLOB    NOT NULL,
-            context_type TEXT    NOT NULL,
+            rc_dir       TEXT    NOT NULL,
             verb         TEXT    NOT NULL,
             started_at   INTEGER NOT NULL
                 DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
@@ -1350,7 +1353,7 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             outcome      TEXT,
             intended_outcome TEXT,
             script_count INTEGER",
-        columns: "run_id, context_id, context_type, verb, started_at, finished_at, outcome, intended_outcome, script_count",
+        columns: "run_id, context_id, rc_dir, verb, started_at, finished_at, outcome, intended_outcome, script_count",
     },
     ValueEnumRebuildSpec {
         table: "approvals",
@@ -1655,6 +1658,70 @@ mod tests {
     /// silently stay on the old shape — and running `migrate()` a further
     /// time after that must still be a no-op, not an "duplicate column"
     /// error.
+    fn rc_runs_columns(conn: &Connection) -> Vec<String> {
+        conn.prepare("PRAGMA table_info(rc_runs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<SqliteResult<Vec<String>>>()
+            .unwrap()
+    }
+
+    /// A fresh store names the rc directory a run read `rc_dir`.
+    ///
+    /// Falsified by a `context_type` column in `DDL`.
+    #[test]
+    fn a_fresh_store_records_the_rc_dir_of_a_run() {
+        let ddl = Connection::open_in_memory().unwrap();
+        ddl.execute_batch(DDL).unwrap();
+        let columns = rc_runs_columns(&ddl);
+        assert!(columns.iter().any(|c| c == "rc_dir"), "DDL names the column rc_dir: {columns:?}");
+        assert!(!columns.iter().any(|c| c == "context_type"), "{columns:?}");
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(rc_runs_columns(&conn), columns, "a fresh migrate is the DDL");
+    }
+
+    /// An old store's `rc_runs.context_type` is renamed `rc_dir`, and an old
+    /// row keeps the name the directory had when it ran. The rename runs
+    /// before the legacy `CHECK` rebuild, so a store that needs both ends on
+    /// `rc_dir` with its rows. A second `migrate` changes nothing.
+    ///
+    /// Falsified by leaving the old column, by rewriting the value, or by a
+    /// rebuild that copies a column the rename has moved.
+    #[test]
+    fn migrate_renames_rc_runs_context_type_to_rc_dir_keeping_old_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rc_runs (
+                run_id       TEXT    NOT NULL PRIMARY KEY,
+                context_id   BLOB    NOT NULL,
+                context_type TEXT    NOT NULL,
+                verb         TEXT    NOT NULL,
+                started_at   INTEGER NOT NULL,
+                finished_at  INTEGER,
+                outcome      TEXT CHECK (outcome IS NULL OR outcome IN ('ok', 'failed'))
+            );
+            INSERT INTO rc_runs (run_id, context_id, context_type, verb, started_at, outcome)
+            VALUES ('r1', X'01', 'director', 'create', 1000, 'ok');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let columns = rc_runs_columns(&conn);
+        assert!(columns.iter().any(|c| c == "rc_dir"), "{columns:?}");
+        assert!(!columns.iter().any(|c| c == "context_type"), "{columns:?}");
+        let dir: String = conn.query_row("SELECT rc_dir FROM rc_runs WHERE run_id = 'r1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(dir, "director", "an old row keeps the directory name it ran under");
+        let run = crate::rc_runs::get_run(&conn, "r1").unwrap().expect("the old run reads back");
+        assert_eq!((run.rc_dir.as_str(), run.outcome), ("director", Some(crate::types::RcOutcome::Ok)));
+
+        migrate(&conn).unwrap();
+        assert_eq!(rc_runs_columns(&conn), columns, "a second migrate changes nothing");
+    }
+
     #[test]
     fn migrate_adds_script_count_to_a_database_created_without_it() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2920,7 +2987,7 @@ mod tests {
         assert_eq!(outcome, "ok", "the rebuild must keep the existing row");
 
         conn.execute(
-            "INSERT INTO rc_runs (run_id, context_id, context_type, verb, started_at, outcome)
+            "INSERT INTO rc_runs (run_id, context_id, rc_dir, verb, started_at, outcome)
              VALUES ('run2', X'01', 'coder', 'create', 2000, 'sideways')",
             [],
         )

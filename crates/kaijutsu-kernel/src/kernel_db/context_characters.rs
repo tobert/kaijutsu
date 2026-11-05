@@ -706,7 +706,7 @@ impl KernelDb {
         Ok(stmt.query_map([], |r| read_context_id(r, 0))?.collect::<SqliteResult<_>>()?)
     }
 
-    /// The facts about `context` that clients read instead of a context type
+    /// The facts about `context` that clients read to tell what it is
     /// ([`ContextFacts`]). A context with no row has none and refuses.
     pub fn context_facts(&self, context: ContextId) -> KernelDbResult<ContextFacts> {
         self.conn.query_row(

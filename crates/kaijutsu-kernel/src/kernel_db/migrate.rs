@@ -109,7 +109,6 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
-            "ALTER TABLE characters ADD COLUMN context_type TEXT",
             "ALTER TABLE characters ADD COLUMN rc_dir TEXT",
             "ALTER TABLE characters ADD COLUMN console_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN mcp_hub_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
@@ -129,6 +128,13 @@ impl KernelDb {
                 Err(e) if is_duplicate_column_error(&e) => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        // A database with `contexts.context_type` is from before
+        // `type-melt-v1`; the migrations below read `characters.context_type`
+        // beside it, so one older than that column gains it, NULL, until
+        // `type-melt-v1` drops both.
+        if Self::has_column(conn, "contexts", "context_type")? && !Self::has_column(conn, "characters", "context_type")? {
+            conn.execute("ALTER TABLE characters ADD COLUMN context_type TEXT", [])?;
         }
         // Accountability moved from the sheet to the context forest, so the
         // column that held it goes. A drop is the one shape the additive
@@ -196,6 +202,7 @@ impl KernelDb {
         Self::migrate_rc_dir_backfill(conn)?;
         Self::migrate_rc_dir_rename(conn)?;
         Self::migrate_slot_roles(conn)?;
+        Self::migrate_type_melt(conn)?;
         Self::ensure_context_guards(conn)?;
         Ok(())
     }

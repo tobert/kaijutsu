@@ -87,7 +87,7 @@ impl KernelDb {
         };
         let characters: HashMap<PrincipalId, CharacterRow> = {
             let mut stmt = tx.prepare(
-                "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, NULL, NULL, NULL, NULL FROM characters",
+                "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx, NULL, NULL, NULL FROM characters",
             )?;
             stmt.query_map([], row_to_character_row)?
                 .map(|r| r.map(|c| (c.principal_id, c)))

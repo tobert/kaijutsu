@@ -53,7 +53,7 @@
 //!   (`crates/kaijutsu-kernel/src/kj/handoff.rs`, `resolve_caller_character`).
 
 mod common;
-use common::{create_context_typed};
+use common::{create_context_with_rc_dir};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -266,7 +266,7 @@ async fn boot() -> Scenario {
     // and the `drive`/`fork`/`drift` verb authorities — amy's own admin
     // seat needs the loadout banto's seat gets, not a coder's narrower grant
     // (`assets/defaults/rc/banto/create/S10-binding.kai`).
-    let amy_home = create_context_typed(&amy, "amy-home", "banto")
+    let amy_home = create_context_with_rc_dir(&amy, "amy-home", "banto")
         .await
         .expect("create amy-home");
     amy.join_context(amy_home, "amy").await.expect("join amy-home");
@@ -651,7 +651,6 @@ fn kaijutsu_session_scenario() {
             assert!(db.get_context(banto_ctx).unwrap().unwrap().archived_at.is_some(), "the predecessor is archived");
             let successor = db.get_context(banto_next_ctx).unwrap().unwrap();
             assert_eq!(successor.performer, Some(banto_principal));
-            assert_eq!(successor.context_type, "banto");
         }
 
         // `S16-handoff.kai` injects the handoff tail as a `Notification`

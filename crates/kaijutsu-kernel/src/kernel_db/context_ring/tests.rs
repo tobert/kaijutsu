@@ -585,7 +585,7 @@ fn console_fixture(db: &KernelDb, ws_id: WorkspaceId) -> (PrincipalId, ContextId
     let bob = PrincipalId::new();
     for (principal_id, name, root) in [(banto, "banto", false), (bob, "bob", true)] {
         db.insert_character(&CharacterRow { rc_dir: Some(name.into()), console_ctx: None, mcp_hub_ctx: None,
-            context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None,
+            principal_id, name: name.into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root,
         }).unwrap();
     }

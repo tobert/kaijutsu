@@ -1,6 +1,6 @@
 # mcp: producer / orchestrator governance grants.
 #
-# The `mcp` context_type is where most orchestration / producer work happens —
+# The `mcp` rc directory is where most orchestration / producer work happens —
 # Claude Code drives kaijutsu over MCP (cheap on the Anthropic subscription),
 # while kaijutsu itself runs local / cheaper models to keep API spend down. That
 # producer role iterates on the kernel's own config-as-code, so it

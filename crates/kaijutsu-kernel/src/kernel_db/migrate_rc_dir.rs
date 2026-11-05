@@ -5,6 +5,14 @@
 
 use super::*;
 
+/// The `contexts.context_type` a model console was stored with before
+/// `type-melt-v1`.
+const CONSOLE_TYPE: &str = "console";
+
+/// The rc directory the backfill gives a root character;
+/// `rc-dir-rename-v1` moves it to `person`.
+const ROOT_RC_DIR: &str = "root";
+
 /// A character as the backfill reads it.
 struct BackfillCharacter {
     id: PrincipalId,
@@ -67,7 +75,7 @@ impl KernelDb {
                                 AND EXISTS(SELECT 1 FROM contexts x
                                            WHERE x.senpai_ctx = c.root_ctx AND x.context_type = ?1
                                              AND x.archived_at IS NULL))",
-                [kaijutsu_types::CONSOLE_CONTEXT_TYPE],
+                [CONSOLE_TYPE],
                 |r| r.get(0),
             )?;
             if !changes {
@@ -153,7 +161,7 @@ impl KernelDb {
                 continue;
             }
             let chosen = if c.root {
-                Ok(kaijutsu_types::ROOT_CONTEXT_TYPE.to_string())
+                Ok(ROOT_RC_DIR.to_string())
             } else if let Some(context_type) = &c.context_type {
                 Ok(context_type.clone())
             } else {
@@ -230,7 +238,7 @@ impl KernelDb {
                      ORDER BY created_at, context_id",
                 )?;
                 stmt.query_map(
-                    params![blob_param(root_ctx.as_bytes()), kaijutsu_types::CONSOLE_CONTEXT_TYPE],
+                    params![blob_param(root_ctx.as_bytes()), CONSOLE_TYPE],
                     |r| Ok((read_context_id(r, 0)?, r.get(1)?)),
                 )?
                 .collect::<SqliteResult<_>>()?

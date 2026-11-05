@@ -1243,8 +1243,8 @@ struct ContextHandleInfo {
   id @0 :Data;                    # 16-byte ContextId (UUIDv7) — the real identity
   label @1 :Text;                 # Optional human-friendly name (mutable)
   parentId @2 :Data;              # 16-byte ContextId of parent (empty = no parent)
-  provider @3 :Text;             # Backend name of the binding's model for this context's type; empty = the binding has none
-  model @4 :Text;                # Model id of the binding's model for this context's type; empty = the binding has none
+  provider @3 :Text;             # Backend name of the context's `model` slot; empty = the context has none
+  model @4 :Text;                # Model id of the context's `model` slot; empty = the context has none
   createdAt @5 :UInt64;
   traceId @6 :Data;               # 16-byte OTel trace ID for context-scoped tracing
   forkKind @7 :Text;              # "full"/"filtered"/"compact" or empty
@@ -1252,7 +1252,7 @@ struct ContextHandleInfo {
   keywords @9 :List(Text);        # Synthesis keywords (empty if not yet synthesized)
   topBlockPreview @10 :Text;      # Preview of most representative block (empty if none)
   contextState @11 :Text;         # "live"/"staging"/"concluded"/"archived" (default "live")
-  contextType @12 :Text;          # Unused: the kernel leaves it empty. The facts below (performer @39 to isMcpSession @43) say what a context is
+  contextType @12 :Text;          # UNUSED — always empty; do not repurpose. The facts below (performer @39 to isMcpSession @43) say what a context is
   concludedAt @13 :UInt64;        # 0 = not concluded, else Unix millis of the explicit `conclude` act
   liveStatus @14 :Status;         # live activity: running (working) / error (last turn failed) / else idle
   lastActivityAt @15 :UInt64;     # Unix millis of the most recent block append/mutation; 0 = never/unknown
@@ -1346,7 +1346,7 @@ struct ContextHandleInfo {
 
   # What the context is, read from its performer and the character pointers
   # (docs/character.md, "A person, the console, MCP sessions, the judge").
-  # Clients decide from these, never from `contextType` or a label.
+  # Clients decide from these, never from a label.
   performer @39 :Text;          # The performer's name; empty = the context has no performer
   performedByPerson @40 :Bool;  # The performer is a root character (a person): no model turns, the draft runs as shell
   isRootConsole @41 :Bool;      # Some character's `root_ctx` names this context

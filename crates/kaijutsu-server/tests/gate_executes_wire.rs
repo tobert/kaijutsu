@@ -143,21 +143,21 @@ async fn seats() -> Seats {
     let kernel = kernel_rx.await.unwrap();
     {
         let db = kernel.kernel_db.lock();
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: amy_principal,
             name: "amy".into(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: worker_principal,
             name: "gate-worker".into(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
-        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: approver_principal,
             name: "gate-approver".into(),
             created_at: kaijutsu_types::now_millis() as i64,
@@ -809,7 +809,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
         s.kernel
             .kernel_db
             .lock()
-            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: replacement,
                 name: "gate-replacement".into(),
                 created_at: kaijutsu_types::now_millis() as i64,

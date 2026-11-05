@@ -607,7 +607,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
         {
             let db = shared_kernel.kernel_db.lock();
             for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
-                db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id,
                     name: name.into(),
                     created_at: 0,
@@ -690,9 +690,9 @@ fn test_rpc_created_context_runs_rc_create() {
         // the same path the GUI app and MCP facade take. Its rc create
         // lifecycle (`/config/rc/coder/create/S00-stance.kai`) emits the coder
         // stance as a System/Text block via `kj block create`.
-        let ctx = create_context_typed(&kernel, "rc-coder", "coder")
+        let ctx = create_context_with_rc_dir(&kernel, "rc-coder", "coder")
             .await
-            .expect("create_context_typed");
+            .expect("create_context_with_rc_dir");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
@@ -727,9 +727,9 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = create_context_typed(&kernel, "rc-assistant", "assistant")
+        let ctx = create_context_with_rc_dir(&kernel, "rc-assistant", "assistant")
             .await
-            .expect("create_context_typed");
+            .expect("create_context_with_rc_dir");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
@@ -794,9 +794,9 @@ fn test_coder_stance_is_the_same_for_every_model() {
         let addr = start_server_with_mock_llm_model(model).await;
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let ctx = create_context_typed(&kernel, "rc-coder-stance", "coder")
+        let ctx = create_context_with_rc_dir(&kernel, "rc-coder-stance", "coder")
             .await
-            .expect("create_context_typed");
+            .expect("create_context_with_rc_dir");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
         let blocks = get_all_blocks(&kernel, ctx).await;
         assert!(

@@ -59,7 +59,7 @@ async fn start_server() -> SocketAddr {
     // An MCP session's character runs the `mcp` rc directory, as in production.
     kaijutsu_kernel::kernel_db::KernelDb::open(config.data_dir.as_ref().expect("an ephemeral config has a data dir").join("kernel.db"))
         .expect("open the ephemeral kernel.db")
-        .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: kaijutsu_types::PrincipalId::new(), name: MCP_CHARACTER.to_string(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         })

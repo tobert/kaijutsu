@@ -1318,7 +1318,7 @@ fn pending_row(app: &App, detail: &AskDetail, now_ms: u64) -> PendingRow {
 /// rule's decision).
 fn answered_row(app: &App, detail: &AskDetail) -> AnsweredRow {
     let summary = &detail.summary;
-    let (context_label, _context_type) = summary
+    let (context_label, _performer) = summary
         .context_id
         .map(|ctx| context_facts(app, ctx))
         .unwrap_or_else(|| ("(unknown)".to_string(), crate::app::NO_PERFORMER.to_string()));

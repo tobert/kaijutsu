@@ -72,7 +72,7 @@ fn a_non_root_registration_lands_under_the_hub_and_archives_itself_with_no_ask()
         // An MCP connection's character runs the `mcp` directory, so its
         // sessions read `[rc.mcp]`, which allows a session's own archive.
         for (name, principal_id, _) in &keys {
-            kernel.kernel_db.lock().insert_character(&CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            kernel.kernel_db.lock().insert_character(&CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: *principal_id, name: (*name).into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -86,7 +86,7 @@ fn a_non_root_registration_lands_under_the_hub_and_archives_itself_with_no_ask()
         {
             let db = kernel.kernel_db.lock();
             let hub = db.find_context_by_label("mcp/amy").unwrap().expect("amy has a hub");
-            assert_eq!(hub.context_type, "mcp-hub");
+            assert_eq!(hub.performer, None, "a hub has no performer");
             let console = db.find_context_by_label("amy").unwrap().expect("amy has a console");
             for (session, name) in [(claude_session, "claude"), (bob_session, "bob")] {
                 let row = db.get_context(session).unwrap().unwrap();

@@ -134,7 +134,6 @@ CREATE TABLE IF NOT EXISTS contexts (
     label        TEXT,
     system_prompt TEXT,
     context_state TEXT NOT NULL DEFAULT 'live',
-    context_type TEXT NOT NULL DEFAULT 'default',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL,
     forked_from  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
@@ -817,9 +816,6 @@ CREATE TABLE IF NOT EXISTS characters (
     -- (docs/senpai-kohai.md, "The model"). A rotation of the console moves the
     -- pointer in the commit, as it moves `handoff_ctx`.
     root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
-    -- The context type this character usually plays; `kj context create
-    -- <character>` takes it when `--type` is absent. NULL = none; a root has none.
-    context_type     TEXT,
     -- The directory under /config/rc/ whose lifecycle scripts this
     -- character's contexts run. NULL until set.
     rc_dir           TEXT,

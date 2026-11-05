@@ -17,7 +17,7 @@
 //! `done` is offered it on every turn, so its tools stay the same from turn
 //! to turn. A call the model makes itself returns no messages.
 //!
-//! `*` does not cover this instance: a context type opts in with
+//! `*` does not cover this instance: an rc directory opts in with
 //! `kj binding allow builtin.turn`, because offering `done` changes how every
 //! turn in the context ends.
 

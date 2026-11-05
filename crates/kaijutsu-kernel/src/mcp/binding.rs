@@ -120,7 +120,7 @@ pub fn is_context_scoped(instance: &InstanceId) -> bool {
 }
 
 /// Builtin instances `*` never covers: offering one changes how the
-/// context's turns behave, so a context type grants it by name.
+/// context's turns behave, so an rc directory grants it by name.
 /// `builtin.turn` offers `done`, which changes how a turn ends.
 pub const OPT_IN_INSTANCES: &[&str] = &["builtin.turn"];
 
@@ -931,7 +931,7 @@ mod tests {
         assert!(b.allows_tool(&inst("builtin.file"), "read"), "control: * still covers the rest");
 
         b.grant(Capability::Instance(turn.clone()));
-        assert!(b.allows_tool(&turn, "done"), "a context type grants it by name");
+        assert!(b.allows_tool(&turn, "done"), "an rc directory grants it by name");
     }
 
     #[test]

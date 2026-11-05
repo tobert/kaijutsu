@@ -713,7 +713,6 @@ mod tests {
                 label: Some("child".to_string()),
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
-                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: principal,
                 forked_from: Some(parent),

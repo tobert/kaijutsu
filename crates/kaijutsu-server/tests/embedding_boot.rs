@@ -221,7 +221,7 @@ async fn wait_for_index(shared: &kaijutsu_server::rpc::SharedKernelState) -> Opt
 /// hand-built `kernel.db`, so seed the root row the same way
 /// `kaijutsu-server init` would, without going through a real SSH boot.
 fn insert_root_character(db: &KernelDb) {
-    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
         principal_id: kaijutsu_types::PrincipalId::new(),
         name: "tester".to_string(),
         created_at: kaijutsu_types::now_millis() as i64,

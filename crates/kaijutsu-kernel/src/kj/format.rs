@@ -660,7 +660,6 @@ mod tests {
                         label: label.map(|s| s.to_string()),
             system_prompt: None,
             context_state: ContextState::Live,
-            context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,

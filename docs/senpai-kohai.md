@@ -42,7 +42,7 @@ with no ask.
 
 ## Names
 
-- **Person**: a root character. Every context a person performs is alike, whatever its type: it runs no model
+- **Person**: a root character. Every context a person performs is alike: it runs no model
   turns, its draft runs as shell, and the person may confirm their own commands there.
 - **Root console**: the context `characters.root_ctx` names on a root character's sheet. It is the person's own,
   performed by them, and has no senpai.
@@ -61,24 +61,24 @@ Two layers. Static settings are edited in place. A context takes its performer, 
 made; only its `senpai_ctx` changes after that, through `kj context set --senpai`.
 
 ```
-static     characters           principal_id, name, root, context_type, created_at, retired_at, handoff_ctx,
-                                root_ctx
+static     characters           principal_id, name, root, rc_dir, created_at, retired_at, handoff_ctx,
+                                root_ctx, console_ctx, mcp_hub_ctx
            character_models     principal_id, backend_id, model, max_tokens, temperature, top_p, effort,
                                 thinking_budget, thinking_style
            character_slots      principal_id, role, backend_id, model, max_tokens, temperature, top_p, effort,
                                 thinking_budget, thinking_style
-dynamic    contexts             context_id, context_type, forked_from, label, archived_at, performer,
-                                senpai_ctx, persona, ...
+dynamic    contexts             context_id, forked_from, label, archived_at, performer, senpai_ctx,
+                                persona, ...
            context_slots        context_id, role, backend_id, model, max_tokens, context_window, temperature,
                                 top_p, effort, thinking_budget, thinking_style
 turns                           turn_id, context_id, provider, model, raw tokens, ...
 ```
 
 - **A character** is the persistent someone a name resolves to. Keys in `auth.db` bind to it. Its row holds
-  static settings only: its name, the root flag, the context type it usually plays (`characters.context_type`,
-  NULL for none) and its handoff log. Editing them changes no context.
-  `kj character create <name> --type <t>` and `kj character set <name> --type <t>|--no-type` set the type. A
-  root character has none.
+  static settings only: its name, the root flag, its rc directory (`characters.rc_dir`, the directory under
+  `/config/rc/` its contexts run), a root's console and MCP hub pointers, and its handoff log. Editing them
+  changes no context. `kj character create <name> --rc <dir>` and `kj character set <name> --rc <dir>` set the
+  directory; it defaults to the character's name, and a root's to `person`.
 - **A character's model** (`character_models`, at most one row) is the one model its contexts' turns run on. `kj
   character create <name> --model <backend>/<model>` sets it, and `kj character model set|unset` changes it. A
   root character has none: a root runs no model.
@@ -98,7 +98,7 @@ turns                           turn_id, context_id, provider, model, raw tokens
   root console moves the pointer at the commit, as it moves `handoff_ctx`. A root console cannot be forked,
   moved under a senpai, or archived; `kj context rotate` replaces it, and `kj character set <person> --no-root`
   archives it with the console and the MCP hub when the person stops being one. A context with no senpai must be
-  performed by a root character, whatever its type; boot archives a live one that no `root_ctx` names (a rotation
+  performed by a root character; boot archives a live one that no `root_ctx` names (a rotation
   that never committed), and when it mints a fresh root console for an archived one, the live console that
   answered to the old one answers to the new one.
 - **Live** means not archived. A concluded context is live; verbs that refuse a concluded target say so.
@@ -111,8 +111,8 @@ turns                           turn_id, context_id, provider, model, raw tokens
 
 What stays as it is:
 
-- `context_type`: what a context does (its rc bundle and gate tier). The `director` type keeps its name until
-  characters carry persona.
+- A context has no type: its performer's rc directory, gate layers and model say what it does
+  (`docs/character.md`, "The type melts into the character").
 - `forked_from` and fork kind: provenance only. `forked_from` is the only parent link.
 
 ## Where a model comes from
@@ -225,13 +225,13 @@ model turns; a model turn refuses to start when its performer would review itsel
 
 ## Creating, forking, rotating
 
-- `kj context create <character> [--name <label>] [--type <t>] [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
+- `kj context create <character> [--name <label>] [--senpai <ctx>] [--parent <ctx>] [--cwd <dir>]
   [--env K=V]...` makes a context performed by the character. The positional names the live character; there is
   no `--as`.
   - **Label:** `--name`, else the character's name when no live context holds it, else `<name>-2`, `-3`, … (the
     first free one); the output names the label. A `--name` another live context holds refuses.
-  - **Type:** `--type`, else the character's type. With neither, the create refuses, naming
-    `kj character set <name> --type <t>`; no type stands in.
+  - **rc directory:** the character's `rc_dir`. A character with none refuses, naming
+    `kj character set <name> --rc <dir>`; no directory stands in.
   - **Senpai:** the caller's context, or `--senpai <ctx>` under "Placing under a senpai". `--parent` sets
     `forked_from` only. A create with no calling context and no `--senpai` refuses: the kernel does not pick one.
   - **Slots** are copied from the character, with unset parameters filled from each model's `backend_models`
@@ -245,7 +245,7 @@ model turns; a model turn refuses to start when its performer would review itsel
   senpai. Asks from a fork climb past its performer to the forking context's senpai (Routing, step 4). A root
   console cannot be forked.
 - `kj context rotate <ctx>`: a new context for the same character, with slots copied fresh from the character.
-  It copies the type, env, cwd and shell, and the predecessor's senpai; its `forked_from` is the predecessor's
+  It copies the env, cwd and shell, and the predecessor's senpai; its `forked_from` is the predecessor's
   parent, so the successor is a sibling. The label and ring position move at the commit. The kernel moves no
   context that answers to it (see "Rotation hands off its contexts").
 - `kj context rotate` of a character's handoff log points `characters.handoff_ctx` at the successor. A context
@@ -266,8 +266,8 @@ model turns; a model turn refuses to start when its performer would review itsel
   parent; steps chain in any order: `.senpai.senpai`, `.parent.senpai`), so `kj drift push .senpai "<text>"`
   reaches the senpai with no id to type. There is no `kj senpai` verb.
 - `kj ledger list --reviewer <character>` lists only the asks whose reviewer is that character.
-- `kj context info` shows the context's performer, its senpai, the migration notes for the context, and the model
-  for its type (or why it has none). Its JSON keys are `performer` and `performer_name`. `kj character show`
+- `kj context info` shows the context's performer, its senpai, the migration notes for the context, and its
+  `model` slot (or why it has none). Its JSON keys are `performer` and `performer_name`. `kj character show`
   lists the character's live contexts.
 
 ## Rotation hands off its contexts
@@ -349,8 +349,8 @@ asks, and no model.
   the root character. The hub is its `forked_from` (`--parent` sets nothing else). `<character>` is the
   connection's own character, or the one `--character` (`KAIJUTSU_CHARACTER`) names for a root connection. A client
   that names a `--parent` (`KAIJUTSU_PARENT`) that is not a root console creates under that context instead. A
-  root console whose sheet names no live hub refuses registration, naming the hub. `register_session` takes no
-  context type.
+  root console whose sheet names no live hub refuses registration, naming the hub. `register_session` takes only
+  a label.
 - **No ask.** The gate's builtin layer allows `kj context create <character> --parent <hub>` when `--parent`
   resolves to the MCP hub of the caller's lineage root (`characters.mcp_hub_ctx`), the senpai the create sets
   (`--senpai`, else the calling context) is that root's console, and every argument is a literal word. A create from a kohai of the root console takes the ordinary layers and asks. The decision reads `builtin allows kj context create under mcp/<root
@@ -466,7 +466,7 @@ context it cannot map in `context_character_migration_report`, which `kj context
   write, and so does a character slot of any role but `distill` and `gate`.
 - A drift along the edge runs with no ask, both ways; up from a fork a person made asks; two hops away asks; a
   drift to a sibling still asks; a `gate.toml` ask key wins.
-- The drift hold keys on `console_ctx`; a context of type `console` that no sheet names is not held, and
+- The drift hold keys on `console_ctx`; a context labeled `console` that no sheet names is not held, and
   archiving the console clears the pointer.
 - Two contexts of one character read and write the same handoff log; rotating the handoff context repoints
   `characters.handoff_ctx`.
@@ -482,8 +482,9 @@ context it cannot map in `context_character_migration_report`, which `kj context
   `judge` makes none; a judge with no model is a miss naming the fix; `slot-roles-v1` moves type-keyed slots to
   `model`, drops and reports the rest, and archives live judge shadows.
 - Bootstrap gives the console character a model, not slots, and a second run changes nothing.
-- `kj context create kohai` takes the character's type and the label `kohai`; a second one is `kohai-2`; `--name`
-  and `--type` win; a taken `--name` refuses; no type anywhere refuses; `--as` is unknown.
+- `kj context create kohai` runs the character's rc directory and takes the label `kohai`; a second one is
+  `kohai-2`; `--name` wins; a taken `--name` refuses; a character with no rc directory refuses; `--type` and `--as`
+  are unknown.
 - A root's MCP hub exists after `kj character create --root` and after start; an MCP registration with no
   `--parent` lands under the hub with the root console as senpai and raises no ask; a `gate.toml` ask key on
   `kj context create` still asks; the session's own performer archives it at session end.

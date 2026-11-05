@@ -1439,7 +1439,7 @@ fn test_the_human_places_and_archives_a_coder_card_from_inside_it() {
             argv
         };
 
-        let card = create_context_typed(&kernel, "card", "coder").await.unwrap();
+        let card = create_context_with_rc_dir(&kernel, "card", "coder").await.unwrap();
         for step in ["promote", "demote", "demote"] {
             let result = kernel.execute_kj(card, &verb(step, card, false)).await.unwrap();
             assert_eq!(result.exit_code, 0, "{step}: {}", result.stderr);
@@ -1449,7 +1449,7 @@ fn test_the_human_places_and_archives_a_coder_card_from_inside_it() {
         let archived = kernel.execute_kj(card, &verb("demote", card, true)).await.unwrap();
         assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
 
-        let other = create_context_typed(&kernel, "other-card", "coder").await.unwrap();
+        let other = create_context_with_rc_dir(&kernel, "other-card", "coder").await.unwrap();
         let archived = kernel.execute_kj(other, &verb("archive", other, true)).await.unwrap();
         assert_eq!(archived.exit_code, 0, "{}", archived.stderr);
         let contexts = kernel.list_contexts().await.unwrap();

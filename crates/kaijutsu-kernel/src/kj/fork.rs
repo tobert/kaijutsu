@@ -592,7 +592,6 @@ impl KjDispatcher {
                 } else {
                     ContextState::Live
                 },
-                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -637,11 +636,9 @@ impl KjDispatcher {
             // The carry above already moved a *surviving* parent policy; this
             // covers the gap it leaves open: a full fork whose PARENT itself had
             // no policy. Keys on attachment PRESENCE
-            // (`list_attachments_for_context`), not `context_type` — the row
-            // above hardcodes `context_type = "default"` for every child
-            // regardless of whether it's beat-driven, so context_type can't
-            // distinguish a musician fork from a plain one; the attachment copy
-            // (inside `insert_forked_context`, just above) is the only signal.
+            // (`list_attachments_for_context`): the attachment copy (inside
+            // `insert_forked_context`, just above) is the one signal that
+            // tells a beat-driven fork from a plain one.
             match db.get_hydration_policy(new_id) {
                 // A policy already landed — the carry above, or (in principle)
                 // anything upstream. Never override: an operator's explicit
@@ -742,11 +739,6 @@ impl KjDispatcher {
         ) {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
         }
-
-        // Inherit parent's context_type so the new context's fork-side
-        // rc scripts dispatch correctly. Done post-commit because the
-        // original ContextRow construction defaulted to "default".
-        inherit_parent_context_type(self, new_id, source_id);
 
         // Run rc fork-lifecycle scripts. Script failures surface as Error
         // blocks; a lifecycle bookkeeping fault stops later child admission.
@@ -907,7 +899,6 @@ impl KjDispatcher {
                 label: label.clone(),
                 system_prompt: None,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
-                context_type: source_row.context_type.clone(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -1203,51 +1194,6 @@ impl KjDispatcher {
         Ok(())
     }
 
-}
-
-/// Copy the parent's `context_type` onto the freshly-forked child so the
-/// child's fork-side rc lifecycle dispatches against the parent's type.
-/// All three fork variants (full, filtered, compact) commit their child
-/// with `context_type='default'` at insert time, so this is a post-commit
-/// fixup.
-///
-/// On any error (parent missing, update fails) we leave the child as
-/// 'default' and log — failure here would corrupt fewer guarantees than
-/// aborting a successful fork.
-fn inherit_parent_context_type(
-    dispatcher: &KjDispatcher,
-    child_id: ContextId,
-    parent_id: ContextId,
-) {
-    let parent_type = {
-        let db = dispatcher.kernel_db().lock();
-        match db.get_context(parent_id) {
-            Ok(Some(row)) => row.context_type,
-            Ok(None) => {
-                tracing::warn!(
-                    "rc fork: parent context {} not found; child {} stays 'default'",
-                    parent_id.short(),
-                    child_id.short()
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("rc fork: cannot read parent context_type: {e}");
-                return;
-            }
-        }
-    };
-    if parent_type == "default" {
-        return; // already the default
-    }
-    let db = dispatcher.kernel_db().lock();
-    if let Err(e) = db.update_context_type(child_id, &parent_type) {
-        tracing::warn!(
-            "rc fork: failed to set context_type='{}' on child {}: {e}",
-            parent_type,
-            child_id.short()
-        );
-    }
 }
 
 // Verb class: kj/effect.rs
@@ -2011,8 +1957,7 @@ mod tests {
 
     /// The negative case for the same backstop: a plain (non-beat) full fork of
     /// an unattached parent must NOT gain a policy — "take it all" stays the
-    /// default shape for ordinary forks. The guard keys on attachment presence,
-    /// not on `context_type` (the fork row always hardcodes `"default"`).
+    /// default shape for ordinary forks. The guard keys on attachment presence.
     #[tokio::test]
     async fn fork_of_unattached_parent_without_policy_gets_no_window() {
         let d = test_dispatcher().await;
@@ -2262,7 +2207,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             let performer = PrincipalId::new();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: performer, name: "compactor".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -2914,7 +2859,7 @@ mod tests {
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: character_id, name: "binder".into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -2994,7 +2939,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             if db.get_character(principal).unwrap().is_none() {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id: principal, name: format!("compact-{}", principal.short()), created_at: 0,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -3029,7 +2974,6 @@ mod tests {
         let source = register_context(&d, Some("parent"), None, principal);
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         setup_compact_source(&d, source, principal).await;
-        d.kernel_db().lock().update_context_type(source, "musician").unwrap();
         d.kernel_db().lock().set_context_env(source, "KJ_CONTINUATION_WORD_TARGET", "1800").unwrap();
         d.kernel_db().lock().set_context_env(source, "KJ_DRIFT_WORD_TARGET", "not-a-briefing").unwrap();
         let mut after = d.block_store().last_block_id(source);
@@ -3057,7 +3001,7 @@ mod tests {
             &caller_with_context(source)).await;
         assert!(result.is_ok(), "{}", result.message());
         let child = d.kernel_db().lock().find_context_by_label("child").unwrap().unwrap();
-        assert_eq!(child.context_type, "musician");
+        assert_eq!(child.performer, d.kernel_db().lock().get_context(source).unwrap().unwrap().performer, "the fork continues the source's performance");
         let blocks = d.block_store().get(child.context_id).unwrap().doc.blocks_ordered();
         assert!(blocks.iter().any(|b| b.role == Role::System && b.content == "CUSTOM-MUSICIAN-INSTRUCTIONS"));
         assert!(!blocks.iter().any(|b| b.content == "EXCLUDED-INSTRUCTIONS" || b.content == "hello world"));
@@ -3077,7 +3021,6 @@ mod tests {
         assert!(result.is_ok(), "{}", result.message());
         let child = d.kernel_db().lock().find_context_by_label("grandchild").unwrap().unwrap();
         let blocks = d.block_store().get(child.context_id).unwrap().doc.blocks_ordered();
-        assert_eq!(child.context_type, "musician");
         assert_eq!(blocks.iter().filter(|b| b.content == "CUSTOM-MUSICIAN-INSTRUCTIONS").count(), 1);
         assert!(blocks.iter().any(|b| b.content == "Check the revised score"));
         assert!(blocks.iter().any(|b| b.kind == BlockKind::ToolResult && b.is_error && b.content == "bar 7 still fails"));

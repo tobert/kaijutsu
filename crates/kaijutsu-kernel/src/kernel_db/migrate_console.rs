@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// The `contexts.context_type` a model console was stored with before
+/// `type-melt-v1`.
+const CONSOLE_TYPE: &str = "console";
+
 impl KernelDb {
     pub(super) const CONSOLE_LABEL_MIGRATION: &'static str = "console-label-v1";
 
@@ -37,7 +41,7 @@ impl KernelDb {
                 .collect::<SqliteResult<_>>()?
         };
         let (consoles, others): (Vec<_>, Vec<_>) =
-            live_root.into_iter().partition(|(_, t)| t == kaijutsu_types::CONSOLE_CONTEXT_TYPE);
+            live_root.into_iter().partition(|(_, t)| t == CONSOLE_TYPE);
         if let Some((console, _)) = consoles.first() {
             let holder: Option<ContextId> = tx
                 .query_row(

@@ -1,9 +1,9 @@
 use super::*;
 
 fn labeled(db: &KernelDb, ws: WorkspaceId, label: &str, context_type: &str) -> ContextRow {
-    let mut row = make_context_row(Some(label));
-    row.context_type = context_type.to_string();
+    let row = make_context_row(Some(label));
     insert_context_with_doc(db, &row, ws);
+    set_legacy_context_type(db, row.context_id, context_type);
     row
 }
 

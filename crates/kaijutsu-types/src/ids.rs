@@ -58,7 +58,7 @@ pub struct PresetId(uuid::Uuid);
 pub struct BackendId(uuid::Uuid);
 
 /// A cast identifier (UUIDv7). A *cast* is a named ensemble: role → backend +
-/// model + tunables, one slot per `context_type`.
+/// model + tunables, one slot per role.
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CastId(uuid::Uuid);

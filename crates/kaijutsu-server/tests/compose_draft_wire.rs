@@ -715,19 +715,17 @@ fn shell_submit_authors_the_command_before_clearing_the_draft() {
     });
 }
 
-/// A context a person performs is a REPL, whatever its type: a chat-mode
-/// submit runs the draft as a shell command, the way a shell-mode submit
-/// does, and starts no model turn. Falsified by reading the context type.
+/// A context a person performs is a REPL: a chat-mode submit runs the draft
+/// as a shell command, the way a shell-mode submit does, and starts no model
+/// turn. Falsified by deciding from anything but the performer.
 #[test]
 fn a_persons_context_chat_submit_runs_the_draft_as_shell() {
     run_local(async {
-        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let (addr, _server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
         let person = kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT;
         let context_id = common::create_context_as(&kernel, "draft-shell-repl", person).await.unwrap();
-        // The type is not what makes it a REPL.
-        server.kernel_db.lock().update_context_type(context_id, "default").unwrap();
         kernel.join_context(context_id, "draft-test").await.unwrap();
 
         kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();

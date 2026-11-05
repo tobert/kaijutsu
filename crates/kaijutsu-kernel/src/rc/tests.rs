@@ -73,7 +73,7 @@
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let ctx = register_context(&d, Some("snapshot"), None, PrincipalId::new());
-        set_context_type(&d, ctx, "snapshot");
+        perform_with_rc_dir(&d, ctx, "snapshot");
         install_rc_script_file(&d, "/config/rc/snapshot/create/S00-change.kai", r#"
             echo 'exit 19' > /config/rc/snapshot/create/S10-author.kai
             echo 'new data' > /config/rc/snapshot/create/S10-author.md
@@ -113,45 +113,44 @@
 
     async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt_body() {
         use crate::vfs::VfsOps;
-        for context_type in ["coder", "banto", "toolie", "musician", "council"] {
+        for dir in ["coder", "banto", "toolie", "musician", "council"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
-            let prefix = format!("/config/rc/{context_type}/create/");
+            let prefix = format!("/config/rc/{dir}/create/");
             let mut expected = Vec::new();
             for (path, _) in crate::seed_scripts::seed_files().into_iter()
                 .filter(|(path, _)| path.starts_with(&prefix) && path.ends_with(".md")) {
                 let data = d.kernel().vfs().read_all(std::path::Path::new(&path)).await.unwrap();
                 expected.push(String::from_utf8(data).unwrap());
             }
-            assert!(!expected.is_empty(), "{context_type} must exercise companion data");
+            assert!(!expected.is_empty(), "{dir} must exercise companion data");
             let mut caller = console_caller(&d);
             caller.actor_id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            let created = d.dispatch(&argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", "prompt-test"]), &caller).await;
-            assert!(created.is_ok(), "{context_type}: {}", created.message());
+            let created = d.dispatch(&argv(&["context", "create", rc_performer(&d, dir).as_str(), "--name", "prompt-test"]), &caller).await;
+            assert!(created.is_ok(), "{dir}: {}", created.message());
             let ctx = lookup_context_id(&d, "prompt-test");
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
             let instructions: Vec<_> = blocks.iter()
                 .filter(|b| b.role == Role::System && b.kind == BlockKind::Text).collect();
             let markdown: Vec<_> = instructions.iter()
                 .filter(|b| b.content_type == ContentType::Markdown).map(|b| b.content.clone()).collect();
-            assert_eq!(markdown, expected, "{context_type}: companion instructions changed or reordered");
+            assert_eq!(markdown, expected, "{dir}: companion instructions changed or reordered");
             assert!(instructions.iter().all(|b| b.id.principal_id == caller.actor_id && b.status == Status::Done),
-                "{context_type}: instruction attribution or status differs");
+                "{dir}: instruction attribution or status differs");
             caller.context_id = Some(ctx);
             let prompt = d.dispatch(&argv(&["context", "prompt"]), &caller).await;
-            assert!(prompt.is_ok(), "{context_type}: {}", prompt.message());
+            assert!(prompt.is_ok(), "{dir}: {}", prompt.message());
             for instruction in &expected {
-                assert!(prompt.message().contains(instruction.trim()), "{context_type}: missing rendered instruction");
+                assert!(prompt.message().contains(instruction.trim()), "{dir}: missing rendered instruction");
             }
         }
     }
 
-    /// `bassist` merged into `musician` (docs/chameleon.md, "Players — a
-    /// context_type is an rc bundle"): the seed ships no `bassist` path at
+    /// `bassist` merged into `musician` (`docs/chameleon.md`): the seed ships no `bassist` path at
     /// all, and `musician`'s `create` bundle carries the folded chair voice.
     #[test]
     fn bassist_retired_musician_carries_the_folded_chair() {
@@ -174,7 +173,7 @@
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let ctx = register_context(&d, Some("md-data"), None, PrincipalId::new());
-        set_context_type(&d, ctx, "mddata");
+        perform_with_rc_dir(&d, ctx, "mddata");
         d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
         for name in ["S00-former.md", "README.md"] {
             install_rc_script_file(&d, &format!("/config/rc/mddata/create/{name}"), "data only").await;
@@ -199,7 +198,7 @@
             d.set_self_arc();
             let creator = PrincipalId::new();
             let ctx = register_context(&d, Some("explicit"), None, creator);
-            set_context_type(&d, ctx, "explicit");
+            perform_with_rc_dir(&d, ctx, "explicit");
             let mut caller = caller_with_context(ctx);
             caller.actor_id = PrincipalId::new();
             assert_ne!(creator, caller.principal_id);
@@ -243,7 +242,7 @@
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let ctx = register_context(&d, Some("bad-input"), None, PrincipalId::new());
-            set_context_type(&d, ctx, "badinput");
+            perform_with_rc_dir(&d, ctx, "badinput");
             let path = "/config/rc/badinput/create/S00-instructions.kai";
             install_rc_script_file(&d, path,
                 r#"kj block create --role system --kind text --content-type text/markdown < "$0.txt""#,
@@ -267,7 +266,7 @@
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let ctx = register_context(&d, Some("input-precedence"), None, PrincipalId::new());
-        set_context_type(&d, ctx, "precedence");
+        perform_with_rc_dir(&d, ctx, "precedence");
         install_rc_script_file(&d, "/config/rc/precedence/create/S00-instructions.kai", r#"
             echo ignored | kj block create --role system --kind text --content 'explicit'
             kj block create --role system --kind text < "$0.txt"
@@ -312,7 +311,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
         // A person at a console is a live root character, which `kj context
         // create` needs and whose console anyone may create under.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("person".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
@@ -564,7 +563,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let context = register_context(&d, Some("full-rc-output"), None, PrincipalId::new());
-            set_context_type(&d, context, "full-output");
+            perform_with_rc_dir(&d, context, "full-output");
             let stdout = format!("stdout-first-{}-stdout-last", "音".repeat(3000));
             let stderr = format!("stderr-first-{}-stderr-last", "err".repeat(3000));
             let ending = if failed { "false" } else { "true" };
@@ -591,7 +590,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                         let d = std::sync::Arc::new(test_dispatcher_rc().await);
                         d.set_self_arc();
                         let context = register_context(&d, Some("rc-settlement-fault"), None, PrincipalId::new());
-                        set_context_type(&d, context, "settlement-fault");
+                        perform_with_rc_dir(&d, context, "settlement-fault");
                         install_rc_script_file(&d, "/config/rc/settlement-fault/create/S00-once.kai",
                             "kj block create --role system --kind text --content executed-once; while test ! -e /config/rc/release-output; do sleep 0.01; done; echo retained-after-storage-fault").await;
                         install_rc_script_file(&d, "/config/rc/settlement-fault/create/S10-later.kai",
@@ -655,7 +654,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                     let d = std::sync::Arc::new(test_dispatcher_rc().await);
                     d.set_self_arc();
                     let context = register_context(&d, Some("rc-record-refusal"), None, PrincipalId::new());
-                    set_context_type(&d, context, "record-refusal");
+                    perform_with_rc_dir(&d, context, "record-refusal");
                     install_rc_script_file(&d, "/config/rc/record-refusal/create/S00-mutation.kai",
                         "kj block create --role system --kind text --content must-not-execute-unrecorded").await;
                     let admission = admit(&d, context);
@@ -717,26 +716,23 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    /// The lifecycle runs the performer's rc directory, not the context's
-    /// type, and the run records the directory that ran.
+    /// The lifecycle runs the performer's rc directory, and the run records
+    /// the directory that ran.
     #[tokio::test]
-    async fn rc_runs_the_performers_directory_not_the_context_type() {
+    async fn rc_runs_the_performers_directory() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/typed/create/S00-wrong.kai", "echo from-the-type").await;
         install_rc_script_file(&d, "/config/rc/performed/create/S00-right.kai", "echo from-the-performer").await;
         let ctx = register_context(&d, Some("follows"), None, PrincipalId::new());
         perform_with_rc_dir(&d, ctx, "performed");
-        d.kernel_db().lock().update_context_type(ctx, "typed").unwrap();
 
         let admission = admit(&d, ctx);
         crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
 
         let contents = block_contents_in(&d, ctx);
         assert!(contents.iter().any(|c| c.contains("from-the-performer")), "{contents:?}");
-        assert!(!contents.iter().any(|c| c.contains("from-the-type")), "{contents:?}");
         let run = find_run_for_context(&d, ctx, "create").unwrap();
-        assert_eq!(run.context_type, "performed", "the run records the directory that ran");
+        assert_eq!(run.rc_dir, "performed", "the run records the directory that ran");
         assert_eq!(run.outcome, Some(RcOutcome::Ok));
     }
 
@@ -755,7 +751,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         assert!(!block_contents_in(&d, ctx).iter().any(|c| c.contains("ran-without-a-performer")));
         let run = find_run_for_context(&d, ctx, "create").unwrap();
-        assert_eq!((run.context_type.as_str(), run.script_count, run.outcome), ("", Some(0), Some(RcOutcome::Ok)));
+        assert_eq!((run.rc_dir.as_str(), run.script_count, run.outcome), ("", Some(0), Some(RcOutcome::Ok)));
     }
 
     /// An empty `rc_dir` names no directory: it is as unset as NULL.
@@ -763,7 +759,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     fn an_empty_rc_dir_is_unset() {
         let sheet = |rc_dir: Option<&str>| crate::kernel_db::CharacterRow {
             rc_dir: rc_dir.map(str::to_string), console_ctx: None, mcp_hub_ctx: None,
-            context_type: None, principal_id: PrincipalId::new(), name: "blank".into(), created_at: 0,
+            principal_id: PrincipalId::new(), name: "blank".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         };
         let error = performer_rc_dir(&sheet(Some(""))).unwrap_err();
@@ -781,7 +777,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let ctx = register_context(&d, Some("unset"), None, PrincipalId::new());
         let performer = PrincipalId::new();
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: None, console_ctx: None, mcp_hub_ctx: None,
-            context_type: Some("default".into()), principal_id: performer, name: "dirless".into(), created_at: 0,
+            principal_id: performer, name: "dirless".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().update_performer(ctx, Some(performer)).unwrap();
@@ -795,29 +791,6 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         assert!(errors.iter().any(|e| e.contains("kj character set dirless --rc <dir>")), "{errors:?}");
         let run = find_run_for_context(&d, ctx, "create").unwrap();
         assert_eq!(run.outcome, Some(RcOutcome::Failed));
-    }
-
-    /// A judge shadow runs its performer's rc directory, as every context
-    /// does: its type names no directory.
-    ///
-    /// Falsified by running `judge/` for a context of type `judge`.
-    #[tokio::test]
-    async fn a_judge_shadow_runs_its_performer_s_rc_directory() {
-        let d = std::sync::Arc::new(test_dispatcher_rc().await);
-        d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/seat/create/S00-seat.kai", "echo from-the-seat").await;
-        install_rc_script_file(&d, "/config/rc/judge/create/S99-judge.kai", "echo from-the-judge").await;
-        let ctx = register_context(&d, Some("judge-seat"), None, PrincipalId::new());
-        perform_with_rc_dir(&d, ctx, "seat");
-        d.kernel_db().lock().update_context_type(ctx, "judge").unwrap();
-
-        let admission = admit(&d, ctx);
-        crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
-
-        let contents = block_contents_in(&d, ctx);
-        assert!(contents.iter().any(|c| c.contains("from-the-seat")), "{contents:?}");
-        assert!(!contents.iter().any(|c| c.contains("from-the-judge")), "{contents:?}");
-        assert_eq!(find_run_for_context(&d, ctx, "create").unwrap().context_type, "seat");
     }
 
     /// The RC boot aesthetic (docs/ansi-and-beyond.md): an rc script that
@@ -1051,7 +1024,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         ] {
             d.kernel_db()
                 .lock()
-                .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                .insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id,
                     name: name.into(),
                     created_at: 0,
@@ -1171,7 +1144,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
         let child = register_context(&d, Some("child"), Some(parent), principal);
-        set_context_type(&d, child, "test");
+        perform_with_rc_dir(&d, child, "test");
         // The child needs a block for the default prefix marker to resolve.
         d.block_store()
             .create_document(child, crate::DocumentKind::Conversation, None)
@@ -1410,9 +1383,9 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    /// `context_type = "nonexistent"` has an rc bucket (`/config/rc/nonexistent/`)
-    /// but no `create/` verb directory at all under `test_dispatcher()`'s
-    /// host-backed `LocalBackend` mount. A type whose create bucket is
+    /// The rc directory `nonexistent` (`/config/rc/nonexistent/`) has no
+    /// `create/` verb directory at all under `test_dispatcher()`'s
+    /// host-backed `LocalBackend` mount. A directory whose create bucket is
     /// missing would bind no loadout, so `context create` refuses before
     /// committing a row — an absent-directory create bucket and an empty one
     /// (`context_create_refuses_an_empty_create_directory`) are the same
@@ -1436,7 +1409,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
             .await;
         assert!(
             !result.is_ok(),
-            "a type with no create directory must refuse: {}",
+            "a directory with no create directory must refuse: {}",
             result.message()
         );
         assert!(
@@ -1643,7 +1616,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
 
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("attach-target"), None, principal);
-        set_context_type(&d, target, "test");
+        perform_with_rc_dir(&d, target, "test");
 
         let caller = caller_with_context(target);
         let admission = admit(&d, target);
@@ -1668,7 +1641,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         d.set_self_arc();
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("admitted-then-archived"), None, principal);
-        set_context_type(&d, target, "archive-race");
+        perform_with_rc_dir(&d, target, "archive-race");
         for (order, marker) in [("S00", "first"), ("S10", "second")] {
             install_rc_script_file(&d,
                 &format!("/config/rc/archive-race/tick/{order}-marker.kai"),
@@ -1719,13 +1692,6 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    /// Set a registered context's type to `t` so rc dispatch finds scripts
-    /// under `/config/rc/<t>/...`. `register_context` defaults to "default".
-    /// Make `ctx` a context of type `t` whose performer runs rc directory `t`.
-    fn set_context_type(d: &KjDispatcher, ctx: ContextId, t: &str) {
-        perform_with_rc_dir(d, ctx, t);
-    }
-
     /// Count blocks whose content contains `needle`.
     fn count_blocks_containing(d: &KjDispatcher, ctx: ContextId, needle: &str) -> usize {
         block_contents_in(d, ctx)
@@ -1756,7 +1722,7 @@ esac
 
         let principal = PrincipalId::new();
         let dst = register_context(&d, Some("dst"), None, principal);
-        set_context_type(&d, dst, "test");
+        perform_with_rc_dir(&d, dst, "test");
         let src = register_context(&d, Some("src"), None, principal);
 
         let caller = caller_with_context(dst);
@@ -1803,7 +1769,7 @@ esac
 
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
-        set_context_type(&d, parent, "test");
+        perform_with_rc_dir(&d, parent, "test");
         let child = register_context(&d, Some("child"), Some(parent), principal);
 
         let caller = caller_with_context(child);
@@ -1841,7 +1807,7 @@ esac
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
         let dst = register_context(&d, Some("dst"), None, principal);
-        set_context_type(&d, dst, "test");
+        perform_with_rc_dir(&d, dst, "test");
         // Flush requires a BlockStore document for the destination.
         d.block_store()
             .create_document(dst, crate::DocumentKind::Conversation, None)
@@ -1884,7 +1850,7 @@ esac
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
         let dst = register_context(&d, Some("dst"), None, principal);
-        set_context_type(&d, dst, "test");
+        perform_with_rc_dir(&d, dst, "test");
         d.block_store()
             .create_document(dst, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -2184,7 +2150,7 @@ esac
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let context = register_context(&d, Some("cancel-lifecycle"), None, PrincipalId::new());
-        set_context_type(&d, context, "cancel");
+        perform_with_rc_dir(&d, context, "cancel");
         install_rc_script_file(
             &d,
             "/config/rc/cancel/create/S00-first.kai",
@@ -2262,7 +2228,7 @@ esac
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let outer = register_context(&d, Some("nested-cancel-outer"), None, PrincipalId::new());
-        set_context_type(&d, outer, "nested-cancel-outer");
+        perform_with_rc_dir(&d, outer, "nested-cancel-outer");
         rc_performer(&d, "nested-cancel-child");
         install_rc_script_file(
             &d,
@@ -2527,24 +2493,24 @@ esac
     }
 
     async fn create_seeds_datetime_notification_for_time_aware_types_body() {
-        for context_type in ["coder", "banto", "mcp"] {
+        for dir in ["coder", "banto", "mcp"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let label = format!("c-{context_type}");
+            let label = format!("c-{dir}");
             let r = d
                 .dispatch(
-                    &argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", &label]),
+                    &argv(&["context", "create", rc_performer(&d, dir).as_str(), "--name", &label]),
                     &caller,
                 )
                 .await;
-            assert!(r.is_ok(), "{context_type} create failed: {}", r.message());
+            assert!(r.is_ok(), "{dir} create failed: {}", r.message());
             let ctx = lookup_context_id(&d, &label);
             let notes = notification_blocks_with_marker(&d, ctx);
             assert_eq!(
                 notes.len(),
                 1,
-                "{context_type}: expected exactly one datetime notification, got: {:?}",
+                "{dir}: expected exactly one datetime notification, got: {:?}",
                 block_contents_in(&d, ctx)
             );
         }
@@ -2556,23 +2522,23 @@ esac
     /// attention pollution for both narrow roles.
     #[tokio::test]
     async fn create_seeds_no_datetime_notification_for_clockless_types() {
-        for context_type in ["musician", "toolie"] {
+        for dir in ["musician", "toolie"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let caller = console_caller(&d);
-            let label = format!("c-{context_type}");
+            let label = format!("c-{dir}");
             let r = d
                 .dispatch(
-                    &argv(&["context", "create", rc_performer(&d, context_type).as_str(), "--name", &label]),
+                    &argv(&["context", "create", rc_performer(&d, dir).as_str(), "--name", &label]),
                     &caller,
                 )
                 .await;
-            assert!(r.is_ok(), "{context_type} create failed: {}", r.message());
+            assert!(r.is_ok(), "{dir} create failed: {}", r.message());
             let ctx = lookup_context_id(&d, &label);
             let notes = notification_blocks_with_marker(&d, ctx);
             assert!(
                 notes.is_empty(),
-                "{context_type}: must stay clock-free, got: {:?}",
+                "{dir}: must stay clock-free, got: {:?}",
                 block_contents_in(&d, ctx)
             );
         }
@@ -2598,7 +2564,7 @@ esac
             let db = d.kernel_db().lock();
             for (id, name, dir) in [(caller.principal_id, "amy", "default"), (teller, "kotone", "storyteller")] {
                 if db.get_character(id).unwrap().is_some() { continue; }
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -2617,7 +2583,7 @@ esac
         let ctx = lookup_context_id(&d, "tale");
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let sections = crate::extract_system_prompt_sections(&blocks).join("\n");
-        assert!(sections.contains("accountable"), "the type stance names who is accountable: {sections}");
+        assert!(sections.contains("accountable"), "the stance names who is accountable: {sections}");
         assert!(sections.contains("tea house at the edge of the marsh"), "the card is instruction text: {sections}");
         assert!(!blocks.iter().any(|b| b.kind == BlockKind::Error), "{:?}", block_contents_in(&d, ctx));
         d.kernel_db().lock().assign_test_review(ctx, Some(teller), Some(caller.principal_id)).unwrap();
@@ -2672,7 +2638,7 @@ esac
             let db = d.kernel_db().lock();
             for (id, name, dir) in [(caller.principal_id, "amy", "default"), (kaiten, "kaiten", "companion")] {
                 if db.get_character(id).unwrap().is_some() { continue; }
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -3397,7 +3363,7 @@ esac
                 // Fork runs the child's `fork` scripts; the parent's type is
                 // irrelevant, so build it without a create lifecycle.
                 let parent = register_context(&d, Some("wired-parent"), None, principal);
-                set_context_type(&d, parent, "test");
+                perform_with_rc_dir(&d, parent, "test");
                 d.block_store()
                     .create_document(parent, crate::DocumentKind::Conversation, None)
                     .unwrap();
@@ -3408,7 +3374,7 @@ esac
             }
             VERB_ATTACH => {
                 let target = register_context(&d, Some("wired-attach"), None, principal);
-                set_context_type(&d, target, "test");
+                perform_with_rc_dir(&d, target, "test");
                 let r = d.dispatch(&argv(&["attach", "wired-attach"]), &console_caller(&d)).await;
                 assert!(matches!(r, crate::KjResult::Switch(..)), "attach failed: {}", r.message());
                 target
@@ -3416,7 +3382,7 @@ esac
             VERB_DRIFT => {
                 let src = register_context(&d, Some("wired-src"), None, principal);
                 let dst = register_context(&d, Some("wired-dst"), None, principal);
-                set_context_type(&d, dst, "test");
+                perform_with_rc_dir(&d, dst, "test");
                 d.block_store()
                     .create_document(dst, crate::DocumentKind::Conversation, None)
                     .unwrap();
@@ -3441,14 +3407,14 @@ esac
                     let db = d.kernel_db().lock();
                     let (performer, reviewer) = (PrincipalId::new(), PrincipalId::new());
                     for (id, name) in [(performer, "performer"), (reviewer, "reviewer")] {
-                        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                        db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                             principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                             handoff_ctx: None, root_ctx: None, root: false,
                         }).unwrap();
                     }
                     db.assign_test_review(ctx, Some(performer), Some(reviewer)).unwrap();
                 }
-                set_context_type(&d, ctx, "test");
+                perform_with_rc_dir(&d, ctx, "test");
                 // No provider is configured, so startup fails after the
                 // lifecycle; only the run row is under test. The submit
                 // replies on commit, so the failure is awaited here.
@@ -3467,7 +3433,7 @@ esac
             }
             VERB_ARCHIVE => {
                 let ctx = crate::kj::test_helpers::register_rooted_context(&d, Some("wired-archive"), principal);
-                set_context_type(&d, ctx, "test");
+                perform_with_rc_dir(&d, ctx, "test");
                 d.block_store()
                     .create_document(ctx, crate::DocumentKind::Conversation, None)
                     .unwrap();
@@ -3883,20 +3849,19 @@ esac
 
     // ── archive verb ────────────────────────────────────────────────────
 
-    /// A live context of `context_type` with a conversation document, a
-    /// child of `parent` when given, as `kj context create` makes.
-    /// A context to archive: under `parent`, or else under amy's console, so
+    /// A live context whose performer runs `dir`, with a conversation
+    /// document, as `kj context create` makes. A context to archive: under `parent`, or else under amy's console, so
     /// [`root_archiver`] has authority over it as its lineage root.
-    fn archivable(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str) -> ContextId {
-        archivable_by(d, label, parent, context_type, PrincipalId::new())
+    fn archivable(d: &KjDispatcher, label: &str, parent: Option<ContextId>, dir: &str) -> ContextId {
+        archivable_by(d, label, parent, dir, PrincipalId::new())
     }
 
     /// [`archivable`], run by `character`.
-    fn archivable_by(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str, character: PrincipalId) -> ContextId {
+    fn archivable_by(d: &KjDispatcher, label: &str, parent: Option<ContextId>, dir: &str, character: PrincipalId) -> ContextId {
         let senpai = parent.unwrap_or_else(|| crate::kj::test_helpers::register_root_context(d));
         let ctx = register_context(d, Some(label), Some(senpai), character);
         d.kernel_db().lock().update_performer(ctx, Some(character)).unwrap();
-        set_context_type(d, ctx, context_type);
+        perform_with_rc_dir(d, ctx, dir);
         d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
         ctx
     }
@@ -4002,7 +3967,7 @@ esac
         {
             let db = d.kernel_db().lock();
             db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None,
-                mcp_hub_ctx: None, context_type: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
+                mcp_hub_ctx: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             // A character whose model is on a council server is a judge.
@@ -4041,7 +4006,7 @@ esac
         install_rc_script_file(&d, "/config/rc/test/archive/S10-kid.kai", "kj context archive kid --confirm").await;
         install_rc_script_file(&d, "/config/rc/test/archive/S20-stranger.kai", "kj context archive stranger --confirm").await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -4067,7 +4032,7 @@ esac
         let d = archive_dispatcher().await;
         install_rc_script_file(&d, "/config/rc/test/archive/S10-cousin.kai", "kj context archive cousin --confirm").await;
         let coder = PrincipalId::new();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: coder, name: "coder".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();

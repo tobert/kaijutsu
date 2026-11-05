@@ -549,7 +549,7 @@ fn bind_seat(
     chat: bool,
 ) {
     use crate::kernel_db::{CharacterModelRow, CharacterSlotRow};
-    db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+    db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
         principal_id: character, name: name.into(), created_at: 0, retired_at: None,
         handoff_ctx: None, root_ctx: None, root: false,
     })
@@ -602,7 +602,7 @@ fn bind_seat(
 fn bind_judge(db: &crate::kernel_db::KernelDb, gate_server: &str, spec: &SlotSpec) -> PrincipalId {
     let judge = PrincipalId::new();
     db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(super::shadow::JUDGE.into()), console_ctx: None,
-        mcp_hub_ctx: None, context_type: None, principal_id: judge, name: super::shadow::JUDGE.into(), created_at: 0,
+        mcp_hub_ctx: None, principal_id: judge, name: super::shadow::JUDGE.into(), created_at: 0,
         retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
     })
     .unwrap();
@@ -770,7 +770,7 @@ impl Rig {
             if gate {
                 bind_seat(&db, actor, &format!("{label}-performer"), &self.gate_server, None, false);
             } else {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id: actor, name: format!("{label}-performer"), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 })
@@ -3325,20 +3325,19 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     rig.finish().await;
 }
 
-/// A shadow is found by its performer, not its type: a live child of type
-/// `judge` that the seat's own character performs, as shadows were made
-/// before the judge was a character, is not the judge's shadow, and the
-/// gate makes one the judge character performs.
+/// A shadow is found by its performer: a live child labeled as a shadow
+/// that the seat's own character performs, as shadows were made before the
+/// judge was a character, is not the judge's shadow, and the gate makes one
+/// the judge character performs.
 ///
-/// Falsified by finding the shadow by its type.
+/// Falsified by finding the shadow by its label.
 #[tokio::test]
-async fn an_old_shadow_of_type_judge_is_not_the_judge_s() {
+async fn an_old_shadow_the_seat_performs_is_not_the_judge_s() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::chat_judge("judge-model")), ..Setup::default() }).await;
     let old = crate::kj::test_helpers::register_context(&rig.d, Some("judge-council-seat-old"), Some(rig.ctx.context_id), rig.ctx.actor_id);
     rig.d.block_store().create_document(old, kaijutsu_types::DocKind::Conversation, None).unwrap();
     {
         let db = rig.d.kernel_db().lock();
-        db.update_context_type(old, super::shadow::JUDGE).unwrap();
         db.write_context_character(old, rig.ctx.actor_id, Some(rig.ctx.context_id), None).unwrap();
     }
     rig.submit("echo static").await.unwrap();

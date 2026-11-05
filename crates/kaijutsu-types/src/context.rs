@@ -8,25 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ContextId, PrincipalId};
 
-/// The context type of a root context: a model-less admin console whose
-/// draft runs as shell (`docs/character.md`, "Roots and rotation").
-pub const ROOT_CONTEXT_TYPE: &str = "root";
-
-/// The context type of the model console: a model context under a root,
-/// which holds the root seat's stance and its shell child. Ctrl+Z treats it
-/// as a root (`docs/character.md`, "The root console and its shell").
-pub const CONSOLE_CONTEXT_TYPE: &str = "console";
-
-/// The context type of a shell context: a REPL whose draft runs as shell
-/// whatever mode the client sent, with no model and no slots. It is the child
-/// of a root context, opened from the client (`docs/character.md`).
-pub const SHELL_CONTEXT_TYPE: &str = "shell";
-
-/// The context type of an MCP hub: the model-less parent of every MCP session
-/// of one root character, labeled `mcp/<root name>`. It runs no turns and
-/// routes nothing (`docs/senpai-kohai.md`, "MCP sessions").
-pub const MCP_HUB_CONTEXT_TYPE: &str = "mcp-hub";
-
 /// Seats per time-well ring — the canonical "10". Ring 0 renders exactly
 /// this many slots, addressed by digit hotkeys 0-9, and the kernel refuses
 /// an eleventh promotion (`ACTIVE_RING_CAPACITY` in `kernel_db.rs` derives

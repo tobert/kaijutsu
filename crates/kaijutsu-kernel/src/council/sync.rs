@@ -1675,7 +1675,7 @@ mod tests {
         use kaijutsu_types::PrincipalId;
         let character = PrincipalId::new();
         let db = r.kernel.kernel_db().lock();
-        db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id: character, name: "council-coder".into(), created_at: 0, retired_at: None,
             handoff_ctx: None, root_ctx: None, root: false,
         })
@@ -1712,7 +1712,6 @@ mod tests {
         drop(db);
         let coder = live_context(&r.kernel, "coder-seat");
         let db = r.kernel.kernel_db().lock();
-        db.update_context_type(coder, "coder").unwrap();
         db.assign_stand_in_character(coder, character).unwrap();
         coder
     }

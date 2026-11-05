@@ -125,24 +125,24 @@ system prompt is the only one its model reads; `register_session` returns no
 instruction text. Guidance for that agent belongs in the MCP server's
 instructions or the `shell` tool description.
 
-The council type is a chat context for council guidance. Its own stance asks
+The council directory makes chat contexts for council guidance. Its own stance asks
 the model to think about submitted guidance and acknowledge it in one or two
 sentences. Its loadout grants compose input, capture, and editor access, with
 no model tools. Assign a live performer (whose senpai's holder is a distinct,
 live character) and give the character a model before chatting. Finished thinking and replies become council guidance;
 see `docs/council.md`, "Council contexts are kaijutsu contexts".
 
-The judge type is a seat's shadow: the kernel creates it, runs its `create`
+The judge directory runs a seat's shadow: the kernel creates it, runs its `create`
 lifecycle, and sends it to a council server; no model turn runs in it. Its
 stance frames the seat's command history for the council, after the
 council framing every council context opens with; see `docs/council.md`, "Shadow context".
 
-The storyteller type is a seat for telling stories with the person, for
+The storyteller is a character for telling stories with the person, for
 enjoyment. Its model has no tools. `S05-card.kai` reads the performer's card
 from `/config/rc/storyteller/cards/<performer>.md` as instruction text after
 the stance; no card ships. After each submit, `submit/S10-reminder.kai` writes
 a turn-scoped `(System, Notification)` reminder behind the input: the card's
-`<performer>.reminder.md`, or the type's `S10-reminder.md`. On a model that
+`<performer>.reminder.md`, or the directory's `S10-reminder.md`. On a model that
 supports it, each reminder stops costing tokens at the next user message;
 elsewhere reminders accumulate until rotation or a filtered fork sheds them
 (`docs/conversation-session.md`, "Turn-scoped instructions"). Open work is in `docs/issues.md`,
@@ -342,7 +342,7 @@ may read the archived context's blocks.
 
 `kj context rotate` creates a successor conversation in the predecessor's
 character instance, on the instance's next binding, read fresh from the
-character's cast. It copies the type, system prompt, workspace, env, and cwd,
+character's cast. It copies the system prompt, workspace, env, and cwd,
 sets `ROTATED_FROM` to the predecessor's id, and runs the `create` lifecycle.
 The senpai and the kohai point at the instance, so they do not move. The hydration window is not
 copied; a musician's create lifecycle sets its own. When the successor has a
@@ -370,8 +370,8 @@ not a complete continuation; it omits tool results and can cut prose. An idle
 predecessor resolves from its log without waiting for another turn.
 
 `kj fork --compact` is the alternative when retaining recent working state
-and a generated continuation is useful. It keeps the source's type and
-performer metadata and runs the fork lifecycle, not creation.
+and a generated continuation is useful. It keeps the source's performer
+metadata and runs the fork lifecycle, not creation.
 
 ## Maintaining instructions
 
@@ -446,7 +446,8 @@ kj context set . --env 'KJ_CONTINUATION_WORD_TARGET=2000'
 kj context set . --env 'KJ_DISTILL_INPUT_BYTES=262144'
 ```
 
-Put those commands in the relevant rc lifecycle to choose defaults for a type,
+Put those commands in the relevant rc lifecycle to choose defaults for an rc
+directory,
 or run them for an existing context. Values belong to the **source context**,
 including a drift pull from another context. Forks inherit context environment
 values. Remove an override with `kj context unset . --env KJ_DRIFT_WORD_TARGET`.
@@ -484,8 +485,8 @@ that group's evidence.
 `kj fork --compact` uses the continuation instruction. The child retains the
 source's chosen system instruction blocks and latest complete eligible turn
 group as native blocks, preserving tool linkage. The generated handoff precedes
-that recent working state. The child keeps its context type and runs the fork
-lifecycle; it does not rerun creation.
+that recent working state. The child keeps its source's performer, so it runs
+the same rc directory's fork lifecycle; it does not rerun creation.
 
 The source block version must still match when retained blocks are copied after the
 model call. If it changed, compaction fails with a retry message instead of

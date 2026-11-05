@@ -611,11 +611,10 @@ fn a_null_senpai_outside_a_root_console_is_refused() {
     bare.performer = Some(coder);
     let error = db.insert_placed_context(&bare, ws_id).unwrap_err().to_string();
     assert!(error.contains("needs a senpai"), "{error}");
-    // The rule reads the performer, not the type: a context of any type a
-    // root character performs may be written with no senpai, to become its
-    // root console when the same transaction sets `root_ctx`.
+    // The rule reads the performer: a context a root character performs may
+    // be written with no senpai, to become its root console when the same
+    // transaction sets `root_ctx`.
     let mut person = make_context_row(Some("person-top"));
-    person.context_type = "coder".into();
     person.performer = Some(amy);
     db.insert_placed_context(&person, ws_id).expect("a root character's context may have no senpai");
     // The trigger, under the guard.

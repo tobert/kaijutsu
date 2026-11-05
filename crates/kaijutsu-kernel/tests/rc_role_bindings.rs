@@ -31,8 +31,7 @@ struct Harness {
 }
 
 /// Build a kernel with builtins registered + a kj dispatcher over the same
-/// DB (so seeded rc scripts, context rows, and bindings all line up). The
-/// in-memory DB auto-seeds the role context_types on open.
+/// DB (so seeded rc scripts, context rows, and bindings all line up).
 async fn harness() -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let creator = PrincipalId::system();
@@ -106,11 +105,11 @@ async fn ensure_root(h: &Harness, name: &str) -> kaijutsu_types::ContextId {
         .expect("character create --root must bind a root context")
 }
 
-/// Create a context of `context_type` via `kj context create`, firing its rc
-/// `create` lifecycle, and return the new context id. The caller stands in
+/// Create a context whose performer runs rc directory `dir` via `kj context
+/// create`, firing its rc `create` lifecycle, and return the new context id. The caller stands in
 /// a root console, because `kj context create` needs a current context or
 /// `--parent`.
-async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_types::ContextId {
+async fn create_typed(h: &Harness, label: &str, dir: &str) -> kaijutsu_types::ContextId {
     let root = ensure_root(h, "amy").await;
     // amy creates from her console: `kj context create` needs a live character
     // caller. Unprivileged: the rc create lifecycle assigns the loadout via its
@@ -128,12 +127,12 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         cancel: tokio_util::sync::CancellationToken::new(),
     };
     // The context is an instance of a live, non-root character whose rc
-    // directory is the type under test; a root cannot be assigned as a performer.
-    let performer = format!("rc-{context_type}");
+    // directory is the one under test; a root cannot be assigned as a performer.
+    let performer = format!("rc-{dir}");
     {
         let db = h.db.lock();
         if db.get_character_by_name(&performer).unwrap().is_none() {
-            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some(context_type.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow { rc_dir: Some(dir.into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: kaijutsu_types::PrincipalId::new(),
                 name: performer.clone(),
                 created_at: 0,
@@ -152,7 +151,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
     let res = h.dispatcher.dispatch(&argv, &caller).await;
     assert!(
         matches!(res, KjResult::Ok { .. }),
-        "{context_type} context create failed: {}",
+        "{dir} context create failed: {}",
         res.message()
     );
     h.db
@@ -480,7 +479,7 @@ fn mcp_role_holds_config_governance() {
 }
 
 async fn mcp_role_holds_config_governance_body() {
-    // The `mcp` context_type is the producer/orchestrator voice (Claude Code
+    // The `mcp` rc directory is the producer/orchestrator voice (Claude Code
     // over MCP, cheaper than API rates). On top of the shared broad loadout it
     // adds the config governance cap via S15-governance.kai, so it can drive
     // the SQL-native model surfaces (`kj backend`/`kj character slot`/`kj alias`) and

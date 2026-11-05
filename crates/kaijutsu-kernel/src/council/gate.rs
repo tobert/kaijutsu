@@ -71,7 +71,7 @@ pub(crate) const VERDICT: &str = "verdict";
 /// recorded and shown in a bump; it never decides.
 pub(crate) const UNDO: &str = "undo";
 /// The slot role that names the council server a seat's gate decisions
-/// run on. It is not a context type, so no context resolves its own model
+/// run on. It is never a chat model, so no context resolves its own model
 /// from it.
 pub(crate) const GATE: &str = "gate";
 

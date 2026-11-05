@@ -71,6 +71,7 @@ mod migrate_fold;
 mod migrate_console;
 mod migrate_rc_dir;
 mod migrate_slot_roles;
+mod migrate_type_melt;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]
@@ -502,6 +503,7 @@ impl KernelDb {
         Self::back_up_before_rc_dir_backfill(&conn, path)?;
         Self::back_up_before_rc_dir_rename(&conn, path)?;
         Self::back_up_before_slot_roles(&conn, path)?;
+        Self::back_up_before_type_melt(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
         Self::apply_additive_migrations(&conn)?;
         Self::migrate_ledger(&conn)?;
@@ -734,30 +736,29 @@ fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
 
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
     let state_str: String = row.get(3)?;
-    let fork_kind_str: Option<String> = row.get(8)?;
+    let fork_kind_str: Option<String> = row.get(7)?;
 
     Ok(ContextRow {
         context_id: read_context_id(row, 0)?,
         label: row.get(1)?,
         system_prompt: row.get(2)?,
         context_state: context_state_from_sql(&state_str),
-        context_type: row.get(4)?,
-        created_at: row.get(5)?,
-        created_by: read_principal_id(row, 6)?,
-        forked_from: read_opt_context_id(row, 7)?,
+        created_at: row.get(4)?,
+        created_by: read_principal_id(row, 5)?,
+        forked_from: read_opt_context_id(row, 6)?,
         fork_kind: fork_kind_from_sql(fork_kind_str)?,
-        archived_at: row.get(9)?,
-        workspace_id: read_opt_workspace_id(row, 10)?,
-        preset_id: read_opt_preset_id(row, 11)?,
-        concluded_at: row.get(12)?,
-        last_activity_at: row.get(13)?,
-        promoted_at: row.get(14)?,
-        demoted_at: row.get(15)?,
-        paused_at: row.get(16)?,
-        origin_host: row.get(17)?,
-        performer: read_opt_principal_id(row, 18)?,
-        senpai_ctx: read_opt_context_id(row, 19)?,
-        persona: row.get(20)?,
+        archived_at: row.get(8)?,
+        workspace_id: read_opt_workspace_id(row, 9)?,
+        preset_id: read_opt_preset_id(row, 10)?,
+        concluded_at: row.get(11)?,
+        last_activity_at: row.get(12)?,
+        promoted_at: row.get(13)?,
+        demoted_at: row.get(14)?,
+        paused_at: row.get(15)?,
+        origin_host: row.get(16)?,
+        performer: read_opt_principal_id(row, 17)?,
+        senpai_ctx: read_opt_context_id(row, 18)?,
+        persona: row.get(19)?,
     })
 }
 
@@ -790,10 +791,9 @@ fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
         handoff_ctx: read_opt_context_id(row, 4)?,
         root: row.get(5)?,
         root_ctx: read_opt_context_id(row, 6)?,
-        context_type: row.get(7)?,
-        rc_dir: row.get(8)?,
-        console_ctx: read_opt_context_id(row, 9)?,
-        mcp_hub_ctx: read_opt_context_id(row, 10)?,
+        rc_dir: row.get(7)?,
+        console_ctx: read_opt_context_id(row, 8)?,
+        mcp_hub_ctx: read_opt_context_id(row, 9)?,
     })
 }
 

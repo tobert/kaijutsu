@@ -66,7 +66,7 @@ mod tests {
 
     fn character(db: &KernelDb, name: &str) -> PrincipalId {
         let principal_id = PrincipalId::new();
-        db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        db.insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id, name: name.into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -99,7 +99,6 @@ mod tests {
         let amy = crate::kj::test_helpers::test_reviewer_principal();
         let lane = crate::kj::test_helpers::register_context(&d, Some("amy-lane"), Some(root), amy);
         d.kernel_db().lock().assign_test_review(lane, Some(amy), None).unwrap();
-        d.kernel_db().lock().update_context_type(lane, "coder").unwrap();
         for context in [root, lane] {
             let Err(IdentityError::Refused(message)) = resolve_for_context(d.kernel(), context).await else {
                 panic!("a person's context must refuse a model turn");

@@ -98,7 +98,7 @@ fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str
 
 /// The embedded seed set as `(canonical /config/rc path, body)` pairs, derived
 /// by walking [`RC_SEED_DIR`]. The path encodes
-/// `context_type / verb / sort_key / name / ext`; nothing else is stored
+/// `rc_dir / verb / sort_key / name / ext`; nothing else is stored
 /// (provenance comes from the kernel block's principal on write).
 pub fn seed_files() -> Vec<(String, &'static str)> {
     let mut out = Vec::new();
@@ -640,13 +640,13 @@ mod tests {
         assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
         assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
-        for context_type in ["coder", "banto", "council", "judge", "storyteller", "companion"] {
-            let path = format!("/config/rc/{context_type}/create/S00-stance.md");
+        for dir in ["coder", "banto", "council", "judge", "storyteller", "companion"] {
+            let path = format!("/config/rc/{dir}/create/S00-stance.md");
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
                 stance.contains("accountable"),
-                "{context_type} names who is accountable for the work in its own stance"
+                "{dir} names who is accountable for the work in its own stance"
             );
         }
     }
@@ -998,7 +998,7 @@ mod tests {
     #[test]
     fn edit_through_a_composed_link_reaches_the_shared_body() {
         // On disk a composed seed is an ordinary symlink, so writing through
-        // it changes the body every linking context_type runs. The document
+        // it changes the body every linking rc directory runs. The document
         // backend refused this through an rc verb; the filesystem does not,
         // and that is the accepted trade for plain files. Pinned so the change
         // in meaning is a decision on the record rather than a surprise.

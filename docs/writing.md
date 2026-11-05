@@ -142,8 +142,8 @@ a collision appears in real prose, not in advance.
 | loadout | noun | The set of capabilities a context is given. Where mistake-prevention is routed. |
 | council context | noun | The context labeled `council-<character>` that holds a character's guidance for the council (`docs/council.md`). The set read along the reviewer chain is "the reviewer contexts". Not "voice", which names a musical voice (ABC `V:`, MIDI). |
 | performer | noun | The character that plays a context (`contexts.performer`), fixed when the context is made (`docs/senpai-kohai.md`). Not "context character" or "character instance", and not "seat", which is the council's word for the context whose calls it gates. |
-| root console | noun | A root character's own context (type `root`, `characters.root_ctx`): it has no senpai and runs no model turns. Not "the console". |
-| console | noun | The model console a person talks to (type `console`, label `console`), performed by a non-root character and answering to the person's root console. Not "ROOT" and not "root console". |
+| root console | noun | A root character's own context, the one `characters.root_ctx` names: it has no senpai and runs no model turns. Not "the console". |
+| console | noun | The model console a person talks to, the context `characters.console_ctx` names (bootstrap labels it `console`), performed by a non-root character and answering to the person's root console. Not "ROOT" and not "root console". |
 | seat | noun | Only the council's: the context whose calls the council gates (`docs/council.md`). For a context a character plays, say "context"; for the character in operation, say "performer". |
 | gate | noun, verb | The check that stops a statement to ask its assigned reviewer. The one place that authority lives. |
 | ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
@@ -156,4 +156,4 @@ a collision appears in real prose, not in advance.
 | character | noun | The persistent someone a name resolves to; human or model. A principal with a sheet (`docs/character.md`). For a text unit say code point, glyph, or `char`, never character. |
 | headless kernel | noun | A kernel started with `--headless` (`KernelMode::Headless`): it runs with little input from people, as under a harness, and turns on behavior an interactive kernel leaves off, such as asking for `done` after a text-only reply. Not a turn property; for a turn the kernel drove, say autonomous turn. |
 | autonomous turn | noun | A turn no person prompted (`TurnOrigin::Autonomous`): `kj drive`, `kj fork --prompt`, drift delivery. Not "headless turn" or "driven turn". |
-| context_type | noun | The rc bundle a context runs, `/config/rc/<type>/<verb>/`. A role, not an individual. Character rc composition is planned; see `docs/character.md`, "Current implementation". |
+| rc directory | noun | The directory under `/config/rc/` whose lifecycle scripts a character's contexts run, `/config/rc/<rc_dir>/<verb>/`, named by `characters.rc_dir`. Several characters may share one. A context has no type; say "rc directory" or "performer", never "context type". See `docs/character.md`, "What a context and a character carry". |

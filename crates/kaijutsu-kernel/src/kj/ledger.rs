@@ -1304,10 +1304,9 @@ impl KjDispatcher {
                 None => r.intended_outcome.map_or_else(|| "(running)".to_string(),
                     |outcome| format!("settlement pending ({outcome})")),
             };
-            // `rc_runs.context_type` records the rc directory the run read.
             lines.push(format!(
                 "  {:<38}  {:<12}  {:<16}  {:<16}  {:<8}  {:<13}  {}",
-                r.run_id, context, performer, r.context_type, r.verb, r.started_at, outcome,
+                r.run_id, context, performer, r.rc_dir, r.verb, r.started_at, outcome,
             ));
         }
         lines.push(String::new());
@@ -1459,12 +1458,11 @@ impl KjDispatcher {
             .and_then(|row| row.performer)
             .map(|performer| db.name_for(performer));
 
-        // `rc_runs.context_type` records the rc directory the run read.
         let mut lines = vec![
             format!("run:          {}", run.run_id),
             format!("context:      {}", context.as_deref().unwrap_or("(unparseable)")),
             format!("performer:    {}", performer.as_deref().unwrap_or("-")),
-            format!("dir:          {}", run.context_type),
+            format!("dir:          {}", run.rc_dir),
             format!("verb:         {}", run.verb),
             format!("started_at:   {}", run.started_at),
             format!(
@@ -1541,7 +1539,7 @@ impl KjDispatcher {
             "run_id": run.run_id,
             "context_id": context,
             "performer": performer,
-            "rc_dir": run.context_type,
+            "rc_dir": run.rc_dir,
             "verb": run.verb,
             "started_at": run.started_at,
             "finished_at": run.finished_at,
@@ -2451,7 +2449,7 @@ mod tests {
         let context = register_context(&d, Some("decision-context"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
@@ -3448,7 +3446,7 @@ mod tests {
         let root = register_root_context(d);
         let character = |name: &str| {
             let id = PrincipalId::new();
-            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
@@ -4048,7 +4046,7 @@ mod tests {
     /// directory or character is listed as applying to nobody; a context
     /// with no performer reads `[global]` alone.
     ///
-    /// Falsified by listing entries by context type, by dropping a layer
+    /// Falsified by listing entries by context, by dropping a layer
     /// from the listing, or by dropping the nobody line.
     #[tokio::test]
     async fn ledger_rules_shows_the_performer_s_layers_and_the_sections_that_apply_to_nobody() {
@@ -4560,7 +4558,7 @@ mod tests {
     fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = kaijutsu_types::PrincipalId::new();
         // A person at a console is a live character, which `kj context create` needs.
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
             principal_id, name: format!("console-{}", principal_id.short()), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
@@ -4667,7 +4665,6 @@ mod tests {
         assert_eq!(obj["run_id"].as_str(), Some(run_id.as_str()));
         assert_eq!(obj["rc_dir"], "ledgertest2", "{obj}");
         assert_eq!(obj["performer"], "rc-ledgertest2", "{obj}");
-        assert!(obj.get("context_type").is_none(), "{obj}");
         assert!(shown.message().contains("dir:          ledgertest2"), "{}", shown.message());
         assert!(shown.message().contains("performer:    rc-ledgertest2"), "{}", shown.message());
         let scripts = obj["scripts"].as_array().expect("scripts array");
@@ -5241,7 +5238,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(banto, "banto"), (coder, "coder"), (sibling, "sibling"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.update_performer(seat, Some(banto)).unwrap();
             db.update_performer(lane, Some(coder)).unwrap();
@@ -5285,7 +5282,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(lead, "lead", false), (bob, "bob", true)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "person" } else { "coder" }.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "person" } else { "coder" }.into()), console_ctx: None, mcp_hub_ctx: None, principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
             }
             db.assign_test_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
         }
@@ -5312,7 +5309,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
@@ -5347,7 +5344,7 @@ mod tests {
         caller.context_id = Some(lane);
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_performer(root, Some(amy)).unwrap();

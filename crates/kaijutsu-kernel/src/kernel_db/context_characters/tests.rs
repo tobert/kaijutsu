@@ -6,7 +6,7 @@ use super::*;
 use crate::kernel_db::{
     BackendModelRow, BackendRow, CharacterModelRow, CharacterRow, CharacterSlotRow, ContextRow, DocumentRow, ModelTunablesRow,
     blob_param, insert_context_with_doc, into_pre_context_character, make_context_row, now_millis,
-    set_stored_played_by, setup_test_db,
+    set_legacy_context_type, set_stored_played_by, setup_test_db,
 };
 use crate::kj::context::{CharacterPlacement, insert_new_context_rows};
 
@@ -86,7 +86,7 @@ impl World {
     fn character(&self, name: &str) -> PrincipalId {
         let principal_id = PrincipalId::new();
         self.db
-            .insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            .insert_character(&CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id,
                 name: name.into(),
                 created_at: 0,
@@ -254,15 +254,18 @@ impl World {
         house
     }
 
-    /// A context row; a legacy database also stores `played_by`.
+    /// A context row; a legacy database also stores its type `ty` and
+    /// `played_by`.
     fn ctx(&self, label: &str, ty: &str, played_by: Option<PrincipalId>, forked_from: Option<&ContextRow>) -> ContextRow {
         assert!(self.legacy || played_by.is_none(), "only a legacy database stores a performer; write a context character instead");
         let mut row = make_context_row(Some(label));
-        row.context_type = ty.into();
         row.forked_from = forked_from.map(|f| f.context_id);
         row.created_at = self.clock.get();
         self.clock.set(self.clock.get() + 1);
         insert_context_with_doc(&self.db, &row, self.ws);
+        if self.legacy {
+            set_legacy_context_type(&self.db, row.context_id, ty);
+        }
         if played_by.is_some() {
             set_stored_played_by(&self.db, row.context_id, played_by);
         }
@@ -443,11 +446,11 @@ impl World {
     }
 }
 
-/// A character's model fills its context's `model` and `distill`, whatever
-/// the context's type, with unset parameters taken from the model's row.
+/// A character's model fills its context's `model` and `distill`, with
+/// unset parameters taken from the model's row.
 ///
-/// Falsified by a copy that skips the model, keys it by the context's type,
-/// or does not fill the parameters from `backend_models`.
+/// Falsified by a copy that skips the model or does not fill the parameters
+/// from `backend_models`.
 #[test]
 fn a_character_model_fills_model_and_distill() {
     let w = world();
@@ -503,8 +506,8 @@ fn a_distill_slot_wins_over_the_model_for_distill() {
     assert_eq!(model.model, "ds-flash", "the model fills `model`");
 }
 
-/// The model never fills `gate`; it fills `model` for every context type,
-/// `mcp` included; and a model on a council server fills `model` alone,
+/// The model never fills `gate`; it fills `model` for every context, an MCP
+/// session's included; and a model on a council server fills `model` alone,
 /// since a council server distills nothing. A character with no model
 /// gives a context no `model` slot.
 ///
@@ -996,8 +999,7 @@ fn a_rotation_copies_fresh_slots_and_keeps_the_predecessors_senpai() {
     w.slot(house, "coder", w.anthropic, "claude-x", None);
     w.default_cast(who, house);
 
-    let mut successor = make_context_row(Some("successor"));
-    successor.context_type = "coder".into();
+    let successor = make_context_row(Some("successor"));
     insert_new_context_rows(&w.db, &successor, CharacterPlacement::Rotate { predecessor: lane.context_id }).unwrap();
 
     let copy = w.db.context_character(successor.context_id).unwrap().unwrap();
@@ -1024,8 +1026,7 @@ fn root_ctx_moves_at_commit_rotation() {
         w.db.write_context_character(console.context_id, who, None, None).unwrap();
         w.db.set_character_root_ctx(who, Some(console.context_id)).unwrap();
     }
-    let mut successor = make_context_row(Some("amy-next"));
-    successor.context_type = "root".into();
+    let successor = make_context_row(Some("amy-next"));
     insert_new_context_rows(&w.db, &successor, CharacterPlacement::Rotate { predecessor: old.context_id }).unwrap();
     assert_eq!(w.db.root_console(amy).unwrap(), Some(old.context_id), "the pointer waits for the commit");
 
@@ -1041,9 +1042,9 @@ fn root_ctx_moves_at_commit_rotation() {
 
 /// A live context a root character performs, with no senpai, that no
 /// character's `root_ctx` names is a rotation's successor that never
-/// committed, whatever its type. Boot archives it and leaves the console, a
-/// person's context with a senpai, a context of type `root` with no
-/// performer, and archived rows alone. Falsified by selecting by type.
+/// committed. Boot archives it and leaves the console, a person's context
+/// with a senpai, a context with no performer, a top a model character
+/// performs, and archived rows alone. Falsified by selecting by label.
 #[test]
 fn an_uncommitted_root_successor_is_archived_and_nothing_else() {
     let w = world();

@@ -306,9 +306,9 @@ fn house_capability_migrates_onto_pre_existing_bindings_once() {
     let ws_id = setup_test_db(&db);
     let mut ids = std::collections::BTreeMap::new();
     for ty in ["default", "mcp", "director", "coder", "toolie", "musician", "empty", "unbound"] {
-        let mut row = make_context_row(Some(ty));
-        row.context_type = if matches!(ty, "empty" | "unbound") { "default" } else { ty }.to_string();
+        let row = make_context_row(Some(ty));
         insert_context_with_doc(&db, &row, ws_id);
+        set_legacy_context_type(&db, row.context_id, if matches!(ty, "empty" | "unbound") { "default" } else { ty });
         let mut b = ContextToolBinding::new();
         match ty {
             "empty" => {}
@@ -503,8 +503,7 @@ fn root_migration_adds_the_flag_and_drops_accountable_to() {
     let row = db.get_character(principal).unwrap().unwrap();
     assert_eq!(row.name, "pre-existing", "an existing row must survive the migration");
     assert!(!row.root, "a pre-migration row is not a root");
-    assert!(has("context_type"), "the guarded ALTER must add context_type");
-    assert_eq!(row.context_type, None, "a pre-migration row has no context type");
+    assert!(!has("context_type"), "a database without contexts.context_type never gains characters.context_type");
 
     // A second pass over the already-migrated database is a no-op.
     KernelDb::apply_additive_migrations(&db.conn).unwrap();

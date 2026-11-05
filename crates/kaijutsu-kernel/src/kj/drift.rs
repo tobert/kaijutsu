@@ -1462,7 +1462,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name, root) in [(amy, "house-amy", true), (rootbot, "house-rootbot", false), (coder, "house-coder", false)] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "person" } else { "coder" }.into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some(if root { "person" } else { "coder" }.into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
                 }).unwrap();
             }
@@ -1472,7 +1472,7 @@ mod tests {
             for (context, performer, reviewer) in [(root, amy, None), (console, rootbot, Some(amy)), (lane, coder, Some(amy))] {
                 db.assign_test_review(context, Some(performer), reviewer).unwrap();
             }
-            // The console is the one amy's sheet points at; its type is not read.
+            // The console is the one amy's sheet points at.
             db.set_character_root_ctx(amy, Some(root)).unwrap();
             db.set_character_console_ctx(amy, Some(console)).unwrap();
         }

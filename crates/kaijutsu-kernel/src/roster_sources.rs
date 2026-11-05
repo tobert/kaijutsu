@@ -234,7 +234,6 @@ mod tests {
             label: Some(label.to_string()),
             system_prompt: None,
             context_state: ContextState::Live,
-            context_type: "default".to_string(),
             created_at: now_millis() as i64,
             created_by: PrincipalId::system(),
             forked_from: None,

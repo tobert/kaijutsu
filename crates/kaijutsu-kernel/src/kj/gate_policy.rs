@@ -1200,7 +1200,7 @@ impl GateConfig {
     /// Find the `[rc.<dir>]` and `[character.<name>]` sections that apply
     /// to nobody: a directory not in `rc_dirs`, a character not in
     /// `characters`. An empty `rc_dirs` names every directory, the rule
-    /// `kj::rc::check_context_type` states: there is nothing to validate
+    /// `KjDispatcher::check_rc_dir` states: there is nothing to validate
     /// against, and a kernel with no rc tree is a legitimate shape.
     fn find_nobody(&mut self, rc_dirs: &[String], characters: &[String]) {
         let dirs = self
@@ -1353,7 +1353,7 @@ pub(crate) async fn load_config(vfs: &MountTable, db: &parking_lot::Mutex<Kernel
     }
     // An empty list names every directory, the rule `find_nobody` states, so
     // a tree that cannot be listed skips the directory check.
-    let rc_dirs = match super::rc::known_context_types(vfs).await {
+    let rc_dirs = match super::rc::known_rc_dirs(vfs).await {
         Ok(dirs) => dirs,
         Err(e) => {
             tracing::warn!(
@@ -3152,7 +3152,7 @@ deny = ["kj context create"]
 
     // ── the uncovered tier ──────────────────────────────────────────
 
-    /// A sandbox posture on one context type, beside ordinary tiers.
+    /// A sandbox posture on one rc directory, beside ordinary tiers.
     const SANDBOX: &str = r#"
 [global]
 allow = ["rg"]
@@ -3247,8 +3247,8 @@ uncovered = "allow"
         ));
     }
 
-    /// The setting is per section: another context type, and a caller with
-    /// no context type at all, keep today's behavior.
+    /// The setting is per section: another rc directory, and a caller with
+    /// no rc directory at all, keep today's behavior.
     #[test]
     fn the_uncovered_tier_reaches_only_the_section_that_sets_it() {
         let cfg = config(SANDBOX);
@@ -3536,7 +3536,7 @@ uncovered = "allow"
         for (name, retired_at) in live.iter().map(|n| (n, None)).chain(retired.iter().map(|n| (n, Some(1)))) {
             db.insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: PrincipalId::new(), name: name.to_string(), created_at: 0, retired_at,
-                handoff_ctx: None, root_ctx: None, root: false, context_type: None, rc_dir: Some(name.to_string()),
+                handoff_ctx: None, root_ctx: None, root: false, rc_dir: Some(name.to_string()),
                 console_ctx: None, mcp_hub_ctx: None,
             })
             .unwrap();
@@ -3563,7 +3563,7 @@ uncovered = "allow"
         (buf.0, tracing::subscriber::set_default(subscriber))
     }
 
-    /// The type sections are gone: one fails the load, naming both
+    /// The `[context_type.*]` sections are gone: one fails the load, naming both
     /// replacements, through the error every unknown section takes.
     ///
     /// Falsified by accepting the section, or by refusing it as an unknown
@@ -3704,7 +3704,7 @@ uncovered = "allow"
 
     /// An rc tree that lists nothing names every directory: there is
     /// nothing to check against, and a kernel with no rc tree is a
-    /// legitimate shape. The rule `kj::rc::check_context_type` states.
+    /// legitimate shape. The rule `KjDispatcher::check_rc_dir` states.
     #[tokio::test]
     async fn an_empty_rc_tree_names_every_directory() {
         let (vfs, _rc, config) = rc_tree(&[]).await;

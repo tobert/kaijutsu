@@ -1434,7 +1434,7 @@ mod tests {
         let context = register_context(&d, Some("trace-context"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(actor), Some(reviewer)).unwrap();
@@ -1682,7 +1682,7 @@ mod tests {
         let context = register_context(&d, Some("lead-coder-gate"), None, requester);
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.assign_test_review(context, Some(coder), Some(lead)).unwrap();
@@ -1834,7 +1834,7 @@ mod tests {
         direct.reviewer_id = None;
         {
             let db = d.kernel_db.lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+            db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("judge".into()), console_ctx: None, mcp_hub_ctx: None,
                 principal_id: judge,
                 name: "judge".into(),
                 created_at: 0,
@@ -2959,7 +2959,7 @@ mod tests {
     /// row and sheet: its rc directory, then its name. Another context's
     /// performer gets neither.
     ///
-    /// Falsified by keying the layers on the context type, or by reading
+    /// Falsified by keying the layers on the context, or by reading
     /// the actor instead of the performer.
     #[tokio::test]
     async fn the_performer_layers_apply_to_the_calling_context_s_performer() {
@@ -3018,7 +3018,7 @@ mod tests {
     fn mcp_connection(d: &crate::kj::KjDispatcher, context: kaijutsu_types::ContextId) -> KjCaller {
         let caller = crate::kj::test_helpers::caller_with_context(context);
         d.kernel_db.lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("mcp".into()), console_ctx: None,
-            mcp_hub_ctx: None, context_type: None, principal_id: caller.actor_id, name: "claude".into(), created_at: 0,
+            mcp_hub_ctx: None, principal_id: caller.actor_id, name: "claude".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         caller
@@ -3144,7 +3144,7 @@ mod tests {
         let banto = kaijutsu_types::PrincipalId::new();
         let db = d.kernel_db.lock();
         db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("banto".into()), console_ctx: None,
-            mcp_hub_ctx: None, context_type: None, principal_id: banto, name: "banto".into(), created_at: 0,
+            mcp_hub_ctx: None, principal_id: banto, name: "banto".into(), created_at: 0,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         drop(db);
@@ -3260,7 +3260,7 @@ mod tests {
         let d = gate_dispatcher().await;
         let (amy, _con) = always_ask_fixture(&d);
         d.kernel_db.lock().insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()),
-            console_ctx: None, mcp_hub_ctx: None, context_type: None, principal_id: kaijutsu_types::PrincipalId::new(),
+            console_ctx: None, mcp_hub_ctx: None, principal_id: kaijutsu_types::PrincipalId::new(),
             name: "plain".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let allow = "[global]\nallow = [\"kj character retire\"]\n";

@@ -14,11 +14,11 @@ use crate::error::{LedgerError, Result};
 use crate::types::{RcOutcome, RcRunRow, RcRunScriptRow, parse_enum};
 
 /// Start a run and return its `run_id` (UUIDv7).
-pub fn start_run(conn: &Connection, context_id: &[u8], context_type: &str, verb: &str) -> Result<String> {
+pub fn start_run(conn: &Connection, context_id: &[u8], rc_dir: &str, verb: &str) -> Result<String> {
     let run_id = uuid::Uuid::now_v7().to_string();
     conn.execute(
-        "INSERT INTO rc_runs (run_id, context_id, context_type, verb) VALUES (?1, ?2, ?3, ?4)",
-        params![run_id, context_id, context_type, verb],
+        "INSERT INTO rc_runs (run_id, context_id, rc_dir, verb) VALUES (?1, ?2, ?3, ?4)",
+        params![run_id, context_id, rc_dir, verb],
     )?;
     Ok(run_id)
 }
@@ -63,7 +63,7 @@ pub fn set_run_script_count(conn: &Connection, run_id: &str, count: usize) -> Re
 /// actually fire" without already knowing a `run_id` to look up.
 pub fn list_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
     let mut stmt = conn.prepare(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
+        "SELECT run_id, context_id, rc_dir, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs ORDER BY started_at DESC",
     )?;
     let rows = stmt.query_map([], row_to_run)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -107,7 +107,7 @@ pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(
         conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
 
     let select_sql = format!(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
+        "SELECT run_id, context_id, rc_dir, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs {where_clause} ORDER BY started_at DESC LIMIT ?"
     );
     let mut select_params = params;
@@ -121,7 +121,7 @@ pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(
 
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RcRunRow>> {
     conn.query_row(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
+        "SELECT run_id, context_id, rc_dir, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs WHERE run_id = ?1",
         params![run_id],
         row_to_run,
@@ -142,7 +142,7 @@ fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RcRunRow> {
     Ok(RcRunRow {
         run_id: row.get(0)?,
         context_id: row.get(1)?,
-        context_type: row.get(2)?,
+        rc_dir: row.get(2)?,
         verb: row.get(3)?,
         started_at: row.get(4)?,
         finished_at: row.get(5)?,
@@ -306,7 +306,7 @@ pub fn mark_run_script_projected(
 /// List runs that have not reached a terminal outcome.
 pub fn list_unfinished_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
     let mut stmt = conn.prepare(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
+        "SELECT run_id, context_id, rc_dir, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs WHERE finished_at IS NULL ORDER BY started_at DESC",
     )?;
     Ok(stmt.query_map([], row_to_run)?.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -315,7 +315,7 @@ pub fn list_unfinished_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
 /// List retained results that still need a context-log projection.
 pub fn list_pending_script_projections(conn: &Connection) -> Result<Vec<(RcRunRow, RcRunScriptRow)>> {
     let mut stmt = conn.prepare(
-        "SELECT r.run_id, r.context_id, r.context_type, r.verb, r.started_at, r.finished_at, r.outcome, r.script_count, r.intended_outcome,
+        "SELECT r.run_id, r.context_id, r.rc_dir, r.verb, r.started_at, r.finished_at, r.outcome, r.script_count, r.intended_outcome,
                 s.seq, s.path, s.body_sha256, s.exit_code, s.started_at, s.finished_at, s.result_json, s.projected_at, s.output_block_id
          FROM rc_runs r JOIN rc_run_scripts s ON s.run_id = r.run_id
          WHERE s.result_json IS NOT NULL AND s.projected_at IS NULL

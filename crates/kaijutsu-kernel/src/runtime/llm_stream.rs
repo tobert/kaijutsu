@@ -6742,7 +6742,6 @@ mod usage_tests {
                 label: None,
                 system_prompt: None,
                 context_state: kaijutsu_types::ContextState::Live,
-                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: player,
                 forked_from: None,
@@ -8029,7 +8028,7 @@ mod lifetime_tests {
         {
             let db = kernel.kernel_db().lock();
             for (id, name) in [(actor, "performer"), (reviewer, "reviewer")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None, context_type: None,
+                db.insert_character(&crate::kernel_db::CharacterRow { rc_dir: Some("coder".into()), console_ctx: None, mcp_hub_ctx: None,
                     principal_id: id, name: name.into(), created_at: 0, retired_at: None,
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
@@ -8040,7 +8039,7 @@ mod lifetime_tests {
             db.insert_context_with_document(&crate::ContextRow {
                 context_id: senpai, label: Some("reviewer-seat".into()), system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: "default".into(), created_at: 0, created_by: reviewer,
+                created_at: 0, created_by: reviewer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
@@ -8049,7 +8048,7 @@ mod lifetime_tests {
             db.insert_context(&crate::ContextRow {
                 context_id: context, label: None, system_prompt: None,
                 context_state: ContextState::Live,
-                context_type: "default".into(), created_at: 0, created_by: reviewer,
+                created_at: 0, created_by: reviewer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,
@@ -8084,7 +8083,7 @@ mod lifetime_tests {
         db.insert_context_with_document(&crate::ContextRow {
             context_id: context, label: None, system_prompt: None,
             context_state: ContextState::Live,
-            context_type: "default".into(), created_at: 0, created_by: creator,
+            created_at: 0, created_by: creator,
             forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
             preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
             demoted_at: None, paused_at: None, origin_host: None,
@@ -8803,7 +8802,7 @@ mod lifetime_tests {
             let ws = db.get_or_create_default_workspace(performer).unwrap();
             db.insert_context_with_document(&crate::ContextRow {
                 context_id: successor, label: None, system_prompt: None,
-                context_state: ContextState::Live, context_type: "default".into(), created_at: 0, created_by: performer,
+                context_state: ContextState::Live, created_at: 0, created_by: performer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, origin_host: None,

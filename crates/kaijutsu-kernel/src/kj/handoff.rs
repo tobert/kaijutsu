@@ -1,8 +1,8 @@
 //! `kj handoff note|tail` — the handoff log, an ordinary context
 //! (`docs/character.md`, "The handoff is an ordinary context", slice 4).
 //!
-//! Every character gets one context of `context_type = "handoff"`, pointed
-//! at by `characters.handoff_ctx`, minted lazily by the first `note` a
+//! Every character gets one performer-less context, pointed at by
+//! `characters.handoff_ctx`, minted lazily by the first `note` a
 //! character's log ever receives. `note` appends a block authored by the
 //! CALLER's principal — never the target's — so a message left for another
 //! character reads as coming from whoever actually wrote it; the handoff
@@ -365,7 +365,6 @@ impl KjDispatcher {
             label: Some(label.clone()),
             system_prompt: None,
             context_state: ContextState::Live,
-            context_type: "handoff".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: target.principal_id,
             forked_from: None,

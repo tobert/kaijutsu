@@ -17,7 +17,7 @@ impl KernelDb {
     pub fn fork_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.label,
-                    c.system_prompt, c.context_state, c.context_type,
+                    c.system_prompt, c.context_state,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                     c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.origin_host, c.performer, c.senpai_ctx, c.persona
@@ -86,7 +86,7 @@ impl KernelDb {
                 WHERE c.forked_from IS NOT NULL
             )
             SELECT c.context_id, c.label,
-                   c.system_prompt, c.context_state, c.context_type,
+                   c.system_prompt, c.context_state,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
@@ -98,7 +98,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(21)?;
+            let depth: i64 = row.get(20)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)

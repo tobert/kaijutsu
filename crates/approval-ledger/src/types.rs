@@ -795,7 +795,8 @@ impl AskCoverage {
 pub struct RcRunRow {
     pub run_id: String,
     pub context_id: Vec<u8>,
-    pub context_type: String,
+    /// The rc directory the run read, under the name it had when it ran.
+    pub rc_dir: String,
     pub verb: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,

@@ -35,7 +35,7 @@ fn set_origin_host_round_trips_through_get_context() {
 }
 
 /// `set_origin_host` on an unknown context must fail loudly
-/// (`NotFound`), same convention as `update_label`/`update_context_type`
+/// (`NotFound`), same convention as `update_label`
 /// — never a silent no-op that could be mistaken for success.
 #[test]
 fn set_origin_host_unknown_context_is_not_found() {
@@ -254,7 +254,6 @@ fn context_row_to_context() {
         label: Some("test".into()),
         system_prompt: None,
         context_state: ContextState::Live,
-        context_type: "default".to_string(),
         created_at: now,
         created_by: creator,
         forked_from: Some(parent),
@@ -292,7 +291,6 @@ fn roundtrip_create_and_recover() {
         label: Some("parent".into()),
         system_prompt: Some("You are helpful.".into()),
         context_state: ContextState::Live,
-        context_type: "default".to_string(),
         created_at: 1000,
         created_by: creator,
         forked_from: None,
@@ -317,7 +315,6 @@ fn roundtrip_create_and_recover() {
         label: Some("child-fork".into()),
         system_prompt: Some("Be concise.".into()),
         context_state: ContextState::Live,
-        context_type: "default".to_string(),
         created_at: 2000,
         created_by: creator,
         forked_from: Some(parent_id),

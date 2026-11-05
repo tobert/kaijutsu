@@ -1206,8 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn transport_attach_falls_back_to_default_when_unpersisted() {
         // No persisted attachment → attach on the musician default + a lane
-        // derived from the label. The context_type is irrelevant — attaching is
-        // the opt-in, so any context with a sluggable label gets a beat.
+        // derived from the label. Attaching is the opt-in, so any context with a sluggable label gets a beat.
         use kaijutsu_types::TrackId;
 
         let d = test_dispatcher().await;
@@ -1331,9 +1330,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_attach_uses_persisted_row_regardless_of_type() {
-        // A type-changed context still carries (and uses) its persisted attachment
-        // row — attaching is an explicit opt-in, so the last-known policy/lane is
+    async fn transport_attach_uses_the_persisted_row() {
+        // A context keeps (and uses) its persisted attachment row — attaching is an explicit opt-in, so the last-known policy/lane is
         // what's wanted, not a refusal.
         use crate::kernel_db::{PersistedAttachment, PersistedTrack};
         use kaijutsu_types::TrackId;
