@@ -55,6 +55,59 @@ own. Each draft left behind logs one `warn` line with the parent and child
 contexts, principal, block id, character count, and a short content hash;
 the text is never logged.
 
+## Dropping bulk (`--drop`)
+
+```sh
+kj fork --name work-lean --drop images,tool_results,thinking
+kj fork --drop mcp:shots
+```
+
+`--drop` thins the blocks a selection keeps, and every turn keeps its shape.
+`images` drops Asset image blocks. A result that attached an image still names
+the image's CAS hash, so the model can attach it again. `thinking` drops
+thinking blocks, except those after the last person's text: that turn may be
+an open tool loop, and its next request must send its signed thinking back.
+`tool_results` drops the bulk of every tool result, and `mcp:<server>` drops it
+only from that server's results. The server's tools are the names the
+context's binding resolved for it; a server the context never named fails the
+fork. `none` alone drops nothing. A tool call stays, paired with its result.
+The child reads an original with `kj block read <key>`, a read that any shell
+may run without an ask, or the `block_read` tool where its loadout has it.
+
+A result whose text is at most 1024 bytes stays whole. A larger one keeps what
+tells the model how the call went:
+
+- A shell result keeps the fact lines a model turn reads
+  (`docs/shell-envelope.md`, "What a model turn reads"), and one line replaces
+  its output. `data` over 1024 bytes goes too.
+
+  ```text
+  [dropped: 48213 bytes of output; read with: kj block read <source block key>]
+  [exit 1]
+  [cwd now /src/kaijutsu]
+  ```
+
+- A JSON object, such as most MCP results, keeps its smallest fields whole
+  while they fit within 1024 bytes, in their original order. The other fields
+  move into `dropped`, with their sizes and the command that reads the
+  original:
+
+  ```json
+  {"ok":true,"count":3,
+   "dropped":{"fields":{"text":48213},"read":"kj block read <source block key>"}}
+  ```
+
+- Any other text becomes one line:
+  `[dropped: 48213 bytes; read with: kj block read <source block key>]`.
+
+The people-facing text shows the same stub, and its rendering, style spans and
+content type are reset. A result no model turn sent keeps a small `stderr`,
+so its Error child still reaches the model. A stub is never slimmed again, so
+a fork of a fork still names the original. Nothing is cut partway. The source
+context keeps every original, and the child's fork marker counts what was
+dropped. `--drop` conflicts with `--compact` and makes the fork a filtered one
+(`slim` in `kaijutsu_kernel::blocks`).
+
 ## The primitive
 
 A fork-time **interval selection** over the order-key-sorted, non-deleted

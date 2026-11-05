@@ -902,7 +902,7 @@ impl BlockStore {
         new_id: ContextId,
         before_timestamp: u64,
         filter: &ForkBlockFilter,
-    ) -> BlockStoreResult<()> {
+    ) -> BlockStoreResult<crate::blocks::DropReport> {
         self.fork_document_filtered_checked(source_id, new_id, before_timestamp, filter, None)
     }
 
@@ -914,7 +914,7 @@ impl BlockStore {
         before_timestamp: u64,
         filter: &ForkBlockFilter,
         expected_version: Option<u64>,
-    ) -> BlockStoreResult<()> {
+    ) -> BlockStoreResult<crate::blocks::DropReport> {
         if self.documents.contains_key(&new_id) {
             return Err(BlockStoreError::DocumentAlreadyExists(new_id));
         }
@@ -939,10 +939,10 @@ impl BlockStore {
         }
 
         let principal_id = self.principal_id();
-        let forked_store =
+        let (forked_store, report) =
             source_entry
                 .doc
-                .fork_filtered(new_id, principal_id, before_timestamp, filter);
+                .fork_filtered_reporting(new_id, principal_id, before_timestamp, filter);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry);
@@ -961,7 +961,8 @@ impl BlockStore {
             uncompacted_bytes: AtomicU64::new(0),
             activity_stamped_at: AtomicI64::new(0),
         };
-        self.publish_fork(new_id, entry)
+        self.publish_fork(new_id, entry)?;
+        Ok(report)
     }
 
     /// Get the number of documents.

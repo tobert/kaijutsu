@@ -64,7 +64,22 @@ pub(crate) struct ForkArgs {
     /// in the source. Ranges use the same grammar as --include.
     #[arg(long)]
     exclude: Vec<String>,
+    /// Drop bulk from the child, comma-separated or repeated: `images`,
+    /// `thinking` (the last turn keeps its own), `tool_results`, or
+    /// `mcp:<server>` for that server's results; `none` drops nothing. Tool calls stay paired with
+    /// their results. A result over 1024 bytes keeps its shell fact lines
+    /// (`[exit 1]`, `[cwd now ...]`) or its smallest JSON fields, and one
+    /// line or a `dropped` field names the source block for `kj block read`.
+    /// The source context keeps everything.
+    #[arg(long, value_delimiter = ',', conflicts_with = "compact")]
+    drop: Vec<String>,
 }
+
+/// A result over this many bytes loses its bulk under `kj fork --drop`.
+const DROP_LIMIT: usize = 1024;
+
+/// What `kj context rotate --migrate` drops when no `--drop` is given.
+pub(super) const MIGRATE_DROP: &[&str] = &["images", "tool_results", "thinking"];
 
 /// The fork-time interval selection, resolved at the fork instant from the
 /// recalled preset patch (`base` + stored include/exclude rows) composed with
@@ -113,6 +128,49 @@ fn fmt_runs(runs: &[std::ops::Range<usize>]) -> String {
 }
 
 impl KjDispatcher {
+    /// Resolve `--drop` against `source`. An `mcp:<server>` entry names the
+    /// tools the source's binding resolved for that server, and fails when
+    /// it resolved none.
+    pub(super) fn resolve_drop(&self, source: ContextId, entries: &[String]) -> Result<Option<crate::blocks::DropSpec>, String> {
+        if entries.is_empty() || entries.iter().all(|e| e.trim() == "none") {
+            return Ok(None);
+        }
+        let mut spec = crate::blocks::DropSpec { limit: DROP_LIMIT, ..Default::default() };
+        for entry in entries {
+            match entry.trim() {
+                "images" => spec.images = true,
+                "thinking" => spec.thinking = true,
+                "tool_results" => spec.tool_results = true,
+                other => {
+                    let Some(server) = other.strip_prefix("mcp:").filter(|s| !s.is_empty()) else {
+                        return Err(format!(
+                            "--drop {other}: expected images, thinking, tool_results, mcp:<server>, or none alone"
+                        ));
+                    };
+                    let binding = self.kernel_db().lock().get_context_binding(source).map_err(|e| e.to_string())?;
+                    let instances = [
+                        crate::mcp::external_instance_id(server),
+                        crate::mcp::context_servers::context_instance_id(source, server),
+                    ];
+                    let names: Vec<String> = binding
+                        .map(|b| {
+                            b.name_map
+                                .into_iter()
+                                .filter(|(_, (instance, _))| instances.contains(instance))
+                                .map(|(visible, _)| visible)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if names.is_empty() {
+                        return Err(format!("--drop mcp:{server}: this context has named no tools of an MCP server called {server}"));
+                    }
+                    spec.tool_names.extend(names);
+                }
+            }
+        }
+        Ok(Some(spec))
+    }
+
     /// Recall a preset patch and compose it with the CLI ranges into the
     /// fork-time keep-set (`kept = (base ∩ ∪cli_inc) \ ∪exc`), resolved against
     /// the parent's fork-instant ordered snapshot.
@@ -500,8 +558,14 @@ impl KjDispatcher {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj fork: {e}")),
         };
-        // A narrowing selection is a Filtered fork; a plain full copy stays Full.
-        let fork_kind = if selection.filtered {
+        let drop = match self.resolve_drop(source_id, &args.drop) {
+            Ok(d) => d,
+            Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+        };
+        // A narrowing selection or a drop is a Filtered fork; a plain full
+        // copy stays Full.
+        let filtered = selection.filtered || drop.is_some();
+        let fork_kind = if filtered {
             ForkKind::Filtered
         } else {
             ForkKind::Full
@@ -511,20 +575,22 @@ impl KjDispatcher {
         // history-preserving path); a narrowing selection routes through the
         // filtered copy (snapshot-rebuilt with the positional keep-set +
         // block-key drops).
-        let copy = if selection.filtered {
+        let copy = if filtered {
             let filter = crate::blocks::ForkBlockFilter {
                 selection: selection.selection.clone(),
                 exclude_block_ids: selection.exclude_block_ids.clone(),
+                drop,
                 ..Default::default()
             };
             self.block_store()
                 .fork_document_filtered(source_id, new_id, fork_ts, &filter)
         } else {
-            self.block_store().fork_document(source_id, new_id)
+            self.block_store().fork_document(source_id, new_id).map(|()| Default::default())
         };
-        if let Err(e) = copy {
-            return KjResult::Err(format!("kj fork: failed to copy document: {e}"));
-        }
+        let dropped = match copy {
+            Ok(report) => report,
+            Err(e) => return KjResult::Err(format!("kj fork: failed to copy document: {e}")),
+        };
 
         // A block still `Running` or `Waiting` in the parent was copied as
         // such, and nothing in the child will ever finish it — the parent's
@@ -726,6 +792,7 @@ impl KjDispatcher {
                 "{closed_at_fork} block(s) left open in the parent were closed here"
             ));
         }
+        notes.extend(dropped.note());
         let marker_note = (!notes.is_empty()).then(|| notes.join(" — "));
         if let Err(e) = self.inject_fork_marker(
             new_id,
@@ -1312,6 +1379,231 @@ mod tests {
             !contents.iter().any(|c| c.contains("DROPME")),
             "the excluded block must not be copied into the child: {contents:?}"
         );
+    }
+
+    /// Insert `snap` as written, under its own id's principal.
+    fn insert_snapshot(
+        d: &crate::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        snap: kaijutsu_types::BlockSnapshot,
+    ) -> kaijutsu_types::BlockId {
+        let principal = snap.id.principal_id;
+        let after = d.block_store().last_block_id(ctx);
+        d.block_store().insert_from_snapshot_as(ctx, snap, after.as_ref(), Some(principal)).unwrap()
+    }
+
+    /// A tool call and its result, the result sent to the model as `sent`.
+    fn insert_tool_pair(
+        d: &crate::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        model: PrincipalId,
+        tool: &str,
+        content: &str,
+        sent: Option<&str>,
+    ) -> (kaijutsu_types::BlockId, kaijutsu_types::BlockId) {
+        insert_tool_pair_with(d, ctx, model, tool, content, sent, None)
+    }
+
+    /// [`insert_tool_pair`] with the shell envelope record a shell result keeps.
+    fn insert_tool_pair_with(
+        d: &crate::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        model: PrincipalId,
+        tool: &str,
+        content: &str,
+        sent: Option<&str>,
+        envelope: Option<String>,
+    ) -> (kaijutsu_types::BlockId, kaijutsu_types::BlockId) {
+        use kaijutsu_types::{BlockId, BlockSnapshot, Role, ToolKind};
+        let seq = d.block_store().block_snapshots(ctx).unwrap().len() as u64;
+        let use_id = format!("toolu_{seq}");
+        let call = insert_snapshot(d, ctx, BlockSnapshot::tool_call(
+            BlockId::new(ctx, model, seq), None, ToolKind::Shell, tool,
+            serde_json::json!({"code": "cat big"}), Role::Model, Some(use_id.clone()),
+        ));
+        let mut result = BlockSnapshot::tool_result(
+            BlockId::new(ctx, PrincipalId::system(), seq + 1), call, ToolKind::Shell,
+            content, false, Some(0), Some(use_id),
+        );
+        result.model_content = sent.map(str::to_owned);
+        result.shell_envelope = envelope;
+        (call, insert_snapshot(d, ctx, result))
+    }
+
+    /// `kj fork --drop` keeps every turn's shape and drops the bulk: images
+    /// and thinking leave, a big result keeps its small fields and names the
+    /// rest, a small result stays whole, and the marker says what was dropped.
+    #[tokio::test]
+    async fn fork_drop_keeps_turns_and_drops_the_bulk() {
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Role};
+        let d = test_dispatcher().await;
+        let human = PrincipalId::new();
+        let model = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, human);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+
+        insert_text(&d, source, human, "read the big file");
+        let mut thinking = BlockSnapshot::text(BlockId::new(source, model, 100), None, Role::Model, "THOUGHTS");
+        thinking.kind = BlockKind::Thinking;
+        thinking.signature = Some("sig".to_string());
+        insert_snapshot(&d, source, thinking);
+        let stdout = "B".repeat(20_000);
+        let mut envelope = kaijutsu_types::shell_envelope::ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Done);
+        envelope.cwd = Some("/src".to_string());
+        let (big_call, big_result) = insert_tool_pair_with(
+            &d, source, model, "shell", &stdout, Some(&envelope.model_text(&stdout)),
+            Some(serde_json::to_string(&envelope).unwrap()),
+        );
+        let (_, small_result) = insert_tool_pair(&d, source, model, "shell", "tiny", Some(r#"{"stdout":"tiny","exit_code":0}"#));
+        let mut image = BlockSnapshot::text(BlockId::new(source, model, 200), None, Role::Asset, "cafebeef");
+        image.content_type = ContentType::Image;
+        insert_snapshot(&d, source, image);
+        insert_text(&d, source, model, "the file is all Bs");
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("lean"), s("--drop"), s("images,tool_results,thinking")], &c)
+            .await;
+        assert!(result.is_ok(), "fork --drop failed: {}", result.message());
+
+        let child = d.kernel_db().lock().find_context_by_label("lean").unwrap().unwrap().context_id;
+        let blocks = d.block_store().block_snapshots(child).unwrap();
+        let in_child = |id: BlockId| {
+            blocks.iter().find(|b| b.id == BlockId::new(child, id.principal_id, id.seq)).cloned()
+        };
+        assert!(!blocks.iter().any(|b| b.kind == BlockKind::Thinking), "thinking is dropped");
+        assert!(!blocks.iter().any(|b| b.content_type == ContentType::Image), "the image is dropped");
+        assert!(in_child(big_call).is_some(), "the call stays");
+
+        let slim = in_child(big_result).expect("the big result stays as a stub");
+        assert_eq!(
+            slim.model_content.as_deref(),
+            Some(format!(
+                "[dropped: 20000 bytes of output; read with: kj block read {}]\n[cwd now /src]",
+                big_result.to_key()
+            ).as_str()),
+            "the shell result keeps its fact lines"
+        );
+        assert!(!slim.content.contains("BBBB"), "the people-facing text is slim too");
+        assert_eq!(
+            in_child(small_result).unwrap().model_content.as_deref(),
+            Some(r#"{"stdout":"tiny","exit_code":0}"#),
+            "a small result stays whole"
+        );
+
+        // The child's conversation keeps each call paired with its result.
+        let messages = crate::llm::hydrate_from_blocks(&blocks);
+        let json = serde_json::to_string(&messages).unwrap();
+        assert!(!json.contains("BBBB") && !json.contains("THOUGHTS"), "{json}");
+        assert_eq!(json.matches("\"ToolUse\"").count(), 2, "{json}");
+        assert_eq!(json.matches("\"ToolResult\"").count(), 2, "{json}");
+
+        // The source keeps everything.
+        let original = d.block_store().get_block_snapshot(source, &big_result).unwrap().unwrap();
+        assert_eq!(original.content, stdout);
+
+        // The child reads the original back with the command its stub names.
+        let read = d
+            .dispatch(&[s("block"), s("read"), s(&big_result.to_key()), s("--no-line-numbers")], &caller_with_context(child))
+            .await;
+        assert!(read.is_ok() && read.message().contains(&stdout), "the child reads the original: {}", read.message());
+
+        let marker = blocks.iter().find(|b| b.kind == BlockKind::Drift).expect("a fork marker");
+        assert!(
+            marker.content.contains("dropped 1 tool result bodies")
+                && marker.content.contains("1 images")
+                && marker.content.contains("1 thinking blocks"),
+            "the marker says what was dropped: {}",
+            marker.content
+        );
+    }
+
+    /// `--drop thinking` keeps the thinking of the last turn: a fork taken
+    /// mid tool loop still sends the signed thinking that loop's next
+    /// request needs. Earlier turns lose theirs.
+    #[tokio::test]
+    async fn fork_drop_thinking_keeps_the_last_turns_thinking() {
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, Role};
+        let d = test_dispatcher().await;
+        let human = PrincipalId::new();
+        let model = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, human);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        let thinking = |seq, text: &str| {
+            let mut snap = BlockSnapshot::text(BlockId::new(source, model, seq), None, Role::Model, text);
+            snap.kind = BlockKind::Thinking;
+            snap.signature = Some("sig".to_string());
+            snap
+        };
+        insert_text(&d, source, human, "first question");
+        insert_snapshot(&d, source, thinking(100, "EARLY THOUGHT"));
+        insert_text(&d, source, model, "first answer");
+        insert_text(&d, source, human, "second question");
+        insert_snapshot(&d, source, thinking(500, "LATE THOUGHT"));
+        insert_tool_pair(&d, source, model, "shell", "ok", Some("ok"));
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("lean"), s("--drop"), s("thinking")], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let child = d.kernel_db().lock().find_context_by_label("lean").unwrap().unwrap().context_id;
+        let thoughts: Vec<String> = d
+            .block_store()
+            .block_snapshots(child)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BlockKind::Thinking)
+            .map(|b| b.content)
+            .collect();
+        assert_eq!(thoughts, vec!["LATE THOUGHT".to_string()]);
+    }
+
+    /// `--drop mcp:<server>` slims only the results of that server's tools,
+    /// by the names the context's binding resolved for them.
+    #[tokio::test]
+    async fn fork_drop_mcp_server_slims_only_that_servers_results() {
+        let d = test_dispatcher().await;
+        let human = PrincipalId::new();
+        let model = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, human);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::AllInstances);
+        binding.authorities.insert("fork".to_string());
+        binding.name_map.insert(
+            "screenshot".to_string(),
+            (crate::mcp::external_instance_id("shots"), "screenshot".to_string()),
+        );
+        d.kernel_db().lock().upsert_context_binding(source, &binding).unwrap();
+
+        let big = "C".repeat(5000);
+        let (_, shot) = insert_tool_pair(&d, source, model, "screenshot", &big, None);
+        let (_, shell) = insert_tool_pair(&d, source, model, "shell", &big, None);
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("lean"), s("--drop"), s("mcp:shots")], &c).await;
+        assert!(result.is_ok(), "fork --drop failed: {}", result.message());
+        let child = d.kernel_db().lock().find_context_by_label("lean").unwrap().unwrap().context_id;
+        let read = |id: kaijutsu_types::BlockId| {
+            d.block_store()
+                .get_block_snapshot(child, &kaijutsu_types::BlockId::new(child, id.principal_id, id.seq))
+                .unwrap()
+                .unwrap()
+                .content
+        };
+        assert_eq!(
+            read(shot),
+            format!("[dropped: 5000 bytes; read with: kj block read {}]", shot.to_key())
+        );
+        assert_eq!(read(shell), big, "another tool's result stays whole");
+
+        let unknown = d.dispatch(&[s("fork"), s("--name"), s("lean2"), s("--drop"), s("mcp:nobody")], &c).await;
+        assert!(
+            !unknown.is_ok() && unknown.message().contains("mcp:nobody"),
+            "an unknown server fails loudly: {}",
+            unknown.message()
+        );
+        let typo = d.dispatch(&[s("fork"), s("--name"), s("lean3"), s("--drop"), s("imagez")], &c).await;
+        assert!(!typo.is_ok() && typo.message().contains("imagez"), "{}", typo.message());
     }
 
     /// Fail-loud (consistent with `kj context hydrate --mark`): a `--exclude`

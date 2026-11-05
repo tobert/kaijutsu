@@ -3675,3 +3675,23 @@ deny. A policy decision now commits with its row, pinned by a seam test that is 
 a flake that shows two opposite shapes (an extra ask, a missing ask) is a window someone else can see, not a slow
 box. Under six parallel copies on 32 cores it went from 9 of 96 runs failing to none; pinning to two cores never
 reproduced it, because the window needs two threads truly in parallel.
+## Carrying the conversation without the bulk (November 5)
+
+Amy's local model clogged after a couple of screenshots, so an MCP image now
+lands as an Asset image block in the same turn, and the result keeps one line.
+She then asked for a fork that "dumps and stubs out images and file reads". A
+script could not do it: kaish never splits a variable into words, so a list of
+`--exclude` keys cannot be built, and `kj stage` acts only on the caller. The
+filtered fork copy already rebuilds each block, so `kj fork --drop` thins
+there. Amy wanted no truncation and asked that a stub keep "success and small
+data", since a kaish result is already structured. A shell result keeps the
+fact lines a model reads (`[exit 1]`, `[cwd now ...]`) with one `[dropped: ...]`
+line for its output; a JSON result keeps its smallest fields whole and names
+the rest under `dropped` (her idea); other text becomes one line. Each stub
+names its source block. Kaibo's review caught that a shell result's model text
+is not JSON, which the first version assumed. Tool calls stay so the
+model still sees what it did; silent gaps would teach it to claim results it
+never fetched. `kj context rotate --migrate` uses the same copy and gives a
+long conversation fresh rc and MCP instructions without its old bulk. The
+predecessor tail in `S17-predecessor.kai` would repeat the carried prose, so a
+migration sets `ROTATED_MIGRATED` and the script skips it.

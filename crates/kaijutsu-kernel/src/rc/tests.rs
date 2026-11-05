@@ -2933,6 +2933,42 @@ esac
         d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
+    /// A migrating rotation already carries the predecessor's prose, so the
+    /// create lifecycle injects no tail of it: the prose appears once.
+    #[test]
+    fn a_migrating_rotation_injects_no_predecessor_tail() {
+        crate::on_rc_thread(a_migrating_rotation_injects_no_predecessor_tail_body);
+    }
+
+    async fn a_migrating_rotation_injects_no_predecessor_tail_body() {
+        let (d, main) = companion_fixture().await;
+        let kaiten = d.kernel_db().lock().get_context(main).unwrap().unwrap().performer.unwrap();
+        let after = d.block_store().last_block_id(main);
+        d.block_store()
+            .insert_block_as(
+                main, None, after.as_ref(), Role::Model, kaijutsu_types::BlockKind::Text,
+                "PROSE FROM BEFORE".to_string(), kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain, Some(kaiten),
+            )
+            .unwrap();
+        let caller = KjCaller {
+            principal_id: kaiten, actor_id: kaiten, reviewer_id: None, context_id: Some(main),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let r = d.dispatch(&argv(&["context", "rotate", "--migrate"]), &caller).await;
+        assert!(r.is_ok(), "rotate failed: {}", r.message());
+        let successor = lookup_context_id(&d, "main");
+        assert!(rc_errors(&d, successor).is_empty(), "{:?}", rc_errors(&d, successor));
+        let contents = block_contents_in(&d, successor);
+        assert_eq!(
+            contents.iter().filter(|c| c.contains("PROSE FROM BEFORE")).count(),
+            1,
+            "the prose is carried once and not repeated as a tail: {contents:?}"
+        );
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
     /// When the person writes, the submit rc shows the seat the recent handoff
     /// notes as a notification that serves only that turn, and says nothing
     /// when the log is empty.

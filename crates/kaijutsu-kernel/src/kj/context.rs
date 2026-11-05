@@ -226,6 +226,17 @@ enum ContextCommand {
         /// Context to rotate. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
         context: Option<String>,
+        /// Carry the conversation into the successor, without the
+        /// predecessor's system instructions: the successor's create
+        /// lifecycle writes fresh ones. Sets `ROTATED_MIGRATED=1`.
+        #[arg(long)]
+        migrate: bool,
+        /// With --migrate, drop bulk from the carried conversation, as
+        /// `kj fork --drop` does: `images`, `thinking`, `tool_results`, or
+        /// `mcp:<server>`, comma-separated or repeated. Defaults to
+        /// `images,tool_results,thinking`; `none` carries everything
+        #[arg(long, value_delimiter = ',', requires = "migrate")]
+        drop: Vec<String>,
     },
     /// Archive one context, retaining its history (latched). Needs the
     /// operator capability, or a person's live root character acting from
@@ -691,7 +702,9 @@ impl KjDispatcher {
                 ))
                 .await
             }
-            ContextCommand::Rotate { context } => self.context_rotate(context.as_deref(), caller).await,
+            ContextCommand::Rotate { context, migrate, drop } => {
+                self.context_rotate(context.as_deref(), migrate.then_some(drop.as_slice()), caller).await
+            }
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
             ContextCommand::Demote { context } => self.context_demote(&context, caller).await,
@@ -2438,6 +2451,66 @@ impl KjDispatcher {
         KjResult::ok(format!("archived {}", archived.join(", ")))
     }
 
+    /// Copy `predecessor`'s conversation into the new `successor` document
+    /// for `kj context rotate --migrate`: every block except system
+    /// instructions, rc traces and unsent drafts, thinned by `drop`. Blocks left open
+    /// are closed in the successor. Runs before the successor's rows exist,
+    /// as a fork's copy does.
+    fn migrate_conversation(
+        &self,
+        predecessor: ContextId,
+        successor: ContextId,
+        drop: Option<crate::blocks::DropSpec>,
+    ) -> Result<crate::blocks::DropReport, String> {
+        let store = self.block_store();
+        let instructions = store
+            .block_snapshots(predecessor)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|b| {
+                (b.role == kaijutsu_types::Role::System && b.kind == kaijutsu_types::BlockKind::Text)
+                    || b.kind == kaijutsu_types::BlockKind::Trace
+            })
+            .map(|b| b.id.to_key())
+            .collect();
+        let filter = crate::blocks::ForkBlockFilter { exclude_block_ids: instructions, drop, ..Default::default() };
+        let report = store
+            .fork_document_filtered(predecessor, successor, kaijutsu_types::now_millis(), &filter)
+            .map_err(|e| e.to_string())?;
+        store
+            .abandon_open_blocks(successor, "left open in the predecessor when this context was rotated; nothing is being retried here")
+            .map_err(|e| e.to_string())?;
+        Ok(report)
+    }
+
+    /// Record in the successor what `kj context rotate --migrate` carried.
+    fn note_migration(&self, predecessor: ContextId, successor: ContextId, report: &crate::blocks::DropReport, name: &str) -> Result<(), String> {
+        let store = self.block_store();
+        let mut note = format!(
+            "Rotated from '{name}' ({}) and migrated its conversation; its system instructions stayed behind, \
+             and this context's create lifecycle wrote fresh ones.",
+            predecessor.short()
+        );
+        if let Some(dropped) = report.note() {
+            note.push_str(&format!(" It {dropped}."));
+        }
+        let after = store.last_block_id(successor);
+        store
+            .insert_block_as(
+                successor,
+                None,
+                after.as_ref(),
+                kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Notification,
+                note,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+                Some(PrincipalId::system()),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// `kj context rotate [<ctx>]` — replace a context with a successor that
     /// carries its configuration (`docs/character.md`, "Roots and
     /// rotation"; `docs/senpai-kohai.md`, "Creating, forking, rotating").
@@ -2454,10 +2527,15 @@ impl KjDispatcher {
     /// inspection. The hydration window is not copied: its marker names a
     /// block in the predecessor.
     ///
+    /// `migrate` carries the predecessor's conversation into the successor
+    /// before its create lifecycle runs, leaving out the predecessor's
+    /// system instructions and dropping what the `--drop` entries name. The
+    /// lifecycle's blocks follow the carried conversation.
+    ///
     /// A character's handoff log has no performer: its rotation
     /// points `characters.handoff_ctx` at the successor and checks no loadout.
     /// Any other context with no performer refuses.
-    async fn context_rotate(&self, ctx_ref: Option<&str>, caller: &KjCaller) -> KjResult {
+    async fn context_rotate(&self, ctx_ref: Option<&str>, migrate: Option<&[String]>, caller: &KjCaller) -> KjResult {
         let (predecessor, character, handoff_owner) = {
             let db = self.kernel_db().lock();
             let id = match super::refs::resolve_context_arg(ctx_ref, caller, &db) {
@@ -2542,7 +2620,30 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
         };
 
+        // Resolve the drop before anything is created, so a bad entry
+        // refuses cleanly.
+        let migration = match migrate {
+            None => None,
+            Some(entries) => {
+                let default: Vec<String> = super::fork::MIGRATE_DROP.iter().map(|e| e.to_string()).collect();
+                let entries = if entries.is_empty() { &default[..] } else { entries };
+                match self.resolve_drop(predecessor.context_id, entries) {
+                    Ok(drop) => Some(drop),
+                    Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
+                }
+            }
+        };
+
         let successor_id = ContextId::new();
+        // The carried conversation is copied before the successor's rows,
+        // which accept an existing document.
+        let migrated = match migration {
+            None => None,
+            Some(drop) => match self.migrate_conversation(predecessor.context_id, successor_id, drop) {
+                Ok(report) => Some(report),
+                Err(e) => return KjResult::Err(format!("kj context rotate: could not carry the conversation: {e}; {name} stays live")),
+            },
+        };
         let parent = predecessor.forked_from;
         let successor = ContextRow {
             context_id: successor_id,
@@ -2567,6 +2668,13 @@ impl KjDispatcher {
                 db.copy_context_env(predecessor.context_id, successor_id)?;
                 db.copy_context_egress(predecessor.context_id, successor_id)?;
                 db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
+                // The env copy carries a predecessor's own mark; only a
+                // migration sets it.
+                if migrated.is_some() {
+                    db.set_context_env(successor_id, "ROTATED_MIGRATED", "1")?;
+                } else {
+                    db.delete_context_env(successor_id, "ROTATED_MIGRATED")?;
+                }
                 if let Some(shell) = db.get_context_shell(predecessor.context_id)? {
                     db.upsert_context_shell(&ContextShellRow {
                         context_id: successor_id,
@@ -2588,6 +2696,15 @@ impl KjDispatcher {
                 let successor = self.successor_fate(root_console, successor_id);
                 return KjResult::Err(format!("kj context rotate: {successor}{e}"));
             }
+        }
+
+        if let Some(report) = &migrated
+            && let Err(e) = self.note_migration(predecessor.context_id, successor_id, report, &name)
+        {
+            let successor = self.successor_fate(root_console, successor_id);
+            return KjResult::Err(format!(
+                "kj context rotate: could not note the migration in the successor {successor_id}; {successor}{name} stays live: {e}"
+            ));
         }
 
         let lifecycle = crate::rc::run(
@@ -4548,6 +4665,206 @@ mod tests {
         let drift = f.d.drift_router().read();
         assert_eq!(drift.get(successor).and_then(|h| h.label.clone()).as_deref(), Some("banto"));
         assert_eq!(drift.get(f.seat).map(|h| h.state), Some(ContextState::Archived));
+    }
+
+    /// `kj context rotate --migrate --drop ...` carries the conversation into
+    /// the successor without its old instructions or its bulk. The stubs name
+    /// the archived predecessor's blocks, which stay readable, and a note
+    /// says what moved.
+    async fn rotate_migrate_carries_the_conversation_without_the_bulk_body() {
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, ToolKind};
+        let f = rotation_fixture().await;
+        let store = f.d.block_store();
+        store.create_document(f.seat, crate::DocumentKind::Conversation, None).unwrap();
+        let system = PrincipalId::system();
+        let put = |snap: BlockSnapshot| {
+            let principal = snap.id.principal_id;
+            let after = store.last_block_id(f.seat);
+            store.insert_from_snapshot_as(f.seat, snap, after.as_ref(), Some(principal)).unwrap()
+        };
+        put(BlockSnapshot::text(BlockId::new(f.seat, system, 0), None, Role::System, "OLD STANCE"));
+        let ask = put(BlockSnapshot::text(BlockId::new(f.seat, f.amy, 0), None, Role::User, "read the log"));
+        let call = put(BlockSnapshot::tool_call(
+            BlockId::new(f.seat, f.banto, 0), None, ToolKind::Shell, "shell",
+            serde_json::json!({"code": "cat log"}), Role::Model, Some(s("toolu_1")),
+        ));
+        let stdout = "L".repeat(8000);
+        let mut result = BlockSnapshot::tool_result(
+            BlockId::new(f.seat, system, 1), call, ToolKind::Shell, &stdout, false, Some(0), Some(s("toolu_1")),
+        );
+        result.model_content = Some(serde_json::json!({"stdout": stdout, "exit_code": 0}).to_string());
+        let result = put(result);
+        let mut image = BlockSnapshot::text(BlockId::new(f.seat, f.banto, 1), None, Role::Asset, "cafebeef");
+        image.content_type = ContentType::Image;
+        put(image);
+        let answer = put(BlockSnapshot::text(BlockId::new(f.seat, f.banto, 2), None, Role::Model, "the log is all Ls"));
+
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--migrate"), s("--drop"), s("images,tool_results")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
+        let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_some());
+
+        let blocks = store.block_snapshots(successor).unwrap();
+        let carried = |id: BlockId| blocks.iter().find(|b| b.id == BlockId::new(successor, id.principal_id, id.seq)).cloned();
+        assert_eq!(carried(ask).map(|b| b.content).as_deref(), Some("read the log"));
+        assert_eq!(carried(answer).map(|b| b.content).as_deref(), Some("the log is all Ls"));
+        assert!(carried(call).is_some(), "the call is carried");
+        assert!(!blocks.iter().any(|b| b.content == "OLD STANCE"), "the old instructions stay behind");
+        assert!(!blocks.iter().any(|b| b.content_type == ContentType::Image), "the image is dropped");
+        assert!(
+            blocks.iter().any(|b| b.role == Role::System && b.kind == BlockKind::Text && b.status == Status::Done),
+            "the create lifecycle wrote fresh instructions"
+        );
+
+        let slim = carried(result).expect("the result is carried as a stub");
+        let sent: serde_json::Value = serde_json::from_str(slim.model_content.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["exit_code"], 0);
+        let read = sent["dropped"]["read"].as_str().unwrap().to_string();
+        assert_eq!(read, format!("kj block read {}", result.to_key()));
+        let key = read.trim_start_matches("kj block read ");
+        let original = f.d.dispatch(&[s("block"), s("read"), s(key)], &rotation_caller(successor, f.banto)).await;
+        assert!(
+            original.is_ok() && original.message().contains("LLLLLLLL"),
+            "the archived predecessor's block reads back: {}",
+            original.message()
+        );
+
+        let note = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Notification && b.content.contains("migrated"))
+            .expect("a note says the conversation was migrated");
+        assert!(note.content.contains("1 tool result bodies") && note.content.contains("1 images"), "{}", note.content);
+        let env: std::collections::HashMap<_, _> =
+            f.d.kernel_db().lock().get_context_env(successor).unwrap().into_iter().map(|e| (e.key, e.value)).collect();
+        assert_eq!(env.get("ROTATED_MIGRATED").map(String::as_str), Some("1"), "rc can tell the history came along");
+    }
+
+    /// Seed the rotation fixture's seat with an earlier turn's thinking, a
+    /// big shell-less tool result and an image, then a new question.
+    fn seed_bulk(f: &RotationFixture) -> kaijutsu_types::BlockId {
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, ToolKind};
+        let store = f.d.block_store();
+        store.create_document(f.seat, crate::DocumentKind::Conversation, None).unwrap();
+        let put = |snap: BlockSnapshot| {
+            let principal = snap.id.principal_id;
+            let after = store.last_block_id(f.seat);
+            store.insert_from_snapshot_as(f.seat, snap, after.as_ref(), Some(principal)).unwrap()
+        };
+        put(BlockSnapshot::text(BlockId::new(f.seat, f.amy, 0), None, Role::User, "look"));
+        let mut thinking = BlockSnapshot::text(BlockId::new(f.seat, f.banto, 0), None, Role::Model, "THOUGHT");
+        thinking.kind = BlockKind::Thinking;
+        thinking.signature = Some(s("sig"));
+        put(thinking);
+        let call = put(BlockSnapshot::tool_call(
+            BlockId::new(f.seat, f.banto, 1), None, ToolKind::Mcp, "screenshot",
+            serde_json::json!({}), Role::Model, Some(s("toolu_1")),
+        ));
+        let result = put(BlockSnapshot::tool_result(
+            BlockId::new(f.seat, PrincipalId::system(), 0), call, ToolKind::Mcp, &"P".repeat(4000),
+            false, Some(0), Some(s("toolu_1")),
+        ));
+        let mut image = BlockSnapshot::text(BlockId::new(f.seat, f.banto, 2), None, Role::Asset, "cafebeef");
+        image.content_type = ContentType::Image;
+        put(image);
+        put(BlockSnapshot::text(BlockId::new(f.seat, f.amy, 1), None, Role::User, "next"));
+        result
+    }
+
+    /// What the successor kept of `seed_bulk`: (thinking, image, result text).
+    fn kept_bulk(f: &RotationFixture, result: kaijutsu_types::BlockId) -> (bool, bool, String) {
+        use kaijutsu_types::{BlockId, BlockKind, ContentType};
+        let successor = f.d.kernel_db().lock().resolve_context("banto").unwrap();
+        let blocks = f.d.block_store().block_snapshots(successor).unwrap();
+        let carried = BlockId::new(successor, result.principal_id, result.seq);
+        (
+            blocks.iter().any(|b| b.kind == BlockKind::Thinking),
+            blocks.iter().any(|b| b.content_type == ContentType::Image),
+            blocks.iter().find(|b| b.id == carried).expect("the result is carried").content.clone(),
+        )
+    }
+
+    /// `--migrate` alone drops images, tool result bulk and earlier thinking.
+    async fn rotate_migrate_drops_the_bulk_by_default_body() {
+        let f = rotation_fixture().await;
+        let result = seed_bulk(&f);
+        let rotated = f.d.dispatch(&[s("context"), s("rotate"), s("--migrate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let (thinking, image, text) = kept_bulk(&f, result);
+        assert!(!thinking && !image, "thinking {thinking}, image {image}");
+        assert!(text.starts_with("[dropped: 4000 bytes;"), "{text}");
+    }
+
+    /// `--drop none` carries everything.
+    async fn rotate_migrate_drop_none_keeps_everything_body() {
+        let f = rotation_fixture().await;
+        let result = seed_bulk(&f);
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--migrate"), s("--drop"), s("none")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let (thinking, image, text) = kept_bulk(&f, result);
+        assert!(thinking && image, "thinking {thinking}, image {image}");
+        assert_eq!(text, "P".repeat(4000));
+    }
+
+    #[test]
+    fn rotate_migrate_drops_the_bulk_by_default() {
+        crate::on_rc_thread(rotate_migrate_drops_the_bulk_by_default_body);
+    }
+
+    #[test]
+    fn rotate_migrate_drop_none_keeps_everything() {
+        crate::on_rc_thread(rotate_migrate_drop_none_keeps_everything_body);
+    }
+
+    /// A plain rotation after a migrating one carries no history, so its
+    /// successor does not inherit `ROTATED_MIGRATED` with the env.
+    async fn a_plain_rotation_after_a_migration_is_not_marked_migrated_body() {
+        let f = rotation_fixture().await;
+        f.d.block_store().create_document(f.seat, crate::DocumentKind::Conversation, None).unwrap();
+        let env_of = |ctx| -> std::collections::HashMap<String, String> {
+            f.d.kernel_db().lock().get_context_env(ctx).unwrap().into_iter().map(|e| (e.key, e.value)).collect()
+        };
+        let migrated = f.d.dispatch(&[s("context"), s("rotate"), s("--migrate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(migrated.is_ok(), "{}", migrated.message());
+        let first = f.d.kernel_db().lock().resolve_context("banto").unwrap();
+        assert_eq!(env_of(first).get("ROTATED_MIGRATED").map(String::as_str), Some("1"));
+
+        let plain = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(first, f.banto)).await;
+        assert!(plain.is_ok(), "{}", plain.message());
+        let second = f.d.kernel_db().lock().resolve_context("banto").unwrap();
+        assert_ne!(second, first);
+        assert_eq!(env_of(second).get("ROTATED_MIGRATED"), None, "a plain rotation is not a migration");
+    }
+
+    #[test]
+    fn a_plain_rotation_after_a_migration_is_not_marked_migrated() {
+        crate::on_rc_thread(a_plain_rotation_after_a_migration_is_not_marked_migrated_body);
+    }
+
+    /// Without `--migrate`, `--drop` has nothing to act on and is refused.
+    async fn rotate_drop_needs_migrate_body() {
+        let f = rotation_fixture().await;
+        let rotated = f.d.dispatch(
+            &[s("context"), s("rotate"), s("--drop"), s("images")],
+            &rotation_caller(f.seat, f.banto),
+        ).await;
+        assert!(!rotated.is_ok() && rotated.message().contains("--migrate"), "{}", rotated.message());
+    }
+
+    #[test]
+    fn rotate_migrate_carries_the_conversation_without_the_bulk() {
+        crate::on_rc_thread(rotate_migrate_carries_the_conversation_without_the_bulk_body);
+    }
+
+    #[test]
+    fn rotate_drop_needs_migrate() {
+        crate::on_rc_thread(rotate_drop_needs_migrate_body);
     }
 
     /// Only the performer rotating itself or the lineage root may rotate;

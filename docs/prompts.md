@@ -369,6 +369,26 @@ up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes
 not a complete continuation; it omits tool results and can cut prose. An idle
 predecessor resolves from its log without waiting for another turn.
 
+### Migrating the conversation
+
+```sh
+kj context rotate banto --migrate
+kj context rotate banto --migrate --drop none
+```
+
+`--migrate` carries the conversation into the successor, with fresh slots, rc
+instructions and MCP tools. The predecessor's system instructions and rc
+traces stay behind, and the successor's `create` lifecycle writes new ones
+after the carried blocks. The carried conversation is thinned as
+`kj fork --drop images,tool_results,thinking` thins it
+(`docs/fork-filters.md`, "Dropping bulk"); `--drop` names another set, and
+`--drop none` carries everything. Each stub
+names its block in the archived predecessor, which `kj block read` still
+reads. A kernel notification after the carried blocks says what moved and
+what was dropped. The rotation sets `ROTATED_MIGRATED=1`, and
+`S17-predecessor.kai` then injects no excerpt, since the prose is already
+there. `--drop` without `--migrate` is refused.
+
 `kj fork --compact` is the alternative when retaining recent working state
 and a generated continuation is useful. It keeps the source's performer
 metadata and runs the fork lifecycle, not creation.

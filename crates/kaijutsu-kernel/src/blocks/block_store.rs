@@ -40,6 +40,10 @@ pub struct ForkBlockFilter {
     /// Whatever the filter says, a fork never copies an unsent draft
     /// (`Status::Draft`): it stays with the parent and is logged.
     pub selection: Option<IntervalSet>,
+    /// What to drop from the blocks the selection keeps (`kj fork --drop`):
+    /// images and thinking leave, and tool results lose their bulk. See
+    /// `super::slim`.
+    pub drop: Option<super::DropSpec>,
 }
 
 impl ForkBlockFilter {
@@ -1531,6 +1535,18 @@ impl BlockDocument {
         before_timestamp: u64,
         filter: &ForkBlockFilter,
     ) -> Self {
+        self.fork_filtered_reporting(new_context_id, new_principal_id, before_timestamp, filter).0
+    }
+
+    /// [`Self::fork_filtered`], also reporting what `filter.drop` dropped.
+    pub fn fork_filtered_reporting(
+        &self,
+        new_context_id: ContextId,
+        new_principal_id: PrincipalId,
+        before_timestamp: u64,
+        filter: &ForkBlockFilter,
+    ) -> (Self, super::DropReport) {
+        let mut report = super::DropReport::default();
         let mut forked = Self::new(new_context_id, new_principal_id);
 
         // Build the positional universe in DOCUMENT order — order_key, BlockId
@@ -1544,6 +1560,13 @@ impl BlockDocument {
             .filter(|(_, b)| !b.is_deleted() && b.header().created_at <= before_timestamp)
             .collect();
         universe.sort_by(|(ia, a), (ib, b)| a.order_key().cmp(b.order_key()).then_with(|| ia.cmp(ib)));
+
+        // A drop keeps thinking after the last person's text: that turn may
+        // still be an open tool loop, whose next request must send its signed
+        // thinking back.
+        let last_turn_start = universe
+            .iter()
+            .rposition(|(_, b)| b.header().role == Role::User && b.header().kind == BlockKind::Text);
 
         // Survivors, kept in document order: drop positions outside the resolved
         // selection (if any), then drop blocks the predicate excludes
@@ -1564,6 +1587,17 @@ impl BlockDocument {
             }
             let snap = block.snapshot();
             if !filter.matches(&snap) {
+                continue;
+            }
+            let in_last_turn = last_turn_start.is_none_or(|start| pos > start);
+            if let Some(drop) = &filter.drop
+                && drop.drops_block(&snap)
+                && !(snap.kind == BlockKind::Thinking && in_last_turn)
+            {
+                match snap.kind {
+                    BlockKind::Thinking => report.thinking += 1,
+                    _ => report.images += 1,
+                }
                 continue;
             }
             passing.push((*block, snap));
@@ -1596,6 +1630,21 @@ impl BlockDocument {
             }
 
             let mut remapped = snap;
+            if let Some(drop) = &filter.drop
+                && remapped.kind == BlockKind::ToolResult
+            {
+                let call_name = remapped
+                    .tool_call_id
+                    .and_then(|call| self.blocks.get(&call))
+                    .and_then(|call| call.tool_name().map(str::to_owned));
+                let source_key = remapped.id.to_key();
+                if drop.slims_result_of(call_name.as_deref())
+                    && let Some(saved) = super::slim::slim_tool_result(&mut remapped, drop.limit, &source_key)
+                {
+                    report.tool_results += 1;
+                    report.bytes += saved;
+                }
+            }
             remapped.id = new_id;
             remapped.parent_id = new_parent_id;
             remapped.tool_call_id = new_tool_call_id;
@@ -1608,7 +1657,7 @@ impl BlockDocument {
         }
 
         forked.version = 1;
-        forked
+        (forked, report)
     }
 
     // =========================================================================

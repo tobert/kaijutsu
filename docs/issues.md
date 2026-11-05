@@ -121,6 +121,29 @@ the character"). Open, outside M2:
   kaijutsu-mcp and kaijutsu-server are the end-to-end check.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate` failed once in a parallel
   `ledger::` run and passes alone: a tracing-subscriber span capture under parallel tests.
+## `kj fork --drop` and `kj context rotate --migrate`: what is open (2026-11-05)
+
+`docs/fork-filters.md`, "Dropping bulk"; `docs/prompts.md`, "Migrating the
+conversation"; `blocks/slim.rs`.
+
+- The limit is fixed at 1024 bytes (`DROP_LIMIT`, `kj/fork.rs`), and slimming
+  looks only at a JSON result's top-level fields: a big field drops whole even
+  when most of it is small.
+- `mcp:<server>` matches the visible tool names in the source's binding. A
+  server's tool reached through `shell` (a kaish wrapper) is not matched.
+- A stub's `kj block read <key>` returns the original's `content`; a dropped
+  `stderr` or `data` is in the original block but not in that output.
+- `kj fork` reports the prefix-cache cost of a selection that drops history
+  (`ForkSelection::cost`), but not of `--drop`, which changes every result
+  after the first slimmed one.
+- No live run yet: the tests drive the kernel. Untried with a real model
+  reading a stub and fetching its original with `kj block read`.
+- `--migrate` copies the conversation before the successor's rows exist, as a
+  fork's copy does; a row insert that then fails leaves an orphan document.
+- `assets/defaults/rc/companion/create/` holds full copies of the `lib/create`
+  scripts, not path shims as `director` and `storyteller` do. The
+  `S17-predecessor.kai` change was made in both; the next edit to a lib
+  create script can miss the companion copy.
 
 ## Companion: what the first build leaves open (2026-11-02)
 

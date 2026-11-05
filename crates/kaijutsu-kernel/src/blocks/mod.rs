@@ -32,9 +32,11 @@ pub mod block_store;
 pub(crate) mod content;
 mod error;
 pub mod selection;
+pub mod slim;
 
 pub use block_store::{BlockDocument, ForkBlockFilter, StoreSnapshot, SyncPayload, TextEdit};
 pub use content::BlockContent;
+pub use slim::{DropReport, DropSpec};
 pub use error::BlockDocumentError;
 pub use selection::{
     IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
