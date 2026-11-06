@@ -308,6 +308,13 @@ Claude reply cut short have shipped. Open:
 - A kernel starts with no prices, so every cost reads unknown until someone
   runs `kj price set`. Existing hosts get the `kj price set` allow for the
   director and root seats only after `kj config reset gate.toml`.
+- A call billed against a plan quota (Alibaba's Token Plan bills in credits) has no honest dollar figure. Amy
+  (2026-11-06): the TUI and app will show plan usage or dollars depending on how the provider and character are
+  set up; deferred until the UI work.
+- One-shot side calls (`summarize` for drift briefings and continuation, kj/mod.rs ~955) go through
+  `Provider::prompt_with_system`, which returns text only, so their usage never reaches `turns` and their cost is
+  invisible. Next: one-shot prompting drains `stream()` and returns usage, and the call is recorded against the
+  caller's context with its own `role`.
 - SillyTavern's edit-cost notes (`llm::prefix::edit_cost_note`,
   `report_divergence`) state token counts only. They can call
   `pricing::cost_micros` once they know the provider, model and time.
