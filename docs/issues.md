@@ -50,6 +50,26 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   context's document where a failed second write would only have deferred the answer. A ledger fault is already
   a P1; this widens what one costs.
 
+## Found rehearsing the zorak deploy (M8, 2026-11-05)
+
+- A kernel booted from a copy of `kernel.db` carries the live kernel's id, so its cc inbox binds the same path
+  (`$XDG_RUNTIME_DIR/kaijutsu/cc/<kernel id>.sock`, server rpc.rs ~1891) and replaces the live kernel's socket:
+  the live listener keeps its unlinked inode and refuses nothing, connections to the path are refused, and it
+  rebinds only at its next start. Harmless today (the inbox only logs), but a copy boot must set its own
+  `XDG_RUNTIME_DIR`. `Inbox::bind` could refuse when a listener answers on the path, naming it.
+- `/run/user/1000/kaijutsu/cc` held 24,903 socket files on zorak: `CcInboxHandle` leaves its socket on disk by
+  design (kernel cc_inbox.rs ~28), so every test kernel leaves one in the shared runtime directory. Remove the
+  file on drop, or put test kernels' inboxes under their own temp directory.
+- `kaijutsu-server bootstrap` on an existing kernel ran `kj character model set banto …` (banto had no model) and
+  then said "banto, coder already exist; bootstrap leaves an existing character as it is, its rc directory and
+  model included". It fills a missing model; the note should say so.
+- `assistant/` ships a stance and a tick check-in but no `create/S10-binding.kai`, so every assistant context is
+  created inert (no loadout; `kj context create assistant` warns). It never had one; decide its loadout (the
+  companion's shape is the nearest) and add a test that each shipped character's `create` binds a loadout
+  (`judge/` excepted: a judge is a shadow).
+- After the deploy, `coder` (an existing character, which bootstrap leaves alone) has no model, so a coder context
+  says so at create and cannot run a turn until `kj character model set coder <backend>/<model>`.
+
 ## Type melt M7: what the docs pass leaves open (2026-11-05)
 
 - "seat" still names a context or a character in docs/container.md, docs/mk.md, the companion, storyteller,
