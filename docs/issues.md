@@ -335,6 +335,10 @@ Claude reply cut short have shipped. Open:
   `usage.x_tools` still need capturing into `add_turn_tool_uses`, under the provider's stable tool name
   (`web_search`, not a versioned id such as `web_search_20250305`), or the use counts as unpriced. Tool uses count
   in `priced_calls` and `unpriced_calls` beside model calls.
+- A price is one rate per token kind, but providers bill by time and size: DeepSeek doubles every rate at peak
+  (01:00-04:00 and 06:00-10:00 UTC, weekdays), and Claude Haiku 5.5 charges more past 100K prompt tokens. zorak's
+  prices (2026-11-06) take DeepSeek's off-peak rates and Haiku's base tier, so a peak or long-prompt call is
+  under-counted.
 - SillyTavern's edit-cost notes (`llm::prefix::edit_cost_note`,
   `report_divergence`) state token counts only. They can call
   `pricing::cost_micros` once they know the provider, model and time.
