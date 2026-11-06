@@ -90,6 +90,21 @@ pub struct ChatRequest {
     /// enabled still bills reasoning tokens; this is the real off-switch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingMode>,
+
+    /// Alibaba's thinking switch, for a model that takes thinking on or off
+    /// (`crate::llm::alibaba::models`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+
+    /// Alibaba's thinking token budget. Never sent beside
+    /// `reasoning_effort`: qwen3.8 refuses the pair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u64>,
+
+    /// Alibaba: `true` carries each earlier assistant message's
+    /// `reasoning_content` into the model's context. Sent when thinking is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preserve_thinking: Option<bool>,
 }
 
 /// DeepSeek's structural thinking mode override. Only the `Disabled` variant
@@ -160,7 +175,7 @@ impl RequestMessage {
     /// An assistant turn. `reasoning_content` is `Some` (possibly `""`) for
     /// DeepSeek's V4 round-trip requirement and `None` for plain
     /// OpenAI-compatible servers that don't want the field; [`super::build`]
-    /// decides based on the provider's `reasoning_required` flag.
+    /// decides by the client's dialect.
     pub fn assistant(
         content: Option<MessageContent>,
         reasoning_content: Option<String>,
@@ -210,8 +225,28 @@ pub enum MessageContent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
+    Text {
+        text: String,
+        /// Alibaba's explicit cache marker: the prefix through this part is
+        /// cached. Set only by the Alibaba dialect.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     ImageUrl { image_url: ImageUrl },
+}
+
+impl ContentPart {
+    /// A text part with no cache marker.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into(), cache_control: None }
+    }
+}
+
+/// A `cache_control` marker. Alibaba has one kind, `ephemeral` (5 minutes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CacheControl {
+    Ephemeral,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -384,6 +419,12 @@ impl Usage {
         }
     }
 
+    /// Prompt tokens written to an explicit cache (Alibaba's
+    /// `prompt_tokens_details.cache_creation_input_tokens`). 0 when none were.
+    pub fn cache_write_tokens(&self) -> u64 {
+        self.prompt_tokens_details.as_ref().map(|d| d.cache_creation_input_tokens).unwrap_or(0)
+    }
+
     /// Reasoning tokens, flattened from the nested details. 0 when the
     /// model didn't think or didn't report it.
     pub fn reasoning_tokens(&self) -> u64 {
@@ -398,6 +439,10 @@ impl Usage {
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Alibaba: prompt tokens written to an explicit cache, inside
+    /// `prompt_tokens`.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -443,6 +488,9 @@ mod tests {
             top_p: None,
             reasoning_effort: None,
             thinking: None,
+            enable_thinking: None,
+            thinking_budget: None,
+            preserve_thinking: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["model"], "deepseek-v4-flash");
@@ -479,6 +527,9 @@ mod tests {
             top_p: None,
             reasoning_effort: None,
             thinking: None,
+            enable_thinking: None,
+            thinking_budget: None,
+            preserve_thinking: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["stream"], true);
@@ -543,9 +594,7 @@ mod tests {
     #[test]
     fn image_content_part_serializes_as_data_url() {
         let content = MessageContent::Parts(vec![
-            ContentPart::Text {
-                text: "what is this?".into(),
-            },
+            ContentPart::text("what is this?"),
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,AAAA".into(),
@@ -677,6 +726,9 @@ mod tests {
             top_p: None,
             reasoning_effort: Some("high".into()),
             thinking: None,
+            enable_thinking: None,
+            thinking_budget: None,
+            preserve_thinking: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["reasoning_effort"], "high");
@@ -698,6 +750,9 @@ mod tests {
             top_p: None,
             reasoning_effort: None,
             thinking: None,
+            enable_thinking: None,
+            thinking_budget: None,
+            preserve_thinking: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("max_tokens").is_none(), "hosted dialect must omit max_tokens entirely");

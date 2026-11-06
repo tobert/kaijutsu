@@ -27,6 +27,7 @@
 //! not implemented — add a real provider (or point the OpenAI-compatible
 //! core at Google's OpenAI-shaped endpoint) when it's needed.
 
+pub mod alibaba;
 pub mod claude;
 pub mod codex;
 pub mod config;
@@ -664,6 +665,10 @@ pub enum Provider {
     /// DeepSeek — a preset over the OpenAI-compatible client, with required
     /// auth + the V4 reasoning-echo quirk (see `llm/deepseek/`).
     DeepSeek(deepseek::Client),
+    /// Alibaba Model Studio — a preset over the OpenAI-compatible client,
+    /// with per-model thinking controls and explicit caching (see
+    /// `llm/alibaba/`).
+    Alibaba(alibaba::Client),
     /// Any other OpenAI-compatible chat-completions server: a local
     /// lemonade / llama.cpp server, Ollama, or OpenAI itself (see
     /// `llm/openai/`). Auth is optional; the provider name is config-driven.
@@ -945,8 +950,8 @@ impl Provider {
     /// (it labels the provider in wire logs), so a local server is finally
     /// nameable as itself.
     ///
-    /// Each anthropic, deepseek, openai, and mk client takes a slot from its
-    /// endpoint in `endpoints` before each request (`llm::endpoint`).
+    /// Each anthropic, deepseek, alibaba, openai, and mk client takes a slot
+    /// from its endpoint in `endpoints` before each request (`llm::endpoint`).
     pub fn from_backend(config: &BackendConfig, endpoints: &endpoint::Endpoints) -> LlmResult<Self> {
         let endpoint = || {
             endpoints.for_backend(config).map_err(|e| {
@@ -976,6 +981,22 @@ impl Provider {
                     client = client.with_base_url(url);
                 }
                 Ok(Self::DeepSeek(client))
+            }
+            // The Token Plan and each workspace are different hosts with
+            // different keys, so the row names its endpoint.
+            BackendKind::Alibaba => {
+                let url = config.base_url.as_deref().filter(|url| !url.trim().is_empty()).ok_or_else(|| {
+                    LlmError::InvalidRequest(format!(
+                        "backend '{}' has kind 'alibaba', which requires --base-url \
+                         (the Token Plan or a workspace endpoint)",
+                        config.name
+                    ))
+                })?;
+                let api_key = resolve_key_or_placeholder(config, "Alibaba")?;
+                let client = alibaba::Client::new(config.name.clone(), url, api_key)
+                    .with_request_timeout(resolve_request_timeout(config))
+                    .with_endpoint(endpoint()?);
+                Ok(Self::Alibaba(client))
             }
             // Any OpenAI-compatible `/chat/completions` server. Auth is
             // optional — a local server needs no key — so a missing key is
@@ -1058,14 +1079,15 @@ impl Provider {
 
     /// Stable identifier for the *kind* of wire this client speaks.
     ///
-    /// NOT the backend name — an `OpenAi` client borrows its config-supplied
-    /// name (which for the OpenAI-compatible kind IS the backend name), while
+    /// NOT the backend name — an `OpenAi` or `Alibaba` client borrows its
+    /// config-supplied name (which for those kinds IS the backend name), while
     /// Claude/DeepSeek report their kind. Registry keys are backend names;
     /// use those when you need the handle.
     pub fn name(&self) -> &str {
         match self {
             Self::Claude(_) => "anthropic",
             Self::DeepSeek(_) => "deepseek",
+            Self::Alibaba(c) => c.provider_name(),
             Self::OpenAi(c) => c.provider_name(),
             Self::CodexApp(c) => &c.name,
             Self::Mk(c) => c.provider_name(),
@@ -1081,6 +1103,7 @@ impl Provider {
         match self {
             Self::Claude(c) => c.endpoint(),
             Self::DeepSeek(c) => c.endpoint(),
+            Self::Alibaba(c) => c.endpoint(),
             Self::OpenAi(c) => c.endpoint(),
             Self::Mk(c) => c.endpoint(),
             Self::CodexApp(_) => None,
@@ -1147,6 +1170,7 @@ impl Provider {
         match self {
             Self::Claude(client) => client.one_shot_opts(opts),
             Self::DeepSeek(client) => client.one_shot_opts(opts),
+            Self::Alibaba(client) => client.one_shot_opts(opts),
             Self::OpenAi(client) => client.one_shot_opts(opts),
             Self::Mk(client) => client.one_shot_opts(opts),
             Self::CodexApp(_) => opts,
@@ -1183,6 +1207,10 @@ impl Provider {
             // DeepSeek delegates to the OpenAI-compatible client, so both
             // yield an `openai::Stream` under the one `ProviderStream::OpenAi`.
             Self::DeepSeek(client) => {
+                let stream = client.stream(opts, messages).await?;
+                Ok(ProviderStream::OpenAi(stream))
+            }
+            Self::Alibaba(client) => {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::OpenAi(stream))
             }
@@ -1269,6 +1297,7 @@ impl Provider {
         match self {
             Self::Claude(c) => c.available_models(),
             Self::DeepSeek(c) => c.available_models(),
+            Self::Alibaba(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
             Self::CodexApp(_) | Self::Mk(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1714,6 +1743,7 @@ mod tests {
                     prompt_cache_hit_tokens: 20,
                     prompt_cache_miss_tokens: 10,
                     reasoning_tokens: 4,
+                    prompt_cache_write_tokens: 0,
                 }))
             );
 
@@ -2307,6 +2337,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("{base_url:?}: must not build"));
             assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("--base-url")), "{base_url:?}: {err:?}");
         }
+    }
+
+    /// An `alibaba` backend builds the Alibaba preset, named after the
+    /// backend (the Token Plan and a workspace are two backends of one kind),
+    /// and a row with no `base_url` does not build.
+    ///
+    /// Falsified by an `alibaba` row that builds another provider, or one that
+    /// guesses an endpoint.
+    #[test]
+    fn an_alibaba_backend_builds_the_alibaba_preset_at_its_own_url() {
+        let config = BackendConfig::new("alibaba-token", BackendKind::Alibaba)
+            .with_base_url("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")
+            .with_key_optional(true);
+        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default()).unwrap();
+        assert!(matches!(provider, Provider::Alibaba(_)), "{provider:?}");
+        assert_eq!(provider.name(), "alibaba-token");
+
+        let bare = BackendConfig::new("alibaba", BackendKind::Alibaba).with_key_optional(true);
+        let err = Provider::from_backend(&bare, &endpoint::Endpoints::default()).err().expect("no URL, no client");
+        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("--base-url")), "{err:?}");
     }
 
     /// The name/kind split in one assertion: two differently-NAMED backends

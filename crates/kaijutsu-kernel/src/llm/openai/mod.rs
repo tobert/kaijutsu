@@ -33,6 +33,7 @@ use crate::llm::endpoint::{Endpoint, Slot};
 use crate::llm::stream::{BuildOpts, StreamError, StreamErrorKind, StreamEvent};
 use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, http_user_agent};
 
+use self::build::Dialect;
 use self::sse::{OpenAiSseEvent, decode_event};
 use self::stream::StateMachine;
 use self::types::ApiError;
@@ -46,16 +47,17 @@ const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// One `reqwest::Client` pools connections across calls; the optional
 /// bearer key is attached per request (so a keyless local server works).
 /// `provider_name` is the stable identifier reported to telemetry / theming
-/// (e.g. "deepseek", "lemonade", "ollama"); `reasoning_required` toggles the
-/// DeepSeek V4 round-trip quirk in [`build`] (echo `reasoning_content` on
-/// every assistant turn) — `false` for plain OpenAI-compatible servers.
+/// (e.g. "deepseek", "lemonade", "ollama"); `dialect` is the one its preset
+/// names ([`build::Dialect`]), `Generic` for a plain OpenAI-compatible server.
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
     provider_name: String,
-    reasoning_required: bool,
+    dialect: Dialect,
+    /// Fixed headers sent on every request, beside auth and content type.
+    headers: Vec<(&'static str, &'static str)>,
     /// Per-request HTTP timeout (`BackendConfig.request_timeout_secs`,
     /// resolved by `Provider::from_backend`). See the field doc on
     /// `claude::Client::request_timeout` for the same rationale — applied
@@ -92,7 +94,7 @@ pub(crate) fn is_hosted_openai(base_url: &str) -> bool {
 impl Client {
     /// Construct a keyless client identified by `provider_name`, pointed at
     /// the OpenAI default base URL. Use the builders to add a key, override
-    /// the base URL, or enable the reasoning-echo quirk.
+    /// the base URL, or name a preset's dialect.
     pub fn new(provider_name: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(http_user_agent())
@@ -103,7 +105,8 @@ impl Client {
             base_url: OPENAI_DEFAULT_BASE_URL.to_string(),
             api_key: None,
             provider_name: provider_name.into(),
-            reasoning_required: false,
+            dialect: Dialect::Generic,
+            headers: Vec::new(),
             request_timeout: None,
             endpoint: None,
         }
@@ -148,12 +151,27 @@ impl Client {
         self
     }
 
-    /// Enable the DeepSeek V4 quirk: echo `reasoning_content` on every
-    /// assistant turn (required on tool-call turns or the API 400s). Plain
-    /// OpenAI-compatible servers leave this off.
-    pub fn with_reasoning_required(mut self, required: bool) -> Self {
-        self.reasoning_required = required;
+    /// Speak `dialect`'s wire rules ([`build::Dialect`]). A preset names its
+    /// own; plain OpenAI-compatible servers keep `Generic`.
+    pub fn with_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
         self
+    }
+
+    /// Send `name: value` on every request.
+    pub fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
+    /// The dialect a request is built in: [`Dialect::HostedOpenAi`] at
+    /// api.openai.com whatever the preset, else the preset's own.
+    pub fn wire_dialect(&self) -> Dialect {
+        if is_hosted_openai(&self.base_url) {
+            Dialect::HostedOpenAi
+        } else {
+            self.dialect
+        }
     }
 
     /// Stable provider identifier reported to telemetry / theming.
@@ -176,34 +194,33 @@ impl Client {
         }
     }
 
-    /// The request options a one-shot prompt runs with. The DeepSeek preset
-    /// thinks by default, and thinking tokens count against `max_tokens`, so
-    /// a one-shot turns it off; hosted OpenAI takes OpenAI's dialect.
+    /// The request options a one-shot prompt runs with. The DeepSeek and
+    /// Alibaba presets think by default, and thinking tokens count against
+    /// `max_tokens`, so a one-shot turns it off, except on an Alibaba model
+    /// that thinks on every request; hosted OpenAI takes OpenAI's dialect.
     pub fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
-        if self.reasoning_required && !is_hosted_openai(&self.base_url) {
-            opts.with_effort("none")
-        } else {
-            opts
+        match self.wire_dialect() {
+            Dialect::DeepSeek => opts.with_effort("none"),
+            Dialect::Alibaba if crate::llm::alibaba::models::can_turn_thinking_off(&opts.model) => {
+                opts.with_effort("none")
+            }
+            Dialect::Alibaba | Dialect::Generic | Dialect::HostedOpenAi => opts,
         }
     }
 
     /// Start a streaming completion. POSTs `stream: true` and wraps the
     /// `text/event-stream` response in a [`Stream`].
     pub async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<Stream> {
-        let body = build::build_request(
-            &opts,
-            &messages,
-            true,
-            self.reasoning_required,
-            is_hosted_openai(&self.base_url),
-            &self.provider_name,
-        );
+        let body = build::build_request(&opts, &messages, true, self.wire_dialect(), &self.provider_name)?;
         let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body);
+        for (name, value) in &self.headers {
+            request = request.header(*name, *value);
+        }
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
@@ -519,6 +536,48 @@ mod tests {
         }
     }
 
+    /// Alibaba's fields and header ride only on the Alibaba dialect: a
+    /// generic or DeepSeek request with cache breakpoints, an effort and a
+    /// thinking budget carries none of them.
+    ///
+    /// Falsified by an Alibaba field, even a null one, in another dialect's
+    /// body.
+    #[tokio::test]
+    async fn other_dialects_carry_no_alibaba_fields() {
+        use crate::llm::stream::{CacheTarget, CacheTtl};
+        use kaijutsu_mk::test_server::{serve, sse};
+        for dialect in [Dialect::Generic, Dialect::DeepSeek] {
+            let (base, seen) = serve(vec![sse(SIMPLE)]).await;
+            let opts = BuildOpts::new("m", 4096)
+                .with_system("sys")
+                .with_effort("high")
+                .with_thinking_budget(1024)
+                .with_cache_breakpoints(vec![CacheTarget::System(CacheTtl::Ephemeral), CacheTarget::MessageIndex(0, CacheTtl::Ephemeral)]);
+            let history = vec![Message::user("hi"), Message::assistant("hello"), Message::user("again")];
+            let mut stream = Client::new("t").with_base_url(&base).with_dialect(dialect).stream(opts, history).await.unwrap();
+            while stream.next_event().await.is_some() {}
+            let seen = seen.lock().unwrap();
+            for field in ["cache_control", "enable_thinking", "preserve_thinking", "thinking_budget"] {
+                assert!(!seen[0].body.contains(field), "{dialect:?} {field}: {}", seen[0].body);
+            }
+            assert_eq!(seen[0].header("x-dashscope-cachecontrol"), None, "{dialect:?}");
+        }
+    }
+
+    /// A client at api.openai.com speaks hosted OpenAI's dialect whatever its
+    /// preset names; anywhere else it speaks the preset's own.
+    ///
+    /// Falsified by a DeepSeek preset that sends DeepSeek's fields to
+    /// api.openai.com.
+    #[test]
+    fn hosted_openai_wins_over_the_preset_dialect() {
+        for preset in [Dialect::Generic, Dialect::DeepSeek, Dialect::Alibaba] {
+            let client = Client::new("t").with_dialect(preset);
+            assert_eq!(client.clone().with_base_url("https://api.openai.com/v1").wire_dialect(), Dialect::HostedOpenAi);
+            assert_eq!(client.with_base_url("http://localhost:11434/v1").wire_dialect(), preset);
+        }
+    }
+
     /// The UA rides the real wire path: reqwest applies client defaults at
     /// `execute()`, so a built request isn't proof — a captured request is.
     #[tokio::test]
@@ -588,6 +647,7 @@ data: [DONE]
                         prompt_cache_hit_tokens: 0,
                         prompt_cache_miss_tokens: 7,
                         reasoning_tokens: 0,
+                        prompt_cache_write_tokens: 0,
                     }))
                 );
             }

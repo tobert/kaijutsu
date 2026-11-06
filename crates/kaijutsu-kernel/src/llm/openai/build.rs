@@ -1,7 +1,7 @@
-//! Translate kaijutsu [`Message`] / [`ContentBlock`] into the DeepSeek
-//! (OpenAI-compatible) [`ChatRequest`] shape.
+//! Translate kaijutsu [`Message`] / [`ContentBlock`] into the
+//! OpenAI-compatible [`ChatRequest`] shape, per [`Dialect`].
 //!
-//! Specializations that distinguish DeepSeek from Claude's `build`:
+//! Specializations that distinguish this from Claude's `build`:
 //!
 //! - **`Reasoning` blocks become `reasoning_content`.** DeepSeek V4
 //!   thinks by default and *requires* the chain-of-thought to be echoed
@@ -14,43 +14,55 @@
 //! - **Tool results become their own `tool`-role messages**, one per
 //!   `tool_use_id` — OpenAI's shape — rather than blocks nested inside a
 //!   user turn.
-//! - **`cache_breakpoints` are ignored.** DeepSeek caches the prompt
-//!   prefix automatically; there is no `cache_control` knob.
+//! - **`cache_breakpoints` are ignored except on Alibaba**, which takes
+//!   `cache_control` markers on message text (`crate::llm::alibaba::cache`).
+//!   DeepSeek and OpenAI cache the prompt prefix automatically.
 //! - The system prompt is the first message with role `system`, not a
 //!   top-level field.
 
 use crate::llm::stream::BuildOpts;
-use crate::llm::{ContentBlock, Message, MessageContent, Role};
+use crate::llm::{ContentBlock, LlmResult, Message, MessageContent, Role};
 
 use super::types::{
     ChatRequest, ContentPart, ImageUrl, MessageContent as WireContent, RequestFunctionCall,
     RequestMessage, RequestTool, RequestToolCall, StreamOptions, ThinkingMode, ToolFunction,
 };
 
-/// Build a `/chat/completions` request body.
+/// Which server a request goes to, where OpenAI-compatible servers differ on
+/// the wire. A preset names its dialect on the client; a client at
+/// api.openai.com speaks [`Dialect::HostedOpenAi`] whatever its preset
+/// (`super::Client::wire_dialect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// Any other OpenAI-compatible server: a local one, a gateway. `effort`
+    /// and `thinking_budget` have no sink; real reasoning is echoed back.
+    Generic,
+    /// OpenAI's own API: `max_completion_tokens`, `reasoning_effort`, no
+    /// `reasoning_content`, and `system` messages anywhere.
+    HostedOpenAi,
+    /// DeepSeek V4: `reasoning_content` on every assistant message, and
+    /// `effort = "none"` as `thinking: {"type": "disabled"}`.
+    DeepSeek,
+    /// Alibaba Model Studio (`docs/alibaba-backend.md`).
+    Alibaba,
+}
+
+/// Build a `/chat/completions` request body for `dialect`.
 ///
 /// `streaming` toggles `stream: true` + `stream_options.include_usage`
 /// (so the trailing usage chunk carries token accounting).
 ///
-/// `reasoning_required` is the DeepSeek V4 quirk: when `true`, every
-/// assistant message carries `reasoning_content` (real, synthesized, or
-/// `""`) so tool-call turns survive the API's presence check. Plain
-/// OpenAI-compatible servers pass `false` — the field is then emitted only
-/// when genuine reasoning exists, and omitted otherwise. `reasoning_required`
-/// doubles as the DeepSeek marker for `opts.effort`'s wire mapping below —
-/// today it is the only preset that sets it `true`. `hosted_openai` wins over
-/// it: api.openai.com gets neither `reasoning_content` nor `thinking`.
+/// [`Dialect::DeepSeek`] carries the V4 quirk: every assistant message
+/// carries `reasoning_content` (real, synthesized, or `""`) so tool-call
+/// turns survive the API's presence check. Other dialects emit the field only
+/// when genuine reasoning exists, and hosted OpenAI never does.
 ///
-/// `hosted_openai` is the caller-computed result of
-/// [`super::is_hosted_openai`] against the client's configured `base_url` —
-/// never guessed in here. `backend_label` is the configured backend NAME
-/// (not the wire dialect), used only to name the backend in inert-tunable
-/// `tracing::warn!`s.
+/// `backend_label` is the configured backend NAME (not the wire dialect),
+/// used only to name the backend in inert-tunable `tracing::warn!`s.
 ///
-/// Wire mapping for the tunables `BuildOpts` carries beyond `temperature`
-/// (Track B):
+/// Wire mapping for the tunables `BuildOpts` carries beyond `temperature`:
 ///
-/// - **`max_tokens` field choice**: `hosted_openai` sends
+/// - **`max_tokens` field choice**: hosted OpenAI sends
 ///   `max_completion_tokens` instead of `max_tokens` — live-probed
 ///   2026-08-03 against `api.openai.com`'s gpt-5.6-terra, which REJECTS
 ///   `max_tokens` outright. Every other endpoint (DeepSeek, local servers,
@@ -62,28 +74,34 @@ use super::types::{
 ///   directly. Every other endpoint has no reasoning-effort concept —
 ///   `effort` is INERT there, warned (not silently dropped) when explicitly
 ///   set.
-/// - **`thinking_budget`**: no OpenAI-compatible dialect has a budget sink —
-///   always INERT here, warned when explicitly set.
+/// - **`thinking_budget`**: INERT on every dialect but Alibaba, warned when
+///   explicitly set.
+/// - **Alibaba**: `effort`, `thinking_style` and `thinking_budget` map onto
+///   the control the model takes (`crate::llm::alibaba::models::resolve`),
+///   which refuses a request the model cannot take.
 /// - **`top_p`**: flows top-level unconditionally; every dialect this build
 ///   targets accepts it.
 pub fn build_request(
     opts: &BuildOpts,
     messages: &[Message],
     streaming: bool,
-    reasoning_required: bool,
-    hosted_openai: bool,
+    dialect: Dialect,
     backend_label: &str,
-) -> ChatRequest {
+) -> LlmResult<ChatRequest> {
+    let hosted_openai = dialect == Dialect::HostedOpenAi;
     let mut wire: Vec<RequestMessage> = Vec::with_capacity(messages.len() + 1);
 
     if let Some(system) = &opts.system {
         wire.push(RequestMessage::system(system.clone()));
     }
 
+    // `ends[i]` is the wire index one past the last message `messages[i]`
+    // produced: a user turn can become several tool messages and a user one.
+    let mut ends = Vec::with_capacity(messages.len());
     for msg in messages {
         match msg.role {
             Role::User => translate_user(msg, &mut wire),
-            Role::Assistant => translate_assistant(msg, &mut wire, reasoning_required, hosted_openai),
+            Role::Assistant => translate_assistant(msg, &mut wire, dialect),
             // Hosted OpenAI takes a `system` message anywhere. Other
             // dialects may not: DeepSeek's template moves every system
             // message into the system prompt, and some local templates
@@ -94,6 +112,7 @@ pub fn build_request(
                 _ => translate_user(msg, &mut wire),
             },
         }
+        ends.push(wire.len());
     }
 
     let tools = opts
@@ -115,27 +134,54 @@ pub fn build_request(
         (Some(opts.max_tokens), None)
     };
 
-    let (reasoning_effort, thinking) = resolve_effort(
-        opts.effort.as_deref(),
-        reasoning_required,
-        hosted_openai,
-        backend_label,
-        &opts.model,
-    );
-
-    if let Some(budget) = opts.thinking_budget {
-        if should_warn_effort_dropped(backend_label, &opts.model, "thinking_budget", &budget.to_string()) {
-            tracing::warn!(
-                backend = backend_label,
-                model = %opts.model,
-                knob = "thinking_budget",
-                value = budget,
-                "thinking_budget has no sink on this OpenAI-compatible dialect; dropped"
+    let alibaba = match dialect {
+        Dialect::Alibaba => Some(crate::llm::alibaba::models::resolve(opts)?),
+        Dialect::Generic | Dialect::HostedOpenAi | Dialect::DeepSeek => None,
+    };
+    // glm drops array content on a request with no tools, and a string has
+    // no part to carry a cache marker, so such a request has none.
+    if alibaba.is_some() {
+        if crate::llm::alibaba::flattens_text(&opts.model, !opts.tools.is_empty()) {
+            if !opts.cache_breakpoints.is_empty()
+                && should_warn_effort_dropped(backend_label, &opts.model, "cache_breakpoints", "no tools")
+            {
+                tracing::warn!(
+                    backend = backend_label,
+                    model = %opts.model,
+                    "cache breakpoints dropped: a glm request with no tools sends text as strings, which carry no marker"
+                );
+            }
+            crate::llm::alibaba::flatten_text(&mut wire);
+        } else {
+            crate::llm::alibaba::cache::place(
+                &mut wire,
+                &opts.cache_breakpoints,
+                opts.system.is_some(),
+                !opts.tools.is_empty(),
+                &ends,
+                &opts.model,
             );
         }
     }
+    let (reasoning_effort, thinking) = match &alibaba {
+        Some(a) => (a.reasoning_effort.clone(), None),
+        None => resolve_effort(opts.effort.as_deref(), dialect, backend_label, &opts.model),
+    };
 
-    ChatRequest {
+    if alibaba.is_none()
+        && let Some(budget) = opts.thinking_budget
+        && should_warn_effort_dropped(backend_label, &opts.model, "thinking_budget", &budget.to_string())
+    {
+        tracing::warn!(
+            backend = backend_label,
+            model = %opts.model,
+            knob = "thinking_budget",
+            value = budget,
+            "thinking_budget has no sink on this OpenAI-compatible dialect; dropped"
+        );
+    }
+
+    Ok(ChatRequest {
         model: opts.model.clone(),
         messages: wire,
         max_tokens,
@@ -148,7 +194,10 @@ pub fn build_request(
         top_p: opts.top_p,
         reasoning_effort,
         thinking,
-    }
+        enable_thinking: alibaba.as_ref().and_then(|a| a.enable_thinking),
+        thinking_budget: alibaba.as_ref().and_then(|a| a.thinking_budget),
+        preserve_thinking: alibaba.as_ref().is_some_and(|a| a.on).then_some(true),
+    })
 }
 
 /// Process-global set of `(backend, model, knob, value)` tuples that have
@@ -162,32 +211,31 @@ static WARNED_INERT_TUNABLE_DROPS: std::sync::OnceLock<
 /// Whether this `(backend, model, knob, value)` tuple should warn — true the
 /// first time it is seen this process, false on every later call. The drop
 /// itself is unconditional; only the logging is deduplicated.
-fn should_warn_effort_dropped(backend: &str, model: &str, knob: &str, value: &str) -> bool {
+pub(crate) fn should_warn_effort_dropped(backend: &str, model: &str, knob: &str, value: &str) -> bool {
     let set = WARNED_INERT_TUNABLE_DROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let key = (backend.to_string(), model.to_string(), knob.to_string(), value.to_string());
     set.lock().expect("dedupe mutex poisoned").insert(key)
 }
 
 /// Resolve `effort` into the `(reasoning_effort, thinking)` wire pair for
-/// one of the three dialects `build_request` distinguishes. Hosted OpenAI
-/// takes OpenAI's mapping even from the DeepSeek preset. Free function so
-/// each branch — and its inert-tunable warning — is directly unit-testable.
+/// `dialect`. Free function so each branch — and its inert-tunable warning —
+/// is directly unit-testable.
 fn resolve_effort(
     effort: Option<&str>,
-    is_deepseek: bool,
-    hosted_openai: bool,
+    dialect: Dialect,
     backend_label: &str,
     model: &str,
 ) -> (Option<String>, Option<ThinkingMode>) {
-    if is_deepseek && !hosted_openai {
-        return match effort {
-            Some("none") => (None, Some(ThinkingMode::Disabled)),
-            Some(e) => (Some(e.to_string()), None),
-            None => (None, None),
-        };
-    }
-    if hosted_openai {
-        return (effort.map(str::to_string), None);
+    match dialect {
+        Dialect::DeepSeek => {
+            return match effort {
+                Some("none") => (None, Some(ThinkingMode::Disabled)),
+                Some(e) => (Some(e.to_string()), None),
+                None => (None, None),
+            };
+        }
+        Dialect::HostedOpenAi => return (effort.map(str::to_string), None),
+        Dialect::Generic | Dialect::Alibaba => {}
     }
     if let Some(e) = effort {
         if should_warn_effort_dropped(backend_label, model, "effort", e) {
@@ -239,9 +287,7 @@ fn translate_user(msg: &Message, out: &mut Vec<RequestMessage>) {
                         };
                         out.push(RequestMessage::tool_result(tool_use_id.clone(), body));
                     }
-                    ContentBlock::Text { text } => parts.push(ContentPart::Text {
-                        text: text.clone(),
-                    }),
+                    ContentBlock::Text { text } => parts.push(ContentPart::text(text.clone())),
                     ContentBlock::Image {
                         hash,
                         media_type,
@@ -254,9 +300,7 @@ fn translate_user(msg: &Message, out: &mut Vec<RequestMessage>) {
                         }),
                         // Unresolved CAS hash — surface a marker instead of
                         // dropping the turn's reference silently.
-                        None => parts.push(ContentPart::Text {
-                            text: format!("[image {hash} unavailable]"),
-                        }),
+                        None => parts.push(ContentPart::text(format!("[image {hash} unavailable]"))),
                     },
                     // A user turn carrying ToolUse / Reasoning is nonsensical
                     // (those are assistant-side); ignore defensively.
@@ -277,7 +321,7 @@ fn user_message_from_parts(parts: Vec<ContentPart>) -> RequestMessage {
     let only_text = parts.len() == 1 && matches!(parts[0], ContentPart::Text { .. });
     let content = if only_text {
         match parts.into_iter().next() {
-            Some(ContentPart::Text { text }) => WireContent::Text(text),
+            Some(ContentPart::Text { text, .. }) => WireContent::Text(text),
             _ => unreachable!("guarded by only_text"),
         }
     } else {
@@ -294,18 +338,15 @@ fn user_message_from_parts(parts: Vec<ContentPart>) -> RequestMessage {
 
 /// Assistant turn → one assistant message. Text blocks concatenate into
 /// `content`; ToolUse blocks become `tool_calls`; a Reasoning block becomes
-/// `reasoning_content`. When `reasoning_required`, every assistant message
+/// `reasoning_content`. For [`Dialect::DeepSeek`], every assistant message
 /// carries `reasoning_content` (empty string when there is no Reasoning
 /// block) so tool-call turns meet DeepSeek's V4 round-trip requirement;
 /// otherwise the field is emitted only when genuine reasoning exists. Hosted
 /// OpenAI never gets it: its assistant messages have no such field. An
 /// assistant message with only tool calls has `content: None`.
-fn translate_assistant(
-    msg: &Message,
-    out: &mut Vec<RequestMessage>,
-    reasoning_required: bool,
-    hosted_openai: bool,
-) {
+fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, dialect: Dialect) {
+    let reasoning_required = dialect == Dialect::DeepSeek;
+    let hosted_openai = dialect == Dialect::HostedOpenAi;
     match &msg.content {
         MessageContent::Text(t) => {
             out.push(RequestMessage::assistant(
@@ -356,14 +397,14 @@ fn translate_assistant(
             }
             // Real reasoning rides verbatim, except to hosted OpenAI, which
             // takes no `reasoning_content`. Beyond that the behavior splits
-            // on `reasoning_required`:
-            //   - DeepSeek (true): a tool-call turn that lost its
-            //     chain-of-thought gets a synthesized marker (V4 requires the
-            //     field on tool-call turns); a plain turn gets "" (the API
-            //     ignores it, so "" is the cheapest way to keep the field
-            //     present and uniform).
-            //   - Generic OpenAI-compatible (false): omit the field entirely
-            //     when there's no genuine reasoning — no synth, no echo noise.
+            // on the dialect:
+            //   - DeepSeek: a tool-call turn that lost its chain-of-thought
+            //     gets a synthesized marker (V4 requires the field on
+            //     tool-call turns); a plain turn gets "" (the API ignores it,
+            //     so "" is the cheapest way to keep the field present and
+            //     uniform).
+            //   - Every other dialect: omit the field entirely when there's
+            //     no genuine reasoning — no synth, no echo noise.
             let reasoning_content = if hosted_openai {
                 None
             } else if !reasoning.is_empty() {
@@ -421,19 +462,17 @@ mod tests {
         BuildOpts::new("deepseek-v4-flash", 4096)
     }
 
-    /// Shadows `super::build_request` for the bulk of this module's
-    /// pre-existing tests: they only ever varied `reasoning_required` and
-    /// don't care about the Track B hosted/backend-label dialect params, so
-    /// this keeps every 4-arg call site unchanged. New tests exercising the
-    /// dialect mapping itself call `super::build_request` directly with all
-    /// six arguments.
+    /// Shadows `super::build_request` for the bulk of this module's tests,
+    /// which vary only DeepSeek against the generic dialect. Tests of the
+    /// dialect mapping itself call `super::build_request` directly.
     fn build_request(
         opts: &BuildOpts,
         messages: &[Message],
         streaming: bool,
         reasoning_required: bool,
     ) -> ChatRequest {
-        super::build_request(opts, messages, streaming, reasoning_required, false, "test")
+        let dialect = if reasoning_required { Dialect::DeepSeek } else { Dialect::Generic };
+        super::build_request(opts, messages, streaming, dialect, "test").unwrap()
     }
 
     /// A kernel instruction is a `system` message on hosted OpenAI and a
@@ -441,8 +480,9 @@ mod tests {
     #[test]
     fn a_kernel_instruction_is_system_text_only_on_hosted_openai() {
         let history = [Message::user("hi"), Message::assistant("hello"), Message::system("call done")];
-        for (hosted, role) in [(true, "system"), (false, "user")] {
-            let req = super::build_request(&opts(), &history, false, !hosted, hosted, "test");
+        for (dialect, role) in [(Dialect::HostedOpenAi, "system"), (Dialect::DeepSeek, "user")] {
+            let hosted = dialect == Dialect::HostedOpenAi;
+            let req = super::build_request(&opts(), &history, false, dialect, "test").unwrap();
             let v = serde_json::to_value(&req).unwrap();
             assert_eq!(v["messages"][2]["role"], role, "hosted={hosted}");
             assert_eq!(v["messages"][2]["content"], "call done");
@@ -750,10 +790,9 @@ mod tests {
                 &opts(),
                 &[Message::user("hi")],
                 false,
-                false,
-                false,
+                Dialect::Generic,
                 "ollama",
-            );
+            ).unwrap();
             assert!(req.max_tokens.is_some());
             assert!(req.max_completion_tokens.is_none());
         }
@@ -766,10 +805,9 @@ mod tests {
                 &o,
                 &[Message::user("hi")],
                 false,
-                false,
-                true,
+                Dialect::HostedOpenAi,
                 "gpt",
-            );
+            ).unwrap();
             assert_eq!(req.max_completion_tokens, Some(4096));
             assert!(
                 req.max_tokens.is_none(),
@@ -785,10 +823,9 @@ mod tests {
                 &o,
                 &[Message::user("hi")],
                 false,
-                true, // reasoning_required = DeepSeek
-                false,
+                Dialect::DeepSeek,
                 "deepseek",
-            );
+            ).unwrap();
             assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
             assert!(req.thinking.is_none());
         }
@@ -801,10 +838,9 @@ mod tests {
                 &o,
                 &[Message::user("hi")],
                 false,
-                true,
-                false,
+                Dialect::DeepSeek,
                 "deepseek",
-            );
+            ).unwrap();
             assert!(
                 req.reasoning_effort.is_none(),
                 "effort=none must NOT become reasoning_effort=\"none\" — that still \
@@ -822,10 +858,9 @@ mod tests {
                 &o,
                 &[Message::user("hi")],
                 false,
-                false,
-                true,
+                Dialect::HostedOpenAi,
                 "gpt",
-            );
+            ).unwrap();
             assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
         }
 
@@ -857,10 +892,9 @@ mod tests {
                 &o,
                 &[Message::user("hi")],
                 false,
-                false, // not the DeepSeek preset
-                false, // not hosted openai
+                Dialect::Generic,
                 "lemonade",
-            );
+            ).unwrap();
             assert!(req.reasoning_effort.is_none());
             assert!(req.thinking.is_none());
         }
@@ -877,10 +911,9 @@ mod tests {
                 &o,
                 &[Message::user("hi")],
                 false,
-                true,
-                false,
+                Dialect::DeepSeek,
                 "deepseek",
-            );
+            ).unwrap();
         }
 
         /// Hosted OpenAI has no `reasoning_content` field on an assistant
@@ -895,14 +928,15 @@ mod tests {
                 Some("calling".into()),
                 vec![ContentBlock::ToolUse { id: "c1".into(), name: "ls".into(), input: serde_json::json!({}) }],
             );
-            let req = super::super::build_request(&opts(), &[msg], false, false, true, "gpt");
+            let req = super::super::build_request(&opts(), &[msg], false, Dialect::HostedOpenAi, "gpt").unwrap();
             let v = serde_json::to_value(&req).unwrap();
             assert!(v["messages"][0].get("reasoning_content").is_none(), "{}", v["messages"][0]);
             assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["name"], "ls");
         }
 
         /// Hosted OpenAI gets OpenAI's dialect even from the DeepSeek preset
-        /// (a `deepseek`-kind backend pointed at api.openai.com): a plain
+        /// (a `deepseek`-kind backend pointed at api.openai.com, which
+        /// `super::Client::wire_dialect` resolves to this dialect): a plain
         /// text assistant turn carries no `reasoning_content`, and
         /// `effort = "none"` is `reasoning_effort`, not DeepSeek's
         /// `thinking` switch.
@@ -914,7 +948,7 @@ mod tests {
             let mut o = opts();
             o.effort = Some("none".into());
             let history = [Message::user("hi"), Message::assistant("hello"), Message::user("again")];
-            let req = super::super::build_request(&o, &history, false, true, true, "deepseek");
+            let req = super::super::build_request(&o, &history, false, Dialect::HostedOpenAi, "deepseek").unwrap();
             let v = serde_json::to_value(&req).unwrap();
             assert_eq!(v["messages"][1]["content"], "hello");
             assert!(v["messages"][1].get("reasoning_content").is_none(), "{}", v["messages"][1]);
@@ -956,7 +990,7 @@ mod tests {
             o.thinking_budget = Some(2048);
             tracing::subscriber::with_default(sub, || {
                 for _ in 0..3 {
-                    super::super::build_request(&o, &[Message::user("hi")], false, false, false, "budget-dedupe-test");
+                    super::super::build_request(&o, &[Message::user("hi")], false, Dialect::Generic, "budget-dedupe-test").unwrap();
                 }
             });
             let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();

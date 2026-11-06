@@ -3281,6 +3281,7 @@ mod tests {
                     prompt_cache_hit_tokens: 400,
                     prompt_cache_miss_tokens: 600,
                     reasoning_tokens: 0,
+                    prompt_cache_write_tokens: 0,
                 })),
             },
         ]

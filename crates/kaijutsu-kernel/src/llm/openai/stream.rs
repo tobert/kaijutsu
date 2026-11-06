@@ -253,6 +253,7 @@ impl StateMachine {
                     prompt_cache_hit_tokens: u.cache_hit_tokens(),
                     prompt_cache_miss_tokens: u.cache_miss_tokens(),
                     reasoning_tokens: u.reasoning_tokens(),
+                    prompt_cache_write_tokens: u.cache_write_tokens(),
                 })),
             ),
             None => (None, None, None),
@@ -450,6 +451,7 @@ data: [DONE]
                         prompt_cache_hit_tokens: 8,
                         prompt_cache_miss_tokens: 2,
                         reasoning_tokens: 0,
+                        prompt_cache_write_tokens: 0,
                     })),
                 },
             ]
@@ -482,6 +484,40 @@ data: [DONE]
 
 ";
 
+    /// Alibaba's explicit cache reports the hit as `cached_tokens` and the
+    /// write as `cache_creation_input_tokens`, both inside
+    /// `prompt_tokens_details` and inside `prompt_tokens`.
+    const ALIBABA_CACHED: &str = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3019,\"completion_tokens\":104,\"total_tokens\":3123,\"prompt_tokens_details\":{\"cached_tokens\":1024,\"cache_creation\":{\"ephemeral_5m_input_tokens\":1500},\"cache_creation_input_tokens\":1500,\"cache_type\":\"ephemeral\"}}}
+
+data: [DONE]
+
+";
+
+    /// Falsified by a cache write that is dropped, or one counted as a hit.
+    #[tokio::test]
+    async fn alibaba_cache_hit_and_write_reach_the_done_extra() {
+        let events = run(ALIBABA_CACHED).await;
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                stop_reason: Some("stop".into()),
+                input_tokens: Some(3019),
+                output_tokens: Some(104),
+                extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                    prompt_cache_hit_tokens: 1024,
+                    prompt_cache_miss_tokens: 1995,
+                    reasoning_tokens: 0,
+                    prompt_cache_write_tokens: 1500,
+                })),
+            })
+        );
+    }
+
     #[tokio::test]
     async fn openai_cached_tokens_reach_the_done_extra() {
         let events = run(OPENAI_CACHED).await;
@@ -495,6 +531,7 @@ data: [DONE]
                     prompt_cache_hit_tokens: 1920,
                     prompt_cache_miss_tokens: 86,
                     reasoning_tokens: 0,
+                    prompt_cache_write_tokens: 0,
                 })),
             })
         );
@@ -522,6 +559,7 @@ data: [DONE]
                         prompt_cache_hit_tokens: 0,
                         prompt_cache_miss_tokens: 0,
                         reasoning_tokens: 6,
+                        prompt_cache_write_tokens: 0,
                     })),
                 },
             ]
@@ -954,6 +992,7 @@ data: [DONE]
                             prompt_cache_hit_tokens: 32,
                             prompt_cache_miss_tokens: 8,
                             reasoning_tokens: 0,
+                            prompt_cache_write_tokens: 0,
                         })),
                         "{finish}"
                     );

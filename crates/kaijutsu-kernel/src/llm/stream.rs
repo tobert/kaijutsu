@@ -311,8 +311,8 @@ impl StreamEvent {
 /// inside `Client::stream()` from configuration and context state. Those
 /// knobs intentionally do *not* appear here.
 ///
-/// `cache_breakpoints` is the one exception: it's a Claude-specific
-/// policy carrier on the shared options because the *policy* of where to
+/// `cache_breakpoints` is the one exception: it's a policy carrier (Claude
+/// and Alibaba honor it) on the shared options because the *policy* of where to
 /// cache straddles the conversation shape (system / tools / message
 /// index). Gemini's `build()` ignores it. The doc's Phase 0 sketch
 /// keyed the map by `BlockId`, but `LlmMessage` doesn't carry block
@@ -336,8 +336,10 @@ pub struct BuildOpts {
     /// validation). Anthropic: adaptive tier's `output_config.effort`.
     /// DeepSeek: `reasoning_effort`, with `"none"` special-cased to the
     /// structural `thinking: {"type": "disabled"}`. Hosted OpenAI
-    /// (`api.openai.com`): `reasoning_effort`. Everywhere else: inert
-    /// (warned if explicitly set — see each provider's `build`).
+    /// (`api.openai.com`): `reasoning_effort`. Alibaba: the model's own
+    /// control (`llm::alibaba::models`), which refuses an effort the model
+    /// does not take. Everywhere else: inert (warned if explicitly set — see
+    /// each provider's `build`).
     pub effort: Option<String>,
     /// Anthropic budget-tier thinking token budget. Only meaningful when
     /// `thinking_style == Some("budget")` on Claude; inert (warned) on every
@@ -347,12 +349,12 @@ pub struct BuildOpts {
     /// `"auto"` (default/unset — current model-gated behavior) | `"adaptive"`
     /// (force the adaptive tier) | `"budget"` (force `Enabled { budget_tokens
     /// }`, which requires `thinking_budget` to be set — see
-    /// `claude::build::resolve_thinking`). Validated on Claude; ignored
-    /// elsewhere (no other provider has a thinking-style knob yet).
+    /// `claude::build::resolve_thinking`). Validated on Claude and Alibaba,
+    /// where `"off"` turns thinking off; ignored elsewhere.
     pub thinking_style: Option<String>,
     pub tools: Vec<ToolDefinition>,
-    /// Cache breakpoint policy for Claude prompt caching. Empty = no
-    /// `cache_control` applied. See [`CacheTarget`].
+    /// Cache breakpoint policy for Claude and Alibaba prompt caching.
+    /// Empty = no `cache_control` applied. See [`CacheTarget`].
     pub cache_breakpoints: Vec<CacheTarget>,
     /// Which inference this request is, for the request sensors
     /// ([`crate::llm::request_dump`]). `None` for requests outside a turn.
@@ -568,11 +570,15 @@ pub struct ClaudeUsageExtra {
 /// chain-of-thought tokens billed as output on thinking-mode turns. Local
 /// servers (lemonade/llama.cpp, Ollama) that don't report a cache split
 /// leave these zero — the field carrier is shared, not the guarantee.
+/// `prompt_cache_write_tokens` is the prompt written to an explicit cache
+/// (Alibaba), inside the prompt count like the hit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiCompatUsageExtra {
     pub prompt_cache_hit_tokens: u64,
     pub prompt_cache_miss_tokens: u64,
     pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub prompt_cache_write_tokens: u64,
 }
 
 /// Usage extras for the megakernel. `kept` prompt tokens came from a held

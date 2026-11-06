@@ -247,6 +247,7 @@ fn report_divergence(
 /// `cache_read`/`cache_write` and a reader adds them to `tokens_in`.
 /// OpenAI-compatible providers (DeepSeek) count the hit inside `tokens_in`, so
 /// theirs are logged as `cache_hit`/`cache_miss`, which a reader must not add.
+/// Alibaba's `cache_write`, logged when nonzero, is inside `tokens_in` too.
 /// The megakernel's `kept` (held prefix) and `fed` are inside `tokens_in` too.
 /// The provider's counts for one call, as reported. Cache reads and writes
 /// come from the provider-specific extra; nothing is added or subtracted
@@ -258,7 +259,7 @@ fn raw_usage(
 ) -> crate::RawUsage {
     use crate::llm::UsageExtra;
     let (cache_read, cache_write, cache_write_1h, reasoning) = match extra {
-        Some(UsageExtra::OpenAiCompat(d)) => (d.prompt_cache_hit_tokens, 0, 0, d.reasoning_tokens),
+        Some(UsageExtra::OpenAiCompat(d)) => (d.prompt_cache_hit_tokens, d.prompt_cache_write_tokens, 0, d.reasoning_tokens),
         Some(UsageExtra::Claude(c)) => (
             c.cache_read_input_tokens,
             c.cache_creation_input_tokens,
@@ -285,6 +286,10 @@ fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
         Some(UsageExtra::Claude(c)) => format!(
             ", cache_read={}, cache_write={}",
             c.cache_read_input_tokens, c.cache_creation_input_tokens
+        ),
+        Some(UsageExtra::OpenAiCompat(d)) if d.prompt_cache_write_tokens > 0 => format!(
+            ", cache_hit={}, cache_miss={}, cache_write={}",
+            d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens, d.prompt_cache_write_tokens
         ),
         Some(UsageExtra::OpenAiCompat(d)) => format!(
             ", cache_hit={}, cache_miss={}",
@@ -3902,6 +3907,7 @@ mod usage_log_tests {
             prompt_cache_hit_tokens: 900,
             prompt_cache_miss_tokens: 100,
             reasoning_tokens: 7,
+            prompt_cache_write_tokens: 0,
         }));
         assert_eq!(usage_log_suffix(&extra), ", cache_hit=900, cache_miss=100");
     }
@@ -6999,6 +7005,7 @@ mod usage_tests {
                                 prompt_cache_hit_tokens: 80,
                                 prompt_cache_miss_tokens: 20,
                                 reasoning_tokens: 0,
+                                prompt_cache_write_tokens: 0,
                             })),
                         },
                     ]],
@@ -7041,6 +7048,7 @@ mod usage_tests {
                                 prompt_cache_hit_tokens: 80,
                                 prompt_cache_miss_tokens: 20,
                                 reasoning_tokens: 3,
+                                prompt_cache_write_tokens: 0,
                             })),
                         },
                     ]],
@@ -8209,6 +8217,7 @@ mod lifetime_tests {
     async fn a_turn_records_deepseek_input_as_reported() {
         let extra = Some(crate::llm::UsageExtra::OpenAiCompat(crate::llm::OpenAiCompatUsageExtra {
             prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 100, reasoning_tokens: 50,
+            prompt_cache_write_tokens: 0,
         }));
         let (kernel, context, turn_id) = run_recorded_turn(vec![call_with("end_turn", 1100, 80, extra)]).await;
         let db = kernel.kernel_db().lock();
@@ -8227,8 +8236,11 @@ mod lifetime_tests {
             cache_read_input_tokens: 1000, cache_creation_input_tokens: 200, cache_creation_1h_input_tokens: 150 })));
         assert_eq!(claude, crate::RawUsage { input: 10, output: 5, cache_read: 1000, cache_write: 200, cache_write_1h: 150, reasoning: 0 });
         let deepseek = raw_usage(Some(1100), Some(5), &Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
-            prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 100, reasoning_tokens: 7 })));
+            prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 100, reasoning_tokens: 7, prompt_cache_write_tokens: 0 })));
         assert_eq!(deepseek, crate::RawUsage { input: 1100, output: 5, cache_read: 1000, cache_write: 0, cache_write_1h: 0, reasoning: 7 });
+        let alibaba = raw_usage(Some(3019), Some(104), &Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+            prompt_cache_hit_tokens: 1024, prompt_cache_miss_tokens: 1995, reasoning_tokens: 0, prompt_cache_write_tokens: 1500 })));
+        assert_eq!(alibaba, crate::RawUsage { input: 3019, output: 104, cache_read: 1024, cache_write: 1500, cache_write_1h: 0, reasoning: 0 });
         assert_eq!(raw_usage(None, None, &None), crate::RawUsage::default());
     }
 

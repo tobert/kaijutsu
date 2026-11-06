@@ -8,7 +8,8 @@
 //! Providers count input differently. Anthropic's `input` leaves out cache
 //! reads and writes, which are billed on their own; an OpenAI-compatible
 //! provider's `input` already includes the cache hit, so the hit is billed at
-//! the cache rate and only the rest at the input rate ([`InputStyle`]).
+//! the cache rate and only the rest at the input rate. Alibaba's `input`
+//! includes its cache write as well ([`InputStyle`]).
 //!
 //! A tool the provider runs and bills per call (a server-side web search) is
 //! priced by `tool_prices`, in micro-dollars per call, whatever the input
@@ -29,12 +30,15 @@ pub enum InputStyle {
     ExcludesCache,
     /// `input` includes the cache hit (OpenAI-compatible, megakernel).
     IncludesCacheHit,
+    /// `input` includes the cache hit and the cache write (Alibaba).
+    IncludesCache,
 }
 
 impl InputStyle {
     pub fn for_kind(kind: &BackendKind) -> Self {
         match kind {
             BackendKind::Anthropic => Self::ExcludesCache,
+            BackendKind::Alibaba => Self::IncludesCache,
             _ => Self::IncludesCacheHit,
         }
     }
@@ -79,6 +83,7 @@ pub fn cost_micros(price: &ModelPriceRow, style: InputStyle, tokens: &Tokens) ->
     let fresh_input = match style {
         InputStyle::ExcludesCache => tokens.input,
         InputStyle::IncludesCacheHit => tokens.input.saturating_sub(tokens.cache_read),
+        InputStyle::IncludesCache => tokens.input.saturating_sub(tokens.cache_read).saturating_sub(tokens.cache_write),
     };
     let write_1h = tokens.cache_write_1h.min(tokens.cache_write);
     let write_5m = tokens.cache_write - write_1h;
@@ -202,6 +207,19 @@ mod tests {
         assert_eq!(cost_micros(&full(), InputStyle::IncludesCacheHit, &tokens), Some(6_000));
         // The same counts under Anthropic's convention are 11k fresh plus 10k read.
         assert_eq!(cost_micros(&full(), InputStyle::ExcludesCache, &tokens), Some(36_000));
+    }
+
+    /// Alibaba counts the cache hit and the cache write inside `input`, so
+    /// only the rest is billed at the input rate, and the write at the write
+    /// rate once.
+    ///
+    /// Falsified by a cache write billed at both the input and write rates.
+    #[test]
+    fn an_alibaba_cache_write_inside_input_is_not_billed_twice() {
+        assert_eq!(InputStyle::for_kind(&BackendKind::Alibaba), InputStyle::IncludesCache);
+        let tokens = Tokens { input: 11_000, output: 0, cache_read: 4_000, cache_write: 5_000, cache_write_1h: 0 };
+        // (2_000 * 3_000_000 + 4_000 * 300_000 + 5_000 * 3_750_000) / 1e6 = 25_950
+        assert_eq!(cost_micros(&full(), InputStyle::IncludesCache, &tokens), Some(25_950));
     }
 
     /// A rate left unknown makes the cost unknown only when those tokens were

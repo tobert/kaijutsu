@@ -31,6 +31,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     the kernel did not execute, with their cost), hydrated back only to that provider and as text to others.
   See `docs/alibaba-backend.md`, "Server-side tools".
 
+## Alibaba backend: wire facts not yet seen live (2026-11-06)
+
+- The cache write is read from `prompt_tokens_details.cache_creation_input_tokens`, Alibaba's documented shape;
+  no captured Token Plan response is in the repo. A write reported elsewhere reads as 0 and under-counts cost.
+- Qwen Code lists `deepseek-v4-pro` (undated) with efforts high and max only; `llm/alibaba/models.rs` gives every
+  `deepseek-v4*` low, high and max, so `low` there may get a 400 from the server.
+- DeepSeek V4 on its own API needs `reasoning_content` on tool-call turns; whether Alibaba's DeepSeek does is
+  unknown. The Alibaba dialect sends real reasoning only and synthesizes none.
+- Explicit-cache markers ride on assistant and `tool` message content as part arrays (as Qwen Code's tail marker
+  does); the 4-marker cap is from Alibaba's docs. Check both against a live multi-turn tool loop.
+
 ## A default shipped after install never reaches the host (2026-11-06)
 
 - A config tree is seeded only when its directory is empty (server rpc.rs ~1776), so a file added to
@@ -328,7 +339,8 @@ Claude reply cut short have shipped. Open:
   display, but no provider stream reports them yet: Anthropic's web search request count and Alibaba's
   `usage.x_tools` still need capturing into `add_turn_tool_uses`, under the provider's stable tool name
   (`web_search`, not a versioned id such as `web_search_20250305`), or the use counts as unpriced. Tool uses count
-  in `priced_calls` and `unpriced_calls` beside model calls.
+  in `priced_calls` and `unpriced_calls` beside model calls. For Alibaba, `x_tools` would parse on
+  `openai::types::Usage` and record from `record_turn_spend` (`docs/alibaba-backend.md`, "Server-side tools").
 - A price is one rate per token kind, but providers bill by time and size: DeepSeek doubles every rate at peak
   (01:00-04:00 and 06:00-10:00 UTC, weekdays), and Claude Haiku 5.5 charges more past 100K prompt tokens. zorak's
   prices (2026-11-06) take DeepSeek's off-peak rates and Haiku's base tier, so a peak or long-prompt call is

@@ -8,9 +8,9 @@
 //!
 //! - **Base URL** `https://api.deepseek.com`.
 //! - **API key required** — bearer auth, unlike a keyless local server.
-//! - **`reasoning_required`** — DeepSeek V4 thinks by default and *requires*
-//!   the chain-of-thought echoed back on any assistant turn that performed
-//!   tool calls (else HTTP 400). See [`crate::llm::openai::build`].
+//! - **[`openai::build::Dialect::DeepSeek`]** — DeepSeek V4 thinks by default
+//!   and *requires* the chain-of-thought echoed back on any assistant turn
+//!   that performed tool calls (else HTTP 400). See [`crate::llm::openai::build`].
 //! - **Model list** — the two tool-capable models (`deepseek-flash`, the
 //!   undated id that tracks each flash generation, and `deepseek-v4-pro`). The pure reasoning model can't call tools, so it
 //!   belongs in a forked, tool-less context rather than the agentic loop.
@@ -32,7 +32,7 @@ impl Client {
             openai::Client::new("deepseek")
                 .with_base_url(DEEPSEEK_DEFAULT_BASE_URL)
                 .with_api_key(api_key)
-                .with_reasoning_required(true),
+                .with_dialect(openai::build::Dialect::DeepSeek),
         )
     }
 

@@ -46,6 +46,10 @@ pub enum BackendKind {
     /// DeepSeek — an OpenAI-compatible preset with required auth and the V4
     /// reasoning-echo quirk (`llm/deepseek/`).
     DeepSeek,
+    /// Alibaba Model Studio — an OpenAI-compatible preset with per-model
+    /// thinking controls and explicit caching (`llm/alibaba/`). `base_url`
+    /// says which endpoint: the Token Plan or a workspace.
+    Alibaba,
     /// Any OpenAI-compatible `/chat/completions` server: OpenAI itself,
     /// Ollama, lemonade, llama.cpp, a proxy (`llm/openai/`). `base_url` is
     /// what distinguishes them, which is why it is required for this kind.
@@ -67,7 +71,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "codex-app", "mk"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "codex-app", "mk"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -75,6 +79,7 @@ impl BackendKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::DeepSeek => "deepseek",
+            Self::Alibaba => "alibaba",
             Self::OpenAi => "openai",
             Self::CodexApp => "codex-app",
             Self::Mk => "mk",
@@ -90,6 +95,7 @@ impl BackendKind {
         match s {
             "anthropic" => Ok(Self::Anthropic),
             "deepseek" => Ok(Self::DeepSeek),
+            "alibaba" => Ok(Self::Alibaba),
             "openai" => Ok(Self::OpenAi),
             "codex-app" => Ok(Self::CodexApp),
             "mk" => Ok(Self::Mk),
@@ -108,6 +114,7 @@ impl BackendKind {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
+            Self::Alibaba => Some("ALIBABA_API_KEY"),
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
@@ -119,15 +126,16 @@ impl BackendKind {
 
     /// Does this kind require a `base_url`?
     ///
-    /// `openai` means "some OpenAI-compatible server", `codex-app` means a
-    /// reachable Codex app-server daemon, and `mk` means a megakernel
-    /// service. Each needs the endpoint in `base_url`, because which server
-    /// is exactly the information `base_url` carries. Anthropic accepts one
+    /// `openai` means "some OpenAI-compatible server", `alibaba` means the
+    /// Token Plan or one workspace (different hosts, different keys),
+    /// `codex-app` means a reachable Codex app-server daemon, and `mk` means a
+    /// megakernel service. Each needs the endpoint in `base_url`, because
+    /// which server is exactly the information `base_url` carries. Anthropic accepts one
     /// as a gateway override; DeepSeek's endpoint is fixed, so a `base_url`
     /// there is accepted-and-ignored rather than silently changing where a
     /// key goes.
     pub fn requires_base_url(&self) -> bool {
-        matches!(self, Self::OpenAi | Self::CodexApp | Self::Mk)
+        matches!(self, Self::OpenAi | Self::Alibaba | Self::CodexApp | Self::Mk)
     }
 }
 
@@ -185,9 +193,10 @@ pub struct BackendConfig {
     /// Which client speaks for it.
     pub kind: BackendKind,
 
-    /// Endpoint override. Required for [`BackendKind::OpenAi`] and
-    /// [`BackendKind::CodexApp`], optional for Anthropic (a gateway), ignored
-    /// for DeepSeek.
+    /// Endpoint override. Required for [`BackendKind::OpenAi`],
+    /// [`BackendKind::Alibaba`], [`BackendKind::CodexApp`] and
+    /// [`BackendKind::Mk`], optional for Anthropic (a gateway), ignored for
+    /// DeepSeek.
     pub base_url: Option<String>,
 
     /// Environment variable NAME holding the API key. Never the key itself.
@@ -402,7 +411,8 @@ pub struct ModelAlias {
 /// and each provider's `build()` maps them to its wire (Claude:
 /// `thinking_style`/`thinking_budget`/`effort` → `thinking`, with
 /// temperature/top_p dropped whenever thinking ends up on; DeepSeek/OpenAI:
-/// `effort` → `reasoning_effort` or a structural disable).
+/// `effort` → `reasoning_effort` or a structural disable; Alibaba: the
+/// model's own thinking control).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlotTunables {
     /// Maximum RESPONSE tokens. Not the context window — a different number.
@@ -494,6 +504,26 @@ mod tests {
         // The other kinds have real endpoints of their own.
         assert!(BackendConfig::new("anthropic", BackendKind::Anthropic).validate().is_ok());
         assert!(BackendConfig::new("deepseek", BackendKind::DeepSeek).validate().is_ok());
+    }
+
+    /// An `alibaba` backend names its endpoint, because the Token Plan and a
+    /// workspace are different hosts with different keys, and it reads
+    /// `ALIBABA_API_KEY` wherever it points, never `OPENAI_API_KEY`.
+    ///
+    /// Falsified by an `alibaba` row that validates with no URL, or by a
+    /// default that reads another provider's key.
+    #[test]
+    fn alibaba_kind_needs_a_base_url_and_reads_its_own_key() {
+        assert_eq!(BackendKind::parse("alibaba"), Ok(BackendKind::Alibaba));
+        assert!(SUPPORTED_BACKEND_KINDS.contains(&"alibaba"));
+        let bare = BackendConfig::new("alibaba-token", BackendKind::Alibaba);
+        let err = bare.validate().unwrap_err();
+        assert!(err.contains("--base-url"), "{err}");
+        let plan = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+        assert!(bare.with_base_url(plan).validate().is_ok());
+        for url in [Some(plan), Some("https://api.openai.com/v1"), None] {
+            assert_eq!(BackendKind::Alibaba.standard_env_var(url), Some("ALIBABA_API_KEY"), "{url:?}");
+        }
     }
 
     #[test]
