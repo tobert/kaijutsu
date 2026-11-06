@@ -189,9 +189,8 @@ fn plan_cache(breakpoints: &[CacheTarget]) -> CachePlan {
 /// Thinking is *not* decided here — `build_request` leaves it `None` and
 /// [`apply_thinking`] (called by [`super::Client::stream`]) resolves
 /// `opts`'s `thinking_style`/`thinking_budget`/`effort` cascade, then strips
-/// `temperature`/`top_p` from the body when thinking ends up on. `prompt()`
-/// never calls `apply_thinking`, so thinking stays off and sampling params
-/// flow unconditionally there — distillation drops thinking blocks anyway.
+/// `temperature`/`top_p` from the body when thinking ends up on. A one-shot
+/// prompt streams too, with thinking off (`super::Client::one_shot_opts`).
 pub fn build_request(
     opts: &BuildOpts,
     messages: &[Message],

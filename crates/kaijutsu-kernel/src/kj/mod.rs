@@ -97,6 +97,14 @@ enum DistillationPurpose {
 }
 
 impl DistillationPurpose {
+    /// The role the call's `turns` row records.
+    fn turn_role(self) -> &'static str {
+        match self {
+            Self::DriftBrief => crate::model_resolution::DISTILL,
+            Self::Continuation => "continuation",
+        }
+    }
+
     fn word_target_key(self) -> &'static str {
         match self {
             Self::DriftBrief => DRIFT_WORD_TARGET_ENV,
@@ -1013,10 +1021,51 @@ impl KjDispatcher {
             )
         })?;
 
-        provider
+        // The call is a turn on the caller's context: the caller pays, and a
+        // call that cannot be recorded does not run.
+        let db = self.kernel_db().clone();
+        let performer = db.lock().get_context(caller)
+            .map_err(|e| format!("could not read the context that pays for the distillation: {e}"))?
+            .and_then(|row| row.performer)
+            .ok_or_else(|| format!("cannot distill: context {} has no performer to record the call against", caller.short()))?;
+        let turn_id = kaijutsu_types::TurnId::new();
+        db.lock().begin_turn(&crate::TurnStart {
+            turn_id,
+            context_id: caller,
+            performer,
+            role: purpose.turn_role().to_string(),
+            provider: provider_name.clone(),
+            model: model.clone(),
+            started_at: kaijutsu_types::now_millis() as i64,
+        }).map_err(|e| format!("could not write the distillation's turn record: {e}. The call was not made."))?;
+
+        let reply = provider
             .prompt_with_system(&model, max_tokens, Some(&system_prompt), &user_prompt)
-            .await
-            .map_err(|e| format!("LLM summarization failed on {provider_name}/{model}: {e}"))
+            .await;
+        // A failed call that reported counts still spent them.
+        let (usage, stop_reason) = match &reply {
+            Ok(reply) => (
+                Some(&reply.usage),
+                crate::runtime::llm_stream::turn_stop_reason(reply.stop_reason.as_deref()).as_str(),
+            ),
+            Err(failed) => (failed.usage.as_ref(), "failed"),
+        };
+        let recorded = usage.map_or(Ok(()), |usage| {
+            crate::runtime::llm_stream::record_turn_spend(
+                &db, Some(turn_id), &provider_name, &model,
+                usage.input_tokens, usage.output_tokens, &usage.extra,
+            ).map(|_| ())
+        });
+        let finished = db.lock().finish_turn(turn_id, kaijutsu_types::now_millis() as i64, stop_reason);
+        let record = recorded
+            .and(finished)
+            .map_err(|e| format!("could not write the distillation's turn record: {e}"));
+        if let Err(error) = &record {
+            tracing::error!(context = %caller, turn = %turn_id, "{error}");
+        }
+        let reply = reply.map_err(|e| format!("LLM summarization failed on {provider_name}/{model}: {e}"))?;
+        record?;
+        Ok(reply.text)
     }
 
     fn distillation_limits(

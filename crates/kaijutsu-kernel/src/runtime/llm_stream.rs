@@ -2282,6 +2282,56 @@ impl Drop for TurnUsageOnSpan {
     }
 }
 
+/// Adds one provider call's spend to the turn's `turns` row (`turn_id`; `None`
+/// for a call no row records) and to the meter, and returns its raw counts.
+/// The row sums every call's raw counts: each call is spend. A call that
+/// reported no counts spent nothing we know of and leaves the row as it is.
+/// A turn's inferences and a one-shot prompt both record through here.
+pub(crate) fn record_turn_spend(
+    kernel_db: &parking_lot::Mutex<KernelDb>,
+    turn_id: Option<kaijutsu_types::TurnId>,
+    provider_name: &str,
+    model_name: &str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    extra: &Option<crate::llm::UsageExtra>,
+) -> crate::kernel_db::KernelDbResult<crate::RawUsage> {
+    // DeepSeek reports an automatic-cache hit/miss split and reasoning
+    // tokens; Anthropic reports cache read/creation. Absent extra means zeros.
+    let raw = raw_usage(input_tokens, output_tokens, extra);
+    if let Some(turn_id) = turn_id
+        && !(input_tokens.is_none() && output_tokens.is_none())
+    {
+        kernel_db.lock().add_turn_usage(turn_id, raw)?;
+    }
+    // The global meter (no-op until OTel is enabled). Both the completed and
+    // cancelled paths spend tokens, so record before branching.
+    // cache_creation maps from the provider extra (Anthropic cache writes);
+    // reasoning rides as its own gen_ai.token.type.
+    kaijutsu_telemetry::record_llm_usage(
+        provider_name,
+        model_name,
+        kaijutsu_telemetry::TokenCounts {
+            input: input_tokens.unwrap_or(0),
+            output: output_tokens.unwrap_or(0),
+            cache_read: raw.cache_read,
+            cache_creation: raw.cache_write,
+            reasoning: raw.reasoning,
+        },
+    );
+    Ok(raw)
+}
+
+/// The turn outcome a completed call's stop reason reports: the output
+/// limit is `MaxTokens`; refusal, stop sequence, and every other reason are
+/// `EndTurn` until the public stop-reason type distinguishes them.
+pub(crate) fn turn_stop_reason(stop_reason: Option<&str>) -> TurnStopReason {
+    match stop_reason {
+        Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
+        _ => TurnStopReason::EndTurn,
+    }
+}
+
 /// Records one provider call's spend: the turn's row, the turn span, the
 /// meter, and the context's fill gauge. A `Done` and an `Error` that carries
 /// usage both come here, because a call that failed after the provider
@@ -2301,20 +2351,13 @@ fn record_call_usage(
     extra: &Option<crate::llm::UsageExtra>,
     stop_reason: &Option<String>,
 ) -> Result<(), StreamFailure> {
-        // DeepSeek reports an automatic-cache hit/miss split and
-        // reasoning tokens; Anthropic reports cache read/creation.
-        // Absent extra means zeros.
         use crate::llm::UsageExtra;
-        let raw = raw_usage(input_tokens, output_tokens, extra);
+        // A write that fails fails the turn.
+        let raw = record_turn_spend(
+            kernel_db, records_turn.then_some(turn_id), provider_name, model_name,
+            input_tokens, output_tokens, extra,
+        ).map_err(|error| StreamFailure::TurnRecord(error.to_string()))?;
         let (cache_read, cache_write, reasoning) = (raw.cache_read, raw.cache_write, raw.reasoning);
-
-        // The turn's row sums every call's raw counts: each call
-        // is spend. A call that reported no counts spent nothing
-        // we know of. A write that fails fails the turn.
-        if records_turn && !(input_tokens.is_none() && output_tokens.is_none()) {
-            kernel_db.lock().add_turn_usage(turn_id, raw)
-                .map_err(|error| StreamFailure::TurnRecord(error.to_string()))?;
-        }
 
         // The turn span gets this call's usage at turn exit, once
         // (`TurnUsageOnSpan`); a later call replaces it.
@@ -2327,22 +2370,6 @@ fn record_call_usage(
             stop_reason: stop_reason.clone(),
         });
 
-        // Record token usage to the global meter (no-op until OTel
-        // is enabled). Both the completed and cancelled paths spend
-        // tokens, so record before branching. cache_creation maps
-        // from the provider extra (Anthropic cache writes); reasoning
-        // rides as its own gen_ai.token.type.
-        kaijutsu_telemetry::record_llm_usage(
-            provider_name,
-            model_name,
-            kaijutsu_telemetry::TokenCounts {
-                input: input_tokens.unwrap_or(0),
-                output: output_tokens.unwrap_or(0),
-                cache_read,
-                cache_creation: cache_write,
-                reasoning,
-            },
-        );
 
         // Context-usage gauge: persist a SNAPSHOT of this call's
         // usage as "how full is this context right now" — NOT a
@@ -3461,10 +3488,7 @@ async fn run_llm_stream(
                         }
                         _ => {}
                     }
-                    stop_reason_out = match stop_reason.as_deref() {
-                        Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
-                        _ => TurnStopReason::EndTurn,
-                    };
+                    stop_reason_out = turn_stop_reason(stop_reason.as_deref());
                     output_ceiling_hit = stop_reason_out == TurnStopReason::MaxTokens;
                     tracing::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}{}",

@@ -3237,6 +3237,135 @@ mod tests {
         assert!(summary.contains("DISTILL-ANSWER"), "{summary:?}");
     }
 
+    /// A context whose `distill` slot is deepseek/deepseek-flash, with one
+    /// block to distill, and a mock on that backend that streams `calls`.
+    async fn distilling_context(
+        d: &crate::kj::KjDispatcher,
+        calls: Vec<Vec<crate::llm::StreamEvent>>,
+    ) -> kaijutsu_types::ContextId {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+        crate::test_backends::example_backends(&d.kernel_db().lock());
+        d.reload_llm_registry().await.unwrap();
+        let ctx = register_context_with_models(
+            d, Some("payer"), None, PrincipalId::new(), &[("distill", "deepseek", "deepseek-flash")],
+        );
+        d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        d.block_store()
+            .insert_block(
+                ctx, None, None,
+                kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text, "material to distill",
+                kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        d.kernel().llm().write().await.register(
+            "deepseek",
+            Arc::new(Provider::Mock(MockClient::new("UNSCRIPTED").with_scripted_stream(calls))),
+        );
+        ctx
+    }
+
+    /// The events of a one-shot reply `text` that reports 1000 tokens in, 400
+    /// of them a cache hit, and 500 out.
+    fn reply_with_usage(text: &str) -> Vec<crate::llm::StreamEvent> {
+        use crate::llm::{OpenAiCompatUsageExtra, StreamEvent, UsageExtra};
+        vec![
+            StreamEvent::TextStart,
+            StreamEvent::TextDelta(text.into()),
+            StreamEvent::TextEnd,
+            StreamEvent::Done {
+                stop_reason: Some("stop".into()),
+                input_tokens: Some(1000),
+                output_tokens: Some(500),
+                extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                    prompt_cache_hit_tokens: 400,
+                    prompt_cache_miss_tokens: 600,
+                    reasoning_tokens: 0,
+                })),
+            },
+        ]
+    }
+
+    /// A summary is a model call, and the caller pays for it: it is a turn
+    /// on the caller's context, in role `distill`, on the slot's backend and
+    /// model, with the counts the provider reported. `kj context turns`
+    /// lists it, and the context's cost includes it once a price exists.
+    ///
+    /// Falsified by a one-shot call that leaves no `turns` row.
+    #[tokio::test]
+    async fn a_summary_is_a_turn_on_the_callers_context_and_is_costed() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let ctx = distilling_context(&d, vec![reply_with_usage("BRIEF")]).await;
+        let summary = d.summarize(ctx, None).await;
+
+        let turns = d.kernel_db().lock().list_turns(ctx, 10).unwrap();
+        assert_eq!(turns.len(), 1, "one turn recorded: {turns:?}");
+        let turn = &turns[0];
+        let performer = d.kernel_db().lock().get_context(ctx).unwrap().unwrap().performer.unwrap();
+        assert_eq!(
+            (turn.start.role.as_str(), turn.start.provider.as_str(), turn.start.model.as_str(), turn.start.performer),
+            ("distill", "deepseek", "deepseek-flash", performer),
+        );
+        assert_eq!((turn.llm_calls, turn.input_tokens, turn.output_tokens, turn.cache_read_tokens), (1, 1000, 500, 400));
+        assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"));
+        assert!(turn.ended_at.is_some());
+        assert!(summary.expect("summarize").contains("BRIEF"));
+
+        let c = caller_with_context(ctx);
+        let listed = d.dispatch(&[s("context"), s("turns")], &c).await;
+        let line = listed.message().lines().find(|l| l.starts_with(&turn.start.turn_id.short()))
+            .unwrap_or_else(|| panic!("the summary turn is listed: {}", listed.message())).to_string();
+        assert!(line.contains("deepseek/deepseek-flash") && line.contains("(role distill)"), "{line}");
+
+        d.kernel_db().lock().insert_model_price(&crate::kernel_db::NewModelPrice {
+            provider: "deepseek".into(), model: "deepseek-flash".into(), effective_from: 0,
+            input: 1_000_000, output: 2_000_000, cache_read: Some(100_000),
+            cache_write_5m: None, cache_write_1h: None, source: "test".into(), set_by: None,
+        }).unwrap();
+        let info = d.dispatch(&[s("context"), s("info")], &c).await;
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info carries a record: {}", info.message()) };
+        // 600 uncached in at $1, 400 cached at $0.10, 500 out at $2.
+        assert_eq!(data["cost"]["micros"], 1640, "{data}");
+        assert_eq!(data["cost"]["priced_calls"], 1, "{data}");
+    }
+
+    /// A compact fork's continuation is recorded in role `continuation`.
+    #[tokio::test]
+    async fn a_continuation_summary_is_a_turn_in_role_continuation() {
+        let d = test_dispatcher().await;
+        let ctx = distilling_context(&d, vec![reply_with_usage("HANDOFF")]).await;
+        let summary = d.summarize_for_continuation(ctx).await;
+        let turns = d.kernel_db().lock().list_turns(ctx, 10).unwrap();
+        assert_eq!(turns.len(), 1, "one turn recorded: {turns:?}");
+        assert_eq!(turns[0].start.role, "continuation");
+        assert!(summary.expect("summarize").contains("HANDOFF"));
+    }
+
+    /// A one-shot that fails after the provider reported counts still spent
+    /// them: its turn carries them and ends `failed`, as a failed model turn
+    /// does.
+    ///
+    /// Falsified by a failed summary whose spend is dropped.
+    #[tokio::test]
+    async fn a_failed_summary_records_the_usage_it_spent() {
+        use crate::llm::{SpentUsage, StreamError, StreamErrorKind, StreamEvent};
+        let d = test_dispatcher().await;
+        let filtered = StreamError::new(StreamErrorKind::ContentFilter, "filtered")
+            .with_usage(SpentUsage { input_tokens: Some(800), output_tokens: Some(20), extra: None });
+        let ctx = distilling_context(&d, vec![vec![
+            StreamEvent::TextStart, StreamEvent::TextDelta("part".into()), StreamEvent::Error(filtered),
+        ]]).await;
+        let summary = d.summarize(ctx, None).await;
+
+        let turns = d.kernel_db().lock().list_turns(ctx, 10).unwrap();
+        assert_eq!(turns.len(), 1, "one turn recorded: {turns:?}");
+        assert_eq!((turns[0].llm_calls, turns[0].input_tokens, turns[0].output_tokens), (1, 800, 20));
+        assert_eq!(turns[0].stop_reason.as_deref(), Some("failed"));
+        let err = summary.expect_err("a filtered summary fails");
+        assert!(err.contains("content_filter"), "{err}");
+    }
+
     /// `--distill-model` is gone from `drift pull` and `drift merge`: the
     /// model a distillation runs on is the instance's `distill` slot. (A
     /// pull's trailing words are its directed prompt, so the flag is checked

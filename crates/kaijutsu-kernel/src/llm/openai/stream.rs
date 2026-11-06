@@ -101,7 +101,7 @@ pub(crate) fn capacity_cut() -> StreamError {
 /// that completes it. A missing reason is a truncation. `length` completes a
 /// reply at the output limit, and a reason this client does not know
 /// completes it too, since servers name their own (`eos_token`).
-pub(crate) fn finish_failure(finish_reason: Option<&str>) -> Option<StreamError> {
+fn finish_failure(finish_reason: Option<&str>) -> Option<StreamError> {
     match finish_reason {
         None => Some(StreamError::new(
             StreamErrorKind::Truncated("no_finish_reason".into()),

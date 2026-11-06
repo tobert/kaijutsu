@@ -8,8 +8,8 @@
 //!
 //! [`Client`] owns a `reqwest::Client` with the Anthropic auth headers
 //! pinned at construction. `stream()` POSTs to `/v1/messages` with
-//! `stream: true` and wraps the byte-stream response in [`Stream`].
-//! `prompt()` does the non-streaming form, returning concatenated text.
+//! `stream: true` and wraps the byte-stream response in [`Stream`]. A
+//! one-shot prompt streams too (`Provider::prompt_with_system`).
 
 pub mod build;
 #[cfg(test)]
@@ -31,7 +31,6 @@ use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, htt
 
 use self::sse::{ClaudeSseEvent, decode_event};
 use self::stream::StateMachine;
-use self::types::{MessagesResponse, ResponseContent};
 
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -189,79 +188,15 @@ impl Client {
         }
     }
 
-    /// One-shot prompt with optional system preamble.
-    ///
-    /// Uses the non-streaming `/v1/messages` form. Concatenates all
-    /// `Text` content blocks in the response. Other content blocks
-    /// (thinking, tool_use) are dropped with a warning — `prompt()` is
-    /// the distillation entry point, not the agentic loop.
-    pub async fn prompt(
-        &self,
-        model: &str,
-        max_tokens: u64,
-        system: Option<&str>,
-        prompt: &str,
-    ) -> LlmResult<String> {
-        let messages = vec![Message::user(prompt)];
-        let mut opts = BuildOpts::new(model, max_tokens);
-        if let Some(sys) = system {
-            opts = opts.with_system(sys);
-        }
-        let mut body = build::build_request(&opts, &messages, false, self.dialect)?;
-        if self.dialect == Dialect::DeepSeek {
-            // The server thinks by default, and thinking tokens count against
-            // `max_tokens`; a distillation wants the answer text.
+    /// The request options a one-shot prompt runs with: thinking off, since
+    /// a one-shot wants the answer text and thinking tokens count against
+    /// `max_tokens`. A model that thinks on every request refuses thinking
+    /// off, so it keeps its default.
+    pub fn one_shot_opts(&self, mut opts: BuildOpts) -> BuildOpts {
+        if self.dialect == Dialect::DeepSeek || !types::Thinking::is_always_on(&opts.model) {
             opts.thinking_style = Some("off".into());
-            build::apply_thinking(&mut body, &opts, self.dialect)?;
         }
-
-        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
-        let mut request = self
-            .http
-            .post(format!("{}/v1/messages", self.base_url))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body);
-        request = with_betas(request, &body);
-        if let Some(timeout) = self.request_timeout {
-            request = request.timeout(timeout);
-        }
-        crate::llm::request_dump::record(
-            None, self.dialect.provider_label(), model, &self.base_url, system, &messages, &body,
-        );
-        let response = request.send().await.map_err(http_error)?;
-        observe(slot.as_ref(), &response, false);
-
-        let response = error_for_status(response).await?;
-
-        let parsed: MessagesResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::ApiError(format!("response JSON parse: {e}")))?;
-
-        // A reply that stopped before it finished is an error, not partial text.
-        stream::check_stop_reason(parsed.stop_reason.as_deref())?;
-
-        let mut text = String::new();
-        for content in &parsed.content {
-            match content {
-                ResponseContent::Text { text: t } => text.push_str(t),
-                ResponseContent::Thinking { .. } | ResponseContent::RedactedThinking { .. } => {
-                    tracing::debug!(
-                        "claude::prompt: dropping thinking block from non-streaming response"
-                    );
-                }
-                ResponseContent::Other => {
-                    tracing::debug!("claude::prompt: dropping a non-text block from the response");
-                }
-                ResponseContent::ToolUse { name, .. } => {
-                    tracing::warn!(
-                        tool = %name,
-                        "claude::prompt: dropping unexpected tool_use block (distillation should not invoke tools)"
-                    );
-                }
-            }
-        }
-        Ok(text)
+        opts
     }
 
     /// Start a streaming completion.
@@ -641,59 +576,20 @@ data: {\"type\":\"message_stop\"}
 
     /// The UA rides the real wire path: reqwest applies client defaults at
     /// `execute()`, so a built request isn't proof — a captured request is.
-    /// A loopback listener reads the raw request head the server receives,
-    /// then answers a minimal `/v1/messages` completion so `prompt()`
-    /// completes. Mirrors `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
+    /// Mirrors `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
     #[tokio::test]
     async fn outbound_requests_carry_the_kaijutsu_user_agent() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        use kaijutsu_mk::test_server::{serve, sse};
+        let (base, seen) = serve(vec![sse(SIMPLE_COMPLETION)]).await;
+        let mut stream = Client::new("fake-key").unwrap()
+            .with_base_url(&base)
+            .stream(BuildOpts::new("claude-haiku-4-5", 4096), vec![Message::user("hi")])
             .await
-            .expect("loopback bind");
-        let port = listener.local_addr().expect("local addr").port();
-
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            use tokio::io::AsyncReadExt;
-            let mut head = Vec::new();
-            loop {
-                let mut buf = [0u8; 512];
-                let n = sock.read(&mut buf).await.expect("read request");
-                if n == 0 {
-                    break;
-                }
-                head.extend_from_slice(&buf[..n]);
-                if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let body = r#"{"id":"msg_01","model":"claude-haiku-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use tokio::io::AsyncWriteExt;
-            let _ = sock.write_all(resp.as_bytes()).await;
-            String::from_utf8_lossy(&head).into_owned()
-        });
-
-        let text = Client::new("fake-key").unwrap()
-            .with_base_url(format!("http://127.0.0.1:{port}"))
-            .prompt("claude-haiku-4-5", 4096, None, "hi")
-            .await
-            .expect("prompt round-trip against loopback");
-        assert_eq!(text, "ok", "response must parse through the real path");
-
-        let head = server.await.expect("server task");
-        let ua = head
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
-            .unwrap_or_else(|| panic!("request head carried no User-Agent:\n{head}"));
-        let (name, value) = ua.split_once(':').expect("matched on the colon");
-        assert!(name.eq_ignore_ascii_case("user-agent"), "header name: {name}");
+            .expect("stream round-trip against loopback");
+        while stream.next_event().await.is_some() {}
         assert_eq!(
-            value.trim(),
-            http_user_agent(),
+            seen.lock().unwrap()[0].header("user-agent"),
+            Some(http_user_agent()),
             "UA must be exactly the kaijutsu identity, not reqwest/none"
         );
     }
@@ -706,7 +602,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![reply(503, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
-        let err = client.prompt("m", 4096, None, "hi").await.unwrap_err();
+        let err = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
@@ -742,7 +638,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![busy]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
-        let err = client.prompt("m", 4096, None, "hi").await.unwrap_err();
+        let err = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 429);
@@ -792,22 +688,6 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(endpoint.busy_in_a_row(), 1, "a failed stream is not a completed answer");
     }
 
-    /// `prompt()` returns text only for a reply that finished.
-    #[tokio::test]
-    async fn a_prompt_that_stopped_before_it_finished_is_an_error() {
-        use kaijutsu_mk::test_server::{reply, serve};
-        let body = |stop: &str| format!(
-            r#"{{"id":"m","model":"claude-haiku-5-5","role":"assistant","content":[{{"type":"text","text":"partial"}}],"stop_reason":{stop},"stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}}"#
-        );
-        for stop in ["\"pause_turn\"", "\"model_context_window_exceeded\"", "null"] {
-            let (base, _) = serve(vec![reply(200, &body(stop))]).await;
-            let err = Client::new("k").unwrap().with_base_url(&base).prompt("m", 4096, None, "hi").await.unwrap_err();
-            assert!(matches!(err, LlmError::CompletionError(_)), "{stop}: {err:?}");
-        }
-        let (base, _) = serve(vec![reply(200, &body("\"end_turn\""))]).await;
-        assert_eq!(Client::new("k").unwrap().with_base_url(&base).prompt("m", 4096, None, "hi").await.unwrap(), "partial");
-    }
-
     /// A model that thinks on every request rejects `thinking: disabled`, so
     /// the request fails before it is sent.
     #[tokio::test]
@@ -831,7 +711,7 @@ data: {\"type\":\"message_stop\"}
         let (base, _) = serve(vec![reply(529, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_1"}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
-        let err = client.prompt("m", 4096, None, "hi").await.unwrap_err();
+        let err = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::ApiError(m) if m.contains("overloaded_error") && m.contains("req_1")), "{err:?}");
         let (_, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
@@ -889,32 +769,5 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(client.dialect(), Dialect::DeepSeek);
         assert_eq!(client.available_models(), vec!["deepseek-flash", "deepseek-v4-pro"]);
         assert_eq!(Client::new("k").unwrap().dialect(), Dialect::Anthropic);
-    }
-
-    /// A one-shot prompt sends the `max_tokens` its caller names, the slot it
-    /// runs on, and no limit of its own.
-    ///
-    /// Falsified by a prompt that sends a fixed limit.
-    #[tokio::test]
-    async fn a_prompt_sends_the_max_tokens_its_caller_names() {
-        use kaijutsu_mk::test_server::{reply, serve};
-        let ok = r#"{"id":"m","model":"m","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        let (base, seen) = serve(vec![reply(200, ok)]).await;
-        Client::new("k").unwrap().with_base_url(&base).prompt("m", 777, None, "hi").await.unwrap();
-        let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
-        assert_eq!(wire["max_tokens"], 777);
-    }
-
-    /// `prompt()` against DeepSeek turns thinking off, so `max_tokens` is
-    /// not spent before the answer.
-    #[tokio::test]
-    async fn a_deepseek_prompt_sends_thinking_disabled() {
-        use kaijutsu_mk::test_server::{reply, serve};
-        let ok = r#"{"id":"m","model":"deepseek-flash","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        let (base, seen) = serve(vec![reply(200, ok)]).await;
-        let text = Client::deepseek("k").unwrap().with_base_url(&base).prompt("deepseek-flash", 4096, None, "hi").await.unwrap();
-        assert_eq!(text, "ok");
-        let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
-        assert_eq!(wire["thinking"], serde_json::json!({"type": "disabled"}));
     }
 }

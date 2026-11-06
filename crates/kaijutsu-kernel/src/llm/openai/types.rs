@@ -334,38 +334,10 @@ pub struct FunctionChunk {
 }
 
 // ============================================================================
-// Non-streaming response types (prompt() path)
-// ============================================================================
-
-/// Full response body for a non-streaming `/chat/completions` call.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChatResponse {
-    pub choices: Vec<ResponseChoice>,
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResponseChoice {
-    pub message: ResponseMessage,
-    #[serde(default)]
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResponseMessage {
-    #[serde(default)]
-    pub content: Option<String>,
-    #[serde(default)]
-    pub reasoning_content: Option<String>,
-}
-
-// ============================================================================
 // Usage + error
 // ============================================================================
 
-/// Token usage payload. Streaming reports it once on the trailing chunk;
-/// non-streaming reports it on the response body. `prompt_cache_*` and
+/// Token usage payload, reported once on the trailing chunk. `prompt_cache_*` and
 /// `reasoning_tokens` are DeepSeek-specific and default to 0 elsewhere.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Usage {
@@ -730,16 +702,5 @@ mod tests {
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("max_tokens").is_none(), "hosted dialect must omit max_tokens entirely");
         assert_eq!(v["max_completion_tokens"], 4096);
-    }
-
-    #[test]
-    fn non_streaming_response_extracts_content_and_reasoning() {
-        let json = r#"{"choices":[{"message":{"role":"assistant","content":"the answer","reasoning_content":"the thinking"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
-        let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content.as_deref(), Some("the answer"));
-        assert_eq!(
-            resp.choices[0].message.reasoning_content.as_deref(),
-            Some("the thinking")
-        );
     }
 }

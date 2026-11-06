@@ -324,10 +324,6 @@ Claude reply cut short have shipped. Open:
 - A call billed against a plan quota (Alibaba's Token Plan bills in credits) has no honest dollar figure. Amy
   (2026-11-06): the TUI and app will show plan usage or dollars depending on how the provider and character are
   set up; deferred until the UI work.
-- One-shot side calls (`summarize` for drift briefings and continuation, kj/mod.rs ~955) go through
-  `Provider::prompt_with_system`, which returns text only, so their usage never reaches `turns` and their cost is
-  invisible. Next: one-shot prompting drains `stream()` and returns usage, and the call is recorded against the
-  caller's context with its own `role`.
 - Provider-billed tool uses have storage (`turn_tool_uses`), prices (`tool_prices`, `kj price set-tool`) and
   display, but no provider stream reports them yet: Anthropic's web search request count and Alibaba's
   `usage.x_tools` still need capturing into `add_turn_tool_uses`, under the provider's stable tool name

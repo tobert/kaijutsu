@@ -14,8 +14,8 @@
 //!
 //! [`Client`] owns a `reqwest::Client` and attaches `Authorization: Bearer`
 //! per request *when a key is configured* — local servers need none.
-//! `stream()` POSTs to `/chat/completions` with `stream: true`; `prompt()`
-//! does the non-streaming form.
+//! `stream()` POSTs to `/chat/completions` with `stream: true`; a one-shot
+//! prompt streams too (`Provider::prompt_with_system`).
 
 pub mod build;
 pub mod sse;
@@ -35,7 +35,7 @@ use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, htt
 
 use self::sse::{OpenAiSseEvent, decode_event};
 use self::stream::StateMachine;
-use self::types::{ApiError, ChatResponse};
+use self::types::ApiError;
 
 /// Fallback endpoint when no `base_url` is configured — OpenAI's own API.
 /// Local providers (lemonade, Ollama) always set `base_url` in config.
@@ -176,66 +176,15 @@ impl Client {
         }
     }
 
-    /// One-shot prompt with optional system preamble (non-streaming).
-    /// Returns the first choice's text; drops any `reasoning_content` (the
-    /// distillation path doesn't surface the chain-of-thought). A reply the
-    /// provider filtered, cut, or left without a `finish_reason` is an error.
-    pub async fn prompt(
-        &self,
-        model: &str,
-        max_tokens: u64,
-        system: Option<&str>,
-        prompt: &str,
-    ) -> LlmResult<String> {
-        let messages = vec![Message::user(prompt)];
-        let mut opts = BuildOpts::new(model, max_tokens);
-        if let Some(sys) = system {
-            opts = opts.with_system(sys);
-        }
-        // DeepSeek thinks by default, and thinking tokens count against
-        // `max_tokens`; a one-shot prompt wants the answer text.
+    /// The request options a one-shot prompt runs with. The DeepSeek preset
+    /// thinks by default, and thinking tokens count against `max_tokens`, so
+    /// a one-shot turns it off; hosted OpenAI takes OpenAI's dialect.
+    pub fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
         if self.reasoning_required && !is_hosted_openai(&self.base_url) {
-            opts = opts.with_effort("none");
+            opts.with_effort("none")
+        } else {
+            opts
         }
-        let body = build::build_request(
-            &opts,
-            &messages,
-            false,
-            self.reasoning_required,
-            is_hosted_openai(&self.base_url),
-            &self.provider_name,
-        );
-        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
-        let mut request = self
-            .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body);
-        if let Some(timeout) = self.request_timeout {
-            request = request.timeout(timeout);
-        }
-        crate::llm::request_dump::record(
-            None, &self.provider_name, model, &self.base_url, system, &messages, &body,
-        );
-        let response = request.send().await.map_err(http_error)?;
-        crate::llm::endpoint::observe(slot.as_ref(), &response);
-
-        let response = self.error_for_status(response).await?;
-
-        let parsed: ChatResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::ApiError(format!("response JSON parse: {e}")))?;
-
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::ApiError("the response carried no choices".into()))?;
-        // A reply that stopped before it finished is an error, not partial text.
-        if let Some(error) = stream::finish_failure(choice.finish_reason.as_deref()) {
-            return Err(error.into());
-        }
-        Ok(choice.message.content.unwrap_or_default())
     }
 
     /// Start a streaming completion. POSTs `stream: true` and wraps the
@@ -568,10 +517,9 @@ mod tests {
 
     /// The UA rides the real wire path: reqwest applies client defaults at
     /// `execute()`, so a built request isn't proof — a captured request is.
-    /// A loopback listener reads the raw request head the server receives,
-    /// then answers a minimal chat-completion so `prompt()` completes.
     #[tokio::test]
     async fn outbound_requests_carry_the_kaijutsu_user_agent() {
+        use kaijutsu_mk::test_server::{serve, sse};
         // The wire check compares against `http_user_agent()`, so pin its
         // content here — a shared-const regression to some other string
         // can't pass this test unnoticed.
@@ -580,61 +528,16 @@ mod tests {
             "UA must name the product: {}",
             http_user_agent()
         );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let (base, seen) = serve(vec![sse(SIMPLE)]).await;
+        let mut stream = Client::new("test-backend")
+            .with_base_url(&base)
+            .stream(BuildOpts::new("m", 4096), vec![Message::user("hi")])
             .await
-            .expect("loopback bind");
-        let port = listener.local_addr().expect("local addr").port();
-
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            use tokio::io::AsyncReadExt;
-            let mut head = Vec::new();
-            // Terminate on the head's double-CRLF (always present regardless
-            // of whether a UA was sent) or on peer EOF — neither a byte cap
-            // nor the presence of the UA gates this loop's exit.
-            loop {
-                let mut buf = [0u8; 512];
-                let n = sock.read(&mut buf).await.expect("read request");
-                if n == 0 {
-                    break;
-                }
-                head.extend_from_slice(&buf[..n]);
-                if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use tokio::io::AsyncWriteExt;
-            let _ = sock.write_all(resp.as_bytes()).await;
-            String::from_utf8_lossy(&head).into_owned()
-        });
-
-        let text = Client::new("test-backend")
-            .with_base_url(format!("http://127.0.0.1:{port}/v1"))
-            .prompt("m", 4096, None, "hi")
-            .await
-            .expect("prompt round-trip against loopback");
-        assert_eq!(text, "ok", "response must parse through the real path");
-
-        let head = server.await.expect("server task");
-        let ua = head
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
-            .unwrap_or_else(|| panic!("request head carried no User-Agent:\n{head}"));
-        // Header NAME matched case-insensitively above (RFC 9110); compare
-        // it the same way and keep the VALUE comparison exact — lowercasing
-        // the whole line would force the value lowercase as policy.
-        let (name, value) = ua.split_once(':').expect("matched on the colon");
-        assert!(name.eq_ignore_ascii_case("user-agent"), "header name: {name}");
+            .expect("stream round-trip against loopback");
+        while stream.next_event().await.is_some() {}
         assert_eq!(
-            value.trim(),
-            http_user_agent(),
+            seen.lock().unwrap()[0].header("user-agent"),
+            Some(http_user_agent()),
             "UA must be exactly the kaijutsu identity, not reqwest/none"
         );
     }
@@ -993,59 +896,6 @@ data: [DONE]
             matches!(events.as_slice(), [StreamEvent::Error(e)] if e.kind == StreamErrorKind::ContentFilter),
             "{events:?}"
         );
-    }
-
-    /// A one-shot prompt fails loudly when the reply did not finish, and
-    /// when there is no reply at all; a reply at the length limit is the
-    /// text it reached, as on the Anthropic dialect.
-    ///
-    /// Falsified by a filtered, cut, unfinished, or missing reply that comes
-    /// back as text.
-    #[tokio::test]
-    async fn a_prompt_reply_that_did_not_finish_is_an_error() {
-        use kaijutsu_mk::test_server::{reply, serve};
-        let body = |finish: &str| {
-            format!(r#"{{"choices":[{{"message":{{"role":"assistant","content":"part"}}{finish}}}]}}"#)
-        };
-        for (finish, failure) in [
-            (r#","finish_reason":"content_filter""#, Some("content_filter")),
-            (r#","finish_reason":"insufficient_system_resource""#, Some("insufficient_system_resource")),
-            ("", Some("no_finish_reason")),
-            (r#","finish_reason":"length""#, None),
-            (r#","finish_reason":"stop""#, None),
-        ] {
-            let (base, _) = serve(vec![reply(200, body(finish))]).await;
-            let result = Client::new("t").with_base_url(&base).prompt("m", 64, None, "hi").await;
-            match failure {
-                Some(label) => {
-                    let err = result.expect_err(finish);
-                    assert!(err.to_string().contains(label), "{finish}: {err}");
-                }
-                None => assert_eq!(result.expect(finish), "part"),
-            }
-        }
-        let (base, _) = serve(vec![reply(200, r#"{"choices":[]}"#)]).await;
-        let err = Client::new("t").with_base_url(&base).prompt("m", 64, None, "hi").await.expect_err("no choices");
-        assert!(err.to_string().contains("no choices"), "{err}");
-    }
-
-    /// A one-shot prompt on the DeepSeek preset turns thinking off: thinking
-    /// tokens count against `max_tokens`, and a one-shot prompt wants the
-    /// answer. A plain OpenAI-compatible server gets no thinking field.
-    ///
-    /// Falsified by a DeepSeek prompt that leaves thinking on.
-    #[tokio::test]
-    async fn a_deepseek_prompt_turns_thinking_off() {
-        use kaijutsu_mk::test_server::{reply, serve};
-        let ok = || reply(200, r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#);
-        let (base, seen) = serve(vec![ok(), ok()]).await;
-        crate::llm::deepseek::Client::new("k").with_base_url(&base).prompt("m", 64, None, "hi").await.unwrap();
-        Client::new("t").with_base_url(&base).prompt("m", 64, None, "hi").await.unwrap();
-        let bodies: Vec<serde_json::Value> =
-            seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
-        assert_eq!(bodies[0]["thinking"]["type"], "disabled", "{}", bodies[0]);
-        assert!(bodies[0].get("reasoning_effort").is_none(), "{}", bodies[0]);
-        assert!(bodies[1].get("thinking").is_none(), "{}", bodies[1]);
     }
 
     /// A stream that reaches `[DONE]` resets the doubling; opening it does

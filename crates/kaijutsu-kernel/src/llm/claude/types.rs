@@ -400,49 +400,8 @@ impl CacheControl {
     }
 }
 
-// ============================================================================
-// Response types (non-streaming /v1/messages reply)
-// ============================================================================
-
-/// Full response body for non-streaming `/v1/messages` calls.
-#[derive(Debug, Clone, Deserialize)]
-pub struct MessagesResponse {
-    pub id: String,
-    pub model: String,
-    pub role: String,
-    pub content: Vec<ResponseContent>,
-    pub stop_reason: Option<String>,
-    pub stop_sequence: Option<String>,
-    pub usage: ResponseUsage,
-}
-
-/// A single content block in a non-streaming response.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseContent {
-    Text {
-        text: String,
-    },
-    Thinking {
-        thinking: String,
-        #[serde(default)]
-        signature: Option<String>,
-    },
-    RedactedThinking {
-        data: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    /// Any block type `prompt()` has no use for (server tool blocks, say).
-    #[serde(other)]
-    Other,
-}
-
-/// Token usage payload — both non-streaming responses and the streaming
-/// `message_start` / `message_delta` events use this shape.
+/// Token usage payload, as the streaming `message_start` and `message_delta`
+/// events carry it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ResponseUsage {
     #[serde(default)]
@@ -596,17 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn a_response_with_server_tool_blocks_still_parses() {
-        let body = r#"{"id":"m","model":"x","role":"assistant","stop_reason":"end_turn","stop_sequence":null,
-            "content":[{"type":"server_tool_use","id":"s","name":"web_search","input":{}},
-                       {"type":"redacted_thinking","data":"d"},{"type":"text","text":"hi"}],
-            "usage":{"input_tokens":1,"output_tokens":1,"service_tier":"standard"}}"#;
-        let parsed: MessagesResponse = serde_json::from_str(body).unwrap();
-        assert!(matches!(parsed.content[0], ResponseContent::Other));
-        assert!(matches!(parsed.content[1], ResponseContent::RedactedThinking { .. }));
-    }
-
-    #[test]
     fn cache_control_ephemeral_omits_ttl() {
         let cc = CacheControl::ephemeral();
         let v = serde_json::to_value(cc).unwrap();
@@ -681,16 +629,6 @@ mod tests {
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["type"], "enabled");
         assert_eq!(v["budget_tokens"], 5000);
-    }
-
-    #[test]
-    fn response_content_text_deserializes() {
-        let json = r#"{"type":"text","text":"hello"}"#;
-        let block: ResponseContent = serde_json::from_str(json).unwrap();
-        match block {
-            ResponseContent::Text { text } => assert_eq!(text, "hello"),
-            other => panic!("expected Text, got {other:?}"),
-        }
     }
 
     #[test]

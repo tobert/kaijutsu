@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use gogi_proto::identity::ServerIdentity;
 use kaijutsu_mk::council::{GenerationEvent, GenerationStream};
 use kaijutsu_mk::generate::{
-    Finish, GenerateEvent, GenerateRequest, GenerateStream, Message as MkMessage, Sample, Source, MAX_TOKENS_LIMIT,
+    GenerateEvent, GenerateRequest, GenerateStream, Message as MkMessage, Sample, Source, MAX_TOKENS_LIMIT,
 };
 use kaijutsu_mk::model::RenderRequest;
 use kaijutsu_mk::{MkClient, MkError};
@@ -140,37 +140,11 @@ impl Client {
         &self.name
     }
 
-    /// One user message, not streamed, with thinking off; returns the answer
-    /// text. A reply that stopped at its output limit is an error.
-    pub async fn prompt(&self, model: &str, max_tokens: u64, system: Option<&str>, prompt: &str) -> LlmResult<String> {
-        let mut messages = Vec::new();
-        if let Some(system) = system.filter(|s| !s.is_empty()) {
-            messages.push(MkMessage::system(system));
-        }
-        messages.push(MkMessage::user(prompt));
-        let thinking = Some(false);
-        let turn = self.turn();
-        let max_tokens = self.admit_messages(&turn, model, &messages, &[], thinking, None, max_tokens).await?;
-        let request = GenerateRequest {
-            thinking,
-            max_tokens: Some(max_tokens),
-            ..GenerateRequest::messages(messages, Vec::new())
-        };
-        crate::llm::request_dump::record(
-            None, &self.name, model, "", system, &[Message::user(prompt)], &serde_json::Value::Null,
-        );
-        let (_slot, done) = self.call(&turn, false, |left| self.mk.generate(&request, left)).await?;
-        match done.finish {
-            Finish::Stop => Ok(done.content),
-            Finish::Length => Err(LlmError::ApiError(format!(
-                "mk backend '{}': the answer stopped at its {max_tokens}-token output limit",
-                self.name
-            ))),
-            Finish::Cancelled => Err(LlmError::ApiError(format!(
-                "mk backend '{}': the megakernel cancelled the generation, and the kernel did not ask it to",
-                self.name
-            ))),
-        }
+    /// The request options a one-shot prompt runs with: thinking off, since a
+    /// one-shot wants the answer text and thinking tokens count against
+    /// `max_tokens`.
+    pub fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
+        opts.with_effort("none")
     }
 
     /// A streamed turn. On a council v2 server that serves the turn's model
@@ -899,23 +873,6 @@ mod tests {
         let err = client(&base, HashMap::new()).stream(o, vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::InvalidRequest(_)), "{err:?}");
         assert!(seen.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn prompt_renders_first_and_a_length_stop_is_an_error() {
-        let done = ANSWER.lines().rfind(|l| l.starts_with("data: ")).unwrap()[6..].to_string();
-        let mut cut: serde_json::Value = serde_json::from_str(&done).unwrap();
-        cut["finish"] = json!("length");
-        let (base, seen) = serve(vec![http(200, MODEL), rendered(40), http(200, done), rendered(40), http(200, cut.to_string())]).await;
-        let c = client(&base, HashMap::new());
-        assert_eq!(c.prompt("qwen", 4096, Some("s"), "sky?").await.unwrap(), "The sky is blue on a clear day.");
-        let err = c.prompt("qwen", 4096, Some("s"), "sky?").await.unwrap_err();
-        assert!(matches!(&err, LlmError::ApiError(m) if m.contains("output limit")), "{err:?}");
-        let seen = seen.lock().unwrap();
-        let paths: Vec<&str> = seen.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, ["/mk/v1/model", "/mk/v1/render", "/mk/v1/generate", "/mk/v1/render", "/mk/v1/generate"]);
-        let body: serde_json::Value = serde_json::from_str(&seen[2].body).unwrap();
-        assert_eq!((body["stream"].clone(), body["thinking"].clone(), body["max_tokens"].clone()), (json!(false), json!(false), json!(4096)));
     }
 
     /// Live, by hand on zorak: a tool call, then its result, through the

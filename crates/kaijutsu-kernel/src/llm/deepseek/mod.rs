@@ -62,15 +62,10 @@ impl Client {
         vec!["deepseek-flash", "deepseek-v4-pro"]
     }
 
-    /// One-shot prompt with optional system preamble (non-streaming).
-    pub async fn prompt(
-        &self,
-        model: &str,
-        max_tokens: u64,
-        system: Option<&str>,
-        prompt: &str,
-    ) -> LlmResult<String> {
-        self.0.prompt(model, max_tokens, system, prompt).await
+    /// The request options a one-shot prompt runs with: thinking off (see
+    /// `openai::Client::one_shot_opts`).
+    pub fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
+        self.0.one_shot_opts(opts)
     }
 
     /// Start a streaming completion.
@@ -96,54 +91,18 @@ mod tests {
     /// `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
     #[tokio::test]
     async fn outbound_requests_carry_the_kaijutsu_user_agent() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        use kaijutsu_mk::test_server::{serve, sse};
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (base, seen) = serve(vec![sse(done)]).await;
+        let mut stream = Client::new("fake-key")
+            .with_base_url(&base)
+            .stream(BuildOpts::new("deepseek-v4-flash", 4096), vec![Message::user("hi")])
             .await
-            .expect("loopback bind");
-        let port = listener.local_addr().expect("local addr").port();
-
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            use tokio::io::AsyncReadExt;
-            let mut head = Vec::new();
-            loop {
-                let mut buf = [0u8; 512];
-                let n = sock.read(&mut buf).await.expect("read request");
-                if n == 0 {
-                    break;
-                }
-                head.extend_from_slice(&buf[..n]);
-                if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            use tokio::io::AsyncWriteExt;
-            let _ = sock.write_all(resp.as_bytes()).await;
-            String::from_utf8_lossy(&head).into_owned()
-        });
-
-        let text = Client::new("fake-key")
-            .with_base_url(format!("http://127.0.0.1:{port}"))
-            .prompt("deepseek-v4-flash", 4096, None, "hi")
-            .await
-            .expect("prompt round-trip against loopback");
-        assert_eq!(text, "ok", "response must parse through the real path");
-
-        let head = server.await.expect("server task");
-        let ua = head
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
-            .unwrap_or_else(|| panic!("request head carried no User-Agent:\n{head}"));
-        let (name, value) = ua.split_once(':').expect("matched on the colon");
-        assert!(name.eq_ignore_ascii_case("user-agent"), "header name: {name}");
+            .expect("stream round-trip against loopback");
+        while stream.next_event().await.is_some() {}
         assert_eq!(
-            value.trim(),
-            http_user_agent(),
+            seen.lock().unwrap()[0].header("user-agent"),
+            Some(http_user_agent()),
             "UA must be exactly the kaijutsu identity, not reqwest/none"
         );
     }

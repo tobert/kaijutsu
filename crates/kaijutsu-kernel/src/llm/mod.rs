@@ -72,11 +72,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 #[derive(Clone, Debug)]
 pub struct MockClient {
     pub canned_response: String,
-    /// Artificial latency applied to `prompt`/`prompt_with_system`, so a test
-    /// can model a slow provider (e.g. exercising the distill `patient` hold).
-    /// Zero by default; the streaming path ignores it.
-    pub delay: std::time::Duration,
-    /// Artificial connection latency before a streaming call opens.
+    /// Artificial connection latency before a streaming call opens, which a
+    /// one-shot prompt waits too (e.g. exercising the distill `patient` hold).
     pub stream_start_delay: std::time::Duration,
     /// Optional scripted event sequence for the streaming path — lets a test
     /// drive a real multi-iteration agentic turn (e.g. tool call → tool
@@ -146,7 +143,6 @@ impl MockClient {
     pub fn new(response: impl Into<String>) -> Self {
         Self {
             canned_response: response.into(),
-            delay: std::time::Duration::ZERO,
             stream_start_delay: std::time::Duration::ZERO,
             scripted: None,
             hangs_when_exhausted: false,
@@ -189,10 +185,10 @@ impl MockClient {
         (self, traces)
     }
 
-    /// Builder: make `prompt`/`prompt_with_system` sleep `delay` before
-    /// returning the canned response.
+    /// Builder: make each call, a one-shot prompt included, wait `delay`
+    /// before its stream opens.
     pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
-        self.delay = delay;
+        self.stream_start_delay = delay;
         self
     }
 
@@ -577,6 +573,37 @@ impl LlmError {
     }
 }
 
+/// A one-shot prompt's reply (`Provider::prompt_with_system`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OneShotReply {
+    /// The text the model wrote; its thinking is not part of it.
+    pub text: String,
+    /// What the call spent, as the provider reported it.
+    pub usage: SpentUsage,
+    /// The provider's stop reason, such as `end_turn`, `stop`, or `length`.
+    pub stop_reason: Option<String>,
+}
+
+/// A one-shot prompt that failed, with what it spent before it failed.
+#[derive(Debug)]
+pub struct OneShotError {
+    pub error: LlmError,
+    /// `None` when the call failed before the provider reported counts.
+    pub usage: Option<SpentUsage>,
+}
+
+impl From<LlmError> for OneShotError {
+    fn from(error: LlmError) -> Self {
+        Self { error, usage: None }
+    }
+}
+
+impl std::fmt::Display for OneShotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 /// A failed stream, reported where a call returns an [`LlmError`] instead of
 /// events. The kind picks the variant; the text is the stream error's own.
 impl From<StreamError> for LlmError {
@@ -816,28 +843,6 @@ impl CodexAppClient {
         Ok(ProviderStream::Codex(CodexStream { client }))
     }
 
-    async fn prompt(&self, model: &str, max_tokens: u64, system: Option<&str>, prompt: &str) -> LlmResult<String> {
-        let mut stream = self
-            .stream(
-                BuildOpts {
-                    model: model.to_string(),
-                    system: system.map(str::to_owned),
-                    ..BuildOpts::new(model, max_tokens)
-                },
-                vec![Message::user(prompt)],
-            )
-            .await?;
-        let mut output = String::new();
-        while let Some(event) = stream.next_event().await {
-            match event {
-                StreamEvent::TextDelta(delta) => output.push_str(&delta),
-                StreamEvent::Done { .. } => break,
-                StreamEvent::Error(error) => return Err(LlmError::from(error)),
-                _ => {}
-            }
-        }
-        Ok(output)
-    }
 }
 
 fn flatten_codex_messages(messages: &[Message]) -> String {
@@ -1084,10 +1089,14 @@ impl Provider {
         }
     }
 
-    /// One-shot prompt with optional system preamble.
+    /// One-shot prompt with optional system preamble, streamed like a turn's
+    /// inference and drained here. The reply is the text the model wrote
+    /// (its thinking is not part of the answer), what the call spent, and
+    /// why it stopped.
     ///
-    /// Claude / DeepSeek / OpenAi hit their provider; Mock returns its
-    /// canned response (used by `KjDispatcher::summarize` in tests).
+    /// A reply at the output limit is the text it reached. A reply the
+    /// provider filtered, cut, or left unfinished is an error, and the error
+    /// carries what the call spent before it failed.
     #[tracing::instrument(
         skip(self, system, prompt),
         fields(llm.model = %model, llm.provider = self.name(), llm.slot_wait_ms = tracing::field::Empty)
@@ -1098,20 +1107,47 @@ impl Provider {
         max_tokens: u64,
         system: Option<&str>,
         prompt: &str,
-    ) -> LlmResult<String> {
-        match self {
-            Self::Claude(client) => client.prompt(model, max_tokens, system, prompt).await,
-            Self::DeepSeek(client) => client.prompt(model, max_tokens, system, prompt).await,
-            Self::OpenAi(client) => client.prompt(model, max_tokens, system, prompt).await,
-            Self::CodexApp(client) => client.prompt(model, max_tokens, system, prompt).await,
-            Self::Mk(client) => client.prompt(model, max_tokens, system, prompt).await,
-            #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(mock) => {
-                if !mock.delay.is_zero() {
-                    tokio::time::sleep(mock.delay).await;
+    ) -> Result<OneShotReply, OneShotError> {
+        let mut opts = BuildOpts::new(model, max_tokens);
+        if let Some(system) = system {
+            opts = opts.with_system(system);
+        }
+        let mut stream = self.stream(self.one_shot_opts(opts), vec![Message::user(prompt)]).await?;
+        let mut text = String::new();
+        while let Some(event) = stream.next_event().await {
+            match event {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::Done { stop_reason, input_tokens, output_tokens, extra } => {
+                    let usage = SpentUsage { input_tokens, output_tokens, extra };
+                    return Ok(OneShotReply { text, usage, stop_reason });
                 }
-                Ok(mock.canned_response.clone())
+                StreamEvent::Error(error) => {
+                    let usage = error.usage.clone();
+                    return Err(OneShotError { error: error.into(), usage });
+                }
+                StreamEvent::ToolUse { name, .. }
+                | StreamEvent::ToolUseInvalid { name, .. }
+                | StreamEvent::InlineToolUse { name, .. } => {
+                    tracing::warn!(tool = %name, "a one-shot prompt offers no tools; dropping the call the model made");
+                }
+                _ => {}
             }
+        }
+        Err(LlmError::CompletionError("the one-shot stream ended before the provider said it was done".into()).into())
+    }
+
+    /// The request options a one-shot prompt runs with. A one-shot wants the
+    /// answer text, and thinking tokens count against `max_tokens`, so each
+    /// provider that can turns thinking off.
+    fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
+        match self {
+            Self::Claude(client) => client.one_shot_opts(opts),
+            Self::DeepSeek(client) => client.one_shot_opts(opts),
+            Self::OpenAi(client) => client.one_shot_opts(opts),
+            Self::Mk(client) => client.one_shot_opts(opts),
+            Self::CodexApp(_) => opts,
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => opts,
         }
     }
 
@@ -1610,6 +1646,159 @@ pub(crate) fn hydrate_in_form(blocks: &[kaijutsu_types::BlockSnapshot], form: hy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod one_shot {
+        use super::*;
+        use kaijutsu_mk::test_server::{serve, sse};
+
+        /// An OpenAI-compatible stream: `reasoning`, then `text`, ending in
+        /// `finish` (no `finish_reason` chunk when `None`), then usage.
+        fn openai_sse(text: &str, finish: Option<&str>) -> String {
+            let finish = finish.map_or(String::new(), |f| {
+                format!("data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{f}\"}}]}}\n\n")
+            });
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"pondering\"}},\"finish_reason\":null}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n\
+                 {finish}\
+                 data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":30,\"completion_tokens\":9,\"total_tokens\":39,\
+                 \"prompt_cache_hit_tokens\":20,\"prompt_cache_miss_tokens\":10,\
+                 \"completion_tokens_details\":{{\"reasoning_tokens\":4}}}}}}\n\n\
+                 data: [DONE]\n\n"
+            )
+        }
+
+        /// A Messages stream with a thinking block, then `text`, ending in
+        /// `stop` (a JSON value: a quoted reason or `null`).
+        fn claude_sse(text: &str, stop: &str) -> String {
+            format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":12,\"output_tokens\":1,\"cache_read_input_tokens\":100}}}}}}\n\n\
+                 event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"pondering\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"sig\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                 event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+                 event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":{stop},\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":7}}}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            )
+        }
+
+        fn openai(base: &str) -> Provider {
+            Provider::OpenAi(openai::Client::new("t").with_base_url(base))
+        }
+
+        fn claude(base: &str) -> Provider {
+            Provider::Claude(claude::Client::new("k").unwrap().with_base_url(base))
+        }
+
+        /// A one-shot reply is the text the model wrote, without its
+        /// thinking, with the usage and stop reason the provider reported.
+        ///
+        /// Falsified by thinking in the answer, or usage dropped.
+        #[tokio::test]
+        async fn a_one_shot_reply_is_the_text_without_thinking_and_carries_its_usage() {
+            let (base, _) = serve(vec![sse(openai_sse("the answer", Some("stop")))]).await;
+            let reply = openai(&base).prompt_with_system("m", 64, Some("sys"), "hi").await.unwrap();
+            assert_eq!(reply.text, "the answer");
+            assert_eq!(reply.stop_reason.as_deref(), Some("stop"));
+            assert_eq!((reply.usage.input_tokens, reply.usage.output_tokens), (Some(30), Some(9)));
+            assert_eq!(
+                reply.usage.extra,
+                Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                    prompt_cache_hit_tokens: 20,
+                    prompt_cache_miss_tokens: 10,
+                    reasoning_tokens: 4,
+                }))
+            );
+
+            let (base, _) = serve(vec![sse(claude_sse("Hi", "\"end_turn\""))]).await;
+            let reply = claude(&base).prompt_with_system("claude-haiku-4-5", 64, None, "hi").await.unwrap();
+            assert_eq!(reply.text, "Hi");
+            assert_eq!(reply.stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!((reply.usage.input_tokens, reply.usage.output_tokens), (Some(12), Some(7)));
+            assert!(matches!(&reply.usage.extra, Some(UsageExtra::Claude(c)) if c.cache_read_input_tokens == 100), "{:?}", reply.usage);
+
+            let reply = Provider::Mock(MockClient::new("CANNED")).prompt_with_system("m", 64, None, "hi").await.unwrap();
+            assert_eq!(reply.text, "CANNED");
+        }
+
+        /// A reply at the output limit is the text it reached. A filtered,
+        /// cut, or unfinished reply is an error that carries the usage the
+        /// provider reported.
+        ///
+        /// Falsified by a failed reply returned as text, or a failure whose
+        /// spend is dropped.
+        #[tokio::test]
+        async fn a_one_shot_that_did_not_finish_is_an_error_carrying_its_usage() {
+            let (base, _) = serve(vec![sse(openai_sse("par", Some("length")))]).await;
+            let reply = openai(&base).prompt_with_system("m", 64, None, "hi").await.unwrap();
+            assert_eq!((reply.text.as_str(), reply.stop_reason.as_deref()), ("par", Some("length")));
+
+            for (finish, label) in [
+                (Some("content_filter"), "content_filter"),
+                (Some("insufficient_system_resource"), "insufficient_system_resource"),
+                (None, "no_finish_reason"),
+            ] {
+                let (base, _) = serve(vec![sse(openai_sse("par", finish))]).await;
+                let failed = openai(&base).prompt_with_system("m", 64, None, "hi").await.expect_err(label);
+                assert!(failed.to_string().contains(label), "{label}: {failed}");
+                let usage = failed.usage.unwrap_or_else(|| panic!("{label}: the error carries the usage"));
+                assert_eq!((usage.input_tokens, usage.output_tokens), (Some(30), Some(9)), "{label}");
+            }
+
+            for stop in ["\"pause_turn\"", "\"model_context_window_exceeded\"", "null"] {
+                let (base, _) = serve(vec![sse(claude_sse("par", stop))]).await;
+                let failed = claude(&base).prompt_with_system("claude-haiku-4-5", 64, None, "hi").await.expect_err(stop);
+                assert!(matches!(failed.error, LlmError::CompletionError(_)), "{stop}: {failed:?}");
+                assert_eq!(failed.usage.and_then(|u| u.input_tokens), Some(12), "{stop}");
+            }
+
+            let (base, _) = serve(vec![reply_status(503)]).await;
+            let failed = openai(&base).prompt_with_system("m", 64, None, "hi").await.expect_err("503");
+            assert!(failed.usage.is_none(), "a refused request spent nothing");
+        }
+
+        fn reply_status(status: u16) -> kaijutsu_mk::test_server::Reply {
+            kaijutsu_mk::test_server::reply(status, r#"{"error": {"message": "busy", "type": "server_error"}}"#)
+        }
+
+        /// A one-shot turns thinking off where the provider has a switch:
+        /// the DeepSeek preset (`thinking: disabled`, but not at hosted
+        /// OpenAI), the Messages dialect for both Anthropic and DeepSeek,
+        /// and a Claude model that thinks on every request keeps its
+        /// default. A generic OpenAI-compatible server gets no thinking
+        /// field. The request carries the caller's `max_tokens`.
+        ///
+        /// Falsified by a DeepSeek one-shot that leaves thinking on.
+        #[tokio::test]
+        async fn a_one_shot_turns_thinking_off_and_sends_the_callers_max_tokens() {
+            let done = || sse(openai_sse("ok", Some("stop")));
+            let (base, seen) = serve(vec![done(), done()]).await;
+            Provider::DeepSeek(deepseek::Client::new("k").with_base_url(&base))
+                .prompt_with_system("m", 64, None, "hi").await.unwrap();
+            openai(&base).prompt_with_system("m", 64, None, "hi").await.unwrap();
+            let bodies: Vec<serde_json::Value> =
+                seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
+            assert_eq!(bodies[0]["thinking"]["type"], "disabled", "{}", bodies[0]);
+            assert!(bodies[0].get("reasoning_effort").is_none(), "{}", bodies[0]);
+            assert!(bodies[1].get("thinking").is_none(), "{}", bodies[1]);
+
+            let ended = || sse(claude_sse("ok", "\"end_turn\""));
+            let (base, seen) = serve(vec![ended(), ended(), ended()]).await;
+            claude(&base).prompt_with_system("claude-opus-4-8", 777, None, "hi").await.unwrap();
+            Provider::Claude(claude::Client::deepseek("k").unwrap().with_base_url(&base))
+                .prompt_with_system("deepseek-flash", 64, None, "hi").await.unwrap();
+            claude(&base).prompt_with_system("claude-sonnet-5-5", 64, None, "hi").await.unwrap();
+            let bodies: Vec<serde_json::Value> =
+                seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
+            assert_eq!(bodies[0]["thinking"], serde_json::json!({"type": "disabled"}), "{}", bodies[0]);
+            assert_eq!(bodies[0]["max_tokens"], 777);
+            assert_eq!(bodies[1]["thinking"], serde_json::json!({"type": "disabled"}), "{}", bodies[1]);
+            assert_ne!(bodies[2]["thinking"]["type"], "disabled", "an always-on model keeps its default: {}", bodies[2]);
+        }
+    }
 
     /// The Codex app-server connection is a WebSocket, not a `reqwest`
     /// client, but the upgrade is still an HTTP request — it must carry the
