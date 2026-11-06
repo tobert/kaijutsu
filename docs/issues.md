@@ -6,11 +6,18 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Type melt M8: the zorak deploy (2026-11-05)
+## A default shipped after install never reaches the host (2026-11-06)
 
-- Retire stale characters by hand, rehearse the boot migrations (`docs/character.md`, "Migrations") on a copy of
-  zorak's `kernel.db`, rewrite the host `gate.toml` by hand with a backup beside it, deploy, and check every shipped
-  character and the console live.
+- A config tree is seeded only when its directory is empty (server rpc.rs ~1776), so a file added to
+  `config_seed_files()` after a host's first boot never arrives there. zorak lacked `distillation.md`,
+  `continuation.md`, `continuation.toml` and `council/{shell-bump,program-gate}.json`, `bump.md` until they were
+  copied by hand on 2026-11-06. `distillation.md` and `continuation.md` have no embedded fallback
+  (`config_seed::load_auxiliary_prompt`), so drift briefings and the compact-fork continuation would have failed
+  there; `continuation.toml` falls back. `kj config list` lists only what is on disk, so nothing said so. rc has
+  `rc reseed`; config needs the same: `kj config list` marks a shipped default that is not installed, and a reseed
+  installs missing defaults without touching present ones.
+- `kj config reset` cannot reach `council/*.json` or `council/bump.md`: `config_canonical` (kj/config.rs ~115)
+  refuses a nested name ("config is a flat namespace"), but `config_seed_files()` seeds those nested paths.
 
 ## Type melt M5e: what the always-asking acts and `--no-root` leave open (2026-11-05)
 
