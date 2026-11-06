@@ -99,13 +99,18 @@ impl BackendKind {
         }
     }
 
-    /// The environment variable this kind reads when a backend names neither
-    /// an `api_key_env` nor an `api_key_file`.
-    pub fn standard_env_var(&self) -> Option<&'static str> {
+    /// The environment variable this kind reads when a backend at `base_url`
+    /// names neither an `api_key_env` nor an `api_key_file`. An `openai`
+    /// backend reads `OPENAI_API_KEY` only at api.openai.com: any other
+    /// OpenAI-compatible server names its own key source, so an OpenAI key
+    /// never goes to a host that is not OpenAI.
+    pub fn standard_env_var(&self, base_url: Option<&str>) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
-            Self::OpenAi => Some("OPENAI_API_KEY"),
+            Self::OpenAi => base_url
+                .is_some_and(crate::llm::openai::is_hosted_openai)
+                .then_some("OPENAI_API_KEY"),
             Self::CodexApp | Self::Mk => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
@@ -284,7 +289,8 @@ impl BackendConfig {
     /// 1. `api_key_file` — trimmed file contents (`~` expanded). A configured
     ///    but unreadable file warns and falls through (not a silent vanish).
     /// 2. environment variable — the explicit `api_key_env` if set, otherwise
-    ///    the kind's standard var.
+    ///    the kind's standard var for this base URL
+    ///    ([`BackendKind::standard_env_var`]).
     ///
     /// There is deliberately no third source: config holds no key material.
     ///
@@ -308,7 +314,7 @@ impl BackendConfig {
         // quietly reading a different one would hide the mistake.
         let env_var = match &self.api_key_env {
             Some(name) => name.as_str(),
-            None => self.kind.standard_env_var()?,
+            None => self.kind.standard_env_var(self.base_url.as_deref())?,
         };
         std::env::var(env_var).ok()
     }
@@ -494,7 +500,7 @@ mod tests {
     fn codex_app_kind_is_local_and_keyless() {
         let config = BackendConfig::new("codex", BackendKind::CodexApp);
         assert_eq!(config.kind.as_str(), "codex-app");
-        assert_eq!(config.kind.standard_env_var(), None);
+        assert_eq!(config.kind.standard_env_var(None), None);
         assert!(config.kind.requires_base_url());
         assert!(config.validate().is_err());
         assert!(config.clone().with_base_url("ws://127.0.0.1:4500").validate().is_ok());
@@ -529,6 +535,30 @@ mod tests {
         unsafe {
             std::env::remove_var("DEEPSEEK_API_KEY");
         }
+    }
+
+    /// An `openai`-kind backend reads `OPENAI_API_KEY` by default only when
+    /// it points at api.openai.com. Any other OpenAI-compatible server (a
+    /// local one, a gateway, another provider) names its own key source, so
+    /// an OpenAI key is never sent to a host that is not OpenAI.
+    ///
+    /// Falsified by a default that sends the OpenAI key to any base URL.
+    #[test]
+    fn openai_kind_reads_the_openai_key_only_for_api_openai_com() {
+        let kind = BackendKind::OpenAi;
+        assert_eq!(kind.standard_env_var(Some("https://api.openai.com/v1")), Some("OPENAI_API_KEY"));
+        for url in [
+            "http://localhost:11434/v1",
+            "https://openrouter.ai/api/v1",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "https://api.openai.com.example/v1",
+        ] {
+            assert_eq!(kind.standard_env_var(Some(url)), None, "{url}");
+        }
+        assert_eq!(kind.standard_env_var(None), None);
+        // The other kinds name their own provider's key wherever they point.
+        assert_eq!(BackendKind::DeepSeek.standard_env_var(Some("https://proxy.example")), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(BackendKind::Anthropic.standard_env_var(Some("https://gateway.example")), Some("ANTHROPIC_API_KEY"));
     }
 
     #[test]

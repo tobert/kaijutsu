@@ -38,7 +38,8 @@ use super::types::{
 /// OpenAI-compatible servers pass `false` — the field is then emitted only
 /// when genuine reasoning exists, and omitted otherwise. `reasoning_required`
 /// doubles as the DeepSeek marker for `opts.effort`'s wire mapping below —
-/// today it is the only preset that sets it `true`.
+/// today it is the only preset that sets it `true`. `hosted_openai` wins over
+/// it: api.openai.com gets neither `reasoning_content` nor `thinking`.
 ///
 /// `hosted_openai` is the caller-computed result of
 /// [`super::is_hosted_openai`] against the client's configured `base_url` —
@@ -82,7 +83,7 @@ pub fn build_request(
     for msg in messages {
         match msg.role {
             Role::User => translate_user(msg, &mut wire),
-            Role::Assistant => translate_assistant(msg, &mut wire, reasoning_required),
+            Role::Assistant => translate_assistant(msg, &mut wire, reasoning_required, hosted_openai),
             // Hosted OpenAI takes a `system` message anywhere. Other
             // dialects may not: DeepSeek's template moves every system
             // message into the system prompt, and some local templates
@@ -122,13 +123,16 @@ pub fn build_request(
         &opts.model,
     );
 
-    if opts.thinking_budget.is_some() {
-        tracing::warn!(
-            backend = backend_label,
-            model = %opts.model,
-            knob = "thinking_budget",
-            "thinking_budget has no sink on this OpenAI-compatible dialect; dropped"
-        );
+    if let Some(budget) = opts.thinking_budget {
+        if should_warn_effort_dropped(backend_label, &opts.model, "thinking_budget", &budget.to_string()) {
+            tracing::warn!(
+                backend = backend_label,
+                model = %opts.model,
+                knob = "thinking_budget",
+                value = budget,
+                "thinking_budget has no sink on this OpenAI-compatible dialect; dropped"
+            );
+        }
     }
 
     ChatRequest {
@@ -165,7 +169,8 @@ fn should_warn_effort_dropped(backend: &str, model: &str, knob: &str, value: &st
 }
 
 /// Resolve `effort` into the `(reasoning_effort, thinking)` wire pair for
-/// one of the three dialects `build_request` distinguishes. Free function so
+/// one of the three dialects `build_request` distinguishes. Hosted OpenAI
+/// takes OpenAI's mapping even from the DeepSeek preset. Free function so
 /// each branch — and its inert-tunable warning — is directly unit-testable.
 fn resolve_effort(
     effort: Option<&str>,
@@ -174,7 +179,7 @@ fn resolve_effort(
     backend_label: &str,
     model: &str,
 ) -> (Option<String>, Option<ThinkingMode>) {
-    if is_deepseek {
+    if is_deepseek && !hosted_openai {
         return match effort {
             Some("none") => (None, Some(ThinkingMode::Disabled)),
             Some(e) => (Some(e.to_string()), None),
@@ -292,14 +297,20 @@ fn user_message_from_parts(parts: Vec<ContentPart>) -> RequestMessage {
 /// `reasoning_content`. When `reasoning_required`, every assistant message
 /// carries `reasoning_content` (empty string when there is no Reasoning
 /// block) so tool-call turns meet DeepSeek's V4 round-trip requirement;
-/// otherwise the field is emitted only when genuine reasoning exists. An
+/// otherwise the field is emitted only when genuine reasoning exists. Hosted
+/// OpenAI never gets it: its assistant messages have no such field. An
 /// assistant message with only tool calls has `content: None`.
-fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, reasoning_required: bool) {
+fn translate_assistant(
+    msg: &Message,
+    out: &mut Vec<RequestMessage>,
+    reasoning_required: bool,
+    hosted_openai: bool,
+) {
     match &msg.content {
         MessageContent::Text(t) => {
             out.push(RequestMessage::assistant(
                 Some(WireContent::Text(t.clone())),
-                reasoning_required.then(String::new),
+                (reasoning_required && !hosted_openai).then(String::new),
                 Vec::new(),
             ));
         }
@@ -343,8 +354,9 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, reasoning_r
                     ContentBlock::Image { .. } => {}
                 }
             }
-            // Real reasoning rides verbatim, always. Beyond that the
-            // behavior splits on `reasoning_required`:
+            // Real reasoning rides verbatim, except to hosted OpenAI, which
+            // takes no `reasoning_content`. Beyond that the behavior splits
+            // on `reasoning_required`:
             //   - DeepSeek (true): a tool-call turn that lost its
             //     chain-of-thought gets a synthesized marker (V4 requires the
             //     field on tool-call turns); a plain turn gets "" (the API
@@ -352,7 +364,9 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, reasoning_r
             //     present and uniform).
             //   - Generic OpenAI-compatible (false): omit the field entirely
             //     when there's no genuine reasoning — no synth, no echo noise.
-            let reasoning_content = if !reasoning.is_empty() {
+            let reasoning_content = if hosted_openai {
+                None
+            } else if !reasoning.is_empty() {
                 Some(reasoning)
             } else if reasoning_required {
                 if !tool_calls.is_empty() {
@@ -867,6 +881,86 @@ mod tests {
                 false,
                 "deepseek",
             );
+        }
+
+        /// Hosted OpenAI has no `reasoning_content` field on an assistant
+        /// message. Reasoning another provider wrote, carried into the
+        /// history by a fork or a model change, stays off its wire.
+        ///
+        /// Falsified by a hosted request that carries `reasoning_content`.
+        #[test]
+        fn hosted_openai_gets_no_reasoning_content() {
+            let msg = Message::with_reasoning_text_and_tool_uses(
+                vec![("deepseek thought".into(), Some("openai-compat-reasoning".into()))],
+                Some("calling".into()),
+                vec![ContentBlock::ToolUse { id: "c1".into(), name: "ls".into(), input: serde_json::json!({}) }],
+            );
+            let req = super::super::build_request(&opts(), &[msg], false, false, true, "gpt");
+            let v = serde_json::to_value(&req).unwrap();
+            assert!(v["messages"][0].get("reasoning_content").is_none(), "{}", v["messages"][0]);
+            assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["name"], "ls");
+        }
+
+        /// Hosted OpenAI gets OpenAI's dialect even from the DeepSeek preset
+        /// (a `deepseek`-kind backend pointed at api.openai.com): a plain
+        /// text assistant turn carries no `reasoning_content`, and
+        /// `effort = "none"` is `reasoning_effort`, not DeepSeek's
+        /// `thinking` switch.
+        ///
+        /// Falsified by a hosted request with `reasoning_content: ""` or a
+        /// `thinking` field.
+        #[test]
+        fn hosted_openai_gets_no_deepseek_fields_from_the_deepseek_preset() {
+            let mut o = opts();
+            o.effort = Some("none".into());
+            let history = [Message::user("hi"), Message::assistant("hello"), Message::user("again")];
+            let req = super::super::build_request(&o, &history, false, true, true, "deepseek");
+            let v = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["messages"][1]["content"], "hello");
+            assert!(v["messages"][1].get("reasoning_content").is_none(), "{}", v["messages"][1]);
+            assert!(v.get("thinking").is_none(), "{v}");
+            assert_eq!(v["reasoning_effort"], "none", "{v}");
+        }
+
+        /// A dropped `thinking_budget` warns once per backend, model, and
+        /// value, as a dropped `effort` does: an endpoint sends the same
+        /// request shape on every call.
+        ///
+        /// Falsified by a warning on every request.
+        #[test]
+        fn a_dropped_thinking_budget_warns_once() {
+            #[derive(Clone, Default)]
+            struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+                type Writer = Buf;
+                fn make_writer(&'a self) -> Buf {
+                    self.clone()
+                }
+            }
+            let buf = Buf::default();
+            let sub = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let mut o = opts();
+            o.thinking_budget = Some(2048);
+            tracing::subscriber::with_default(sub, || {
+                for _ in 0..3 {
+                    super::super::build_request(&o, &[Message::user("hi")], false, false, false, "budget-dedupe-test");
+                }
+            });
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(log.matches("thinking_budget has no sink").count(), 1, "{log}");
         }
 
         #[test]

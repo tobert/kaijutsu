@@ -425,7 +425,7 @@ impl KjDispatcher {
         let env_name = backend.api_key_env.clone().or_else(|| {
             BackendKind::parse(&backend.kind)
                 .ok()
-                .and_then(|k| k.standard_env_var().map(str::to_string))
+                .and_then(|k| k.standard_env_var(backend.base_url.as_deref()).map(str::to_string))
         });
         match &env_name {
             Some(v) => lines.push(format!(

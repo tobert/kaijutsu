@@ -974,14 +974,20 @@ impl Provider {
             }
             // Any OpenAI-compatible `/chat/completions` server. Auth is
             // optional — a local server needs no key — so a missing key is
-            // not an error here.
+            // not an error here. A missing `base_url` is: the row names no
+            // server, and the client's own default is api.openai.com.
             BackendKind::OpenAi => {
+                let url = config.base_url.as_deref().filter(|url| !url.trim().is_empty()).ok_or_else(|| {
+                    LlmError::InvalidRequest(format!(
+                        "backend '{}' has kind 'openai', which requires --base-url \
+                         (which OpenAI-compatible server it is)",
+                        config.name
+                    ))
+                })?;
                 let mut client = openai::Client::new(config.name.clone())
                     .with_request_timeout(resolve_request_timeout(config))
-                    .with_endpoint(endpoint()?);
-                if let Some(ref url) = config.base_url {
-                    client = client.with_base_url(url);
-                }
+                    .with_endpoint(endpoint()?)
+                    .with_base_url(url);
                 if let Some(key) = config.resolve_api_key() {
                     client = client.with_api_key(key);
                 }
@@ -2014,6 +2020,25 @@ mod tests {
             .with_base_url("http://localhost:11434/v1")
             .with_key_optional(true);
         assert!(Provider::from_backend(&config, &endpoint::Endpoints::default()).is_ok());
+    }
+
+    /// An `openai` backend with no `base_url` does not build: the row does
+    /// not say which server it means, and the client's own default would
+    /// send it to api.openai.com with no key. `validate()` refuses the same
+    /// row at write time; a row written another way fails here, loudly.
+    ///
+    /// Falsified by a keyless client pointed at OpenAI for a row that named
+    /// no server.
+    #[test]
+    fn an_openai_backend_without_a_base_url_does_not_build() {
+        for base_url in [None, Some("  ")] {
+            let mut config = BackendConfig::new("bare", BackendKind::OpenAi).with_key_optional(true);
+            config.base_url = base_url.map(str::to_string);
+            let err = Provider::from_backend(&config, &endpoint::Endpoints::default())
+                .err()
+                .unwrap_or_else(|| panic!("{base_url:?}: must not build"));
+            assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("--base-url")), "{base_url:?}: {err:?}");
+        }
     }
 
     /// The name/kind split in one assertion: two differently-NAMED backends

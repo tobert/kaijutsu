@@ -116,7 +116,7 @@ mod tests {
                     break;
                 }
             }
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 body.len(),

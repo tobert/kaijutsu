@@ -8,8 +8,9 @@ document is the plan for a dedicated `alibaba` kind.
 
 The generic `openai` client (`llm/openai/build.rs`) treats every non-OpenAI,
 non-DeepSeek server the same: `effort` is inert and warned, thinking cannot be
-turned on or off, `cache_breakpoints` are ignored, and the key env defaults to
-`OPENAI_API_KEY`. Alibaba differs on each:
+turned on or off, `cache_breakpoints` are ignored, and no key env is assumed
+(`OPENAI_API_KEY` is the default only at api.openai.com). Alibaba differs on
+each:
 
 - **Thinking is per model.** qwen3.8-max and qwen3.8-flash take
   `reasoning_effort` (`low`, `medium`, `high`, `xhigh`, `max`; `none`
@@ -28,8 +29,8 @@ turned on or off, `cache_breakpoints` are ignored, and the key env defaults to
 - **GLM drops array content on a request with no tools.** A tool-less GLM
   request must send each message's text parts joined into one string.
 - **Two key families.** The Token Plan key and a workspace key are different
-  keys for different hosts; neither is an OpenAI key, and an `openai`-kind
-  backend that names no `api_key_env` reads `OPENAI_API_KEY`.
+  keys for different hosts, and neither is an OpenAI key. An `openai`-kind
+  backend at an Alibaba host that names no key source has no key.
 
 Sources: Alibaba's docs ("Deep thinking", "Context cache", "Explicit cache
 best practices", the model pages) and Qwen Code (`QwenLM/qwen-code`,

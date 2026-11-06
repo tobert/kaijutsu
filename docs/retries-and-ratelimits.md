@@ -112,11 +112,16 @@ in the first place.
   `request_id` kept; the `mk` client by status or by how the call failed; and
   the runtime's own idle and total timeouts are `Timeout`. Endpoint cooling
   stays in the providers: a capacity cut starts a cooldown (503, from 5 s,
-  doubling while cuts repeat), so parallel seats wait with the one that was
-  cut. A capacity cut sends no usage, so each one logs a `warn` with context,
-  step, attempt, and the provider's reason, and the turn span records the
-  count as `llm.stream_cuts`. A stream that fails after it wrote a block
-  fails the turn whatever its kind: streamed text, thinking, and tool calls
+  doubling while cuts repeat), so parallel callers wait with the one that was
+  cut. Each capacity cut logs a `warn` with context, step, attempt, and the
+  provider's reason, and the turn span records the count as
+  `llm.stream_cuts`. The OpenAI-compatible client holds a failing
+  `finish_reason`'s error until `[DONE]`, so the usage the provider reports
+  after it rides on the error and is recorded; a `[DONE]` with no
+  `finish_reason` before it is `Truncated` and runs none of the reply's tool
+  calls. An error chunk that means "too much load" (a rate limit or an
+  overload) cools the endpoint as a 429 or 503 on the HTTP status does. A
+  stream that fails after it wrote a block fails the turn whatever its kind: streamed text, thinking, and tool calls
   are durable as they arrive, so a resend would duplicate them. A
   `content_filter` stop and an in-stream error chunk end the stream with
   their error and run none of the reply's tool calls. `Display` of a stream

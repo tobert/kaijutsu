@@ -3497,7 +3497,7 @@ async fn run_llm_stream(
                         usage_on_span.cuts += 1;
                         tracing::warn!(
                             %context_id, step = iteration, attempt = step_attempt, reason = %err,
-                            "provider cut the stream; no usage is reported for the attempt"
+                            "provider cut the stream"
                         );
                     }
                     // A failure the kind marks transient is sent again when

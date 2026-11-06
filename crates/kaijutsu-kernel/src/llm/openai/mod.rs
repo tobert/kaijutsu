@@ -177,8 +177,9 @@ impl Client {
     }
 
     /// One-shot prompt with optional system preamble (non-streaming).
-    /// Concatenates response text; drops any `reasoning_content` (the
-    /// distillation path doesn't surface the chain-of-thought).
+    /// Returns the first choice's text; drops any `reasoning_content` (the
+    /// distillation path doesn't surface the chain-of-thought). A reply the
+    /// provider filtered, cut, or left without a `finish_reason` is an error.
     pub async fn prompt(
         &self,
         model: &str,
@@ -190,6 +191,11 @@ impl Client {
         let mut opts = BuildOpts::new(model, max_tokens);
         if let Some(sys) = system {
             opts = opts.with_system(sys);
+        }
+        // DeepSeek thinks by default, and thinking tokens count against
+        // `max_tokens`; a one-shot prompt wants the answer text.
+        if self.reasoning_required && !is_hosted_openai(&self.base_url) {
+            opts = opts.with_effort("none");
         }
         let body = build::build_request(
             &opts,
@@ -220,13 +226,16 @@ impl Client {
             .await
             .map_err(|e| LlmError::ApiError(format!("response JSON parse: {e}")))?;
 
-        let text = parsed
+        let choice = parsed
             .choices
             .into_iter()
             .next()
-            .and_then(|c| c.message.content)
-            .unwrap_or_default();
-        Ok(text)
+            .ok_or_else(|| LlmError::ApiError("the response carried no choices".into()))?;
+        // A reply that stopped before it finished is an error, not partial text.
+        if let Some(error) = stream::finish_failure(choice.finish_reason.as_deref()) {
+            return Err(error.into());
+        }
+        Ok(choice.message.content.unwrap_or_default())
     }
 
     /// Start a streaming completion. POSTs `stream: true` and wraps the
@@ -300,6 +309,16 @@ fn map_status(status: reqwest::StatusCode, detail: String) -> LlmError {
     }
 }
 
+/// The status that tells an endpoint it is busy, for the stream error kinds
+/// that mean "too much load": the limiter cools down on 429 and 503 only.
+fn busy_status(kind: &StreamErrorKind) -> Option<u16> {
+    match kind {
+        StreamErrorKind::RateLimited => Some(429),
+        StreamErrorKind::Overloaded => Some(503),
+        _ => None,
+    }
+}
+
 fn http_error(e: reqwest::Error) -> LlmError {
     if e.is_timeout() {
         LlmError::NetworkError(format!("timeout: {e}"))
@@ -329,8 +348,9 @@ pub struct Stream {
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
     finished: bool,
-    /// Released once the stream finishes. `[DONE]` tells it the reply
-    /// completed.
+    /// Released once the stream finishes. A `[DONE]` that ends the reply
+    /// whole tells it the reply completed; one the state machine turns into
+    /// an error does not.
     slot: Option<Slot>,
 }
 
@@ -404,27 +424,30 @@ impl Stream {
                     match item {
                         Some(Ok(event)) => match decode_event(&event) {
                             Ok(typed) => {
-                                if matches!(&typed, OpenAiSseEvent::Done) {
-                                    self.finished = true;
-                                    if !self.state.failed() {
-                                        if let Some(slot) = &self.slot {
-                                            slot.completed();
-                                        }
-                                    }
-                                }
-                                if matches!(&typed, OpenAiSseEvent::Error(_)) {
-                                    self.finished = true;
-                                }
+                                let ends = matches!(&typed, OpenAiSseEvent::Done | OpenAiSseEvent::Error(_));
+                                let busy = match &typed {
+                                    OpenAiSseEvent::Error(e) => busy_status(&e.kind),
+                                    _ => None,
+                                };
+                                let completes = matches!(&typed, OpenAiSseEvent::Done);
                                 let emitted = self.state.step(typed);
-                                // A capacity cut tells the endpoint it is overloaded, so
-                                // other callers wait with this one.
-                                if emitted.iter().any(|ev| matches!(ev,
-                                    StreamEvent::Error(e) if e.kind == StreamErrorKind::CapacityCut))
-                                {
+                                if ends {
+                                    self.finished = true;
+                                }
+                                // Only a `[DONE]` the state machine did not turn
+                                // into an error completes the answer.
+                                if completes && !self.state.failed() {
                                     if let Some(slot) = &self.slot {
-                                        slot.cut();
+                                        slot.completed();
                                     }
                                 }
+                                // An error that means "too much load" cools the
+                                // endpoint as the same answer on the HTTP status
+                                // would.
+                                if let (Some(slot), Some(status)) = (&self.slot, busy) {
+                                    slot.answered_with(status, None);
+                                }
+                                self.cut_on_capacity(&emitted);
                                 for ev in emitted {
                                     self.pending.push_back(ev);
                                 }
@@ -447,14 +470,28 @@ impl Stream {
                         None => {
                             // Source closed without an explicit [DONE].
                             // Don't synthesize Done — that would mask a
-                            // wire-shape bug.
+                            // wire-shape bug — but report a failure the
+                            // reply already ended in.
                             self.finished = true;
                             self.inner = None;
-                            return None;
+                            let failure = self.state.take_failure();
+                            self.cut_on_capacity(failure.as_slice());
+                            return failure;
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// A capacity cut tells the endpoint it is overloaded, so other callers
+    /// wait with this one.
+    fn cut_on_capacity(&self, emitted: &[StreamEvent]) {
+        let cut = emitted
+            .iter()
+            .any(|ev| matches!(ev, StreamEvent::Error(e) if e.kind == StreamErrorKind::CapacityCut));
+        if let (true, Some(slot)) = (cut, &self.slot) {
+            slot.cut();
         }
     }
 
@@ -567,7 +604,7 @@ mod tests {
                     break;
                 }
             }
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                 body.len(),
@@ -798,11 +835,17 @@ data: [DONE]
         let (client, endpoint) = limited(&base);
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         assert_eq!(endpoint.status().in_flight, 1);
+        let mut first = true;
         while let Some(ev) = stream.next_event().await {
+            if first {
+                assert_eq!(endpoint.status().in_flight, 1, "held while content arrives: {ev:?}");
+                first = false;
+            }
             if matches!(ev, StreamEvent::Done { .. }) {
                 assert_eq!(endpoint.status().in_flight, 0, "released by the time Done arrives");
             }
         }
+        assert!(!first, "the stream delivered events");
         assert_eq!(endpoint.status().in_flight, 0);
     }
 
@@ -825,12 +868,41 @@ data: [DONE]
 
     /// A capacity cut cools the endpoint and the `[DONE]` after it does not
     /// reset the doubling, so parallel callers wait with the one that was cut.
+    /// The cut follows an earlier busy round, so it doubles the cooldown.
     ///
-    /// Falsified by a cut that leaves the endpoint open for the next request.
+    /// Falsified by a cut that leaves the endpoint open for the next request,
+    /// or by a `[DONE]` that resets the doubling before the cut counts.
     #[tokio::test]
     async fn a_capacity_cut_cools_the_endpoint() {
         use kaijutsu_mk::test_server::{serve, sse};
         let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\ndata: [DONE]\n\n";
+        let (base, _) = serve(vec![sse(cut)]).await;
+        let (client, endpoint) = limited(&base);
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
+        assert_eq!(endpoint.busy_in_a_row(), 1);
+        // The earlier round's cooldown ends, so the cut starts a new round.
+        tokio::time::sleep(crate::llm::endpoint::MIN_COOLDOWN + std::time::Duration::from_millis(100)).await;
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        assert!(matches!(events.as_slice(), [StreamEvent::Error(e)] if e.kind == StreamErrorKind::CapacityCut), "{events:?}");
+        let (left, status) = endpoint.status().cooldown.expect("cooling down after a cut");
+        assert_eq!(status, 503);
+        assert_eq!(endpoint.busy_in_a_row(), 2, "the [DONE] after a cut completes nothing");
+        assert!(left > crate::llm::endpoint::FIRST_COOLDOWN, "a second round doubles: {left:?}");
+    }
+
+    /// A cut whose connection closes before `[DONE]` cools the endpoint as a
+    /// cut with `[DONE]` does.
+    ///
+    /// Falsified by a failure reported at the source end that skips the slot.
+    #[tokio::test]
+    async fn a_capacity_cut_without_done_cools_the_endpoint() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n";
         let (base, _) = serve(vec![sse(cut)]).await;
         let (client, endpoint) = limited(&base);
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
@@ -841,7 +913,139 @@ data: [DONE]
         assert!(matches!(events.as_slice(), [StreamEvent::Error(e)] if e.kind == StreamErrorKind::CapacityCut), "{events:?}");
         let (_, status) = endpoint.status().cooldown.expect("cooling down after a cut");
         assert_eq!(status, 503);
-        assert_eq!(endpoint.busy_in_a_row(), 1, "the [DONE] after a cut completes nothing");
+    }
+
+    /// A stream that ends in an error is not a completed answer: a bare
+    /// `[DONE]` that ends the reply as truncated leaves the doubling as it was.
+    ///
+    /// Falsified by a `[DONE]` that resets the doubling before the state
+    /// machine says the reply failed.
+    #[tokio::test]
+    async fn a_stream_that_ends_in_an_error_keeps_the_doubling() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let bare = "data: {\"choices\":[{\"delta\":{\"content\":\"part\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        let (base, _) = serve(vec![sse(bare)]).await;
+        let (client, endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
+        assert_eq!(endpoint.busy_in_a_row(), 1);
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        assert!(matches!(events.last(), Some(StreamEvent::Error(e)) if matches!(e.kind, StreamErrorKind::Truncated(_))), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Done { .. })), "{events:?}");
+        assert_eq!(endpoint.busy_in_a_row(), 1, "a failed stream is not a completed answer");
+    }
+
+    /// An error event that means "too much load" cools the endpoint as the
+    /// same answer on the HTTP status does: a rate limit as a 429, an
+    /// overload as a 503.
+    ///
+    /// Falsified by an in-stream busy error that leaves the endpoint open.
+    #[tokio::test]
+    async fn an_in_stream_busy_error_cools_the_endpoint() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        for (kind, status) in [("rate_limit_error", 429), ("overloaded_error", 503)] {
+            let body = format!("data: {{\"error\":{{\"message\":\"busy\",\"type\":\"{kind}\"}}}}\n\n");
+            let (base, _) = serve(vec![sse(body)]).await;
+            let (client, endpoint) = limited(&base);
+            let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
+            let mut events = Vec::new();
+            while let Some(ev) = stream.next_event().await {
+                events.push(ev);
+            }
+            assert!(matches!(events.as_slice(), [StreamEvent::Error(_)]), "{kind}: {events:?}");
+            let (_, cooled) = endpoint.status().cooldown.unwrap_or_else(|| panic!("{kind}: cooling down"));
+            assert_eq!(cooled, status, "{kind}");
+        }
+    }
+
+    /// A server error event does not mean the endpoint is busy.
+    #[tokio::test]
+    async fn an_in_stream_server_error_leaves_the_endpoint_open() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let (base, _) = serve(vec![sse("data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n")]).await;
+        let (client, endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
+        while stream.next_event().await.is_some() {}
+        assert!(endpoint.status().cooldown.is_none());
+    }
+
+    /// A reply cut by its provider still reports the cut when the connection
+    /// closes before `[DONE]`.
+    ///
+    /// Falsified by a source end that drops the failure and leaves the turn
+    /// to report a stream that "ended before Done".
+    #[tokio::test]
+    async fn a_failed_finish_without_done_still_reports_the_failure() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n";
+        let (base, _) = serve(vec![sse(cut)]).await;
+        let (client, _endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Error(e)] if e.kind == StreamErrorKind::ContentFilter),
+            "{events:?}"
+        );
+    }
+
+    /// A one-shot prompt fails loudly when the reply did not finish, and
+    /// when there is no reply at all; a reply at the length limit is the
+    /// text it reached, as on the Anthropic dialect.
+    ///
+    /// Falsified by a filtered, cut, unfinished, or missing reply that comes
+    /// back as text.
+    #[tokio::test]
+    async fn a_prompt_reply_that_did_not_finish_is_an_error() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let body = |finish: &str| {
+            format!(r#"{{"choices":[{{"message":{{"role":"assistant","content":"part"}}{finish}}}]}}"#)
+        };
+        for (finish, failure) in [
+            (r#","finish_reason":"content_filter""#, Some("content_filter")),
+            (r#","finish_reason":"insufficient_system_resource""#, Some("insufficient_system_resource")),
+            ("", Some("no_finish_reason")),
+            (r#","finish_reason":"length""#, None),
+            (r#","finish_reason":"stop""#, None),
+        ] {
+            let (base, _) = serve(vec![reply(200, body(finish))]).await;
+            let result = Client::new("t").with_base_url(&base).prompt("m", 64, None, "hi").await;
+            match failure {
+                Some(label) => {
+                    let err = result.expect_err(finish);
+                    assert!(err.to_string().contains(label), "{finish}: {err}");
+                }
+                None => assert_eq!(result.expect(finish), "part"),
+            }
+        }
+        let (base, _) = serve(vec![reply(200, r#"{"choices":[]}"#)]).await;
+        let err = Client::new("t").with_base_url(&base).prompt("m", 64, None, "hi").await.expect_err("no choices");
+        assert!(err.to_string().contains("no choices"), "{err}");
+    }
+
+    /// A one-shot prompt on the DeepSeek preset turns thinking off: thinking
+    /// tokens count against `max_tokens`, and a one-shot prompt wants the
+    /// answer. A plain OpenAI-compatible server gets no thinking field.
+    ///
+    /// Falsified by a DeepSeek prompt that leaves thinking on.
+    #[tokio::test]
+    async fn a_deepseek_prompt_turns_thinking_off() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let ok = || reply(200, r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#);
+        let (base, seen) = serve(vec![ok(), ok()]).await;
+        crate::llm::deepseek::Client::new("k").with_base_url(&base).prompt("m", 64, None, "hi").await.unwrap();
+        Client::new("t").with_base_url(&base).prompt("m", 64, None, "hi").await.unwrap();
+        let bodies: Vec<serde_json::Value> =
+            seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
+        assert_eq!(bodies[0]["thinking"]["type"], "disabled", "{}", bodies[0]);
+        assert!(bodies[0].get("reasoning_effort").is_none(), "{}", bodies[0]);
+        assert!(bodies[1].get("thinking").is_none(), "{}", bodies[1]);
     }
 
     /// A stream that reaches `[DONE]` resets the doubling; opening it does

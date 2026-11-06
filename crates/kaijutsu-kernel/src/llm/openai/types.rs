@@ -119,9 +119,11 @@ pub struct RequestMessage {
     pub content: Option<MessageContent>,
 
     /// Thinking-mode chain-of-thought echoed back on assistant messages.
-    /// Set (possibly to `""`) on every assistant turn so tool-call turns
-    /// satisfy DeepSeek's V4 round-trip requirement; `None` (skipped) on
-    /// system/user/tool roles. See the module doc.
+    /// For DeepSeek it is set (possibly to `""`, or a synthesized marker on a
+    /// tool-call turn) on every assistant turn, to satisfy V4's round-trip
+    /// requirement. Other servers get it only when real reasoning exists,
+    /// and hosted OpenAI never does. `None` (skipped) on system/user/tool
+    /// roles. See `super::build::build_request`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 

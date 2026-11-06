@@ -17,8 +17,15 @@
 //! content (more)                  Text                 TextDelta
 //! tool_calls                      * → None             (close open block); accumulate
 //! finish_reason present           close + flush        TextEnd/ThinkingEnd, ToolUse…
-//! [DONE]                          terminal             Done{usage}
+//! [DONE] after finish_reason      terminal             Done{usage}
+//! [DONE] with no finish_reason    terminal             Error(Truncated), tools dropped
 //! ```
+//!
+//! A `finish_reason` that ends the reply in a failure (a capacity cut, a
+//! content filter) drops the pending tool calls, and its
+//! [`StreamEvent::Error`] waits for `[DONE]`: the usage chunk the server
+//! sends between them rides on the error, because the failed call still
+//! spent its tokens. After an `Error` the machine emits nothing more.
 //!
 //! Tool-call arguments stream as JSON-string fragments keyed by
 //! `tool_calls[].index`; they accumulate and parse at flush time
@@ -33,7 +40,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::llm::stream::{OpenAiCompatUsageExtra, StreamError, StreamErrorKind, StreamEvent, UsageExtra};
+use crate::llm::stream::{OpenAiCompatUsageExtra, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra};
 
 use super::sse::OpenAiSseEvent;
 use super::types::{ChunkChoice, ToolCallChunk, Usage};
@@ -65,9 +72,14 @@ pub struct StateMachine {
     tool_calls: BTreeMap<usize, ToolAccum>,
     stop_reason: Option<String>,
     usage: Option<Usage>,
-    /// A `finish_reason` ended the stream in an error. The `[DONE]` that
-    /// follows completes nothing.
+    /// A `finish_reason` or an error chunk ended the stream in an error. The
+    /// `[DONE]` that follows completes nothing.
     failed: bool,
+    /// The error a failing `finish_reason` ends the reply with, held until
+    /// `[DONE]` so the usage reported after it rides along.
+    failure: Option<StreamError>,
+    /// An `Error` was emitted. The machine emits nothing more.
+    ended: bool,
 }
 
 /// `finish_reason` a provider sends when it cut the response for lack of
@@ -83,6 +95,25 @@ pub(crate) fn capacity_cut() -> StreamError {
         StreamErrorKind::CapacityCut,
         "the provider cut the response for lack of capacity",
     )
+}
+
+/// The error a reply's `finish_reason` ends it with, or `None` for a reason
+/// that completes it. A missing reason is a truncation. `length` completes a
+/// reply at the output limit, and a reason this client does not know
+/// completes it too, since servers name their own (`eos_token`).
+pub(crate) fn finish_failure(finish_reason: Option<&str>) -> Option<StreamError> {
+    match finish_reason {
+        None => Some(StreamError::new(
+            StreamErrorKind::Truncated("no_finish_reason".into()),
+            "the reply ended without a finish_reason",
+        )),
+        Some(INSUFFICIENT_RESOURCE) => Some(capacity_cut()),
+        Some(CONTENT_FILTER) => Some(StreamError::new(
+            StreamErrorKind::ContentFilter,
+            "the provider's content filter ended the response",
+        )),
+        Some(_) => None,
+    }
 }
 
 /// Sentinel token marking openai-compatible reasoning as rehydratable. Opaque —
@@ -107,7 +138,22 @@ impl StateMachine {
         Some(REASONING_NONCE.to_string())
     }
 
+    /// Take one event. After the first `Error` it emits, the machine emits
+    /// nothing more: no `ToolUse` and no `Done` follow a failure.
     pub fn step(&mut self, event: OpenAiSseEvent) -> Vec<StreamEvent> {
+        if self.ended {
+            return Vec::new();
+        }
+        let mut out = self.dispatch(event);
+        if let Some(position) = out.iter().position(|e| matches!(e, StreamEvent::Error(_))) {
+            out.truncate(position + 1);
+            self.failed = true;
+            self.ended = true;
+        }
+        out
+    }
+
+    fn dispatch(&mut self, event: OpenAiSseEvent) -> Vec<StreamEvent> {
         match event {
             OpenAiSseEvent::Chunk(chunk) => {
                 let mut out = Vec::new();
@@ -121,31 +167,29 @@ impl StateMachine {
                 }
                 out
             }
-            OpenAiSseEvent::Error(error) => {
-                self.failed = true;
-                vec![StreamEvent::Error(error)]
-            }
-            OpenAiSseEvent::Done if self.failed => Vec::new(),
+            OpenAiSseEvent::Error(error) => vec![StreamEvent::Error(self.with_spent(error))],
             OpenAiSseEvent::Done => {
+                if let Some(error) = self.take_failure() {
+                    return vec![error];
+                }
+                if self.failed {
+                    return Vec::new();
+                }
                 let mut out = Vec::new();
-                // Defensive: if the stream ended without a finish_reason
-                // chunk, close any block still open and flush pending tool
-                // calls so we never drop content.
                 self.close_open_block(&mut out);
+                // A reply that never said it finished may have been cut
+                // anywhere, a tool call's arguments included: its open text
+                // is kept, its tool calls are not run.
+                if self.stop_reason.is_none()
+                    && let Some(error) = finish_failure(None)
+                {
+                    self.tool_calls.clear();
+                    self.failed = true;
+                    out.push(StreamEvent::Error(self.with_spent(error)));
+                    return out;
+                }
                 self.flush_tool_calls(&mut out);
-
-                let (input_tokens, output_tokens, extra) = match &self.usage {
-                    Some(u) => (
-                        Some(u.prompt_tokens),
-                        Some(u.completion_tokens),
-                        Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
-                            prompt_cache_hit_tokens: u.cache_hit_tokens(),
-                            prompt_cache_miss_tokens: u.cache_miss_tokens(),
-                            reasoning_tokens: u.reasoning_tokens(),
-                        })),
-                    ),
-                    None => (None, None, None),
-                };
+                let (input_tokens, output_tokens, extra) = self.usage_counts();
                 out.push(StreamEvent::Done {
                     stop_reason: self.stop_reason.clone(),
                     input_tokens,
@@ -154,6 +198,42 @@ impl StateMachine {
                 });
                 out
             }
+        }
+    }
+
+    /// The failure a `finish_reason` ended the reply with, carrying the usage
+    /// reported so far. Taken at `[DONE]`, or when the source closes without
+    /// one.
+    pub(crate) fn take_failure(&mut self) -> Option<StreamEvent> {
+        if self.ended {
+            return None;
+        }
+        let error = self.failure.take()?;
+        self.ended = true;
+        Some(StreamEvent::Error(self.with_spent(error)))
+    }
+
+    /// `error` with the usage the server reported, when it reported any.
+    fn with_spent(&self, error: StreamError) -> StreamError {
+        match self.usage_counts() {
+            (None, None, None) => error,
+            (input_tokens, output_tokens, extra) => error.with_usage(SpentUsage { input_tokens, output_tokens, extra }),
+        }
+    }
+
+    /// The reported usage as `Done` carries it.
+    fn usage_counts(&self) -> (Option<u64>, Option<u64>, Option<UsageExtra>) {
+        match &self.usage {
+            Some(u) => (
+                Some(u.prompt_tokens),
+                Some(u.completion_tokens),
+                Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                    prompt_cache_hit_tokens: u.cache_hit_tokens(),
+                    prompt_cache_miss_tokens: u.cache_miss_tokens(),
+                    reasoning_tokens: u.reasoning_tokens(),
+                })),
+            ),
+            None => (None, None, None),
         }
     }
 
@@ -196,21 +276,14 @@ impl StateMachine {
 
         // finish_reason → close the open block and flush accumulated tools.
         // A capacity cut or a content filter ends the reply without its
-        // pending tool calls: they are dropped, not run.
+        // pending tool calls: they are dropped, not run, and the error waits
+        // for `[DONE]`.
         if let Some(fr) = finish_reason {
             self.close_open_block(out);
-            let failure = match fr.as_str() {
-                INSUFFICIENT_RESOURCE => Some(capacity_cut()),
-                CONTENT_FILTER => Some(StreamError::new(
-                    StreamErrorKind::ContentFilter,
-                    "the provider's content filter ended the response",
-                )),
-                _ => None,
-            };
-            if let Some(error) = failure {
+            if let Some(error) = finish_failure(Some(&fr)) {
                 self.tool_calls.clear();
                 self.failed = true;
-                out.push(StreamEvent::Error(error));
+                self.failure.get_or_insert(error);
             } else {
                 self.flush_tool_calls(out);
             }
@@ -723,10 +796,13 @@ data: [DONE]
         assert_eq!(ids, vec!["call_real"], "a later empty id must not overwrite the real one");
     }
 
+    /// A `[DONE]` with no `finish_reason` before it ends a reply that did not
+    /// say it finished: the open text is closed, and the stream ends in a
+    /// `Truncated` error, not a completion.
+    ///
+    /// Falsified by a `Done` that reports the partial text as a whole reply.
     #[tokio::test]
-    async fn done_without_finish_reason_still_closes_open_text() {
-        // Stream truncated: content delta then [DONE] with no finish_reason
-        // chunk. The defensive close must still bracket the text.
+    async fn done_without_finish_reason_closes_open_text_and_is_truncated() {
         let payload = "\
 data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}
 
@@ -740,14 +816,124 @@ data: [DONE]
                 StreamEvent::TextStart,
                 StreamEvent::TextDelta("partial".into()),
                 StreamEvent::TextEnd,
-                StreamEvent::Done {
-                    stop_reason: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    extra: None,
-                },
+                StreamEvent::Error(StreamError::new(
+                    StreamErrorKind::Truncated("no_finish_reason".into()),
+                    "the reply ended without a finish_reason",
+                )),
             ]
         );
+    }
+
+    /// An `Error` ends the stream: a nameless tool call fails the reply, and
+    /// neither the named call after it nor a `Done` follows.
+    ///
+    /// Falsified by a `ToolUse` or a `Done` after the error.
+    #[tokio::test]
+    async fn a_nameless_tool_call_ends_the_stream_in_its_error() {
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"function\":{\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"call_1\",\"function\":{\"name\":\"b\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        match events.as_slice() {
+            [StreamEvent::Error(error)] => assert_eq!(error.kind, StreamErrorKind::Protocol, "{error}"),
+            other => panic!("expected one Protocol error, got {other:?}"),
+        }
+    }
+
+    /// An error chunk after a usage report carries that usage: the failed
+    /// call spent it.
+    ///
+    /// Falsified by an in-stream error that drops the usage already received.
+    #[tokio::test]
+    async fn an_error_chunk_carries_the_usage_received_before_it() {
+        let payload = "\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":21,\"completion_tokens\":4,\"total_tokens\":25}}
+
+data: {\"error\":{\"message\":\"engine overloaded\",\"type\":\"server_error\"}}
+
+";
+        let events = run(payload).await;
+        match events.as_slice() {
+            [StreamEvent::Error(error)] => {
+                let spent = error.usage.as_ref().expect("usage rides on the error");
+                assert_eq!((spent.input_tokens, spent.output_tokens), (Some(21), Some(4)));
+            }
+            other => panic!("expected one Error, got {other:?}"),
+        }
+    }
+
+    /// A tool call whose reply never reached a `finish_reason` may hold
+    /// arguments the server cut off; it is dropped, not run. The usage the
+    /// server reported rides on the error.
+    ///
+    /// Falsified by a `ToolUse` emitted at a bare `[DONE]`.
+    #[tokio::test]
+    async fn done_without_finish_reason_runs_no_tool_call_and_keeps_its_usage() {
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        match events.as_slice() {
+            [StreamEvent::Error(error)] => {
+                assert_eq!(error.kind, StreamErrorKind::Truncated("no_finish_reason".into()), "{error}");
+                let spent = error.usage.as_ref().expect("usage rides on the error");
+                assert_eq!((spent.input_tokens, spent.output_tokens), (Some(12), Some(3)));
+            }
+            other => panic!("expected one Truncated error, got {other:?}"),
+        }
+    }
+
+    /// A reply that ends in a failure still spent its tokens, and OpenAI-shaped
+    /// servers report them in the usage chunk that follows the
+    /// `finish_reason`: the error carries them.
+    ///
+    /// Falsified by an error emitted at the `finish_reason`, before the usage
+    /// chunk arrives.
+    #[tokio::test]
+    async fn a_failed_finish_carries_the_usage_reported_after_it() {
+        for (finish, kind) in [
+            ("content_filter", StreamErrorKind::ContentFilter),
+            ("insufficient_system_resource", StreamErrorKind::CapacityCut),
+        ] {
+            let payload = format!("\
+data: {{\"choices\":[{{\"delta\":{{\"content\":\"some\"}},\"finish_reason\":null}}]}}
+
+data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish}\"}}]}}
+
+data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":40,\"completion_tokens\":7,\"total_tokens\":47,\"prompt_tokens_details\":{{\"cached_tokens\":32}}}}}}
+
+data: [DONE]
+
+");
+            let events = run(&payload).await;
+            match events.last() {
+                Some(StreamEvent::Error(error)) => {
+                    assert_eq!(error.kind, kind, "{finish}: {error}");
+                    let spent = error.usage.as_ref().unwrap_or_else(|| panic!("{finish}: usage rides on the error"));
+                    assert_eq!((spent.input_tokens, spent.output_tokens), (Some(40), Some(7)), "{finish}");
+                    assert_eq!(
+                        spent.extra,
+                        Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                            prompt_cache_hit_tokens: 32,
+                            prompt_cache_miss_tokens: 8,
+                            reasoning_tokens: 0,
+                        })),
+                        "{finish}"
+                    );
+                }
+                other => panic!("{finish}: expected an Error last, got {other:?}"),
+            }
+        }
     }
 
     const CUT_WITH_TOOL_CALL: &str = "\
