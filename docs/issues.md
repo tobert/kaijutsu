@@ -6,6 +6,18 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Server-side tools have no representation (2026-11-06)
+
+- A tool the provider runs (Alibaba's `web_search`/`web_extractor`, billed under `usage.x_tools`; Anthropic's
+  `server_tool_use`, which `llm/claude/types.rs` parses and drops) is neither a kernel tool call nor plain text.
+  Two shapes, not exclusive:
+  - A kernel tool whose implementation is a provider side call: `web.search` runs a small model with the
+    provider's search tool, as Qwen Code's `tools/web-search-dashscope.ts` does (Responses API,
+    `tools: [{type: "web_search"}]`). It is gated, receipted, bound by loadout, and usable by any performer.
+  - Provider-run tool blocks recorded faithfully when a turn's own response carries them (a tool use and result
+    the kernel did not execute, with their cost), hydrated back only to that provider and as text to others.
+  See `docs/alibaba-backend.md`, "Server-side tools".
+
 ## A default shipped after install never reaches the host (2026-11-06)
 
 - A config tree is seeded only when its directory is empty (server rpc.rs ~1776), so a file added to
