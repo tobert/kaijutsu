@@ -781,6 +781,7 @@ impl KjDispatcher {
             egress_hosts,
             usage,
             turn_totals,
+            tool_uses,
             workspace_paths,
             workspace_label,
             bound_model,
@@ -846,6 +847,10 @@ impl KjDispatcher {
                 Ok(totals) => totals,
                 Err(e) => return KjResult::Err(format!("kj context info: turn totals: {e}")),
             };
+            let tool_uses = match db.context_tool_use_totals(target_id) {
+                Ok(uses) => uses,
+                Err(e) => return KjResult::Err(format!("kj context info: tool uses: {e}")),
+            };
 
             // Workspace paths
             let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
@@ -880,6 +885,7 @@ impl KjDispatcher {
                 egress_hosts,
                 usage,
                 turn_totals,
+                tool_uses,
                 workspace_paths,
                 workspace_label,
                 bound_model,
@@ -999,6 +1005,9 @@ impl KjDispatcher {
             turn_totals.cache_write_tokens,
             turn_totals.reasoning_tokens,
         ));
+        if !tool_uses.is_empty() {
+            info.push_str(&format!("\nTools:   {}", describe_tool_uses(&tool_uses)));
+        }
         if let Some(cost) = &cost {
             info.push_str(&format!("\nCost:    {}", describe_cost(cost)));
         }
@@ -1144,6 +1153,7 @@ impl KjDispatcher {
                 "context_used_pct": context_used_pct,
             })),
         });
+        record["tool_uses"] = tool_uses_json(&tool_uses);
         record["turns"] = serde_json::json!({
             "turns": turn_totals.turns,
             "llm_calls": turn_totals.llm_calls,
@@ -1200,8 +1210,13 @@ impl KjDispatcher {
             let start = &turn.start;
             let performer = names(start.performer);
             let ended = turn.stop_reason.as_deref().unwrap_or("running");
+            let tool_uses = match db.turn_tool_uses(start.turn_id) {
+                Ok(uses) => uses,
+                Err(e) => return KjResult::Err(format!("kj context turns: tool uses: {e}")),
+            };
+            let tools = if tool_uses.is_empty() { String::new() } else { format!(", tools {}", describe_tool_uses(&tool_uses)) };
             text.push_str(&format!(
-                "{} {} {performer} {}/{} (role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}\n",
+                "{} {} {performer} {}/{} (role {}) {ended}: {} calls, {} in, {} out, cache read {}, write {}, reasoning {}{tools}\n",
                 start.turn_id.short(),
                 start.started_at,
                 start.provider,
@@ -1215,6 +1230,7 @@ impl KjDispatcher {
                 turn.reasoning_tokens,
             ));
             records.push(serde_json::json!({
+                "tool_uses": tool_uses_json(&tool_uses),
                 "turn_id": start.turn_id.to_hex(),
                 "context_id": start.context_id.to_hex(),
                 "performer": start.performer.to_hex(),
@@ -3509,15 +3525,30 @@ impl Classify for ContextCommand {
     }
 }
 
+/// Provider-billed tool uses as `web_search 3, web_extractor 1`.
+fn describe_tool_uses(uses: &[(String, i64)]) -> String {
+    uses.iter().map(|(tool, calls)| format!("{tool} {calls}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Provider-billed tool uses as a JSON object of tool name to call count.
+fn tool_uses_json(uses: &[(String, i64)]) -> serde_json::Value {
+    serde_json::Value::Object(uses.iter().map(|(tool, calls)| (tool.clone(), serde_json::json!(calls))).collect())
+}
+
 /// How `kj context info` writes a context's cost. Calls with no price are
 /// said plainly: the amount is then a floor, or wholly unknown.
 fn describe_cost(cost: &crate::pricing::ContextCost) -> String {
     let priced = |n: u64| if n == 1 { "1 call priced".to_string() } else { format!("{n} calls priced") };
+    // Counts model calls and provider-billed tool uses alike.
     let unpriced = |n: u64| if n == 1 { "1 call has no price".to_string() } else { format!("{n} calls have no price") };
     let amount = kaijutsu_types::format_micro_dollars(cost.micros);
     match (cost.priced_calls, cost.unpriced_calls) {
         (_, 0) => format!("{amount} ({})", priced(cost.priced_calls)),
-        (0, n) => format!("unknown ({}: `kj price set <backend>/<model> --input <$/M> --output <$/M>`)", unpriced(n)),
+        (0, n) => format!(
+            "unknown ({}: `kj price set <backend>/<model> --input <$/M> --output <$/M>`, \
+             or `kj price set-tool <backend> <tool> --per-call <$>`)",
+            unpriced(n)
+        ),
         (_, n) => format!("at least {amount} ({}, {}: `kj price list`)", priced(cost.priced_calls), unpriced(n)),
     }
 }
@@ -7711,6 +7742,98 @@ mod tests {
         assert_eq!(data["cost"]["micros"], 4_000_000);
         assert_eq!(data["cost"]["priced_calls"], 2);
         assert_eq!(data["cost"]["unpriced_calls"], 1);
+    }
+
+    /// A tool price alone makes the cost known: a turn whose model has no
+    /// price still shows the priced searches as a dollar figure, not "unknown".
+    #[tokio::test]
+    async fn a_tool_price_alone_reads_as_a_known_cost() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        {
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
+        }
+        d.reload_llm_registry().await.unwrap();
+        let ctx = register_context(&d, Some("tool-only"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        {
+            let db = d.kernel_db().lock();
+            let turn_id = kaijutsu_types::TurnId::new();
+            db.begin_turn(&crate::TurnStart {
+                turn_id, context_id: ctx, performer: PrincipalId::new(),
+                role: "coder".into(), provider: "anthropic".into(), model: "unpriced".into(), started_at: 2_000,
+            }).unwrap();
+            db.add_turn_tool_uses(turn_id, &[("web_search", 3)]).unwrap();
+            db.finish_turn(turn_id, 2_001, "end_turn").unwrap();
+        }
+        let set = d.dispatch(&[s("price"), s("set-tool"), s("anthropic"), s("web_search"), s("--per-call"), s("0.01"), s("--from"), s("500")], &test_caller()).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let info = d.dispatch(&[s("context"), s("info")], &c).await;
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info carries a record") };
+        assert_eq!(data["cost"]["micros"], 30_000, "{data}");
+        assert_eq!(data["cost"]["priced_calls"], 3);
+        assert_eq!(data["cost"]["unpriced_calls"], 0);
+        assert!(info.message().contains("\nCost:    $0.030 (3 calls priced)"), "{}", info.message());
+    }
+
+    /// Provider-billed tool uses show per turn and in the context totals, and
+    /// a use with no tool price counts as a call with no price rather than
+    /// reading as free; a tool price makes it a dollar figure.
+    #[tokio::test]
+    async fn tool_uses_show_in_turns_and_info_and_price_the_cost() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        {
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
+        }
+        d.reload_llm_registry().await.unwrap();
+        let ctx = register_context(&d, Some("searcher"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let plain = record_turn(&d, ctx, 10, 1_000);
+        let turn = {
+            let db = d.kernel_db().lock();
+            let turn_id = kaijutsu_types::TurnId::new();
+            db.begin_turn(&crate::TurnStart {
+                turn_id, context_id: ctx, performer: PrincipalId::new(),
+                role: "coder".into(), provider: "anthropic".into(), model: "m".into(), started_at: 2_000,
+            }).unwrap();
+            db.add_turn_usage(turn_id, crate::RawUsage::default()).unwrap();
+            db.add_turn_tool_uses(turn_id, &[("web_search", 3), ("web_extractor", 1)]).unwrap();
+            turn_id
+        };
+        let set = d.dispatch(&[s("price"), s("set"), s("anthropic/m"), s("--free"), s("--from"), s("500")], &test_caller()).await;
+        assert!(set.is_ok(), "{}", set.message());
+
+        let listed = d.dispatch(&[s("context"), s("turns")], &c).await;
+        let KjResult::Ok { data: Some(data), .. } = &listed else { panic!("turns carries a record") };
+        let line = listed.message().lines().find(|l| l.starts_with(&turn.short())).expect("the tool turn is listed").to_string();
+        assert!(line.ends_with(", tools web_extractor 1, web_search 3"), "{line}");
+        let plain_line = listed.message().lines().find(|l| l.starts_with(&plain.short())).unwrap().to_string();
+        assert!(!plain_line.contains("tools"), "a turn with no tool use says nothing: {plain_line}");
+        let records = data.as_array().unwrap();
+        let of = |id: kaijutsu_types::TurnId| records.iter().find(|r| r["turn_id"] == id.to_hex()).unwrap();
+        assert_eq!(of(turn)["tool_uses"], serde_json::json!({ "web_extractor": 1, "web_search": 3 }));
+        assert_eq!(of(plain)["tool_uses"], serde_json::json!({}));
+
+        let info = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(info.message().contains("\nTools:   web_extractor 1, web_search 3"), "{}", info.message());
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info carries a record") };
+        assert_eq!(data["tool_uses"], serde_json::json!({ "web_extractor": 1, "web_search": 3 }));
+        // The deepseek turn has no price and the free anthropic turn is
+        // priced; the 4 tool uses have no price, so the cost is a floor.
+        assert_eq!(data["cost"]["priced_calls"], 1);
+        assert_eq!(data["cost"]["unpriced_calls"], 5, "1 model call and 4 tool uses: {data}");
+        assert!(info.message().contains("at least $0.000 (1 call priced, 5 calls have no price"), "{}", info.message());
+
+        let set = d.dispatch(&[s("price"), s("set-tool"), s("anthropic"), s("web_search"), s("--per-call"), s("0.01"), s("--from"), s("500")], &test_caller()).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let info = d.dispatch(&[s("context"), s("info")], &c).await;
+        let KjResult::Ok { data: Some(data), .. } = &info else { panic!("info carries a record") };
+        assert_eq!(data["cost"]["priced_calls"], 4, "1 model call and 3 searches: {data}");
+        assert_eq!(data["cost"]["unpriced_calls"], 2, "web_extractor still has no price: {data}");
+        assert_eq!(data["cost"]["micros"], 30_000);
     }
 
     /// `kj context info --json`'s `usage` field is the token-usage gauge's

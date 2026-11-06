@@ -64,7 +64,7 @@ kaish           print the kaish agent primer
 character       the someone a name resolves to, and the model each of its roles runs
 backend         LLM endpoints and the models on each
 alias           short model names that point at a backend and model
-price           what a model's tokens cost
+price           what a model's tokens and a provider-billed tool call cost
 ```
 
 ### Music and media

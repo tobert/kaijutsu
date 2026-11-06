@@ -723,3 +723,39 @@ fn the_old_index_shape_is_rebuilt_at_open() {
     KernelDb::apply_additive_migrations(&db.conn).unwrap();
     assert!(index_sql(&db).contains("archived_at IS NULL"));
 }
+
+/// A database written before provider-billed tool uses has neither table;
+/// opening it creates both, empty and working, and keeps its turns.
+#[test]
+fn an_older_database_gains_the_tool_use_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel.db");
+    let turn = {
+        let db = KernelDb::open(&path).unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("pre-tool-uses"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        let start = turn_start(ctx.context_id);
+        db.begin_turn(&start).unwrap();
+        db.conn.execute_batch(
+            "DROP TABLE turn_tool_uses;
+             DROP TRIGGER tool_prices_no_update;
+             DROP TRIGGER tool_prices_no_delete;
+             DROP TABLE tool_prices;",
+        ).unwrap();
+        start
+    };
+    let db = KernelDb::open(&path).unwrap();
+    let tables: i64 = db.conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('turn_tool_uses', 'tool_prices')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(tables, 2);
+    db.add_turn_tool_uses(turn.turn_id, &[("web_search", 2)]).unwrap();
+    assert_eq!(db.turn_tool_uses(turn.turn_id).unwrap(), vec![("web_search".to_string(), 2)]);
+    let id = db.insert_tool_price(&NewToolPrice {
+        provider: "anthropic".into(), tool: "web_search".into(), effective_from: 0, per_call: 10_000,
+        source: String::new(), set_by: None,
+    }).unwrap();
+    assert!(db.conn.execute("DELETE FROM tool_prices WHERE price_id = ?1", [id]).is_err(), "the triggers came back too");
+}

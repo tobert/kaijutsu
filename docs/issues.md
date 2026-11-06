@@ -6,6 +6,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## OpenAI-compatible client: what the audit leaves open (2026-11-06)
+
+- A stream that closes after `finish_reason` but before `[DONE]` fails the turn ("stream ended before Done"),
+  though its `ToolUse` events were emitted and their blocks written; hydration later answers them with error
+  results. eventsource-stream 0.2.3 also drops a final `data: [DONE]` that lacks its trailing blank line. Decide
+  whether a seen `finish_reason` ends the reply.
+- An unknown `finish_reason` completes the reply (keeps TGI's `eos_token` working); Claude treats an unknown stop
+  reason as a truncation.
+- A server that sends no tool-call id gets `call_{index}`, which repeats across turns. Validation is per message;
+  a context moved to Anthropic, which may refuse duplicate `tool_use` ids in one request, could get a 400.
+- Parallel calls on one `index` with different ids, or a chunk with no `index`, concatenate arguments
+  (`ToolUseInvalid`) or fail decoding (`ToolCallChunk.index` is a required `usize`). No server fixture shows it.
+- Reasoning from another provider goes to DeepSeek and generic servers as their own `reasoning_content`;
+  hydration treats the signature as opaque.
+
 ## Server-side tools have no representation (2026-11-06)
 
 - A tool the provider runs (Alibaba's `web_search`/`web_extractor`, billed under `usage.x_tools`; Anthropic's
@@ -315,6 +330,11 @@ Claude reply cut short have shipped. Open:
   `Provider::prompt_with_system`, which returns text only, so their usage never reaches `turns` and their cost is
   invisible. Next: one-shot prompting drains `stream()` and returns usage, and the call is recorded against the
   caller's context with its own `role`.
+- Provider-billed tool uses have storage (`turn_tool_uses`), prices (`tool_prices`, `kj price set-tool`) and
+  display, but no provider stream reports them yet: Anthropic's web search request count and Alibaba's
+  `usage.x_tools` still need capturing into `add_turn_tool_uses`, under the provider's stable tool name
+  (`web_search`, not a versioned id such as `web_search_20250305`), or the use counts as unpriced. Tool uses count
+  in `priced_calls` and `unpriced_calls` beside model calls.
 - SillyTavern's edit-cost notes (`llm::prefix::edit_cost_note`,
   `report_divergence`) state token counts only. They can call
   `pricing::cost_micros` once they know the provider, model and time.
@@ -1912,6 +1932,9 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   in the default and director stances, unmeasured. Tune it from what the morning rotation finds.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
   is flaky under the parallel test runner and passes single-threaded.
+- `kj::drive::tests::drive_with_prompt_writes_seed_block_and_anchors_turn` failed 2 of 19 `kj::drive` tests in
+  one run and passed 19 of 19 on rerun (2026-11-06): it saw one block more than the seed ("left 3, right 2").
+  It counts blocks right after the drive returns; the admitted turn may write its reply first.
 - `mcp::broker::tests::tool_call_spans_keep_requester_actor_and_reviewer_distinct`
   missed both spans in a parallel `tool_` test run; its isolated rerun passed
   (2026-09-17, /tmp/kaijutsu-tool-write-tests.log). Audit tracing subscriber and

@@ -418,6 +418,40 @@ BEGIN SELECT RAISE(ABORT, 'model_prices is append-only: insert a later price ins
 CREATE TRIGGER IF NOT EXISTS model_prices_no_delete BEFORE DELETE ON model_prices
 BEGIN SELECT RAISE(ABORT, 'model_prices is append-only: insert a later price instead'); END;
 
+-- ── Turn tool uses (provider-billed tool calls) ─────────────────
+-- Calls a provider ran and billed per call during a turn (a server-side web
+-- search), summed per tool. Tokens alone cannot price these. A turn with no
+-- row for a tool used it zero times.
+CREATE TABLE IF NOT EXISTS turn_tool_uses (
+    turn_id BLOB    NOT NULL REFERENCES turns(turn_id),
+    tool    TEXT    NOT NULL CHECK (tool <> ''),
+    calls   INTEGER NOT NULL CHECK (calls >= 0),
+    PRIMARY KEY (turn_id, tool)
+);
+
+-- ── Tool prices (append-only history) ────────────────────────────
+-- What one provider-billed tool call costs, keyed by the provider string
+-- `turns` records and the tool name. Same history rules as `model_prices`:
+-- a change inserts a row, the latest `effective_from` at or before a turn's
+-- start prices that turn, the later insert wins a tie, and triggers refuse
+-- UPDATE and DELETE. The rate is integer micro-dollars per call.
+CREATE TABLE IF NOT EXISTS tool_prices (
+    price_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider        TEXT    NOT NULL CHECK (provider <> ''),
+    tool            TEXT    NOT NULL CHECK (tool <> ''),
+    effective_from  INTEGER NOT NULL,
+    per_call_micros INTEGER NOT NULL CHECK (per_call_micros >= 0),
+    source          TEXT    NOT NULL DEFAULT '',
+    set_by          BLOB,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_prices_lookup
+    ON tool_prices(provider, tool, effective_from, price_id);
+CREATE TRIGGER IF NOT EXISTS tool_prices_no_update BEFORE UPDATE ON tool_prices
+BEGIN SELECT RAISE(ABORT, 'tool_prices is append-only: insert a later price instead'); END;
+CREATE TRIGGER IF NOT EXISTS tool_prices_no_delete BEFORE DELETE ON tool_prices
+BEGIN SELECT RAISE(ABORT, 'tool_prices is append-only: insert a later price instead'); END;
+
 -- ── Context Tool Bindings (Phase 5, D-54) ───────────────────────
 -- Per-context capability allow-set + sticky name resolution, persisted so the
 -- loadout survives kernel restart. Deny-by-default: an absent parent row (or an

@@ -11,6 +11,11 @@
 //! `3_000_000`, and tokens times a rate over `1_000_000` is micro-dollars.
 //! `input` and `output` are always known. A cache rate may be `None`, which
 //! means unknown: a price cannot cost tokens it has no rate for.
+//!
+//! A tool the provider runs and bills per call (a server-side web search) has
+//! its own history in `tool_prices`, keyed by `(provider, tool)` with the same
+//! rules and a rate in micro-dollars per call. `turn_tool_uses` records the
+//! calls; a use with no price in force is unknown, never free.
 
 use rusqlite::{OptionalExtension, params};
 
@@ -66,6 +71,61 @@ pub struct CostGroup {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub cache_write_1h_tokens: i64,
+}
+
+/// One stored tool price.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPriceRow {
+    pub price_id: i64,
+    pub provider: String,
+    pub tool: String,
+    /// Unix milliseconds the rate takes effect.
+    pub effective_from: i64,
+    /// Micro-dollars per call.
+    pub per_call: i64,
+    /// Free text saying where the number came from.
+    pub source: String,
+    pub set_by: Option<PrincipalId>,
+    pub created_at: i64,
+}
+
+/// A tool price to append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewToolPrice {
+    pub provider: String,
+    pub tool: String,
+    pub effective_from: i64,
+    pub per_call: i64,
+    pub source: String,
+    pub set_by: Option<PrincipalId>,
+}
+
+/// A context's tool uses on one provider's tool, summed over the turns that
+/// ran under one tool price. `price_id` is `None` when no price was in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUseGroup {
+    pub context_id: ContextId,
+    pub provider: String,
+    pub tool: String,
+    pub price_id: Option<i64>,
+    pub calls: i64,
+}
+
+const TOOL_PRICE_COLUMNS: &str = "price_id, provider, tool, effective_from, per_call_micros,
+    source, set_by, created_at";
+
+fn read_tool_price(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolPriceRow> {
+    let set_by: Option<Vec<u8>> = row.get(6)?;
+    Ok(ToolPriceRow {
+        price_id: row.get(0)?,
+        provider: row.get(1)?,
+        tool: row.get(2)?,
+        effective_from: row.get(3)?,
+        per_call: row.get(4)?,
+        source: row.get(5)?,
+        set_by: set_by.as_deref().and_then(PrincipalId::try_from_slice),
+        created_at: row.get(7)?,
+    })
 }
 
 const PRICE_COLUMNS: &str = "price_id, provider, model, effective_from, input_micros,
@@ -151,6 +211,92 @@ impl KernelDb {
     pub fn get_model_price(&self, price_id: i64) -> KernelDbResult<Option<ModelPriceRow>> {
         let sql = format!("SELECT {PRICE_COLUMNS} FROM model_prices WHERE price_id = ?1");
         Ok(self.conn.query_row(&sql, params![price_id], read_price).optional()?)
+    }
+
+    /// Append a tool price and return its id. Refuses a negative rate.
+    pub fn insert_tool_price(&self, price: &NewToolPrice) -> KernelDbResult<i64> {
+        if price.per_call < 0 {
+            return Err(KernelDbError::Validation("a price rate cannot be negative".into()));
+        }
+        if price.provider.is_empty() || price.tool.is_empty() {
+            return Err(KernelDbError::Validation("a tool price names a provider and a tool".into()));
+        }
+        let set_by = price.set_by.map(|p| *p.as_bytes());
+        self.conn.execute(
+            "INSERT INTO tool_prices (provider, tool, effective_from, per_call_micros, source, set_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                price.provider,
+                price.tool,
+                price.effective_from,
+                price.per_call,
+                price.source,
+                set_by.as_ref().map(blob_param),
+                now_millis(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The tool price in force at `at`: the latest `effective_from` at or
+    /// before it, the later insert winning a tie. `None` is "unknown", never free.
+    pub fn effective_tool_price(&self, provider: &str, tool: &str, at: i64) -> KernelDbResult<Option<ToolPriceRow>> {
+        let sql = format!(
+            "SELECT {TOOL_PRICE_COLUMNS} FROM tool_prices
+             WHERE provider = ?1 AND tool = ?2 AND effective_from <= ?3
+             ORDER BY effective_from DESC, price_id DESC LIMIT 1"
+        );
+        Ok(self.conn.query_row(&sql, params![provider, tool, at], read_tool_price).optional()?)
+    }
+
+    /// Every tool price, oldest first, optionally narrowed to one provider's tool.
+    pub fn list_tool_prices(&self, tool: Option<(&str, &str)>) -> KernelDbResult<Vec<ToolPriceRow>> {
+        let (provider, name) = tool.unzip();
+        let sql = format!(
+            "SELECT {TOOL_PRICE_COLUMNS} FROM tool_prices
+             WHERE (?1 IS NULL OR provider = ?1) AND (?2 IS NULL OR tool = ?2)
+             ORDER BY provider, tool, effective_from, price_id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![provider, name], read_tool_price)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// One tool price by id.
+    pub fn get_tool_price(&self, price_id: i64) -> KernelDbResult<Option<ToolPriceRow>> {
+        let sql = format!("SELECT {TOOL_PRICE_COLUMNS} FROM tool_prices WHERE price_id = ?1");
+        Ok(self.conn.query_row(&sql, params![price_id], read_tool_price).optional()?)
+    }
+
+    /// Tool uses summed per context, provider, tool and the tool price in
+    /// force when each turn started, for one context or every context. Zero
+    /// calls are left out.
+    pub fn context_tool_use_groups(&self, context: Option<ContextId>) -> KernelDbResult<Vec<ToolUseGroup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, provider, tool, price_id, SUM(calls)
+             FROM (
+                SELECT t.context_id, t.provider, u.tool, u.calls,
+                       (SELECT p.price_id FROM tool_prices p
+                         WHERE p.provider = t.provider AND p.tool = u.tool AND p.effective_from <= t.started_at
+                         ORDER BY p.effective_from DESC, p.price_id DESC LIMIT 1) AS price_id
+                FROM turn_tool_uses u JOIN turns t ON t.turn_id = u.turn_id
+                WHERE u.calls > 0 AND (?1 IS NULL OR t.context_id = ?1)
+             )
+             GROUP BY context_id, provider, tool, price_id
+             ORDER BY context_id, provider, tool, price_id",
+        )?;
+        let context = context.map(|c| *c.as_bytes());
+        let context = context.as_ref().map(blob_param);
+        let rows = stmt.query_map(params![context], |row| {
+            Ok(ToolUseGroup {
+                context_id: read_context_id(row, 0)?,
+                provider: row.get(1)?,
+                tool: row.get(2)?,
+                price_id: row.get(3)?,
+                calls: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Turns summed per context, model and the price in force when each

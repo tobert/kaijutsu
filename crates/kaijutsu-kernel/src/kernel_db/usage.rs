@@ -287,6 +287,50 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Add provider-billed tool calls to a running turn, summed per tool with
+    /// any already recorded. All entries are written or none. Fails when the
+    /// turn has no row or has already ended, when a tool name is empty, or
+    /// when a count does not fit the column.
+    pub fn add_turn_tool_uses(&self, turn_id: TurnId, uses: &[(&str, u64)]) -> KernelDbResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let running: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM turns WHERE turn_id = ?1 AND ended_at IS NULL)",
+            params![blob_param(turn_id.as_bytes())],
+            |row| row.get(0),
+        )?;
+        if !running {
+            return Err(KernelDbError::NotFound(format!("running turn {turn_id}")));
+        }
+        for (tool, calls) in uses {
+            let calls = i64::try_from(*calls)
+                .map_err(|_| KernelDbError::Validation(format!("tool use count for '{tool}' is too large")))?;
+            tx.execute(
+                "INSERT INTO turn_tool_uses (turn_id, tool, calls) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(turn_id, tool) DO UPDATE SET calls = calls + excluded.calls",
+                params![blob_param(turn_id.as_bytes()), tool, calls],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A turn's tool uses as `(tool, calls)`, sorted by tool name.
+    pub fn turn_tool_uses(&self, turn_id: TurnId) -> KernelDbResult<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare("SELECT tool, calls FROM turn_tool_uses WHERE turn_id = ?1 ORDER BY tool")?;
+        let rows = stmt.query_map(params![blob_param(turn_id.as_bytes())], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Every turn of a context, tool uses summed as `(tool, calls)`, sorted by tool name.
+    pub fn context_tool_use_totals(&self, context_id: ContextId) -> KernelDbResult<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.tool, SUM(u.calls) FROM turn_tool_uses u JOIN turns t ON t.turn_id = u.turn_id
+             WHERE t.context_id = ?1 GROUP BY u.tool ORDER BY u.tool",
+        )?;
+        let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
     /// Close a turn with how it ended. Fails when the turn has no row or has
     /// already ended.
     pub fn finish_turn(&self, turn_id: TurnId, ended_at: i64, stop_reason: &str) -> KernelDbResult<()> {

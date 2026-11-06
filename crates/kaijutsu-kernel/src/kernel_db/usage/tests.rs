@@ -274,3 +274,58 @@ fn context_used_pct_zero_window_is_none_not_nan_or_inf() {
     usage.input_tokens = 1_000;
     assert_eq!(context_used_pct(&usage, Some(0)), None);
 }
+
+/// Tool uses add up per (turn, tool) across calls; a repeated tool inside one
+/// call sums; reads come back sorted by tool name; the context totals sum
+/// across that context's turns only.
+#[test]
+fn turn_tool_uses_accumulate_per_tool_and_total_per_context() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let ours = make_context_row(Some("tool-ours"));
+    let theirs = make_context_row(Some("tool-theirs"));
+    insert_context_with_doc(&db, &ours, ws_id);
+    insert_context_with_doc(&db, &theirs, ws_id);
+    let first = turn_start(ours.context_id);
+    let mut second = turn_start(ours.context_id);
+    second.started_at += 1;
+    let other = turn_start(theirs.context_id);
+    for start in [&first, &second, &other] {
+        db.begin_turn(start).unwrap();
+    }
+    assert!(db.turn_tool_uses(first.turn_id).unwrap().is_empty());
+    db.add_turn_tool_uses(first.turn_id, &[("web_search", 2), ("web_extractor", 1)]).unwrap();
+    db.add_turn_tool_uses(first.turn_id, &[("web_search", 1), ("web_search", 1)]).unwrap();
+    db.add_turn_tool_uses(first.turn_id, &[]).unwrap();
+    db.add_turn_tool_uses(second.turn_id, &[("web_search", 5)]).unwrap();
+    db.add_turn_tool_uses(other.turn_id, &[("web_search", 99)]).unwrap();
+    assert_eq!(
+        db.turn_tool_uses(first.turn_id).unwrap(),
+        vec![("web_extractor".to_string(), 1), ("web_search".to_string(), 4)]
+    );
+    assert_eq!(
+        db.context_tool_use_totals(ours.context_id).unwrap(),
+        vec![("web_extractor".to_string(), 1), ("web_search".to_string(), 9)]
+    );
+}
+
+/// A tool use with nowhere to land is an error, and a bad entry leaves the
+/// earlier entries of the same call unwritten.
+#[test]
+fn turn_tool_uses_fail_loudly_and_all_or_nothing() {
+    let db = KernelDb::temporary().unwrap();
+    let ws_id = setup_test_db(&db);
+    let ctx = make_context_row(Some("tool-loud"));
+    insert_context_with_doc(&db, &ctx, ws_id);
+    assert!(matches!(db.add_turn_tool_uses(TurnId::new(), &[("web_search", 1)]), Err(KernelDbError::NotFound(_))));
+
+    let start = turn_start(ctx.context_id);
+    db.begin_turn(&start).unwrap();
+    assert!(db.add_turn_tool_uses(start.turn_id, &[("web_search", 1), ("", 1)]).is_err(), "a tool has a name");
+    assert!(db.add_turn_tool_uses(start.turn_id, &[("web_search", 1), ("x", u64::MAX)]).is_err(), "a count fits the column");
+    assert!(db.turn_tool_uses(start.turn_id).unwrap().is_empty(), "the failed call wrote nothing");
+
+    db.finish_turn(start.turn_id, 2_000, "end_turn").unwrap();
+    assert!(matches!(db.add_turn_tool_uses(start.turn_id, &[("web_search", 1)]), Err(KernelDbError::NotFound(_))));
+    assert!(db.turn_tool_uses(start.turn_id).unwrap().is_empty());
+}

@@ -125,11 +125,13 @@ allow = [
   "kj fork",             # a fork copies this context's own performer
   "kj drive",            # runs a turn on a lane banto directs
   "kj price set",        # appends a price row; a correction is a later row
+  "kj price set-tool",   # appends a tool price row; a correction is a later row
 ]
 
 [root]
 allow = [
   "kj price set",        # appends a price row; a correction is a later row
+  "kj price set-tool",   # appends a tool price row; a correction is a later row
 ]
 
 # The main seat of a companion has a writable shell while the person is

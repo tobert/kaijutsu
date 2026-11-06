@@ -9,12 +9,17 @@
 //! reads and writes, which are billed on their own; an OpenAI-compatible
 //! provider's `input` already includes the cache hit, so the hit is billed at
 //! the cache rate and only the rest at the input rate ([`InputStyle`]).
+//!
+//! A tool the provider runs and bills per call (a server-side web search) is
+//! priced by `tool_prices`, in micro-dollars per call, whatever the input
+//! style. A tool use with no price in force is unknown: it counts as unpriced
+//! calls and adds nothing to the dollar figure.
 
 use std::collections::HashMap;
 
 use kaijutsu_types::ContextId;
 
-use crate::kernel_db::{CostGroup, KernelDb, KernelDbResult, ModelPriceRow};
+use crate::kernel_db::{CostGroup, KernelDb, KernelDbResult, ModelPriceRow, ToolPriceRow};
 use crate::llm::BackendKind;
 
 /// How a provider's `input` count relates to its cache counts.
@@ -91,14 +96,16 @@ pub fn cost_micros(price: &ModelPriceRow, style: InputStyle, tokens: &Tokens) ->
 pub struct ContextCost {
     /// Micro-dollars over the calls that could be priced.
     pub micros: u64,
-    /// Calls priced.
+    /// Billable items priced: model calls, and provider-billed tool uses
+    /// with a tool price in force.
     pub priced_calls: u64,
-    /// Calls with no price in force, or a price missing a rate they needed.
+    /// Billable items with no price: model calls with no price in force or a
+    /// price missing a rate they needed, and tool uses with no tool price.
     pub unpriced_calls: u64,
 }
 
 /// The cost of one context, or of every context with turns, each turn priced
-/// by the price in force when it started. `style_of` maps a provider name to
+/// by the price in force when it started, tool uses included. `style_of` maps a provider name to
 /// how it counts input, or `None` for a provider that is no longer configured:
 /// its input convention is unknown, so its calls are unpriced.
 pub fn context_costs(
@@ -124,6 +131,25 @@ pub fn context_costs(
         match micros {
             Some(m) => {
                 entry.micros = entry.micros.saturating_add(m);
+                entry.priced_calls += calls;
+            }
+            None => entry.unpriced_calls += calls,
+        }
+    }
+    let mut tool_prices: HashMap<i64, Option<ToolPriceRow>> = HashMap::new();
+    for group in db.context_tool_use_groups(context)? {
+        let calls = group.calls.max(0) as u64;
+        let price = match group.price_id {
+            Some(id) => match tool_prices.entry(id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(db.get_tool_price(id)?).clone(),
+            },
+            None => None,
+        };
+        let entry = costs.entry(group.context_id).or_default();
+        match price {
+            Some(p) => {
+                entry.micros = entry.micros.saturating_add(calls.saturating_mul(p.per_call.max(0) as u64));
                 entry.priced_calls += calls;
             }
             None => entry.unpriced_calls += calls,
