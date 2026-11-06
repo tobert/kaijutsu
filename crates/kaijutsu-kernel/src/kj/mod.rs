@@ -96,6 +96,34 @@ enum DistillationPurpose {
     Continuation,
 }
 
+/// A one-shot call's open `turns` row. Dropped before [`Self::finish`] (the
+/// caller dropped the call, or it panicked), it closes the row as cancelled,
+/// as a cancelled turn's row is closed, so no row stays running.
+struct OpenTurnRow {
+    db: Arc<parking_lot::Mutex<KernelDb>>,
+    turn_id: kaijutsu_types::TurnId,
+    open: bool,
+}
+
+impl OpenTurnRow {
+    fn finish(mut self, stop_reason: &str) -> crate::kernel_db::KernelDbResult<()> {
+        self.open = false;
+        self.db.lock().finish_turn(self.turn_id, kaijutsu_types::now_millis() as i64, stop_reason)
+    }
+}
+
+impl Drop for OpenTurnRow {
+    fn drop(&mut self) {
+        if !self.open {
+            return;
+        }
+        let cancelled = crate::flows::TurnStopReason::Cancelled { immediate: true }.as_str();
+        if let Err(error) = self.db.lock().finish_turn(self.turn_id, kaijutsu_types::now_millis() as i64, cancelled) {
+            tracing::error!(turn = %self.turn_id, "a dropped one-shot's turn record could not be closed: {error}");
+        }
+    }
+}
+
 impl DistillationPurpose {
     /// The role the call's `turns` row records.
     fn turn_role(self) -> &'static str {
@@ -1029,7 +1057,7 @@ impl KjDispatcher {
             .and_then(|row| row.performer)
             .ok_or_else(|| format!("cannot distill: context {} has no performer to record the call against", caller.short()))?;
         let turn_id = kaijutsu_types::TurnId::new();
-        db.lock().begin_turn(&crate::TurnStart {
+        let row = db.lock().begin_turn(&crate::TurnStart {
             turn_id,
             context_id: caller,
             performer,
@@ -1037,11 +1065,25 @@ impl KjDispatcher {
             provider: provider_name.clone(),
             model: model.clone(),
             started_at: kaijutsu_types::now_millis() as i64,
-        }).map_err(|e| format!("could not write the distillation's turn record: {e}. The call was not made."))?;
+        }).map(|()| OpenTurnRow { db: db.clone(), turn_id, open: true })
+            .map_err(|e| format!("could not write the distillation's turn record: {e}. The call was not made."))?;
 
-        let reply = provider
-            .prompt_with_system(&model, max_tokens, Some(&system_prompt), &user_prompt)
-            .await;
+        // The slot's tunables ride on the request; with no effort and no
+        // thinking style, the one-shot turns thinking off.
+        let slot = &bound.slot;
+        let tunables = crate::llm::SlotTunables {
+            max_tokens: None,
+            temperature: slot.temperature,
+            top_p: slot.top_p,
+            effort: slot.effort.clone(),
+            thinking_budget: slot.thinking_budget.and_then(|v| u64::try_from(v).ok()),
+            thinking_style: slot.thinking_style.clone(),
+        };
+        let opts = crate::llm::apply_tunables(
+            crate::llm::BuildOpts::new(&model, max_tokens).with_system(&system_prompt),
+            &tunables,
+        );
+        let reply = provider.prompt_with_system(opts, &user_prompt).await;
         // A failed call that reported counts still spent them.
         let (usage, stop_reason) = match &reply {
             Ok(reply) => (
@@ -1052,11 +1094,11 @@ impl KjDispatcher {
         };
         let recorded = usage.map_or(Ok(()), |usage| {
             crate::runtime::llm_stream::record_turn_spend(
-                &db, Some(turn_id), &provider_name, &model,
+                &db, Some(turn_id), provider.name(), &model,
                 usage.input_tokens, usage.output_tokens, &usage.extra,
             ).map(|_| ())
         });
-        let finished = db.lock().finish_turn(turn_id, kaijutsu_types::now_millis() as i64, stop_reason);
+        let finished = row.finish(stop_reason);
         let record = recorded
             .and(finished)
             .map_err(|e| format!("could not write the distillation's turn record: {e}"));

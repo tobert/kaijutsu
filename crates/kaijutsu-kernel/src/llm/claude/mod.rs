@@ -447,18 +447,12 @@ impl Stream {
                             }
                             Err(e) => {
                                 self.finished = true;
-                                return Some(StreamEvent::Error(StreamError::new(
-                                    StreamErrorKind::Protocol,
-                                    format!("SSE decode: {e}"),
-                                )));
+                                return Some(self.failure(StreamErrorKind::Protocol, format!("SSE decode: {e}")));
                             }
                         },
                         Some(Err(e)) => {
                             self.finished = true;
-                            return Some(StreamEvent::Error(StreamError::new(
-                                StreamErrorKind::Transport,
-                                format!("SSE transport: {e}"),
-                            )));
+                            return Some(self.failure(StreamErrorKind::Transport, format!("SSE transport: {e}")));
                         }
                         None => {
                             // Source stream closed without an explicit
@@ -472,6 +466,16 @@ impl Stream {
                 }
             }
         }
+    }
+
+    /// The error for a stream that broke below the state machine, carrying
+    /// what the call had spent.
+    fn failure(&self, kind: StreamErrorKind, message: String) -> StreamEvent {
+        let error = StreamError::new(kind, message);
+        StreamEvent::Error(match self.state.spent() {
+            Some(spent) => error.with_usage(spent),
+            None => error,
+        })
     }
 
     /// Abort the underlying HTTP stream.

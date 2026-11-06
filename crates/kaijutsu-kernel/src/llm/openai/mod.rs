@@ -372,65 +372,69 @@ impl Stream {
                 item = inner.next() => {
                     match item {
                         Some(Ok(event)) => match decode_event(&event) {
-                            Ok(typed) => {
-                                let ends = matches!(&typed, OpenAiSseEvent::Done | OpenAiSseEvent::Error(_));
-                                let busy = match &typed {
-                                    OpenAiSseEvent::Error(e) => busy_status(&e.kind),
-                                    _ => None,
-                                };
-                                let completes = matches!(&typed, OpenAiSseEvent::Done);
-                                let emitted = self.state.step(typed);
-                                if ends {
-                                    self.finished = true;
-                                }
-                                // Only a `[DONE]` the state machine did not turn
-                                // into an error completes the answer.
-                                if completes && !self.state.failed() {
-                                    if let Some(slot) = &self.slot {
-                                        slot.completed();
-                                    }
-                                }
-                                // An error that means "too much load" cools the
-                                // endpoint as the same answer on the HTTP status
-                                // would.
-                                if let (Some(slot), Some(status)) = (&self.slot, busy) {
-                                    slot.answered_with(status, None);
-                                }
-                                self.cut_on_capacity(&emitted);
-                                for ev in emitted {
-                                    self.pending.push_back(ev);
-                                }
-                            }
+                            Ok(typed) => self.take(typed),
                             Err(e) => {
                                 self.finished = true;
-                                return Some(StreamEvent::Error(StreamError::new(
-                                    StreamErrorKind::Protocol,
-                                    format!("SSE decode: {e}"),
-                                )));
+                                return Some(self.failure(StreamErrorKind::Protocol, format!("SSE decode: {e}")));
                             }
                         },
                         Some(Err(e)) => {
                             self.finished = true;
-                            return Some(StreamEvent::Error(StreamError::new(
-                                StreamErrorKind::Transport,
-                                format!("SSE transport: {e}"),
-                            )));
+                            return Some(self.failure(StreamErrorKind::Transport, format!("SSE transport: {e}")));
                         }
                         None => {
-                            // Source closed without an explicit [DONE].
-                            // Don't synthesize Done — that would mask a
-                            // wire-shape bug — but report a failure the
-                            // reply already ended in.
-                            self.finished = true;
+                            // The source closed without `[DONE]`. It ends the
+                            // reply as `[DONE]` would: a seen `finish_reason`
+                            // ends it whole, a failing one in its error, and a
+                            // reply that never said it finished is truncated.
+                            // The SSE parser also drops a final `data: [DONE]`
+                            // that lacks its blank line, which lands here.
                             self.inner = None;
-                            let failure = self.state.take_failure();
-                            self.cut_on_capacity(failure.as_slice());
-                            return failure;
+                            self.take(OpenAiSseEvent::Done);
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Step the state machine with `typed`, tell the slot how the answer
+    /// went, and queue what it emits.
+    fn take(&mut self, typed: OpenAiSseEvent) {
+        let ends = matches!(&typed, OpenAiSseEvent::Done | OpenAiSseEvent::Error(_));
+        let busy = match &typed {
+            OpenAiSseEvent::Error(e) => busy_status(&e.kind),
+            _ => None,
+        };
+        let completes = matches!(&typed, OpenAiSseEvent::Done);
+        let emitted = self.state.step(typed);
+        if ends {
+            self.finished = true;
+        }
+        // Only a `[DONE]` the state machine did not turn into an error
+        // completes the answer.
+        if completes && !self.state.failed() {
+            if let Some(slot) = &self.slot {
+                slot.completed();
+            }
+        }
+        // An error that means "too much load" cools the endpoint as the same
+        // answer on the HTTP status would.
+        if let (Some(slot), Some(status)) = (&self.slot, busy) {
+            slot.answered_with(status, None);
+        }
+        self.cut_on_capacity(&emitted);
+        self.pending.extend(emitted);
+    }
+
+    /// The error for a stream that broke below the state machine, carrying
+    /// what the call had spent.
+    fn failure(&self, kind: StreamErrorKind, message: String) -> StreamEvent {
+        let error = StreamError::new(kind, message);
+        StreamEvent::Error(match self.state.spent() {
+            Some(spent) => error.with_usage(spent),
+            None => error,
+        })
     }
 
     /// A capacity cut tells the endpoint it is overloaded, so other callers
@@ -874,6 +878,93 @@ data: [DONE]
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
         while stream.next_event().await.is_some() {}
         assert!(endpoint.status().cooldown.is_none());
+    }
+
+    /// Drain a stream served from `body`, with the endpoint primed by one busy
+    /// answer, and return its events and the doubling left after it.
+    async fn close_after(body: &str) -> (Vec<StreamEvent>, u32) {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let (base, _) = serve(vec![sse(body)]).await;
+        let (client, endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next_event().await {
+            events.push(ev);
+        }
+        (events, endpoint.busy_in_a_row())
+    }
+
+    /// A seen `finish_reason` ends the reply: a connection that closes before
+    /// `[DONE]` ends it with the `Done` `[DONE]` would have brought, and the
+    /// answer counts as completed.
+    ///
+    /// Falsified by a finished reply that fails as a stream that "ended
+    /// before Done".
+    #[tokio::test]
+    async fn a_finished_reply_whose_connection_closes_before_done_ends_with_done() {
+        let stop = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let (events, busy) = close_after(stop).await;
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Done { stop_reason: Some(r), .. }) if r == "stop"),
+            "{events:?}"
+        );
+        assert_eq!(busy, 0, "a finished reply completes the answer");
+    }
+
+    /// Tool calls a finished reply made run when the connection closes before
+    /// `[DONE]`.
+    #[tokio::test]
+    async fn a_tool_call_reply_whose_connection_closes_before_done_runs_its_calls() {
+        let calls = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}
+
+";
+        let (events, _) = close_after(calls).await;
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::ToolUse { id, .. }, StreamEvent::Done { stop_reason: Some(r), .. }]
+                if id == "call_a" && r == "tool_calls"),
+            "{events:?}"
+        );
+    }
+
+    /// Usage that arrives after the `finish_reason` rides on the `Done`, and a
+    /// final `data: [DONE]` without its blank line (which the SSE parser drops
+    /// at the source end) still ends the reply.
+    #[tokio::test]
+    async fn usage_after_the_finish_reason_rides_on_the_done_at_close() {
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}
+
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}
+
+data: [DONE]
+";
+        let (events, _) = close_after(body).await;
+        match events.last() {
+            Some(StreamEvent::Done { input_tokens, output_tokens, .. }) => {
+                assert_eq!((*input_tokens, *output_tokens), (Some(7), Some(2)));
+            }
+            other => panic!("expected Done last, got {other:?}"),
+        }
+    }
+
+    /// A reply that never reached a `finish_reason` is still an error when its
+    /// connection closes: it is truncated, as at a bare `[DONE]`, and the
+    /// answer is not completed.
+    #[tokio::test]
+    async fn an_unfinished_reply_whose_connection_closes_is_truncated() {
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n";
+        let (events, busy) = close_after(partial).await;
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Error(e)) if e.kind == StreamErrorKind::Truncated("no_finish_reason".into())),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Done { .. })), "{events:?}");
+        assert_eq!(busy, 1, "a truncated reply is not a completed answer");
     }
 
     /// A reply cut by its provider still reports the cut when the connection

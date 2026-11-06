@@ -284,8 +284,11 @@ fn auto_tail_cache(plan: &CachePlan, messages: usize, dialect: Dialect) -> Optio
 ///   downstream. `effort` has no field on this tier — it's INERT
 ///   (warned, never silently dropped).
 /// - `"off"`: send `thinking: {"type": "disabled"}`. A model that thinks on
-///   every request ([`Thinking::is_always_on`]) rejects it, so the request
-///   fails here with [`LlmError::InvalidRequest`] naming the model.
+///   every request ([`Thinking::is_always_on`]) rejects it, and a model that
+///   takes it only at effort high or below
+///   ([`Thinking::disables_only_at_high_effort`]) rejects it beside effort
+///   `xhigh` or `max`, so the request fails here with
+///   [`LlmError::InvalidRequest`] naming the model.
 /// - Anything else: refused — the closed set is `auto`/`adaptive`/`budget`/`off`.
 ///
 /// Every branch that can't apply an explicitly-set `effort` or
@@ -302,6 +305,17 @@ pub fn resolve_thinking(opts: &BuildOpts, dialect: Dialect) -> Result<Option<Thi
                 "thinking_style=off is not available for model {}: it thinks on every request \
                  and rejects thinking disabled (use adaptive, with a lower effort to think less)",
                 opts.model
+            )));
+        }
+        Some("off")
+            if matches!(opts.effort.as_deref(), Some("xhigh" | "max"))
+                && Thinking::disables_only_at_high_effort(&opts.model) =>
+        {
+            return Err(LlmError::InvalidRequest(format!(
+                "thinking_style=off is not available for model {} at effort {}: it takes thinking \
+                 disabled only at effort high or below (lower the effort, or leave thinking on)",
+                opts.model,
+                opts.effort.as_deref().unwrap_or_default(),
             )));
         }
         Some("off") => Some(Thinking::Disabled),
@@ -1914,7 +1928,10 @@ mod tests {
     /// fails before the wire and names the model.
     #[test]
     fn thinking_off_fails_locally_for_an_always_on_model() {
-        for model in ["claude-fable-5", "claude-mythos-5", "claude-sonnet-5-5", "claude-sonnet-5-6", "claude-sonnet-6"] {
+        for model in [
+            "claude-fable-5", "claude-mythos-5", "claude-sonnet-5-5", "claude-sonnet-5-6", "claude-sonnet-6",
+            "claude-opus-5-5", "claude-opus-5-5-20261101", "claude-opus-6",
+        ] {
             let mut o = opts(model);
             o.thinking_style = Some("off".into());
             let err = resolve_thinking(&o, Dialect::Anthropic).unwrap_err();
@@ -1922,9 +1939,43 @@ mod tests {
         }
     }
 
+    /// Claude Opus 5 and Claude Haiku 5.5 take thinking disabled only at
+    /// effort high or below. `off` with effort `xhigh` or `max` fails before
+    /// the wire and names the model and the effort, as `off` does on a model
+    /// that always thinks; other models keep `off` at any effort.
+    ///
+    /// Falsified by an `off` that quietly drops an explicit `xhigh` or `max`.
+    #[test]
+    fn thinking_off_at_xhigh_or_max_fails_locally_where_the_model_refuses_it() {
+        for model in ["claude-opus-5", "claude-opus-5-20260203", "claude-haiku-5-5", "claude-haiku-6"] {
+            for effort in ["xhigh", "max"] {
+                let mut o = opts(model);
+                o.thinking_style = Some("off".into());
+                o.effort = Some(effort.into());
+                let err = resolve_thinking(&o, Dialect::Anthropic).unwrap_err();
+                assert!(
+                    matches!(&err, LlmError::InvalidRequest(m) if m.contains(model) && m.contains(effort)),
+                    "{model} at {effort}: {err:?}"
+                );
+            }
+            for effort in [None, Some("high"), Some("low")] {
+                let mut o = opts(model);
+                o.thinking_style = Some("off".into());
+                o.effort = effort.map(str::to_string);
+                assert!(matches!(resolve_thinking(&o, Dialect::Anthropic), Ok(Some(Thinking::Disabled))), "{model} at {effort:?}");
+            }
+        }
+        for model in ["claude-opus-4-8", "claude-haiku-4-5", "claude-sonnet-5-4"] {
+            let mut o = opts(model);
+            o.thinking_style = Some("off".into());
+            o.effort = Some("max".into());
+            assert!(matches!(resolve_thinking(&o, Dialect::Anthropic), Ok(Some(Thinking::Disabled))), "{model}");
+        }
+    }
+
     #[test]
     fn thinking_off_is_sent_to_a_model_that_allows_it() {
-        for model in ["claude-haiku-4-5", "claude-haiku-5-5", "claude-sonnet-5-4", "claude-sonnet-4-6", "claude-opus-4-8"] {
+        for model in ["claude-haiku-4-5", "claude-haiku-5-5", "claude-sonnet-5-4", "claude-sonnet-4-6", "claude-opus-4-8", "claude-opus-5", "claude-opus-5-4"] {
             let mut o = opts(model);
             o.thinking_style = Some("off".into());
             assert!(matches!(resolve_thinking(&o, Dialect::Anthropic), Ok(Some(Thinking::Disabled))), "{model}");

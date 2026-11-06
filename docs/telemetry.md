@@ -202,7 +202,6 @@ not spans — see Metrics below.
 
 | Method | Fields |
 |--------|--------|
-| `prompt()` | `llm.model`, `llm.provider` |
 | `prompt_with_system()` | `llm.model`, `llm.provider` |
 | `stream()` | `llm.provider` |
 | `models()` | — |
@@ -267,8 +266,9 @@ Coverage:
 
 - Dumped and logged: OpenAI-compatible providers (including DeepSeek) and
   Anthropic, on the turn's streaming path.
-- Logged only: one-shot `prompt` calls of those providers (no turn trace); the
-  `mk` provider, streaming and `prompt` (its request is not a JSON body; a
+- Logged only: one-shot prompts on those providers (`prompt_with_system`
+  streams with no turn trace); the `mk` provider, turns and one-shot prompts
+  alike (its request is not a JSON body; a
   `429` resend inside one call is the same request and is not logged again;
   `provider` is the backend's name, so two mk backends differ); council
   decisions (`provider="council"`, with the count of held contexts, because a

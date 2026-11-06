@@ -305,22 +305,23 @@ impl Thinking {
 
     /// Whether the model thinks on every request. Such a model rejects
     /// `thinking: {"type": "disabled"}`: the Fable and Mythos tiers, and
-    /// Sonnet from 5.5. Parses the id as [`Self::default_for_model`] does.
+    /// Sonnet and Opus from 5.5. Parses the id as [`Self::default_for_model`]
+    /// does.
     pub fn is_always_on(model: &str) -> bool {
-        let mut parts = model.split('-');
-        if parts.next() != Some("claude") {
-            return false;
+        match family_version(model) {
+            Some(("fable" | "mythos", _)) => true,
+            Some(("sonnet" | "opus", Some(version))) => version >= (5, 5),
+            _ => false,
         }
-        match parts.next() {
-            Some("fable" | "mythos") => true,
-            Some("sonnet") => {
-                let major: Option<u32> = parts.next().and_then(|p| p.parse().ok());
-                let minor: u32 = parts
-                    .next()
-                    .and_then(|p| if p.len() <= 2 { p.parse().ok() } else { None })
-                    .unwrap_or(0);
-                major.is_some_and(|major| (major, minor) >= (5, 5))
-            }
+    }
+
+    /// Whether the model takes `thinking: {"type": "disabled"}` only at effort
+    /// `high` or below, refusing it at `xhigh` and `max`: Opus 5 before 5.5,
+    /// and Haiku from 5.5.
+    pub fn disables_only_at_high_effort(model: &str) -> bool {
+        match family_version(model) {
+            Some(("opus", Some(version))) => ((5, 0)..(5, 5)).contains(&version),
+            Some(("haiku", Some(version))) => version >= (5, 5),
             _ => false,
         }
     }
@@ -362,6 +363,24 @@ impl Thinking {
             _ => None,
         }
     }
+}
+
+/// A Claude model id's family and `(major, minor)` version:
+/// `claude-<family>-<major>[-<minor>][-<date>]`. A missing or date-shaped minor
+/// reads as 0, and the version is `None` when the major does not parse.
+/// `None` for an id that is not Claude's.
+fn family_version(model: &str) -> Option<(&str, Option<(u32, u32)>)> {
+    let mut parts = model.split('-');
+    if parts.next() != Some("claude") {
+        return None;
+    }
+    let family = parts.next()?;
+    let major: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+    let minor: u32 = parts
+        .next()
+        .and_then(|p| if p.len() <= 2 { p.parse().ok() } else { None })
+        .unwrap_or(0);
+    Some((family, major.map(|major| (major, minor))))
 }
 
 /// `cache_control` annotation. Anthropic accepts this on tools,

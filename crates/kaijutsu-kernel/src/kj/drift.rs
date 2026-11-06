@@ -3366,6 +3366,77 @@ mod tests {
         assert!(err.contains("content_filter"), "{err}");
     }
 
+    /// A summary whose caller drops it mid-call still closes its turn: the row
+    /// ends cancelled instead of running forever.
+    ///
+    /// Falsified by a dropped summary that leaves its row open.
+    #[tokio::test]
+    async fn a_dropped_summary_closes_its_turn_as_cancelled() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+        let d = test_dispatcher().await;
+        let ctx = distilling_context(&d, vec![]).await;
+        let (mock, hold) = MockClient::new("x").holding_call(0);
+        d.kernel().llm().write().await.register("deepseek", Arc::new(Provider::Mock(mock)));
+        let mut summary = Box::pin(d.summarize(ctx, None));
+        tokio::select! {
+            _ = &mut summary => panic!("the held call cannot finish"),
+            _ = hold.entered.notified() => {}
+        }
+        drop(summary);
+        let turns = d.kernel_db().lock().list_turns(ctx, 10).unwrap();
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert!(turns[0].ended_at.is_some(), "the dropped call's row is closed: {turns:?}");
+        assert_eq!(turns[0].stop_reason.as_deref(), Some("cancelled_immediate"));
+    }
+
+    /// The `distill` slot's tunables reach the request: temperature and
+    /// top_p always, and an explicit effort or thinking style wins over the
+    /// one-shot's thinking-off default, which applies only when the slot
+    /// says nothing (`llm::tests::one_shot`). The example backends give
+    /// deepseek-flash `effort: high` in its model row, which a slot copies.
+    ///
+    /// Falsified by a summary that ignores the slot's tunables.
+    #[tokio::test]
+    async fn a_summary_runs_with_the_distill_slots_tunables() {
+        use crate::llm::{Provider, deepseek};
+        use kaijutsu_mk::test_server::{serve, sse};
+        use std::sync::Arc;
+        let d = test_dispatcher().await;
+        let plain = distilling_context(&d, vec![]).await;
+        let character = d.kernel_db().lock().get_context(plain).unwrap().unwrap().performer.unwrap();
+        let name = d.kernel_db().lock().get_character(character).unwrap().unwrap().name;
+        let set = d.dispatch(&[s("character"), s("slot"), s("set"), s(&name), s("distill"), s("deepseek/deepseek-flash"),
+            s("--max-tokens"), s("512"), s("--temperature"), s("0.3"), s("--top-p"), s("0.8"), s("--effort"), s("low")],
+            &test_caller()).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let tuned = register_context(&d, Some("tuned"), None, character);
+        d.kernel_db().lock().assign_stand_in_character(tuned, character).unwrap();
+        d.block_store().create_document(tuned, crate::DocumentKind::Conversation, None).unwrap();
+        d.block_store()
+            .insert_block(
+                tuned, None, None,
+                kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text, "material to distill",
+                kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        let done = || sse("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+        let (base, seen) = serve(vec![done(), done()]).await;
+        d.kernel().llm().write().await.register(
+            "deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("k").with_base_url(&base))),
+        );
+        d.summarize(tuned, None).await.expect("tuned summary");
+        d.summarize(plain, None).await.expect("plain summary");
+        let bodies: Vec<serde_json::Value> =
+            seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
+        assert_eq!((bodies[0]["temperature"].as_f64(), bodies[0]["top_p"].as_f64()), (Some(0.3), Some(0.8)), "{}", bodies[0]);
+        assert_eq!(bodies[0]["reasoning_effort"], "low", "the slot's effort wins: {}", bodies[0]);
+        assert!(bodies[0].get("thinking").is_none(), "{}", bodies[0]);
+        assert_eq!(bodies[0]["max_tokens"], 512);
+        assert_eq!(bodies[1]["reasoning_effort"], "high", "the model row's effort, copied into the slot, wins: {}", bodies[1]);
+        assert!(bodies[1].get("thinking").is_none(), "{}", bodies[1]);
+    }
+
     /// `--distill-model` is gone from `drift pull` and `drift merge`: the
     /// model a distillation runs on is the instance's `distill` slot. (A
     /// pull's trailing words are its directed prompt, so the flag is checked

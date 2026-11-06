@@ -8184,6 +8184,25 @@ mod lifetime_tests {
         assert_eq!(db.context_turn_totals(context).unwrap().input_tokens, 30);
     }
 
+    /// A call whose `Done` reports no token counts spent nothing we know of:
+    /// it adds no call and no tokens to the turn's row, while a counted call
+    /// beside it does.
+    ///
+    /// Falsified by a row that counts an uncounted call.
+    #[tokio::test]
+    async fn a_done_with_no_counts_adds_no_call_to_the_turn() {
+        let uncounted = vec![
+            crate::llm::StreamEvent::TextStart,
+            crate::llm::StreamEvent::TextDelta("hi".into()),
+            crate::llm::StreamEvent::TextEnd,
+            crate::llm::StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None },
+        ];
+        let (kernel, _, turn_id) = run_recorded_turn(vec![uncounted]).await;
+        let turn = kernel.kernel_db().lock().get_turn(turn_id).unwrap().unwrap();
+        assert_eq!((turn.llm_calls, turn.input_tokens, turn.output_tokens), (0, 0, 0));
+        assert_eq!(turn.stop_reason.as_deref(), Some("end_turn"));
+    }
+
     /// DeepSeek reports `input` with its cache hits already inside it, so the
     /// row keeps that number and records the hits beside it, uncounted twice.
     #[tokio::test]

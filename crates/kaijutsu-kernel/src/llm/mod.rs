@@ -1089,29 +1089,24 @@ impl Provider {
         }
     }
 
-    /// One-shot prompt with optional system preamble, streamed like a turn's
-    /// inference and drained here. The reply is the text the model wrote
-    /// (its thinking is not part of the answer), what the call spent, and
-    /// why it stopped.
+    /// One-shot prompt of `prompt` as one user message, on `opts` (the model,
+    /// `max_tokens`, an optional system preamble, and the slot's tunables),
+    /// streamed like a turn's inference and drained here. The reply is the
+    /// text the model wrote (its thinking is not part of the answer), what
+    /// the call spent, and why it stopped.
     ///
     /// A reply at the output limit is the text it reached. A reply the
     /// provider filtered, cut, or left unfinished is an error, and the error
     /// carries what the call spent before it failed.
     #[tracing::instrument(
-        skip(self, system, prompt),
-        fields(llm.model = %model, llm.provider = self.name(), llm.slot_wait_ms = tracing::field::Empty)
+        skip(self, opts, prompt),
+        fields(llm.model = %opts.model, llm.provider = self.name(), llm.slot_wait_ms = tracing::field::Empty)
     )]
     pub async fn prompt_with_system(
         &self,
-        model: &str,
-        max_tokens: u64,
-        system: Option<&str>,
+        opts: BuildOpts,
         prompt: &str,
     ) -> Result<OneShotReply, OneShotError> {
-        let mut opts = BuildOpts::new(model, max_tokens);
-        if let Some(system) = system {
-            opts = opts.with_system(system);
-        }
         let mut stream = self.stream(self.one_shot_opts(opts), vec![Message::user(prompt)]).await?;
         let mut text = String::new();
         while let Some(event) = stream.next_event().await {
@@ -1125,10 +1120,15 @@ impl Provider {
                     let usage = error.usage.clone();
                     return Err(OneShotError { error: error.into(), usage });
                 }
-                StreamEvent::ToolUse { name, .. }
-                | StreamEvent::ToolUseInvalid { name, .. }
-                | StreamEvent::InlineToolUse { name, .. } => {
+                StreamEvent::ToolUse { name, .. } | StreamEvent::ToolUseInvalid { name, .. } => {
                     tracing::warn!(tool = %name, "a one-shot prompt offers no tools; dropping the call the model made");
+                }
+                // The provider waits for an answer the one-shot cannot give.
+                StreamEvent::InlineToolUse { name, .. } => {
+                    stream.cancel();
+                    return Err(LlmError::InvalidRequest(format!(
+                        "the model called {name} inside a one-shot prompt, which offers no tools"
+                    )).into());
                 }
                 _ => {}
             }
@@ -1138,8 +1138,12 @@ impl Provider {
 
     /// The request options a one-shot prompt runs with. A one-shot wants the
     /// answer text, and thinking tokens count against `max_tokens`, so each
-    /// provider that can turns thinking off.
+    /// provider that can turns thinking off, unless `opts` names an effort or
+    /// a thinking style: an explicit slot value is the operator's choice.
     fn one_shot_opts(&self, opts: BuildOpts) -> BuildOpts {
+        if opts.effort.is_some() || opts.thinking_style.is_some() {
+            return opts;
+        }
         match self {
             Self::Claude(client) => client.one_shot_opts(opts),
             Self::DeepSeek(client) => client.one_shot_opts(opts),
@@ -1700,7 +1704,7 @@ mod tests {
         #[tokio::test]
         async fn a_one_shot_reply_is_the_text_without_thinking_and_carries_its_usage() {
             let (base, _) = serve(vec![sse(openai_sse("the answer", Some("stop")))]).await;
-            let reply = openai(&base).prompt_with_system("m", 64, Some("sys"), "hi").await.unwrap();
+            let reply = openai(&base).prompt_with_system(BuildOpts::new("m", 64).with_system("sys"), "hi").await.unwrap();
             assert_eq!(reply.text, "the answer");
             assert_eq!(reply.stop_reason.as_deref(), Some("stop"));
             assert_eq!((reply.usage.input_tokens, reply.usage.output_tokens), (Some(30), Some(9)));
@@ -1714,13 +1718,13 @@ mod tests {
             );
 
             let (base, _) = serve(vec![sse(claude_sse("Hi", "\"end_turn\""))]).await;
-            let reply = claude(&base).prompt_with_system("claude-haiku-4-5", 64, None, "hi").await.unwrap();
+            let reply = claude(&base).prompt_with_system(BuildOpts::new("claude-haiku-4-5", 64), "hi").await.unwrap();
             assert_eq!(reply.text, "Hi");
             assert_eq!(reply.stop_reason.as_deref(), Some("end_turn"));
             assert_eq!((reply.usage.input_tokens, reply.usage.output_tokens), (Some(12), Some(7)));
             assert!(matches!(&reply.usage.extra, Some(UsageExtra::Claude(c)) if c.cache_read_input_tokens == 100), "{:?}", reply.usage);
 
-            let reply = Provider::Mock(MockClient::new("CANNED")).prompt_with_system("m", 64, None, "hi").await.unwrap();
+            let reply = Provider::Mock(MockClient::new("CANNED")).prompt_with_system(BuildOpts::new("m", 64), "hi").await.unwrap();
             assert_eq!(reply.text, "CANNED");
         }
 
@@ -1733,7 +1737,7 @@ mod tests {
         #[tokio::test]
         async fn a_one_shot_that_did_not_finish_is_an_error_carrying_its_usage() {
             let (base, _) = serve(vec![sse(openai_sse("par", Some("length")))]).await;
-            let reply = openai(&base).prompt_with_system("m", 64, None, "hi").await.unwrap();
+            let reply = openai(&base).prompt_with_system(BuildOpts::new("m", 64), "hi").await.unwrap();
             assert_eq!((reply.text.as_str(), reply.stop_reason.as_deref()), ("par", Some("length")));
 
             for (finish, label) in [
@@ -1742,7 +1746,7 @@ mod tests {
                 (None, "no_finish_reason"),
             ] {
                 let (base, _) = serve(vec![sse(openai_sse("par", finish))]).await;
-                let failed = openai(&base).prompt_with_system("m", 64, None, "hi").await.expect_err(label);
+                let failed = openai(&base).prompt_with_system(BuildOpts::new("m", 64), "hi").await.expect_err(label);
                 assert!(failed.to_string().contains(label), "{label}: {failed}");
                 let usage = failed.usage.unwrap_or_else(|| panic!("{label}: the error carries the usage"));
                 assert_eq!((usage.input_tokens, usage.output_tokens), (Some(30), Some(9)), "{label}");
@@ -1750,14 +1754,84 @@ mod tests {
 
             for stop in ["\"pause_turn\"", "\"model_context_window_exceeded\"", "null"] {
                 let (base, _) = serve(vec![sse(claude_sse("par", stop))]).await;
-                let failed = claude(&base).prompt_with_system("claude-haiku-4-5", 64, None, "hi").await.expect_err(stop);
+                let failed = claude(&base).prompt_with_system(BuildOpts::new("claude-haiku-4-5", 64), "hi").await.expect_err(stop);
                 assert!(matches!(failed.error, LlmError::CompletionError(_)), "{stop}: {failed:?}");
                 assert_eq!(failed.usage.and_then(|u| u.input_tokens), Some(12), "{stop}");
             }
 
             let (base, _) = serve(vec![reply_status(503)]).await;
-            let failed = openai(&base).prompt_with_system("m", 64, None, "hi").await.expect_err("503");
+            let failed = openai(&base).prompt_with_system(BuildOpts::new("m", 64), "hi").await.expect_err("503");
             assert!(failed.usage.is_none(), "a refused request spent nothing");
+        }
+
+        /// A Messages `message_start` that reports 12 input tokens.
+        const CLAUDE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n";
+
+        /// A failure after the provider reported counts carries them, however
+        /// the stream failed: an error event, a block that breaks the wire
+        /// contract, data that does not decode, or a tool call with no name.
+        ///
+        /// Falsified by an error that drops usage the stream already held.
+        #[tokio::test]
+        async fn a_one_shot_that_fails_after_usage_carries_that_usage() {
+            let claude_failures = [
+                ("error event", format!("{CLAUDE_START}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}}\n\n")),
+                ("protocol", format!("{CLAUDE_START}event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":3,\"delta\":{{\"type\":\"text_delta\",\"text\":\"x\"}}}}\n\n")),
+                ("decode", format!("{CLAUDE_START}event: content_block_start\ndata: {{not json\n\n")),
+            ];
+            for (label, body) in claude_failures {
+                let (base, _) = serve(vec![sse(body)]).await;
+                let failed = claude(&base).prompt_with_system(opts("claude-haiku-4-5"), "hi").await.expect_err(label);
+                assert_eq!(failed.usage.and_then(|u| u.input_tokens), Some(12), "claude {label}: {}", failed.error);
+            }
+
+            let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":9,\"total_tokens\":39}}\n\n";
+            let openai_failures = [
+                ("decode", format!("{usage}data: {{not json\n\n")),
+                ("nameless call", format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c\",\"function\":{{\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n{usage}data: [DONE]\n\n"
+                )),
+            ];
+            for (label, body) in openai_failures {
+                let (base, _) = serve(vec![sse(body)]).await;
+                let failed = openai(&base).prompt_with_system(opts("m"), "hi").await.expect_err(label);
+                assert_eq!(failed.usage.and_then(|u| u.input_tokens), Some(30), "openai {label}: {}", failed.error);
+            }
+        }
+
+        /// A stream that ends with no `Done` is an error, not an empty reply.
+        #[tokio::test]
+        async fn a_one_shot_stream_that_ends_without_done_is_an_error() {
+            let mock = MockClient::new("x").with_scripted_stream(vec![vec![
+                StreamEvent::TextStart, StreamEvent::TextDelta("half".into()), StreamEvent::TextEnd,
+            ]]);
+            let failed = Provider::Mock(mock).prompt_with_system(opts("m"), "hi").await.expect_err("no Done");
+            assert!(matches!(&failed.error, LlmError::CompletionError(m) if m.contains("before the provider said it was done")), "{failed}");
+        }
+
+        /// A one-shot offers no tools, so a call that waits for the kernel's
+        /// answer ends the reply as an error at once, instead of holding the
+        /// request until its timeout.
+        ///
+        /// Falsified by a one-shot that keeps waiting after an inline call.
+        #[tokio::test]
+        async fn an_inline_tool_call_ends_a_one_shot_as_an_error() {
+            let mock = MockClient::new("x")
+                .with_scripted_stream(vec![vec![StreamEvent::InlineToolUse {
+                    id: "i".into(), name: "shell".into(), input: serde_json::json!({}),
+                }]])
+                .hangs_when_exhausted();
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                Provider::Mock(mock).prompt_with_system(opts("m"), "hi"),
+            ).await.expect("an inline call ends the one-shot");
+            let failed = reply.expect_err("an inline call fails the one-shot");
+            assert!(failed.to_string().contains("shell"), "{failed}");
+        }
+
+        fn opts(model: &str) -> BuildOpts {
+            BuildOpts::new(model, 64)
         }
 
         fn reply_status(status: u16) -> kaijutsu_mk::test_server::Reply {
@@ -1777,8 +1851,8 @@ mod tests {
             let done = || sse(openai_sse("ok", Some("stop")));
             let (base, seen) = serve(vec![done(), done()]).await;
             Provider::DeepSeek(deepseek::Client::new("k").with_base_url(&base))
-                .prompt_with_system("m", 64, None, "hi").await.unwrap();
-            openai(&base).prompt_with_system("m", 64, None, "hi").await.unwrap();
+                .prompt_with_system(BuildOpts::new("m", 64), "hi").await.unwrap();
+            openai(&base).prompt_with_system(BuildOpts::new("m", 64), "hi").await.unwrap();
             let bodies: Vec<serde_json::Value> =
                 seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
             assert_eq!(bodies[0]["thinking"]["type"], "disabled", "{}", bodies[0]);
@@ -1786,17 +1860,22 @@ mod tests {
             assert!(bodies[1].get("thinking").is_none(), "{}", bodies[1]);
 
             let ended = || sse(claude_sse("ok", "\"end_turn\""));
-            let (base, seen) = serve(vec![ended(), ended(), ended()]).await;
-            claude(&base).prompt_with_system("claude-opus-4-8", 777, None, "hi").await.unwrap();
+            let (base, seen) = serve(vec![ended(), ended(), ended(), ended()]).await;
+            claude(&base).prompt_with_system(BuildOpts::new("claude-opus-4-8", 777), "hi").await.unwrap();
             Provider::Claude(claude::Client::deepseek("k").unwrap().with_base_url(&base))
-                .prompt_with_system("deepseek-flash", 64, None, "hi").await.unwrap();
-            claude(&base).prompt_with_system("claude-sonnet-5-5", 64, None, "hi").await.unwrap();
+                .prompt_with_system(BuildOpts::new("deepseek-flash", 64), "hi").await.unwrap();
+            for model in ["claude-sonnet-5-5", "claude-opus-5-5"] {
+                claude(&base).prompt_with_system(BuildOpts::new(model, 64), "hi").await
+                    .unwrap_or_else(|e| panic!("{model}: an always-on model's one-shot is sent: {e}"));
+            }
             let bodies: Vec<serde_json::Value> =
                 seen.lock().unwrap().iter().map(|c| serde_json::from_str(&c.body).unwrap()).collect();
             assert_eq!(bodies[0]["thinking"], serde_json::json!({"type": "disabled"}), "{}", bodies[0]);
             assert_eq!(bodies[0]["max_tokens"], 777);
             assert_eq!(bodies[1]["thinking"], serde_json::json!({"type": "disabled"}), "{}", bodies[1]);
-            assert_ne!(bodies[2]["thinking"]["type"], "disabled", "an always-on model keeps its default: {}", bodies[2]);
+            for body in &bodies[2..] {
+                assert_ne!(body["thinking"]["type"], "disabled", "an always-on model keeps its default: {body}");
+            }
         }
     }
 

@@ -27,6 +27,9 @@
 //! sends between them rides on the error, because the failed call still
 //! spent its tokens. After an `Error` the machine emits nothing more.
 //!
+//! The source closing before `[DONE]` ends the reply as `[DONE]` does
+//! (`super::Stream` steps a `Done` there): a seen `finish_reason` ends it.
+//!
 //! Tool-call arguments stream as JSON-string fragments keyed by
 //! `tool_calls[].index`; they accumulate and parse at flush time
 //! (`finish_reason`), emitting one atomic [`StreamEvent::ToolUse`] each —
@@ -149,8 +152,24 @@ impl StateMachine {
             out.truncate(position + 1);
             self.failed = true;
             self.ended = true;
+            // A failed call still spent what the provider had reported.
+            if let Some(StreamEvent::Error(error)) = out.last_mut()
+                && error.usage.is_none()
+                && let Some(spent) = self.spent()
+            {
+                error.usage = Some(spent);
+            }
         }
         out
+    }
+
+    /// What the call has spent so far, as the provider reported it; `None`
+    /// before any count arrived.
+    pub(crate) fn spent(&self) -> Option<SpentUsage> {
+        match self.usage_counts() {
+            (None, None, None) => None,
+            (input_tokens, output_tokens, extra) => Some(SpentUsage { input_tokens, output_tokens, extra }),
+        }
     }
 
     fn dispatch(&mut self, event: OpenAiSseEvent) -> Vec<StreamEvent> {
@@ -167,7 +186,7 @@ impl StateMachine {
                 }
                 out
             }
-            OpenAiSseEvent::Error(error) => vec![StreamEvent::Error(self.with_spent(error))],
+            OpenAiSseEvent::Error(error) => vec![StreamEvent::Error(error)],
             OpenAiSseEvent::Done => {
                 if let Some(error) = self.take_failure() {
                     return vec![error];
@@ -189,6 +208,10 @@ impl StateMachine {
                     return out;
                 }
                 self.flush_tool_calls(&mut out);
+                if let Some(error) = self.take_failure() {
+                    out.push(error);
+                    return out;
+                }
                 let (input_tokens, output_tokens, extra) = self.usage_counts();
                 out.push(StreamEvent::Done {
                     stop_reason: self.stop_reason.clone(),
@@ -202,9 +225,8 @@ impl StateMachine {
     }
 
     /// The failure a `finish_reason` ended the reply with, carrying the usage
-    /// reported so far. Taken at `[DONE]`, or when the source closes without
-    /// one.
-    pub(crate) fn take_failure(&mut self) -> Option<StreamEvent> {
+    /// reported so far. Taken at `[DONE]`.
+    fn take_failure(&mut self) -> Option<StreamEvent> {
         if self.ended {
             return None;
         }
@@ -325,20 +347,25 @@ impl StateMachine {
     }
 
     /// Drain accumulated tool calls into atomic [`StreamEvent::ToolUse`]
-    /// events (index order). A missing name surfaces a loud
-    /// [`StreamEvent::Error`] rather than a bogus call; arguments that do not
+    /// events (index order). A missing name fails the reply with a loud
+    /// [`StreamEvent::Error`] at `[DONE]` rather than a bogus call; arguments that do not
     /// parse surface as [`StreamEvent::ToolUseInvalid`], which the runtime
     /// answers with an error tool result.
     fn flush_tool_calls(&mut self, out: &mut Vec<StreamEvent>) {
         let drained = std::mem::take(&mut self.tool_calls);
+        // A nameless call fails the whole reply, and none of its calls run.
+        // Like a failing `finish_reason`, the error waits for `[DONE]` so the
+        // usage reported after it rides along.
+        if let Some((index, _)) = drained.iter().find(|(_, accum)| accum.name.is_none()) {
+            self.failed = true;
+            self.failure.get_or_insert(StreamError::new(
+                StreamErrorKind::Protocol,
+                format!("tool call at index {index} arrived without a function name"),
+            ));
+            return;
+        }
         for (index, accum) in drained {
-            let Some(name) = accum.name else {
-                out.push(StreamEvent::Error(StreamError::new(
-                    StreamErrorKind::Protocol,
-                    format!("tool call at index {index} arrived without a function name"),
-                )));
-                continue;
-            };
+            let name = accum.name.expect("a nameless call failed the reply above");
             // DeepSeek always sends an id; fall back to an index-derived
             // correlation key for OpenAI-compatible servers that omit it
             // (or send it empty — `accumulate_tool_call` drops those).

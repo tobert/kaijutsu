@@ -39,7 +39,8 @@
 //! usage the call reported, which was still spent.
 //!
 //! After an `Error` the machine emits nothing more: no `Done` follows a
-//! failure.
+//! failure. Every `Error` carries the usage the provider reported before it,
+//! because the failed call still spent it.
 //!
 //! The Messages API returns a redacted thinking block as opaque `data` that
 //! must go back unchanged. `StreamEvent::ThinkingEnd` has one string for it,
@@ -179,8 +180,36 @@ impl StateMachine {
         if let Some(position) = out.iter().position(|e| matches!(e, StreamEvent::Error(_))) {
             out.truncate(position + 1);
             self.failed = true;
+            // A failed call still spent what the provider had reported.
+            if let Some(StreamEvent::Error(error)) = out.last_mut()
+                && error.usage.is_none()
+                && let Some(spent) = self.spent()
+            {
+                error.usage = Some(spent);
+            }
         }
         out
+    }
+
+    /// What the call has spent so far, as the provider reported it; `None`
+    /// before any count arrived.
+    pub(crate) fn spent(&self) -> Option<crate::llm::SpentUsage> {
+        (self.input_tokens.is_some() || self.output_tokens.is_some()).then(|| crate::llm::SpentUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            extra: self.usage_extra(),
+        })
+    }
+
+    /// The cache counts, when the provider reported any.
+    fn usage_extra(&self) -> Option<crate::llm::stream::UsageExtra> {
+        (self.cache_read_input_tokens > 0 || self.cache_creation_input_tokens > 0).then(|| {
+            crate::llm::stream::UsageExtra::Claude(crate::llm::stream::ClaudeUsageExtra {
+                cache_read_input_tokens: self.cache_read_input_tokens,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
+            })
+        })
     }
 
     fn dispatch(&mut self, event: ClaudeSseEvent) -> Vec<StreamEvent> {
@@ -236,37 +265,16 @@ impl StateMachine {
                 open.sort_unstable();
                 let mut out: Vec<StreamEvent> =
                     open.into_iter().flat_map(|index| self.on_block_stop(index)).collect();
-                let extra = (self.cache_read_input_tokens > 0
-                    || self.cache_creation_input_tokens > 0)
-                    .then_some({
-                        crate::llm::stream::UsageExtra::Claude(
-                            crate::llm::stream::ClaudeUsageExtra {
-                                cache_read_input_tokens: self.cache_read_input_tokens,
-                                cache_creation_input_tokens: self.cache_creation_input_tokens,
-                                cache_creation_1h_input_tokens: self.cache_creation_1h_input_tokens,
-                            },
-                        )
-                    });
                 match check_stop_reason(self.stop_reason.as_deref()) {
                     Ok(()) => out.push(StreamEvent::Done {
                         stop_reason: self.stop_reason.clone(),
                         input_tokens: self.input_tokens,
                         output_tokens: self.output_tokens,
-                        extra,
+                        extra: self.usage_extra(),
                     }),
-                    // The reply did not complete, but the call still spent
-                    // what the provider reported.
-                    Err(error) => out.push(StreamEvent::Error(
-                        if self.input_tokens.is_some() || self.output_tokens.is_some() {
-                            error.with_usage(crate::llm::SpentUsage {
-                                input_tokens: self.input_tokens,
-                                output_tokens: self.output_tokens,
-                                extra,
-                            })
-                        } else {
-                            error
-                        },
-                    )),
+                    // The reply did not complete; `step` puts what the call
+                    // spent on the error.
+                    Err(error) => out.push(StreamEvent::Error(error)),
                 }
                 out
             }

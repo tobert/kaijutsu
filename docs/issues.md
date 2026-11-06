@@ -8,10 +8,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## OpenAI-compatible client: what the audit leaves open (2026-11-06)
 
-- A stream that closes after `finish_reason` but before `[DONE]` fails the turn ("stream ended before Done"),
-  though its `ToolUse` events were emitted and their blocks written; hydration later answers them with error
-  results. eventsource-stream 0.2.3 also drops a final `data: [DONE]` that lacks its trailing blank line. Amy
-  (2026-11-06): a seen `finish_reason` ends the reply; next.
+- A Claude slot with `thinking_style budget` on Opus 5.5 (which refuses `budget_tokens` at every effort) is sent and
+  refused by the server with a 400; `resolve_thinking` checks a budget only for being missing or inverted. Refuse
+  it locally as `off` is refused on an always-on model.
+
 - An unknown `finish_reason` completes the reply (keeps TGI's `eos_token` working); Claude treats an unknown stop
   reason as a truncation.
 - A server that sends no tool-call id gets `call_{index}`, which repeats across turns. Validation is per message;

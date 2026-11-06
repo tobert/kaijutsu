@@ -478,9 +478,8 @@ values. Remove an override with `kj context unset . --env KJ_DRIFT_WORD_TARGET`.
 | `KJ_DISTILL_INPUT_BYTES` | 131072 | Maximum bytes in the complete summary user prompt, including framing, references, length guidance, and directed focus |
 
 All values must be positive integers. Invalid values fail before a provider
-call. Word guidance is advisory. The Claude, DeepSeek, and OpenAI-compatible
-one-shot adapters request a 4096-token output cap separately from these values;
-the CodexApp one-shot path does not apply that cap.
+call. Word guidance is advisory. The output cap is the `distill` slot's
+`max_tokens`, separate from these values.
 
 The summary transcript uses the conversation hydration admission rule. Excluded,
 draft, ephemeral, file, trace, and ordinary system instruction blocks are absent.

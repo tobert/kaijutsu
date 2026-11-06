@@ -289,8 +289,7 @@ server does not serve is an invalid request naming the ones it serves.
   as `LlmError::ContextFull`, the same as a render with no room. The kernel
   sends a shorter conversation after `kj stage exclude` and a fork.
 - `max_tokens` is capped at the server's `context_tokens`; the server checks
-  the room. `reasoning_effort` does not apply, and `prompt()` stays on
-  `/mk/v1/generate`.
+  the room. `reasoning_effort` does not apply.
 
 ### Window and admission
 
