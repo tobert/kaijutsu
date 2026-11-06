@@ -10,16 +10,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 - A stream that closes after `finish_reason` but before `[DONE]` fails the turn ("stream ended before Done"),
   though its `ToolUse` events were emitted and their blocks written; hydration later answers them with error
-  results. eventsource-stream 0.2.3 also drops a final `data: [DONE]` that lacks its trailing blank line. Decide
-  whether a seen `finish_reason` ends the reply.
+  results. eventsource-stream 0.2.3 also drops a final `data: [DONE]` that lacks its trailing blank line. Amy
+  (2026-11-06): a seen `finish_reason` ends the reply; next.
 - An unknown `finish_reason` completes the reply (keeps TGI's `eos_token` working); Claude treats an unknown stop
   reason as a truncation.
 - A server that sends no tool-call id gets `call_{index}`, which repeats across turns. Validation is per message;
   a context moved to Anthropic, which may refuse duplicate `tool_use` ids in one request, could get a 400.
 - Parallel calls on one `index` with different ids, or a chunk with no `index`, concatenate arguments
   (`ToolUseInvalid`) or fail decoding (`ToolCallChunk.index` is a required `usize`). No server fixture shows it.
-- Reasoning from another provider goes to DeepSeek and generic servers as their own `reasoning_content`;
-  hydration treats the signature as opaque.
 
 ## Server-side tools have no representation (2026-11-06)
 

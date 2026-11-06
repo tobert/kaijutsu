@@ -67,6 +67,9 @@ kj fork --drop mcp:shots
 the image's CAS hash, so the model can attach it again. `thinking` drops
 thinking blocks, except those after the last person's text: that turn may be
 an open tool loop, and its next request must send its signed thinking back.
+Thinking crosses providers on purpose: a context that moves to another model
+sends the earlier model's thinking as its own reasoning, and `--drop thinking`
+(here or on `kj context rotate --migrate`) is how a context leaves it behind.
 `tool_results` drops the bulk of every tool result, and `mcp:<server>` drops it
 only from that server's results. The server's tools are the names the
 context's binding resolved for it; a server the context never named fails the
