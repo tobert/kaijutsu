@@ -111,6 +111,9 @@ struct Mock {
     hold: Arc<Mutex<Option<Hold>>>,
     /// The identity's `contexts_per_decision`.
     context_limit: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the served model declares `thinking`. Without it, the mock
+    /// refuses a build or decision with `thinking: true`, as gogi does.
+    thinks: Arc<std::sync::atomic::AtomicBool>,
     /// Every seat build's body and the head it was given, and every
     /// decision's body, in arrival order.
     built: Arc<Mutex<Vec<(serde_json::Value, String)>>>,
@@ -142,6 +145,12 @@ impl Mock {
     /// caches the identity, so set it before the first call.
     fn limit_contexts(&self, limit: u64) {
         self.context_limit.store(limit, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Declare `thinking` on the served model. The kernel caches the
+    /// identity, so set it before the first call.
+    fn declare_thinking(&self) {
+        self.thinks.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The bodies of the seat builds, `POST /council/v2/contexts`, in order.
@@ -218,6 +227,22 @@ fn server_identity(context_limit: u64, capabilities: serde_json::Value) -> Strin
         .to_string()
 }
 
+/// The param a council server names when a build or decision on a model
+/// without `thinking` sends `thinking: true`: `thinking` for a build,
+/// `contexts[i].thinking` for a decision.
+fn refused_thinking(path: &str, body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    match path {
+        "/council/v2/contexts" => (body["context"]["thinking"] == true).then(|| "thinking".to_string()),
+        "/council/v2/decisions" => body["contexts"]
+            .as_array()?
+            .iter()
+            .position(|c| c["thinking"] == true)
+            .map(|i| format!("contexts[{i}].thinking")),
+        _ => None,
+    }
+}
+
 async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(String, String, String)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -260,23 +285,38 @@ async fn serve() -> Mock {
     let build_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
     let hold: Arc<Mutex<Option<Hold>>> = Arc::default();
     let context_limit = Arc::new(std::sync::atomic::AtomicU64::new(8));
+    let thinks = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let built: Arc<Mutex<Vec<(serde_json::Value, String)>>> = Arc::default();
     let decision_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     let (log, how, seen, delays) = (decisions.clone(), behavior.clone(), calls.clone(), build_delays.clone());
     let (holding, limit, builds, bodies) = (hold.clone(), context_limit.clone(), built.clone(), decision_bodies.clone());
+    let thinking = thinks.clone();
     tokio::spawn(async move {
         let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let (log, how, count, seen, delays) = (log.clone(), how.clone(), count.clone(), seen.clone(), delays.clone());
             let (holding, limit, builds, bodies) = (holding.clone(), limit.clone(), builds.clone(), bodies.clone());
+            let thinks = thinking.load(std::sync::atomic::Ordering::SeqCst);
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
                 seen.lock().unwrap().push((method.clone(), path.clone()));
+                let refused = if thinks { None } else { refused_thinking(&path, &body) };
                 let reply = match (method.as_str(), path.as_str()) {
+                    _ if refused.is_some() => Reply {
+                        status: 400,
+                        body: serde_json::json!({"error": {"type": "invalid_request", "param": refused,
+                                                           "message": "nothing ran: test-council does not declare thinking"}})
+                        .to_string(),
+                        delay: Duration::ZERO,
+                    },
                     ("GET", "/council/v2/identity") => {
                         let limit = limit.load(std::sync::atomic::Ordering::SeqCst);
-                        Reply { status: 200, body: server_identity(limit, serde_json::json!(["leave_one_out", "pins"])), delay: Duration::ZERO }
+                        let mut capabilities = serde_json::json!(["leave_one_out", "pins"]);
+                        if thinks {
+                            capabilities.as_array_mut().unwrap().push(serde_json::json!("thinking"));
+                        }
+                        Reply { status: 200, body: server_identity(limit, capabilities), delay: Duration::ZERO }
                     }
                     ("POST", "/council/v2/specs") => {
                         let spec: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -329,7 +369,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior, calls, build_delays, hold, context_limit, built, decision_bodies }
+    Mock { base, decisions, behavior, calls, build_delays, hold, context_limit, thinks, built, decision_bodies }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -988,6 +1028,29 @@ async fn a_council_allow_runs_the_submission_with_a_row_naming_the_council() {
         assert_eq!(state["character"], "council-seat-performer");
         rig.finish().await;
     }
+}
+
+/// On a served model that declares `thinking`, every seat a decision
+/// sends has `thinking: true`, and the server accepts it. The mock
+/// refuses `thinking: true` on a model without the capability, so every
+/// other test here checks the `false` side.
+///
+/// Falsified by seats that send `false` to a model that declares
+/// `thinking`.
+#[tokio::test]
+async fn on_a_thinking_model_each_seat_of_a_decision_thinks() {
+    let rig = rig(Via::Tool, Setup::default()).await;
+    rig.mock.declare_thinking();
+    rig.mock.answers(&ALLOW);
+    rig.submit("echo council-thinks").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
+    assert_eq!(rig.only_ask().status, ApprovalStatus::Allowed);
+    let sent = rig.mock.decision_bodies();
+    assert_eq!(sent.len(), 1);
+    let contexts = sent[0]["contexts"].as_array().unwrap();
+    assert_eq!(contexts.len(), 2);
+    assert!(contexts.iter().all(|c| c["thinking"] == true), "{}", sent[0]);
+    assert!(rig.mock.built().iter().all(|b| b["context"]["thinking"] == true));
+    rig.finish().await;
 }
 
 /// A council ask leaves a pending ask carrying the council's signal and a
