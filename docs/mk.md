@@ -255,7 +255,8 @@ model as a served model with `generate`, every streamed turn is one
 `POST /council/v2/generations` (gogi's `docs/council-api.md`,
 "Generations") instead of render and `/mk/v1/generate`. The turn's model
 names the served model by its `model` or an alias, and the generation sends
-its `model`. The client asks for the identity once. A 404, or a served
+its `model`. The client caches the identity (see "The identity is read
+again" below). A 404, or a served
 model without `generate`, keeps the `/mk/v1` path above. A model the
 server does not serve is an invalid request naming the ones it serves.
 
@@ -271,6 +272,13 @@ server does not serve is an invalid request naming the ones it serves.
   `thinking` capability and the turn's effort is not `none`, and `false`
   otherwise. An effort other than `none` on a model without `thinking` is
   an invalid request, not a dropped setting (`llm/mk/v2.rs`, `v2_thinking`).
+- **The identity is read again.** A turn reads the identity when none is
+  cached, when the cached one is older than ten minutes
+  (`V2_IDENTITY_MAX_AGE`), and after a generation refused with a 400 whose
+  `param` names `thinking`. The 400 covers a model that lost `thinking`:
+  the refused turn fails, and the next one sends `false`. The age covers a
+  model that gained it, which no error reports, since `false` is always
+  allowed.
 - **Nothing is held by the client.** There is no context id, no `PUT`, and
   no fork request. A fork, an exclude, or an edit sends the messages as they
   now stand, and the server reuses the prefix they share with what it holds.

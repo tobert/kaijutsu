@@ -59,10 +59,21 @@ pub struct Client {
     /// render through the reply. `None` only for a client built directly
     /// rather than by `Provider::from_backend`.
     endpoint: Option<Arc<Endpoint>>,
-    /// The server's council v2 identity when it lists `generate`, `None`
-    /// when it does not; read on the first streamed turn.
-    v2: Arc<tokio::sync::OnceCell<Option<ServerIdentity>>>,
+    /// The server's council v2 identity, `None` when the server has no
+    /// council v2, and when it was read. A turn reads it when none is
+    /// cached, when the cached one is older than `v2_max_age`, and after a
+    /// generation refused for its `thinking`.
+    v2: Arc<parking_lot::Mutex<V2Cell>>,
+    v2_max_age: Duration,
 }
+
+/// One read of the council v2 identity, which concurrent turns share.
+type V2Cell = Arc<tokio::sync::OnceCell<(Option<ServerIdentity>, tokio::time::Instant)>>;
+
+/// How long a council v2 identity serves turns before the next turn reads
+/// it again. A model that gains `thinking` in a redeploy thinks within
+/// this time; a model that loses it is read again after the first 400.
+const V2_IDENTITY_MAX_AGE: Duration = Duration::from_secs(600);
 
 impl Client {
     /// `name` is the backend name, reported as the provider name.
@@ -77,6 +88,7 @@ impl Client {
             max_context: Arc::default(),
             endpoint: None,
             v2: Arc::default(),
+            v2_max_age: V2_IDENTITY_MAX_AGE,
         })
     }
 
@@ -90,7 +102,19 @@ impl Client {
     /// turns take `/mk/v1` without asking.
     #[cfg(test)]
     fn v1_only(mut self) -> Self {
-        self.v2 = Arc::new(tokio::sync::OnceCell::new_with(Some(None)));
+        self.v2 = Arc::new(parking_lot::Mutex::new(Arc::new(tokio::sync::OnceCell::new_with(Some((
+            None,
+            tokio::time::Instant::now(),
+        ))))));
+        self.v2_max_age = Duration::MAX;
+        self
+    }
+
+    /// The same client, reading the council v2 identity again once the
+    /// cached one is older than `age`.
+    #[cfg(test)]
+    fn with_v2_max_age(mut self, age: Duration) -> Self {
+        self.v2_max_age = age;
         self
     }
 
@@ -772,6 +796,72 @@ mod tests {
         let (err, thinking) = sent(json!(["generate"]), Some("medium")).await;
         assert!(matches!(&err, Err(LlmError::InvalidRequest(m)) if m.contains("thinking") && m.contains("medium")), "{err:?}");
         assert_eq!(thinking, None, "nothing is sent");
+    }
+
+    /// The `thinking` sent by each v2 generation, in order.
+    fn sent_thinking(seen: &std::sync::Mutex<Vec<kaijutsu_mk::test_server::Captured>>) -> Vec<serde_json::Value> {
+        bodies(seen, "/council/v2/generations").iter().map(|g| g["context"]["thinking"].clone()).collect()
+    }
+
+    /// A generation refused with a 400 naming `thinking` drops the cached
+    /// identity, and the next turn reads it again. Here the model lost
+    /// `thinking` in a redeploy between two turns.
+    ///
+    /// Falsified by a cached identity that outlives the 400, so the next
+    /// turn sends the refused `thinking: true` without asking.
+    #[tokio::test]
+    async fn a_generation_refused_for_thinking_reads_the_identity_again() {
+        let refused = http(
+            400,
+            json!({"error": {"type": "invalid_request", "param": "thinking",
+                             "message": "nothing ran: gemma-4 does not declare thinking; send thinking: false"}})
+            .to_string(),
+        );
+        let (base, seen) = serve(vec![
+            v2_identity(json!(["generate", "thinking"])),
+            generation("a", json!([]), 2),
+            refused,
+            v2_identity(json!(["generate"])),
+            generation("b", json!([]), 3),
+        ])
+        .await;
+        let c = probing(&base);
+        let mut o = opts(64);
+        o.effort = None;
+        drain(&mut c.stream(o.clone(), vec![Message::user("u1")]).await.unwrap()).await;
+        let err = c.stream(o.clone(), vec![Message::user("u2")]).await.err().unwrap();
+        assert!(matches!(&err, LlmError::InvalidRequest(_) | LlmError::ApiError(_)), "{err:?}");
+        drain(&mut c.stream(o, vec![Message::user("u3")]).await.unwrap()).await;
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(
+            paths,
+            ["/council/v2/identity", "/council/v2/generations", "/council/v2/generations", "/council/v2/identity", "/council/v2/generations"]
+        );
+        assert_eq!(sent_thinking(&seen), [json!(true), json!(true), json!(false)]);
+    }
+
+    /// An identity older than the client's limit is read again on the next
+    /// turn, so a model that gains `thinking` in a redeploy thinks from then
+    /// on. No 400 tells a client about a gain, since `false` is always
+    /// allowed.
+    ///
+    /// Falsified by an identity read once for the client's life.
+    #[tokio::test]
+    async fn an_old_identity_is_read_again_and_a_gained_thinking_is_used() {
+        let (base, seen) = serve(vec![
+            v2_identity(json!(["generate"])),
+            generation("a", json!([]), 2),
+            v2_identity(json!(["generate", "thinking"])),
+            generation("b", json!([]), 3),
+        ])
+        .await;
+        let c = probing(&base).with_v2_max_age(Duration::ZERO);
+        let mut o = opts(64);
+        o.effort = None;
+        drain(&mut c.stream(o.clone(), vec![Message::user("u1")]).await.unwrap()).await;
+        drain(&mut c.stream(o, vec![Message::user("u2")]).await.unwrap()).await;
+        assert_eq!(sent_thinking(&seen), [json!(false), json!(true)]);
+        assert_eq!(seen.lock().unwrap().iter().filter(|c| c.path == "/council/v2/identity").count(), 2);
     }
 
     /// A conversation that ends with an assistant message has nothing to

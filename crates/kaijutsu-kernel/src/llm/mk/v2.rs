@@ -9,9 +9,12 @@
 //! messages, and a fork or an exclude reuses the prefix it keeps. The
 //! client keeps nothing between turns: the kernel's history is the context.
 
+use std::sync::Arc;
+
 use gogi_proto::generation::{GenerationRequest, Sample};
 use gogi_proto::identity::{Capability, ServedModel, ServerIdentity};
 use gogi_proto::{Context, Role as V2Role};
+use kaijutsu_mk::MkError;
 
 use super::reply::Reply;
 use super::{build, Client, Inner, Stream, Turn};
@@ -26,14 +29,22 @@ pub(super) struct ReplyIdentity {
 
 impl Client {
     /// The served model `model` names on a council v2 server, when it lists
-    /// `generate`. The identity is read once. A server without v2 answers
-    /// 404, and it and a model without `generate` keep the `/mk/v1` path. A
-    /// v2 server that serves no model by that name or alias is an error
-    /// naming the ones it serves. The server answers a model that is not
-    /// ready.
+    /// `generate`. The identity is read when none is cached, when the
+    /// cached one is older than `v2_max_age`, or after a generation refused
+    /// for its `thinking` ([`Client::forget_v2`]). A server without v2
+    /// answers 404, and it and a model without `generate` keep the `/mk/v1`
+    /// path. A v2 server that serves no model by that name or alias is an
+    /// error naming the ones it serves. The server answers a model that is
+    /// not ready.
     pub(super) async fn council_v2(&self, turn: &Turn, model: &str) -> LlmResult<Option<ServedModel>> {
-        let identity = self
-            .v2
+        let cell = {
+            let mut cached = self.v2.lock();
+            if cached.get().is_some_and(|(_, read)| read.elapsed() >= self.v2_max_age) {
+                *cached = Arc::default();
+            }
+            cached.clone()
+        };
+        let (identity, _) = cell
             .get_or_try_init(|| async {
                 let (_slot, identity) = self
                     .call(turn, false, |_| async {
@@ -45,12 +56,19 @@ impl Client {
                     })
                     .await?;
                 tracing::info!(backend = %self.name, council_v2 = identity.is_some(), "mk: turns are council v2 generations when council v2 lists the model with generate");
-                Ok::<_, LlmError>(identity)
+                Ok::<_, LlmError>((identity, tokio::time::Instant::now()))
             })
             .await?;
         let Some(identity) = identity else { return Ok(None) };
         let served = served(&self.name, identity, model)?;
         Ok(served.has(Capability::Generate).then(|| served.clone()))
+    }
+
+    /// Drops the cached council v2 identity, so the next turn reads it
+    /// again. A generation refused for its `thinking` calls this: the
+    /// served model no longer declares what the identity said.
+    pub(super) fn forget_v2(&self) {
+        *self.v2.lock() = Arc::default();
     }
 
     /// A streamed turn as a council v2 generation after the whole
@@ -94,7 +112,15 @@ impl Client {
             previews: None,
         };
         let started = std::time::Instant::now();
-        let (slot, inner) = self.call(&turn, true, |_| async { self.mk.council().generate_stream(&request, self.timeout).await }).await?;
+        let (slot, inner) = self
+            .call(&turn, true, |_| async {
+                let opened = self.mk.council().generate_stream(&request, self.timeout).await;
+                if opened.as_ref().is_err_and(MkError::refuses_thinking) {
+                    self.forget_v2();
+                }
+                opened
+            })
+            .await?;
         Ok(Stream {
             name: self.name.clone(),
             inner: Some(Inner::V2(inner)),
