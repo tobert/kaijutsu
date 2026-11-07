@@ -637,12 +637,17 @@ pub(crate) fn queue_ms(waits: &SlotWaits, server_queue_ms: Option<f64>) -> i64 {
     waits.total().as_millis() as i64 + server_queue_ms.unwrap_or(0.0).round() as i64
 }
 
-/// Forget a spec the server no longer holds, so the next prepare posts it
-/// again. The server holds no context records, so a decision's 404 names
-/// the spec.
-fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared) {
+/// Forget what a failed decision shows the kernel has wrong. The server
+/// holds no context records, so a decision's 404 names the spec, which the
+/// next prepare posts again. A 400 naming a context's `thinking` means the
+/// served model changed what it declares, so the server's identity is read
+/// again, and each seat whose `thinking` changes is built again.
+fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared, server: &str) {
     if error.status() == Some(404) {
         kernel.council_sync().invalidate_spec(&prepared.spec_id);
+    }
+    if error.refuses_thinking() {
+        kernel.council_sync().forget_thinking(kernel, server);
     }
 }
 
@@ -673,7 +678,8 @@ pub(crate) async fn prepare_within(
 /// left as the call's own timeout. The call takes a slot at the server's
 /// endpoint first, and a 429 is sent again after its cooldown
 /// (`llm::endpoint::mk_call`); slot waits are added to `waits`. A 404
-/// forgets the spec ([`forget_after`]). Every failure is a miss cause.
+/// forgets the spec, and a 400 naming `thinking` the identity
+/// ([`forget_after`]). Every failure is a miss cause.
 pub(crate) async fn ask_within(
     kernel: &crate::Kernel,
     prepared: &Prepared,
@@ -699,7 +705,7 @@ pub(crate) async fn ask_within(
         Err(_) | Ok(Ok((_, Err(MkError::Timeout)))) => Err(deadline_cause(council.deadline_ms, "the decision", waits)),
         Ok(Err(no_slot)) => Err(no_slot_cause(council.deadline_ms, &no_slot)),
         Ok(Ok((_, Err(error)))) => {
-            forget_after(kernel, &error, prepared);
+            forget_after(kernel, &error, prepared, &council.server);
             Err(failure_cause(&error, council.deadline_ms))
         }
         Ok(Ok((_, Ok(response)))) => Ok(response),

@@ -653,6 +653,15 @@ impl CouncilSync {
         Ok(())
     }
 
+    /// The server at `server` refused a context's `thinking`: forget the
+    /// server's identity, so the next prepare reads it again. Each seat's
+    /// body hash holds its `thinking`, so a seat whose value changes is
+    /// built again, and one whose value stays keeps its head.
+    pub(crate) fn forget_thinking(&self, kernel: &crate::Kernel, server: &str) {
+        let Ok((_, key)) = endpoint_of(kernel, server) else { return };
+        self.state.lock().identities.remove(&key);
+    }
+
     /// A call to `server`, whose origin is `key`, failed: forget its
     /// identity and posted specs, so the next `prepare_labels` asks again,
     /// and name the failure.
@@ -1146,7 +1155,8 @@ pub(super) mod mock {
         serve_with(json!(["leave_one_out", "pins"])).await
     }
 
-    async fn serve_with(capabilities: serde_json::Value) -> Mock {
+    /// A council v2 server whose identity and model list `capabilities`.
+    pub(crate) async fn serve_with(capabilities: serde_json::Value) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2274,6 +2284,45 @@ mod tests {
         r.council.model = Some("a".into());
         let p = prepare_seat(&r, seat).await.expect("prepared on a");
         assert!(p.contexts.iter().all(|c| c.seat.thinking), "every seat on a sends thinking: true");
+    }
+
+    /// A decision the server refuses with a 400 naming a context's
+    /// `thinking` drops the server's identity. The next prepare reads the
+    /// identity again and builds each seat with the `thinking` the model
+    /// now takes. Here the model lost
+    /// `thinking` in a redeploy after the seats were built.
+    ///
+    /// Falsified by a cached identity or a held seat that outlives the 400,
+    /// so every later decision sends the refused `thinking: true`.
+    #[tokio::test]
+    async fn a_decision_refused_for_thinking_reads_the_identity_again() {
+        let r = rig_on(serve_pinning().await).await;
+        r.mock.force("GET", reply(200, super::mock::identity_listing(json!(["leave_one_out", "pins", "thinking"]))));
+        converse(&r);
+        let p = r.prepare().await.expect("prepared while the model thinks");
+        assert!(p.contexts[0].seat.thinking);
+        r.mock.on_decide(|_| {
+            reply(
+                400,
+                json!({"error": {"type": "invalid_request", "param": "contexts[0].thinking",
+                                 "message": "nothing ran: m does not declare thinking; send thinking: false"}})
+                .to_string(),
+            )
+        });
+        let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
+        let refused = super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default()).await;
+        assert!(refused.is_err());
+
+        decide_allow(&r);
+        let p = r.prepare().await.expect("prepared after the 400");
+        assert!(!p.contexts[0].seat.thinking, "the seat follows the identity read after the 400");
+        assert_eq!(r.mock.calls("GET").iter().filter(|c| *c == "/council/v2/identity").count(), 2, "the identity is read again");
+        let builds = r.mock.builds();
+        assert_eq!(builds.len(), 2, "the seat is built again");
+        assert_eq!(builds[1]["context"]["thinking"], false);
+        let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
+        super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default()).await.expect("answered");
+        assert_eq!(r.mock.bodies("/council/v2/decisions")[1]["contexts"][0]["thinking"], false);
     }
 
     /// Live, by hand: [`house_rules_edit_replaces_the_pinned_seat`] against

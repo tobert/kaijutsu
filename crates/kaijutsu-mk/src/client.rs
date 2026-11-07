@@ -106,6 +106,21 @@ impl MkError {
         }
     }
 
+    /// Whether the server refused the request's `thinking`: a 400 whose
+    /// `param` is `thinking` or `contexts[N].thinking`. The served model
+    /// takes another `thinking` than the caller's identity said.
+    pub fn refuses_thinking(&self) -> bool {
+        let MkError::Status { status: 400, error: Some(error), .. } = self else { return false };
+        match error.param.as_deref() {
+            Some("thinking") => true,
+            Some(p) => p
+                .strip_prefix("contexts[")
+                .and_then(|rest| rest.strip_suffix("].thinking"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+            None => false,
+        }
+    }
+
     /// The `Retry-After` header of an error status, when it held whole
     /// seconds.
     pub fn retry_after(&self) -> Option<Duration> {
@@ -401,5 +416,37 @@ mod tests {
         }
         let counts: Vec<usize> = per_connection.lock().unwrap().iter().map(|c| c.load(Ordering::SeqCst)).collect();
         assert_eq!(counts, vec![1, 1], "each request on its own connection");
+    }
+
+    /// A 400 refuses `thinking` when its `param` names `thinking` or a
+    /// context's `thinking`, and only then.
+    ///
+    /// Falsified by a 400 naming another param, or another status, read as
+    /// a refused `thinking`.
+    #[test]
+    fn a_400_naming_thinking_refuses_thinking() {
+        let status = |status: u16, param: Option<&str>| MkError::Status {
+            status,
+            error: Some(ErrorDetail {
+                r#type: ErrorType::InvalidRequest,
+                message: "m".into(),
+                param: param.map(str::to_string),
+                prompt_tokens: None,
+                context_tokens: None,
+                model: None,
+                status: None,
+            }),
+            retry_after: None,
+            body: String::new(),
+            request_id: None,
+        };
+        for param in ["thinking", "contexts[0].thinking", "contexts[12].thinking"] {
+            assert!(status(400, Some(param)).refuses_thinking(), "{param}");
+        }
+        for param in [None, Some("contexts"), Some("contexts[].thinking"), Some("contexts[a].thinking"), Some("messages[0].thinking")] {
+            assert!(!status(400, param).refuses_thinking(), "{param:?}");
+        }
+        assert!(!status(409, Some("thinking")).refuses_thinking());
+        assert!(!MkError::Request("thinking".into()).refuses_thinking());
     }
 }
