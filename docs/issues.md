@@ -6,6 +6,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Council v2 `thinking`: what the kaibo review leaves open (2026-11-07)
+
+- `judge_one` reads the identity twice for one decision: once to prepare the labels and house rules
+  (`council/shadow.rs:282`) and once to prime the shadow (`council/shadow.rs:287`). If a failure drops the cached
+  identity between them, the contexts of one decision could carry different `thinking` values.
+- `mk`'s public `Client::one_shot_opts` (`llm/mk/mod.rs`) forces effort `none` even when the slot names an effort,
+  against the one-shot contract in `llm/mod.rs` (an explicit effort wins). Today the provider wrapper returns
+  first when an effort is named, so only a direct caller loses it. It predates the `thinking` change.
+
 ## OpenAI-compatible client: what the audit leaves open (2026-11-06)
 
 - A Claude slot with `thinking_style budget` on Opus 5.5 (which refuses `budget_tokens` at every effort) is sent and

@@ -362,8 +362,10 @@ context holds those rules and nothing the seat said or did.
 - **It votes.** It is pooled with the other reads. With `require_agree`,
   every read must top allow on its own, so the rules cannot turn another
   read's ask into an allow.
-- **Shared by content.** Every seat under one `AGENTS.md` sends the same
-  house-rules context, so they share its snapshots on the server. Its id in
+- **Shared by content and `thinking`.** Every seat under one `AGENTS.md`
+  whose served model takes the same `thinking` sends the same house-rules
+  context, so they share its snapshots on the server. A model that declares
+  `thinking` and one that does not get two bodies and two ids. Its id in
   kaijutsu's records is a UUIDv5 over the sha256 of the projected body, in a
   namespace fixed in `council/sync.rs`, so an edited file is a new id. The
   kernel builds the context only when its body changed from the last one it
