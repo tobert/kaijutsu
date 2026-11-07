@@ -74,16 +74,18 @@ pub(crate) fn is_reviewer_context(label: &str) -> bool {
 }
 
 /// The council context for the context labeled `label`, projected from its
-/// `blocks` in document order. `Err` when a drift's source cannot be named.
-pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
-    project_framed(framed(&CONTEXT_FRAMING.replace("{label}", label)), is_reviewer_context(label), blocks, names)
+/// `blocks` in document order, with `thinking` as the context's thinking.
+/// `Err` when a drift's source cannot be named.
+pub(crate) fn project(label: &str, thinking: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
+    project_framed(framed(&CONTEXT_FRAMING.replace("{label}", label)), thinking, is_reviewer_context(label), blocks, names)
 }
 
 /// The council context for a shadow, projected from the shadow's `blocks` in
 /// document order. The system message is the framing, then the shadow's
 /// stance: its live system instruction blocks written by the `judge` type's
-/// rc. `Err` when the shadow has no stance.
-pub(crate) fn project_shadow(blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
+/// rc. `thinking` is the context's thinking. `Err` when the shadow has no
+/// stance.
+pub(crate) fn project_shadow(thinking: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
     let stance: Vec<&str> = blocks
         .iter()
         .filter(|b| b.role == Role::System && b.kind == BlockKind::Text && !b.excluded && !b.content.trim().is_empty())
@@ -94,10 +96,10 @@ pub(crate) fn project_shadow(blocks: &[BlockSnapshot], names: &dyn Names) -> Res
                     (`kaijutsu-server rc reseed` installs /config/rc/judge)"
             .to_string());
     }
-    project_framed(framed(&stance.join("\n\n")), false, blocks, names)
+    project_framed(framed(&stance.join("\n\n")), thinking, false, blocks, names)
 }
 
-fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
+fn project_framed(system: String, thinks: bool, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<Context, String> {
     let mut turns: Vec<Message> = vec![Message::system(system)];
     // Finished thinking waiting for the model reply it belongs to.
     let mut thinking: Vec<&str> = Vec::new();
@@ -131,7 +133,7 @@ fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: 
     if !thinking.is_empty() {
         push(&mut turns, WireRole::Assistant, String::new(), Some(thinking.join("\n\n")));
     }
-    Ok(Context { messages: turns, ..Context::default() })
+    Ok(Context::new(thinks, turns))
 }
 
 /// The bytes a house-rules budget allows per token: an estimate, since the
@@ -159,8 +161,8 @@ pub(crate) struct HouseRules {
 /// The context is one user message that keeps a snapshot boundary: the
 /// file's path and its text, cut to its first `budget_tokens` worth of bytes.
 /// Nothing the seat said or did reaches it, so it changes only when the file
-/// does.
-pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64) -> Option<Context> {
+/// does or `thinking` does.
+pub(crate) fn project_house_rules(house: Option<&HouseRules>, thinking: bool, budget_tokens: u64) -> Option<Context> {
     let house = house?;
     let budget = usize::try_from(budget_tokens.saturating_mul(HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
     let text = match house.text.len() > budget {
@@ -168,7 +170,7 @@ pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64
         false => house.text.clone(),
     };
     let content = format!("The house rules in {}:\n\n{text}", house.path);
-    Some(Context { messages: vec![Message::system(framed(HOUSE_RULES_FRAMING)), Message::user(content).snapped()], ..Context::default() })
+    Some(Context::new(thinking, vec![Message::system(framed(HOUSE_RULES_FRAMING)), Message::user(content).snapped()]))
 }
 
 /// The longest prefix of `text` within `bytes`, on a char boundary.
@@ -422,7 +424,7 @@ mod tests {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         append_dialogue(&kernel, ctx, &refs);
         let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
-        let p = project("reviewer", &blocks, &*kernel.kernel_db().lock()).unwrap();
+        let p = project("reviewer", false, &blocks, &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(contents(&p), refs);
         assert_eq!(turns(&p)[0].role, WireRole::User);
         assert_eq!(turns(&p)[1].role, WireRole::Assistant);
@@ -446,7 +448,7 @@ mod tests {
         append(&kernel, ctx, last.as_ref(), Role::User, BlockKind::Text, Status::Done, "keep three");
         kernel.blocks().set_excluded(ctx, &ids[1], true).unwrap();
         let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
-        let p = project("reviewer", &blocks, &*kernel.kernel_db().lock()).unwrap();
+        let p = project("reviewer", false, &blocks, &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(contents(&p), ["keep one", "keep two", "keep three"]);
     }
 
@@ -513,12 +515,12 @@ mod tests {
         let texts: Vec<String> = (0..17).map(|i| format!("t{i}")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let ids = append_dialogue(&kernel, ctx, &refs[..16]);
-        let before = project("reviewer", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
+        let before = project("reviewer", false, &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
         let snapped: Vec<usize> =
             turns(&before).iter().enumerate().filter(|(_, t)| t.snap).map(|(i, _)| i).collect();
         assert_eq!(snapped, vec![7, 15]);
         append(&kernel, ctx, ids.last(), Role::User, BlockKind::Text, Status::Done, "t16");
-        let after = project("reviewer", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
+        let after = project("reviewer", false, &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(turns(&after).len(), 17);
         assert_eq!(
             turns(&before).iter().map(|t| t.snap).collect::<Vec<_>>(),
@@ -531,13 +533,13 @@ mod tests {
     async fn an_empty_context_projects_the_framing_alone() {
         let kernel = Kernel::new_ephemeral("proj-empty").await;
         let ctx = live_context(&kernel, "system-rules");
-        let p = project("system-rules", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
+        let p = project("system-rules", false, &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
         assert!(turns(&p).is_empty());
         assert!(system(&p).contains("\"system-rules\""), "{}", system(&p));
     }
 
     fn projected(kernel: &Kernel, label: &str, ctx: kaijutsu_types::ContextId) -> Context {
-        project(label, &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap()
+        project(label, false, &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap()
     }
 
     #[tokio::test]
@@ -579,9 +581,9 @@ mod tests {
     /// account or drops the boundary.
     #[test]
     fn the_house_rules_alone_make_the_context() {
-        assert!(project_house_rules(None, 2000).is_none(), "no AGENTS.md, no context");
+        assert!(project_house_rules(None, false, 2000).is_none(), "no AGENTS.md, no context");
         let rules = HouseRules { path: "/work/repo/AGENTS.md".into(), text: "Never touch prod.".into() };
-        let p = project_house_rules(Some(&rules), 2000).expect("house rules make a context");
+        let p = project_house_rules(Some(&rules), false, 2000).expect("house rules make a context");
         assert_eq!(contents(&p), ["The house rules in /work/repo/AGENTS.md:\n\nNever touch prod."]);
         assert_eq!(turns(&p).iter().map(|t| (t.role, t.snap)).collect::<Vec<_>>(), [(WireRole::User, true)]);
         assert!(system(&p).starts_with(FRAMING.trim()), "{}", system(&p));
@@ -593,10 +595,10 @@ mod tests {
     #[test]
     fn rules_larger_than_the_budget_keep_their_start() {
         let long = HouseRules { path: "/AGENTS.md".into(), text: format!("START{}", "r".repeat(200)) };
-        let p = project_house_rules(Some(&long), 16).unwrap();
+        let p = project_house_rules(Some(&long), false, 16).unwrap();
         assert_eq!(turns(&p)[0].content.as_ref().and_then(|c| c.as_text()).unwrap(), format!("The house rules in /AGENTS.md:\n\n{}...", &long.text[..64]));
         let multi = HouseRules { path: "/AGENTS.md".into(), text: "é".repeat(100) };
-        let p = project_house_rules(Some(&multi), 16).unwrap();
+        let p = project_house_rules(Some(&multi), false, 16).unwrap();
         assert!(turns(&p)[0].content.as_ref().and_then(|c| c.as_text()).unwrap().ends_with("é..."), "a cut stays on a character boundary");
     }
 

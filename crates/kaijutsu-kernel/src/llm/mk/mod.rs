@@ -730,6 +730,50 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 2, "the identity and one generation");
     }
 
+    /// A v2 turn sends `thinking: true` only to a model that declares
+    /// `thinking` and when the turn wants thinking: with no effort, or an
+    /// effort other than `none`. A model without `thinking` gets `false`
+    /// when the turn names no effort. A turn that asks such a model for an
+    /// effort is refused before any generation.
+    ///
+    /// Falsified by a turn that sends `true` to a model without `thinking`,
+    /// sends `false` to one with it when no effort is named, or drops an
+    /// asked effort without a word.
+    #[tokio::test]
+    async fn a_v2_turn_thinks_only_on_a_model_that_declares_thinking() {
+        let sent = |capabilities: serde_json::Value, effort: Option<&str>| {
+            let effort = effort.map(str::to_string);
+            async move {
+                let (base, seen) = serve(vec![v2_identity(capabilities), generation("hi", json!([]), 2)]).await;
+                let mut o = opts(64);
+                o.effort = effort;
+                let opened = match probing(&base).stream(o, vec![Message::user("u1")]).await {
+                    Ok(mut s) => {
+                        drain(&mut s).await;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+                (opened, bodies(&seen, "/council/v2/generations").first().map(|g| g["context"]["thinking"].clone()))
+            }
+        };
+        let (ok, thinking) = sent(json!(["generate", "thinking"]), None).await;
+        assert!(ok.is_ok(), "{ok:?}");
+        assert_eq!(thinking, Some(json!(true)), "a thinking model thinks when the turn names no effort");
+        let (_, thinking) = sent(json!(["generate", "thinking"]), Some("low")).await;
+        assert_eq!(thinking, Some(json!(true)));
+        let (_, thinking) = sent(json!(["generate", "thinking"]), Some("none")).await;
+        assert_eq!(thinking, Some(json!(false)), "effort none turns thinking off");
+        let (ok, thinking) = sent(json!(["generate"]), None).await;
+        assert!(ok.is_ok(), "{ok:?}");
+        assert_eq!(thinking, Some(json!(false)), "a model without thinking gets false");
+        let (_, thinking) = sent(json!(["generate"]), Some("none")).await;
+        assert_eq!(thinking, Some(json!(false)));
+        let (err, thinking) = sent(json!(["generate"]), Some("medium")).await;
+        assert!(matches!(&err, Err(LlmError::InvalidRequest(m)) if m.contains("thinking") && m.contains("medium")), "{err:?}");
+        assert_eq!(thinking, None, "nothing is sent");
+    }
+
     /// A conversation that ends with an assistant message has nothing to
     /// reply to and is refused before any generation.
     #[tokio::test]

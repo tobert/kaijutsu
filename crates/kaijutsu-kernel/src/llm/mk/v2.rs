@@ -62,7 +62,7 @@ impl Client {
         identity: ServedModel,
         turn: Turn,
     ) -> LlmResult<Stream> {
-        let (thinking, _) = build::effort(opts.effort.as_deref())?;
+        let thinking = v2_thinking(&self.name, opts.effort.as_deref(), &identity)?;
         let messages = build::messages_v2(opts.system.as_deref(), &history)?;
         let tools = build::tools_v2(&opts.tools)
             .map_err(|e| LlmError::InvalidRequest(format!("mk backend '{}': {e}", self.name)))?;
@@ -98,7 +98,7 @@ impl Client {
         Ok(Stream {
             name: self.name.clone(),
             inner: Some(Inner::V2(inner)),
-            reply: Some(Reply::new(thinking.unwrap_or(true), has_tools)),
+            reply: Some(Reply::new(thinking, has_tools)),
             pending: Default::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             finished: false,
@@ -107,6 +107,23 @@ impl Client {
             slot,
             v2: Some(ReplyIdentity { model: identity.model, weight_hash: identity.weight_hash }),
         })
+    }
+}
+
+/// Whether a v2 turn on served model `model` thinks. The turn wants
+/// thinking unless its effort is `none`. A model that declares `thinking`
+/// thinks when the turn wants it, and any other model gets `false`. An
+/// effort asked of a model without `thinking` is refused, not dropped.
+fn v2_thinking(name: &str, effort: Option<&str>, model: &ServedModel) -> LlmResult<bool> {
+    let (wants, _) = build::effort(effort)?;
+    match (wants, model.has(Capability::Thinking)) {
+        (Some(true), false) => Err(LlmError::InvalidRequest(format!(
+            "mk backend '{name}': served model {} does not declare thinking, so it takes no effort {:?}; \
+             set effort none or leave it unset",
+            model.model,
+            effort.unwrap_or_default()
+        ))),
+        (wants, declared) => Ok(declared && wants != Some(false)),
     }
 }
 

@@ -169,6 +169,14 @@ fn endpoint_of(kernel: &crate::Kernel, server: &str) -> Result<(Arc<Endpoint>, S
     Ok((kernel.endpoints().for_url(server).map_err(missed)?, key))
 }
 
+/// Whether a council context on served model `model` thinks: when the
+/// model declares `thinking`. A context sent without `thinking` meant true
+/// before the field was required, so a thinking model keeps reading its
+/// contexts as it did; any other model gets false, the only value it takes.
+pub(crate) fn council_thinks(model: &ServedModel) -> bool {
+    model.has(Capability::Thinking)
+}
+
 /// A served model's status as identity spells it.
 pub(crate) fn status_word(status: ModelStatus) -> &'static str {
     match status {
@@ -367,6 +375,7 @@ impl CouncilSync {
         let server_identity = self.identity(&link).await?;
         let identity = self.served(&link, &server_identity, council.model.as_deref())?;
         link.model = identity.model.clone();
+        let thinking = council_thinks(&identity);
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
         if let Some(text) = spec_body.questions.iter().find(|q| matches!(q.kind, QuestionKind::Text { .. }))
             && !identity.has(Capability::Describe)
@@ -388,7 +397,7 @@ impl CouncilSync {
             None => None,
             Some(context_id) => {
                 let rules = house_rules(kernel, context_id, council.house_rules_tokens).await;
-                match (project_house_rules(rules.as_ref(), council.house_rules_tokens), rules) {
+                match (project_house_rules(rules.as_ref(), thinking, council.house_rules_tokens), rules) {
                     (Some(body), Some(rules)) => {
                         let slot = Slot::HouseRules { path: rules.path, tokens: council.house_rules_tokens };
                         Some((house_rules_id(&body)?, slot, body))
@@ -420,7 +429,7 @@ impl CouncilSync {
             let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
                 PrepareMiss(format!("council context \"{label}\" cannot be read: {e}"))
             })?;
-            let body = project(label, &blocks, &*kernel.kernel_db().lock())
+            let body = project(label, thinking, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
             let slot = Slot::Label(label.clone());
             let (seat, head) = self.hold(&link, &spec_body, slot, label, context_id, body).await?;
@@ -461,14 +470,16 @@ impl CouncilSync {
         let mut link =
             Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()), model: String::new() };
         let identity = self.identity(&link).await?;
-        link.model = self.served(&link, &identity, model)?.model;
+        let served = self.served(&link, &identity, model)?;
+        let thinking = council_thinks(&served);
+        link.model = served.model;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
         self.ensure_spec(&link, &spec_body, &spec_id).await?;
         let blocks = kernel
             .blocks()
             .block_snapshots(shadow)
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be read: {e}")))?;
-        let body = project_shadow(&blocks, &*kernel.kernel_db().lock())
+        let body = project_shadow(thinking, &blocks, &*kernel.kernel_db().lock())
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
         let label = format!("shadow of {seat}");
         let held = self.hold(&link, &spec_body, Slot::Shadow(shadow), &label, shadow, body).await?;
@@ -2224,6 +2235,45 @@ mod tests {
             .expect("answered");
         gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
         assert_eq!(response.identity.model, "b");
+    }
+
+    /// A council context thinks only on a served model that declares
+    /// `thinking`: each seat and the house rules send `thinking: false` to
+    /// a model without it, and the server holds them and decides over them.
+    /// On a model that declares it, they send `true`.
+    ///
+    /// Falsified by a seat that sends `true` to a model without `thinking`,
+    /// which the fake refuses with a 400 naming `thinking`.
+    #[tokio::test]
+    async fn against_the_fake_a_council_context_thinks_only_on_a_thinking_model() {
+        let config = gogi_fake::Config {
+            models: vec![gogi_fake::FakeModel::ready("a", 0), gogi_fake::FakeModel::without_thinking("b", 1)],
+            context_tokens: 1 << 20,
+            decision_context_tokens: 1 << 20,
+            pin_bytes: 1 << 34,
+            ..gogi_fake::Config::default()
+        };
+        let fake = gogi_fake::Server::start(config).expect("the fake council starts");
+        let mut r = rig_on(serve_pinning().await).await;
+        r.council.server = fake.url();
+        r.council.deadline_ms = 120_000;
+        r.council.house_rules = true;
+        write_rules(&r, "Back up data before changing it.").await;
+        let seat = seat_in(&r, "lane-a", Some("/work/repo"));
+
+        r.council.model = Some("b".into());
+        let p = prepare_seat(&r, seat).await.expect("prepared on b");
+        assert!(p.house_rules().is_some());
+        assert!(p.contexts.iter().all(|c| !c.seat.thinking), "every seat on b sends thinking: false");
+        let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
+        let response = super::super::gate::ask_within(&r.kernel, &p, &request, &r.council, far(), &SlotWaits::default())
+            .await
+            .expect("answered on b");
+        gogi_proto::math::verify(&response, &request.expect()).expect("the numbers recompute");
+
+        r.council.model = Some("a".into());
+        let p = prepare_seat(&r, seat).await.expect("prepared on a");
+        assert!(p.contexts.iter().all(|c| c.seat.thinking), "every seat on a sends thinking: true");
     }
 
     /// Live, by hand: [`house_rules_edit_replaces_the_pinned_seat`] against

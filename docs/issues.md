@@ -750,9 +750,10 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   Open: past decisions are not replayed as call and result pairs; a seat
   never sees the spec's own `instructions` or `input_label` (shell-bump's
   instructions in the task message scored 34 of 36 labels on mkviolet's 13
-  cases, against 36 without); `thinking` is the server's default; a custom
-  spec gets no examples; and the seat's size against
-  `decision_context_tokens` is checked only by the server's `413`.
+  cases, against 36 without); a seat thinks whenever its model declares
+  `thinking`, with no per-spec choice; a custom spec gets no examples; and
+  the seat's size against `decision_context_tokens` is checked only by the
+  server's `413`.
 - **Seats built ahead are built once.** `kj council build` runs at create
   and fork. An `AGENTS.md` edited later, a reviewer assigned after create,
   or a `cd` into another workspace is built by the next decision, on its

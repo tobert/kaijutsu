@@ -231,7 +231,8 @@ mod tests {
     }
 
     fn chat() -> Context {
-        Context { messages: vec![Message::system("s"), Message::user("how did it go?").snapped()], ..Context::default() }
+        // The toy model declares thinking; true is what an absent `thinking` meant before.
+        Context::new(true, vec![Message::system("s"), Message::user("how did it go?").snapped()])
     }
 
     /// The fake's one served model.
@@ -446,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_reply_matches_the_plain_one_and_extends_the_context() {
         let (_server, c) = fake();
-        let chat = || Context { thinking: Some(false), ..chat() };
+        let chat = || Context { thinking: false, ..chat() };
         let plain = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
         let mut s = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
         let mut tokens = 0;
@@ -472,7 +473,7 @@ mod tests {
     async fn a_reply_call_carries_its_id_into_the_next_context() {
         let (_server, c) = fake();
         let tool = gogi_proto::Tool::new("ls", json!({"type": "object", "properties": {}}));
-        let context = Context { tools: vec![tool], messages: vec![Message::user("CALL ls")], ..Context::default() };
+        let context = Context { tools: vec![tool], ..Context::new(true, vec![Message::user("CALL ls")]) };
         let done = c.council().generate(&greedy(context.clone()), Duration::from_secs(5)).await.unwrap();
         let [ReplyToolCall::Parsed { id, name, .. }] = done.tool_calls.as_slice() else { panic!("{:?}", done.tool_calls) };
         assert_eq!(name, "ls");
@@ -486,9 +487,9 @@ mod tests {
     async fn an_invalid_request_is_refused_before_it_is_sent() {
         let (base, seen) = serve(vec![]).await;
         let c = client(&base);
-        let user_reasoning = Context { messages: vec![Message { reasoning: Some("r".into()), ..Message::user("u") }], ..Context::default() };
+        let user_reasoning = Context::new(true, vec![Message { reasoning: Some("r".into()), ..Message::user("u") }]);
         assert!(matches!(c.council().build_context(TOY, &user_reasoning, false).await, Err(MkError::Request(_))));
-        assert!(matches!(c.council().build_context(TOY, &Context::default(), false).await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().build_context(TOY, &Context::new(true, vec![]), false).await, Err(MkError::Request(_))));
         assert!(matches!(c.council().get_pins("a/b").await, Err(MkError::Request(_))));
         let forever = PinsPut { snapshots: vec![], ttl_s: 86_401 };
         assert!(matches!(c.council().put_pins("k", &forever).await, Err(MkError::Request(_))));
@@ -537,7 +538,7 @@ mod tests {
     async fn the_fakes_context_limit_is_context_full() {
         let server = Server::start(Config { context_tokens: 256, ..Config::default() }).unwrap();
         let c = client(&server.url());
-        let long = Context { messages: vec![Message::user("x".repeat(400))], ..Context::default() };
+        let long = Context::new(true, vec![Message::user("x".repeat(400))]);
         let err = c.council().generate(&greedy(long), Duration::from_secs(5)).await.unwrap_err();
         assert!(matches!(err, MkError::ContextFull { .. }), "{err:?}");
     }

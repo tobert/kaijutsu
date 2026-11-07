@@ -2111,7 +2111,7 @@ mod tests {
     }
 
     fn request() -> DecisionRequest {
-        let context = |text: &str| gogi_proto::Context { messages: vec![gogi_proto::Message::user(text)], ..Default::default() };
+        let context = |text: &str| gogi_proto::Context::new(false, vec![gogi_proto::Message::user(text)]);
         DecisionRequest {
             model: "test-council".into(),
             spec_id: spec_id(),
@@ -2308,10 +2308,7 @@ mod tests {
                 .map(|(i, id)| super::super::sync::PreparedContext {
                     label: format!("c{i}"),
                     context_id: *id,
-                    seat: Box::new(gogi_proto::Context {
-                        messages: vec![gogi_proto::Message::system(format!("seat {i}"))],
-                        ..Default::default()
-                    }),
+                    seat: Box::new(gogi_proto::Context::new(false, vec![gogi_proto::Message::system(format!("seat {i}"))])),
                     head: gogi_proto::SnapshotId::parse(format!("blake3:{}", i.to_string().repeat(64))).unwrap(),
                     house_rules: false,
                 })

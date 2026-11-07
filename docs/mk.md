@@ -266,6 +266,11 @@ server does not serve is an invalid request naming the ones it serves.
   results. The server keeps no record of the chat; it starts from the
   longest snapshot it holds along the messages, so a turn that extends the
   last feeds only its new messages.
+- **`thinking` follows the served model.** Every context names
+  `thinking`. A turn sends `true` when the served model declares the
+  `thinking` capability and the turn's effort is not `none`, and `false`
+  otherwise. An effort other than `none` on a model without `thinking` is
+  an invalid request, not a dropped setting (`llm/mk/v2.rs`, `v2_thinking`).
 - **Nothing is held by the client.** There is no context id, no `PUT`, and
   no fork request. A fork, an exclude, or an edit sends the messages as they
   now stand, and the server reuses the prefix they share with what it holds.

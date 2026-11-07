@@ -273,6 +273,11 @@ are no server-side context ids, and a seat is sent whole each time.
   input_schema}`, whose `answers` schema is the spec's (`council/seat.rs`).
   Each call is `{id, name, input}`. One context under two specs is two
   seats.
+- **A seat thinks when its served model declares `thinking`.** Council v2
+  requires `thinking` in every context. Each seat and the house rules send
+  `true` to a model whose identity lists the `thinking` capability, and
+  `false` to any other model (`council/sync.rs`, `council_thinks`). Before
+  the field was required, a seat sent none and the server read `true`.
 - **A decision sends its case as `case`,** with the served model's
   `model` and the spec's `spec_id`. A failed call names the server's
   `request-id` in its miss cause, so the server's log can be searched for

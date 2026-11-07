@@ -292,14 +292,14 @@ mod tests {
     }
 
     fn body() -> Context {
-        Context {
-            messages: vec![
+        Context::new(
+            true,
+            vec![
                 Message::system("framing\n\nThis conversation is the council context \"council-system\"."),
                 Message::user("never push to main"),
                 Message { reasoning: Some("noted".into()), ..Message::assistant("understood") },
             ],
-            ..Context::default()
-        }
+        )
     }
 
     fn value(seat: &Context) -> serde_json::Value {
@@ -371,7 +371,7 @@ mod tests {
         let last = messages.last().unwrap();
         assert_eq!(last["snap"], true);
         assert!(messages[..messages.len() - 1].iter().skip(4).all(|m| m.get("snap").is_none()), "{seat}");
-        assert!(seat.get("thinking").is_none(), "thinking stays the server's default");
+        assert_eq!(seat["thinking"], true, "the seat keeps the projection's thinking");
     }
 
     /// An example's result is the case the gate's builder makes for its
