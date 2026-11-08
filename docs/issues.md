@@ -6,6 +6,73 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kj watch`: notices a context subscribes to (design, 2026-11-08)
+
+A context has no way to subscribe to events. The nearest pieces each do one part:
+completion notices (`runtime/completion_notice.rs`) deliver durably but only for
+shell jobs and approvals; drift is push only; a track attachment wakes on time,
+not on an event; hooks see only MCP broker phases; `kj wait` blocks its caller;
+and the kernel's flow buses (`turn.*`, `ledger.changed`) have no subscription a
+context can hold. `notify = "7"` is in `kaijutsu-kernel/Cargo.toml` and nothing
+uses it.
+
+Decided (Amy, 2026-11-08):
+
+- **A watch never starts a turn.** Notices accrue while the context is idle,
+  coalesce, and go with the next user prompt. "Maybe we'll add a way to do that
+  later, but only after we've gotten some experience with it."
+- **Coalesce where it makes sense.** Each watch keeps a current status record, so
+  a turn turns it into a payload quickly instead of replaying raw events.
+- **Rotation copies and restarts watches.** The old watch is archived with the
+  old context, and the successor gets a new one built from it. This keeps old
+  notices from building up.
+- **The verb is `kj watch`.**
+- **The payload is a system block placed before the user's prompt.**
+
+Open:
+
+- Which sources come first: a path changed (through `notify`), a ledger event
+  for a context, a council report. Each needs its coalescing rule stated.
+- Whether delivery extends completion notices (a new `Source` kind) or is its
+  own table. Completion notices already refuse an archived recipient or one with
+  another performer (`recipient_disposition`), which matches the rotation rule.
+- The `kj watch` verbs (add, list, remove, show status) and how `kj context
+  archive` and `promote` treat watches.
+
+## Council house rules are built on the decision's deadline (2026-11-08)
+
+An edited `AGENTS.md` reaches the council at the next decision, not at rotation
+(`council/sync.rs:279` reads it each decision). That decision feeds the new
+house-rules seat inside the gate deadline, and a slow build is a miss and a
+ledger ask. Plan: a kernel watch on the `AGENTS.md` paths current seats name
+rebuilds the seat ahead, with a hash check on the pin sweep as a backstop. The
+decision keeps its own read and hash check, so a dropped file event costs a
+build, never a judgment by old rules. Shares its file source with `kj watch`.
+Undocumented meanwhile: the council can judge by new rules while the seat's own
+prompt holds the old ones until rotation.
+
+## Council objects and provider file handles (2026-11-08)
+
+gogi's `objects` and `keeps` (`docs/council-api.md`, "Objects and keeps") hold
+media by blake3 id: images and audio a message names, and control vectors.
+Kaijutsu has no client for them, and mkviolet's source shows no object route.
+Direction (Amy, 2026-11-08: "kaijutsu needs its own facade and basic working
+system, but could lean on some other object storage like nagaya/council"): the
+CAS is the facade, and each provider keeps a map from hash to its own handle
+and expiry (the blake3 id under a keep for a council server; a file URI or id
+for Gemini or Anthropic). The provider resolves on the request path and uploads
+or inlines on a miss, so a turn never fails for want of a copy. rc scripts own
+policy only: which backends get copies ahead, and keep terms. Not decided.
+
+## `kj council` verbs beyond `build` (2026-11-08)
+
+Amy, 2026-11-08: "I'm inclined to keep growing `kj council` a bit". Candidates:
+`status` (each seat, the head the kernel expects, whether pins agree, the house
+rules path and hash; this exposes stale heads after a server restart), a
+house-rules rebuild by hand until the watch exists, and `decisions` (recent
+`council_decisions` rows with each read's probabilities, since the kernel log
+shows only reports). A generic server inspector can live in gogi later.
+
 ## Council v2 `thinking`: what the kaibo review leaves open (2026-11-07)
 
 - `judge_one` reads the identity twice for one decision: once to prepare the labels and house rules
