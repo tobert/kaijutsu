@@ -1063,6 +1063,39 @@ CREATE TABLE IF NOT EXISTS dirty_file_buffers (
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
+-- ── Context watches (docs/watch.md) ─────────────────────────────
+-- One row per thing a context watches. The status columns are the
+-- coalesced record since the last delivery: a prompt submit renders every
+-- row with `changes > 0` into one notice block and resets them in the same
+-- acceptance. A watch never starts a turn.
+--   kind              'path' only: a host file behind a VFS path.
+--   target            the VFS path as resolved when the watch was added.
+--   host_path         the host file the VFS path names; events match on it.
+--   changes           bursts of change since the last delivery.
+--   first_change_at   the first burst since the last delivery.
+--   last_change_at    the latest event since the last delivery.
+--   present           whether the file existed at the latest event.
+--   delivered_at      the last delivery, NULL before the first.
+--   stopped_at        set when promotion brings the context back, so its
+--                     watches do not re-arm; `kj watch add` clears it.
+CREATE TABLE IF NOT EXISTS context_watches (
+    watch_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    context_id       BLOB    NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    kind             TEXT    NOT NULL CHECK (kind IN ('path')),
+    target           TEXT    NOT NULL,
+    host_path        TEXT    NOT NULL,
+    created_by       BLOB    NOT NULL,
+    created_at       INTEGER NOT NULL,
+    changes          INTEGER NOT NULL DEFAULT 0 CHECK (changes >= 0),
+    first_change_at  INTEGER,
+    last_change_at   INTEGER,
+    present          INTEGER,
+    delivered_at     INTEGER,
+    stopped_at       INTEGER,
+    UNIQUE (context_id, kind, target)
+);
+CREATE INDEX IF NOT EXISTS idx_context_watches_host_path ON context_watches(host_path);
+
 -- A retired table is dropped, not left behind. Child before parent: this
 -- foreign-keys onto `gate_actions`, so it must go first.
 DROP TABLE IF EXISTS gate_action_argv;

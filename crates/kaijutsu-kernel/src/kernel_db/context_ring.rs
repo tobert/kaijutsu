@@ -647,18 +647,28 @@ impl KernelDb {
             // `archive_context` clears promoted_at, so an archived row
             // shouldn't still carry one — but stamp unconditionally anyway:
             // the old seat was surrendered at archive time either way.
-            self.conn.execute(
-                // The restored state is derived from `concluded_at`, not
-                // remembered from before the archive: the timestamps are what
-                // survive, so they are what the state is read back out of.
-                "UPDATE contexts
-                    SET archived_at = NULL,
-                        context_state = CASE WHEN concluded_at IS NULL
-                                             THEN 'live' ELSE 'concluded' END,
-                        promoted_at = ?1, demoted_at = NULL
-                 WHERE context_id = ?2",
-                params![now_millis(), blob_param(id.as_bytes())],
-            )?;
+            let resurrect = |db: &KernelDb| -> KernelDbResult<()> {
+                let at = now_millis();
+                db.conn.execute(
+                    // The restored state is derived from `concluded_at`, not
+                    // remembered from before the archive: the timestamps are what
+                    // survive, so they are what the state is read back out of.
+                    "UPDATE contexts
+                        SET archived_at = NULL,
+                            context_state = CASE WHEN concluded_at IS NULL
+                                                 THEN 'live' ELSE 'concluded' END,
+                            promoted_at = ?1, demoted_at = NULL
+                     WHERE context_id = ?2",
+                    params![at, blob_param(id.as_bytes())],
+                )?;
+                // Its watches do not re-arm (`docs/watch.md`, "Lifecycle").
+                db.stop_watches(id, at)
+            };
+            if self.conn.is_autocommit() {
+                self.in_transaction(resurrect)?;
+            } else {
+                resurrect(self)?;
+            }
             return Ok(PromoteOutcome::Resurrected {
                 concluded: concluded_at.is_some(),
             });

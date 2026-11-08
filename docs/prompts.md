@@ -345,7 +345,9 @@ performer and senpai, its slots read fresh from the character's own. It
 copies the system prompt, workspace, env, and cwd, sets `ROTATED_FROM` to the predecessor's
 id, and runs the `create` lifecycle. The kohai point at the predecessor, so
 they do not move (`docs/senpai-kohai.md`, "Rotation hands off its contexts"). The hydration window is not
-copied; a musician's create lifecycle sets its own. When the successor has a
+copied; a musician's create lifecycle sets its own. Each watch is copied with
+an empty status, and the predecessor's watches are archived with it
+(`docs/watch.md`). When the successor has a
 usable loadout, the predecessor's `archive` lifecycle runs, then one
 transaction archives the predecessor and gives the
 successor its label and ring position. When
@@ -537,6 +539,13 @@ commits, `submitInput` returns its block at once, and the `submit` scripts
 and turn startup run after the reply. A turn that then fails to start is
 recorded once in the transcript and published as a turn failure, not
 returned as a submit error.
+
+A submit whose context holds watch changes puts them in one kernel
+`(System, Notification)` notice just before the user block, in the same
+acceptance that resets the watches (`docs/watch.md`). `kj drive --prompt`
+does the same before its seed block. The notice names each changed path and
+holds no file content; a submit with no waiting change adds no notice. When
+a notice lands, it is the submit's `KJ_LOG_TAIL`.
 
 Its scripts read the submit facts as `KJ_*` variables. Every name is always
 set, empty rather than absent when the fact does not apply:

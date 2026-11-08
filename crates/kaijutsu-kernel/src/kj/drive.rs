@@ -159,6 +159,11 @@ impl KjDispatcher {
         let seed: String = parsed.prompt.clone().unwrap_or_default();
         let after = match parsed.prompt.as_deref() {
             Some(prompt) => {
+                // A prompt carries the target's waiting watch changes before it.
+                let tail = match crate::runtime::prompt::deliver_watches(self.kernel(), target) {
+                    Ok(notice) => notice.unwrap_or(tail),
+                    Err(e) => return KjResult::Err(format!("kj drive: {e}")),
+                };
                 match self.block_store().insert_block_as(
                     target,
                     None,
@@ -465,6 +470,34 @@ mod tests {
             }
             other => panic!("expected Requested, got {other:?}"),
         }
+    }
+
+    /// A driven prompt carries the target's waiting watch changes in a
+    /// notice just before it; a drive with no prompt delivers nothing.
+    #[tokio::test]
+    async fn drive_with_a_prompt_delivers_waiting_watch_changes() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let watched = |label: &str| {
+            let ctx = register_context(&d, Some(label), None, principal);
+            seed_with_block(&d, ctx, principal);
+            let db = d.kernel_db().lock();
+            db.add_path_watch(ctx, "/w/a", "/h/a", principal).unwrap();
+            ctx
+        };
+        let (bare, prompted) = (watched("bare"), watched("prompted"));
+        d.kernel_db().lock().record_path_event("/h/a", true, 1, true).unwrap();
+
+        let result = d.dispatch(&[s("drive")], &caller_with_context(bare)).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+        assert_eq!(d.kernel_db().lock().pending_watches(bare).unwrap().len(), 1, "no prompt, no delivery");
+
+        let result = d.dispatch(&[s("drive"), s("--prompt"), s("go")], &caller_with_context(prompted)).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+        let blocks = d.block_store().block_snapshots(prompted).unwrap();
+        let at = blocks.iter().position(|b| b.content == "go").unwrap();
+        assert!(blocks[at - 1].content.starts_with("Watched files changed"), "{:?}", blocks[at - 1]);
+        assert!(d.kernel_db().lock().pending_watches(prompted).unwrap().is_empty());
     }
 
     /// A model that drives another context with a prompt wrote that prompt,

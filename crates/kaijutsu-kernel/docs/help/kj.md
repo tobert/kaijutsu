@@ -33,6 +33,7 @@ preset          fork presets: what a child copies from its parent
 ```
 drift           send text to another context (`kj drift push .senpai` reaches our senpai), or distill one context into another
 wait            wait for a turn, a shell operation, an ask, or a kaish job
+watch           watch files; changes go with the next prompt as a notice
 drive           start one autonomous turn on a context
 interrupt       stop a turn; the context does not resume on its own after it
 handoff         a character's handoff log: leave notes and read them

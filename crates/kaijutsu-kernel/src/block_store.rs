@@ -1473,6 +1473,36 @@ impl BlockStore {
         }).map(|id| Some((id, notice, message)))
     }
 
+    /// Publish `context`'s waiting watch changes as one kernel notice after
+    /// `after`, and reset the watches in the same acceptance
+    /// (`docs/watch.md`). `None` when no watch holds a change.
+    pub(crate) fn insert_watch_notice(
+        &self, context: ContextId, after: Option<&BlockId>,
+    ) -> BlockStoreResult<Option<BlockId>> {
+        let Some(db) = self.journaling_db()? else { return Ok(None) };
+        let mut entry = self.get_mut(context).ok_or(BlockStoreError::DocumentNotFound(context))?;
+        let db = db.lock();
+        let pending = db.pending_watches(context).map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let message = crate::path_watch::render_notice(&pending);
+        let delivered: Vec<(i64, u64)> = pending.iter().map(|w| (w.watch_id, w.changes)).collect();
+        self.accept_locked_recorded(context, &mut entry, Some(db), |entry| {
+            let author = PrincipalId::system();
+            entry.doc.set_principal_id(author);
+            // A kernel instruction, so it never reads as a person's words
+            // (`llm::hydrate::is_kernel_instruction`).
+            let id = entry.doc.insert_block(None, after, Role::System, BlockKind::Notification,
+                &message, Status::Done, ContentType::Plain)?;
+            entry.touch(author);
+            let snapshot = entry.doc.get_block_snapshot(&id).expect("inserted watch notice exists");
+            let events = vec![BlockFlow::Inserted { context_id: context, block: Arc::new(snapshot.clone()),
+                after_id: after.copied(), version: entry.version(), source: OpSource::Local }];
+            Ok((SyncPayload::from_new_block(snapshot), events, id))
+        }, |db, _| db.mark_watches_delivered(&delivered, crate::path_watch::now_millis())).map(Some)
+    }
+
     /// Insert a tool call block into a document.
     pub fn insert_tool_call(
         &self,

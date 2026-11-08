@@ -445,6 +445,8 @@ pub(crate) fn insert_new_context_rows(db: &KernelDb, row: &ContextRow, placement
         CharacterPlacement::Rotate { predecessor } => {
             // The successor rides the predecessor's beat tracks, as a fork does.
             db.copy_attachments(predecessor, row.context_id)?;
+            // Watches restart on the successor; the predecessor's stay with it.
+            db.copy_watches(predecessor, row.context_id)?;
             let predecessor = db.require_context_character(predecessor)?;
             // Only a root console rotates into a context with no senpai.
             db.check_senpai_edge(row.context_id, Some(predecessor.principal_id), predecessor.senpai_ctx)?;
@@ -5205,6 +5207,35 @@ mod tests {
         assert_eq!(copied[0].rotate_every_phrases, Some(2700));
         assert_eq!(db.list_attachments_for_context(f.seat).unwrap().len(), 1,
             "the predecessor keeps its row for its own detach");
+    }
+
+    /// Rotation gives the successor a fresh copy of each watch: the same
+    /// target, no waiting changes. The predecessor's rows are archived with
+    /// it, so a change after the rotation reaches only the successor.
+    #[test]
+    fn rotation_restarts_watches_on_the_successor() {
+        crate::on_rc_thread(rotation_restarts_watches_on_the_successor_body);
+    }
+
+    async fn rotation_restarts_watches_on_the_successor_body() {
+        let f = rotation_fixture().await;
+        {
+            let db = f.d.kernel_db().lock();
+            db.add_path_watch(f.seat, "/w/a", "/h/a", f.banto).unwrap();
+            db.record_path_event("/h/a", true, 1, true).unwrap();
+        }
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
+        let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+
+        let db = f.d.kernel_db().lock();
+        let copied = db.list_watches(successor).unwrap();
+        assert_eq!(copied.len(), 1, "the successor watches what the predecessor did");
+        assert_eq!((copied[0].target.as_str(), copied[0].changes), ("/w/a", 0), "with a fresh status");
+        db.record_path_event("/h/a", true, 5_000, true).unwrap();
+        assert_eq!(db.pending_watches(successor).unwrap().len(), 1);
+        assert_eq!(db.list_watches(f.seat).unwrap()[0].changes, 1, "the archived predecessor's watch is inert");
     }
 
     /// The successor keeps the predecessor's senpai. The kernel moves no

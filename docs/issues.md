@@ -6,38 +6,27 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## `kj watch`: notices a context subscribes to (design, 2026-11-08)
+## `kj watch`: what the first build leaves open (2026-11-08)
 
-A context has no way to subscribe to events. The nearest pieces each do one part:
-completion notices (`runtime/completion_notice.rs`) deliver durably but only for
-shell jobs and approvals; drift is push only; a track attachment wakes on time,
-not on an event; hooks see only MCP broker phases; `kj wait` blocks its caller;
-and the kernel's flow buses (`turn.*`, `ledger.changed`) have no subscription a
-context can hold. `notify = "7"` is in `kaijutsu-kernel/Cargo.toml` and nothing
-uses it.
+`kj watch` watches host files and delivers waiting changes before the next
+prompt (`docs/watch.md`). Open:
 
-Decided (Amy, 2026-11-08):
-
-- **A watch never starts a turn.** Notices accrue while the context is idle,
-  coalesce, and go with the next user prompt. "Maybe we'll add a way to do that
-  later, but only after we've gotten some experience with it."
-- **Coalesce where it makes sense.** Each watch keeps a current status record, so
-  a turn turns it into a payload quickly instead of replaying raw events.
-- **Rotation copies and restarts watches.** The old watch is archived with the
-  old context, and the successor gets a new one built from it. This keeps old
-  notices from building up.
-- **The verb is `kj watch`.**
-- **The payload is a system block placed before the user's prompt.**
-
-Open:
-
-- Which sources come first: a path changed (through `notify`), a ledger event
-  for a context, a council report. Each needs its coalescing rule stated.
-- Whether delivery extends completion notices (a new `Source` kind) or is its
-  own table. Completion notices already refuse an archived recipient or one with
-  another performer (`recipient_disposition`), which matches the rotation rule.
-- The `kj watch` verbs (add, list, remove, show status) and how `kj context
-  archive` and `promote` treat watches.
+- **Only path watches.** Next sources named: a ledger event for a context, a
+  council report. Each needs its coalescing rule.
+- **No way to wake a turn.** Deliberate for now (Amy, 2026-11-08: "only after
+  we've gotten some experience with it").
+- **A fork copies no watches.** Amy: "no copy for now but might change my mind
+  later".
+- **Two acceptances per prompt.** The notice and the user block commit
+  separately; a user-block insert that fails after the notice leaves the
+  notice in the log, and the next prompt follows it.
+- **Archive and promote do not resync the watcher.** Their watches record
+  nothing, but the directory stays watched until the next `kj watch add`,
+  `kj watch rm`, or kernel start.
+- **A draft submit in the `llm_stream` fixture never completes its turn**
+  within 5 s (seen writing `a_submitted_draft_follows_the_watch_notice`); the
+  test checks ordering only. Cause unknown; may be the fixture's missing
+  `submit` rc.
 
 ## Council house rules are built on the decision's deadline (2026-11-08)
 
@@ -47,7 +36,9 @@ house-rules seat inside the gate deadline, and a slow build is a miss and a
 ledger ask. Plan: a kernel watch on the `AGENTS.md` paths current seats name
 rebuilds the seat ahead, with a hash check on the pin sweep as a backstop. The
 decision keeps its own read and hash check, so a dropped file event costs a
-build, never a judgment by old rules. Shares its file source with `kj watch`.
+build, never a judgment by old rules. `path_watch.rs` (the `kj watch`
+listener) records into `context_watches` only; the council needs a kernel
+subscriber on it.
 Undocumented meanwhile: the council can judge by new rules while the seat's own
 prompt holds the old ones until rotation.
 
@@ -55,7 +46,7 @@ prompt holds the old ones until rotation.
 
 gogi's `objects` and `keeps` (`docs/council-api.md`, "Objects and keeps") hold
 media by blake3 id: images and audio a message names, and control vectors.
-Kaijutsu has no client for them, and mkviolet's source shows no object route.
+Kaijutsu has no client for them. The nagaya serves them (`nagaya/src/http/objects.rs`); mkviolet's source shows no object route.
 Direction (Amy, 2026-11-08: "kaijutsu needs its own facade and basic working
 system, but could lean on some other object storage like nagaya/council"): the
 CAS is the facade, and each provider keeps a map from hash to its own handle

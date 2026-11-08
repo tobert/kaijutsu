@@ -85,12 +85,16 @@ pub async fn submit(
             if documents.get(context).is_none() {
                 return Err(format!("context {context} not found — call join_context first").into());
             }
+            deliver_watches(kernel, context)?;
             let block = documents.insert_block_as(context, None, documents.last_block_id(context).as_ref(),
                 Role::User, BlockKind::Text, &content, Status::Done, ContentType::Plain, Some(principal))
                 .map_err(|error| format!("failed to insert user block: {error}"))?;
             (block, Some(tool_ctx), None)
         }
         PromptSource::Draft { edge } => {
+            // The draft moves after blocks inserted while it was typed, so the
+            // notice lands before it.
+            deliver_watches(kernel, context)?;
             let (block, _) = documents.submit_draft(context, principal, edge)
                 .map_err(|error| format!("submit: {error}"))?;
             let info = crate::rc::SubmitInfo {
@@ -126,6 +130,14 @@ pub async fn submit(
         }
     }
     Ok(after_block_id)
+}
+
+/// Put the context's waiting watch changes in one notice at the end of the
+/// log, so the prompt that follows carries them (`docs/watch.md`).
+pub(crate) fn deliver_watches(kernel: &Kernel, context: ContextId) -> Result<Option<BlockId>, String> {
+    let documents = kernel.blocks();
+    documents.insert_watch_notice(context, documents.last_block_id(context).as_ref())
+        .map_err(|error| format!("failed to deliver watch changes: {error}"))
 }
 
 /// Start the turn for a submit a running turn accepted but never delivered.

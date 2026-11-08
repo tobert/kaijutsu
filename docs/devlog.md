@@ -3695,3 +3695,27 @@ never fetched. `kj context rotate --migrate` uses the same copy and gives a
 long conversation fresh rc and MCP instructions without its old bulk. The
 predecessor tail in `S17-predecessor.kai` would repeat the carried prose, so a
 migration sets `ROTATED_MIGRATED` and the script skips it.
+
+## A context learns what changed while it waited (November 8)
+
+The question started with the council: an edited `AGENTS.md` reaches the
+council's house-rules seat at the next decision, which then builds the new
+seat on the gate's deadline. A watch that rebuilt it ahead needed a way for
+the kernel to hear about host file changes, and Amy asked whether a context
+could set the same kind of watch for itself. Nothing did: completion notices
+deliver only shell and approval results, drift is push only, and a track
+wakes on time, not on an event. Amy set the shape: a watch never starts a
+turn; changes coalesce while the context is idle and go with the next prompt
+as a system block before it; rotation archives the old watches with the old
+context and gives the successor fresh copies, which keeps old changes from
+building up. A fork copies none, and promote does not re-arm.
+
+The plan first leaned on completion notices for delivery. Reading
+`insert_completion_notice` showed they insert at once and may resume a turn,
+the opposite of a status that renders only at a prompt, so watches got their
+own table and reuse only the notice block form. The notice and the reset of
+each watch it names are one acceptance, and a reset that finds a count other
+than the one rendered fails the delivery. The listener watches parent
+directories, because an editor's rename-over save replaces the file a direct
+watch would hold. Writing the docs exposed that "only live contexts accrue"
+would let promote re-arm a context's watches, so promotion now stops them.

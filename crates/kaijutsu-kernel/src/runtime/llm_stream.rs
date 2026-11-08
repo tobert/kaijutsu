@@ -9491,6 +9491,62 @@ mod lifetime_tests {
             crate::runtime::prompt::PromptSource::Text { content: text.into() }).await.unwrap()
     }
 
+    /// A watch change waiting since the context went idle goes into one
+    /// kernel notice placed just before the next prompt, the model reads it,
+    /// and a prompt with nothing new adds no notice. `docs/watch.md`.
+    #[tokio::test]
+    async fn waiting_watch_changes_go_before_the_next_prompt_once() {
+        let (mock, sent) = MockClient::new("ack").recording_sent_messages();
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        {
+            let db = kernel.kernel_db().lock();
+            db.add_path_watch(context, "/w/AGENTS.md", "/h/AGENTS.md", call.principal_id).unwrap();
+            db.record_path_event("/h/AGENTS.md", true, 1, true).unwrap();
+            db.record_path_event("/h/AGENTS.md", true, 2, false).unwrap();
+        }
+        assert!(!kernel.turn_in_flight(context), "a waiting change starts no turn");
+        let go = submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        let at = blocks.iter().position(|b| b.id == go).unwrap();
+        let notice = &blocks[at - 1];
+        assert!(crate::llm::hydrate::is_kernel_instruction(notice), "{notice:?}");
+        assert_eq!(notice.content.lines().count(), 2, "a heading and one line per watch: {}", notice.content);
+        assert!(notice.content.starts_with("Watched files changed since the last prompt:\n- /w/AGENTS.md: changed once, last "),
+            "{}", notice.content);
+        let wire = serde_json::to_string(&sent.lock()[0]).unwrap();
+        assert!(wire.contains("/w/AGENTS.md: changed once"), "the model reads the notice: {wire}");
+        assert!(kernel.kernel_db().lock().pending_watches(context).unwrap().is_empty(), "delivery resets the watch");
+
+        submit_text(&kernel, context, call.principal_id, "again").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let notices = kernel.blocks().non_draft_snapshots(context).unwrap().iter()
+            .filter(|b| b.content.starts_with("Watched files changed")).count();
+        assert_eq!(notices, 1, "a prompt with nothing new carries no notice");
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A submitted draft also lands after the notice.
+    #[tokio::test]
+    async fn a_submitted_draft_follows_the_watch_notice() {
+        let (kernel, context, _after, call) = fixture(Some(MockClient::new("ack"))).await;
+        let player = call.principal_id;
+        kernel.blocks().edit_draft(context, player, 0, "typed", 0).unwrap();
+        {
+            let db = kernel.kernel_db().lock();
+            db.add_path_watch(context, "/w/a", "/h/a", player).unwrap();
+            db.record_path_event("/h/a", false, 1, true).unwrap();
+        }
+        let block = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
+            crate::runtime::prompt::PromptSource::Draft { edge: None }).await.unwrap();
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        let at = blocks.iter().position(|b| b.id == block).unwrap();
+        assert!(blocks[at - 1].content.ends_with("; it no longer exists"), "{:?}", blocks[at - 1]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
     fn done(stop: &str) -> StreamEvent {
         StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: Some(1), output_tokens: Some(1), extra: None }
     }

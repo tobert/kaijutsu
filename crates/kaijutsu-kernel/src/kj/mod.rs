@@ -26,6 +26,7 @@ pub mod cp;
 pub mod config;
 pub mod context;
 pub mod council;
+pub mod watch;
 pub mod db;
 pub mod diff;
 pub mod doc;
@@ -752,6 +753,7 @@ impl KjDispatcher {
             "drift" => Box::pin(async { self.dispatch_drift(&argv[1..], caller).await }).await,
             "cache" => self.dispatch_cache(&argv[1..], caller),
             "council" => self.dispatch_council(&argv[1..], caller).await,
+            "watch" => self.dispatch_watch(&argv[1..], caller).await,
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,

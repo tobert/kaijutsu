@@ -45,6 +45,8 @@ mod kernel_meta;
 mod presets;
 mod hooks;
 mod client_state;
+mod watches;
+pub use watches::WatchRow;
 mod well_known;
 mod workspaces;
 mod roster;

@@ -38,6 +38,7 @@ pub mod midi_identity;
 pub mod midi_presence;
 pub mod midi_seed;
 pub mod model_resolution;
+pub mod path_watch;
 pub mod peers;
 pub mod pricing;
 pub mod order_repair;

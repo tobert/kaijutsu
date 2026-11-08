@@ -222,6 +222,8 @@ pub struct Kernel {
     /// `new`/`new_ephemeral`/`with_flows` call would race dozens of
     /// concurrently-running test kernels over the same runtime directory.
     cc_inbox: OnceLock<Arc<crate::cc_inbox::CcInboxHandle>>,
+    /// The host file watcher behind `kj watch`.
+    path_watcher: crate::path_watch::PathWatcher,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -477,12 +479,18 @@ impl Kernel {
             approval_delivery: OnceLock::new(),
             runtime_worker_shutdown,
             cc_inbox: OnceLock::new(),
+            path_watcher: Default::default(),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
         kernel.rc_settlements.recover().expect("recover rc lifecycle settlements");
         crate::runtime::approval_resume::recover_unpublished_pairs(&kernel).expect("retire unpublished approval invocations");
         crate::runtime::command::recover_unfinished(&kernel).expect("settle interrupted shell operations");
         crate::runtime::completion_notice::recover(&kernel).expect("recover execution completion notifications");
+        // A watcher that cannot start leaves watches recording nothing; it does
+        // not stop the kernel.
+        if let Err(e) = kernel.path_watcher.sync(&kernel.db) {
+            tracing::error!(error = %e, "kj watch: the host file watcher did not start; watches record no changes");
+        }
         kernel
     }
 
@@ -1555,6 +1563,11 @@ impl Kernel {
     /// this rather than opening their own `KernelDb`.
     pub fn kernel_db(&self) -> &Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>> {
         &self.db
+    }
+
+    /// The host file watcher behind `kj watch`.
+    pub fn path_watcher(&self) -> &crate::path_watch::PathWatcher {
+        &self.path_watcher
     }
 
     // ── Editor sessions ───────────────────────────────────────────────────
