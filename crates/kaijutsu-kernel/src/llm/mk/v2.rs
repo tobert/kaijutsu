@@ -101,7 +101,7 @@ impl Client {
         let has_tools = !tools.is_empty();
         let request = GenerationRequest {
             model: identity.model.clone(),
-            context: Context { thinking, tools, queue: None, messages },
+            context: Context { thinking, tools, queue: None, control: Vec::new(), messages },
             max_tokens,
             sample,
             stream: None,
