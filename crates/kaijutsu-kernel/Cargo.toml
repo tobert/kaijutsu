@@ -20,7 +20,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 # `preserve_order`: a JSON object keeps its member order, so a tool call goes
-# back to a model as it wrote it (the megakernel re-renders it; docs/mk.md).
+# back to a model as it wrote it (the council server re-renders it).
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = "0.10"
 uuid = { workspace = true }
@@ -54,8 +54,9 @@ rusqlite.workspace = true
 # the ledger crate its own `&Connection`, same pattern as `hook_scripts`.
 approval-ledger.workspace = true
 
-# The megakernel client: the council gate's decision calls (docs/mk.md).
-kaijutsu-mk.workspace = true
+# The council v2 client: chat turns and the council gate's decision calls
+# (docs/council-backend.md).
+kaijutsu-council.workspace = true
 gogi-proto.workspace = true
 
 # Claude Code's per-session peer messaging socket: registry scan, liveness
@@ -197,8 +198,8 @@ tracing-subscriber = { workspace = true }
 # Enable the cross-crate test-only helpers (e.g. push_committed_for_test) for the
 # kernel's own tests — feature unification makes this dev-only.
 kaijutsu-hyoushigi = { workspace = true, features = ["test-util"] }
-# The megakernel client's scripted HTTP server, for the `mk` provider's tests.
-kaijutsu-mk = { workspace = true, features = ["test-util"] }
+# The council client's scripted HTTP server, for the council provider's tests.
+kaijutsu-council = { workspace = true, features = ["test-util"] }
 gogi-fake = { workspace = true }
 # Self-dependency so this crate's OWN `test-util` feature (KernelDb::temporary())
 # is enabled when building its integration tests under `tests/` — that build

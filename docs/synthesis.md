@@ -14,7 +14,7 @@ off", and `kj synth` and semantic search report the index unavailable.
 The row names a backend, a model, and a vector size. The backend is an
 ordinary row (`kj backend`) of one of two kinds. Kind `openai` has a
 `base_url` with an `/embeddings` route: OpenRouter, OpenAI, Google's Gemini API
-through its OpenAI-compatible base URL, or a local server. Kind `mk` is a
+through its OpenAI-compatible base URL, or a local server. Kind `council` is a
 council server that serves `POST /council/v2/embeddings`, such as nagaya's
 EmbeddingGemma 2. The backend owns the URL and the key, so the key never sits
 in this row. Configure it with the kernel stopped,

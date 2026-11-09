@@ -7,7 +7,7 @@
 //! its projected body changed.
 //!
 //! Every call takes a slot at the server's endpoint first
-//! (`llm::endpoint::mk_call`), waiting no later than the caller's deadline,
+//! (`llm::endpoint::council_call`), waiting no later than the caller's deadline,
 //! and a 429 is sent again after its cooldown.
 //!
 //! The server speaks council v2 (gogi's `docs/council-api.md`) and keeps
@@ -33,20 +33,20 @@ use gogi_proto::identity::{Capability, ModelStatus, ServedModel, ServerIdentity}
 use gogi_proto::pins::PinsPut;
 use gogi_proto::spec::{QuestionKind, Spec};
 use gogi_proto::{Context, SnapshotId, SpecId};
-use kaijutsu_mk::{MkClient, MkError};
+use kaijutsu_council::{CouncilClient, CouncilError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
 use super::projection::{HOUSE_RULES_BYTES_PER_TOKEN, HouseRules, project, project_house_rules, project_shadow};
 use crate::kj::gate_policy::CouncilConfig;
-use crate::llm::endpoint::{Endpoint, NoSlot, SlotWaits, mk_call};
+use crate::llm::endpoint::{Endpoint, NoSlot, SlotWaits, council_call};
 
 /// Everything one decision needs from the server's side.
 pub(crate) struct Prepared {
     /// Addresses `CouncilConfig.server`. Its timeout, `deadline_ms`, bounds
     /// each call `prepare_labels` makes; a decision passes the time its
     /// deadline leaves.
-    pub(crate) client: MkClient,
+    pub(crate) client: CouncilClient,
     /// The server's endpoint, which each call takes a slot from.
     pub(crate) endpoint: Arc<Endpoint>,
     /// The served model the decision runs on, which was `ready`.
@@ -131,7 +131,7 @@ pub(crate) fn no_slot_cause(deadline_ms: u64, no_slot: &NoSlot) -> String {
 /// The council server one decision or priming talks to: its client, its
 /// endpoint, and the deadline that bounds every slot wait.
 struct Link<'a> {
-    client: &'a MkClient,
+    client: &'a CouncilClient,
     /// The server as configured, for messages.
     server: &'a str,
     /// The server's origin (`llm::endpoint::origin`), which keys what this
@@ -150,12 +150,12 @@ struct Link<'a> {
 
 impl Link<'_> {
     /// One call through the endpoint. No slot before the deadline is a miss.
-    async fn send<T, F, Fut>(&self, call: F) -> Result<Result<T, MkError>, PrepareMiss>
+    async fn send<T, F, Fut>(&self, call: F) -> Result<Result<T, CouncilError>, PrepareMiss>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T, MkError>>,
+        Fut: std::future::Future<Output = Result<T, CouncilError>>,
     {
-        match mk_call(&self.endpoint, self.deadline, self.waits, call).await {
+        match council_call(&self.endpoint, self.deadline, self.waits, call).await {
             Ok((_slot, result)) => Ok(result),
             Err(no_slot) => Err(PrepareMiss(no_slot_cause(self.deadline_ms, &no_slot))),
         }
@@ -357,7 +357,7 @@ impl CouncilSync {
         let _serial = self.serial.lock().await;
         let server = council.server.as_str();
         let (endpoint, key) = endpoint_of(kernel, server)?;
-        let client = MkClient::new(server, Duration::from_millis(council.deadline_ms))
+        let client = CouncilClient::new(server, Duration::from_millis(council.deadline_ms))
             .map_err(|e| self.failed(&key, server, "client", e))?;
         let owner = pin_owner(kernel.id());
         let mut link = Link {
@@ -465,7 +465,7 @@ impl CouncilSync {
     ) -> Result<(Box<Context>, SnapshotId), PrepareMiss> {
         let _serial = self.shadow_serial.lock().await;
         let (endpoint, key) = endpoint_of(kernel, server)?;
-        let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
+        let client = CouncilClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
         let deadline_ms = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
         let mut link =
             Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits, owner: pin_owner(kernel.id()), model: String::new() };
@@ -665,7 +665,7 @@ impl CouncilSync {
     /// A call to `server`, whose origin is `key`, failed: forget its
     /// identity and posted specs, so the next `prepare_labels` asks again,
     /// and name the failure.
-    fn failed(&self, key: &str, server: &str, what: &str, e: MkError) -> PrepareMiss {
+    fn failed(&self, key: &str, server: &str, what: &str, e: CouncilError) -> PrepareMiss {
         let mut state = self.state.lock();
         state.identities.remove(key);
         state.specs.retain(|(s, _)| s != key);
@@ -693,7 +693,7 @@ impl Pinner {
     /// forget the seats nothing current reaches, when the kernel is
     /// shared, then send the heads still held.
     async fn run(self, mut set: tokio::sync::watch::Receiver<BTreeSet<String>>) {
-        let client = match MkClient::new(&self.server, PIN_TIMEOUT) {
+        let client = match CouncilClient::new(&self.server, PIN_TIMEOUT) {
             Ok(client) => client,
             Err(e) => {
                 tracing::warn!(server = %self.server, error = %e, "council seats are not pinned: no client for the server");
@@ -732,11 +732,11 @@ impl Pinner {
     /// forgotten, so the next decision builds its seat again; every
     /// failure is logged and the set is sent again at the next change or
     /// renewal. An empty set drops the owner's pins with `DELETE`.
-    async fn put(&self, client: &MkClient, heads: Vec<String>) {
+    async fn put(&self, client: &CouncilClient, heads: Vec<String>) {
         let deadline = tokio::time::Instant::now() + PIN_TIMEOUT;
         let waits = SlotWaits::default();
         if heads.is_empty() {
-            let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.council().delete_pins(&self.owner).await }).await;
+            let answer = council_call(&self.endpoint, deadline, &waits, || async { client.council().delete_pins(&self.owner).await }).await;
             match answer {
                 Ok((_slot, Ok(()))) => tracing::info!(server = %self.server, owner = %self.owner, "council pins dropped: no seat is current"),
                 Ok((_slot, Err(e))) if e.status() == Some(404) => {}
@@ -746,7 +746,7 @@ impl Pinner {
             return;
         }
         let body = PinsPut { snapshots: heads, ttl_s: PIN_TTL.as_secs() };
-        let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.council().put_pins(&self.owner, &body).await }).await;
+        let answer = council_call(&self.endpoint, deadline, &waits, || async { client.council().put_pins(&self.owner, &body).await }).await;
         let pinned = match answer {
             Ok((_slot, Ok(pinned))) => pinned,
             Ok((_slot, Err(e))) => {
@@ -1246,7 +1246,7 @@ mod tests {
     /// `describe` capability.
     const SPEC: &str = crate::config_seed::DEFAULT_COUNCIL_SHELL_GATE;
     /// gogi's example spec, which holds the `text` question `effect`.
-    const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json");
+    const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-council/tests/fixtures/spec.json");
 
     struct Rig {
         kernel: Arc<Kernel>,
@@ -2103,7 +2103,7 @@ mod tests {
     }
 
     /// Waits until `owner`'s pins on `client`'s server are exactly `want`.
-    async fn pinned_exactly(client: &MkClient, owner: &str, want: &[&SnapshotId]) -> gogi_proto::pins::PinSet {
+    async fn pinned_exactly(client: &CouncilClient, owner: &str, want: &[&SnapshotId]) -> gogi_proto::pins::PinSet {
         let want: BTreeSet<&str> = want.iter().map(|id| id.as_str()).collect();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
@@ -2124,7 +2124,7 @@ mod tests {
         r.council.deadline_ms = 120_000;
         r.council.house_rules = true;
         let owner = pin_owner(r.kernel.id());
-        let client = MkClient::new(&server, Duration::from_secs(30)).unwrap();
+        let client = CouncilClient::new(&server, Duration::from_secs(30)).unwrap();
         write_rules(&r, "Back up data before changing it.").await;
         let seat = seat_in(&r, "lane-a", Some("/work/repo"));
         let first = prepare_seat(&r, seat).await.expect("prepared");
@@ -2157,7 +2157,7 @@ mod tests {
         let head = p.contexts[0].head.clone();
         println!("seat built in {} ms, head {head}", started.elapsed().as_millis());
 
-        let client = MkClient::new(&server, Duration::from_secs(30)).unwrap();
+        let client = CouncilClient::new(&server, Duration::from_secs(30)).unwrap();
         let pins = pinned_exactly(&client, &owner, &[&head]).await;
         println!("pins: {pins:?}");
         assert!(pins.expires_in_s > 3500 && pins.expires_in_s <= 3600, "{pins:?}");
@@ -2235,7 +2235,7 @@ mod tests {
         fake.set_status("b", gogi_fake::ModelStatus::Ready).unwrap();
         let p = r.prepare().await.expect("prepared once b is ready");
         assert_eq!(p.identity.model, "b");
-        let client = MkClient::new(&fake.url(), Duration::from_secs(30)).unwrap();
+        let client = CouncilClient::new(&fake.url(), Duration::from_secs(30)).unwrap();
         assert_eq!(client.council().snapshot(&p.contexts[0].head).await.unwrap().model, "b");
 
         let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));

@@ -435,8 +435,8 @@ grows with the gate.
   council whose blocks name no judge runs with no judge; no default name
   stands in. The shadow
   copies its slots from the judge character when it is made, and its
-  `model` slot names the judge's server: the megakernel or lfm2d (a backend
-  of kind `council`). `kj character model set judge mk-zorak/<served model>`
+  `model` slot names the judge's server, a backend of kind `council` such
+  as the nagaya. `kj character model set judge spaceghost/<served model>`
   points it. A judge on a chat model, such as Jev through OpenRouter, gets
   a shadow that records the dialogue, and is not asked (build order 5). A
   shadow made before the model changed keeps the model it copied;
@@ -463,7 +463,7 @@ grows with the gate.
   not prose, so the kernel writes its answer as text from the top options.
 - **Each model is fed the way its API works.** The stored dialogue is the
   same; hydration differs by backend.
-  - A council server (megakernel, lfm2d) gets each call as it arrives: the
+  - A council server (the nagaya) gets each call as it arrives: the
     kernel builds the shadow's seat off the hot path, so the server holds
     its snapshot when the question comes.
   - A chat model (Jev) is to be hydrated whole for each request: the
@@ -911,17 +911,13 @@ posts the spec again.
 
 ## Servers
 
-- **A server speaks council v2.** mkviolet (Gemma 4) serves it. A server
-  that serves only `/council/v1/` is a miss.
-- **Megakernel.** Qwen3.8-Flash-Next on zorak has given more consistent
-  reads than lfm2d. Amy, 2026-10-04: "mk seems to be overall better". It
-  served the council over `/council/v1/`, so it serves it again only once
-  it serves council v2. Long runs against it on zorak take the heavy lock
-  (`flock -w 900 ~/.cache/zorak-heavy.lock`).
-- **lfm2d,** behind the same port once it serves council v2.
+- **A server speaks council v2.** The nagaya serves it, on spaceghost
+  (`http://100.65.47.5:8091`) and on zorak; its served models include
+  Gemma 4 and LFM3. A server that serves only `/council/v1/` is a miss.
+  The same backend serves chat turns and embeddings (`docs/council-backend.md`).
 - **A seat's binding chooses the server.** A `gate` slot whose backend
-  has kind `council` names the server for that context's decisions ("mk bumps",
-  "lfm2d bumps"); see "Configuration". A `gate` slot on a backend of any
+  has kind `council` names the server for that context's decisions; see
+  "Configuration". A `gate` slot on a backend of any
   other kind, such as Jev through OpenRouter, is a miss.
 - **Jev through OpenRouter, for comparison only.** It speaks the gateway
   Decisions API, which council v2 no longer accepts, and it holds no

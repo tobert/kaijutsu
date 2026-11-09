@@ -2,7 +2,7 @@
 //!
 //! The request and response types are `gogi_proto`'s. Each call checks its
 //! request with `gogi_proto`'s rules before sending it, so a request the
-//! contract refuses is [`MkError::Request`] and never reaches the server.
+//! contract refuses is [`CouncilError::Request`] and never reaches the server.
 
 use std::time::Duration;
 
@@ -17,26 +17,26 @@ use gogi_proto::spec::{HeldSpec, Spec};
 use gogi_proto::{SnapshotId, SpecId};
 use reqwest::Method;
 
-use crate::client::{excerpt, to_body, Family, MkClient, MkError};
-use crate::generate::{EventStream, Frame, StreamItem};
+use crate::client::{excerpt, to_body, CouncilClient, CouncilError};
+use crate::sse::{EventStream, Frame, StreamItem};
 
-/// The council v2 calls of one [`MkClient`].
+/// The council v2 calls of one [`CouncilClient`].
 #[derive(Clone, Copy, Debug)]
 pub struct Council<'a> {
-    mk: &'a MkClient,
+    client: &'a CouncilClient,
 }
 
-impl MkClient {
+impl CouncilClient {
     /// This client's council v2 calls.
     pub fn council(&self) -> Council<'_> {
-        Council { mk: self }
+        Council { client: self }
     }
 }
 
 /// One event of a streamed generation. A `ping`, the `output`, `progress`
 /// and `preview` events of a reply this client never asks to write objects
 /// or preview, and an event the contract does not name, are skipped; an
-/// `error` event is [`MkError::CouncilStream`].
+/// `error` event is [`CouncilError::Stream`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum GenerationEvent {
     Token(TokenEvent),
@@ -48,8 +48,8 @@ pub enum GenerationEvent {
 pub type GenerationStream = EventStream<GenerationEvent>;
 
 impl StreamItem for GenerationEvent {
-    fn decode(frame: &Frame) -> Result<Option<Self>, MkError> {
-        let event = StreamEvent::parse(&frame.event, &frame.data).map_err(|message| MkError::Decode {
+    fn decode(frame: &Frame) -> Result<Option<Self>, CouncilError> {
+        let event = StreamEvent::parse(&frame.event, &frame.data).map_err(|message| CouncilError::Decode {
             what: "event stream",
             message,
             body: excerpt(frame.data.as_bytes()),
@@ -57,7 +57,7 @@ impl StreamItem for GenerationEvent {
         match event {
             Some(StreamEvent::Token(t)) => Ok(Some(GenerationEvent::Token(t))),
             Some(StreamEvent::Done(d)) => Ok(Some(GenerationEvent::Done(d))),
-            Some(StreamEvent::Error(b)) => Err(MkError::CouncilStream { error: b.error, request_id: b.request_id }),
+            Some(StreamEvent::Error(b)) => Err(CouncilError::Stream { error: b.error, request_id: b.request_id }),
             Some(StreamEvent::Ping | StreamEvent::Output(_) | StreamEvent::Progress(_) | StreamEvent::Preview(_))
             | None => Ok(None),
         }
@@ -70,70 +70,70 @@ impl StreamItem for GenerationEvent {
 
 impl Council<'_> {
     /// `GET /council/v2/identity`.
-    pub async fn identity(&self) -> Result<ServerIdentity, MkError> {
-        self.mk
-            .json(Family::Council, Method::GET, "/council/v2/identity", None, &[], self.mk.timeout, 200, "identity")
+    pub async fn identity(&self) -> Result<ServerIdentity, CouncilError> {
+        self.client
+            .json(Method::GET, "/council/v2/identity", None, &[], self.client.timeout, 200, "identity")
             .await
     }
 
     /// `POST /council/v2/contexts`: builds `context` on the served model
     /// `model` and holds its snapshots, or, with `dry_run`, reports what a
     /// build would reuse without feeding. A context with no room is
-    /// [`MkError::ContextFull`].
-    pub async fn build_context(&self, model: &str, context: &Context, dry_run: bool) -> Result<ContextBuilt, MkError> {
+    /// [`CouncilError::ContextFull`].
+    pub async fn build_context(&self, model: &str, context: &Context, dry_run: bool) -> Result<ContextBuilt, CouncilError> {
         context.check()?;
         let body = ContextBuild { model: model.to_string(), context: context.clone(), dry_run: dry_run.then_some(true), class: None, priority: None };
-        self.mk
-            .json(Family::Council, Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.mk.timeout, 200, "context build")
+        self.client
+            .json(Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.client.timeout, 200, "context build")
             .await
     }
 
     /// `GET /council/v2/snapshots/{id}`. A snapshot the server does not hold
     /// is a 404.
-    pub async fn snapshot(&self, id: &SnapshotId) -> Result<SnapshotDetail, MkError> {
+    pub async fn snapshot(&self, id: &SnapshotId) -> Result<SnapshotDetail, CouncilError> {
         let path = format!("/council/v2/snapshots/{id}");
-        self.mk.json(Family::Council, Method::GET, &path, None, &[], self.mk.timeout, 200, "snapshot").await
+        self.client.json(Method::GET, &path, None, &[], self.client.timeout, 200, "snapshot").await
     }
 
     /// `PUT /council/v2/pins/{owner}`: replaces `owner`'s whole set with
     /// `body` and renews it. Past `pin_bytes` it is a 413 that pins nothing.
-    pub async fn put_pins(&self, owner: &str, body: &PinsPut) -> Result<PinsPutResult, MkError> {
+    pub async fn put_pins(&self, owner: &str, body: &PinsPut) -> Result<PinsPutResult, CouncilError> {
         let path = pins_path(owner)?;
         body.validate()?;
-        self.mk.json(Family::Council, Method::PUT, &path, Some(to_body(body)?), &[], self.mk.timeout, 200, "pins").await
+        self.client.json(Method::PUT, &path, Some(to_body(body)?), &[], self.client.timeout, 200, "pins").await
     }
 
     /// `GET /council/v2/pins/{owner}`. An owner with no pins is a 404.
-    pub async fn get_pins(&self, owner: &str) -> Result<PinSet, MkError> {
+    pub async fn get_pins(&self, owner: &str) -> Result<PinSet, CouncilError> {
         let path = pins_path(owner)?;
-        self.mk.json(Family::Council, Method::GET, &path, None, &[], self.mk.timeout, 200, "pin set").await
+        self.client.json(Method::GET, &path, None, &[], self.client.timeout, 200, "pin set").await
     }
 
     /// `DELETE /council/v2/pins/{owner}`. An owner with no pins is a 404.
-    pub async fn delete_pins(&self, owner: &str) -> Result<(), MkError> {
+    pub async fn delete_pins(&self, owner: &str) -> Result<(), CouncilError> {
         let path = pins_path(owner)?;
-        self.mk.call(Family::Council, Method::DELETE, &path, None, &[], self.mk.timeout, 204).await.map(|_| ())
+        self.client.call(Method::DELETE, &path, None, &[], self.client.timeout, 204).await.map(|_| ())
     }
 
     /// `POST /council/v2/specs` with the spec's JSON. Fails with
-    /// [`MkError::SpecIdMismatch`] when the server's id is not the spec's
+    /// [`CouncilError::SpecIdMismatch`] when the server's id is not the spec's
     /// canonical id.
-    pub async fn post_spec(&self, spec: &Spec) -> Result<HeldSpec, MkError> {
+    pub async fn post_spec(&self, spec: &Spec) -> Result<HeldSpec, CouncilError> {
         let held: HeldSpec = self
-            .mk
-            .json(Family::Council, Method::POST, "/council/v2/specs", Some(to_body(&spec.value)?), &[], self.mk.timeout, 200, "held spec")
+            .client
+            .json(Method::POST, "/council/v2/specs", Some(to_body(&spec.value)?), &[], self.client.timeout, 200, "held spec")
             .await?;
         let computed = spec.id();
         if held.spec_id.as_str() != computed {
-            return Err(MkError::SpecIdMismatch { computed, server: held.spec_id.to_string() });
+            return Err(CouncilError::SpecIdMismatch { computed, server: held.spec_id.to_string() });
         }
         Ok(held)
     }
 
     /// `GET /council/v2/specs/{spec_id}`.
-    pub async fn get_spec(&self, id: &SpecId) -> Result<HeldSpec, MkError> {
+    pub async fn get_spec(&self, id: &SpecId) -> Result<HeldSpec, CouncilError> {
         let path = format!("/council/v2/specs/{id}");
-        self.mk.json(Family::Council, Method::GET, &path, None, &[], self.mk.timeout, 200, "held spec").await
+        self.client.json(Method::GET, &path, None, &[], self.client.timeout, 200, "held spec").await
     }
 
     /// `POST /council/v2/decisions`, sending `traceparent` for this call
@@ -143,44 +143,44 @@ impl Council<'_> {
         request: &DecisionRequest,
         timeout: Duration,
         traceparent: Option<&str>,
-    ) -> Result<DecisionResponse, MkError> {
+    ) -> Result<DecisionResponse, CouncilError> {
         request.validate()?;
         let mut headers = Vec::new();
         if let Some(tp) = traceparent {
             headers.push(("traceparent", tp.to_string()));
         }
-        self.mk
-            .json(Family::Council, Method::POST, "/council/v2/decisions", Some(to_body(request)?), &headers, timeout, 200, "decision")
+        self.client
+            .json(Method::POST, "/council/v2/decisions", Some(to_body(request)?), &headers, timeout, 200, "decision")
             .await
     }
 
     /// `POST /council/v2/reads`.
-    pub async fn reads(&self, request: &ReadsRequest, timeout: Duration) -> Result<ReadsResponse, MkError> {
+    pub async fn reads(&self, request: &ReadsRequest, timeout: Duration) -> Result<ReadsResponse, CouncilError> {
         request.validate()?;
-        self.mk
-            .json(Family::Council, Method::POST, "/council/v2/reads", Some(to_body(request)?), &[], timeout, 200, "reads")
+        self.client
+            .json(Method::POST, "/council/v2/reads", Some(to_body(request)?), &[], timeout, 200, "reads")
             .await
     }
 
     /// `POST /council/v2/embeddings`. The server checks the request against
     /// the served model it names (`EmbeddingsRequest::check` holds the same
     /// rules for a caller that has the model's identity); a refusal is
-    /// [`MkError::Status`] with the parameter it names. `timeout` bounds the
+    /// [`CouncilError::Status`] with the parameter it names. `timeout` bounds the
     /// whole call.
-    pub async fn embeddings(&self, request: &EmbeddingsRequest, timeout: Duration) -> Result<EmbeddingsResponse, MkError> {
-        self.mk
-            .json(Family::Council, Method::POST, "/council/v2/embeddings", Some(to_body(request)?), &[], timeout, 200, "embeddings")
+    pub async fn embeddings(&self, request: &EmbeddingsRequest, timeout: Duration) -> Result<EmbeddingsResponse, CouncilError> {
+        self.client
+            .json(Method::POST, "/council/v2/embeddings", Some(to_body(request)?), &[], timeout, 200, "embeddings")
             .await
     }
 
     /// `POST /council/v2/generations` without streaming; the call sets
     /// `stream`. `timeout` bounds the whole call. A prompt with no room is
-    /// [`MkError::ContextFull`].
-    pub async fn generate(&self, request: &GenerationRequest, timeout: Duration) -> Result<GenerationDone, MkError> {
+    /// [`CouncilError::ContextFull`].
+    pub async fn generate(&self, request: &GenerationRequest, timeout: Duration) -> Result<GenerationDone, CouncilError> {
         let request = GenerationRequest { stream: Some(false), ..request.clone() };
         request.validate()?;
-        self.mk
-            .json(Family::Council, Method::POST, "/council/v2/generations", Some(to_body(&request)?), &[], timeout, 200, "done")
+        self.client
+            .json(Method::POST, "/council/v2/generations", Some(to_body(&request)?), &[], timeout, 200, "done")
             .await
     }
 
@@ -188,15 +188,15 @@ impl Council<'_> {
     /// `done`; the call sets `stream`. `idle` bounds the wait for the
     /// response and then each read. Dropping the stream closes the
     /// connection, which cancels the reply. A prompt with no room is
-    /// [`MkError::ContextFull`], before any event.
-    pub async fn generate_stream(&self, request: &GenerationRequest, idle: Duration) -> Result<GenerationStream, MkError> {
+    /// [`CouncilError::ContextFull`], before any event.
+    pub async fn generate_stream(&self, request: &GenerationRequest, idle: Duration) -> Result<GenerationStream, CouncilError> {
         let request = GenerationRequest { stream: Some(true), ..request.clone() };
         request.validate()?;
-        self.mk.open_stream(Family::Council, "/council/v2/generations", to_body(&request)?, idle).await
+        self.client.open_stream("/council/v2/generations", to_body(&request)?, idle).await
     }
 }
 
-fn pins_path(owner: &str) -> Result<String, MkError> {
+fn pins_path(owner: &str) -> Result<String, CouncilError> {
     validate_owner(owner)?;
     let mut path = String::from("/council/v2/pins/");
     for b in owner.bytes() {
@@ -220,11 +220,11 @@ mod tests {
     use super::*;
     use crate::test_server::{reply, serve, sse};
 
-    fn client(base: &str) -> MkClient {
-        MkClient::new(base, Duration::from_secs(5)).unwrap()
+    fn client(base: &str) -> CouncilClient {
+        CouncilClient::new(base, Duration::from_secs(5)).unwrap()
     }
 
-    fn fake() -> (Server, MkClient) {
+    fn fake() -> (Server, CouncilClient) {
         let server = Server::start(Config::default()).unwrap();
         let c = client(&server.url());
         (server, c)
@@ -293,7 +293,7 @@ mod tests {
         let (server, c) = fake();
         server.set_status(TOY, gogi_fake::ModelStatus::Loading).unwrap();
         let err = c.council().build_context(TOY, &chat(), false).await.unwrap_err();
-        let MkError::Status { status: 503, error: Some(e), .. } = &err else { panic!("{err:?}") };
+        let CouncilError::Status { status: 503, error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!((e.r#type, e.model.as_deref(), e.status), (ErrorType::ModelUnavailable, Some(TOY), Some(gogi_fake::ModelStatus::Loading)));
         server.set_status(TOY, gogi_fake::ModelStatus::Ready).unwrap();
         c.council().build_context(TOY, &chat(), false).await.unwrap();
@@ -366,7 +366,7 @@ mod tests {
     /// The fake's served model that only embeds.
     const EMBED: &str = "embed-toy-1";
 
-    fn fake_embedder(context_tokens: Option<usize>) -> (Server, MkClient) {
+    fn fake_embedder(context_tokens: Option<usize>) -> (Server, CouncilClient) {
         let mut config = Config::default();
         config.models.push(gogi_fake::FakeModel::embedding(EMBED, 7));
         if let Some(tokens) = context_tokens {
@@ -429,14 +429,14 @@ mod tests {
     async fn the_servers_refusals_name_their_parameter() {
         let (_server, c) = fake_embedder(Some(64));
         let err = c.council().embeddings(&embed_request("no-such-task", &["alpha"]), Duration::from_secs(5)).await.unwrap_err();
-        let MkError::Status { status: 400, error: Some(e), .. } = &err else { panic!("{err:?}") };
+        let CouncilError::Status { status: 400, error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!(e.param.as_deref(), Some("task"));
 
         let identity = c.council().identity().await.unwrap();
         let task = identity.route(EMBED).unwrap().embeddings.as_ref().unwrap().tasks[0].clone();
         let long = "x".repeat(10_000);
         let err = c.council().embeddings(&embed_request(&task, &[&long]), Duration::from_secs(5)).await.unwrap_err();
-        let MkError::Status { status: 413, error: Some(e), .. } = &err else { panic!("{err:?}") };
+        let CouncilError::Status { status: 413, error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!((e.r#type, e.param.as_deref()), (ErrorType::TooLarge, Some("context_tokens")));
     }
 
@@ -488,15 +488,15 @@ mod tests {
         let (base, seen) = serve(vec![]).await;
         let c = client(&base);
         let user_reasoning = Context::new(true, vec![Message { reasoning: Some("r".into()), ..Message::user("u") }]);
-        assert!(matches!(c.council().build_context(TOY, &user_reasoning, false).await, Err(MkError::Request(_))));
-        assert!(matches!(c.council().build_context(TOY, &Context::new(true, vec![]), false).await, Err(MkError::Request(_))));
-        assert!(matches!(c.council().get_pins("a/b").await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().build_context(TOY, &user_reasoning, false).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.council().build_context(TOY, &Context::new(true, vec![]), false).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.council().get_pins("a/b").await, Err(CouncilError::Request(_))));
         let forever = PinsPut { snapshots: vec![], ttl_s: 86_401 };
-        assert!(matches!(c.council().put_pins("k", &forever).await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().put_pins("k", &forever).await, Err(CouncilError::Request(_))));
         let empty = GenerationRequest { max_tokens: 0, ..greedy(chat()) };
-        assert!(matches!(c.council().generate(&empty, Duration::from_secs(1)).await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().generate(&empty, Duration::from_secs(1)).await, Err(CouncilError::Request(_))));
         let number = DecisionRequest { model: TOY.into(), case: json!(3), spec_id: gate_spec().id(), ..DecisionRequest::default() };
-        assert!(matches!(c.council().decide_traced(&number, Duration::from_secs(1), None).await, Err(MkError::Request(_))));
+        assert!(matches!(c.council().decide_traced(&number, Duration::from_secs(1), None).await, Err(CouncilError::Request(_))));
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -506,7 +506,7 @@ mod tests {
         let held = json!({"spec_id": format!("blake3:{}", "0".repeat(64)), "spec": spec.value});
         let (base, _) = serve(vec![reply(200, held.to_string())]).await;
         let err = client(&base).council().post_spec(&spec).await.unwrap_err();
-        assert!(matches!(&err, MkError::SpecIdMismatch { computed, .. } if *computed == spec.id()), "{err:?}");
+        assert!(matches!(&err, CouncilError::SpecIdMismatch { computed, .. } if *computed == spec.id()), "{err:?}");
     }
 
     /// A prompt that leaves no room is a 413 of type `context_full`, before
@@ -523,32 +523,31 @@ mod tests {
         let (base, _) = serve(vec![reply(413, full.clone()), reply(413, full), reply(413, too_large)]).await;
         let c = client(&base);
         let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
-        let MkError::ContextFull { message, body, .. } = &err else { panic!("{err:?}") };
+        let CouncilError::ContextFull { message, body, .. } = &err else { panic!("{err:?}") };
         assert!(message.contains("32760") && body.contains("context_tokens"), "{message} {body}");
         assert_eq!(err.status(), Some(413));
         let err = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
-        assert!(matches!(err, MkError::ContextFull { .. }), "{err:?}");
+        assert!(matches!(err, CouncilError::ContextFull { .. }), "{err:?}");
         let err = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
-        assert!(matches!(err, MkError::Status { status: 413, .. }), "another 413 stays a status: {err:?}");
+        assert!(matches!(err, CouncilError::Status { status: 413, .. }), "another 413 stays a status: {err:?}");
     }
 
     /// The fake's context limit is reached by a long enough context, and
-    /// the client reads its answer as [`MkError::ContextFull`].
+    /// the client reads its answer as [`CouncilError::ContextFull`].
     #[tokio::test]
     async fn the_fakes_context_limit_is_context_full() {
         let server = Server::start(Config { context_tokens: 256, ..Config::default() }).unwrap();
         let c = client(&server.url());
         let long = Context::new(true, vec![Message::user("x".repeat(400))]);
         let err = c.council().generate(&greedy(long), Duration::from_secs(5)).await.unwrap_err();
-        assert!(matches!(err, MkError::ContextFull { .. }), "{err:?}");
+        assert!(matches!(err, CouncilError::ContextFull { .. }), "{err:?}");
     }
 
     /// A stream cut before `done` is truncated. An `error` event ends it as
-    /// [`MkError::CouncilStream`] with the request id, and a `ping` or an
+    /// [`CouncilError::Stream`] with the request id, and a `ping` or an
     /// event the contract does not name is skipped.
     ///
-    /// Falsified by a ping or an unknown event that ends the stream, or an
-    /// error event decoded in `/mk/v1`'s shape.
+    /// Falsified by a ping or an unknown event that ends the stream.
     #[tokio::test]
     async fn a_generation_cut_before_done_is_truncated_and_an_error_event_ends_it() {
         let token = json!({"id": 1, "piece": "Fi", "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
@@ -562,16 +561,56 @@ mod tests {
             assert_eq!(t.phase, gogi_proto::generation::Phase::Content);
             let last = s.next().await.unwrap();
             match want_stream_error {
-                false => assert!(matches!(last, Err(MkError::Truncated(_))), "{last:?}"),
+                false => assert!(matches!(last, Err(CouncilError::Truncated(_))), "{last:?}"),
                 true => {
                     let Err(err) = last else { panic!("{last:?}") };
-                    assert!(matches!(&err, MkError::CouncilStream { request_id: Some(id), .. } if id == "req_7"), "{err:?}");
+                    assert!(matches!(&err, CouncilError::Stream { request_id: Some(id), .. } if id == "req_7"), "{err:?}");
                     assert_eq!(err.status(), Some(503));
                     assert!(err.to_string().contains("(request req_7)"), "{err}");
                 }
             }
             assert!(s.next().await.is_none());
         }
+    }
+
+    /// A streamed generation that stalls, or a response that is slow to
+    /// start, is a timeout once it waits longer than `idle`.
+    ///
+    /// Falsified by an idle bound that covers only the response or only
+    /// the reads.
+    #[tokio::test]
+    async fn a_stalled_generation_is_a_timeout() {
+        let token = json!({"id": 1, "piece": "Fi", "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
+        let body = format!("event: token\ndata: {token}\n\nevent: token\ndata: {token}\n\n");
+        let mut slow = sse(body.clone());
+        slow.stall = Some(Duration::from_millis(800));
+        let mut late = sse(body);
+        late.delay = Duration::from_millis(800);
+        let (base, _) = serve(vec![slow, late]).await;
+        let c = client(&base);
+        let mut s = c.council().generate_stream(&greedy(chat()), Duration::from_millis(150)).await.unwrap();
+        let last = loop {
+            match s.next().await.unwrap() {
+                Ok(GenerationEvent::Token(_)) => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(last, Err(CouncilError::Timeout)), "{last:?}");
+        let err = c.council().generate_stream(&greedy(chat()), Duration::from_millis(150)).await.err().unwrap();
+        assert!(matches!(err, CouncilError::Timeout), "{err:?}");
+    }
+
+    /// A streamed generation answered with a JSON body, or with a success
+    /// status other than 200, is refused rather than read as a reply.
+    #[tokio::test]
+    async fn a_generation_that_is_not_a_200_stream_is_refused() {
+        let accepted = crate::test_server::Reply { status: 202, ..sse("event: ping\ndata: {}\n\n") };
+        let (base, _) = serve(vec![reply(200, "{}"), accepted]).await;
+        let c = client(&base);
+        let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
+        assert!(matches!(err, CouncilError::Decode { what: "content type", .. }), "{err:?}");
+        let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
+        assert!(matches!(err, CouncilError::Decode { what: "status", .. }), "{err:?}");
     }
 
     /// An error status names its request by the `request-id` header, else
@@ -584,7 +623,7 @@ mod tests {
         let c = client(&base);
         for want in ["req_head", "req_body"] {
             let err = c.council().identity().await.unwrap_err();
-            assert!(matches!(&err, MkError::Status { status: 429, request_id: Some(id), .. } if id == want), "{err:?}");
+            assert!(matches!(&err, CouncilError::Status { status: 429, request_id: Some(id), .. } if id == want), "{err:?}");
             assert!(err.to_string().ends_with(&format!("(request {want})")), "{err}");
         }
     }

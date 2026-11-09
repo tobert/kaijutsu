@@ -371,7 +371,7 @@ mod tests {
     }
 
     /// The program spec parses under mkviolet's rules, asks only choice
-    /// questions (the megakernel does not answer `text`), and holds the
+    /// questions (the council server does not answer `text`), and holds the
     /// rubric the gate decides a program from.
     #[test]
     fn council_program_gate_spec_holds_the_rubric_and_the_verdict() {

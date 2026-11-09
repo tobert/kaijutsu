@@ -48,7 +48,7 @@ use gogi_proto::spec::{QuestionKind, Spec};
 use gogi_proto::decision::{
     DecisionRequest, DecisionResponse, Pool, PoolMethod, PoolWeights, PooledAnswer, ReadAnswer,
 };
-use kaijutsu_mk::MkError;
+use kaijutsu_council::CouncilError;
 use kaijutsu_types::{ContextId, PrincipalId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -589,29 +589,27 @@ fn read_of(read: &gogi_proto::decision::Read) -> String {
 }
 
 /// A council failure that produced no response, in plain words.
-pub(crate) fn failure_cause(error: &MkError, deadline_ms: u64) -> String {
+pub(crate) fn failure_cause(error: &CouncilError, deadline_ms: u64) -> String {
     match error {
-        MkError::Timeout => format!("no answer within the {deadline_ms} ms deadline"),
-        MkError::Status { status, error: Some(detail), request_id, .. } => {
+        CouncilError::Timeout => format!("no answer within the {deadline_ms} ms deadline"),
+        CouncilError::Status { status, error: Some(detail), request_id, .. } => {
             format!("the council server answered {status} ({:?}: {}){}", detail.r#type, detail.message, request_note(request_id))
         }
-        MkError::Status { status, body, request_id, .. } => {
+        CouncilError::Status { status, body, request_id, .. } => {
             format!("the council server answered {status}: {}{}", body.chars().take(200).collect::<String>(), request_note(request_id))
         }
-        MkError::Transport(e) => format!("the council server could not be reached: {e}"),
-        MkError::Decode { what, message, .. } => format!("the answer is outside the schema ({what}): {message}"),
-        MkError::Request(e) => format!("the kernel built a request the contract refuses: {e}"),
-        MkError::SpecIdMismatch { computed, server } => {
+        CouncilError::Transport(e) => format!("the council server could not be reached: {e}"),
+        CouncilError::Decode { what, message, .. } => format!("the answer is outside the schema ({what}): {message}"),
+        CouncilError::Request(e) => format!("the kernel built a request the contract refuses: {e}"),
+        CouncilError::SpecIdMismatch { computed, server } => {
             format!("the server holds the spec as {server}, not {computed}")
         }
-        // Only `/mk/v1` routes and generations produce these; a decision
-        // never does.
-        other @ (MkError::Service { .. }
-        | MkError::Stream(_)
-        | MkError::CouncilStream { .. }
-        | MkError::Truncated(_)
-        | MkError::ContextFull { .. }) => {
-            format!("the megakernel failed outside the council contract: {other}")
+        // Only streamed generations and context builds produce these; a
+        // decision never does.
+        other @ (CouncilError::Stream { .. }
+        | CouncilError::Truncated(_)
+        | CouncilError::ContextFull { .. }) => {
+            format!("the council server failed outside the decision contract: {other}")
         }
     }
 }
@@ -642,7 +640,7 @@ pub(crate) fn queue_ms(waits: &SlotWaits, server_queue_ms: Option<f64>) -> i64 {
 /// next prepare posts again. A 400 naming a context's `thinking` means the
 /// served model changed what it declares, so the server's identity is read
 /// again, and each seat whose `thinking` changes is built again.
-fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared, server: &str) {
+fn forget_after(kernel: &crate::Kernel, error: &CouncilError, prepared: &Prepared, server: &str) {
     if error.status() == Some(404) {
         kernel.council_sync().invalidate_spec(&prepared.spec_id);
     }
@@ -677,7 +675,7 @@ pub(crate) async fn prepare_within(
 /// Send `request` and wait for the answer until `deadline`, with the time
 /// left as the call's own timeout. The call takes a slot at the server's
 /// endpoint first, and a 429 is sent again after its cooldown
-/// (`llm::endpoint::mk_call`); slot waits are added to `waits`. A 404
+/// (`llm::endpoint::council_call`); slot waits are added to `waits`. A 404
 /// forgets the spec, and a 400 naming `thinking` the identity
 /// ([`forget_after`]). Every failure is a miss cause.
 pub(crate) async fn ask_within(
@@ -700,9 +698,9 @@ pub(crate) async fn ask_within(
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         prepared.client.council().decide_traced(request, left, traceparent.as_deref()).await
     };
-    let answer = tokio::time::timeout_at(deadline, crate::llm::endpoint::mk_call(&prepared.endpoint, deadline, waits, decide)).await;
+    let answer = tokio::time::timeout_at(deadline, crate::llm::endpoint::council_call(&prepared.endpoint, deadline, waits, decide)).await;
     match answer {
-        Err(_) | Ok(Ok((_, Err(MkError::Timeout)))) => Err(deadline_cause(council.deadline_ms, "the decision", waits)),
+        Err(_) | Ok(Ok((_, Err(CouncilError::Timeout)))) => Err(deadline_cause(council.deadline_ms, "the decision", waits)),
         Ok(Err(no_slot)) => Err(no_slot_cause(council.deadline_ms, &no_slot)),
         Ok(Ok((_, Err(error)))) => {
             forget_after(kernel, &error, prepared, &council.server);
@@ -2088,7 +2086,7 @@ mod tests {
 
     /// The spec with a `text` question, `effect`, from gogi's example.
     fn example_spec() -> gogi_proto::spec::Spec {
-        crate::council::parse_spec(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap()
+        crate::council::parse_spec(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap()
     }
 
     fn council(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
@@ -2286,12 +2284,12 @@ mod tests {
 
     #[test]
     fn failures_read_as_plain_causes() {
-        assert_eq!(failure_cause(&MkError::Timeout, 700), "no answer within the 700 ms deadline");
-        let status = MkError::Status { status: 503, error: None, retry_after: None, body: "busy".into(), request_id: None };
+        assert_eq!(failure_cause(&CouncilError::Timeout, 700), "no answer within the 700 ms deadline");
+        let status = CouncilError::Status { status: 503, error: None, retry_after: None, body: "busy".into(), request_id: None };
         assert!(failure_cause(&status, 700).contains("503"));
-        let named = MkError::Status { status: 503, error: None, retry_after: None, body: "busy".into(), request_id: Some("req_9".into()) };
+        let named = CouncilError::Status { status: 503, error: None, retry_after: None, body: "busy".into(), request_id: Some("req_9".into()) };
         assert!(failure_cause(&named, 700).ends_with("(request req_9)"), "{}", failure_cause(&named, 700));
-        let transport = MkError::Transport("connection refused".into());
+        let transport = CouncilError::Transport("connection refused".into());
         assert!(failure_cause(&transport, 700).contains("could not be reached"));
     }
 
@@ -2303,7 +2301,7 @@ mod tests {
             "capabilities": []})).unwrap();
         let spec = example_spec();
         Prepared {
-            client: kaijutsu_mk::MkClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
+            client: kaijutsu_council::CouncilClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
             endpoint: crate::llm::endpoint::Endpoints::default().get("http://127.0.0.1:1"),
             identity,
             spec_id: gogi_proto::SpecId::parse(spec.id()).unwrap(),

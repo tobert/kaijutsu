@@ -13,7 +13,7 @@ kaijutsu-types.workspace = true
 # Embedding service clients: the council API's embeddings route, and any
 # OpenAI-compatible /embeddings endpoint
 gogi-proto.workspace = true
-kaijutsu-mk.workspace = true
+kaijutsu-council.workspace = true
 async-trait.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 
@@ -46,6 +46,6 @@ sha2 = "0.10"
 
 [dev-dependencies]
 gogi-fake = { workspace = true }
-kaijutsu-mk = { workspace = true, features = ["test-util"] }
+kaijutsu-council = { workspace = true, features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
 tempfile = { workspace = true }

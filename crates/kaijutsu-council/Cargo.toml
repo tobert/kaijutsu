@@ -1,9 +1,9 @@
 [package]
-name = "kaijutsu-mk"
+name = "kaijutsu-council"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Megakernel client: the HTTP transport for the council API (gogi-proto types) and /mk/v1"
+description = "The HTTP client for a council v2 server, over gogi-proto types"
 
 [lints]
 workspace = true
@@ -23,4 +23,3 @@ tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 gogi-fake = { workspace = true }
-jsonschema = { version = "0.58.6", default-features = false }

@@ -583,7 +583,7 @@ data: {\"type\":\"message_stop\"}
     /// Mirrors `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
     #[tokio::test]
     async fn outbound_requests_carry_the_kaijutsu_user_agent() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let (base, seen) = serve(vec![sse(SIMPLE_COMPLETION)]).await;
         let mut stream = Client::new("fake-key").unwrap()
             .with_base_url(&base)
@@ -602,7 +602,7 @@ data: {\"type\":\"message_stop\"}
     /// request waits it out.
     #[tokio::test]
     async fn a_503_cools_the_endpoint() {
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         let (base, _) = serve(vec![reply(503, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
@@ -618,7 +618,7 @@ data: {\"type\":\"message_stop\"}
     #[tokio::test]
     async fn a_stream_dumps_the_body_the_server_received() {
         use crate::llm::request_dump::{RequestTrace, wait_for_files};
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         use kaijutsu_types::{ContextId, TurnId};
         let (base, seen) = serve(vec![reply(500, r#"{"type": "error", "error": {"type": "api_error", "message": "x"}}"#)]).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -636,7 +636,7 @@ data: {\"type\":\"message_stop\"}
     /// `RateLimited`.
     #[tokio::test]
     async fn a_429_cools_the_endpoint_for_its_retry_after() {
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         let mut busy = reply(429, r#"{"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}"#);
         busy.headers.push(("retry-after", "3".into()));
         let (base, _) = serve(vec![busy]).await;
@@ -656,7 +656,7 @@ data: {\"type\":\"message_stop\"}
     /// Falsified by a stream whose end leaves a busy answer counted.
     #[tokio::test]
     async fn a_stream_that_ends_whole_resets_the_doubling() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(SIMPLE_COMPLETION)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
@@ -674,7 +674,7 @@ data: {\"type\":\"message_stop\"}
     /// Falsified by a failed stream that still calls `completed`.
     #[tokio::test]
     async fn a_stream_that_ends_in_an_error_keeps_the_doubling() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let paused = SIMPLE_COMPLETION.replace("end_turn", "pause_turn");
         let (base, _) = serve(vec![sse(&paused)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
@@ -696,7 +696,7 @@ data: {\"type\":\"message_stop\"}
     /// the request fails before it is sent.
     #[tokio::test]
     async fn thinking_off_for_an_always_on_model_never_reaches_the_wire() {
-        use kaijutsu_mk::test_server::serve;
+        use kaijutsu_council::test_server::serve;
         let (base, seen) = serve(vec![]).await;
         let mut opts = BuildOpts::new("claude-sonnet-5-5", 4096);
         opts.thinking_style = Some("off".into());
@@ -711,7 +711,7 @@ data: {\"type\":\"message_stop\"}
     /// Falsified by a 529 the limiter never hears about.
     #[tokio::test]
     async fn a_529_cools_the_endpoint_as_a_503() {
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         let (base, _) = serve(vec![reply(529, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_1"}"#)]).await;
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
         let client = Client::new("k").unwrap().with_base_url(&base).with_endpoint(endpoint.clone());
@@ -745,7 +745,7 @@ data: {\"type\":\"message_stop\"}
     /// that leaves the stream open.
     #[tokio::test]
     async fn a_mid_stream_overloaded_error_cools_the_endpoint_and_ends_the_stream() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let cut = &SIMPLE_COMPLETION[..SIMPLE_COMPLETION.find("event: content_block_stop").unwrap()];
         let failed = format!(
             "{cut}event: error\ndata: {}\n\n{}",

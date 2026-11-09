@@ -248,7 +248,7 @@ fn report_divergence(
 /// OpenAI-compatible providers (DeepSeek) count the hit inside `tokens_in`, so
 /// theirs are logged as `cache_hit`/`cache_miss`, which a reader must not add.
 /// Alibaba's `cache_write`, logged when nonzero, is inside `tokens_in` too.
-/// The megakernel's `kept` (held prefix) and `fed` are inside `tokens_in` too.
+/// A council server's `kept` (held prefix) and `fed` are inside `tokens_in` too.
 /// The provider's counts for one call, as reported. Cache reads and writes
 /// come from the provider-specific extra; nothing is added or subtracted
 /// (see [`crate::RawUsage`]).
@@ -266,8 +266,8 @@ fn raw_usage(
             c.cache_creation_1h_input_tokens,
             0,
         ),
-        // A held prefix is the megakernel's cache hit.
-        Some(UsageExtra::Mk(m)) => (m.kept, 0, 0, 0),
+        // A held prefix is the council server's cache hit.
+        Some(UsageExtra::Council(m)) => (m.kept, 0, 0, 0),
         None => (0, 0, 0, 0),
     };
     crate::RawUsage {
@@ -295,7 +295,7 @@ fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
             ", cache_hit={}, cache_miss={}",
             d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens
         ),
-        Some(UsageExtra::Mk(m)) => format!(
+        Some(UsageExtra::Council(m)) => format!(
             ", kept={}, fed={}, first_token_ms={}, wall_ms={}{}",
             m.kept,
             m.fed,
@@ -4765,7 +4765,7 @@ mod publish_tests {
     /// retries.
     #[tokio::test]
     async fn an_insufficient_balance_answer_sends_one_request() {
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         tokio::task::LocalSet::new().run_until(async {
             let body = r#"{"error":{"message":"Insufficient Balance","type":"unknown_error"}}"#;
             let (base, captured) = serve(vec![reply(402, body), reply(402, body), reply(402, body)]).await;

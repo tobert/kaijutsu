@@ -545,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn other_dialects_carry_no_alibaba_fields() {
         use crate::llm::stream::{CacheTarget, CacheTtl};
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         for dialect in [Dialect::Generic, Dialect::DeepSeek] {
             let (base, seen) = serve(vec![sse(SIMPLE)]).await;
             let opts = BuildOpts::new("m", 4096)
@@ -582,7 +582,7 @@ mod tests {
     /// `execute()`, so a built request isn't proof — a captured request is.
     #[tokio::test]
     async fn outbound_requests_carry_the_kaijutsu_user_agent() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         // The wire check compares against `http_user_agent()`, so pin its
         // content here — a shared-const regression to some other string
         // can't pass this test unnoticed.
@@ -742,7 +742,7 @@ data: [DONE]
     #[tokio::test]
     async fn a_stream_dumps_the_body_the_server_received() {
         use crate::llm::request_dump::{RequestTrace, wait_for_files};
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         use kaijutsu_types::{ContextId, TurnId};
         let (base, seen) = serve(vec![sse(SIMPLE)]).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -768,7 +768,7 @@ data: [DONE]
     #[tokio::test]
     async fn a_request_with_no_slot_leaves_no_dump() {
         use crate::llm::request_dump::{RequestTrace, wait_for_files};
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         use kaijutsu_types::{ContextId, TurnId};
         let mut busy = reply(429, r#"{"error": {"message": "slow down", "type": "rate_limit"}}"#);
         busy.headers.push(("retry-after", "30".into()));
@@ -797,7 +797,7 @@ data: [DONE]
     /// A streamed reply holds its slot until the stream finishes.
     #[tokio::test]
     async fn a_stream_holds_its_slot_until_it_finishes() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(SIMPLE)]).await;
         let (client, endpoint) = limited(&base);
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
@@ -820,7 +820,7 @@ data: [DONE]
     /// `RateLimited`.
     #[tokio::test]
     async fn a_429_cools_the_endpoint_for_its_retry_after() {
-        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_council::test_server::{reply, serve};
         let mut busy = reply(429, r#"{"error": {"message": "slow down", "type": "rate_limit"}}"#);
         busy.headers.push(("retry-after", "3".into()));
         let (base, _) = serve(vec![busy]).await;
@@ -841,7 +841,7 @@ data: [DONE]
     /// or by a `[DONE]` that resets the doubling before the cut counts.
     #[tokio::test]
     async fn a_capacity_cut_cools_the_endpoint() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\ndata: [DONE]\n\n";
         let (base, _) = serve(vec![sse(cut)]).await;
         let (client, endpoint) = limited(&base);
@@ -868,7 +868,7 @@ data: [DONE]
     /// Falsified by a failure reported at the source end that skips the slot.
     #[tokio::test]
     async fn a_capacity_cut_without_done_cools_the_endpoint() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n";
         let (base, _) = serve(vec![sse(cut)]).await;
         let (client, endpoint) = limited(&base);
@@ -889,7 +889,7 @@ data: [DONE]
     /// machine says the reply failed.
     #[tokio::test]
     async fn a_stream_that_ends_in_an_error_keeps_the_doubling() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let bare = "data: {\"choices\":[{\"delta\":{\"content\":\"part\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
         let (base, _) = serve(vec![sse(bare)]).await;
         let (client, endpoint) = limited(&base);
@@ -913,7 +913,7 @@ data: [DONE]
     /// Falsified by an in-stream busy error that leaves the endpoint open.
     #[tokio::test]
     async fn an_in_stream_busy_error_cools_the_endpoint() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         for (kind, status) in [("rate_limit_error", 429), ("overloaded_error", 503)] {
             let body = format!("data: {{\"error\":{{\"message\":\"busy\",\"type\":\"{kind}\"}}}}\n\n");
             let (base, _) = serve(vec![sse(body)]).await;
@@ -932,7 +932,7 @@ data: [DONE]
     /// A server error event does not mean the endpoint is busy.
     #[tokio::test]
     async fn an_in_stream_server_error_leaves_the_endpoint_open() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let (base, _) = serve(vec![sse("data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n")]).await;
         let (client, endpoint) = limited(&base);
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
@@ -943,7 +943,7 @@ data: [DONE]
     /// Drain a stream served from `body`, with the endpoint primed by one busy
     /// answer, and return its events and the doubling left after it.
     async fn close_after(body: &str) -> (Vec<StreamEvent>, u32) {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(body)]).await;
         let (client, endpoint) = limited(&base);
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();
@@ -1034,7 +1034,7 @@ data: [DONE]
     /// to report a stream that "ended before Done".
     #[tokio::test]
     async fn a_failed_finish_without_done_still_reports_the_failure() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let cut = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n";
         let (base, _) = serve(vec![sse(cut)]).await;
         let (client, _endpoint) = limited(&base);
@@ -1055,7 +1055,7 @@ data: [DONE]
     /// Falsified by a stream whose end leaves a busy answer counted.
     #[tokio::test]
     async fn a_stream_that_ends_whole_resets_the_doubling() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let (base, _) = serve(vec![sse(SIMPLE)]).await;
         let (client, endpoint) = limited(&base);
         let mut stream = client.stream(BuildOpts::new("m", 4096), vec![Message::user("hi")]).await.unwrap();

@@ -1,59 +1,36 @@
-//! Translate kaijutsu [`Message`]s, tools, and tunables into a
-//! `/mk/v1/generate` request (`docs/mk.md`, "Request mapping"), or into
-//! council v2 messages (gogi's `docs/council-api.md`).
+//! Translate kaijutsu [`Message`]s, tools, and effort into council v2
+//! messages and tools (gogi's `docs/council-api.md`).
 //!
 //! - The system prompt is one `system` message, first. A kernel instruction
 //!   later in the history is a `system` message at its point, which the
-//!   service renders as its own system turn.
-//! - `/mk/v1` has no tool-call ids. Results go back as `tool` messages in
-//!   the order of the calls they answer, matched by the kernel's ids; a
-//!   history whose results do not answer exactly the preceding calls is
-//!   refused. Council v2 keeps the ids, and marks a failed result with
-//!   `is_error` where `/mk/v1` prefixes `[tool error]`.
-//! - `Reasoning` blocks go back as `reasoning_content`; the template decides
-//!   what to keep.
-//! - The service takes text only. An image becomes a visible marker.
+//!   server renders as its own system turn.
+//! - Results go back as `tool` messages in the order of the calls they
+//!   answer, each naming its call's id, and a failed result is marked with
+//!   `is_error`. A history whose results do not answer exactly the
+//!   preceding calls is refused.
+//! - `Reasoning` blocks go back as `reasoning`; the template decides what to
+//!   keep.
+//! - The server takes text only. An image becomes a visible marker.
 
-use kaijutsu_mk::Json;
 use gogi_proto::{Message as V2Message, Role as V2Role, Tool as V2Tool, ToolCall as V2ToolCall};
-use kaijutsu_mk::generate::{Function, Message as MkMessage, ReasoningEffort, Role as MkRole, Tool, ToolCallIn};
+use kaijutsu_council::Json;
 
 use crate::llm::{ContentBlock, LlmError, LlmResult, Message, MessageContent, Role, ToolDefinition};
 
-/// `effort` as the service's `thinking` and `reasoning_effort`. Absent
-/// sends neither, so the template's default applies (thinking on, `xhigh`).
-pub(super) fn effort(effort: Option<&str>) -> LlmResult<(Option<bool>, Option<ReasoningEffort>)> {
+/// Whether `effort` asks for thinking: `None` when no effort is named,
+/// `false` for `none`, and `true` for `xhigh`, `medium`, or `low`. Any
+/// other effort is refused.
+pub(super) fn effort(effort: Option<&str>) -> LlmResult<Option<bool>> {
     Ok(match effort {
-        None => (None, None),
-        Some("none") => (Some(false), None),
-        Some("xhigh") => (Some(true), Some(ReasoningEffort::Xhigh)),
-        Some("medium") => (Some(true), Some(ReasoningEffort::Medium)),
-        Some("low") => (Some(true), Some(ReasoningEffort::Low)),
+        None => None,
+        Some("none") => Some(false),
+        Some("xhigh" | "medium" | "low") => Some(true),
         Some(other) => {
             return Err(LlmError::InvalidRequest(format!(
-                "the mk backend takes effort xhigh, medium, low, or none; got {other:?}"
+                "the council backend takes effort xhigh, medium, low, or none; got {other:?}"
             )));
         }
     })
-}
-
-/// The tool definitions as the service's function tools.
-pub(super) fn tools(tools: &[ToolDefinition]) -> LlmResult<Vec<Tool>> {
-    tools
-        .iter()
-        .map(|t| {
-            let parameters: Json = serde_json::from_value(t.input_schema.clone()).map_err(|e| {
-                LlmError::InvalidRequest(format!("tool {:?} input schema is not JSON the mk client keeps: {e}", t.name))
-            })?;
-            Ok(Tool::Function {
-                function: Function {
-                    name: t.name.clone(),
-                    description: (!t.description.is_empty()).then(|| t.description.clone()),
-                    parameters: Some(parameters),
-                },
-            })
-        })
-        .collect()
 }
 
 /// The tool definitions as council v2 tools. An input schema that is not a
@@ -70,25 +47,6 @@ pub(super) fn tools_v2(tools: &[ToolDefinition]) -> LlmResult<Vec<V2Tool>> {
             _ => Err(LlmError::InvalidRequest(format!("tool {:?} input schema is not a JSON object", t.name))),
         })
         .collect()
-}
-
-/// The system prompt and history as the service's messages.
-pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<MkMessage>> {
-    Ok(walk(system, history)?
-        .into_iter()
-        .map(|m| match m {
-            Walked::System(text) => MkMessage::system(text),
-            Walked::User(text) => MkMessage::user(text),
-            Walked::Assistant { content, reasoning, calls } => MkMessage {
-                role: MkRole::Assistant,
-                content,
-                reasoning_content: reasoning,
-                tool_calls: calls.into_iter().map(|(_, name, arguments)| ToolCallIn { name, arguments }).collect(),
-            },
-            Walked::Tool { content, is_error: true, .. } => MkMessage::tool(format!("[tool error]\n{content}")),
-            Walked::Tool { content, .. } => MkMessage::tool(content),
-        })
-        .collect())
 }
 
 /// The system prompt and history as council v2 messages
@@ -135,7 +93,7 @@ pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResul
     Ok(out)
 }
 
-/// One message of the walk both shapes are built from.
+/// One message of the walk the council v2 messages are built from.
 enum Walked {
     System(String),
     User(String),
@@ -177,7 +135,7 @@ fn walk(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<Walked>> {
 }
 
 fn pairing(index: usize, detail: String) -> LlmError {
-    LlmError::InvalidRequest(format!("mk: tool results do not pair with their calls at message {index}: {detail}"))
+    LlmError::InvalidRequest(format!("council: tool results do not pair with their calls at message {index}: {detail}"))
 }
 
 /// An assistant message, and the ids of the calls it made.
@@ -196,11 +154,11 @@ fn assistant(index: usize, content: &MessageContent) -> LlmResult<(Walked, Vec<S
                     ContentBlock::ToolUse { id, name, input } => {
                         if !input.is_object() {
                             return Err(LlmError::InvalidRequest(format!(
-                                "mk: message {index}: tool call {name:?} ({id}) input is not a JSON object"
+                                "council: message {index}: tool call {name:?} ({id}) input is not a JSON object"
                             )));
                         }
                         let arguments: Json = serde_json::from_value(input.clone())
-                            .map_err(|e| LlmError::InvalidRequest(format!("mk: message {index}: tool call {id}: {e}")))?;
+                            .map_err(|e| LlmError::InvalidRequest(format!("council: message {index}: tool call {id}: {e}")))?;
                         calls.push((id.clone(), name.clone(), arguments));
                         ids.push(id.clone());
                     }
@@ -235,7 +193,7 @@ fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &m
             }
             ContentBlock::Text { text: t } => join(&mut text, t),
             ContentBlock::Image { hash, media_type, .. } => {
-                join(&mut text, &format!("[image {hash} ({media_type}) omitted: the mk backend takes text only]"))
+                join(&mut text, &format!("[image {hash} ({media_type}) omitted: the council backend takes text only]"))
             }
             ContentBlock::ToolUse { .. } | ContentBlock::Reasoning { .. } => {}
         }
@@ -300,41 +258,18 @@ mod tests {
         Message { role: Role::Assistant, content: MessageContent::Blocks(blocks), turn_scoped: false }
     }
 
-    fn wire(messages: &[MkMessage]) -> serde_json::Value {
-        serde_json::to_value(messages).unwrap()
+    fn wire(system: Option<&str>, history: &[Message]) -> serde_json::Value {
+        serde_json::to_value(messages_v2(system, history).unwrap()).unwrap()
     }
 
     #[test]
     fn the_system_prompt_is_one_message_first_and_an_empty_one_is_omitted() {
-        let m = messages(Some("rules"), &[Message::user("hi")]).unwrap();
-        assert_eq!(wire(&m), json!([{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}]));
-        assert_eq!(messages(Some(""), &[Message::user("hi")]).unwrap().len(), 1);
-        assert_eq!(messages(None, &[Message::user("hi")]).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn results_go_back_in_call_order_with_errors_marked() {
-        let history = vec![
-            Message::user("look"),
-            said(vec![
-                ContentBlock::Reasoning { text: "two calls".into(), signature: None },
-                ContentBlock::Text { text: "checking".into() },
-                call("a", "ls", json!({"path": "/"})),
-                call("b", "cat", json!({"path": "/x"})),
-            ]),
-            Message::tool_results(vec![result("b", "no such file", true), result("a", "x\ny", false)]),
-        ];
-        let m = messages(None, &history).unwrap();
         assert_eq!(
-            wire(&m),
-            json!([
-                {"role": "user", "content": "look"},
-                {"role": "assistant", "content": "checking", "reasoning_content": "two calls",
-                 "tool_calls": [{"name": "ls", "arguments": {"path": "/"}}, {"name": "cat", "arguments": {"path": "/x"}}]},
-                {"role": "tool", "content": "x\ny"},
-                {"role": "tool", "content": "[tool error]\nno such file"},
-            ])
+            wire(Some("rules"), &[Message::user("hi")]),
+            json!([{"role": "system", "content": "rules", "snap": true}, {"role": "user", "content": "hi", "snap": true}])
         );
+        assert_eq!(messages_v2(Some(""), &[Message::user("hi")]).unwrap().len(), 1);
+        assert_eq!(messages_v2(None, &[Message::user("hi")]).unwrap().len(), 1);
     }
 
     #[test]
@@ -344,9 +279,9 @@ mod tests {
             said(vec![call("c", "write", json!({"truncated_arguments": "<parameter=path>"}))]),
             Message::tool_results(vec![result("c", "This call did not run", true)]),
         ];
-        let m = messages(None, &history).unwrap();
-        assert_eq!(wire(&m)[1]["tool_calls"], json!([{"name": "write", "arguments": {"truncated_arguments": "<parameter=path>"}}]));
-        assert_eq!(wire(&m)[2], json!({"role": "tool", "content": "[tool error]\nThis call did not run"}));
+        let w = wire(None, &history);
+        assert_eq!(w[1]["tool_calls"], json!([{"id": "c", "name": "write", "input": {"truncated_arguments": "<parameter=path>"}}]));
+        assert_eq!(w[2], json!({"role": "tool", "tool_call_id": "c", "content": "This call did not run", "is_error": true, "snap": true}));
     }
 
     /// Council v2 messages keep the kernel's call ids, and `snap` falls on
@@ -393,8 +328,8 @@ mod tests {
     }
 
     /// A kernel instruction is a `system` message at its point in the
-    /// history, in both shapes, and its boundary falls where a user
-    /// message's would.
+    /// history, and its boundary falls where a user message's would. One
+    /// that follows unanswered calls is refused.
     #[test]
     fn a_kernel_instruction_is_a_system_message_at_its_point() {
         let history = vec![
@@ -403,7 +338,7 @@ mod tests {
             Message::system("You replied without a tool call."),
         ];
         assert_eq!(
-            serde_json::to_value(messages_v2(Some("rules"), &history).unwrap()).unwrap(),
+            wire(Some("rules"), &history),
             json!([
                 {"role": "system", "content": "rules", "snap": true},
                 {"role": "user", "content": "list the files", "snap": true},
@@ -411,10 +346,8 @@ mod tests {
                 {"role": "system", "content": "You replied without a tool call.", "snap": true},
             ])
         );
-        let v1 = wire(&messages(Some("rules"), &history).unwrap());
-        assert_eq!(v1[3], json!({"role": "system", "content": "You replied without a tool call."}));
         let unanswered = [Message::user("x"), said(vec![call("a", "ls", json!({}))]), Message::system("s")];
-        assert!(matches!(messages(None, &unanswered), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(messages_v2(None, &unanswered), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]
@@ -427,7 +360,7 @@ mod tests {
             vec![Message::user("x"), ask()],
             vec![Message::user("x"), ask(), ask()],
         ] {
-            assert!(matches!(messages(None, &history), Err(LlmError::InvalidRequest(_))), "{history:?}");
+            assert!(matches!(messages_v2(None, &history), Err(LlmError::InvalidRequest(_))), "{history:?}");
         }
     }
 
@@ -442,8 +375,8 @@ mod tests {
                 ContentBlock::Text { text: "and look".into() },
             ]),
         ];
-        let w = wire(&messages(None, &history).unwrap());
-        assert_eq!(w[2], json!({"role": "tool", "content": "done"}));
+        let w = wire(None, &history);
+        assert_eq!(w[2], json!({"role": "tool", "tool_call_id": "a", "content": "done", "snap": true}));
         assert_eq!(w[3]["role"], json!("user"));
         let text = w[3]["content"].as_str().unwrap();
         assert!(text.contains("[image h1 (image/png) omitted") && text.ends_with("\nand look"), "{text}");
@@ -456,33 +389,35 @@ mod tests {
             said(vec![call("a", "ls", json!("not an object"))]),
             Message::tool_results(vec![result("a", "", false)]),
         ];
-        assert!(matches!(messages(None, &history), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(messages_v2(None, &history), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]
-    fn effort_maps_to_thinking_and_reasoning_effort() {
-        assert_eq!(effort(None).unwrap(), (None, None));
-        assert_eq!(effort(Some("none")).unwrap(), (Some(false), None));
-        assert_eq!(effort(Some("low")).unwrap(), (Some(true), Some(ReasoningEffort::Low)));
-        assert_eq!(effort(Some("medium")).unwrap(), (Some(true), Some(ReasoningEffort::Medium)));
-        assert_eq!(effort(Some("xhigh")).unwrap(), (Some(true), Some(ReasoningEffort::Xhigh)));
+    fn effort_says_whether_the_turn_asks_for_thinking() {
+        assert_eq!(effort(None).unwrap(), None);
+        assert_eq!(effort(Some("none")).unwrap(), Some(false));
+        for asks in ["low", "medium", "xhigh"] {
+            assert_eq!(effort(Some(asks)).unwrap(), Some(true), "{asks}");
+        }
         for other in ["high", "max", ""] {
             assert!(matches!(effort(Some(other)), Err(LlmError::InvalidRequest(_))), "{other}");
         }
     }
 
     #[test]
-    fn tools_become_function_tools_with_their_schema() {
+    fn tools_keep_their_schema_and_a_non_object_schema_is_refused() {
         let defs = vec![
             ToolDefinition { name: "ls".into(), description: "List.".into(), input_schema: json!({"type": "object"}) },
             ToolDefinition { name: "pwd".into(), description: String::new(), input_schema: json!({"type": "object"}) },
         ];
         assert_eq!(
-            serde_json::to_value(tools(&defs).unwrap()).unwrap(),
+            serde_json::to_value(tools_v2(&defs).unwrap()).unwrap(),
             json!([
-                {"type": "function", "function": {"name": "ls", "description": "List.", "parameters": {"type": "object"}}},
-                {"type": "function", "function": {"name": "pwd", "parameters": {"type": "object"}}},
+                {"name": "ls", "description": "List.", "input_schema": {"type": "object"}},
+                {"name": "pwd", "input_schema": {"type": "object"}},
             ])
         );
+        let bad = [ToolDefinition { name: "x".into(), description: String::new(), input_schema: json!(true) }];
+        assert!(matches!(tools_v2(&bad), Err(LlmError::InvalidRequest(_))));
     }
 }

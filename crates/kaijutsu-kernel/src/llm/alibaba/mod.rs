@@ -111,7 +111,7 @@ impl Client {
 mod tests {
     use super::*;
     use crate::llm::http_user_agent;
-    use kaijutsu_mk::test_server::{serve, sse};
+    use kaijutsu_council::test_server::{serve, sse};
 
     const DONE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 
@@ -328,7 +328,7 @@ mod tests {
     }
 
     /// The captured request and its body, for one request.
-    async fn request(opts: BuildOpts, messages: Vec<Message>) -> (kaijutsu_mk::test_server::Captured, serde_json::Value) {
+    async fn request(opts: BuildOpts, messages: Vec<Message>) -> (kaijutsu_council::test_server::Captured, serde_json::Value) {
         let (base, seen) = serve(vec![sse(DONE)]).await;
         let mut stream = Client::new("alibaba", &base, "k").stream(opts, messages).await.expect("request is sent");
         while stream.next_event().await.is_some() {}

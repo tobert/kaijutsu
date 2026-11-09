@@ -3401,7 +3401,7 @@ mod tests {
     #[tokio::test]
     async fn a_summary_runs_with_the_distill_slots_tunables() {
         use crate::llm::{Provider, deepseek};
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         use std::sync::Arc;
         let d = test_dispatcher().await;
         let plain = distilling_context(&d, vec![]).await;

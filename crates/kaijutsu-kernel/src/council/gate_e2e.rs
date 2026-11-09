@@ -34,7 +34,7 @@ use crate::mcp::{
 /// gogi's example shell spec without its `text` question, as the shipped
 /// default holds it while the server does not declare `describe`.
 fn spec_text() -> String {
-    let mut spec: serde_json::Value = serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
+    let mut spec: serde_json::Value = serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
     spec["questions"].as_array_mut().unwrap().retain(|q| q["type"] != "text");
     spec.to_string()
 }
@@ -356,7 +356,7 @@ async fn serve() -> Mock {
                     _ => Reply { status: 404, body: "{}".into(), delay: Duration::ZERO },
                 };
                 tokio::time::sleep(reply.delay).await;
-                // The megakernel answers a 429 with `Retry-After: 1` (`docs/mk-admission.md`).
+                // The council server answers a 429 with `Retry-After: 1` (`docs/retries-and-ratelimits.md`).
                 let retry_after = if reply.status == 429 { "retry-after: 1\r\n" } else { "" };
                 let out = format!(
                     "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{retry_after}connection: close\r\n\r\n{}",
@@ -1255,7 +1255,7 @@ async fn a_decision_that_cannot_get_a_slot_is_a_miss_naming_the_wait() {
 }
 
 /// The council server refuses a request past its limit with 429 before any
-/// work starts (`docs/mk-admission.md`), so the gate sends the same
+/// work starts (`docs/retries-and-ratelimits.md`), so the gate sends the same
 /// decision again after `Retry-After`, within its deadline, and records the
 /// wait as `queue_ms`.
 ///

@@ -31,6 +31,7 @@ pub mod alibaba;
 pub mod claude;
 pub mod codex;
 pub mod config;
+pub mod council;
 pub mod db_config;
 pub mod deepseek;
 pub mod endpoint;
@@ -38,7 +39,6 @@ pub(crate) mod hydrate;
 pub mod prefix;
 pub mod image_cache;
 pub mod mailbox;
-pub mod mk;
 pub mod openai;
 pub mod request_dump;
 pub(crate) mod splice;
@@ -53,7 +53,7 @@ pub use config::{
 pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, MkUsageExtra, OpenAiCompatUsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, CouncilUsageExtra, OpenAiCompatUsageExtra,
     InlineToolResult, RetryDisposition, SpentUsage, StreamError, StreamErrorKind, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
@@ -321,7 +321,7 @@ pub enum ContentBlock {
     /// Assistant reasoning preserved across tool-use iterations within a
     /// single agentic-loop turn (A3). The signature is provider-specific:
     /// Anthropic requires its own signature for thinking replayed beside a
-    /// tool call, the OpenAI-compatible client and `mk` use a sentinel, and a
+    /// tool call, the OpenAI-compatible client and `council` use a sentinel, and a
     /// redacted block carries its opaque data behind the
     /// `anthropic:redacted_thinking:` prefix. A provider sends only a
     /// signature it produced and drops the block otherwise. `text` can be
@@ -676,8 +676,8 @@ pub enum Provider {
     /// Experimental Codex app-server daemon, reached over a configured
     /// `ws://`/`wss://` endpoint. The provider never launches Codex itself.
     CodexApp(CodexAppClient),
-    /// The megakernel service (see `llm/mk/`).
-    Council(mk::Client),
+    /// A council v2 server (see `llm/council/`).
+    Council(council::Client),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
@@ -950,7 +950,7 @@ impl Provider {
     /// (it labels the provider in wire logs), so a local server is finally
     /// nameable as itself.
     ///
-    /// Each anthropic, deepseek, alibaba, openai, and mk client takes a slot
+    /// Each anthropic, deepseek, alibaba, openai, and council client takes a slot
     /// from its endpoint in `endpoints` before each request (`llm::endpoint`).
     pub fn from_backend(config: &BackendConfig, endpoints: &endpoint::Endpoints) -> LlmResult<Self> {
         let endpoint = || {
@@ -1043,17 +1043,12 @@ impl Provider {
             BackendKind::Council => {
                 let base_url = config.base_url.as_deref().ok_or_else(|| {
                     LlmError::InvalidRequest(format!(
-                        "backend '{}' has kind 'mk', which requires --base-url (the megakernel service address)",
+                        "backend '{}' has kind 'council', which requires --base-url (the council server address)",
                         config.name
                     ))
                 })?;
-                let windows = config
-                    .models
-                    .iter()
-                    .filter_map(|(model, info)| info.context_window.map(|w| (model.clone(), w)))
-                    .collect();
                 Ok(Self::Council(
-                    mk::Client::new(config.name.clone(), base_url, resolve_request_timeout(config), windows)?
+                    council::Client::new(config.name.clone(), base_url, resolve_request_timeout(config))?
                         .with_endpoint(endpoint()?),
                 ))
             }
@@ -1318,8 +1313,8 @@ pub enum ProviderStream {
     OpenAi(openai::Stream),
     /// Codex app-server's translated event stream.
     Codex(CodexStream),
-    /// The megakernel's token stream.
-    Council(mk::Stream),
+    /// A council v2 generation stream.
+    Council(council::Stream),
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
@@ -1682,7 +1677,7 @@ mod tests {
 
     mod one_shot {
         use super::*;
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
 
         /// An OpenAI-compatible stream: `reasoning`, then `text`, ending in
         /// `finish` (no `finish_reason` chunk when `None`), then usage.
@@ -1864,8 +1859,8 @@ mod tests {
             BuildOpts::new(model, 64)
         }
 
-        fn reply_status(status: u16) -> kaijutsu_mk::test_server::Reply {
-            kaijutsu_mk::test_server::reply(status, r#"{"error": {"message": "busy", "type": "server_error"}}"#)
+        fn reply_status(status: u16) -> kaijutsu_council::test_server::Reply {
+            kaijutsu_council::test_server::reply(status, r#"{"error": {"message": "busy", "type": "server_error"}}"#)
         }
 
         /// A one-shot turns thinking off where the provider has a switch:

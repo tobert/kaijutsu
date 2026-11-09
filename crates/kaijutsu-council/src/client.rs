@@ -1,9 +1,9 @@
-//! The HTTP transport every megakernel call shares.
+//! The HTTP transport every council server call shares.
 //!
-//! Every failure is a typed [`MkError`]. The client never retries and never
+//! Every failure is a typed [`CouncilError`]. The client never retries and never
 //! turns a failure into a default answer; a caller that wants to retry reads
-//! `retry_after` and decides. Each route family adds its calls in its own
-//! `impl MkClient` block.
+//! `retry_after` and decides. The council v2 calls are their own
+//! `impl CouncilClient` block.
 
 use std::time::Duration;
 
@@ -13,18 +13,16 @@ use serde::de::DeserializeOwned;
 
 use gogi_proto::{ErrorBody, ErrorDetail, ErrorType, Invalid};
 
-use crate::json::Json;
-
 /// Longest slice of a response body kept in an error.
 const BODY_EXCERPT: usize = 512;
 
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
-pub enum MkError {
-    /// A council route answered with an error status. `error` is the decoded
+pub enum CouncilError {
+    /// A council v2 route answered with an error status. `error` is the decoded
     /// body when it matched the contract's error object; `body` is the start
     /// of the raw text either way.
-    #[error("megakernel answered {status}{}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default(), request_note(.request_id))]
+    #[error("council server answered {status}{}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default(), request_note(.request_id))]
     Status {
         status: u16,
         error: Option<ErrorDetail>,
@@ -35,46 +33,31 @@ pub enum MkError {
         /// the body's `request_id`.
         request_id: Option<String>,
     },
-    /// A `/mk/v1` route answered with an error status. `error` is the decoded
-    /// body when it matched the service's error schema; `body` is the start of
-    /// the raw text either way.
-    #[error("megakernel answered {status}{}", .error.as_ref().map(|e| format!(": {}: {}", e.r#type, e.message)).unwrap_or_default())]
-    Service {
-        status: u16,
-        error: Option<ServiceError>,
-        /// The `Retry-After` header, when it held whole seconds.
-        retry_after: Option<Duration>,
-        body: String,
-    },
     /// A council v2 `413` of type `context_full`: the prompt leaves no room
     /// for a reply, and nothing ran. The caller forks the context.
-    #[error("megakernel answered 413 context_full: {message}{}", request_note(.request_id))]
+    #[error("council server answered 413 context_full: {message}{}", request_note(.request_id))]
     ContextFull {
         message: String,
         /// The start of the raw body, which carries the server's counts.
         body: String,
         request_id: Option<String>,
     },
-    /// The server failed after a stream began and said so in an `error` event.
-    /// A 503 of type `pass_timeout_error` dropped only this request.
-    #[error("megakernel failed mid-stream ({}): {}: {}", .0.code, .0.r#type, .0.message)]
-    Stream(ServiceError),
     /// A council v2 stream's `error` event: the server failed after the
     /// stream began, and nothing more follows.
-    #[error("megakernel failed mid-stream: {:?}: {}{}", .error.r#type, .error.message, request_note(.request_id))]
-    CouncilStream { error: ErrorDetail, request_id: Option<String> },
+    #[error("council server failed mid-stream: {:?}: {}{}", .error.r#type, .error.message, request_note(.request_id))]
+    Stream { error: ErrorDetail, request_id: Option<String> },
     /// The stream ended before its `done` event. What arrived is not a reply.
-    #[error("megakernel stream ended before its done event: {0}")]
+    #[error("council server stream ended before its done event: {0}")]
     Truncated(String),
     /// The call took longer than the client's timeout.
-    #[error("megakernel call timed out")]
+    #[error("council server call timed out")]
     Timeout,
     /// The request did not reach the server or the reply did not arrive whole.
-    #[error("megakernel transport failed: {0}")]
+    #[error("council server transport failed: {0}")]
     Transport(String),
     /// The server answered success with a body outside the schema, or with a
     /// success status the contract does not give for the call.
-    #[error("megakernel reply outside the schema ({what}): {message}")]
+    #[error("council server reply outside the schema ({what}): {message}")]
     Decode {
         what: &'static str,
         message: String,
@@ -88,14 +71,13 @@ pub enum MkError {
     SpecIdMismatch { computed: String, server: String },
 }
 
-impl MkError {
+impl CouncilError {
     /// The HTTP status, when the server answered with one.
     pub fn status(&self) -> Option<u16> {
         match self {
-            MkError::Status { status, .. } | MkError::Service { status, .. } => Some(*status),
-            MkError::ContextFull { .. } => Some(413),
-            MkError::Stream(e) => Some(e.code),
-            MkError::CouncilStream { error, .. } => match error.r#type {
+            CouncilError::Status { status, .. } => Some(*status),
+            CouncilError::ContextFull { .. } => Some(413),
+            CouncilError::Stream { error, .. } => match error.r#type {
                 ErrorType::Busy => Some(429),
                 ErrorType::Internal => Some(500),
                 ErrorType::Unavailable | ErrorType::ModelUnavailable => Some(503),
@@ -110,7 +92,7 @@ impl MkError {
     /// `param` is `thinking` or `contexts[N].thinking`. The served model
     /// takes another `thinking` than the caller's identity said.
     pub fn refuses_thinking(&self) -> bool {
-        let MkError::Status { status: 400, error: Some(error), .. } = self else { return false };
+        let CouncilError::Status { status: 400, error: Some(error), .. } = self else { return false };
         match error.param.as_deref() {
             Some("thinking") => true,
             Some(p) => p
@@ -125,7 +107,7 @@ impl MkError {
     /// seconds.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            MkError::Status { retry_after, .. } | MkError::Service { retry_after, .. } => *retry_after,
+            CouncilError::Status { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -136,34 +118,13 @@ fn request_note(request_id: &Option<String>) -> String {
     request_id.as_ref().map(|id| format!(" (request {id})")).unwrap_or_default()
 }
 
-impl From<Invalid> for MkError {
+impl From<Invalid> for CouncilError {
     fn from(e: Invalid) -> Self {
         match e.param {
-            Some(param) => MkError::Request(format!("invalid request: {param}: {}", e.message)),
-            None => MkError::Request(format!("invalid request: {}", e.message)),
+            Some(param) => CouncilError::Request(format!("invalid request: {param}: {}", e.message)),
+            None => CouncilError::Request(format!("invalid request: {}", e.message)),
         }
     }
-}
-
-/// The inside of a `/mk/v1` error body, `{"error": {...}}`. `type` is the
-/// service's own name for the failure, such as `pass_timeout_error`.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-pub struct ServiceError {
-    pub code: u16,
-    pub message: String,
-    pub r#type: String,
-}
-
-#[derive(serde::Deserialize)]
-pub(crate) struct ServiceErrorBody {
-    pub(crate) error: ServiceError,
-}
-
-/// Which error schema a route's failures follow.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Family {
-    Council,
-    Mk,
 }
 
 pub(crate) fn excerpt(body: &[u8]) -> String {
@@ -171,25 +132,25 @@ pub(crate) fn excerpt(body: &[u8]) -> String {
     text.chars().take(BODY_EXCERPT).collect()
 }
 
-/// A client for one megakernel service.
+/// A client for one council v2 server.
 #[derive(Clone, Debug)]
-pub struct MkClient {
+pub struct CouncilClient {
     http: reqwest::Client,
     base: String,
     pub(crate) timeout: Duration,
     traceparent: Option<String>,
 }
 
-impl MkClient {
-    /// A client for the service at `base_url` (such as `http://localhost:8090`).
+impl CouncilClient {
+    /// A client for the server at `base_url` (such as `http://localhost:8090`).
     /// `timeout` bounds each call that does not take its own. The client
-    /// ignores proxy environment variables: the service is addressed directly.
-    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, MkError> {
+    /// ignores proxy environment variables: the server is addressed directly.
+    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, CouncilError> {
         let http = reqwest::Client::builder()
             .no_proxy()
             .build()
-            .map_err(|e| MkError::Transport(e.to_string()))?;
-        Ok(MkClient {
+            .map_err(|e| CouncilError::Transport(e.to_string()))?;
+        Ok(CouncilClient {
             http,
             base: base_url.into().trim_end_matches('/').to_string(),
             timeout,
@@ -207,7 +168,6 @@ impl MkClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn json<T: DeserializeOwned>(
         &self,
-        family: Family,
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
@@ -215,8 +175,8 @@ impl MkClient {
         timeout: Duration,
         expect: u16,
         what: &'static str,
-    ) -> Result<T, MkError> {
-        let bytes = self.call(family, method, path, body, headers, timeout, expect).await?;
+    ) -> Result<T, CouncilError> {
+        let bytes = self.call(method, path, body, headers, timeout, expect).await?;
         decode(&bytes, what)
     }
 
@@ -224,21 +184,20 @@ impl MkClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn call(
         &self,
-        family: Family,
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
         headers: &[(&'static str, String)],
         timeout: Duration,
         expect: u16,
-    ) -> Result<Vec<u8>, MkError> {
-        let resp = self.send(family, method, path, body, headers, Some(timeout)).await?;
+    ) -> Result<Vec<u8>, CouncilError> {
+        let resp = self.send(method, path, body, headers, Some(timeout)).await?;
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
         if status.as_u16() == expect {
             return Ok(bytes);
         }
-        Err(MkError::Decode {
+        Err(CouncilError::Decode {
             what: "status",
             message: format!("expected {expect}, got {status}"),
             body: excerpt(&bytes),
@@ -246,18 +205,17 @@ impl MkClient {
     }
 
     /// Sends a request and returns the response once its status is a
-    /// success. An error status reads the body and becomes the family's error.
+    /// success. An error status reads the body and becomes an error.
     /// With `timeout` of `None`, nothing bounds the call: a stream bounds each
     /// read itself.
     pub(crate) async fn send(
         &self,
-        family: Family,
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
         headers: &[(&'static str, String)],
         timeout: Option<Duration>,
-    ) -> Result<reqwest::Response, MkError> {
+    ) -> Result<reqwest::Response, CouncilError> {
         let mut req = self.http.request(method, format!("{}{}", self.base, path));
         if let Some(timeout) = timeout {
             req = req.timeout(timeout);
@@ -291,69 +249,50 @@ impl MkClient {
             .filter(|v| gogi_proto::ids::is_request_id(v))
             .map(str::to_string);
         let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
-        Err(status_error(family, status, retry_after, request_id, &bytes))
+        Err(status_error(status, retry_after, request_id, &bytes))
     }
 }
 
 /// Decodes a success body. Unknown fields are ignored; a missing field or a
 /// wrong type is a decode error.
-pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], what: &'static str) -> Result<T, MkError> {
-    serde_json::from_slice(bytes).map_err(|e| MkError::Decode {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], what: &'static str) -> Result<T, CouncilError> {
+    serde_json::from_slice(bytes).map_err(|e| CouncilError::Decode {
         what,
         message: e.to_string(),
         body: excerpt(bytes),
     })
 }
 
-/// Fails unless `value` is a JSON object, as tool-call arguments must be.
-pub(crate) fn require_object(value: &Json, what: &'static str) -> Result<(), MkError> {
-    match value {
-        Json::Object(_) => Ok(()),
-        _ => Err(MkError::Decode { what, message: "arguments are not an object".into(), body: String::new() }),
-    }
-}
-
 fn status_error(
-    family: Family,
     status: StatusCode,
     retry_after: Option<Duration>,
     request_id: Option<String>,
     bytes: &[u8],
-) -> MkError {
-    match family {
-        Family::Council => {
-            let decoded = serde_json::from_slice::<ErrorBody>(bytes).ok();
-            let request_id = request_id.or_else(|| decoded.as_ref().and_then(|b| b.request_id.clone()));
-            match decoded.map(|b| b.error) {
-                Some(e) if status.as_u16() == 413 && e.r#type == ErrorType::ContextFull => {
-                    MkError::ContextFull { message: e.message, body: excerpt(bytes), request_id }
-                }
-                error => MkError::Status { status: status.as_u16(), error, retry_after, body: excerpt(bytes), request_id },
-            }
+) -> CouncilError {
+    let decoded = serde_json::from_slice::<ErrorBody>(bytes).ok();
+    let request_id = request_id.or_else(|| decoded.as_ref().and_then(|b| b.request_id.clone()));
+    match decoded.map(|b| b.error) {
+        Some(e) if status.as_u16() == 413 && e.r#type == ErrorType::ContextFull => {
+            CouncilError::ContextFull { message: e.message, body: excerpt(bytes), request_id }
         }
-        Family::Mk => MkError::Service {
-            status: status.as_u16(),
-            error: serde_json::from_slice::<ServiceErrorBody>(bytes).ok().map(|b| b.error),
-            retry_after,
-            body: excerpt(bytes),
-        },
+        error => CouncilError::Status { status: status.as_u16(), error, retry_after, body: excerpt(bytes), request_id },
     }
 }
 
-pub(crate) fn map_reqwest(e: reqwest::Error) -> MkError {
+pub(crate) fn map_reqwest(e: reqwest::Error) -> CouncilError {
     if e.is_timeout() {
-        MkError::Timeout
+        CouncilError::Timeout
     } else {
-        MkError::Transport(e.to_string())
+        CouncilError::Transport(e.to_string())
     }
 }
 
-fn header_value(name: &str, value: &str) -> Result<HeaderValue, MkError> {
-    HeaderValue::from_str(value).map_err(|_| MkError::Request(format!("{name} header value is not valid")))
+fn header_value(name: &str, value: &str) -> Result<HeaderValue, CouncilError> {
+    HeaderValue::from_str(value).map_err(|_| CouncilError::Request(format!("{name} header value is not valid")))
 }
 
-pub(crate) fn to_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MkError> {
-    serde_json::to_vec(value).map_err(|e| MkError::Request(format!("request does not serialize: {e}")))
+pub(crate) fn to_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CouncilError> {
+    serde_json::to_vec(value).map_err(|e| CouncilError::Request(format!("request does not serialize: {e}")))
 }
 
 #[cfg(test)]
@@ -366,8 +305,8 @@ mod tests {
 
     use super::*;
 
-    /// The service answers an error with `Connection: close` and expects the
-    /// next request on a new connection (`docs/mk-admission.md`). This server
+    /// A council server answers an error with `Connection: close` and expects the
+    /// next request on a new connection (`docs/retries-and-ratelimits.md`). This server
     /// leaves each socket open after its answer and counts the requests each
     /// connection carries.
     ///
@@ -408,9 +347,9 @@ mod tests {
                 });
             }
         });
-        let client = MkClient::new(&base, Duration::from_secs(5)).unwrap();
+        let client = CouncilClient::new(&base, Duration::from_secs(5)).unwrap();
         for _ in 0..2 {
-            let error = client.model().await.unwrap_err();
+            let error = client.council().identity().await.unwrap_err();
             assert_eq!(error.status(), Some(429));
             assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
         }
@@ -425,7 +364,7 @@ mod tests {
     /// a refused `thinking`.
     #[test]
     fn a_400_naming_thinking_refuses_thinking() {
-        let status = |status: u16, param: Option<&str>| MkError::Status {
+        let status = |status: u16, param: Option<&str>| CouncilError::Status {
             status,
             error: Some(ErrorDetail {
                 r#type: ErrorType::InvalidRequest,
@@ -447,6 +386,6 @@ mod tests {
             assert!(!status(400, param).refuses_thinking(), "{param:?}");
         }
         assert!(!status(409, Some("thinking")).refuses_thinking());
-        assert!(!MkError::Request("thinking".into()).refuses_thinking());
+        assert!(!CouncilError::Request("thinking".into()).refuses_thinking());
     }
 }

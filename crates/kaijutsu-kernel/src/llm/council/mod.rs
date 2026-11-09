@@ -1,34 +1,25 @@
-//! The `mk` provider: a context talks to the megakernel service as a model
-//! (`docs/mk.md`, "Provider: `BackendKind::Council`").
+//! The `council` provider: a context talks to a council v2 server as a
+//! model (`BackendKind::Council`).
 //!
-//! An adapter over `kaijutsu_mk`; it does no HTTP of its own. Each call
-//! renders the request first and checks it against the window, so a prompt
-//! that leaves no room for a reply is refused instead of truncated, and a
-//! reply that stops at its output limit is never returned as a whole one.
-//! `cache_breakpoints`, `thinking_budget`, and `thinking_style` do not apply
-//! to this backend and are ignored.
-//!
-//! When the server speaks council v2 and lists `generate`, each streamed
+//! An adapter over `kaijutsu_council`; it does no HTTP of its own. Each streamed
 //! turn is a council v2 generation that sends the whole conversation
-//! instead ([`v2`]).
+//! ([`v2`]), on a served model that lists `generate`. A turn on any other
+//! model is refused before anything is sent. A prompt that leaves no room
+//! for a reply is the server's `context_full`, and a reply that stops at its
+//! output limit is never returned as a whole one. `cache_breakpoints`,
+//! `thinking_budget`, and `thinking_style` do not apply to this backend and
+//! are ignored.
 
 mod build;
-#[cfg(test)]
-mod probes;
 mod reply;
 mod v2;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gogi_proto::identity::ServerIdentity;
-use kaijutsu_mk::council::{GenerationEvent, GenerationStream};
-use kaijutsu_mk::generate::{
-    GenerateEvent, GenerateRequest, GenerateStream, Message as MkMessage, Sample, Source, MAX_TOKENS_LIMIT,
-};
-use kaijutsu_mk::model::RenderRequest;
-use kaijutsu_mk::{MkClient, MkError};
+use kaijutsu_council::council::{GenerationEvent, GenerationStream};
+use kaijutsu_council::{CouncilClient, CouncilError};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::endpoint::{Endpoint, Slot, SlotWaits};
@@ -44,31 +35,26 @@ struct Turn {
     waits: SlotWaits,
 }
 
-/// A client for one `mk` backend.
+/// A client for one `council` backend.
 #[derive(Clone, Debug)]
 pub struct Client {
     name: String,
-    mk: MkClient,
+    client: CouncilClient,
     /// Bounds each non-streamed call, and each read of a stream.
     timeout: Duration,
-    /// The configured `context_window` per model, where one is set.
-    windows: HashMap<String, u64>,
-    /// The service's `max_context`, read on first use.
-    max_context: Arc<tokio::sync::OnceCell<u64>>,
-    /// The endpoint each prompt or turn takes one slot from, held from the
-    /// render through the reply. `None` only for a client built directly
+    /// The endpoint each turn takes one slot from, held from the identity
+    /// read through the reply. `None` only for a client built directly
     /// rather than by `Provider::from_backend`.
     endpoint: Option<Arc<Endpoint>>,
-    /// The server's council v2 identity, `None` when the server has no
-    /// council v2, and when it was read. A turn reads it when none is
-    /// cached, when the cached one is older than `v2_max_age`, and after a
-    /// generation refused for its `thinking`.
+    /// The server's council v2 identity and when it was read. A turn reads
+    /// it when none is cached, when the cached one is older than
+    /// `v2_max_age`, and after a generation refused for its `thinking`.
     v2: Arc<parking_lot::Mutex<V2Cell>>,
     v2_max_age: Duration,
 }
 
 /// One read of the council v2 identity, which concurrent turns share.
-type V2Cell = Arc<tokio::sync::OnceCell<(Option<ServerIdentity>, tokio::time::Instant)>>;
+type V2Cell = Arc<tokio::sync::OnceCell<(ServerIdentity, tokio::time::Instant)>>;
 
 /// How long a council v2 identity serves turns before the next turn reads
 /// it again. A model that gains `thinking` in a redeploy thinks within
@@ -77,36 +63,22 @@ const V2_IDENTITY_MAX_AGE: Duration = Duration::from_secs(600);
 
 impl Client {
     /// `name` is the backend name, reported as the provider name.
-    pub fn new(name: impl Into<String>, base_url: &str, timeout: Duration, windows: HashMap<String, u64>) -> LlmResult<Self> {
+    pub fn new(name: impl Into<String>, base_url: &str, timeout: Duration) -> LlmResult<Self> {
         let name = name.into();
-        let mk = MkClient::new(base_url, timeout).map_err(|e| to_llm(&name, e))?;
+        let client = CouncilClient::new(base_url, timeout).map_err(|e| to_llm(&name, e))?;
         Ok(Client {
             name,
-            mk,
+            client,
             timeout,
-            windows,
-            max_context: Arc::default(),
             endpoint: None,
             v2: Arc::default(),
             v2_max_age: V2_IDENTITY_MAX_AGE,
         })
     }
 
-    /// Take a slot from `endpoint` for each call to the service.
+    /// Take a slot from `endpoint` for each call to the server.
     pub fn with_endpoint(mut self, endpoint: Arc<Endpoint>) -> Self {
         self.endpoint = Some(endpoint);
-        self
-    }
-
-    /// The same client, known to have no council v2 `generate`, so its
-    /// turns take `/mk/v1` without asking.
-    #[cfg(test)]
-    fn v1_only(mut self) -> Self {
-        self.v2 = Arc::new(parking_lot::Mutex::new(Arc::new(tokio::sync::OnceCell::new_with(Some((
-            None,
-            tokio::time::Instant::now(),
-        ))))));
-        self.v2_max_age = Duration::MAX;
         self
     }
 
@@ -123,9 +95,9 @@ impl Client {
         self.endpoint.as_ref()
     }
 
-    /// One call to the service through this client's endpoint
-    /// ([`crate::llm::endpoint::mk_call`]): a slot first, and the same call
-    /// again after the cooldown when the service answers 429, all within
+    /// One call to the server through this client's endpoint
+    /// ([`crate::llm::endpoint::council_call`]): a slot first, and the same call
+    /// again after the cooldown when the server answers 429, all within
     /// `turn`'s deadline. `call` is given each attempt's timeout, the time
     /// left before the deadline and no more than the client's timeout, and
     /// each attempt ends at the deadline. Returns the slot, which a stream
@@ -133,25 +105,25 @@ impl Client {
     async fn call<T, F, Fut>(&self, turn: &Turn, opens_stream: bool, mut call: F) -> LlmResult<(Option<Slot>, T)>
     where
         F: FnMut(Duration) -> Fut,
-        Fut: std::future::Future<Output = Result<T, MkError>>,
+        Fut: std::future::Future<Output = Result<T, CouncilError>>,
     {
         let mut attempt = || {
             let left = turn.deadline.saturating_duration_since(tokio::time::Instant::now()).min(self.timeout);
             let sent = call(left);
-            async move { tokio::time::timeout_at(turn.deadline, sent).await.unwrap_or(Err(MkError::Timeout)) }
+            async move { tokio::time::timeout_at(turn.deadline, sent).await.unwrap_or(Err(CouncilError::Timeout)) }
         };
         let Some(endpoint) = &self.endpoint else {
             return attempt().await.map(|v| (None, v)).map_err(|e| to_llm(&self.name, e));
         };
         let answered = if opens_stream {
-            crate::llm::endpoint::mk_open(endpoint, turn.deadline, &turn.waits, attempt).await
+            crate::llm::endpoint::council_open(endpoint, turn.deadline, &turn.waits, attempt).await
         } else {
-            crate::llm::endpoint::mk_call(endpoint, turn.deadline, &turn.waits, attempt).await
+            crate::llm::endpoint::council_call(endpoint, turn.deadline, &turn.waits, attempt).await
         };
         tracing::Span::current().record("llm.slot_wait_ms", turn.waits.total().as_millis() as u64);
         match answered {
             Ok((slot, result)) => result.map(|v| (Some(slot), v)).map_err(|e| to_llm(&self.name, e)),
-            Err(no_slot) => Err(LlmError::RateLimited(format!("mk backend '{}': {no_slot}", self.name))),
+            Err(no_slot) => Err(LlmError::RateLimited(format!("council backend '{}': {no_slot}", self.name))),
         }
     }
 
@@ -171,174 +143,50 @@ impl Client {
         opts.with_effort("none")
     }
 
-    /// A streamed turn. On a council v2 server that serves the turn's model
-    /// with `generate`, it is a generation after the whole conversation. Otherwise the request is
-    /// rendered and checked against the window before `/mk/v1/generate`
-    /// starts.
+    /// A streamed turn: a council v2 generation after the whole
+    /// conversation, on the served model the turn's model names. A model
+    /// the server does not serve, or serves without `generate`, is refused
+    /// before any generation.
     pub async fn stream(&self, opts: BuildOpts, history: Vec<Message>) -> LlmResult<Stream> {
-        let (thinking, reasoning_effort) = build::effort(opts.effort.as_deref())?;
+        build::effort(opts.effort.as_deref())?;
         let turn = self.turn();
-        if let Some(identity) = self.council_v2(&turn, &opts.model).await? {
-            return self.stream_v2(opts, history, identity, turn).await;
-        }
-        let messages = build::messages(opts.system.as_deref(), &history)?;
-        let tools = build::tools(&opts.tools)?;
-        let max_tokens = self
-            .admit_messages(&turn, &opts.model, &messages, &tools, thinking, reasoning_effort, opts.max_tokens)
-            .await?;
-        let sample = (opts.temperature.is_some() || opts.top_p.is_some())
-            .then(|| Sample { temperature: opts.temperature, top_p: opts.top_p, ..Sample::default() });
-        let has_tools = !tools.is_empty();
-        let request = GenerateRequest {
-            from: Source::Messages { messages, tools },
-            thinking,
-            reasoning_effort,
-            prefill: None,
-            sample,
-            max_tokens: Some(max_tokens),
-        };
-        // The megakernel request is not a JSON body, so only the summary line.
-        // One line per call: the endpoint's 429 resend inside `call` is the
-        // same request again and is not logged twice.
-        crate::llm::request_dump::record(
-            opts.trace.as_deref().map(|t| t.summary_only()).as_ref(),
-            &self.name, &opts.model, "", opts.system.as_deref(), &history, &serde_json::Value::Null,
-        );
-        let started = Instant::now();
-        // The stream opens within the turn's deadline, and then waits up to
-        // the client's timeout for each read.
-        let (slot, inner) = self.call(&turn, true, |_| self.mk.generate_stream(&request, self.timeout)).await?;
-        Ok(Stream {
-            name: self.name.clone(),
-            inner: Some(Inner::Mk(inner)),
-            reply: Some(Reply::new(thinking.unwrap_or(true), has_tools)),
-            pending: Default::default(),
-            cancel: CancellationToken::new(),
-            finished: false,
-            started,
-            first_token: None,
-            slot,
-            v2: None,
-        })
-    }
-
-    /// Renders the request and returns the `max_tokens` it may send.
-    #[allow(clippy::too_many_arguments)]
-    async fn admit_messages(
-        &self,
-        turn: &Turn,
-        model: &str,
-        messages: &[MkMessage],
-        tools: &[kaijutsu_mk::generate::Tool],
-        thinking: Option<bool>,
-        reasoning_effort: Option<kaijutsu_mk::generate::ReasoningEffort>,
-        asked: u64,
-    ) -> LlmResult<u32> {
-        let window = self.window(turn, model).await?;
-        let render = RenderRequest {
-            messages: messages.to_vec(),
-            tools: tools.to_vec(),
-            thinking,
-            reasoning_effort,
-            generation_prompt: None,
-        };
-        let (_slot, rendered) = self.call(turn, false, |left| self.mk.render(&render, left)).await?;
-        admit(&self.name, u64::from(rendered.n_tokens), window, asked)
-    }
-
-    /// The window a turn on `model` gets ([`Self::window`]), or `None` when
-    /// the service cannot be read or the model row does not fit it.
-    pub async fn context_window(&self, model: &str) -> Option<u64> {
-        match self.window(&self.turn(), model).await {
-            Ok(window) => Some(window),
-            Err(e) => {
-                tracing::warn!(backend = %self.name, error = %e, "mk: the context window is unknown");
-                None
-            }
-        }
-    }
-
-    /// The window for `model`: the service's `max_context`, or the model
-    /// row's `context_window` when that is smaller. A row larger than the
-    /// service is a configuration error.
-    async fn window(&self, turn: &Turn, model: &str) -> LlmResult<u64> {
-        let max_context = *self
-            .max_context
-            .get_or_try_init(|| async {
-                let (_slot, model) = self.call(turn, false, |_| self.mk.model()).await?;
-                Ok::<_, LlmError>(u64::from(model.max_context))
-            })
-            .await?;
-        match self.windows.get(model) {
-            Some(&row) if row > max_context => Err(LlmError::InvalidRequest(format!(
-                "mk backend '{}': model {model:?} has context_window {row}, but the service holds at most \
-                 {max_context} tokens; set the window with `kj backend model set` to {max_context} or less",
-                self.name
-            ))),
-            Some(&row) => Ok(row),
-            None => Ok(max_context),
-        }
+        let served = self.council_v2(&turn, &opts.model).await?;
+        self.stream_v2(opts, history, served, turn).await
     }
 }
 
-/// The `max_tokens` to send: the asked-for amount, lowered to the room the
-/// prompt leaves in the window and to the schema's limit. No room is an
-/// error.
-fn admit(name: &str, prompt: u64, window: u64, asked: u64) -> LlmResult<u32> {
-    let room = window.saturating_sub(prompt);
-    if room == 0 {
-        return Err(LlmError::ContextFull(format!(
-            "mk backend '{name}': the prompt takes {prompt} of the {window}-token window and leaves no room \
-             for a reply; exclude blocks with `kj stage exclude`, then fork"
-        )));
-    }
-    if asked == 0 {
-        return Err(LlmError::InvalidRequest(format!("mk backend '{name}': max_tokens is 0")));
-    }
-    let max = asked.min(room).min(u64::from(MAX_TOKENS_LIMIT));
-    if max < asked {
-        let cause = if max == room { "the room the prompt leaves in the window" } else { "the service's max_tokens limit" };
-        tracing::info!(backend = %name, prompt, window, asked, sent = max, "mk: max_tokens lowered to {cause}");
-    }
-    Ok(max as u32)
-}
-
-fn to_llm(name: &str, e: MkError) -> LlmError {
-    let detail = format!("mk backend '{name}': {e}");
+fn to_llm(name: &str, e: CouncilError) -> LlmError {
+    let detail = format!("council backend '{name}': {e}");
     match e {
-        MkError::Request(_) => LlmError::InvalidRequest(detail),
-        MkError::Service { status: 400 | 404 | 413, .. } => LlmError::InvalidRequest(detail),
-        MkError::Service { status: 429, .. } => LlmError::RateLimited(detail),
-        MkError::Service { status: 402, .. } | MkError::Status { status: 402, .. } => {
-            LlmError::InsufficientBalance(detail)
-        }
-        MkError::Timeout | MkError::Transport(_) => LlmError::NetworkError(detail),
-        MkError::ContextFull { .. } => LlmError::ContextFull(format!(
+        CouncilError::Request(_) => LlmError::InvalidRequest(detail),
+        CouncilError::Status { status: 400 | 404 | 413, .. } => LlmError::InvalidRequest(detail),
+        CouncilError::Status { status: 429, .. } => LlmError::RateLimited(detail),
+        CouncilError::Status { status: 402, .. } => LlmError::InsufficientBalance(detail),
+        CouncilError::Timeout | CouncilError::Transport(_) => LlmError::NetworkError(detail),
+        CouncilError::ContextFull { .. } => LlmError::ContextFull(format!(
             "{detail}; exclude blocks with `kj stage exclude`, then fork"
         )),
-        MkError::Service { .. }
-        | MkError::Stream(_)
-        | MkError::CouncilStream { .. }
-        | MkError::Truncated(_)
-        | MkError::Decode { .. }
-        | MkError::Status { .. }
-        | MkError::SpecIdMismatch { .. } => LlmError::ApiError(detail),
+        CouncilError::Stream { .. }
+        | CouncilError::Truncated(_)
+        | CouncilError::Decode { .. }
+        | CouncilError::Status { .. }
+        | CouncilError::SpecIdMismatch { .. } => LlmError::ApiError(detail),
     }
 }
 
-/// The kind of a stream failure that came from the megakernel. An error
-/// event or status maps by its HTTP status; the rest by how the call failed.
-fn mk_error_kind(e: &MkError) -> StreamErrorKind {
+/// The kind of a stream failure that came from the council server. An
+/// error event or status maps by its HTTP status; the rest by how the call
+/// failed.
+fn error_kind(e: &CouncilError) -> StreamErrorKind {
     use StreamErrorKind::*;
     match e {
-        MkError::Timeout => Timeout,
-        MkError::Transport(_) | MkError::Truncated(_) => Transport,
-        MkError::Decode { .. } | MkError::SpecIdMismatch { .. } => Protocol,
-        MkError::Request(_) | MkError::ContextFull { .. } => InvalidRequest,
-        MkError::Status { status, .. } | MkError::Service { status, .. } => status_kind(*status),
-        MkError::Stream(error) => status_kind(error.code),
+        CouncilError::Timeout => Timeout,
+        CouncilError::Transport(_) | CouncilError::Truncated(_) => Transport,
+        CouncilError::Decode { .. } | CouncilError::SpecIdMismatch { .. } => Protocol,
+        CouncilError::Request(_) | CouncilError::ContextFull { .. } => InvalidRequest,
+        CouncilError::Status { status, .. } => status_kind(*status),
         // A council error event names a type, which `status` maps to the status it stands for.
-        MkError::CouncilStream { .. } => e.status().map_or(ServerError, status_kind),
+        CouncilError::Stream { .. } => e.status().map_or(ServerError, status_kind),
     }
 }
 
@@ -356,15 +204,15 @@ fn status_kind(status: u16) -> StreamErrorKind {
     }
 }
 
-/// A streamed `mk` turn as [`StreamEvent`]s.
+/// A streamed `council` turn as [`StreamEvent`]s.
 ///
 /// [`Self::cancel`] is observed by the next [`Self::next_event`], which drops
-/// the HTTP stream (the service cancels the generation when the connection
+/// the HTTP stream (the server cancels the generation when the connection
 /// closes) and yields `Done { stop_reason: None }`, the cancel-confirm the
 /// server expects.
 pub struct Stream {
     name: String,
-    inner: Option<Inner>,
+    inner: Option<GenerationStream>,
     reply: Option<Reply>,
     pending: std::collections::VecDeque<StreamEvent>,
     cancel: CancellationToken,
@@ -375,40 +223,8 @@ pub struct Stream {
     /// done event is a completed answer, and an error event with 429 or 503
     /// is a busy one.
     slot: Option<Slot>,
-    /// On the council v2 path, the server identity the reply reports.
+    /// The server identity the reply reports.
     v2: Option<v2::ReplyIdentity>,
-}
-
-/// The reply stream: `/mk/v1/generate`, or a council v2 generation.
-enum Inner {
-    Mk(GenerateStream),
-    V2(GenerationStream),
-}
-
-/// One event of either stream.
-enum Event {
-    Token(String),
-    Done(kaijutsu_mk::generate::Done),
-    /// A council v2 token, which names its phase.
-    V2Token(gogi_proto::generation::TokenEvent),
-    V2Done(Box<gogi_proto::generation::GenerationDone>),
-}
-
-impl Inner {
-    async fn next(&mut self) -> Option<Result<Event, MkError>> {
-        Some(Ok(match self {
-            Inner::Mk(s) => match s.next().await? {
-                Ok(GenerateEvent::Token(t)) => Event::Token(t.piece),
-                Ok(GenerateEvent::Done(d)) => Event::Done(d),
-                Err(e) => return Some(Err(e)),
-            },
-            Inner::V2(s) => match s.next().await? {
-                Ok(GenerationEvent::Token(t)) => Event::V2Token(t),
-                Ok(GenerationEvent::Done(d)) => Event::V2Done(d),
-                Err(e) => return Some(Err(e)),
-            },
-        }))
-    }
 }
 
 impl Stream {
@@ -433,17 +249,12 @@ impl Stream {
                     return Some(StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None });
                 }
                 item = inner.next() => match item {
-                    Some(Ok(Event::Token(piece))) => {
-                        self.first_token.get_or_insert_with(|| self.started.elapsed());
-                        let reply = self.reply.as_mut().expect("the reply lives until done");
-                        self.pending.extend(reply.piece(&piece));
-                    }
-                    Some(Ok(Event::V2Token(token))) => {
+                    Some(Ok(GenerationEvent::Token(token))) => {
                         self.first_token.get_or_insert_with(|| self.started.elapsed());
                         let reply = self.reply.as_mut().expect("the reply lives until done");
                         self.pending.extend(reply.phased(token.phase, &token.piece));
                     }
-                    Some(Ok(Event::V2Done(done))) => {
+                    Some(Ok(GenerationEvent::Done(done))) => {
                         self.finished = true;
                         self.inner = None;
                         if let Some(slot) = &self.slot {
@@ -453,33 +264,13 @@ impl Stream {
                             first_token_ms: self.first_token.unwrap_or_default().as_millis() as u64,
                             wall_ms: self.started.elapsed().as_millis() as u64,
                         };
-                        let identity = self.v2.take().expect("a council v2 stream names its server");
+                        let identity = self.v2.take().expect("a stream names its server");
                         let reply = self.reply.take().expect("done comes once");
                         match reply.done_v2(*done, &identity.model, &identity.weight_hash, timing) {
                             Ok(events) => self.pending.extend(events),
                             Err(e) => return Some(StreamEvent::Error(StreamError::new(
                                 StreamErrorKind::Protocol,
-                                format!("mk backend '{}': {e}", self.name),
-                            ))),
-                        }
-                    }
-                    Some(Ok(Event::Done(done))) => {
-                        self.finished = true;
-                        self.inner = None;
-                        if let Some(slot) = &self.slot {
-                            slot.completed();
-                        }
-                        let timing = Timing {
-                            first_token_ms: self.first_token.unwrap_or_default().as_millis() as u64,
-                            wall_ms: self.started.elapsed().as_millis() as u64,
-                        };
-                        let id_base = format!("mk-{}", &done.context[..done.context.len().min(16)]);
-                        let reply = self.reply.take().expect("done comes once");
-                        match reply.done(done, &id_base, timing) {
-                            Ok(events) => self.pending.extend(events),
-                            Err(e) => return Some(StreamEvent::Error(StreamError::new(
-                                StreamErrorKind::Protocol,
-                                format!("mk backend '{}': {e}", self.name),
+                                format!("council backend '{}': {e}", self.name),
                             ))),
                         }
                     }
@@ -487,11 +278,11 @@ impl Stream {
                         self.finished = true;
                         self.inner = None;
                         if let Some(slot) = &self.slot {
-                            slot.failed_mk(&e);
+                            slot.failed_council(&e);
                         }
                         return Some(StreamEvent::Error(StreamError::new(
-                            mk_error_kind(&e),
-                            format!("mk backend '{}': {e}", self.name),
+                            error_kind(&e),
+                            format!("council backend '{}': {e}", self.name),
                         )));
                     }
                     None => {
@@ -512,31 +303,18 @@ impl Stream {
 
 #[cfg(test)]
 mod tests {
-    use kaijutsu_mk::test_server::{reply as http, serve, sse};
+    use kaijutsu_council::test_server::{reply as http, serve, sse};
     use serde_json::json;
 
     use super::*;
     use crate::llm::ToolDefinition;
 
-    const MODEL: &str = include_str!("../../../../kaijutsu-mk/tests/fixtures/mk_model.json");
-    const ANSWER: &str = include_str!("../../../../kaijutsu-mk/tests/fixtures/mk_stream_answer.sse");
-    const TOOL: &str = include_str!("../../../../kaijutsu-mk/tests/fixtures/mk_stream_tool.sse");
-
-    /// A 402 is a refusal that repeating cannot fix, whichever error family
-    /// carries it.
+    /// A 402 is a refusal that repeating cannot fix.
     #[test]
     fn a_402_is_an_insufficient_balance_error() {
-        for e in [
-            MkError::Service { status: 402, error: None, retry_after: None, body: "pay".into() },
-            MkError::Status { status: 402, error: None, retry_after: None, body: "pay".into(), request_id: None },
-        ] {
-            let err = to_llm("b", e);
-            assert!(matches!(&err, LlmError::InsufficientBalance(m) if m.contains("mk backend 'b'")), "{err:?}");
-        }
-    }
-
-    fn rendered(n: u32) -> kaijutsu_mk::test_server::Reply {
-        http(200, json!({"text": "", "tokens": [], "n_tokens": n}).to_string())
+        let e = CouncilError::Status { status: 402, error: None, retry_after: None, body: "pay".into(), request_id: None };
+        let err = to_llm("b", e);
+        assert!(matches!(&err, LlmError::InsufficientBalance(m) if m.contains("council backend 'b'")), "{err:?}");
     }
 
     fn opts(max_tokens: u64) -> BuildOpts {
@@ -555,11 +333,6 @@ mod tests {
         }
     }
 
-    /// A client of a server without council v2.
-    fn client(base: &str, windows: HashMap<String, u64>) -> Client {
-        Client::new("zorak-mk", base, Duration::from_secs(5), windows).unwrap().v1_only()
-    }
-
     async fn drain(stream: &mut Stream) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         while let Some(ev) = stream.next_event().await {
@@ -568,11 +341,9 @@ mod tests {
         out
     }
 
-    // ---- council v2: generations after the whole conversation
-
     use crate::llm::{ContentBlock, MessageContent, Role};
 
-    fn v2_identity(capabilities: serde_json::Value) -> kaijutsu_mk::test_server::Reply {
+    fn v2_identity(capabilities: serde_json::Value) -> kaijutsu_council::test_server::Reply {
         http(
             200,
             json!({"models": [{"model": "gemma-4", "aliases": ["qwen"], "status": "ready", "weight_hash": "w4",
@@ -586,13 +357,12 @@ mod tests {
         )
     }
 
-    fn no_v2() -> kaijutsu_mk::test_server::Reply {
+    fn no_v2() -> kaijutsu_council::test_server::Reply {
         http(404, "no such route")
     }
 
-    /// A client that asks the server for its council v2 identity.
-    fn probing(base: &str) -> Client {
-        Client::new("zorak-mk", base, Duration::from_secs(5), HashMap::new()).unwrap()
+    fn client(base: &str) -> Client {
+        Client::new("zorak", base, Duration::from_secs(5)).unwrap()
     }
 
     fn snap_id(n: u64) -> String {
@@ -601,7 +371,12 @@ mod tests {
 
     /// A streamed generation: `content` as one answer token, then `done`
     /// with `head` held, or `null` for 0.
-    fn generation(content: &str, calls: serde_json::Value, head: u64) -> kaijutsu_mk::test_server::Reply {
+    fn generation(content: &str, calls: serde_json::Value, head: u64) -> kaijutsu_council::test_server::Reply {
+        sse(generation_events(content, calls, head))
+    }
+
+    /// The events of [`generation`].
+    fn generation_events(content: &str, calls: serde_json::Value, head: u64) -> String {
         let mut out = String::new();
         if !content.is_empty() {
             let t = json!({"id": 1, "piece": content, "phase": "content", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
@@ -613,35 +388,50 @@ mod tests {
                           "usage": {"prompt": 47, "kept": 40, "fed": 7, "completion": 3, "reasoning": 0}, "head": head, "seed": 11,
                           "snapshots": [{"id": snap_id(1), "message": 1, "tokens": 15}]});
         out.push_str(&format!("event: done\ndata: {done}\n\n"));
-        sse(out)
+        out
     }
 
     fn said(text: &str) -> Message {
         Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]), turn_scoped: false }
     }
 
-    fn bodies(seen: &std::sync::Mutex<Vec<kaijutsu_mk::test_server::Captured>>, path_prefix: &str) -> Vec<serde_json::Value> {
+    fn bodies(seen: &std::sync::Mutex<Vec<kaijutsu_council::test_server::Captured>>, path_prefix: &str) -> Vec<serde_json::Value> {
         seen.lock().unwrap().iter().filter(|c| c.path.starts_with(path_prefix)).map(|c| serde_json::from_str(&c.body).unwrap()).collect()
     }
 
-    /// A server without council v2, or one whose v2 identity does not list
-    /// `generate`, keeps the `/mk/v1` path, and the client asks once.
+    /// A served model without `generate` cannot take a turn: the turn is
+    /// refused, naming the backend, the model, and what the server serves,
+    /// and no generation is sent.
     ///
-    /// Falsified by a provider that generates on council v2 on a server
-    /// that cannot, or that asks for the identity every turn.
+    /// Falsified by a turn that falls back to another route, or sends a
+    /// generation the model cannot run.
     #[tokio::test]
-    async fn without_v2_generate_a_turn_keeps_the_mk_v1_path() {
-        let (base, seen) = serve(vec![no_v2(), http(200, MODEL), rendered(10), sse(ANSWER), rendered(10), sse(ANSWER)]).await;
-        let c = probing(&base);
-        for _ in 0..2 {
-            drain(&mut c.stream(opts(64), vec![Message::user("hi")]).await.unwrap()).await;
-        }
+    async fn a_served_model_without_generate_is_refused() {
+        let (base, seen) = serve(vec![v2_identity(json!(["reads", "pins"]))]).await;
+        let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(
+            matches!(&err, LlmError::InvalidRequest(m)
+                if m.contains("council backend 'zorak'") && m.contains("gemma-4") && m.contains("generate")),
+            "{err:?}"
+        );
         let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
-        assert_eq!(paths, ["/council/v2/identity", "/mk/v1/model", "/mk/v1/render", "/mk/v1/generate", "/mk/v1/render", "/mk/v1/generate"]);
+        assert_eq!(paths, ["/council/v2/identity"], "only the identity");
+    }
 
-        let (base, seen) = serve(vec![v2_identity(json!(["reads", "pins"])), http(200, MODEL), rendered(10), sse(ANSWER)]).await;
-        drain(&mut probing(&base).stream(opts(64), vec![Message::user("hi")]).await.unwrap()).await;
-        assert_eq!(seen.lock().unwrap().last().unwrap().path, "/mk/v1/generate");
+    /// A server without council v2 answers the identity with 404, and a
+    /// turn on it is refused, saying so, and sends nothing else.
+    ///
+    /// Falsified by a turn that tries another route.
+    #[tokio::test]
+    async fn a_server_without_council_v2_is_refused() {
+        let (base, seen) = serve(vec![no_v2()]).await;
+        let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(
+            matches!(&err, LlmError::InvalidRequest(m)
+                if m.contains("council backend 'zorak'") && m.contains("404") && m.contains("no council v2 identity")),
+            "{err:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the identity");
     }
 
     /// On a council v2 server that lists `generate`, every turn is one
@@ -663,7 +453,7 @@ mod tests {
             generation("Two files.", json!([]), 3),
         ])
         .await;
-        let c = probing(&base);
+        let c = client(&base);
         let mut o = opts(64);
         o.tools = vec![ToolDefinition { name: "ls".into(), description: "List.".into(), input_schema: json!({"type": "object"}) }];
         let mut history = vec![Message::user("list /tmp")];
@@ -673,7 +463,7 @@ mod tests {
         let first = drain(&mut opened.unwrap()).await;
         let Some(StreamEvent::ToolUse { id, name, input }) = first.first().cloned() else { panic!("{first:?}") };
         assert_eq!((id.as_str(), name.as_str(), input), ("c0", "ls", json!({"path": "/tmp"})));
-        let Some(StreamEvent::Done { stop_reason, input_tokens, extra: Some(crate::llm::UsageExtra::Mk(x)), .. }) = first.last() else {
+        let Some(StreamEvent::Done { stop_reason, input_tokens, extra: Some(crate::llm::UsageExtra::Council(x)), .. }) = first.last() else {
             panic!("{first:?}")
         };
         assert_eq!((stop_reason.as_deref(), *input_tokens, x.kept, x.seed, x.model.as_str()), (Some("tool_use"), Some(47), 40, Some(11), "gemma-4"));
@@ -711,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn a_shorter_conversation_is_sent_as_it_stands() {
         let (base, seen) = serve(vec![v2_identity(json!(["generate"])), generation("r2", json!([]), 4), generation("r3", json!([]), 5)]).await;
-        let c = probing(&base);
+        let c = client(&base);
         drain(&mut c.stream(opts(64), vec![Message::user("u1"), said("r1"), Message::user("u2")]).await.unwrap()).await;
         drain(&mut c.stream(opts(64), vec![Message::user("u1"), said("r1"), Message::user("u3")]).await.unwrap()).await;
         let gens = bodies(&seen, "/council/v2/generations");
@@ -730,7 +520,7 @@ mod tests {
     async fn a_context_full_generation_is_a_full_context() {
         let full = http(413, json!({"error": {"type": "context_full", "message": "the prompt takes 32768 of 32768 tokens"}}).to_string());
         let (base, _) = serve(vec![v2_identity(json!(["generate"])), full]).await;
-        let err = probing(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::ContextFull(m) if m.contains("32768") && m.contains("fork")), "{err:?}");
         assert_eq!(err.category_and_code(), (kaijutsu_types::ErrorCategory::Context, Some("full")));
     }
@@ -744,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_names_its_served_model_and_one_the_server_lacks_is_refused() {
         let (base, seen) = serve(vec![v2_identity(json!(["generate"])), generation("hi", json!([]), 2)]).await;
-        let c = probing(&base);
+        let c = client(&base);
         drain(&mut c.stream(opts(64), vec![Message::user("u1")]).await.unwrap()).await;
         assert_eq!(bodies(&seen, "/council/v2/generations")[0]["model"], "gemma-4", "the alias qwen routes to gemma-4");
         let mut other = opts(64);
@@ -771,7 +561,7 @@ mod tests {
                 let (base, seen) = serve(vec![v2_identity(capabilities), generation("hi", json!([]), 2)]).await;
                 let mut o = opts(64);
                 o.effort = effort;
-                let opened = match probing(&base).stream(o, vec![Message::user("u1")]).await {
+                let opened = match client(&base).stream(o, vec![Message::user("u1")]).await {
                     Ok(mut s) => {
                         drain(&mut s).await;
                         Ok(())
@@ -799,7 +589,7 @@ mod tests {
     }
 
     /// The `thinking` sent by each v2 generation, in order.
-    fn sent_thinking(seen: &std::sync::Mutex<Vec<kaijutsu_mk::test_server::Captured>>) -> Vec<serde_json::Value> {
+    fn sent_thinking(seen: &std::sync::Mutex<Vec<kaijutsu_council::test_server::Captured>>) -> Vec<serde_json::Value> {
         bodies(seen, "/council/v2/generations").iter().map(|g| g["context"]["thinking"].clone()).collect()
     }
 
@@ -825,7 +615,7 @@ mod tests {
             generation("b", json!([]), 3),
         ])
         .await;
-        let c = probing(&base);
+        let c = client(&base);
         let mut o = opts(64);
         o.effort = None;
         drain(&mut c.stream(o.clone(), vec![Message::user("u1")]).await.unwrap()).await;
@@ -855,7 +645,7 @@ mod tests {
             generation("b", json!([]), 3),
         ])
         .await;
-        let c = probing(&base).with_v2_max_age(Duration::ZERO);
+        let c = client(&base).with_v2_max_age(Duration::ZERO);
         let mut o = opts(64);
         o.effort = None;
         drain(&mut c.stream(o.clone(), vec![Message::user("u1")]).await.unwrap()).await;
@@ -869,102 +659,41 @@ mod tests {
     #[tokio::test]
     async fn a_conversation_that_ends_with_the_assistant_is_refused() {
         let (base, seen) = serve(vec![v2_identity(json!(["generate"]))]).await;
-        let err = probing(&base).stream(opts(64), vec![Message::user("u1"), said("r1")]).await.err().unwrap();
+        let err = client(&base).stream(opts(64), vec![Message::user("u1"), said("r1")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("assistant")), "{err:?}");
         assert_eq!(seen.lock().unwrap().len(), 1, "only the identity");
     }
 
     #[test]
-    fn admission_lowers_max_tokens_to_the_room_and_refuses_no_room() {
-        assert_eq!(admit("b", 1000, 32768, 4096).unwrap(), 4096);
-        assert_eq!(admit("b", 30000, 32768, 4096).unwrap(), 2768);
-        assert_eq!(admit("b", 0, 65536, 40000).unwrap(), MAX_TOKENS_LIMIT);
-        assert!(matches!(admit("b", 32768, 32768, 10), Err(LlmError::ContextFull(m)) if m.contains("leaves no room")));
-        assert!(matches!(admit("b", 40000, 32768, 10), Err(LlmError::ContextFull(_))));
-        assert!(matches!(admit("b", 10, 32768, 0), Err(LlmError::InvalidRequest(_))));
-    }
-
-    #[tokio::test]
-    async fn a_turn_renders_then_streams_and_sends_the_mapped_request() {
-        let (base, seen) = serve(vec![http(200, MODEL), rendered(30000), sse(TOOL)]).await;
-        let mut o = opts(4096);
-        o.temperature = Some(0.0);
-        o.tools = vec![ToolDefinition { name: "ls".into(), description: "List.".into(), input_schema: json!({"type": "object"}) }];
-        let mut stream = client(&base, HashMap::new()).stream(o, vec![Message::user("list")]).await.unwrap();
-        let events = drain(&mut stream).await;
-        assert!(matches!(&events[0], StreamEvent::ToolUse { name, .. } if name == "ls"), "{events:?}");
-        assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: Some(s), .. }) if s == "tool_calls"));
-
-        let seen = seen.lock().unwrap();
-        let paths: Vec<&str> = seen.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, ["/mk/v1/model", "/mk/v1/render", "/mk/v1/generate"]);
-        let render: serde_json::Value = serde_json::from_str(&seen[1].body).unwrap();
-        let generate: serde_json::Value = serde_json::from_str(&seen[2].body).unwrap();
-        assert_eq!(render["messages"], generate["from"]["messages"]);
-        assert_eq!(render["thinking"], json!(false));
-        assert_eq!(generate["thinking"], json!(false));
-        assert_eq!(generate["max_tokens"], json!(2768), "lowered to the room the 30000-token prompt leaves");
-        assert_eq!(generate["sample"], json!({"temperature": 0.0}));
-        assert_eq!(generate["from"]["messages"][0], json!({"role": "system", "content": "rules"}));
-        assert_eq!(generate["from"]["tools"][0]["function"]["name"], json!("ls"));
-    }
-
-    #[tokio::test]
-    async fn the_model_is_read_once_and_a_row_window_narrows_it() {
-        let windows = HashMap::from([("qwen".to_string(), 8192)]);
-        let (base, seen) = serve(vec![http(200, MODEL), rendered(8000), sse(ANSWER), rendered(8192)]).await;
-        let c = client(&base, windows);
-        let mut stream = c.stream(opts(4096), vec![Message::user("hi")]).await.unwrap();
-        drain(&mut stream).await;
-        let err = c.stream(opts(4096), vec![Message::user("hi")]).await.err().unwrap();
-        assert!(matches!(&err, LlmError::ContextFull(m) if m.contains("leaves no room")), "{err:?}");
-        let seen = seen.lock().unwrap();
-        let generate: serde_json::Value = serde_json::from_str(&seen[2].body).unwrap();
-        assert_eq!(generate["max_tokens"], json!(192));
-        assert_eq!(seen.iter().filter(|c| c.path == "/mk/v1/model").count(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_row_window_larger_than_the_service_is_refused() {
-        let (base, _) = serve(vec![http(200, MODEL)]).await;
-        let err = client(&base, HashMap::from([("qwen".to_string(), 65536)]))
-            .stream(opts(10), vec![Message::user("hi")])
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("holds at most 32768")), "{err:?}");
-    }
-
-    #[test]
     fn an_mk_error_maps_to_its_stream_kind() {
-        use kaijutsu_mk::{MkError, ServiceError};
-        let stream = |code: u16| MkError::Stream(ServiceError { code, message: "m".into(), r#type: "t".into() });
-        let council = |r#type| MkError::CouncilStream { error: gogi_proto::ErrorBody::new(r#type, "m").error, request_id: None };
+        let status = |status: u16| CouncilError::Status { status, error: None, retry_after: None, body: String::new(), request_id: None };
+        let council = |r#type| CouncilError::Stream { error: gogi_proto::ErrorBody::new(r#type, "m").error, request_id: None };
         let cases = [
-            (stream(503), StreamErrorKind::Overloaded),
-            (stream(429), StreamErrorKind::RateLimited),
-            (stream(500), StreamErrorKind::ServerError),
-            (stream(504), StreamErrorKind::Timeout),
-            (stream(400), StreamErrorKind::InvalidRequest),
-            (MkError::Timeout, StreamErrorKind::Timeout),
-            (MkError::Transport("reset".into()), StreamErrorKind::Transport),
-            (MkError::Truncated("x".into()), StreamErrorKind::Transport),
-            (MkError::Decode { what: "w", message: "m".into(), body: String::new() }, StreamErrorKind::Protocol),
+            (status(503), StreamErrorKind::Overloaded),
+            (status(429), StreamErrorKind::RateLimited),
+            (status(500), StreamErrorKind::ServerError),
+            (status(504), StreamErrorKind::Timeout),
+            (status(400), StreamErrorKind::InvalidRequest),
+            (CouncilError::Timeout, StreamErrorKind::Timeout),
+            (CouncilError::Transport("reset".into()), StreamErrorKind::Transport),
+            (CouncilError::Truncated("x".into()), StreamErrorKind::Transport),
+            (CouncilError::Decode { what: "w", message: "m".into(), body: String::new() }, StreamErrorKind::Protocol),
             (council(gogi_proto::ErrorType::ModelUnavailable), StreamErrorKind::Overloaded),
             (council(gogi_proto::ErrorType::Busy), StreamErrorKind::RateLimited),
             (council(gogi_proto::ErrorType::Timeout), StreamErrorKind::Timeout),
             (council(gogi_proto::ErrorType::InvalidRequest), StreamErrorKind::ServerError),
         ];
         for (error, kind) in cases {
-            assert_eq!(mk_error_kind(&error), kind, "{error}");
+            assert_eq!(error_kind(&error), kind, "{error}");
         }
     }
 
     #[tokio::test]
     async fn a_stream_cut_before_done_is_an_error_event() {
-        let cut = &ANSWER[..ANSWER.find("event: done").unwrap()];
-        let (base, _) = serve(vec![http(200, MODEL), rendered(10), sse(cut)]).await;
-        let mut stream = client(&base, HashMap::new()).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
+        let events = generation_events("Hello.", json!([]), 2);
+        let cut = &events[..events.find("event: done").unwrap()];
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), sse(cut)]).await;
+        let mut stream = client(&base).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let events = drain(&mut stream).await;
         assert!(matches!(events.last(), Some(StreamEvent::Error(e))
             if e.kind == StreamErrorKind::Transport && e.message.contains("before its done event")), "{events:?}");
@@ -973,10 +702,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_yields_the_cancel_confirm_done() {
-        let mut slow = sse(ANSWER);
+        let mut slow = generation("Hello.", json!([]), 2);
         slow.stall = Some(Duration::from_secs(3));
-        let (base, _) = serve(vec![http(200, MODEL), rendered(10), slow]).await;
-        let mut stream = client(&base, HashMap::new()).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), slow]).await;
+        let mut stream = client(&base).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         stream.cancel();
         let events = drain(&mut stream).await;
         assert!(
@@ -987,15 +716,15 @@ mod tests {
 
     #[tokio::test]
     async fn service_errors_map_to_kernel_errors() {
-        let bad = r#"{"error":{"code":400,"message":"noncharacter","type":"bad_request"}}"#;
-        let (base, _) = serve(vec![http(200, MODEL), http(400, bad)]).await;
-        let err = client(&base, HashMap::new()).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
-        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("zorak-mk") && m.contains("noncharacter")), "{err:?}");
+        let bad = r#"{"error":{"type":"invalid_request","message":"noncharacter","param":"context.messages[1].content"}}"#;
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), http(400, bad)]).await;
+        let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("council backend 'zorak'") && m.contains("noncharacter")), "{err:?}");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closed = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        let err = client(&closed, HashMap::new()).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        let err = client(&closed).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::NetworkError(_)), "{err:?}");
     }
 
@@ -1004,55 +733,9 @@ mod tests {
         let (base, seen) = serve(vec![]).await;
         let mut o = opts(64);
         o.effort = Some("max".into());
-        let err = client(&base, HashMap::new()).stream(o, vec![Message::user("hi")]).await.err().unwrap();
+        let err = client(&base).stream(o, vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::InvalidRequest(_)), "{err:?}");
         assert!(seen.lock().unwrap().is_empty());
-    }
-
-    /// Live, by hand on zorak: a tool call, then its result, through the
-    /// provider. Prints the prefix reuse of the second turn.
-    /// `MK_URL=http://100.83.138.103:8090 cargo test -p kaijutsu-kernel --lib live_mk -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "needs a running megakernel at MK_URL"]
-    async fn live_mk_tool_loop() {
-        use crate::llm::ContentBlock;
-
-        let base = std::env::var("MK_URL").expect("MK_URL names the service");
-        let c = Client::new("live-mk", &base, Duration::from_secs(120), HashMap::new()).unwrap();
-        let mut o = opts(256);
-        o.system = Some("Use the tools to answer. Be brief.".into());
-        o.temperature = Some(0.0);
-        o.tools = vec![ToolDefinition {
-            name: "ls".into(),
-            description: "List a directory.".into(),
-            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
-        }];
-        let mut history = vec![Message::user("What files are in /tmp/demo?")];
-        let first = drain(&mut c.stream(o.clone(), history.clone()).await.unwrap()).await;
-        let Some(StreamEvent::ToolUse { id, name, input }) = first.iter().find(|e| matches!(e, StreamEvent::ToolUse { .. })).cloned() else {
-            panic!("no tool call: {first:?}")
-        };
-        assert_eq!(name, "ls");
-        history.push(Message { role: crate::llm::Role::Assistant, content: crate::llm::MessageContent::Blocks(vec![
-            ContentBlock::ToolUse { id: id.clone(), name, input },
-        ]), turn_scoped: false });
-        history.push(Message::tool_results(vec![ContentBlock::ToolResult {
-            tool_use_id: id,
-            content: "notes.txt\nplan.md".into(),
-            is_error: false,
-        }]));
-        let second = drain(&mut c.stream(o, history).await.unwrap()).await;
-        let answer: String = second.iter().filter_map(|e| match e {
-            StreamEvent::TextDelta(t) => Some(t.as_str()),
-            _ => None,
-        }).collect();
-        let Some(StreamEvent::Done { stop_reason, extra: Some(crate::llm::UsageExtra::Mk(x)), input_tokens, .. }) = second.last() else {
-            panic!("no done: {second:?}")
-        };
-        assert_eq!(stop_reason.as_deref(), Some("stop"));
-        assert!(answer.contains("notes.txt"), "{answer:?}");
-        println!("second turn: prompt={input_tokens:?} kept={} fed={} first_token_ms={} wall_ms={} answer={answer:?}",
-            x.kept, x.fed, x.first_token_ms, x.wall_ms);
     }
 
     /// The kernel's `serde_json` keeps object member order (its
@@ -1076,20 +759,20 @@ mod tests {
             },
             Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "a".into(), content: String::new(), is_error: false }]),
         ];
-        let messages = build::messages(None, &history).unwrap();
-        let sent = serde_json::to_string(&messages[1].tool_calls[0].arguments).unwrap();
+        let messages = build::messages_v2(None, &history).unwrap();
+        let sent = serde_json::to_string(&messages[1].tool_calls[0].input).unwrap();
         assert_eq!(sent, r#"{"path":"/tmp","all":true}"#);
     }
 
     /// A client whose calls take slots at a fresh endpoint for `base`.
     fn limited(base: &str, timeout: Duration) -> (Client, Arc<Endpoint>) {
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(base).unwrap();
-        let c = Client::new("zorak-mk", base, timeout, HashMap::new()).unwrap().v1_only().with_endpoint(endpoint.clone());
+        let c = Client::new("zorak", base, timeout).unwrap().with_endpoint(endpoint.clone());
         (c, endpoint)
     }
 
-    fn busy() -> kaijutsu_mk::test_server::Reply {
-        let mut r = http(429, json!({"error": {"code": 429, "message": "16 requests in progress", "type": "busy"}}).to_string());
+    fn busy() -> kaijutsu_council::test_server::Reply {
+        let mut r = http(429, json!({"error": {"type": "busy", "message": "16 requests in progress"}}).to_string());
         r.headers.push(("retry-after", "1".into()));
         r
     }
@@ -1100,7 +783,7 @@ mod tests {
     /// after its last event.
     #[tokio::test]
     async fn a_turn_holds_its_slot_until_its_stream_ends() {
-        let (base, _) = serve(vec![http(200, MODEL), rendered(30), sse(ANSWER)]).await;
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), generation("Hello.", json!([]), 2)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         assert_eq!(endpoint.status().in_flight, 1);
@@ -1108,15 +791,15 @@ mod tests {
         assert_eq!(endpoint.status().in_flight, 0);
     }
 
-    /// The service refuses a 429 before any work starts
-    /// (`docs/mk-admission.md`), so the turn sends the same call again after
+    /// The server refuses with 429 before any work starts
+    /// (`docs/retries-and-ratelimits.md`), so the turn sends the same call again after
     /// `Retry-After`.
     ///
     /// Falsified by a 429 that fails the turn, or a resend that ignores the
     /// cooldown.
     #[tokio::test]
     async fn a_busy_answer_is_sent_again_after_its_retry_after() {
-        let (base, seen) = serve(vec![http(200, MODEL), busy(), rendered(30), sse(ANSWER)]).await;
+        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), busy(), generation("Hello.", json!([]), 2)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let started = std::time::Instant::now();
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
@@ -1124,18 +807,18 @@ mod tests {
         let events = drain(&mut stream).await;
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
         let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
-        assert_eq!(paths, ["/mk/v1/model", "/mk/v1/render", "/mk/v1/render", "/mk/v1/generate"]);
+        assert_eq!(paths, ["/council/v2/identity", "/council/v2/generations", "/council/v2/generations"]);
         assert_eq!(endpoint.status().cooldown, None);
     }
 
     /// A 503 cools the endpoint and fails the turn; it is not sent again.
     #[tokio::test]
     async fn a_503_cools_the_endpoint_and_is_not_sent_again() {
-        let (base, seen) = serve(vec![http(200, MODEL), rendered(30), http(503, "{}")]).await;
+        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), http(503, "{}")]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(seen.lock().unwrap().len(), 2);
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
         assert!(left > Duration::from_secs(4), "{left:?}");
@@ -1151,7 +834,7 @@ mod tests {
         let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         match err {
             LlmError::RateLimited(why) => {
-                assert!(why.starts_with("mk backend 'zorak-mk': no slot at http://127.0.0.1:"), "{why}");
+                assert!(why.starts_with("council backend 'zorak': no slot at http://127.0.0.1:"), "{why}");
                 assert!(why.contains("cooling down"), "{why}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
@@ -1166,9 +849,9 @@ mod tests {
     /// fail about 3 s in, past its 2 s deadline.
     #[tokio::test]
     async fn a_resent_call_gets_only_the_time_left_before_the_deadline() {
-        let mut slow = rendered(30);
+        let mut slow = generation("Hello.", json!([]), 2);
         slow.delay = Duration::from_secs(4);
-        let (base, _) = serve(vec![http(200, MODEL), busy(), slow]).await;
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), busy(), slow]).await;
         let (c, _) = limited(&base, Duration::from_secs(2));
         let started = std::time::Instant::now();
         let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
@@ -1181,17 +864,15 @@ mod tests {
     /// Falsified by a mid-stream 503 that never reaches the limiter.
     #[tokio::test]
     async fn a_mid_stream_503_cools_the_endpoint() {
-        let cut = &ANSWER[..ANSWER.find("event: done").unwrap()];
-        let failed = format!(
-            "{cut}event: error\ndata: {}\n\n",
-            r#"{"error":{"code":503,"message":"spin","type":"pass_timeout_error"}}"#
-        );
-        let (base, _) = serve(vec![http(200, MODEL), rendered(10), sse(failed)]).await;
+        let events = generation_events("Hello.", json!([]), 2);
+        let cut = &events[..events.find("event: done").unwrap()];
+        let failed = format!("{cut}event: error\ndata: {}\n\n", r#"{"error":{"type":"unavailable","message":"spin"}}"#);
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), sse(failed)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let events = drain(&mut stream).await;
         assert!(matches!(events.last(), Some(StreamEvent::Error(e))
-            if e.kind == StreamErrorKind::Overloaded && e.message.contains("pass_timeout_error")), "{events:?}");
+            if e.kind == StreamErrorKind::Overloaded && e.message.contains("spin")), "{events:?}");
         let (_, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
     }
@@ -1201,7 +882,7 @@ mod tests {
     /// Falsified by a stream whose end leaves a busy answer counted.
     #[tokio::test]
     async fn a_stream_that_ends_whole_resets_the_doubling() {
-        let (base, _) = serve(vec![http(200, MODEL), rendered(30), sse(ANSWER)]).await;
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), generation("Hello.", json!([]), 2)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + Duration::from_secs(5);

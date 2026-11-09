@@ -51,7 +51,7 @@ pub enum StreamEvent {
     ///
     /// `signature` is the provider's continuity token for the block, and
     /// only that provider can use it: Anthropic's `signature_delta` (base64),
-    /// a UUID from DeepSeek's Messages endpoint, a sentinel the OpenAI-compatible client and `mk` write (reasoning
+    /// a UUID from DeepSeek's Messages endpoint, a sentinel the OpenAI-compatible client and `council` write (reasoning
     /// they round-trip as text), or, for a `redacted_thinking` block, its
     /// opaque `data` behind the `anthropic:redacted_thinking:` prefix. The
     /// block writer stores it on the block and threads it into
@@ -546,8 +546,8 @@ pub enum UsageExtra {
     /// lemonade/llama.cpp server, Ollama, OpenAI itself). DeepSeek populates
     /// the cache split + reasoning tokens; leaner servers leave them zero.
     OpenAiCompat(OpenAiCompatUsageExtra),
-    /// The megakernel (`llm/mk/`).
-    Mk(MkUsageExtra),
+    /// A council v2 server (`llm/council/`).
+    Council(CouncilUsageExtra),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,20 +581,16 @@ pub struct OpenAiCompatUsageExtra {
     pub prompt_cache_write_tokens: u64,
 }
 
-/// Usage extras for the megakernel. `kept` prompt tokens came from a held
-/// prefix and `fed` were prefilled for this call; both are inside
-/// `input_tokens`. The times are whole milliseconds: `prefill_ms` and
-/// `decode_ms` as the service measured them, `first_token_ms` and `wall_ms`
-/// as the provider saw them, queueing behind other GPU work included. `seed`
-/// replays the reply under the same weights (`model`, `weight_hash`). A
-/// council v2 generation reports no service times and no seed, so those are
-/// `None`.
+/// Usage extras for a council v2 server. `kept` prompt tokens came from a
+/// held snapshot and `fed` were prefilled for this call; both are inside
+/// `input_tokens`. `first_token_ms` and `wall_ms` are whole milliseconds as
+/// the provider saw them, queueing behind other GPU work included. `seed`,
+/// when the server reports one, replays the reply under the same weights
+/// (`model`, `weight_hash`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MkUsageExtra {
+pub struct CouncilUsageExtra {
     pub kept: u64,
     pub fed: u64,
-    pub prefill_ms: Option<u64>,
-    pub decode_ms: Option<u64>,
     pub first_token_ms: u64,
     pub wall_ms: u64,
     pub seed: Option<u64>,

@@ -6,6 +6,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Council backend: what retiring mk leaves open (2026-11-08)
+
+- **Liveness during a long `call` phase.** A call's pieces add no text, so a
+  slow served model writing a long call can reach the runtime's 120 s idle
+  timeout; the backend's `--idle-timeout` is the only lever
+  (`docs/council-backend.md`, "Liveness").
+- **Media.** `lfm3-omni` reads images, audio and video and writes audio;
+  the provider sends text only and turns an image into a marker.
+- **`mk-reasoning` stays the thinking signature**, because stored blocks
+  carry it; renaming it needs a hydration alias.
+- **`kaijutsu_council::council::{GenerationEvent, GenerationStream}`**
+  stutters; the stream types could move to the crate root.
+- **lfm3 on tool loops.** A 1.7B model is weaker than Gemma 4 on long tool
+  loops (nagaya-85); nothing has measured it in a kaijutsu seat yet.
+
 ## `kj watch`: what the first build leaves open (2026-11-08)
 
 `kj watch` watches host files and delivers waiting changes before the next
@@ -69,7 +84,7 @@ shows only reports). A generic server inspector can live in gogi later.
 - `judge_one` reads the identity twice for one decision: once to prepare the labels and house rules
   (`council/shadow.rs:282`) and once to prime the shadow (`council/shadow.rs:287`). If a failure drops the cached
   identity between them, the contexts of one decision could carry different `thinking` values.
-- `mk`'s public `Client::one_shot_opts` (`llm/mk/mod.rs`) forces effort `none` even when the slot names an effort,
+- The council provider's public `Client::one_shot_opts` (`llm/council/mod.rs`) forces effort `none` even when the slot names an effort,
   against the one-shot contract in `llm/mod.rs` (an explicit effort wins). Today the provider wrapper returns
   first when an effort is named, so only a direct caller loses it. It predates the `thinking` change.
 
@@ -182,7 +197,7 @@ shows only reports). A generic server inspector can live in gogi later.
 
 ## Type melt M7: what the docs pass leaves open (2026-11-05)
 
-- "seat" still names a context or a character in docs/container.md, docs/mk.md, the companion, storyteller,
+- "seat" still names a context or a character in docs/container.md, the companion, storyteller,
   toolie and assistant stances, and the assistant `S00` comment; docs/writing.md Terms keep "seat" for the
   council. The stances are published prose: rewrite them together, read the composed prompt after.
 - A rotation moves no context that answered to the predecessor; the character takes them by hand
@@ -236,9 +251,6 @@ the character"). Open, outside M2:
 - The `KJ_TOOL_PLAN` tier stamp comes from `command_verdict` (`kj/gate_policy.rs`), which does not consult the
   edge rules (senpai-edge drift, MCP session create): a create or drift push the gate allows as builtin stamps
   `score`. Safe direction (a hook scores rather than skips), but two classifications.
-- `councils()` is a union of every enabled block over `[council]`, a superset of any one performer's composed
-  council. A fork performed by a judge with no `mk` model, answering to its parent, can be taken for a judge
-  shadow of a council its parent's performer does not run, and is archived with the parent.
 - The MCP session rule's kernel test mirrors the client's argv by hand (`MCP_SESSION_ARGV`); the wire tests in
   kaijutsu-mcp and kaijutsu-server are the end-to-end check.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate` failed once in a parallel
@@ -639,6 +651,11 @@ Clarity:
 
 ## Flaky tests and an early-keys race (2026-10-30)
 
+- `kaijutsu-server` `tests/rpc_integration.rs`, `test_interrupt_cancels_execution`, failed once in a full
+  parallel run on 2026-11-08 (no exit code within 5 s after `interrupt`) and passed 3 of 3 reruns. It interrupts
+  after one `yield_now`, so the interrupt may land before `sleep 60` starts. The same run's
+  `kernel_e2e::deleting_a_session_archives_its_context_and_its_judge_shadow` failed once in setup ("the server
+  hands back its kernel") and passed 3 of 3 reruns.
 - The editor drops keys that arrive after the status line names the file and
   before the kernel answers with its text. `a_burst_into_the_editor_lands_in_order_with_a_paste_in_place`
   now waits for the file's first line before it types. The test's own claim,
@@ -798,11 +815,10 @@ WAL. Accept `-p`, or have the refusal name the fix.
 
 ## Council v2 client: what is open (2026-10-16)
 
-The council speaks only council v2 (gogi's `docs/council-api.md`), and
-the mk provider speaks it when a server's `GET /council/v2/identity` lists
-the turn's model with `generate`. mkviolet serves it. The live
-checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
-(`COUNCIL_URL`) and the mk probes and `live_mk_tool_loop` (`MK_URL`).
+The council and chat turns on a `council` backend speak only council v2
+(gogi's `docs/council-api.md`; `docs/council-backend.md`). The nagaya serves
+it. The live check runs by hand:
+`live_council_v2_seat_is_pinned_and_read_whole` (`COUNCIL_URL`).
 
 - **Queue seats.** Each council context is held as a queue seat per spec
   (`council/seat.rs`), with worked examples for the shipped specs only.
@@ -831,13 +847,13 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
 - **Thinking markers in a thinking-off answer.** On mkviolet, a
   `thinking: false` generation after a tool result answered with
   `<|channel>thought\n<channel|>` at the start of `content`
-  (`live_mk_tool_loop`, 2026-10-17). `done.content` carried it, so the
+  (a live tool loop, 2026-10-17). `done.content` carried it, so the
   server did not read it as thinking, and the provider passes it through.
   The cause is unknown; a plain thinking-off turn answers cleanly.
-- **The context window on v2.** `context_window` still reads
-  `/mk/v1/model`, and a model row's `context_window` smaller than the
-  server's `context_tokens` is not enforced on the v2 path: there is no
-  render to count the prompt, so the server's `context_full` is the check.
+- **The context window.** A model row's `context_window` smaller than the
+  served model's `context_tokens` is not enforced on a council turn: there
+  is no render to count the prompt, so the server's `context_full` is the
+  check, and `max_tokens` is capped at `context_tokens`.
 - **A server restart leaves seat records stale.** Each decision sends its
   seats whole, so it still works, but the kernel keeps each seat's old head:
   it records that head as a read's `expected_head` and keeps it in the pin
@@ -855,8 +871,8 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   `contexts_per_decision` and `context_tokens` are read; a spec over the
   server's `choice_options` or `questions_per_spec` fails at the decision,
   not as a prepare miss that names the limit.
-- **Questions for the spec.** Snapshot ids keep v1's `snap:` form; tokens
-  and stream errors are `/mk/v1`'s; the `reads` reply shape; whether a
+- **Questions for the spec.** Snapshot ids keep v1's `snap:` form; the
+  `reads` reply shape; whether a
   generation can mark its reply `snap`; and
   `reasoning_effort`, which v2 does not carry.
 

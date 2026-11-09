@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_text_question_has_no_queue_seat() {
-        let spec = spec(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json"));
+        let spec = spec(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json"));
         let e = queue_seat(body(), &spec).unwrap_err();
         assert!(e.contains("text question"), "{e}");
     }

@@ -3719,3 +3719,27 @@ than the one rendered fails the delivery. The listener watches parent
 directories, because an editor's rename-over save replaces the file a direct
 watch would hold. Writing the docs exposed that "only live contexts accrue"
 would let promote re-arm a context's watches, so promotion now stops them.
+
+## The council server becomes a backend like any other (November 8)
+
+The nagaya started serving LFM3 through council v2, and a context on it ran
+no turn: since the one-model change, a backend of kind `mk` was "never a
+chat model", and a character whose model sat on one was taken for a judge.
+Amy: "we're definitely doing chat turns in the nagaya web app", and then
+"mk should be entirely replaced by gogi & modern council api, of which
+nagaya is our current implementation". So kind `mk` became `council`, the
+megakernel's `/mk/v1` render-and-generate path went, and `kaijutsu-mk`
+became `kaijutsu-council`: one contract (gogi's) for chat turns, gate
+decisions and embeddings.
+
+Lifting the chat guard broke the judge's identity. Archive, rotation,
+demote, retire and move all told a judge shadow from an ordinary kohai by its
+performer's backend, and most archive paths ran without gate.toml's judge
+names. A council-model kohai of any context would have been archived with
+its senpai. The council already knows when it makes a shadow, so it records
+the fact in `judge_shadows` in the same transaction; the backend guess and
+the threaded judge names are gone. The boot migration backfills the table by
+the old rule before renaming the kind, which is exact for old data because
+no chat context could run on `mk` before it. A council slot with
+`max_tokens` is a chat model; one without, a judge's, runs no chat turn and
+says how to give it one.

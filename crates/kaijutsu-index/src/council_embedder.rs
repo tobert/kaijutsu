@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use gogi_proto::embeddings::EmbeddingsRequest;
 use gogi_proto::identity::{Capability, ModelStatus};
 use gogi_proto::message::Content;
-use kaijutsu_mk::MkClient;
+use kaijutsu_council::CouncilClient;
 use sha2::{Digest, Sha256};
 
 use crate::{Embedder, EmbeddingPurpose, IndexError};
@@ -32,7 +32,7 @@ pub struct CouncilEmbedderConfig {
 /// other identity is refused: vectors of different identities do not compare,
 /// so restart the index to adopt a changed server.
 pub struct CouncilEmbedder {
-    client: MkClient,
+    client: CouncilClient,
     model: String,
     /// A hash of the identity fields the vectors depend on.
     revision: String,
@@ -77,7 +77,7 @@ impl CouncilEmbedder {
         if config.model.trim().is_empty() {
             return Err(failure("the model name is empty"));
         }
-        let client = MkClient::new(config.base_url.as_str(), config.timeout).map_err(failure)?;
+        let client = CouncilClient::new(config.base_url.as_str(), config.timeout).map_err(failure)?;
         let identity = client.council().identity().await.map_err(failure)?;
         let served = identity.route(&config.model).map_err(|e| failure(e.message))?;
         let offered = match &served.embeddings {

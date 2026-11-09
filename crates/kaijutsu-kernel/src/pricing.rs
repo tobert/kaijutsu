@@ -28,7 +28,7 @@ use crate::llm::BackendKind;
 pub enum InputStyle {
     /// `input` leaves out cache reads and writes (Anthropic).
     ExcludesCache,
-    /// `input` includes the cache hit (OpenAI-compatible, megakernel).
+    /// `input` includes the cache hit (OpenAI-compatible, council).
     IncludesCacheHit,
     /// `input` includes the cache hit and the cache write (Alibaba).
     IncludesCache,

@@ -149,7 +149,7 @@ async fn an_input_past_the_servers_limit_is_an_error_naming_it() {
 /// new template) must not feed vectors from another space into the index.
 #[tokio::test]
 async fn a_response_with_another_identity_is_refused() {
-    use kaijutsu_mk::test_server::{reply, serve};
+    use kaijutsu_council::test_server::{reply, serve};
 
     let server = embedder_server();
     let http = reqwest::Client::new();
@@ -186,7 +186,7 @@ async fn fake_replies(server: &Server) -> (serde_json::Value, serde_json::Value)
 /// another must fail at connect, not at the first block that needs a vector.
 #[tokio::test]
 async fn connect_refuses_a_probe_that_returns_the_wrong_size() {
-    use kaijutsu_mk::test_server::{reply, serve};
+    use kaijutsu_council::test_server::{reply, serve};
 
     let server = embedder_server();
     let (identity, mut probe) = fake_replies(&server).await;
@@ -203,7 +203,7 @@ async fn connect_refuses_a_probe_that_returns_the_wrong_size() {
 /// in `chunks(0)`; refuse it where the cause is visible.
 #[tokio::test]
 async fn connect_refuses_a_server_that_takes_no_inputs_per_request() {
-    use kaijutsu_mk::test_server::{reply, serve};
+    use kaijutsu_council::test_server::{reply, serve};
 
     let server = embedder_server();
     let (mut identity, probe) = fake_replies(&server).await;

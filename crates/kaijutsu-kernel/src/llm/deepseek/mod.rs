@@ -91,7 +91,7 @@ mod tests {
     /// `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
     #[tokio::test]
     async fn outbound_requests_carry_the_kaijutsu_user_agent() {
-        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_council::test_server::{serve, sse};
         let done = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let (base, seen) = serve(vec![sse(done)]).await;
         let mut stream = Client::new("fake-key")

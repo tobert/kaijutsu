@@ -17,8 +17,8 @@
 //!
 //! A caller waits for a slot until its own deadline: one that finds a free
 //! slot when it asks takes it, and one that has waited gets none at or after
-//! its deadline. The limiter never retries a request, except a megakernel
-//! 429 ([`mk_call`]). See `docs/retries-and-ratelimits.md`.
+//! its deadline. The limiter never retries a request, except a council
+//! 429 ([`council_call`]). See `docs/retries-and-ratelimits.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,8 +37,8 @@ pub const FIRST_COOLDOWN: Duration = Duration::from_secs(5);
 pub const MAX_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// The shortest cooldown a busy answer starts, `Retry-After: 0` included, so
-/// a megakernel 429 is sent again at most once a second
-/// (`docs/mk-admission.md`).
+/// a council server 429 is sent again at most once a second
+/// (`docs/retries-and-ratelimits.md`).
 pub const MIN_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// The endpoint a backend's requests go to: its base URL's origin, or
@@ -85,66 +85,66 @@ pub(crate) async fn take_for_request(endpoint: Option<&Arc<Endpoint>>, wait: Dur
     }
 }
 
-/// One megakernel call through `endpoint`: takes a slot, noting the wait in
+/// One council server call through `endpoint`: takes a slot, noting the wait in
 /// `waits`, makes the call, and tells the endpoint how it answered. A 429 is
 /// refused before any work starts, so the same call goes out again once the
-/// cooldown it started ends (`docs/mk-admission.md`). Any other answer,
+/// cooldown it started ends (`docs/retries-and-ratelimits.md`). Any other answer,
 /// a 503 included, is returned with the slot it was made under. Every wait
 /// ends at `deadline`, and every cooldown lasts at least [`MIN_COOLDOWN`],
 /// so the call goes out at most once a second and never after a wait that
 /// reached `deadline`.
-pub async fn mk_call<T, F, Fut>(
+pub async fn council_call<T, F, Fut>(
     endpoint: &Arc<Endpoint>,
     deadline: Instant,
     waits: &SlotWaits,
     call: F,
-) -> Result<(Slot, Result<T, kaijutsu_mk::MkError>), NoSlot>
+) -> Result<(Slot, Result<T, kaijutsu_council::CouncilError>), NoSlot>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, kaijutsu_mk::MkError>>,
+    Fut: std::future::Future<Output = Result<T, kaijutsu_council::CouncilError>>,
 {
-    mk_send(endpoint, deadline, waits, false, call).await
+    council_send(endpoint, deadline, waits, false, call).await
 }
 
-/// [`mk_call`] for a call that opens a stream. An opened stream is not yet a
+/// [`council_call`] for a call that opens a stream. An opened stream is not yet a
 /// completed answer, so it leaves the doubling as it was; the stream calls
-/// [`Slot::completed`] or [`Slot::failed_mk`] when it ends.
-pub async fn mk_open<T, F, Fut>(
+/// [`Slot::completed`] or [`Slot::failed_council`] when it ends.
+pub async fn council_open<T, F, Fut>(
     endpoint: &Arc<Endpoint>,
     deadline: Instant,
     waits: &SlotWaits,
     call: F,
-) -> Result<(Slot, Result<T, kaijutsu_mk::MkError>), NoSlot>
+) -> Result<(Slot, Result<T, kaijutsu_council::CouncilError>), NoSlot>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, kaijutsu_mk::MkError>>,
+    Fut: std::future::Future<Output = Result<T, kaijutsu_council::CouncilError>>,
 {
-    mk_send(endpoint, deadline, waits, true, call).await
+    council_send(endpoint, deadline, waits, true, call).await
 }
 
-async fn mk_send<T, F, Fut>(
+async fn council_send<T, F, Fut>(
     endpoint: &Arc<Endpoint>,
     deadline: Instant,
     waits: &SlotWaits,
     opens_stream: bool,
     mut call: F,
-) -> Result<(Slot, Result<T, kaijutsu_mk::MkError>), NoSlot>
+) -> Result<(Slot, Result<T, kaijutsu_council::CouncilError>), NoSlot>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, kaijutsu_mk::MkError>>,
+    Fut: std::future::Future<Output = Result<T, kaijutsu_council::CouncilError>>,
 {
-    use kaijutsu_mk::MkError;
+    use kaijutsu_council::CouncilError;
     loop {
         let slot = endpoint.acquire_noting(deadline, waits).await?;
         let result = call().await;
         match &result {
             Ok(_) if opens_stream => {}
             Ok(_) => slot.completed(),
-            Err(e) => slot.failed_mk(e),
+            Err(e) => slot.failed_council(e),
         }
         match &result {
-            Err(MkError::Status { status: 429, .. } | MkError::Service { status: 429, .. }) => {
-                tracing::debug!(endpoint = %endpoint.key, "megakernel refused the call with 429; sending it again after the cooldown");
+            Err(CouncilError::Status { status: 429, .. }) => {
+                tracing::debug!(endpoint = %endpoint.key, "council server refused the call with 429; sending it again after the cooldown");
             }
             _ => return Ok((slot, result)),
         }
@@ -507,9 +507,9 @@ impl Slot {
         self.endpoint.busy(503, None);
     }
 
-    /// A megakernel call or stream failed with `error`. An error status, or
+    /// A council server call or stream failed with `error`. An error status, or
     /// an error event in a stream, of 429 or 503 starts a cooldown.
-    pub fn failed_mk(&self, error: &kaijutsu_mk::MkError) {
+    pub fn failed_council(&self, error: &kaijutsu_council::CouncilError) {
         if let Some(status @ (429 | 503)) = error.status() {
             self.endpoint.busy(status, error.retry_after());
         }
@@ -693,8 +693,8 @@ mod tests {
         assert_eq!(ea.status().in_flight, 2);
     }
 
-    fn busy_mk(retry_after: Option<Duration>) -> kaijutsu_mk::MkError {
-        kaijutsu_mk::MkError::Service { status: 429, error: None, retry_after, body: String::new() }
+    fn busy_council(retry_after: Option<Duration>) -> kaijutsu_council::CouncilError {
+        kaijutsu_council::CouncilError::Status { status: 429, error: None, retry_after, body: String::new(), request_id: None }
     }
 
     /// A busy answer that asks for no wait still cools the endpoint for 1 s.
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(miss.waited, Duration::from_secs(2));
     }
 
-    /// A megakernel that answers 429 with no wait gets the call again at
+    /// A council server that answers 429 with no wait gets the call again at
     /// most once a second, and the resends end at the deadline.
     ///
     /// Falsified by a resend loop with no floor on its wait (it would send
@@ -731,9 +731,9 @@ mod tests {
         let endpoint = Endpoints::default().get("http://zorak:8090");
         let calls = AtomicU32::new(0);
         let deadline = Instant::now() + Duration::from_millis(3500);
-        let answered = mk_call(&endpoint, deadline, &SlotWaits::default(), || {
+        let answered = council_call(&endpoint, deadline, &SlotWaits::default(), || {
             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
-            async move { if n > 100 { Ok(()) } else { Err(busy_mk(Some(Duration::ZERO))) } }
+            async move { if n > 100 { Ok(()) } else { Err(busy_council(Some(Duration::ZERO))) } }
         })
         .await;
         assert!(answered.is_err(), "the resends end at the deadline with no slot");
@@ -750,14 +750,14 @@ mod tests {
         let endpoint = Endpoints::default().get("http://zorak:8090");
         let calls = AtomicU32::new(0);
         let deadline = Instant::now() + Duration::from_secs(1);
-        let answered = mk_call(&endpoint, deadline, &SlotWaits::default(), || {
+        let answered = council_call(&endpoint, deadline, &SlotWaits::default(), || {
             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 if n > 1 {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                Err(busy_mk(Some(Duration::ZERO)))
+                Err(busy_council(Some(Duration::ZERO)))
             }
         })
         .await;
@@ -798,7 +798,7 @@ mod tests {
         endpoint.acquire(Instant::now()).await.unwrap().answered_with(503, Some(Duration::from_secs(1)));
         let far = Instant::now() + Duration::from_secs(600);
         let (slot, opened) =
-            mk_open(&endpoint, far, &SlotWaits::default(), || async { Ok::<_, kaijutsu_mk::MkError>(()) }).await.unwrap();
+            council_open(&endpoint, far, &SlotWaits::default(), || async { Ok::<_, kaijutsu_council::CouncilError>(()) }).await.unwrap();
         opened.unwrap();
         assert_eq!(endpoint.busy_in_a_row(), 1, "an open stream is not yet a success");
         slot.completed();
@@ -813,11 +813,10 @@ mod tests {
     async fn a_mid_stream_503_cools_the_endpoint() {
         let endpoint = Endpoints::default().get("http://zorak:8090");
         let slot = endpoint.acquire(Instant::now()).await.unwrap();
-        slot.failed_mk(&kaijutsu_mk::MkError::Stream(kaijutsu_mk::ServiceError {
-            code: 503,
-            message: "spin".into(),
-            r#type: "pass_timeout_error".into(),
-        }));
+        slot.failed_council(&kaijutsu_council::CouncilError::Stream {
+            error: gogi_proto::ErrorBody::new(gogi_proto::ErrorType::Unavailable, "spin").error,
+            request_id: None,
+        });
         assert_eq!(endpoint.status().cooldown, Some((FIRST_COOLDOWN, 503)));
     }
 }

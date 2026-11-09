@@ -129,8 +129,8 @@ impl BackendKind {
     ///
     /// `openai` means "some OpenAI-compatible server", `alibaba` means the
     /// Token Plan or one workspace (different hosts, different keys),
-    /// `codex-app` means a reachable Codex app-server daemon, and `mk` means a
-    /// megakernel service. Each needs the endpoint in `base_url`, because
+    /// `codex-app` means a reachable Codex app-server daemon, and `council` means a
+    /// council v2 server. Each needs the endpoint in `base_url`, because
     /// which server is exactly the information `base_url` carries. Anthropic accepts one
     /// as a gateway override; DeepSeek's endpoint is fixed, so a `base_url`
     /// there is accepted-and-ignored rather than silently changing where a
