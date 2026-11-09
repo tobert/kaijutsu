@@ -10,21 +10,25 @@ struct Rig {
     mk: BackendId,
 }
 
+/// Insert a backend row as an older database holds it: raw SQL, since
+/// `upsert_backend` refuses the retired kind `mk`.
+fn old_backend(db: &KernelDb, name: &str, kind: &str) -> BackendId {
+    let id = BackendId::new();
+    db.conn.execute(
+        "INSERT INTO backends (backend_id, name, kind, key_optional, created_by) VALUES (?1, ?2, ?3, 1, ?4)",
+        params![blob_param(id.as_bytes()), name, kind, blob_param(PrincipalId::system().as_bytes())],
+    ).unwrap();
+    id
+}
+
 fn rig() -> Rig {
     rig_on(KernelDb::temporary().unwrap())
 }
 
 fn rig_on(db: KernelDb) -> Rig {
     let ws = setup_test_db(&db);
-    let backend = |name: &str, kind: &str| {
-        db.upsert_backend(&BackendRow {
-            backend_id: BackendId::new(), name: name.into(), kind: kind.into(), base_url: None, api_key_env: None,
-            api_key_file: None, key_optional: true, request_timeout_secs: None, idle_timeout_secs: None,
-            max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
-        }).unwrap().backend_id
-    };
-    let deepseek = backend("deepseek", "deepseek");
-    let mk = backend("mk-zorak", "mk");
+    let deepseek = old_backend(&db, "deepseek", "deepseek");
+    let mk = old_backend(&db, "mk-zorak", "mk");
     Rig { db, ws, deepseek, mk }
 }
 

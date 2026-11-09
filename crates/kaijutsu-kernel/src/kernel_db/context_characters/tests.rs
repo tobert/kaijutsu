@@ -34,7 +34,7 @@ struct World {
     ws: WorkspaceId,
     anthropic: BackendId,
     deepseek: BackendId,
-    /// A council server (kind `mk`).
+    /// A council server (kind `council`).
     mk: BackendId,
     /// Next `created_at` a test context takes, so creation order is explicit.
     clock: std::cell::Cell<i64>,
@@ -78,7 +78,7 @@ fn build_world(legacy: bool) -> World {
     };
     let anthropic = backend("anthropic", "anthropic");
     let deepseek = backend("deepseek", "deepseek");
-    let mk = backend("mk-zorak", "mk");
+    let mk = backend("mk-zorak", "council");
     World { db, casts: Default::default(), ws, anthropic, deepseek, mk, clock: std::cell::Cell::new(1_000), legacy }
 }
 
@@ -506,13 +506,13 @@ fn a_distill_slot_wins_over_the_model_for_distill() {
     assert_eq!(model.model, "ds-flash", "the model fills `model`");
 }
 
-/// The model never fills `gate`; it fills `model` for every context, an MCP
-/// session's included; and a model on a council server fills `model` alone,
-/// since a council server distills nothing. A character with no model
-/// gives a context no `model` slot.
+/// The model never fills `gate`; it fills `model` and `distill` for every
+/// context, an MCP session's included, and a model on a council server
+/// does the same, since a council server serves chat turns too. A character
+/// with no model gives a context no `model` slot.
 ///
-/// Falsified by keeping the `mcp` carve-out, or by copying a council server
-/// under `distill`.
+/// Falsified by keeping the `mcp` carve-out, or by leaving a council model
+/// out of `distill`.
 #[test]
 fn the_model_fills_model_for_every_type_and_never_gate() {
     let w = world();
@@ -532,7 +532,7 @@ fn the_model_fills_model_for_every_type_and_never_gate() {
     w.give_model(judge, w.mk, "gemma", None);
     let shadow = w.ctx("shadow", "judge", None, None);
     w.db.write_context_character(shadow.context_id, judge, None, None).unwrap();
-    assert_eq!(w.roles(&shadow), ["model"], "a council server distills nothing");
+    assert_eq!(w.roles(&shadow), ["distill", "model"], "a council model distills like any model");
     assert_eq!(w.db.context_slot(shadow.context_id, "model").unwrap().unwrap().max_tokens, None);
 
     let bare = w.character("bare");
@@ -557,7 +557,7 @@ fn a_character_slot_of_another_role_refuses() {
         principal_id: who, role: "gate".into(), backend_id: w.deepseek, model: "ds-flash".into(),
         max_tokens: Some(10), temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
     }).unwrap_err().to_string();
-    assert!(error.contains("`gate` slot names a council server") && error.contains("not mk"), "{error}");
+    assert!(error.contains("`gate` slot names a council server") && error.contains("not council"), "{error}");
 
     w.exec(
         "INSERT INTO character_slots (principal_id, role, backend_id, model, max_tokens) VALUES (?1, 'coder', ?2, 'ds-flash', 10)",
@@ -1030,7 +1030,7 @@ fn root_ctx_moves_at_commit_rotation() {
     insert_new_context_rows(&w.db, &successor, CharacterPlacement::Rotate { predecessor: old.context_id }).unwrap();
     assert_eq!(w.db.root_console(amy).unwrap(), Some(old.context_id), "the pointer waits for the commit");
 
-    w.db.commit_rotation(old.context_id, successor.context_id, None).unwrap();
+    w.db.commit_rotation(old.context_id, successor.context_id).unwrap();
 
     assert_eq!(w.db.root_console(amy).unwrap(), Some(successor.context_id), "the commit moves the console");
     assert_eq!(w.db.root_console(bob).unwrap(), Some(bob_console.context_id), "another root's console stays");

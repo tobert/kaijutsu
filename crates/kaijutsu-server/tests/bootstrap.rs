@@ -186,7 +186,7 @@ fn a_console_on_a_council_server_slot_is_rotated() {
         let before = {
             let db = kernel_db(&config);
             let mk = db.upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: "mk-zorak".into(), kind: "mk".into(),
+                backend_id: kaijutsu_types::BackendId::new(), name: "mk-zorak".into(), kind: "council".into(),
                 base_url: None, api_key_env: None, api_key_file: None, key_optional: true,
                 request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
                 created_by: kaijutsu_types::PrincipalId::system(),

@@ -84,7 +84,7 @@ turns                           turn_id, context_id, provider, model, raw tokens
   root character has none: a root runs no model.
 - **A character slot** is the model a character uses for one of two roles: `distill`, a cheaper model for `kj fork
   --compact` and `kj drift pull|merge`, and `gate`, the council server that judges the gate. `kj character slot
-  set` refuses any other role, and a `gate` slot on a backend that is not kind `mk`. A NULL parameter takes the
+  set` refuses any other role, and a `gate` slot on a backend that is not kind `council`. A NULL parameter takes the
   model's `backend_models` value when a context is made. There are no casts: each character holds its own slots.
 - **A context's performer** (`contexts.performer`) is the character that plays it. A trigger refuses a change to
   `performer` and `persona` once set, and `context_slots` rows are never changed. `persona` is NULL until
@@ -132,7 +132,7 @@ model.
   parameter value of its own.
 - `max_tokens`, which every provider request carries, must come from the character's model or slot, or from the
   model's row. A slot with none refuses when the context is made, naming the character, the role and the model.
-  A slot whose backend is a council server (kind `mk`) names a served model, needs no `max_tokens`, and is never
+  A slot whose backend is a council server (kind `council`) names a served model, needs no `max_tokens`, and is never
   a chat model: that is decided by the backend's kind, not by the role's name. A `gate` slot whose backend is not
   a council server refuses when it is written. `context_window` comes from the slot's model row in
   `backend_models`, or is unknown. An unset optional parameter (temperature, top_p, effort, thinking) is left out of
@@ -141,17 +141,19 @@ model.
   ("<context> has no model: <character> has no model; `kj character model set <character> <backend>/<model>`, then
   `kj context rotate`"), and `kj context info` shows the same line. An MCP session, a context whose parent is an
   MCP hub, prints no such line: its client brings its own model ("MCP sessions"). A model turn in K refuses before
-  any provider work, naming the character and the same fix. A judge shadow, whose `model` slot is on a council
-  server, has no chat model: `kj context info` says it runs on a council server. A listing shows a context whose
+  any provider work, naming the character and the same fix. A `model` slot on a council server with no
+  `max_tokens`, a judge shadow's, runs no chat turn: `kj context info` says so and names
+  `kj character model set <character> <backend>/<model> --max-tokens <n>`. A listing shows a context whose
   slot cannot be read with the error in its model column and lists the rest.
 - The gate runs on K's `gate` slot and the judge on its shadow's `model` slot. The two are independent: a context
   with no `gate` slot has no council, and its gate decides without one; a council block with no `judge` key runs
   its council with no judge.
 - A judge shadow belongs to one context. The gate makes it as a context performed by the judge character the
   council block names, with K as its parent and its senpai, and slots copied from the judge character. It is
-  found as K's live child that character performs. A context is a judge shadow when its parent is its senpai and
-  its performer is a judge: a character whose model is on a council server, or one some council block in a
-  gate.toml that loaded names as `judge`. `kj context set --senpai` refuses to move one. The kernel archives K's
+  found as K's live child that character performs and the gate made as its shadow. A context is a judge shadow
+  when the gate made it as one, recorded in `judge_shadows`, and its parent is still its senpai. A kohai of a
+  character whose model is on a council server is an ordinary context. `kj context set --senpai` refuses to move a
+  shadow. The kernel archives K's
   judge shadows in the same transaction that archives K, at `kj context archive`, a rotation's commit, a demote
   past the rim and a character's retirement, and the successor's first gate call makes a new one.
 - A fork's distillation runs on the forking context's `distill` slot, and `kj drift pull|merge` on the caller's

@@ -1486,7 +1486,7 @@ async fn connect_semantic_index(
     let backend = &emb_config.backend;
     let timeout = std::time::Duration::from_millis(emb_config.timeout_ms);
     let connected: Result<Box<dyn kaijutsu_index::Embedder>, kaijutsu_index::IndexError> = match backend.kind {
-        kaijutsu_kernel::BackendKind::Mk => {
+        kaijutsu_kernel::BackendKind::Council => {
             let Some(base_url) = backend.base_url.clone() else {
                 log::warn!("Embedding backend `{}` needs a base_url; the semantic index stays off", backend.name);
                 return None;

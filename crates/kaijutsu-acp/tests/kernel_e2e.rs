@@ -659,10 +659,9 @@ fn deleting_a_session_archives_its_context_and_its_judge_shadow() {
         .expect("seat the shadow under the session");
         // Bootstrap creates the judge character with no model.
         let judge = db.get_character_by_name("judge").unwrap().expect("bootstrap creates the judge").principal_id;
-        // A character whose model is on a council server is a judge.
         let mk = db
             .upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "mk".into(),
+                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "council".into(),
                 base_url: None, api_key_env: None, api_key_file: None, key_optional: true,
                 request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
                 created_by: PrincipalId::system(),
@@ -675,6 +674,7 @@ fn deleting_a_session_archives_its_context_and_its_judge_shadow() {
         .expect("give the judge its council server");
         db.note_senpai_intent(shadow, Some(seat)).expect("the shadow answers to the session");
         db.update_performer(shadow, Some(judge)).expect("the judge character performs the shadow");
+        db.mark_judge_shadow(shadow).expect("the council made it as the session's shadow");
     }
 
     client

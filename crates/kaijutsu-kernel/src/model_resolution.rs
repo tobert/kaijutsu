@@ -25,7 +25,7 @@ pub const CHARACTER_SLOT_ROLES: &[&str] = &[DISTILL, crate::council::gate::GATE]
 
 /// The backend kind of a council server. A slot on such a backend names a
 /// served model, needs no `max_tokens`, and is never a chat model.
-pub const COUNCIL_BACKEND_KIND: &str = "mk";
+pub const COUNCIL_BACKEND_KIND: &str = "council";
 
 /// Whether a backend of `kind` is a council server.
 pub fn is_council_kind(kind: &str) -> bool {
@@ -41,7 +41,7 @@ pub fn refuse_character_slot_role(role: &str, character: &str) -> Result<(), Str
     if role == crate::council::shadow::JUDGE {
         return Err(
             "a character holds no `judge` slot: the judge is a character, `judge` on a shipped host. \
-             `kj character model set judge <mk-backend>/<model>` gives it its council server, and \
+             `kj character model set judge <council-backend>/<model>` gives it its council server, and \
              `judge = \"judge\"` in the council block names it"
                 .to_string(),
         );
@@ -72,9 +72,10 @@ pub enum NoModelReason {
     NoContextCharacter,
     /// The context's slots have none for the role.
     NoSlot,
-    /// The role's slot is on a council server (a backend of kind `mk`): it
-    /// names a served model, not a chat model.
-    CouncilServer,
+    /// The role's slot is on a council server and has no `max_tokens`, which
+    /// a chat turn needs: a judge's model, which only answers the gate.
+    /// `model` is `<backend>/<model>`.
+    NoMaxTokens { model: String },
 }
 
 /// A context, or a role of it, that has no model.
@@ -86,8 +87,8 @@ pub struct NoModel {
     pub context_ref: String,
     pub character: Option<String>,
     /// The performer now has what the role copies when a context is made:
-    /// its model for `model`; a `distill` slot, or a model that is no council
-    /// server, for `distill`; the slot itself for any other role. Rotating
+    /// its model for `model`; a `distill` slot or its model for `distill`;
+    /// the slot itself for any other role. Rotating
     /// the context then fills the role.
     pub rotation_fills: bool,
     /// The role looked up: `model`, `gate` or `distill`.
@@ -99,16 +100,16 @@ pub struct NoModel {
 }
 
 impl NoModel {
-    /// The role `role` of `bound`'s context, whose slot names a council
-    /// server rather than a chat model.
-    pub fn council_server(bound: &BoundSlot, role: &str) -> Self {
+    /// The role `role` of `bound`'s context, whose slot is on a council
+    /// server and has no `max_tokens`.
+    pub fn no_max_tokens(bound: &BoundSlot, role: &str) -> Self {
         NoModel {
             context: bound.context.clone(),
             context_ref: bound.context_ref.clone(),
             character: Some(bound.character.clone()),
             rotation_fills: false,
             role: role.to_string(),
-            reason: NoModelReason::CouncilServer,
+            reason: NoModelReason::NoMaxTokens { model: format!("{}/{}", bound.backend, bound.slot.model) },
             mcp_session: false,
         }
     }
@@ -123,6 +124,15 @@ impl NoModel {
         Some(self.line())
     }
 
+    /// The verb that gives `character`'s role `model` a `max_tokens`.
+    fn max_tokens_fix(&self, character: &str, model: &str) -> String {
+        if self.role == MODEL {
+            format!("`kj character model set {character} {model} --max-tokens <n>`")
+        } else {
+            format!("`kj character slot set {character} {} {model} --max-tokens <n>`", self.role)
+        }
+    }
+
     /// The line itself, for any context.
     pub fn line(&self) -> String {
         let character = self.character.as_deref().unwrap_or("its character");
@@ -130,9 +140,9 @@ impl NoModel {
             NoModelReason::NoContextCharacter => {
                 format!("{} has no performer, so it runs no model", self.context)
             }
-            NoModelReason::CouncilServer => format!(
-                "{} runs on a council server, not a chat model: its {} slot names the server",
-                self.context, self.role
+            NoModelReason::NoMaxTokens { model } => format!(
+                "{} runs no {} turn: {model} has no max_tokens; {}, then `kj context rotate {}`",
+                self.context, self.role, self.max_tokens_fix(character, model), self.context_ref
             ),
             NoModelReason::NoSlot if self.rotation_fills && self.role == MODEL => format!(
                 "{} has no model: it was made before {character} had one; `kj context rotate {}` copies \
@@ -177,15 +187,9 @@ impl NoModel {
                  `kj context create <character> [--name <label>]`",
                 self.context
             ),
-            NoModelReason::CouncilServer if self.role == DISTILL => format!(
-                "{} {what}: its {DISTILL} slot names a council server, not a chat model. Fix: \
-                 `kj character slot set {character} {DISTILL} <backend>/<model>` with a chat model, \
-                 then `kj context rotate {}`",
-                self.context, self.context_ref
-            ),
-            NoModelReason::CouncilServer => format!(
-                "{} {what}: its {} slot names a council server, not a chat model",
-                self.context, self.role
+            NoModelReason::NoMaxTokens { model } => format!(
+                "{} {what}: its {} slot {model} has no max_tokens. Fix: {}, then `kj context rotate {}`",
+                self.context, self.role, self.max_tokens_fix(character, model), self.context_ref
             ),
             NoModelReason::NoSlot if self.rotation_fills && self.role == MODEL => format!(
                 "{} {what}: it was made before character {character} had a model. Fix: `kj context rotate {}`",
@@ -230,10 +234,7 @@ fn character_fills(db: &KernelDb, principal: kaijutsu_types::PrincipalId, role: 
             if db.get_character_slot(principal, DISTILL)?.is_some() {
                 return Ok(true);
             }
-            match model {
-                Some(model) => Ok(!db.backend_is_council_server(model.backend_id)?),
-                None => Ok(false),
-            }
+            Ok(model.is_some())
         }
         _ => Ok(db.get_character_slot(principal, role)?.is_some()),
     }
@@ -316,7 +317,7 @@ pub struct BoundSlot {
     pub character: String,
     /// Backend NAME.
     pub backend: String,
-    /// The backend is a council server (kind `mk`).
+    /// The backend is a council server (kind `council`).
     pub council_server: bool,
     pub slot: ContextSlotRow,
 }
@@ -333,13 +334,15 @@ fn non_negative(value: Option<i64>) -> Option<u64> {
 }
 
 /// The model context `context_id` runs, from its [`MODEL`] slot. A slot on a
-/// council server (a judge shadow's) is no chat model. `Err` is a fault
-/// reading the slot, or a chat slot with no `max_tokens` (which a context
-/// character write refuses).
+/// council server with no `max_tokens` (a judge's) runs no chat turn. `Err`
+/// is a fault reading the slot, or a slot on another backend with no
+/// `max_tokens` (which a context character write refuses).
 pub fn context_model(db: &KernelDb, context_id: ContextId) -> KernelDbResult<ContextModelLookup> {
     match role_slot(db, context_id, MODEL)? {
         RoleSlot::None(none) => Ok(ContextModelLookup::None(none)),
-        RoleSlot::Slot(bound) if bound.council_server => Ok(ContextModelLookup::None(NoModel::council_server(&bound, MODEL))),
+        RoleSlot::Slot(bound) if bound.council_server && bound.slot.max_tokens.is_none() => {
+            Ok(ContextModelLookup::None(NoModel::no_max_tokens(&bound, MODEL)))
+        }
         RoleSlot::Slot(bound) => {
             let slot = &bound.slot;
             let max_tokens = non_negative(slot.max_tokens).filter(|m| *m > 0).ok_or_else(|| {

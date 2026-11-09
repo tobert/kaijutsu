@@ -537,16 +537,16 @@ fn a_demote_refuses_a_step_that_changed_after_its_caller_decided_it() {
     let cid = row.context_id;
     insert_kohai_with_doc(&db, &row, ws_id);
 
-    let error = db.demote_context_with_shadows(cid, None, true, None).unwrap_err().to_string();
+    let error = db.demote_context_with_shadows(cid, true, None).unwrap_err().to_string();
     assert!(error.contains("kj context demote"), "{error}");
     assert_eq!(db.get_context(cid).unwrap().unwrap().demoted_at, None, "a stale archive decision demotes nothing");
 
     assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Demoted);
-    let error = db.demote_context_with_shadows(cid, None, false, None).unwrap_err().to_string();
+    let error = db.demote_context_with_shadows(cid, false, None).unwrap_err().to_string();
     assert!(error.contains("kj context demote") && error.contains("--confirm"), "{error}");
     assert!(!db.get_context(cid).unwrap().unwrap().is_archived(), "a stale demote decision archives nothing");
 
-    let (outcome, _) = db.demote_context_with_shadows(cid, None, true, None).unwrap();
+    let (outcome, _) = db.demote_context_with_shadows(cid, true, None).unwrap();
     assert_eq!(outcome, DemoteOutcome::Archived);
 }
 
@@ -606,12 +606,12 @@ fn archiving_a_console_checks_its_person_inside_the_write() {
     let ws_id = setup_test_db(&db);
     let (amy, con, bob) = console_fixture(&db, ws_id);
 
-    let error = db.archive_with_shadows_by(con, None, Some(bob)).unwrap_err().to_string();
+    let error = db.archive_with_shadows_by(con, Some(bob)).unwrap_err().to_string();
     assert!(error.contains("con") && error.contains("console") && error.contains("only"), "{error}");
     assert!(!db.get_context(con).unwrap().unwrap().is_archived(), "the refused write archives nothing");
     assert_eq!(db.get_character(amy).unwrap().unwrap().console_ctx, Some(con));
 
-    assert!(db.archive_with_shadows_by(con, None, Some(amy)).unwrap().context);
+    assert!(db.archive_with_shadows_by(con, Some(amy)).unwrap().context);
     assert_eq!(db.get_character(amy).unwrap().unwrap().console_ctx, None);
 }
 
@@ -626,10 +626,10 @@ fn a_console_whose_person_is_retired_is_archived_by_a_person_only() {
     db.retire_character(amy, 1).unwrap();
     let model = PrincipalId::new();
 
-    let error = db.archive_with_shadows_by(con, None, Some(model)).unwrap_err().to_string();
+    let error = db.archive_with_shadows_by(con, Some(model)).unwrap_err().to_string();
     assert!(error.contains("live person"), "{error}");
     assert!(!db.get_context(con).unwrap().unwrap().is_archived());
-    assert!(db.archive_with_shadows_by(con, None, Some(bob)).unwrap().context);
+    assert!(db.archive_with_shadows_by(con, Some(bob)).unwrap().context);
 }
 
 /// The demote ladder's archive step checks the console's person inside
@@ -641,9 +641,9 @@ fn a_demote_that_archives_a_console_checks_its_person_inside_the_write() {
     let (amy, con, bob) = console_fixture(&db, ws_id);
     assert_eq!(db.demote_context(con).unwrap(), DemoteOutcome::Demoted);
 
-    let error = db.demote_context_with_shadows(con, None, true, Some(bob)).unwrap_err().to_string();
+    let error = db.demote_context_with_shadows(con, true, Some(bob)).unwrap_err().to_string();
     assert!(error.contains("console"), "{error}");
     assert!(!db.get_context(con).unwrap().unwrap().is_archived());
-    let (outcome, _) = db.demote_context_with_shadows(con, None, true, Some(amy)).unwrap();
+    let (outcome, _) = db.demote_context_with_shadows(con, true, Some(amy)).unwrap();
     assert_eq!(outcome, DemoteOutcome::Archived);
 }

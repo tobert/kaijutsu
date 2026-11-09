@@ -60,9 +60,10 @@ pub enum BackendKind {
     /// an external process owner.
     #[serde(rename = "codex-app")]
     CodexApp,
-    /// The megakernel service's `/mk/v1` API (`llm/mk/`, `docs/mk.md`). No
-    /// key; `base_url` is the service address.
-    Mk,
+    /// A council v2 server (gogi's `docs/council-api.md`; the nagaya serves
+    /// it). It serves chat turns, gate decisions and embeddings. No key;
+    /// `base_url` is the server address.
+    Council,
     /// Canned-response client for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock,
@@ -71,7 +72,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "codex-app", "mk"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "alibaba", "codex-app", "council"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -82,7 +83,7 @@ impl BackendKind {
             Self::Alibaba => "alibaba",
             Self::OpenAi => "openai",
             Self::CodexApp => "codex-app",
-            Self::Mk => "mk",
+            Self::Council => "council",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => "mock",
         }
@@ -98,7 +99,7 @@ impl BackendKind {
             "alibaba" => Ok(Self::Alibaba),
             "openai" => Ok(Self::OpenAi),
             "codex-app" => Ok(Self::CodexApp),
-            "mk" => Ok(Self::Mk),
+            "council" => Ok(Self::Council),
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => Ok(Self::Mock),
             other => Err(unknown_backend_kind_message(other)),
@@ -118,7 +119,7 @@ impl BackendKind {
             Self::OpenAi => base_url
                 .is_some_and(crate::llm::openai::is_hosted_openai)
                 .then_some("OPENAI_API_KEY"),
-            Self::CodexApp | Self::Mk => None,
+            Self::CodexApp | Self::Council => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
         }
@@ -135,7 +136,7 @@ impl BackendKind {
     /// there is accepted-and-ignored rather than silently changing where a
     /// key goes.
     pub fn requires_base_url(&self) -> bool {
-        matches!(self, Self::OpenAi | Self::Alibaba | Self::CodexApp | Self::Mk)
+        matches!(self, Self::OpenAi | Self::Alibaba | Self::CodexApp | Self::Council)
     }
 }
 
@@ -195,7 +196,7 @@ pub struct BackendConfig {
 
     /// Endpoint override. Required for [`BackendKind::OpenAi`],
     /// [`BackendKind::Alibaba`], [`BackendKind::CodexApp`] and
-    /// [`BackendKind::Mk`], optional for Anthropic (a gateway), ignored for
+    /// [`BackendKind::Council`], optional for Anthropic (a gateway), ignored for
     /// DeepSeek.
     pub base_url: Option<String>,
 

@@ -77,7 +77,7 @@ async fn boot_embeds_through_a_council_server() {
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
     db.upsert_backend(&BackendRow {
         backend_id: kaijutsu_types::BackendId::new(),
-        name: "spaceghost".into(), kind: "mk".into(), base_url: Some(council.url()),
+        name: "spaceghost".into(), kind: "council".into(), base_url: Some(council.url()),
         api_key_env: None, api_key_file: None, key_optional: true,
         request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None,
         created_at: 0, created_by: kaijutsu_types::PrincipalId::system(),

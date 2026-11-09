@@ -120,7 +120,7 @@ pub(super) fn row_to_character_model(row: &rusqlite::Row<'_>) -> SqliteResult<Ch
 
 impl KernelDb {
     /// Insert or replace one slot of a character. The role is `distill` or
-    /// `gate`. A `gate` slot names a council server (a backend of kind `mk`),
+    /// `gate`. A `gate` slot names a council server (a backend of kind `council`),
     /// and a `distill` slot names a chat model (any other kind); anything
     /// else refuses, naming the fix.
     pub fn set_character_slot(&self, row: &CharacterSlotRow) -> KernelDbResult<()> {
@@ -135,16 +135,9 @@ impl KernelDb {
         let council_server = crate::model_resolution::is_council_kind(&backend.kind);
         if row.role == crate::council::gate::GATE && !council_server {
             return Err(KernelDbError::Validation(format!(
-                "a `gate` slot names a council server, and backend {} is kind {}, not mk; \
-                 `kj backend list` names the mk backends",
+                "a `gate` slot names a council server, and backend {} is kind {}, not council; \
+                 `kj backend list` names the council backends",
                 backend.name, backend.kind
-            )));
-        }
-        if row.role == crate::model_resolution::DISTILL && council_server {
-            return Err(KernelDbError::Validation(format!(
-                "a `distill` slot names a chat model, and backend {} is kind mk, a council server, which \
-                 distills nothing; name a backend of another kind (`kj backend list`)",
-                backend.name
             )));
         }
         if row.model.trim().is_empty() {

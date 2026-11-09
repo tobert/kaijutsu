@@ -831,7 +831,7 @@ impl SeatBuild {
 /// along the reviewer chain of its performer and the house rules of its
 /// workspace, routed to the server its context's `gate` slot names; each
 /// observing reviewer context alone under `direction-check`; and, when its
-/// council names a judge whose model is on an `mk` backend, the judge read's
+/// council names a judge whose model is on a `council` backend, the judge read's
 /// labels and house rules on the judge's server. Empty when its performer's layers enable no council or its context has no
 /// `gate` slot. Waits on no server.
 ///
@@ -1819,7 +1819,7 @@ mod tests {
             .upsert_backend(&BackendRow {
                 backend_id: kaijutsu_types::BackendId::new(),
                 name: "council-mk".into(),
-                kind: "mk".into(),
+                kind: "council".into(),
                 base_url: Some(r.mock.base.clone()),
                 api_key_env: None,
                 api_key_file: None,

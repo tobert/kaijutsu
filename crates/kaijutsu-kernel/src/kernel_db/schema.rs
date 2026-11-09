@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS senpai_migration_report (
 -- A copy of the character's model (role `model`) or of one character slot
 -- (`distill`, `gate`), with every unset parameter filled from the model's
 -- `backend_models` row. `max_tokens` is required: every provider request
--- carries it, except on a council server (a backend of kind `mk`). NULL
+-- carries it, except on a council server (a backend of kind `council`). NULL
 -- optional parameters are left out of the request. A trigger refuses an
 -- UPDATE or DELETE.
 CREATE TABLE IF NOT EXISTS context_slots (
@@ -788,7 +788,7 @@ CREATE TABLE IF NOT EXISTS backend_models (
 -- ── Character slots ───────────────────────────────────────────
 -- A character's models for its two roles besides its chat model: `distill`
 -- (the model that summarizes for forks and pulls) and `gate` (the council
--- server, a backend of kind `mk`, that judges the gate). A NULL tunable takes
+-- server, a backend of kind `council`, that judges the gate). A NULL tunable takes
 -- the model's `backend_models` value when a context is made and copies the
 -- slot (docs/senpai-kohai.md, "The model").
 CREATE TABLE IF NOT EXISTS character_slots (
@@ -1095,6 +1095,13 @@ CREATE TABLE IF NOT EXISTS context_watches (
     UNIQUE (context_id, kind, target)
 );
 CREATE INDEX IF NOT EXISTS idx_context_watches_host_path ON context_watches(host_path);
+
+-- The contexts the council made as judge shadows (`docs/council.md`, "The
+-- judge"). A shadow is archived with the seat it answers to; nothing else
+-- tells a shadow from an ordinary kohai of the judge character.
+CREATE TABLE IF NOT EXISTS judge_shadows (
+    context_id BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE
+);
 
 -- A retired table is dropped, not left behind. Child before parent: this
 -- foreign-keys onto `gate_actions`, so it must go first.

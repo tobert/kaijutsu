@@ -1748,13 +1748,13 @@ pub(crate) struct SlotServer {
 }
 
 /// The council server a slot on `backend` names, with the slot's `model`:
-/// the backend's `base_url` when its kind is `mk`. `Err` says why it names
+/// the backend's `base_url` when its kind is `council`. `Err` says why it names
 /// none.
 pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow, model: &str) -> Result<SlotServer, String> {
     match (backend.kind.as_str(), &backend.base_url) {
-        ("mk", Some(url)) => Ok(SlotServer { server: url.clone(), model: model.to_string() }),
-        ("mk", None) => Err(format!("backend {} has no base URL, so it names no council server", backend.name)),
-        (kind, _) => Err(format!("backend {} is kind {kind}, not mk, so it is not a council server", backend.name)),
+        ("council", Some(url)) => Ok(SlotServer { server: url.clone(), model: model.to_string() }),
+        ("council", None) => Err(format!("backend {} has no base URL, so it names no council server", backend.name)),
+        (kind, _) => Err(format!("backend {} is kind {kind}, not council, so it is not a council server", backend.name)),
     }
 }
 

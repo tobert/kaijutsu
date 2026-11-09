@@ -108,14 +108,13 @@ async fn context_move_moves_a_kohai_under_the_rule_and_reroutes_its_asks() {
 
 /// A root character's console is the top of its lineage, and a judge
 /// shadow answers to the context it shadows: `kj context set --senpai` moves
-/// neither, even for the lineage root. A judge shadow is a context performed
-/// by a character a council block names as judge, whose parent is its senpai.
+/// neither, even for the lineage root. A judge shadow is a context the
+/// council made as one, whose parent is its senpai.
 ///
 /// Falsified by telling a shadow by its label: a context another character
 /// performs moves.
 #[tokio::test]
 async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
-    use crate::vfs::VfsOps;
     let d = test_dispatcher().await;
     let h = house(&d);
     let refused = d.dispatch(&[s("context"), s("set"), h.root.to_hex(), s("--senpai"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
@@ -123,14 +122,10 @@ async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
     assert!(refused.message().contains("root console"), "{}", refused.message());
     assert_eq!(d.kernel_db().lock().senpai_of(h.root).unwrap(), None);
 
-    let gate = "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"loglinear\", weights = \"mass\" }\ndeadline_ms = 700\n\n\
-                [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
-                [rc.coder.council]\nenabled = true\njudge = \"judge\"\n";
-    let path = kaijutsu_types::paths::config_path(crate::kj::gate_policy::GATE_CONFIG_FILE);
-    d.kernel().vfs().write_all(std::path::Path::new(&path), gate.as_bytes()).await.expect("write gate.toml");
     let judge = d.kernel_db().lock().get_character_by_name("judge").unwrap().unwrap().principal_id;
     let shadow = register_context(&d, Some("judge-lane"), Some(h.lane), h.amy);
     d.kernel_db().lock().update_performer(shadow, Some(judge)).unwrap();
+    d.kernel_db().lock().mark_judge_shadow(shadow).unwrap();
     assert_eq!(d.kernel_db().lock().senpai_of(shadow).unwrap(), Some(h.lane));
     let refused = d.dispatch(&[s("context"), s("set"), shadow.to_hex(), s("--senpai"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
     assert!(!refused.is_ok(), "a judge shadow stays under the context it shadows");
@@ -141,25 +136,6 @@ async fn context_move_refuses_a_root_console_and_a_judge_shadow() {
     assert!(moved.is_ok(), "a context no judge performs moves: {}", moved.message());
 }
 
-/// The judge names that tell a judge shadow come from every section's
-/// council block that enables a council: `[rc.<dir>]`, `[character.<name>]`
-/// and `[root]` alike.
-///
-/// Falsified by reading the judge names from one kind of section only.
-#[tokio::test]
-async fn the_council_judges_come_from_every_layer_s_council_block() {
-    let d = test_dispatcher().await;
-    write_gate_toml(&d, "[council]\ncontexts = [\"reviewer\"]\npool = { method = \"loglinear\", weights = \"mass\" }\ndeadline_ms = 700\n\n\
-                         [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
-                         [rc.coder.council]\nenabled = true\njudge = \"judge\"\n\
-                         [character.banto.council]\nenabled = true\njudge = \"banto-judge\"\n\
-                         [root.council]\nenabled = true\njudge = \"root-judge\"\n\
-                         [character.quiet.council]\nenabled = false\n").await;
-    let mut judges = d.council_judges().await.expect("gate.toml loads");
-    judges.sort();
-    assert_eq!(judges, ["banto-judge", "judge", "root-judge"]);
-}
-
 /// Write `text` as the kernel's gate.toml.
 async fn write_gate_toml(d: &KjDispatcher, text: &str) {
     use crate::vfs::VfsOps;
@@ -167,11 +143,11 @@ async fn write_gate_toml(d: &KjDispatcher, text: &str) {
     d.kernel().vfs().write_all(std::path::Path::new(&path), text.as_bytes()).await.expect("write gate.toml");
 }
 
-/// Give the character `judge` a model on a council server (a backend of kind `mk`).
+/// Give the character `judge` a model on a council server (a backend of kind `council`).
 fn give_judge_a_council_model(d: &KjDispatcher) -> PrincipalId {
     let db = d.kernel_db().lock();
     let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-        backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("mk"), base_url: None,
+        backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("council"), base_url: None,
         api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
         idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
     }).unwrap();
@@ -183,9 +159,8 @@ fn give_judge_a_council_model(d: &KjDispatcher) -> PrincipalId {
     judge
 }
 
-/// A gate.toml that does not load leaves the judge's model to tell a judge
-/// shadow, and refuses nothing for it: an ordinary fork, whose parent is its
-/// senpai, still moves.
+/// A gate.toml that does not load refuses nothing for a judge shadow: an
+/// ordinary fork, whose parent is its senpai, still moves.
 ///
 /// Falsified by refusing every context shaped like a shadow when gate.toml
 /// does not load.
@@ -199,33 +174,33 @@ async fn context_move_moves_an_ordinary_fork_when_gate_toml_does_not_load() {
     assert_eq!(d.kernel_db().lock().senpai_of(h.lane).unwrap(), Some(h.judge_seat));
 }
 
-/// A character whose model is on a council server is a judge, so its fork
-/// child that answers to its parent is a judge shadow, whether or not a
-/// council block names it, and whether or not gate.toml loads.
+/// A character whose model is on a council server plays chat contexts like
+/// any other: its kohai that answers to its parent is no judge shadow, so it
+/// moves, whether or not gate.toml loads.
 ///
-/// Falsified by telling a judge shadow only by gate.toml's `judge` names.
+/// Falsified by telling a judge shadow by its performer's backend.
 #[tokio::test]
-async fn context_move_refuses_a_shadow_whose_judge_has_a_council_model() {
+async fn context_move_moves_a_kohai_whose_character_has_a_council_model() {
     let d = test_dispatcher().await;
     let h = house(&d);
     let judge = give_judge_a_council_model(&d);
-    let shadow = register_context(&d, Some("judge-lane"), Some(h.lane), h.amy);
-    d.kernel_db().lock().update_performer(shadow, Some(judge)).unwrap();
     for gate in ["[global]\n", "[council\nthis is not toml"] {
         write_gate_toml(&d, gate).await;
-        let refused = d.dispatch(&[s("context"), s("set"), shadow.to_hex(), s("--senpai"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
-        assert!(!refused.is_ok(), "{gate:?}: a judge shadow stays under the context it shadows");
-        assert!(refused.message().contains("is a judge shadow"), "{gate:?}: {}", refused.message());
-        assert_eq!(d.kernel_db().lock().senpai_of(shadow).unwrap(), Some(h.lane));
+        let kohai = register_context(&d, None, Some(h.lane), h.amy);
+        d.kernel_db().lock().update_performer(kohai, Some(judge)).unwrap();
+        let moved = d.dispatch(&[s("context"), s("set"), kohai.to_hex(), s("--senpai"), h.seat.to_hex()], &caller(h.amy, h.root)).await;
+        assert!(moved.is_ok(), "{gate:?}: {}", moved.message());
+        assert_eq!(d.kernel_db().lock().senpai_of(kohai).unwrap(), Some(h.seat));
     }
 }
 
 /// `kj context archive` of a context archives its judge shadow in the same
 /// transaction, says so, and marks the shadow archived in the drift router,
-/// which frees its label there.
+/// which frees its label there. A kohai the same character performs, which
+/// the council did not make, stays live.
 ///
 /// Falsified by archiving the shadow's row and leaving the router holding it
-/// live.
+/// live, or by archiving the kohai as a shadow.
 #[tokio::test]
 async fn archiving_a_context_archives_its_judge_shadow_in_the_row_and_the_router() {
     let d = test_dispatcher().await;
@@ -233,11 +208,15 @@ async fn archiving_a_context_archives_its_judge_shadow_in_the_row_and_the_router
     let judge = give_judge_a_council_model(&d);
     let shadow = register_context(&d, Some("judge-lane"), Some(h.lane), h.amy);
     d.kernel_db().lock().update_performer(shadow, Some(judge)).unwrap();
+    d.kernel_db().lock().mark_judge_shadow(shadow).unwrap();
+    let kohai = register_context(&d, Some("judge-kohai"), Some(h.lane), h.amy);
+    d.kernel_db().lock().update_performer(kohai, Some(judge)).unwrap();
     let confirmed = KjCaller { confirmed: true, ..caller(h.amy, h.root) };
     let archived = d.dispatch(&[s("context"), s("archive"), h.lane.to_hex()], &confirmed).await;
     assert!(archived.is_ok(), "{}", archived.message());
     assert!(archived.message().contains("judge shadow judge-lane"), "{}", archived.message());
     assert!(d.kernel_db().lock().get_context(shadow).unwrap().unwrap().archived_at.is_some());
+    assert!(d.kernel_db().lock().get_context(kohai).unwrap().unwrap().archived_at.is_none(), "the kohai is no shadow");
     let router = d.drift_router().read();
     assert_eq!(router.context_state(shadow), Some(kaijutsu_types::ContextState::Archived));
     assert!(router.resolve_context("judge-lane").is_err(), "the router frees the label");

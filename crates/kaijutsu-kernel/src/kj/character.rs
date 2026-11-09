@@ -1166,7 +1166,6 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj character set: {name} stays a root, and {label} stays live: {e}"));
             }
         }
-        let judges = self.council_judges().await;
         let (demotion, archived, updated) = {
             let db = self.kernel_db().lock();
             let principal_id = match db.get_character_by_name(name) {
@@ -1176,7 +1175,7 @@ impl KjDispatcher {
             };
             // The transaction archives what the lifecycles ran for, or
             // refuses naming the pointer that moved.
-            let demotion = match db.demote_person(principal_id, pointers, rc_dir, judges.as_deref(), caller.actor_id) {
+            let demotion = match db.demote_person(principal_id, pointers, rc_dir, caller.actor_id) {
                 Ok(demotion) => demotion,
                 Err(e) => return KjResult::Err(format!("kj character set: {name} stays a root: {e}")),
             };
@@ -1232,15 +1231,12 @@ impl KjDispatcher {
                 ));
             }
         }
-        let judges = self.council_judges().await;
-        self.character_retire_commit(name, caller, judges.as_deref())
+        self.character_retire_commit(name, caller)
     }
 
     /// Retire after each played context's archive lifecycle has run, in one
     /// transaction ([`crate::kernel_db::KernelDb::retire_with_contexts`]).
-    /// `judges` are the judge characters gate.toml names, or `None` when it
-    /// did not load.
-    fn character_retire_commit(&self, name: &str, caller: &KjCaller, judges: Option<&[String]>) -> KjResult {
+    fn character_retire_commit(&self, name: &str, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
         let row = match db.get_character_by_name(name) {
             Ok(Some(r)) => r,
@@ -1263,7 +1259,7 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj character retire: {e}")),
         }
         let now = kaijutsu_types::now_millis() as i64;
-        let retirement = match db.retire_with_contexts(row.principal_id, now, judges) {
+        let retirement = match db.retire_with_contexts(row.principal_id, now) {
             Ok(Some(retirement)) => retirement,
             Ok(None) => return KjResult::ok(format!("{name} already retired")),
             Err(e) => return KjResult::Err(format!("kj character retire: {name} stays live: {e}")),
@@ -2709,7 +2705,7 @@ mod tests {
         assert!(d.dispatch(&[s("character"), s("set"), s("boss"), s("--console"), s("con")], &caller).await.is_ok());
         let banto = sheet(&d, "banto").principal_id;
         let successor = register_context(&d, Some("con-next"), None, banto);
-        d.kernel_db().lock().commit_rotation(con, successor, None).unwrap();
+        d.kernel_db().lock().commit_rotation(con, successor).unwrap();
         assert_eq!(sheet(&d, "boss").console_ctx, Some(successor), "the pointer follows the label");
         let label = d.kernel_db().lock().get_context(successor).unwrap().unwrap().label;
         assert_eq!(label.as_deref(), Some("con"), "the successor took the label");

@@ -2366,10 +2366,9 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj context archive: {target_label} stays live: {e}"));
         }
 
-        let judges = self.council_judges().await;
         let (archived, shadows) = {
             let db = self.kernel_db().lock();
-            match db.archive_with_shadows_by(target_id, judges.as_deref(), Some(caller.actor_id)) {
+            match db.archive_with_shadows_by(target_id, Some(caller.actor_id)) {
                 Ok(v) => {
                     let shadows: Vec<String> = v.shadows.iter().map(|id| db.context_name(*id)).collect();
                     (v, shadows)
@@ -2786,8 +2785,7 @@ impl KjDispatcher {
                  {successor}{name} stays live, and its archive lifecycle already ran"
             ));
         }
-        let judges = self.council_judges().await;
-        let committed = self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id, judges.as_deref());
+        let committed = self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id);
         let moved = match committed {
             Ok(commit) => {
                 self.archived_in_router(commit.shadows.iter().copied());
@@ -2850,7 +2848,7 @@ impl KjDispatcher {
         if !root_console {
             return "";
         }
-        let archived = self.kernel_db().lock().archive_with_shadows(successor, None);
+        let archived = self.kernel_db().lock().archive_with_shadows(successor);
         match archived {
             Ok(archived) => {
                 self.archived_in_router(std::iter::once(successor).chain(archived.shadows));
@@ -3136,7 +3134,6 @@ impl KjDispatcher {
         if archiving && let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
             return KjResult::Err(format!("kj context demote: {} stays live: {e}", target_id.short()));
         }
-        let judges = self.council_judges().await;
 
         let (outcome, shadows) = {
             let db = self.kernel_db().lock();
@@ -3150,7 +3147,7 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
                 }
             }
-            match db.demote_context_with_shadows(target_id, judges.as_deref(), archiving, Some(caller.actor_id)) {
+            match db.demote_context_with_shadows(target_id, archiving, Some(caller.actor_id)) {
                 Ok(v) => v,
                 Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
             }
@@ -3369,12 +3366,11 @@ impl KjDispatcher {
     /// the council blocks name are read from gate.toml first, to tell a
     /// judge shadow.
     async fn context_set_senpai(&self, context: Option<&str>, senpai: &str, caller: &KjCaller) -> KjResult {
-        let judges = self.council_judges().await;
         let db = self.kernel_db().lock();
         let moved = (|| -> Result<(ContextRow, ContextRow), String> {
             let (target, _) = resolve_character_arg(context, caller, &db)?;
             let senpai = resolve_senpai_arg(senpai, caller, &db, false)?;
-            db.in_transaction(|db| Ok(set_senpai(db, target, senpai, caller, judges.as_deref())))
+            db.in_transaction(|db| Ok(set_senpai(db, target, senpai, caller)))
                 .map_err(|e| e.to_string())?
         })();
         match moved {
@@ -3388,21 +3384,6 @@ impl KjDispatcher {
 }
 
 impl KjDispatcher {
-    /// The judge characters the council blocks of gate.toml name, in every
-    /// `[rc.<dir>]`, `[character.<name>]` and `[root]` section that enables
-    /// a council, or `None` when gate.toml does not load (logged), so that a
-    /// judge shadow is told by its judge's model alone
-    /// ([`KernelDb::is_judge_shadow`]).
-    pub(crate) async fn council_judges(&self) -> Option<Vec<String>> {
-        match crate::kj::gate_policy::load_config(self.kernel().vfs(), self.kernel().kernel_db()).await {
-            Ok(config) => Some(config.councils().into_iter().filter_map(|c| c.judge).collect()),
-            Err(e) => {
-                tracing::warn!("gate.toml does not load, so a judge shadow is told by its judge's model alone: {e}");
-                None
-            }
-        }
-    }
-
     /// Mark `archived` contexts archived in the drift router, so it agrees
     /// with their rows and frees their labels.
     pub(crate) fn archived_in_router(&self, archived: impl IntoIterator<Item = ContextId>) {
@@ -3414,14 +3395,12 @@ impl KjDispatcher {
 }
 
 /// The checks and the write behind `kj context set --senpai`, inside the caller's
-/// transaction. The inner `Err` is the refusal. `judges` are the judge
-/// characters the council blocks name, or `None` when gate.toml did not load.
+/// transaction. The inner `Err` is the refusal.
 fn set_senpai(
     db: &KernelDb,
     target: ContextId,
     senpai: ContextId,
     caller: &KjCaller,
-    judges: Option<&[String]>,
 ) -> Result<(ContextRow, ContextRow), String> {
     let row = db.get_context(target).map_err(|e| e.to_string())?
         .ok_or_else(|| format!("context {} has no row", target.short()))?;
@@ -3431,7 +3410,7 @@ fn set_senpai(
             db.context_name(target)
         ));
     }
-    if db.is_judge_shadow(&row, judges).map_err(|e| e.to_string())? {
+    if db.is_judge_shadow(&row).map_err(|e| e.to_string())? {
         return Err(format!(
             "{} is a judge shadow, which answers to the context it shadows; archive it with that context instead",
             db.context_name(target)
@@ -3946,7 +3925,7 @@ mod tests {
     }
 
     /// A seat performed by banto, and its judge shadow performed by the judge
-    /// character, whose model is on a council (mk) backend with
+    /// character, whose model is on a council backend with
     /// `judge_max_tokens`. Returns the dispatcher, the seat and the shadow.
     async fn judge_shadow_fixture(judge_max_tokens: Option<i64>) -> (crate::kj::KjDispatcher, ContextId, ContextId) {
         let d = test_dispatcher().await;
@@ -3961,7 +3940,7 @@ mod tests {
         }
         db.seed_test_slots(banto, "mock", "mock-banto", &["model"]).unwrap();
         let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-            backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("mk"),
+            backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("council"),
             base_url: Some(s("http://zorak:8090")), api_key_env: None, api_key_file: None, key_optional: true,
             request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
             created_by: PrincipalId::system(),
@@ -3977,6 +3956,7 @@ mod tests {
         let db = d.kernel_db().lock();
         db.update_performer(seat, Some(banto)).unwrap();
         db.write_context_character(shadow, judge, Some(seat), None).unwrap();
+        db.mark_judge_shadow(shadow).unwrap();
         drop(db);
         (d, seat, shadow)
     }
@@ -3990,9 +3970,9 @@ mod tests {
         conn.execute("UPDATE context_slots SET max_tokens = NULL WHERE role = 'model'", []).unwrap();
     }
 
-    /// A judge shadow's `model` slot names a council server (a backend of
-    /// kind `mk`) and carries no `max_tokens`. The shadow has no chat model,
-    /// which is not corruption, and `kj context list|log|info` show it.
+    /// A judge shadow's `model` slot names a council server and carries no
+    /// `max_tokens`. The shadow runs no chat turn, which is not corruption,
+    /// and `kj context list|log|info` show it, naming the fix.
     ///
     /// Falsified by exempting a slot by its role rather than its backend's
     /// kind: the shadow's slot is role `model`, as a chat model's is.
@@ -4004,7 +3984,7 @@ mod tests {
             assert!(db.context_slot(shadow, "model").unwrap().unwrap().max_tokens.is_none());
             match crate::model_resolution::context_model(&db, shadow).unwrap() {
                 crate::model_resolution::ContextModelLookup::None(none) => {
-                    assert!(none.line().contains("council server"), "{}", none.line());
+                    assert!(none.line().contains("has no max_tokens") && none.line().contains("--max-tokens"), "{}", none.line());
                 }
                 other => panic!("a judge shadow runs no chat model: {other:?}"),
             }
@@ -4019,9 +3999,25 @@ mod tests {
         assert!(r.is_ok(), "{}", r.message());
         let r = d.dispatch(&[s("context"), s("info"), shadow.to_hex()], &caller).await;
         assert!(r.is_ok(), "{}", r.message());
-        assert!(r.message().contains("council server"), "{}", r.message());
+        assert!(r.message().contains("has no max_tokens"), "{}", r.message());
         let r = d.dispatch(&[s("context"), s("info"), seat.to_hex()], &caller).await;
         assert!(r.is_ok(), "{}", r.message());
+    }
+
+    /// A character's model on a council server with `max_tokens` is a chat
+    /// model: the context runs turns on it like any other.
+    ///
+    /// Falsified by reading every council slot as no chat model.
+    #[tokio::test]
+    async fn a_council_model_with_max_tokens_is_a_chat_model() {
+        let (d, _seat, shadow) = judge_shadow_fixture(Some(2048)).await;
+        let db = d.kernel_db().lock();
+        match crate::model_resolution::context_model(&db, shadow).unwrap() {
+            crate::model_resolution::ContextModelLookup::Model(m) => {
+                assert_eq!((m.backend.as_str(), m.model.as_str(), m.max_tokens), ("mk-zorak", "judge-model", 2048));
+            }
+            other => panic!("a council model with max_tokens runs chat turns: {other:?}"),
+        }
     }
 
     /// A council server is exempt only by its backend's kind: a `model` slot
@@ -8107,14 +8103,13 @@ mod tests {
         assert!(msg.contains("`kj context rotate early-ctx`") && !msg.contains("kj character model set"), "{msg}");
     }
 
-    /// A distill slot on a council server distills nothing: a distillation
-    /// refuses, naming the verb that gives the character a chat distill
-    /// slot, and never sends the request.
+    /// A distill slot on a council server with no `max_tokens` distills
+    /// nothing: a distillation refuses, naming the verb that sets it, and
+    /// never sends the request.
     ///
-    /// Falsified by a distillation that reads the slot's server as a chat
-    /// model.
+    /// Falsified by a distillation that sends a request with no output limit.
     #[tokio::test]
-    async fn a_distill_slot_on_a_council_server_refuses_naming_the_fix() {
+    async fn a_distill_slot_on_a_council_server_with_no_max_tokens_refuses_naming_the_fix() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context_with_model(&d, Some("mk-distill"), None, principal, &[]);
@@ -8128,7 +8123,7 @@ mod tests {
         let name = {
             let db = d.kernel_db().lock();
             let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("mk"), base_url: None,
+                backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("council"), base_url: None,
                 api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
                 idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
             }).unwrap();
@@ -8141,8 +8136,8 @@ mod tests {
         let fork = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &caller_with_context(source)).await;
         assert!(!fork.is_ok(), "{}", fork.message());
         let msg = fork.message();
-        assert!(msg.contains("cannot distill") && msg.contains("council server"), "{msg}");
-        assert!(msg.contains(&format!("`kj character slot set {name} distill <backend>/<model>`")), "{msg}");
+        assert!(msg.contains("cannot distill") && msg.contains("has no max_tokens"), "{msg}");
+        assert!(msg.contains(&format!("`kj character slot set {name} distill mk-zorak/gemma --max-tokens <n>`")), "{msg}");
     }
     /// The flip side: once `LlmRegistry::context_window_for` resolves a real
     /// window (mirroring how it's populated from the backend model metadata in

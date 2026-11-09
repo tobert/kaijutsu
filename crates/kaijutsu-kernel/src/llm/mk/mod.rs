@@ -1,5 +1,5 @@
 //! The `mk` provider: a context talks to the megakernel service as a model
-//! (`docs/mk.md`, "Provider: `BackendKind::Mk`").
+//! (`docs/mk.md`, "Provider: `BackendKind::Council`").
 //!
 //! An adapter over `kaijutsu_mk`; it does no HTTP of its own. Each call
 //! renders the request first and checks it against the window, so a prompt

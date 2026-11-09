@@ -136,7 +136,7 @@ Rules the crate keeps:
 `llm/mk/` sits beside `llm/openai/` and `llm/deepseek/`. It is an adapter over
 `kaijutsu-mk::generate`; it does no HTTP of its own.
 
-Backend row: kind `mk`, `base_url` required (the service address), no key.
+Backend row: kind `council`, `base_url` required (the service address), no key.
 `kj backend set` and `SUPPORTED_BACKEND_KINDS` gain `mk`. `Provider::from_backend`
 builds the client. `Provider::stream` wraps the result in a new
 `ProviderStream::Mk` that yields the kernel's `StreamEvent`.
@@ -242,7 +242,7 @@ to 19 tokens per second, a call that writes 1500 tokens of a file is about 90
 seconds with no event. A long prefill before the first token is silent too.
 This is more than a display problem: the runtime cancels a stream that sends
 no event for its idle timeout (120 seconds by default) and fails the turn.
-Until a liveness event exists, an `mk` backend sets a longer idle timeout
+Until a liveness event exists, a `council` backend sets a longer idle timeout
 (`kj backend set ... --idle-timeout`), and the in-flight strip shows nothing.
 `StreamEvent` has no event for this today. The design choice (a progress event
 carrying the token count, or the tool-phase text as it arrives) is open; it

@@ -85,12 +85,11 @@ pub struct Demotion {
 
 impl KernelDb {
     /// Archive a context while retaining its history. Returns true if it was
-    /// active. Its live judge shadows are archived with it, told by their
-    /// judge's model alone ([`Self::is_judge_shadow`] with no gate.toml
-    /// names); [`Self::archive_with_shadows`] takes the names and returns the
-    /// shadows, for a caller that keeps the drift router in step.
+    /// active. Its live judge shadows are archived with it;
+    /// [`Self::archive_with_shadows`] also returns them, for a caller that
+    /// keeps the drift router in step.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
-        Ok(self.archive_with_shadows(id, None)?.context)
+        Ok(self.archive_with_shadows(id)?.context)
     }
 
     /// Archive a context and its live judge shadows in one transaction, while
@@ -99,12 +98,8 @@ impl KernelDb {
     /// answers. State and sweep commit together; an already archived row
     /// retries unresolved ask cleanup and still archives a live shadow. This
     /// method does not stop running work.
-    ///
-    /// `judges` are the judge characters the council blocks of a gate.toml
-    /// that loaded name, or `None` when it did not load
-    /// ([`Self::is_judge_shadow`]).
-    pub fn archive_with_shadows(&self, id: ContextId, judges: Option<&[String]>) -> KernelDbResult<Archived> {
-        self.archive_with_shadows_by(id, judges, None)
+    pub fn archive_with_shadows(&self, id: ContextId) -> KernelDbResult<Archived> {
+        self.archive_with_shadows_by(id, None)
     }
 
     /// [`Self::archive_with_shadows`] on behalf of `by`, a verb's caller:
@@ -115,14 +110,13 @@ impl KernelDb {
     pub fn archive_with_shadows_by(
         &self,
         id: ContextId,
-        judges: Option<&[String]>,
         by: Option<PrincipalId>,
     ) -> KernelDbResult<Archived> {
         if self.conn.is_autocommit() {
-            return self.in_transaction(|db| db.archive_context_writes(id, judges, by));
+            return self.in_transaction(|db| db.archive_context_writes(id, by));
         }
         self.conn.execute_batch("SAVEPOINT archive_context")?;
-        let result = self.archive_context_writes(id, judges, by);
+        let result = self.archive_context_writes(id, by);
         match result {
             Ok(archived) => {
                 self.conn.execute_batch("RELEASE SAVEPOINT archive_context")?;
@@ -204,30 +198,33 @@ impl KernelDb {
         )))
     }
 
-    /// Whether `row` is a judge shadow: its parent is the context it answers
-    /// to, and its performer is a judge. A character whose model is on a
-    /// council server (a backend of kind `mk`) is a judge, since a council
-    /// server is never a chat model; so is one some council block names as
-    /// `judge`, in `judges`. `judges` is `None` when gate.toml did not load,
-    /// and then the model alone tells.
-    pub fn is_judge_shadow(&self, row: &ContextRow, judges: Option<&[String]>) -> KernelDbResult<bool> {
-        let (Some(performer), Some(parent)) = (row.performer, row.forked_from) else { return Ok(false) };
+    /// Whether `row` is a judge shadow: the council made it as one
+    /// ([`Self::mark_judge_shadow`]), and it still answers to its parent.
+    pub fn is_judge_shadow(&self, row: &ContextRow) -> KernelDbResult<bool> {
+        let Some(parent) = row.forked_from else { return Ok(false) };
         if row.senpai_ctx != Some(parent) {
             return Ok(false);
         }
-        if let Some(model) = self.get_character_model(performer)?
-            && self.backend_is_council_server(model.backend_id)?
-        {
-            return Ok(true);
-        }
-        let Some(judges) = judges else { return Ok(false) };
-        Ok(self.get_character(performer)?.is_some_and(|sheet| judges.contains(&sheet.name)))
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM judge_shadows WHERE context_id = ?1)",
+            params![blob_param(row.context_id.as_bytes())],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Record that the council made `id` as a judge shadow. The caller writes
+    /// it in the transaction that inserts the shadow's row.
+    pub fn mark_judge_shadow(&self, id: ContextId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO judge_shadows (context_id) VALUES (?1)",
+            params![blob_param(id.as_bytes())],
+        )?;
+        Ok(())
     }
 
     pub(super) fn archive_context_writes(
         &self,
         id: ContextId,
-        judges: Option<&[String]>,
         by: Option<PrincipalId>,
     ) -> KernelDbResult<Archived> {
         if let Some(by) = by
@@ -238,7 +235,7 @@ impl KernelDb {
         let context = self.archive_one_context(id)?;
         let mut shadows = Vec::new();
         for child in self.fork_children(id)? {
-            if self.is_judge_shadow(&child, judges)? && self.archive_one_context(child.context_id)? {
+            if self.is_judge_shadow(&child)? && self.archive_one_context(child.context_id)? {
                 shadows.push(child.context_id);
             }
         }
@@ -291,7 +288,7 @@ impl KernelDb {
     }
 
     /// Finish a rotation in one transaction: archive `predecessor` and its
-    /// judge shadows ([`Self::archive_with_shadows`], with `judges`), give
+    /// judge shadows ([`Self::archive_with_shadows`], give
     /// `successor` its label and ring placement, and point a character's
     /// `handoff_ctx` at the successor when it named the predecessor. A
     /// predecessor that is missing or already archived refuses. Moves a
@@ -304,7 +301,6 @@ impl KernelDb {
         &self,
         predecessor: ContextId,
         successor: ContextId,
-        judges: Option<&[String]>,
     ) -> KernelDbResult<RotationCommit> {
         self.in_transaction(|db| {
             let row = db.get_context(predecessor)?.ok_or_else(|| {
@@ -319,7 +315,7 @@ impl KernelDb {
                 "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
                 params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
             )?;
-            let archived = db.archive_with_shadows(predecessor, judges)?;
+            let archived = db.archive_with_shadows(predecessor)?;
             if !archived.context {
                 return Err(KernelDbError::Validation(format!(
                     "context {} was archived before the rotation finished",
@@ -349,7 +345,7 @@ impl KernelDb {
     /// Retire `principal_id` in one transaction: stamp `retired_at`, clear
     /// its `root_ctx`, `console_ctx` and `mcp_hub_ctx`, then conclude and
     /// archive each live context it performs, with that context's judge
-    /// shadows ([`Self::archive_with_shadows`], with `judges`). For a root
+    /// shadows ([`Self::archive_with_shadows`]). For a root
     /// character, any `root_ctx` naming a context it performs clears first,
     /// so its root consoles are archived with it. Any refusal or fault rolls
     /// the whole retirement back. `None` when the character was already
@@ -358,7 +354,6 @@ impl KernelDb {
         &self,
         principal_id: PrincipalId,
         at: i64,
-        judges: Option<&[String]>,
     ) -> KernelDbResult<Option<Retirement>> {
         self.in_transaction(|db| {
             let sheet = db.get_character(principal_id)?
@@ -380,7 +375,7 @@ impl KernelDb {
             let mut retirement = Retirement::default();
             for ctx in db.contexts_played_by(principal_id)? {
                 db.conclude_context(ctx.context_id)?;
-                let archived = db.archive_with_shadows(ctx.context_id, judges)?;
+                let archived = db.archive_with_shadows(ctx.context_id)?;
                 retirement.archived.push(ctx.context_id);
                 retirement.shadows.extend(archived.shadows);
             }
@@ -464,7 +459,7 @@ impl KernelDb {
     /// Make the person `principal_id` an ordinary character on behalf of
     /// `by`, in one transaction: archive each live context its `root_ctx`,
     /// `console_ctx` and `mcp_hub_ctx` name, with their judge shadows
-    /// ([`Self::archive_with_shadows_by`], with `judges`), clear the three
+    /// ([`Self::archive_with_shadows_by`]), clear the three
     /// pointers and the `root` flag, and set `rc_dir` when one is given. The
     /// `root_ctx` pointer clears first, so the root console archives; every
     /// other archive refusal still applies. [`Self::demote_refusal`] is
@@ -480,7 +475,6 @@ impl KernelDb {
         principal_id: PrincipalId,
         pointers: [Option<ContextId>; 3],
         rc_dir: Option<&str>,
-        judges: Option<&[String]>,
         by: PrincipalId,
     ) -> KernelDbResult<Demotion> {
         self.in_transaction(|db| {
@@ -514,7 +508,7 @@ impl KernelDb {
                 if demotion.archived.contains(&ctx) || !db.get_context(ctx)?.is_some_and(|row| !row.is_archived()) {
                     continue;
                 }
-                let archived = db.archive_with_shadows_by(ctx, judges, Some(by))?;
+                let archived = db.archive_with_shadows_by(ctx, Some(by))?;
                 demotion.archived.push(ctx);
                 demotion.shadows.extend(archived.shadows);
             }
@@ -698,12 +692,12 @@ impl KernelDb {
     /// ring 3.
     pub fn demote_context(&self, id: ContextId) -> KernelDbResult<DemoteOutcome> {
         let archives = self.get_context(id)?.is_some_and(|row| row.demoted_at.is_some());
-        Ok(self.demote_context_with_shadows(id, None, archives, None)?.0)
+        Ok(self.demote_context_with_shadows(id, archives, None)?.0)
     }
 
     /// [`Self::demote_context`], whose archive step archives the context's
     /// judge shadows with it ([`Self::archive_with_shadows_by`], with
-    /// `judges` and `by`) and returns them. `archives` is the step the caller
+    /// `by`) and returns them. `archives` is the step the caller
     /// decided on and prepared for: true for the archive step, whose checks
     /// and archive lifecycle the caller ran. A row whose next step is no
     /// longer that one refuses and changes nothing. `by` is the verb's
@@ -712,7 +706,6 @@ impl KernelDb {
     pub fn demote_context_with_shadows(
         &self,
         id: ContextId,
-        judges: Option<&[String]>,
         archives: bool,
         by: Option<PrincipalId>,
     ) -> KernelDbResult<(DemoteOutcome, Vec<ContextId>)> {
@@ -747,7 +740,7 @@ impl KernelDb {
         }
 
         if demoted_at.is_some() {
-            let archived = self.archive_with_shadows_by(id, judges, by)?;
+            let archived = self.archive_with_shadows_by(id, by)?;
             Ok((DemoteOutcome::Archived, archived.shadows))
         } else if promoted_at.is_some() {
             self.conn.execute(

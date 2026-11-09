@@ -23,7 +23,7 @@ nonexistent features.
 | Client creation | There is no create RPC. A client runs `kj context create <character>` through `executeKj` from an existing context, which becomes the new context's senpai. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`). The performer is the connection's character; a person's connection names another with `--character` (`kaijutsu-tui`, `kaijutsu-acp`, `kaijutsu-mcp`, and `KAIJUTSU_CHARACTER`), and without it refuses. An MCP session created from a root console passes `--parent <hub id>`, the `mcp_hub_ctx` the person's sheet names (read with `kj character show`), so the hub is its `forked_from` and the gate raises no ask (`ActorHandle::mcp_hub_of`; `docs/senpai-kohai.md`, "MCP sessions"). `Ctrl+Z` in a root console or the console opens `kj context create <person>` from it (`docs/tui.md`) |
 | Gate layers | `gate.toml` reads `[global]`, then `[rc.<dir>]` for the performer's `rc_dir`, then `[root]` when a root character performs the context, then `[character.<name>]` for the performer; each later one reads over the earlier, so the narrowest decides. A context with no performer reads `[global]` alone; a context id with no row refuses. `[context_type.<type>]` and a bare `[context_type]` fail the load naming their replacements; a section naming no rc directory or character is listed by `kj ledger rules` and warns when the set of such sections changes between loads. See "Gate" and `docs/gate-policy-tuning.md`, "Performer layers" |
 | Senpai edge | Every context answers to one senpai context (`contexts.senpai_ctx`), except a root console; a context with no senpai must be performed by a live root character; the senpai's character reviews the context's asks, receives its reports, and holds authority over it. One resolver, one authority rule, no per-context override and no delegation. See `docs/senpai-kohai.md` and `docs/approval-identity.md` |
-| Model | A character has one model (`character_models`), set with `kj character create <name> --model <backend>/<model>` or `kj character model set <name> <backend>/<model>`, `unset` or `show`; a root runs none. It may also hold a `distill` and a `gate` slot (`character_slots`, `kj character slot set\|unset\|list`); any other role refuses, and a `gate` slot must name an `mk` backend. A context copies them into `context_slots` when it is made: the model under `model`, and under `distill` when the character has no `distill` slot and the model is no council server; then the `distill` and `gate` slots. A character with no model gives a context no `model` slot. Unset parameters come from `backend_models`. Every model turn reads the context's own `model` slot, and its turn row records role `model`. No default stands in; a context with no `model` slot gives no model, and a turn refuses naming the fix (`kj character model set <name> <backend>/<model>`, then `kj context rotate`); an MCP session, whose parent is an MCP hub, prints no notice. A slot on an `mk` backend is a council server: it needs no `max_tokens` and is never a chat model. The gate uses the context's `gate` slot and distillation its `distill` slot. The judge is a character: `judge = "<character>"` in a council block of the seat's performer's gate layers (`[rc.<dir>.council]`, `[character.<name>.council]`) names it, its shadow is a child of the seat that character performs, and the shadow's `model` slot is the judge's server |
+| Model | A character has one model (`character_models`), set with `kj character create <name> --model <backend>/<model>` or `kj character model set <name> <backend>/<model>`, `unset` or `show`; a root runs none. It may also hold a `distill` and a `gate` slot (`character_slots`, `kj character slot set\|unset\|list`); any other role refuses, and a `gate` slot must name a `council` backend. A context copies them into `context_slots` when it is made: the model under `model`, and under `distill` when the character has no `distill` slot and the model is no council server; then the `distill` and `gate` slots. A character with no model gives a context no `model` slot. Unset parameters come from `backend_models`. Every model turn reads the context's own `model` slot, and its turn row records role `model`. No default stands in; a context with no `model` slot gives no model, and a turn refuses naming the fix (`kj character model set <name> <backend>/<model>`, then `kj context rotate`); an MCP session, whose parent is an MCP hub, prints no notice. A slot on a `council` backend is a council server: it needs no `max_tokens` and is never a chat model. The gate uses the context's `gate` slot and distillation its `distill` slot. The judge is a character: `judge = "<character>"` in a council block of the seat's performer's gate layers (`[rc.<dir>.council]`, `[character.<name>.council]`) names it, its shadow is a child of the seat that character performs, and the shadow's `model` slot is the judge's server |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a context a person performs. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except a person's self-confirmation in a context they perform. See `docs/approval-identity.md` |
 | Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts whose senpai that character holds. See `docs/approval-identity.md`, "Standing rules for a character" |
@@ -73,8 +73,8 @@ answers its turns. A context with no performer runs no rc and no turns.
 - **Slot roles** are `distill` (a cheaper model for `kj fork --compact` and `kj drift pull|merge`) and `gate` (the
   council server that judges the gate). A context copies the character's model under role `model`, and each slot
   under its role, when it is made. A model turn reads the context's `model` slot, and the durable turn row records
-  role `model`. A slot whose backend is a council server (kind `mk`) needs no `max_tokens` and is never a chat
-  model; that is decided by the backend's kind, not by the role's name.
+  role `model`. A slot whose backend is a council server (kind `council`) needs no `max_tokens`; with one it is a
+  chat model like any other, and without one (a judge's) it runs no chat turn.
 
 ### A person, the console, MCP sessions, the judge
 
@@ -98,11 +98,11 @@ answers its turns. A context with no performer runs no rc and no turns.
   answers to the person's root console, and its parent is the person's MCP hub, the performer-less context
   `characters.mcp_hub_ctx` names; archiving the hub clears the pointer. A session is a context whose parent is an
   MCP hub. Creating one under the caller's own hub needs no ask (`docs/senpai-kohai.md`, "MCP sessions").
-- **The judge** is a character, `judge`, whose model is a council server (a backend of kind `mk`). The judge
-  shadow of a context K is a context performed by the judge character named in K's gate layers
+- **The judge** is a character, `judge`, whose model is a council server (a backend of kind `council`). The judge
+  shadow of a context K is a context the gate makes, performed by the judge character named in K's gate layers
   (`[character.<name>.council] judge = "judge"`), with `forked_from` K and K as its senpai, and slots copied from
-  the judge character. It is found as the live child of K performed by that character, and the council server is
-  its `model` slot.
+  the judge character. The gate records it in `judge_shadows` in the transaction that makes it; that record, not
+  the judge's backend, tells a shadow from an ordinary kohai. The council server is its `model` slot.
 - **A context with no performer** (the handoff log, the MCP hub, a score, the drift queue, lost+found, cold-start
   discovery) runs no rc and no turns. Pointers find the ones the kernel needs: `handoff_ctx`, `mcp_hub_ctx`.
 
@@ -235,6 +235,10 @@ itself, and copies the database aside first when it would change a row: `kernel.
 4. **`type-melt-v1`.** `contexts.context_type` and `characters.context_type` are dropped, with their
    schema defaults, so a fresh database never creates them. The approval ledger's `rc_runs.context_type` is
    renamed `rc_dir`; an old row keeps the name the directory had when it ran.
+5. **`council-backends-v1`.** Backend kind `mk` becomes `council`. Before the rename, a context whose parent is its
+   senpai and whose performer's model is on an `mk` backend gets a `judge_shadows` row: under the old rule such a
+   context was a judge shadow, and no chat context could run on an `mk` backend. It makes no copy; the rows it
+   changes are a kind name and a new table.
 
 Earlier migrations that read `context_type` still run on an old database before these, and a fresh database
 never needs them; both paths are tested.

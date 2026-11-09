@@ -4006,9 +4006,8 @@ esac
                 mcp_hub_ctx: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            // A character whose model is on a council server is a judge.
             let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "mk".into(), base_url: None,
+                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "council".into(), base_url: None,
                 api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
                 idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
             }).unwrap();
@@ -4018,6 +4017,7 @@ esac
             }).unwrap();
         }
         let judge = archivable_by(&d, "judge-coder-seat", Some(seat), "judge-shadow-type-unread", judge_character);
+        d.kernel_db().lock().mark_judge_shadow(judge).unwrap();
         let other = archivable(&d, "other-child", Some(seat), "judge");
         let caller = root_archiver(&d);
         let r = d.dispatch(&argv(&["context", "archive", "coder-seat"]), &caller).await;

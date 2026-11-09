@@ -390,7 +390,7 @@ struct Setup {
     server: Option<String>,
     global: &'static str,
     /// The seat's `gate` slot instead of the default one (the test model on
-    /// an `mk` backend at the mock's address).
+    /// a `council` backend at the mock's address).
     gate_slot: Option<SlotSpec>,
     /// The model of the judge character, `judge`, which the council block
     /// names; none names no judge, so the seat has no judge shadow.
@@ -446,9 +446,9 @@ impl SlotSpec {
         SlotSpec { model, backend: "judge-anthropic", kind: "anthropic", base: Base::None }
     }
 
-    /// A slot on a council server (`mk` backend) at `base`.
+    /// A slot on a council server (`council` backend) at `base`.
     fn council(backend: &'static str, base: Base) -> Self {
-        SlotSpec { model: "test-council", backend, kind: "mk", base }
+        SlotSpec { model: "test-council", backend, kind: "council", base }
     }
 
     fn at(self, model: &'static str) -> Self {
@@ -596,7 +596,7 @@ fn bind_seat(
     .unwrap();
     let gate = gate.cloned().unwrap_or(SlotSpec::council("gate-mk", Base::Gate));
     let backend = spec_backend(db, gate_server, &gate);
-    if gate.kind != "mk" {
+    if gate.kind != "council" {
         // A gate slot on a chat backend is refused when it is written; one
         // written before that check is a chat slot, so it carries max_tokens.
         db.conn_for_ledger()
@@ -651,7 +651,7 @@ fn bind_judge(db: &crate::kernel_db::KernelDb, gate_server: &str, spec: &SlotSpe
         principal_id: judge,
         backend_id: backend.backend_id,
         model: spec.model.into(),
-        max_tokens: (spec.kind != "mk").then_some(4096),
+        max_tokens: (spec.kind != "council").then_some(4096),
         temperature: None,
         top_p: None,
         effort: None,
@@ -1215,9 +1215,9 @@ async fn a_council_report_asks_and_emits_the_report_event() {
 }
 
 /// Limits the council server's endpoint to one request in flight, as `kj
-/// backend set` does for an mk backend at the same address.
+/// backend set` does for a council backend at the same address.
 async fn limit_council_to_one(rig: &Rig) {
-    let argv: Vec<String> = ["backend", "set", "council-mk", "--kind", "mk", "--base-url", rig.mock.base.as_str(), "--max-concurrent", "1"]
+    let argv: Vec<String> = ["backend", "set", "council-mk", "--kind", "council", "--base-url", rig.mock.base.as_str(), "--max-concurrent", "1"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -3761,8 +3761,8 @@ async fn a_seat_with_no_gate_slot_has_no_council() {
 #[tokio::test]
 async fn a_gate_slot_that_names_no_council_server_is_a_miss_naming_it() {
     let cases: [(&str, &str, Option<&str>, &str); 2] = [
-        ("chat-backend", "anthropic", Some("http://127.0.0.1:1"), "kind anthropic, not mk"),
-        ("no-address", "mk", None, "has no base URL"),
+        ("chat-backend", "anthropic", Some("http://127.0.0.1:1"), "kind anthropic, not council"),
+        ("no-address", "council", None, "has no base URL"),
     ];
     for (backend, kind, base_url, cause) in cases {
         for via in BOTH {
@@ -3947,7 +3947,7 @@ async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
     rig.finish().await;
 }
 
-/// A judge whose model is on an mk backend with no address names no council server:
+/// A judge whose model is on a council backend with no address names no council server:
 /// each judged decision records a judge miss that names the backend, and
 /// the gate's decision stands.
 ///

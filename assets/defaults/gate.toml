@@ -55,7 +55,7 @@
 # compose, and the last block's `enabled` decides. The file refuses to load
 # on an unknown field, a threshold naming no spec, or two thresholds for one
 # spec. The council server is not named here: a context decides on its
-# `gate` slot (`kj character slot set <character> gate <mk backend>/<served
+# `gate` slot (`kj character slot set <character> gate <council backend>/<served
 # model>`, then `kj context rotate`), and a context with no `gate`
 # slot has no council. See docs/council.md, "Configuration".
 #

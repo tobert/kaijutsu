@@ -8,7 +8,7 @@
 //!
 //! A character also holds up to two **slots**: `distill`, a cheaper model
 //! that summarizes for `kj fork --compact` and `kj drift pull|merge`, and
-//! `gate`, the council server (a backend of kind `mk`) that judges the gate
+//! `gate`, the council server (a backend of kind `council`) that judges the gate
 //! (`docs/council.md`, "Configuration"). No other role exists: the judge is
 //! a character of its own, whose model is its council server.
 //!
@@ -36,7 +36,7 @@ pub(super) enum CharacterSlotCommand {
         character: String,
         /// Role: `distill` for the model that summarizes for `kj fork
         /// --compact` and `kj drift pull|merge`, or `gate` for the council
-        /// server (an mk backend) that judges the gate. The character's chat
+        /// server (a council backend) that judges the gate. The character's chat
         /// model is `kj character model set`
         role: String,
         /// The model as `<backend>/<model>`, split at the first `/`, as `kj
@@ -554,7 +554,7 @@ mod tests {
         d.reload_llm_registry().await.unwrap();
         let r = d.dispatch(&argv(&["character", "create", "house", "--rc", "coder"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
-        let r = d.dispatch(&argv(&["backend", "set", "mk-zorak", "--kind", "mk", "--base-url", "http://zorak:8090", "--key-optional"]), &test_caller()).await;
+        let r = d.dispatch(&argv(&["backend", "set", "mk-zorak", "--kind", "council", "--base-url", "http://zorak:8090", "--key-optional"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
         d
     }
@@ -620,20 +620,20 @@ mod tests {
         assert!(council_model.is_ok() && !council_model.message().contains("WARN"), "{}", council_model.message());
     }
 
-    /// A `distill` slot names a chat model, so a council server (a backend
-    /// of kind `mk`) refuses for it, as a chat backend refuses for `gate`.
+    /// A council server serves chat turns, so a `distill` slot may name one,
+    /// with the `max_tokens` a distillation sends.
     ///
-    /// Falsified by a `distill` slot written on a council server.
+    /// Falsified by refusing a `distill` slot by its backend's kind.
     #[tokio::test]
-    async fn slot_set_refuses_a_distill_slot_on_a_council_server() {
+    async fn slot_set_takes_a_distill_slot_on_a_council_server() {
         let d = seeded().await;
         let c = test_caller();
-        let refused = d.dispatch(&argv(&["character", "slot", "set", "house", "distill", "mk-zorak/gemma"]), &c).await;
-        assert!(!refused.is_ok(), "{}", refused.message());
-        assert!(refused.message().contains("`distill`") && refused.message().contains("mk-zorak"), "{}", refused.message());
+        let set = d.dispatch(&argv(&["character", "slot", "set", "house", "distill", "mk-zorak/gemma", "--max-tokens", "1024"]), &c).await;
+        assert!(set.is_ok(), "{}", set.message());
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
-        assert!(db.get_character_slot(house.principal_id, "distill").unwrap().is_none(), "nothing was written");
+        let slot = db.get_character_slot(house.principal_id, "distill").unwrap().expect("the slot is written");
+        assert_eq!((slot.model.as_str(), slot.max_tokens), ("gemma", Some(1024)));
     }
 
     #[tokio::test]
@@ -919,7 +919,7 @@ mod tests {
             );
         }
         let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "anthropic/claude-opus-5"]), &c).await;
-        assert!(matches!(&gate, KjResult::Err(m) if m.contains("council server") && m.contains("not mk")), "{gate:?}");
+        assert!(matches!(&gate, KjResult::Err(m) if m.contains("council server") && m.contains("not council")), "{gate:?}");
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
         assert!(db.list_character_slots(house.principal_id).unwrap().is_empty(), "nothing was written");

@@ -74,6 +74,7 @@ mod migrate_console;
 mod migrate_rc_dir;
 mod migrate_slot_roles;
 mod migrate_type_melt;
+mod migrate_council_backends;
 mod migrate_cast;
 mod migrate;
 #[cfg(test)]

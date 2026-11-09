@@ -16,11 +16,11 @@
 //! (`projection::project_shadow`).
 //!
 //! The shadow's `model` slot names its judge. A judge on a council server (a
-//! backend of kind `mk`) is primed after each call: the shadow is sent whole
+//! backend of kind `council`) is primed after each call: the shadow is sent whole
 //! on a task of its own, warming the seat's shell spec, so the server holds
 //! the dialogue before it is asked about it. A judge on a chat backend is
 //! not asked: its shadow records the dialogue and nothing reads it. A judge
-//! on an `mk` backend with no address, or a shadow with no `model` slot, is
+//! on a `council` backend with no address, or a shadow with no `model` slot, is
 //! never primed, and each judge read is a miss that names why.
 //!
 //! After the council decides a judged seat's call, [`spawn_judge`] reads the
@@ -81,7 +81,7 @@ pub(crate) struct JudgeRead {
     /// The shadow's own label, which names it in the record.
     shadow_label: String,
     call: BlockId,
-    /// The judge's council server and served model, or why its `mk`
+    /// The judge's council server and served model, or why its `council`
     /// backend names none.
     server: Result<SlotServer, String>,
 }
@@ -100,7 +100,7 @@ struct Judge {
     /// council declares no shell spec.
     spec_name: Option<String>,
     /// The council server that holds the shadow: its `model` slot's backend
-    /// address and model when its kind is `mk`, or why it names none. `None`
+    /// address and model when its kind is `council`, or why it names none. `None`
     /// for a chat backend.
     server: Option<Result<SlotServer, String>>,
 }
@@ -489,9 +489,14 @@ fn judge_character(db: &crate::kernel_db::KernelDb, name: &str) -> KernelDbResul
 }
 
 /// The seat's live judge shadow: the live child of `seat` that `judge`
-/// performs.
+/// performs and the council made as its shadow.
 fn live_shadow(db: &crate::kernel_db::KernelDb, seat: ContextId, judge: PrincipalId) -> KernelDbResult<Option<ContextRow>> {
-    Ok(db.fork_children(seat)?.into_iter().find(|c| c.performer == Some(judge)))
+    for child in db.fork_children(seat)? {
+        if child.performer == Some(judge) && db.is_judge_shadow(&child)? {
+            return Ok(Some(child));
+        }
+    }
+    Ok(None)
 }
 
 /// A context's label, or its short id when it has none.
@@ -501,7 +506,7 @@ fn name_of(row: &ContextRow) -> String {
 
 /// The seat's live judge shadow, created when the seat's council names a
 /// judge character and no shadow exists yet. The shadow is found by its fork
-/// edge and its performer, never by its label or type. Returns the judge and
+/// edge, its performer, and its `judge_shadows` row, never by its label. Returns the judge and
 /// whether this call created its shadow.
 fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad) -> KernelDbResult<Option<(Judge, bool)>> {
     let _create = CREATE.lock();
@@ -535,7 +540,8 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
                 db,
                 &row,
                 crate::kj::context::CharacterPlacement::Start { performer: sheet.principal_id, senpai: Some(seat) },
-            )
+            )?;
+            db.mark_judge_shadow(row.context_id)
         })?;
         judge.shadow = row.context_id;
         judge.shadow_label = name_of(&row);
@@ -550,7 +556,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
             };
             tracing::warn!(
                 %seat, shadow = %judge.shadow, judge = %name, %backend,
-                "shadow: the judge's model is not on an mk backend, so this judge shadow is created but its judge is never read"
+                "shadow: the judge's model is not on a council backend, so this judge shadow is created but its judge is never read"
             );
         }
         (row, judge)
@@ -568,7 +574,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId, config: &GateConfigLoad
 
 /// The council server a judge shadow reads on, from its own `model` slot:
 /// the backend's address and the slot's model when the backend's kind is
-/// `mk`, or why it names none. `None` for a chat backend, whose judge is not
+/// `council`, or why it names none. `None` for a chat backend, whose judge is not
 /// read yet.
 fn shadow_server(
     db: &crate::kernel_db::KernelDb,
@@ -579,7 +585,7 @@ fn shadow_server(
         let name = performer.map(|p| db.name_for(p)).unwrap_or_else(|| "(none)".into());
         return Ok(Some(Err(format!(
             "the shadow has none: its judge character {name} had no model when the shadow was made; \
-             `kj character model set {name} <mk-backend>/<model>`, then archive {} so the next gate call makes another",
+             `kj character model set {name} <council-backend>/<model>`, then archive {} so the next gate call makes another",
             db.context_name(shadow)
         ))));
     };
@@ -594,7 +600,7 @@ fn shadow_server(
 /// or, before the shadow is made, the model of the judge character
 /// `council` names, which the shadow will copy. `None` when the council
 /// names no judge, the judge is no live character, or its model is not on
-/// an `mk` backend with an address.
+/// a `council` backend with an address.
 pub(crate) fn judge_server(
     db: &crate::kernel_db::KernelDb,
     council: &crate::kj::gate_policy::CouncilConfig,

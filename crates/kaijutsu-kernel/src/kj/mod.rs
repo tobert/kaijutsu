@@ -1024,8 +1024,8 @@ impl KjDispatcher {
                 .map_err(|e| format!("could not read the distill slot: {e}"))?
         };
         let bound = match bound {
-            crate::model_resolution::RoleSlot::Slot(bound) if bound.council_server => {
-                return Err(crate::model_resolution::NoModel::council_server(&bound, crate::model_resolution::DISTILL)
+            crate::model_resolution::RoleSlot::Slot(bound) if bound.council_server && bound.slot.max_tokens.is_none() => {
+                return Err(crate::model_resolution::NoModel::no_max_tokens(&bound, crate::model_resolution::DISTILL)
                     .refusal_as("cannot distill"));
             }
             crate::model_resolution::RoleSlot::Slot(bound) => bound,

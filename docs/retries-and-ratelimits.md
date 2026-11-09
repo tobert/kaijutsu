@@ -33,7 +33,7 @@ in the first place.
   (scheme, host, and port), written `http://zorak:8090` or
   `https://api.anthropic.com:443`, with the default port written out. Two
   backends that name the same server share one limiter, and so do the gate's
-  `[council] server` and an `mk` backend at the same address. The key is the
+  `[council] server` and a `council` backend at the same address. The key is the
   host as written, not its address: `http://zorak:8090` and
   `http://100.83.138.103:8090` are two endpoints, so name a server one way. A backend with
   no base URL is its own endpoint, `hosted backend <name>`: two hosted

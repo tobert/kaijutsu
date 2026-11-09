@@ -34,10 +34,10 @@ sqlite3 ~/.local/share/kaijutsu/kernel/kernel.db \
 | Field | Suggested | Meaning |
 |---|---|---|
 | enabled | 1 | Initialize semantic indexing at startup; 0 leaves the index off |
-| backend | none | Name of an `openai` or `mk` kind backend; any other kind is an error at boot |
+| backend | none | Name of an `openai` or `council` kind backend; any other kind is an error at boot |
 | model | none | The provider's model id, sent as `model` |
 | dimensions | 1024 | Vector size, sent as `dimensions` and checked on every response |
-| profile | `plain` | How queries and documents are prefixed: `plain`, `qwen3`, `embeddinggemma`. An `mk` backend takes only `plain` |
+| profile | `plain` | How queries and documents are prefixed: `plain`, `qwen3`, `embeddinggemma`. A `council` backend takes only `plain` |
 | timeout_ms | 30000 | Request deadline, including queue time |
 | max_in_flight | 2 | Maximum concurrent requests |
 | max_context_bytes | 2048 | UTF-8 byte budget of the search projection |

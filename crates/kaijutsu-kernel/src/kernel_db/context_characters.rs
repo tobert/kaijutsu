@@ -356,7 +356,7 @@ impl KernelDb {
     /// `backend_models` value; nothing else supplies one. A chat model with
     /// no `max_tokens` in either place refuses, and so does
     /// `thinking_style=budget` with no `thinking_budget` below `max_tokens`;
-    /// a council server (a backend of kind `mk`) is exempt from both. A
+    /// a council server (a backend of kind `council`) is exempt from both. A
     /// character slot of any other role is corruption and refuses.
     fn copy_character_slots(&self, context_id: ContextId, principal_id: PrincipalId) -> KernelDbResult<()> {
         use crate::model_resolution::{CHARACTER_SLOT_ROLES, DISTILL, MODEL};
@@ -380,8 +380,7 @@ impl KernelDb {
                 thinking_style: model.thinking_style.clone(),
             };
             self.copy_one_slot(context_id, MODEL, &subject, model.backend_id, &model.model, tunables.clone())?;
-            // A council server is never a chat model, so it distills nothing.
-            if !slots.iter().any(|slot| slot.role == DISTILL) && !self.backend_is_council_server(model.backend_id)? {
+            if !slots.iter().any(|slot| slot.role == DISTILL) {
                 self.copy_one_slot(context_id, DISTILL, &subject, model.backend_id, &model.model, tunables)?;
             }
         }

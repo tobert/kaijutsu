@@ -503,12 +503,12 @@ fn commit_rotation_leaves_the_kohai_and_repoints_a_handoff_log() {
     let handoff_next = senpai_ctx_row(&db, ws_id, "rot-handoff-next", None, None);
     db.set_character_handoff_ctx(owner, Some(handoff.context_id)).unwrap();
 
-    assert_eq!(db.commit_rotation(old.context_id, new.context_id, None).unwrap().handoffs_moved, 0, "no handoff log pointed at it");
+    assert_eq!(db.commit_rotation(old.context_id, new.context_id).unwrap().handoffs_moved, 0, "no handoff log pointed at it");
     assert_eq!(db.senpai_of(kohai.context_id).unwrap(), Some(old.context_id), "the kohai still answer to the predecessor");
     assert!(db.list_kohai(new.context_id).unwrap().is_empty(), "the successor has none until it takes them");
     assert!(db.get_context(old.context_id).unwrap().unwrap().is_archived());
 
-    assert_eq!(db.commit_rotation(handoff.context_id, handoff_next.context_id, None).unwrap().handoffs_moved, 1);
+    assert_eq!(db.commit_rotation(handoff.context_id, handoff_next.context_id).unwrap().handoffs_moved, 1);
     assert_eq!(db.get_character(owner).unwrap().unwrap().handoff_ctx, Some(handoff_next.context_id));
 }
 

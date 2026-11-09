@@ -489,11 +489,12 @@ async fn create_shipped_characters(
     Ok(())
 }
 
-/// Whether `performer` has a model a console can run: one on a backend that
-/// is no council server.
+/// Whether `performer` has a model a console can run: one with
+/// `max_tokens`, or one on a backend that is no council server, where the
+/// write path requires it.
 fn performer_model_usable(db: &KernelDb, performer: kaijutsu_types::PrincipalId) -> KernelDbResult<bool> {
     match db.get_character_model(performer)? {
-        Some(model) => Ok(!db.backend_is_council_server(model.backend_id)?),
+        Some(model) => Ok(model.max_tokens.is_some() || !db.backend_is_council_server(model.backend_id)?),
         None => Ok(false),
     }
 }

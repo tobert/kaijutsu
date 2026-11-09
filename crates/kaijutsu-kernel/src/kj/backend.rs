@@ -2,7 +2,7 @@
 //!
 //! A **backend** is one configured endpoint: a free-form unique `name` (the
 //! handle you type) plus a closed `kind` (`anthropic` | `deepseek` | `openai` |
-//! `alibaba` | `codex-app` | `mk`) that picks which client speaks for it. That split is the point of this
+//! `alibaba` | `codex-app` | `council`) that picks which client speaks for it. That split is the point of this
 //! renovation — the demolished `models.toml` made the `[providers.<name>]`
 //! table name BE the provider type, so two Anthropic gateways were
 //! inexpressible and a local server had to be called `ollama`/`lemonade`/
@@ -55,17 +55,18 @@ enum BackendCommand {
     Set {
         /// Backend name — free-form, unique (e.g. anthropic, gpt, zorak)
         name: String,
-        /// Wire dialect: anthropic | deepseek | openai | alibaba | codex-app | mk.
+        /// Wire dialect: anthropic | deepseek | openai | alibaba | codex-app | council.
         /// alibaba is Alibaba Model Studio; its key defaults to
-        /// ALIBABA_API_KEY.
+        /// ALIBABA_API_KEY. council is a council v2 server, such as a nagaya,
+        /// which serves chat turns, gate decisions and embeddings.
         #[arg(long)]
         kind: String,
         /// Endpoint URL. REQUIRED for --kind openai (it says WHICH
         /// OpenAI-compatible server) and for alibaba (the Token Plan,
         /// https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1,
         /// or a workspace endpoint); optional gateway override for anthropic;
-        /// unnecessary for deepseek; required for codex-app and for mk (the
-        /// megakernel service address, such as http://zorak:8090).
+        /// unnecessary for deepseek; required for codex-app and for council
+        /// (the server address, such as http://100.65.47.5:8091).
         #[arg(long = "base-url")]
         base_url: Option<String>,
         /// Environment variable NAME holding the API key (never the key)
@@ -1178,7 +1179,7 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         for args in [
-            &["backend", "set", "mk-zorak", "--kind", "mk", "--base-url", "http://zorak:8090", "--max-concurrent", "4"][..],
+            &["backend", "set", "mk-zorak", "--kind", "council", "--base-url", "http://zorak:8090", "--max-concurrent", "4"][..],
             &["backend", "set", "tenchi", "--kind", "openai", "--base-url", "http://zorak:8090/v1", "--key-optional",
               "--max-concurrent", "2"][..],
         ] {
@@ -1211,7 +1212,7 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         let r = d
-            .dispatch(&argv(&["backend", "set", "mk", "--kind", "mk", "--base-url", "http://zorak:8090", "--max-concurrent", "0"]), &c)
+            .dispatch(&argv(&["backend", "set", "mk", "--kind", "council", "--base-url", "http://zorak:8090", "--max-concurrent", "0"]), &c)
             .await;
         match r {
             KjResult::Err(msg) => assert!(msg.contains("--max-concurrent must be at least 1"), "{msg}"),
