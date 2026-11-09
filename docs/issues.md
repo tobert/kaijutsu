@@ -14,10 +14,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   (`docs/council-backend.md`, "Liveness").
 - **Media.** `lfm3-omni` reads images, audio and video and writes audio;
   the provider sends text only and turns an image into a marker.
-- **`mk-reasoning` stays the thinking signature**, because stored blocks
-  carry it; renaming it needs a hydration alias.
-- **`kaijutsu_council::council::{GenerationEvent, GenerationStream}`**
-  stutters; the stream types could move to the crate root.
 - **lfm3 on tool loops.** A 1.7B model is weaker than Gemma 4 on long tool
   loops (nagaya-85); nothing has measured it in a kaijutsu seat yet.
 
@@ -1160,7 +1156,7 @@ unused. Seen while retiring `shellDryRun`; not caused by it.
 look whatever the deadline, so a caller whose deadline already passed
 still sends. A strict "deadline before slot" rule would refuse it. About
 a dozen tests take a slot with `acquire(Instant::now())` as a holder
-(`llm/endpoint.rs`, `llm/mk/mod.rs`, `council/gate_e2e.rs`), so the change
+(`llm/endpoint.rs`, `llm/council/mod.rs`, `council/gate_e2e.rs`), so the change
 moves each of them to a future deadline; left for its own change, with
 `docs/retries-and-ratelimits.md`, "Waiting is bounded by the caller's own
 deadline".
@@ -1403,13 +1399,12 @@ could not find her root context (`amy`, f8f4010b, 125 children) in the tui
 either; the root is not labeled as one, and about 150 contexts sit at the
 top level beside it.
 
-## System 1 musicians share the megakernel with the gate (2026-10-06)
+## System 1 musicians share the council server with the gate (2026-10-06)
 
-The bass prototype (`contrib/chameleon-s1/`) chose one bass cell per bar
-from the megakernel in about 250 ms (median, client wall time, one choice
-question), while moltar's gate decisions ran on the same server. The
-response has no `queue_ms`, although gogi's `docs/council-api.md` lists it, so a
-1475 ms outlier has no recorded cause. Before a second musician joins, the
+A bass prototype (removed with mk; see git history for
+`contrib/chameleon-s1/`) chose one bass cell per bar from the megakernel in
+about 250 ms (median, client wall time, one choice question), while moltar's
+gate decisions ran on the same server. Before a second musician joins, the
 band's decisions and the gate need a priority or admission story, and a
 producer measuring council latency must use its own wall time.
 
@@ -3707,8 +3702,8 @@ Unit tests cover both halves, and
 runs a scripted turn through it. Not yet run: a coder context on a vision model
 (`tenchi/qwen3.8-27b` answers image input directly over vLLM) calling the tool
 in a real turn. Still open: no per-model "accepts images" check, so a
-text-only provider gets the image block and drops it (`mk` writes a text
-marker). Also, `mcp/servers/file.rs` tests `broker_with_vfs_file` and
+text-only provider gets the image block and drops it (the council provider writes a
+text marker). Also, `mcp/servers/file.rs` tests `broker_with_vfs_file` and
 `broker_with_vfs_files` have no callers.
 
 Also open for images (2026-11-02, from the local model clogging on
@@ -4667,7 +4662,7 @@ the wire change first.
 `llm/claude/build.rs` sends a thinking block only when its signature has the
 shape its dialect's streams produce (`is_own_signature`): base64 for Anthropic,
 a UUID for DeepSeek's Messages endpoint (live-observed). The other providers'
-markers (`openai-compat-reasoning`, `mk-reasoning`) and the redacted-thinking
+markers (`openai-compat-reasoning`, `council-reasoning`) and the redacted-thinking
 marker (`anthropic:redacted_thinking:`) fit neither. If a server changes its
 signature encoding, valid thinking is dropped with a warning. A block that says
 which provider signed it (a field on `BlockSnapshot`, set by the block writer
@@ -4675,7 +4670,7 @@ from the stream) would replace the check.
 
 ## The catch-all HTTP statuses still land on a retried `ApiError` (2026-09-20)
 
-HTTP 402 is fixed on the OpenAI-compatible and `mk` paths (both give
+HTTP 402 is fixed on the OpenAI-compatible and council paths (both give
 `LlmError::InsufficientBalance`, permanent). Claude routes 402 through
 `400..=499 => InvalidRequest` (`llm/claude/mod.rs:331`), which is also
 permanent. The catch-all `_` arm in both providers still lands a

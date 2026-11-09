@@ -1749,7 +1749,7 @@ pub struct BlockSnapshot {
     /// during a tool-use cycle; the `anthropic:redacted_thinking:` prefix and
     /// then the opaque `data` for a `redacted_thinking` block, whose `content`
     /// is empty; and a sentinel nonce for every OpenAI-compatible provider
-    /// (DeepSeek, vLLM, llama.cpp, Alibaba) and `mk`, which round-trip
+    /// (DeepSeek, vLLM, llama.cpp, Alibaba) and council servers, which round-trip
     /// reasoning as plain text. A block with a signature and no text still
     /// replays, since the API withheld or omitted its text. `None` means "not
     /// rehydratable": the hydrator drops the block with a warning (blocks

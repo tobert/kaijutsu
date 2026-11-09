@@ -35,7 +35,7 @@ struct World {
     anthropic: BackendId,
     deepseek: BackendId,
     /// A council server (kind `council`).
-    mk: BackendId,
+    nagaya: BackendId,
     /// Next `created_at` a test context takes, so creation order is explicit.
     clock: std::cell::Cell<i64>,
     /// Whether the database has the columns a migration reads.
@@ -78,8 +78,8 @@ fn build_world(legacy: bool) -> World {
     };
     let anthropic = backend("anthropic", "anthropic");
     let deepseek = backend("deepseek", "deepseek");
-    let mk = backend("mk-zorak", "council");
-    World { db, casts: Default::default(), ws, anthropic, deepseek, mk, clock: std::cell::Cell::new(1_000), legacy }
+    let nagaya = backend("nagaya", "council");
+    World { db, casts: Default::default(), ws, anthropic, deepseek, nagaya, clock: std::cell::Cell::new(1_000), legacy }
 }
 
 impl World {
@@ -250,7 +250,7 @@ impl World {
         let house = self.cast("house");
         self.slot(house, "coder", self.deepseek, "ds-flash", None);
         self.slot(house, "judge", self.deepseek, "ds-flash", Some(2048));
-        self.slot(house, "gate", self.mk, "gemma", None);
+        self.slot(house, "gate", self.nagaya, "gemma", None);
         house
     }
 
@@ -389,7 +389,7 @@ fn write_copies_the_cast_and_fills_unset_parameters_from_the_model_row() {
     let distill = w.db.context_slot(conv.context_id, "distill").unwrap().unwrap();
     assert_eq!(distill.max_tokens, Some(2048), "the slot's own max_tokens wins over the model row");
     let gate = w.db.context_slot(conv.context_id, "gate").unwrap().unwrap();
-    assert_eq!((gate.backend_id, gate.max_tokens), (w.mk, None), "a council server needs no max_tokens");
+    assert_eq!((gate.backend_id, gate.max_tokens), (w.nagaya, None), "a council server needs no max_tokens");
     assert_eq!(row.persona.as_deref(), Some("be terse"));
     assert_eq!((row.principal_id, row.senpai_ctx), (who, None));
     assert_eq!(w.cc(&conv), Some(row));
@@ -529,7 +529,7 @@ fn the_model_fills_model_for_every_type_and_never_gate() {
     assert_eq!(w.roles(&mcp), ["distill", "model"], "an mcp context is like any other");
 
     let judge = w.character("judge");
-    w.give_model(judge, w.mk, "gemma", None);
+    w.give_model(judge, w.nagaya, "gemma", None);
     let shadow = w.ctx("shadow", "judge", None, None);
     w.db.write_context_character(shadow.context_id, judge, None, None).unwrap();
     assert_eq!(w.roles(&shadow), ["distill", "model"], "a council model distills like any model");
@@ -771,7 +771,7 @@ fn a_thinking_budget_not_below_max_tokens_refuses_at_write() {
 fn a_council_server_slot_is_exempt_from_the_thinking_checks() {
     let w = world();
     let cast = w.cast("council");
-    let mut gate = w.slot(cast, "gate", w.mk, "gemma", None);
+    let mut gate = w.slot(cast, "gate", w.nagaya, "gemma", None);
     gate.thinking_style = Some("budget".into());
     w.set_cast_slot(&gate);
     let who = w.character("thinker");

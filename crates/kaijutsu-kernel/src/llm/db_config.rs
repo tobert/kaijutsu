@@ -248,12 +248,12 @@ mod tests {
     #[test]
     fn a_backend_that_does_not_build_sets_no_limit() {
         let db = seeded_db();
-        for (name, kind, key_env, max) in [("mk-zorak", "council", None, None), ("broken", "anthropic", Some("KJ_TEST_NO_SUCH_KEY"), Some(1))] {
+        for (name, kind, key_env, max) in [("nagaya", "council", None, None), ("broken", "anthropic", Some("KJ_TEST_NO_SUCH_KEY"), Some(1))] {
             db.upsert_backend(&crate::kernel_db::BackendRow {
                 backend_id: BackendId::new(),
                 name: name.into(),
                 kind: kind.into(),
-                base_url: Some("http://zorak:8090".into()),
+                base_url: Some("http://nagaya:8091".into()),
                 api_key_env: key_env.map(str::to_string),
                 api_key_file: None,
                 key_optional: false,
@@ -268,9 +268,9 @@ mod tests {
         let endpoints = Endpoints::default();
         let registry = build_llm_registry(&db, &endpoints).unwrap();
         assert!(registry.get("broken").is_none(), "the anthropic row has no key");
-        let status = endpoints.get("http://zorak:8090").status();
+        let status = endpoints.get("http://nagaya:8091").status();
         assert_eq!(status.limit, None);
-        assert_eq!(status.backends, vec![("mk-zorak".to_string(), None)]);
+        assert_eq!(status.backends, vec![("nagaya".to_string(), None)]);
     }
 
     /// A kernel ships no backends: a new DB has no backend, model, alias or

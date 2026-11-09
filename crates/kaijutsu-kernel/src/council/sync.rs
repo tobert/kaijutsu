@@ -512,7 +512,7 @@ impl CouncilSync {
             return Ok((Box::new(seat), head));
         }
         let built = link
-            .send(|| async { link.client.council().build_context(&link.model, &seat, false).await })
+            .send(|| async { link.client.build_context(&link.model, &seat, false).await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, &format!("build of context \"{label}\""), e))?;
         self.state.lock().contexts.insert(key, Held { id: context_id, body: hash, head: built.head.clone() });
@@ -610,7 +610,7 @@ impl CouncilSync {
             return Ok(i.clone());
         }
         let identity = link
-            .send(|| async { link.client.council().identity().await })
+            .send(|| async { link.client.identity().await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, "council v2 identity", e))?;
         self.state.lock().identities.insert(link.key.clone(), identity.clone());
@@ -646,7 +646,7 @@ impl CouncilSync {
         if self.state.lock().specs.contains(&key) {
             return Ok(());
         }
-        link.send(|| async { link.client.council().post_spec(spec).await })
+        link.send(|| async { link.client.post_spec(spec).await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, &format!("POST of spec \"{}\"", spec.name), e))?;
         self.state.lock().specs.insert(key);
@@ -736,7 +736,7 @@ impl Pinner {
         let deadline = tokio::time::Instant::now() + PIN_TIMEOUT;
         let waits = SlotWaits::default();
         if heads.is_empty() {
-            let answer = council_call(&self.endpoint, deadline, &waits, || async { client.council().delete_pins(&self.owner).await }).await;
+            let answer = council_call(&self.endpoint, deadline, &waits, || async { client.delete_pins(&self.owner).await }).await;
             match answer {
                 Ok((_slot, Ok(()))) => tracing::info!(server = %self.server, owner = %self.owner, "council pins dropped: no seat is current"),
                 Ok((_slot, Err(e))) if e.status() == Some(404) => {}
@@ -746,7 +746,7 @@ impl Pinner {
             return;
         }
         let body = PinsPut { snapshots: heads, ttl_s: PIN_TTL.as_secs() };
-        let answer = council_call(&self.endpoint, deadline, &waits, || async { client.council().put_pins(&self.owner, &body).await }).await;
+        let answer = council_call(&self.endpoint, deadline, &waits, || async { client.put_pins(&self.owner, &body).await }).await;
         let pinned = match answer {
             Ok((_slot, Ok(pinned))) => pinned,
             Ok((_slot, Err(e))) => {
@@ -1818,7 +1818,7 @@ mod tests {
         let backend = db
             .upsert_backend(&BackendRow {
                 backend_id: kaijutsu_types::BackendId::new(),
-                name: "council-mk".into(),
+                name: "nagaya".into(),
                 kind: "council".into(),
                 base_url: Some(r.mock.base.clone()),
                 api_key_env: None,
@@ -2107,7 +2107,7 @@ mod tests {
         let want: BTreeSet<&str> = want.iter().map(|id| id.as_str()).collect();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
-            match client.council().get_pins(owner).await {
+            match client.get_pins(owner).await {
                 Ok(pins) if pins.snapshots.iter().map(String::as_str).collect::<BTreeSet<_>>() == want => return pins,
                 _ if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
                 other => panic!("pins for {owner} never became {want:?}: {other:?}"),
@@ -2139,7 +2139,7 @@ mod tests {
         let pins = pinned_exactly(&client, &owner, &[&reviewer, &new]).await;
         println!("after the edit: {pins:?}");
         assert!(!pins.snapshots.iter().any(|id| id == old.as_str()), "{pins:?}");
-        client.council().delete_pins(&owner).await.expect("pins dropped");
+        client.delete_pins(&owner).await.expect("pins dropped");
     }
 
     /// A seat built on the council server at `server`, pinned under the
@@ -2161,7 +2161,7 @@ mod tests {
         let pins = pinned_exactly(&client, &owner, &[&head]).await;
         println!("pins: {pins:?}");
         assert!(pins.expires_in_s > 3500 && pins.expires_in_s <= 3600, "{pins:?}");
-        let snapshot = client.council().snapshot(&head).await.expect("the head is held");
+        let snapshot = client.snapshot(&head).await.expect("the head is held");
         println!("snapshot: {snapshot:?}");
         assert!(snapshot.pins.iter().any(|pin| pin.owner == owner), "{snapshot:?}");
 
@@ -2179,7 +2179,7 @@ mod tests {
             serde_json::to_string(&response.answers).unwrap()
         );
         println!("read snapshot {:?}", response.reads[0].snapshot);
-        client.council().delete_pins(&owner).await.expect("pins dropped");
+        client.delete_pins(&owner).await.expect("pins dropped");
     }
 
     /// The kernel and gogi's fake council server agree on the contract: a
@@ -2236,7 +2236,7 @@ mod tests {
         let p = r.prepare().await.expect("prepared once b is ready");
         assert_eq!(p.identity.model, "b");
         let client = CouncilClient::new(&fake.url(), Duration::from_secs(30)).unwrap();
-        assert_eq!(client.council().snapshot(&p.contexts[0].head).await.unwrap().model, "b");
+        assert_eq!(client.snapshot(&p.contexts[0].head).await.unwrap().model, "b");
 
         let request = super::super::gate::decision_request(&p, &r.council, serde_json::Value::from("git push origin main"));
         assert_eq!(request.model, "b");

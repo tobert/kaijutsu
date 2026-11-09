@@ -630,7 +630,7 @@ fn build_message(index: usize, msg: &Message, native_system: bool, dialect: Dial
 
 /// Whether `signature` is one a stream of this dialect produced. Anthropic's
 /// signatures are base64; DeepSeek's Messages endpoint signs with a UUID.
-/// Every other provider's marker (`openai-compat-reasoning`, `mk-reasoning`)
+/// Every other provider's marker (`openai-compat-reasoning`, `council-reasoning`)
 /// fits neither, and the redacted-thinking marker holds `:`.
 fn is_own_signature(signature: &str, dialect: Dialect) -> bool {
     match dialect {
@@ -1851,7 +1851,7 @@ mod tests {
     /// provider's stream produced never reaches it.
     #[test]
     fn another_providers_signature_is_not_sent() {
-        for foreign in ["openai-compat-reasoning", "mk-reasoning", "sig_with_underscore", "a b"] {
+        for foreign in ["openai-compat-reasoning", "council-reasoning", "sig_with_underscore", "a b"] {
             let blocks = built_blocks(&assistant_with(vec![
                 ContentBlock::Reasoning { text: "thoughts".into(), signature: Some(foreign.into()) },
                 ContentBlock::Text { text: "answer".into() },

@@ -264,14 +264,12 @@ done.
 
 Coverage:
 
-- Dumped and logged: OpenAI-compatible providers (including DeepSeek) and
-  Anthropic, on the turn's streaming path.
-- Logged only: one-shot prompts on those providers (`prompt_with_system`
-  streams with no turn trace); the `mk` provider, turns and one-shot prompts
-  alike (its request is not a JSON body; a
-  `429` resend inside one call is the same request and is not logged again;
-  `provider` is the backend's name, so two mk backends differ); council
-  decisions (`provider="council"`, with the count of held contexts, because a
+- Dumped and logged: OpenAI-compatible providers (including DeepSeek),
+  Anthropic, and council generations, on the turn's streaming path. A council
+  turn's `provider` is the backend's name, and a `429` resend inside one call
+  is the same request and is not written again.
+- Logged only: one-shot prompts (`prompt_with_system` streams with no turn
+  trace); council decisions (`provider="council"`, with the count of held contexts, because a
   decision sends context ids, not messages).
 - Not covered: the Codex provider, embeddings, the Anthropic models `GET`, and
   council context puts.

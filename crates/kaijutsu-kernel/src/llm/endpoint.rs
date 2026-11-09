@@ -594,8 +594,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_limit_of_one_holds_a_second_request_until_the_first_ends() {
         let endpoints = Endpoints::default();
-        endpoints.configure(&[backend("mk", Some("http://zorak:8090"), Some(1))]);
-        let endpoint = endpoints.for_url("http://zorak:8090").unwrap();
+        endpoints.configure(&[backend("nagaya", Some("http://nagaya:8091"), Some(1))]);
+        let endpoint = endpoints.for_url("http://nagaya:8091").unwrap();
         let first = endpoint.acquire(Instant::now()).await.unwrap();
         let waiter = endpoint.clone();
         let second = tokio::spawn(async move {
@@ -614,13 +614,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_wait_past_its_deadline_names_the_endpoint_and_the_limit() {
         let endpoints = Endpoints::default();
-        endpoints.configure(&[backend("mk", Some("http://zorak:8090"), Some(1))]);
-        let endpoint = endpoints.for_url("http://zorak:8090").unwrap();
+        endpoints.configure(&[backend("nagaya", Some("http://nagaya:8091"), Some(1))]);
+        let endpoint = endpoints.for_url("http://nagaya:8091").unwrap();
         let _held = endpoint.acquire(Instant::now()).await.unwrap();
         let waits = SlotWaits::default();
         let miss = endpoint.acquire_noting(Instant::now() + Duration::from_millis(700), &waits).await.unwrap_err();
         assert_eq!(miss.waited, Duration::from_millis(700));
-        assert_eq!(miss.to_string(), "no slot at http://zorak:8090 after waiting 700 ms: 1 of 1 slots in flight");
+        assert_eq!(miss.to_string(), "no slot at http://nagaya:8091 after waiting 700 ms: 1 of 1 slots in flight");
         assert_eq!(waits.total(), Duration::from_millis(700));
         assert!(waits.open().is_none());
     }
@@ -628,20 +628,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_wait_cut_short_by_its_caller_stays_open_in_its_waits() {
         let endpoints = Endpoints::default();
-        endpoints.configure(&[backend("mk", Some("http://zorak:8090"), Some(1))]);
-        let endpoint = endpoints.for_url("http://zorak:8090").unwrap();
+        endpoints.configure(&[backend("nagaya", Some("http://nagaya:8091"), Some(1))]);
+        let endpoint = endpoints.for_url("http://nagaya:8091").unwrap();
         let _held = endpoint.acquire(Instant::now()).await.unwrap();
         let waits = SlotWaits::default();
         let far = Instant::now() + Duration::from_secs(60);
         assert!(tokio::time::timeout(Duration::from_millis(400), endpoint.acquire_noting(far, &waits)).await.is_err());
         assert_eq!(waits.total(), Duration::from_millis(400));
-        assert_eq!(waits.open().as_deref(), Some("waiting 400 ms for a slot at http://zorak:8090"));
+        assert_eq!(waits.open().as_deref(), Some("waiting 400 ms for a slot at http://nagaya:8091"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_retry_after_delays_the_next_request_to_that_endpoint_only() {
         let endpoints = Endpoints::default();
-        let busy = endpoints.for_url("http://zorak:8090").unwrap();
+        let busy = endpoints.for_url("http://nagaya:8091").unwrap();
         let other = endpoints.for_url("http://zorak:8091").unwrap();
         busy.acquire(Instant::now()).await.unwrap().answered_with(429, Some(Duration::from_secs(2)));
         assert_eq!(busy.status().cooldown, Some((Duration::from_secs(2), 429)));
@@ -657,7 +657,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn busy_answers_in_a_row_double_the_cooldown_and_a_success_resets_it() {
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         let far = || Instant::now() + Duration::from_secs(600);
         for (n, want) in [(1, 5), (2, 10), (3, 20)] {
             let slot = endpoint.acquire(far()).await.unwrap();
@@ -674,14 +674,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn two_backends_at_one_origin_share_one_limiter_at_the_smaller_limit() {
         let endpoints = Endpoints::default();
-        let a = backend("mk-zorak", Some("http://zorak:8090"), Some(4));
-        let b = backend("tenchi", Some("http://zorak:8090/v1"), Some(2));
+        let a = backend("nagaya", Some("http://nagaya:8091"), Some(4));
+        let b = backend("tenchi", Some("http://nagaya:8091/v1"), Some(2));
         endpoints.configure(&[a.clone(), b.clone(), backend("local", Some("http://localhost:11434/v1"), None)]);
         let (ea, eb) = (endpoints.for_backend(&a).unwrap(), endpoints.for_backend(&b).unwrap());
         assert!(Arc::ptr_eq(&ea, &eb));
         let status = ea.status();
         assert_eq!(status.limit, Some(2));
-        assert_eq!(status.backends, vec![("mk-zorak".to_string(), Some(4)), ("tenchi".to_string(), Some(2))]);
+        assert_eq!(status.backends, vec![("nagaya".to_string(), Some(4)), ("tenchi".to_string(), Some(2))]);
         let _x = ea.acquire(Instant::now()).await.unwrap();
         let _y = eb.acquire(Instant::now()).await.unwrap();
         assert!(ea.acquire(Instant::now()).await.is_err(), "a third slot at a limit of 2");
@@ -702,7 +702,7 @@ mod tests {
     /// Falsified by a `Retry-After: 0` that starts no cooldown.
     #[tokio::test(start_paused = true)]
     async fn a_busy_answer_cools_the_endpoint_for_at_least_one_second() {
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         endpoint.acquire(Instant::now()).await.unwrap().answered_with(429, Some(Duration::ZERO));
         assert_eq!(endpoint.status().cooldown, Some((Duration::from_secs(1), 429)));
     }
@@ -714,7 +714,7 @@ mod tests {
     /// ends at the caller's deadline.
     #[tokio::test(start_paused = true)]
     async fn a_wait_that_reaches_its_deadline_gets_no_slot_though_one_is_free() {
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         endpoint.acquire(Instant::now()).await.unwrap().answered_with(503, Some(Duration::from_secs(2)));
         let miss = endpoint.acquire(Instant::now() + Duration::from_secs(2)).await.unwrap_err();
         assert_eq!(miss.waited, Duration::from_secs(2));
@@ -728,7 +728,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_429_with_no_wait_is_sent_again_once_a_second_until_the_deadline() {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         let calls = AtomicU32::new(0);
         let deadline = Instant::now() + Duration::from_millis(3500);
         let answered = council_call(&endpoint, deadline, &SlotWaits::default(), || {
@@ -747,7 +747,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_429_at_the_deadline_is_not_sent_again() {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         let calls = AtomicU32::new(0);
         let deadline = Instant::now() + Duration::from_secs(1);
         let answered = council_call(&endpoint, deadline, &SlotWaits::default(), || {
@@ -772,7 +772,7 @@ mod tests {
     /// Falsified by 16 simultaneous 503s that reach the 60 s cooldown.
     #[tokio::test(start_paused = true)]
     async fn simultaneous_busy_answers_step_the_doubling_once() {
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         let far = Instant::now() + Duration::from_secs(600);
         let mut slots = Vec::new();
         for _ in 0..16 {
@@ -794,7 +794,7 @@ mod tests {
     /// Falsified by an opened stream that resets the doubling.
     #[tokio::test(start_paused = true)]
     async fn opening_a_stream_keeps_the_doubling_and_its_end_resets_it() {
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         endpoint.acquire(Instant::now()).await.unwrap().answered_with(503, Some(Duration::from_secs(1)));
         let far = Instant::now() + Duration::from_secs(600);
         let (slot, opened) =
@@ -811,7 +811,7 @@ mod tests {
     /// Falsified by a mid-stream 503 that leaves the endpoint open.
     #[tokio::test(start_paused = true)]
     async fn a_mid_stream_503_cools_the_endpoint() {
-        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let endpoint = Endpoints::default().get("http://nagaya:8091");
         let slot = endpoint.acquire(Instant::now()).await.unwrap();
         slot.failed_council(&kaijutsu_council::CouncilError::Stream {
             error: gogi_proto::ErrorBody::new(gogi_proto::ErrorType::Unavailable, "spin").error,

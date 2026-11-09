@@ -554,7 +554,7 @@ mod tests {
         d.reload_llm_registry().await.unwrap();
         let r = d.dispatch(&argv(&["character", "create", "house", "--rc", "coder"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
-        let r = d.dispatch(&argv(&["backend", "set", "mk-zorak", "--kind", "council", "--base-url", "http://zorak:8090", "--key-optional"]), &test_caller()).await;
+        let r = d.dispatch(&argv(&["backend", "set", "nagaya", "--kind", "council", "--base-url", "http://nagaya:8091", "--key-optional"]), &test_caller()).await;
         assert!(r.is_ok(), "{}", r.message());
         d
     }
@@ -614,9 +614,9 @@ mod tests {
         let sized = d.dispatch(&set("distill", &["--max-tokens", "4096"]), &c).await;
         assert!(!sized.message().contains("WARN"), "{}", sized.message());
         // A council server needs no max_tokens, by its backend's kind.
-        let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "mk-zorak/gemma"]), &c).await;
+        let gate = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "nagaya/gemma"]), &c).await;
         assert!(gate.is_ok() && !gate.message().contains("WARN"), "{}", gate.message());
-        let council_model = d.dispatch(&argv(&["character", "model", "set", "house", "mk-zorak/gemma"]), &c).await;
+        let council_model = d.dispatch(&argv(&["character", "model", "set", "house", "nagaya/gemma"]), &c).await;
         assert!(council_model.is_ok() && !council_model.message().contains("WARN"), "{}", council_model.message());
     }
 
@@ -628,7 +628,7 @@ mod tests {
     async fn slot_set_takes_a_distill_slot_on_a_council_server() {
         let d = seeded().await;
         let c = test_caller();
-        let set = d.dispatch(&argv(&["character", "slot", "set", "house", "distill", "mk-zorak/gemma", "--max-tokens", "1024"]), &c).await;
+        let set = d.dispatch(&argv(&["character", "slot", "set", "house", "distill", "nagaya/gemma", "--max-tokens", "1024"]), &c).await;
         assert!(set.is_ok(), "{}", set.message());
         let db = d.kernel_db().lock();
         let house = db.get_character_by_name("house").unwrap().unwrap();
@@ -801,7 +801,7 @@ mod tests {
         let c = test_caller();
         let set = d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
         assert!(set.is_ok(), "{}", set.message());
-        let slot = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "mk-zorak/zai-org/GLM-5.3"]), &c).await;
+        let slot = d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "nagaya/zai-org/GLM-5.3"]), &c).await;
         assert!(slot.is_ok(), "{}", slot.message());
         let made = d.dispatch(&argv(&["character", "create", "glm", "--rc", "coder", "--model", "anthropic/zai-org/GLM-5.3", "--max-tokens", "4096"]), &c).await;
         assert!(made.is_ok(), "{}", made.message());
@@ -853,7 +853,7 @@ mod tests {
         assert!(v["model"].is_null(), "{v}");
 
         d.dispatch(&argv(&["character", "model", "set", "house", "anthropic/claude-opus-5"]), &c).await;
-        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "mk-zorak/g"]), &c).await;
+        d.dispatch(&argv(&["character", "slot", "set", "house", "gate", "nagaya/g"]), &c).await;
         let shown = d.dispatch(&argv(&["character", "show", "house"]), &c).await;
         let KjResult::Ok { data: Some(v), message, .. } = &shown else { panic!("{shown:?}") };
         assert_eq!(v["model"]["model"], "claude-opus-5");
@@ -910,7 +910,7 @@ mod tests {
             }
             let mut words = vec!["character", "slot", verb, "house", "judge"];
             if verb == "set" {
-                words.push("mk-zorak/gemma");
+                words.push("nagaya/gemma");
             }
             let r = d.dispatch(&argv(&words), &c).await;
             assert!(
@@ -1067,7 +1067,7 @@ mod tests {
     async fn slot_unset_removes_one_role_and_list_shows_the_rest() {
         let d = seeded().await;
         let c = test_caller();
-        for (role, model) in [("distill", "anthropic/claude-opus-5"), ("gate", "mk-zorak/gemma")] {
+        for (role, model) in [("distill", "anthropic/claude-opus-5"), ("gate", "nagaya/gemma")] {
             let r = d
                 .dispatch(&argv(&["character", "slot", "set", "house", role, model, "--max-tokens", "4096"]), &c)
                 .await;

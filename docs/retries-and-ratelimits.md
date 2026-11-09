@@ -165,9 +165,9 @@ request goes through.
 The limit belongs to the backend, set with `kj backend`:
 
 ```sh
-kj backend set spaceghost --kind council --base-url http://100.65.47.5:8091 --max-concurrent 2
-kj backend set tenchi --kind openai --base-url http://zorak:8090/v1 --key-optional --max-concurrent 4
-kj backend show spaceghost
+kj backend set nagaya --kind council --base-url http://gpu.local:8091 --max-concurrent 2
+kj backend set tenchi --kind openai --base-url http://gpu.local:8091/v1 --key-optional --max-concurrent 4
+kj backend show nagaya
 ```
 
 `kj backend set` declares the whole row, so the other flags are stated
@@ -180,8 +180,8 @@ show` reports its limit as `not applied: the backend is not registered`.
 
 ```text
 Max concurrent: 2
-Endpoint: http://zorak:8090
-  Limit: 2, the smallest of the backends here (mk-zorak 2, tenchi 4)
+Endpoint: http://gpu.local:8091
+  Limit: 2, the smallest of the backends here (nagaya 2, tenchi 4)
   In flight: 1
   Cooldown: none
 ```

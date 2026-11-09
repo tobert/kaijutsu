@@ -696,7 +696,7 @@ pub(crate) async fn ask_within(
     );
     let decide = || async {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        prepared.client.council().decide_traced(request, left, traceparent.as_deref()).await
+        prepared.client.decide_traced(request, left, traceparent.as_deref()).await
     };
     let answer = tokio::time::timeout_at(deadline, crate::llm::endpoint::council_call(&prepared.endpoint, deadline, waits, decide)).await;
     match answer {
@@ -1972,7 +1972,7 @@ pub(crate) mod test_support {
     /// The identity the test server reports.
     pub(crate) fn identity() -> serde_json::Value {
         serde_json::json!({"model": "test-council", "weight_hash": "w1", "tokenizer_hash": "t1",
-                           "template": "mk-letters-1:0123456789abcdef", "engine": "e1"})
+                           "template": "letters-1:0123456789abcdef", "engine": "e1"})
     }
 
     /// An answer to `request` whose reads put `logprobs[i]` (allow, ask,

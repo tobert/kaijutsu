@@ -3,7 +3,7 @@
 //!
 //! An adapter over `kaijutsu_council`; it does no HTTP of its own. Each streamed
 //! turn is a council v2 generation that sends the whole conversation
-//! ([`v2`]), on a served model that lists `generate`. A turn on any other
+//! ([`generation`]), on a served model that lists `generate`. A turn on any other
 //! model is refused before anything is sent. A prompt that leaves no room
 //! for a reply is the server's `context_full`, and a reply that stops at its
 //! output limit is never returned as a whole one. `cache_breakpoints`,
@@ -12,14 +12,13 @@
 
 mod build;
 mod reply;
-mod v2;
+mod generation;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gogi_proto::identity::ServerIdentity;
-use kaijutsu_council::council::{GenerationEvent, GenerationStream};
-use kaijutsu_council::{CouncilClient, CouncilError};
+use kaijutsu_council::{CouncilClient, CouncilError, GenerationEvent, GenerationStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::endpoint::{Endpoint, Slot, SlotWaits};
@@ -39,6 +38,8 @@ struct Turn {
 #[derive(Clone, Debug)]
 pub struct Client {
     name: String,
+    /// The server address, as the request dump names it.
+    base_url: String,
     client: CouncilClient,
     /// Bounds each non-streamed call, and each read of a stream.
     timeout: Duration,
@@ -48,18 +49,18 @@ pub struct Client {
     endpoint: Option<Arc<Endpoint>>,
     /// The server's council v2 identity and when it was read. A turn reads
     /// it when none is cached, when the cached one is older than
-    /// `v2_max_age`, and after a generation refused for its `thinking`.
-    v2: Arc<parking_lot::Mutex<V2Cell>>,
-    v2_max_age: Duration,
+    /// `identity_max_age`, and after a generation refused for its `thinking`.
+    identity: Arc<parking_lot::Mutex<IdentityCell>>,
+    identity_max_age: Duration,
 }
 
 /// One read of the council v2 identity, which concurrent turns share.
-type V2Cell = Arc<tokio::sync::OnceCell<(ServerIdentity, tokio::time::Instant)>>;
+type IdentityCell = Arc<tokio::sync::OnceCell<(ServerIdentity, tokio::time::Instant)>>;
 
 /// How long a council v2 identity serves turns before the next turn reads
 /// it again. A model that gains `thinking` in a redeploy thinks within
 /// this time; a model that loses it is read again after the first 400.
-const V2_IDENTITY_MAX_AGE: Duration = Duration::from_secs(600);
+const IDENTITY_MAX_AGE: Duration = Duration::from_secs(600);
 
 impl Client {
     /// `name` is the backend name, reported as the provider name.
@@ -68,11 +69,12 @@ impl Client {
         let client = CouncilClient::new(base_url, timeout).map_err(|e| to_llm(&name, e))?;
         Ok(Client {
             name,
+            base_url: base_url.to_string(),
             client,
             timeout,
             endpoint: None,
-            v2: Arc::default(),
-            v2_max_age: V2_IDENTITY_MAX_AGE,
+            identity: Arc::default(),
+            identity_max_age: IDENTITY_MAX_AGE,
         })
     }
 
@@ -85,8 +87,8 @@ impl Client {
     /// The same client, reading the council v2 identity again once the
     /// cached one is older than `age`.
     #[cfg(test)]
-    fn with_v2_max_age(mut self, age: Duration) -> Self {
-        self.v2_max_age = age;
+    fn with_identity_max_age(mut self, age: Duration) -> Self {
+        self.identity_max_age = age;
         self
     }
 
@@ -150,8 +152,8 @@ impl Client {
     pub async fn stream(&self, opts: BuildOpts, history: Vec<Message>) -> LlmResult<Stream> {
         build::effort(opts.effort.as_deref())?;
         let turn = self.turn();
-        let served = self.council_v2(&turn, &opts.model).await?;
-        self.stream_v2(opts, history, served, turn).await
+        let served = self.served_model(&turn, &opts.model).await?;
+        self.stream_generation(opts, history, served, turn).await
     }
 }
 
@@ -224,7 +226,7 @@ pub struct Stream {
     /// is a busy one.
     slot: Option<Slot>,
     /// The server identity the reply reports.
-    v2: Option<v2::ReplyIdentity>,
+    reply_identity: Option<generation::ReplyIdentity>,
 }
 
 impl Stream {
@@ -264,9 +266,9 @@ impl Stream {
                             first_token_ms: self.first_token.unwrap_or_default().as_millis() as u64,
                             wall_ms: self.started.elapsed().as_millis() as u64,
                         };
-                        let identity = self.v2.take().expect("a stream names its server");
+                        let identity = self.reply_identity.take().expect("a stream names its server");
                         let reply = self.reply.take().expect("done comes once");
-                        match reply.done_v2(*done, &identity.model, &identity.weight_hash, timing) {
+                        match reply.done(*done, &identity.model, &identity.weight_hash, timing) {
                             Ok(events) => self.pending.extend(events),
                             Err(e) => return Some(StreamEvent::Error(StreamError::new(
                                 StreamErrorKind::Protocol,
@@ -343,7 +345,7 @@ mod tests {
 
     use crate::llm::{ContentBlock, MessageContent, Role};
 
-    fn v2_identity(capabilities: serde_json::Value) -> kaijutsu_council::test_server::Reply {
+    fn serving(capabilities: serde_json::Value) -> kaijutsu_council::test_server::Reply {
         http(
             200,
             json!({"models": [{"model": "gemma-4", "aliases": ["qwen"], "status": "ready", "weight_hash": "w4",
@@ -357,12 +359,12 @@ mod tests {
         )
     }
 
-    fn no_v2() -> kaijutsu_council::test_server::Reply {
+    fn no_council() -> kaijutsu_council::test_server::Reply {
         http(404, "no such route")
     }
 
     fn client(base: &str) -> Client {
-        Client::new("zorak", base, Duration::from_secs(5)).unwrap()
+        Client::new("nagaya", base, Duration::from_secs(5)).unwrap()
     }
 
     fn snap_id(n: u64) -> String {
@@ -399,6 +401,29 @@ mod tests {
         seen.lock().unwrap().iter().filter(|c| c.path.starts_with(path_prefix)).map(|c| serde_json::from_str(&c.body).unwrap()).collect()
     }
 
+    /// With a dump directory on the turn's trace, a turn writes the
+    /// generation it put on the wire: the file's `body` equals what the
+    /// server received, and the header names the backend and the endpoint.
+    ///
+    /// Falsified by a turn that logs a summary and dumps no body.
+    #[tokio::test]
+    async fn a_turn_dumps_the_generation_the_server_received() {
+        use crate::llm::request_dump::{RequestTrace, wait_for_files};
+        use kaijutsu_types::{ContextId, TurnId};
+        let (base, seen) = serve(vec![serving(json!(["generate"])), generation("hi", json!([]), 2)]).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut o = opts(64);
+        o.trace = Some(Arc::new(RequestTrace::new(ContextId::new(), TurnId::new(), 3, Some(tmp.path().to_path_buf()))));
+        drain(&mut client(&base).stream(o, vec![Message::user("u1")]).await.unwrap()).await;
+        let files = wait_for_files(tmp.path(), 1).await;
+        assert_eq!(files.len(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(v["body"], bodies(&seen, "/council/v2/generations")[0]);
+        assert_eq!(v["header"]["provider"], "nagaya");
+        assert_eq!(v["header"]["step"], 3);
+        assert!(v["header"]["endpoint_host"].as_str().is_some_and(|h| h.contains("127.0.0.1")), "{}", v["header"]);
+    }
+
     /// A served model without `generate` cannot take a turn: the turn is
     /// refused, naming the backend, the model, and what the server serves,
     /// and no generation is sent.
@@ -407,11 +432,11 @@ mod tests {
     /// generation the model cannot run.
     #[tokio::test]
     async fn a_served_model_without_generate_is_refused() {
-        let (base, seen) = serve(vec![v2_identity(json!(["reads", "pins"]))]).await;
+        let (base, seen) = serve(vec![serving(json!(["reads", "pins"]))]).await;
         let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(
             matches!(&err, LlmError::InvalidRequest(m)
-                if m.contains("council backend 'zorak'") && m.contains("gemma-4") && m.contains("generate")),
+                if m.contains("council backend 'nagaya'") && m.contains("gemma-4") && m.contains("generate")),
             "{err:?}"
         );
         let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
@@ -424,11 +449,11 @@ mod tests {
     /// Falsified by a turn that tries another route.
     #[tokio::test]
     async fn a_server_without_council_v2_is_refused() {
-        let (base, seen) = serve(vec![no_v2()]).await;
+        let (base, seen) = serve(vec![no_council()]).await;
         let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(
             matches!(&err, LlmError::InvalidRequest(m)
-                if m.contains("council backend 'zorak'") && m.contains("404") && m.contains("no council v2 identity")),
+                if m.contains("council backend 'nagaya'") && m.contains("404") && m.contains("no council v2 identity")),
             "{err:?}"
         );
         assert_eq!(seen.lock().unwrap().len(), 1, "only the identity");
@@ -446,9 +471,9 @@ mod tests {
     /// sends only the new messages, mints its own call ids, or snaps an
     /// assistant message.
     #[tokio::test]
-    async fn a_v2_turn_sends_the_whole_conversation_and_no_put() {
+    async fn a_turn_sends_the_whole_conversation_and_no_put() {
         let (base, seen) = serve(vec![
-            v2_identity(json!(["generate", "pins"])),
+            serving(json!(["generate", "pins"])),
             generation("", json!([{"id": "c0", "name": "ls", "input": {"path": "/tmp"}}]), 0),
             generation("Two files.", json!([]), 3),
         ])
@@ -500,7 +525,7 @@ mod tests {
     /// Falsified by a provider that sends history the kernel no longer has.
     #[tokio::test]
     async fn a_shorter_conversation_is_sent_as_it_stands() {
-        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), generation("r2", json!([]), 4), generation("r3", json!([]), 5)]).await;
+        let (base, seen) = serve(vec![serving(json!(["generate"])), generation("r2", json!([]), 4), generation("r3", json!([]), 5)]).await;
         let c = client(&base);
         drain(&mut c.stream(opts(64), vec![Message::user("u1"), said("r1"), Message::user("u2")]).await.unwrap()).await;
         drain(&mut c.stream(opts(64), vec![Message::user("u1"), said("r1"), Message::user("u3")]).await.unwrap()).await;
@@ -519,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn a_context_full_generation_is_a_full_context() {
         let full = http(413, json!({"error": {"type": "context_full", "message": "the prompt takes 32768 of 32768 tokens"}}).to_string());
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), full]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), full]).await;
         let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::ContextFull(m) if m.contains("32768") && m.contains("fork")), "{err:?}");
         assert_eq!(err.category_and_code(), (kaijutsu_types::ErrorCategory::Context, Some("full")));
@@ -533,7 +558,7 @@ mod tests {
     /// model the server lacks.
     #[tokio::test]
     async fn a_turn_names_its_served_model_and_one_the_server_lacks_is_refused() {
-        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), generation("hi", json!([]), 2)]).await;
+        let (base, seen) = serve(vec![serving(json!(["generate"])), generation("hi", json!([]), 2)]).await;
         let c = client(&base);
         drain(&mut c.stream(opts(64), vec![Message::user("u1")]).await.unwrap()).await;
         assert_eq!(bodies(&seen, "/council/v2/generations")[0]["model"], "gemma-4", "the alias qwen routes to gemma-4");
@@ -544,7 +569,7 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 2, "the identity and one generation");
     }
 
-    /// A v2 turn sends `thinking: true` only to a model that declares
+    /// A turn sends `thinking: true` only to a model that declares
     /// `thinking` and when the turn wants thinking: with no effort, or an
     /// effort other than `none`. A model without `thinking` gets `false`
     /// when the turn names no effort. A turn that asks such a model for an
@@ -554,11 +579,11 @@ mod tests {
     /// sends `false` to one with it when no effort is named, or drops an
     /// asked effort without a word.
     #[tokio::test]
-    async fn a_v2_turn_thinks_only_on_a_model_that_declares_thinking() {
+    async fn a_turn_thinks_only_on_a_model_that_declares_thinking() {
         let sent = |capabilities: serde_json::Value, effort: Option<&str>| {
             let effort = effort.map(str::to_string);
             async move {
-                let (base, seen) = serve(vec![v2_identity(capabilities), generation("hi", json!([]), 2)]).await;
+                let (base, seen) = serve(vec![serving(capabilities), generation("hi", json!([]), 2)]).await;
                 let mut o = opts(64);
                 o.effort = effort;
                 let opened = match client(&base).stream(o, vec![Message::user("u1")]).await {
@@ -588,7 +613,7 @@ mod tests {
         assert_eq!(thinking, None, "nothing is sent");
     }
 
-    /// The `thinking` sent by each v2 generation, in order.
+    /// The `thinking` sent by each generation, in order.
     fn sent_thinking(seen: &std::sync::Mutex<Vec<kaijutsu_council::test_server::Captured>>) -> Vec<serde_json::Value> {
         bodies(seen, "/council/v2/generations").iter().map(|g| g["context"]["thinking"].clone()).collect()
     }
@@ -608,10 +633,10 @@ mod tests {
             .to_string(),
         );
         let (base, seen) = serve(vec![
-            v2_identity(json!(["generate", "thinking"])),
+            serving(json!(["generate", "thinking"])),
             generation("a", json!([]), 2),
             refused,
-            v2_identity(json!(["generate"])),
+            serving(json!(["generate"])),
             generation("b", json!([]), 3),
         ])
         .await;
@@ -639,13 +664,13 @@ mod tests {
     #[tokio::test]
     async fn an_old_identity_is_read_again_and_a_gained_thinking_is_used() {
         let (base, seen) = serve(vec![
-            v2_identity(json!(["generate"])),
+            serving(json!(["generate"])),
             generation("a", json!([]), 2),
-            v2_identity(json!(["generate", "thinking"])),
+            serving(json!(["generate", "thinking"])),
             generation("b", json!([]), 3),
         ])
         .await;
-        let c = client(&base).with_v2_max_age(Duration::ZERO);
+        let c = client(&base).with_identity_max_age(Duration::ZERO);
         let mut o = opts(64);
         o.effort = None;
         drain(&mut c.stream(o.clone(), vec![Message::user("u1")]).await.unwrap()).await;
@@ -658,7 +683,7 @@ mod tests {
     /// reply to and is refused before any generation.
     #[tokio::test]
     async fn a_conversation_that_ends_with_the_assistant_is_refused() {
-        let (base, seen) = serve(vec![v2_identity(json!(["generate"]))]).await;
+        let (base, seen) = serve(vec![serving(json!(["generate"]))]).await;
         let err = client(&base).stream(opts(64), vec![Message::user("u1"), said("r1")]).await.err().unwrap();
         assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("assistant")), "{err:?}");
         assert_eq!(seen.lock().unwrap().len(), 1, "only the identity");
@@ -692,7 +717,7 @@ mod tests {
     async fn a_stream_cut_before_done_is_an_error_event() {
         let events = generation_events("Hello.", json!([]), 2);
         let cut = &events[..events.find("event: done").unwrap()];
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), sse(cut)]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), sse(cut)]).await;
         let mut stream = client(&base).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let events = drain(&mut stream).await;
         assert!(matches!(events.last(), Some(StreamEvent::Error(e))
@@ -704,7 +729,7 @@ mod tests {
     async fn cancel_yields_the_cancel_confirm_done() {
         let mut slow = generation("Hello.", json!([]), 2);
         slow.stall = Some(Duration::from_secs(3));
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), slow]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), slow]).await;
         let mut stream = client(&base).stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         stream.cancel();
         let events = drain(&mut stream).await;
@@ -717,9 +742,9 @@ mod tests {
     #[tokio::test]
     async fn service_errors_map_to_kernel_errors() {
         let bad = r#"{"error":{"type":"invalid_request","message":"noncharacter","param":"context.messages[1].content"}}"#;
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), http(400, bad)]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), http(400, bad)]).await;
         let err = client(&base).stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
-        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("council backend 'zorak'") && m.contains("noncharacter")), "{err:?}");
+        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("council backend 'nagaya'") && m.contains("noncharacter")), "{err:?}");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closed = format!("http://{}", listener.local_addr().unwrap());
@@ -759,7 +784,7 @@ mod tests {
             },
             Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "a".into(), content: String::new(), is_error: false }]),
         ];
-        let messages = build::messages_v2(None, &history).unwrap();
+        let messages = build::messages(None, &history).unwrap();
         let sent = serde_json::to_string(&messages[1].tool_calls[0].input).unwrap();
         assert_eq!(sent, r#"{"path":"/tmp","all":true}"#);
     }
@@ -767,7 +792,7 @@ mod tests {
     /// A client whose calls take slots at a fresh endpoint for `base`.
     fn limited(base: &str, timeout: Duration) -> (Client, Arc<Endpoint>) {
         let endpoint = crate::llm::endpoint::Endpoints::default().for_url(base).unwrap();
-        let c = Client::new("zorak", base, timeout).unwrap().with_endpoint(endpoint.clone());
+        let c = Client::new("nagaya", base, timeout).unwrap().with_endpoint(endpoint.clone());
         (c, endpoint)
     }
 
@@ -783,7 +808,7 @@ mod tests {
     /// after its last event.
     #[tokio::test]
     async fn a_turn_holds_its_slot_until_its_stream_ends() {
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), generation("Hello.", json!([]), 2)]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), generation("Hello.", json!([]), 2)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         assert_eq!(endpoint.status().in_flight, 1);
@@ -799,7 +824,7 @@ mod tests {
     /// cooldown.
     #[tokio::test]
     async fn a_busy_answer_is_sent_again_after_its_retry_after() {
-        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), busy(), generation("Hello.", json!([]), 2)]).await;
+        let (base, seen) = serve(vec![serving(json!(["generate"])), busy(), generation("Hello.", json!([]), 2)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let started = std::time::Instant::now();
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
@@ -814,7 +839,7 @@ mod tests {
     /// A 503 cools the endpoint and fails the turn; it is not sent again.
     #[tokio::test]
     async fn a_503_cools_the_endpoint_and_is_not_sent_again() {
-        let (base, seen) = serve(vec![v2_identity(json!(["generate"])), http(503, "{}")]).await;
+        let (base, seen) = serve(vec![serving(json!(["generate"])), http(503, "{}")]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
@@ -834,7 +859,7 @@ mod tests {
         let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
         match err {
             LlmError::RateLimited(why) => {
-                assert!(why.starts_with("council backend 'zorak': no slot at http://127.0.0.1:"), "{why}");
+                assert!(why.starts_with("council backend 'nagaya': no slot at http://127.0.0.1:"), "{why}");
                 assert!(why.contains("cooling down"), "{why}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
@@ -851,7 +876,7 @@ mod tests {
     async fn a_resent_call_gets_only_the_time_left_before_the_deadline() {
         let mut slow = generation("Hello.", json!([]), 2);
         slow.delay = Duration::from_secs(4);
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), busy(), slow]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), busy(), slow]).await;
         let (c, _) = limited(&base, Duration::from_secs(2));
         let started = std::time::Instant::now();
         let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
@@ -867,7 +892,7 @@ mod tests {
         let events = generation_events("Hello.", json!([]), 2);
         let cut = &events[..events.find("event: done").unwrap()];
         let failed = format!("{cut}event: error\ndata: {}\n\n", r#"{"error":{"type":"unavailable","message":"spin"}}"#);
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), sse(failed)]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), sse(failed)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let events = drain(&mut stream).await;
@@ -882,7 +907,7 @@ mod tests {
     /// Falsified by a stream whose end leaves a busy answer counted.
     #[tokio::test]
     async fn a_stream_that_ends_whole_resets_the_doubling() {
-        let (base, _) = serve(vec![v2_identity(json!(["generate"])), generation("Hello.", json!([]), 2)]).await;
+        let (base, _) = serve(vec![serving(json!(["generate"])), generation("Hello.", json!([]), 2)]).await;
         let (c, endpoint) = limited(&base, Duration::from_secs(5));
         let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
         let far = tokio::time::Instant::now() + Duration::from_secs(5);

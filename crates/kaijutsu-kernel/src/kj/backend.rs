@@ -1179,8 +1179,8 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         for args in [
-            &["backend", "set", "mk-zorak", "--kind", "council", "--base-url", "http://zorak:8090", "--max-concurrent", "4"][..],
-            &["backend", "set", "tenchi", "--kind", "openai", "--base-url", "http://zorak:8090/v1", "--key-optional",
+            &["backend", "set", "nagaya", "--kind", "council", "--base-url", "http://nagaya:8091", "--max-concurrent", "4"][..],
+            &["backend", "set", "tenchi", "--kind", "openai", "--base-url", "http://nagaya:8091/v1", "--key-optional",
               "--max-concurrent", "2"][..],
         ] {
             let r = d.dispatch(&argv(args), &c).await;
@@ -1188,18 +1188,18 @@ mod tests {
         }
         {
             let llm = d.kernel().llm().read().await;
-            let (a, b) = (llm.get("mk-zorak").unwrap(), llm.get("tenchi").unwrap());
+            let (a, b) = (llm.get("nagaya").unwrap(), llm.get("tenchi").unwrap());
             assert!(std::sync::Arc::ptr_eq(a.endpoint().unwrap(), b.endpoint().unwrap()), "one limiter per origin");
         }
-        match d.dispatch(&argv(&["backend", "show", "mk-zorak"]), &c).await {
+        match d.dispatch(&argv(&["backend", "show", "nagaya"]), &c).await {
             KjResult::Ok { message: text, data: Some(data), .. } => {
                 assert!(text.contains("Max concurrent: 4\n"), "{text}");
-                assert!(text.contains("Endpoint: http://zorak:8090\n"), "{text}");
-                assert!(text.contains("  Limit: 2, the smallest of the backends here (mk-zorak 4, tenchi 2)\n"), "{text}");
+                assert!(text.contains("Endpoint: http://nagaya:8091\n"), "{text}");
+                assert!(text.contains("  Limit: 2, the smallest of the backends here (nagaya 4, tenchi 2)\n"), "{text}");
                 assert!(text.contains("  In flight: 0\n"), "{text}");
                 assert!(text.contains("  Cooldown: none"), "{text}");
                 assert_eq!(data["max_concurrent"], 4);
-                assert_eq!(data["endpoint"]["key"], "http://zorak:8090");
+                assert_eq!(data["endpoint"]["key"], "http://nagaya:8091");
                 assert_eq!(data["endpoint"]["limit"], 2);
                 assert_eq!(data["endpoint"]["in_flight"], 0);
             }
@@ -1212,7 +1212,7 @@ mod tests {
         let d = seeded().await;
         let c = test_caller();
         let r = d
-            .dispatch(&argv(&["backend", "set", "mk", "--kind", "council", "--base-url", "http://zorak:8090", "--max-concurrent", "0"]), &c)
+            .dispatch(&argv(&["backend", "set", "nagaya", "--kind", "council", "--base-url", "http://nagaya:8091", "--max-concurrent", "0"]), &c)
             .await;
         match r {
             KjResult::Err(msg) => assert!(msg.contains("--max-concurrent must be at least 1"), "{msg}"),
@@ -1226,7 +1226,7 @@ mod tests {
     async fn show_says_a_limit_is_not_applied_when_its_backend_did_not_build() {
         let d = seeded().await;
         let c = test_caller();
-        let args = ["backend", "set", "broken", "--kind", "anthropic", "--base-url", "http://zorak:8090",
+        let args = ["backend", "set", "broken", "--kind", "anthropic", "--base-url", "http://nagaya:8091",
             "--api-key-env", "KJ_TEST_NO_SUCH_KEY", "--max-concurrent", "1"];
         let r = d.dispatch(&argv(&args), &c).await;
         assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");

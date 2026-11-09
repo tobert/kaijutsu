@@ -39,7 +39,7 @@ Volume=%h/src/%i:%h/src/%i:rw
 Volume=/dev/null:%h/src/old/automaton/github/id_rsa:ro
 Volume=/dev/null:%h/src/wringer/certs/key.pem:ro
 
-# Model weights, read-only, at their host path. mk's GPU tests read its shards from MK_SHARDS.
+# Model weights, read-only, at their host path, for projects whose tests load them.
 Volume=/tank/ml/models:/tank/ml/models:ro
 
 # Provider keys and kaibo's config, read-only, at the paths their configs name.

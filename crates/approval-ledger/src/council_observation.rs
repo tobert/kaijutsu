@@ -287,10 +287,10 @@ mod tests {
 
     fn server() -> CouncilServer {
         CouncilServer {
-            model: "mk".into(),
+            model: "gemma".into(),
             weight_hash: "w1".into(),
             tokenizer_hash: "t1".into(),
-            template: "mk-letters-1:x".into(),
+            template: "letters-1:x".into(),
             engine: "e1".into(),
         }
     }

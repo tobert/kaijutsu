@@ -20,19 +20,6 @@ use reqwest::Method;
 use crate::client::{excerpt, to_body, CouncilClient, CouncilError};
 use crate::sse::{EventStream, Frame, StreamItem};
 
-/// The council v2 calls of one [`CouncilClient`].
-#[derive(Clone, Copy, Debug)]
-pub struct Council<'a> {
-    client: &'a CouncilClient,
-}
-
-impl CouncilClient {
-    /// This client's council v2 calls.
-    pub fn council(&self) -> Council<'_> {
-        Council { client: self }
-    }
-}
-
 /// One event of a streamed generation. A `ping`, the `output`, `progress`
 /// and `preview` events of a reply this client never asks to write objects
 /// or preview, and an event the contract does not name, are skipped; an
@@ -68,11 +55,11 @@ impl StreamItem for GenerationEvent {
     }
 }
 
-impl Council<'_> {
+impl CouncilClient {
     /// `GET /council/v2/identity`.
     pub async fn identity(&self) -> Result<ServerIdentity, CouncilError> {
-        self.client
-            .json(Method::GET, "/council/v2/identity", None, &[], self.client.timeout, 200, "identity")
+        self
+            .json(Method::GET, "/council/v2/identity", None, &[], self.timeout, 200, "identity")
             .await
     }
 
@@ -83,8 +70,8 @@ impl Council<'_> {
     pub async fn build_context(&self, model: &str, context: &Context, dry_run: bool) -> Result<ContextBuilt, CouncilError> {
         context.check()?;
         let body = ContextBuild { model: model.to_string(), context: context.clone(), dry_run: dry_run.then_some(true), class: None, priority: None };
-        self.client
-            .json(Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.client.timeout, 200, "context build")
+        self
+            .json(Method::POST, "/council/v2/contexts", Some(to_body(&body)?), &[], self.timeout, 200, "context build")
             .await
     }
 
@@ -92,7 +79,7 @@ impl Council<'_> {
     /// is a 404.
     pub async fn snapshot(&self, id: &SnapshotId) -> Result<SnapshotDetail, CouncilError> {
         let path = format!("/council/v2/snapshots/{id}");
-        self.client.json(Method::GET, &path, None, &[], self.client.timeout, 200, "snapshot").await
+        self.json(Method::GET, &path, None, &[], self.timeout, 200, "snapshot").await
     }
 
     /// `PUT /council/v2/pins/{owner}`: replaces `owner`'s whole set with
@@ -100,19 +87,19 @@ impl Council<'_> {
     pub async fn put_pins(&self, owner: &str, body: &PinsPut) -> Result<PinsPutResult, CouncilError> {
         let path = pins_path(owner)?;
         body.validate()?;
-        self.client.json(Method::PUT, &path, Some(to_body(body)?), &[], self.client.timeout, 200, "pins").await
+        self.json(Method::PUT, &path, Some(to_body(body)?), &[], self.timeout, 200, "pins").await
     }
 
     /// `GET /council/v2/pins/{owner}`. An owner with no pins is a 404.
     pub async fn get_pins(&self, owner: &str) -> Result<PinSet, CouncilError> {
         let path = pins_path(owner)?;
-        self.client.json(Method::GET, &path, None, &[], self.client.timeout, 200, "pin set").await
+        self.json(Method::GET, &path, None, &[], self.timeout, 200, "pin set").await
     }
 
     /// `DELETE /council/v2/pins/{owner}`. An owner with no pins is a 404.
     pub async fn delete_pins(&self, owner: &str) -> Result<(), CouncilError> {
         let path = pins_path(owner)?;
-        self.client.call(Method::DELETE, &path, None, &[], self.client.timeout, 204).await.map(|_| ())
+        self.call(Method::DELETE, &path, None, &[], self.timeout, 204).await.map(|_| ())
     }
 
     /// `POST /council/v2/specs` with the spec's JSON. Fails with
@@ -120,8 +107,7 @@ impl Council<'_> {
     /// canonical id.
     pub async fn post_spec(&self, spec: &Spec) -> Result<HeldSpec, CouncilError> {
         let held: HeldSpec = self
-            .client
-            .json(Method::POST, "/council/v2/specs", Some(to_body(&spec.value)?), &[], self.client.timeout, 200, "held spec")
+            .json(Method::POST, "/council/v2/specs", Some(to_body(&spec.value)?), &[], self.timeout, 200, "held spec")
             .await?;
         let computed = spec.id();
         if held.spec_id.as_str() != computed {
@@ -133,7 +119,7 @@ impl Council<'_> {
     /// `GET /council/v2/specs/{spec_id}`.
     pub async fn get_spec(&self, id: &SpecId) -> Result<HeldSpec, CouncilError> {
         let path = format!("/council/v2/specs/{id}");
-        self.client.json(Method::GET, &path, None, &[], self.client.timeout, 200, "held spec").await
+        self.json(Method::GET, &path, None, &[], self.timeout, 200, "held spec").await
     }
 
     /// `POST /council/v2/decisions`, sending `traceparent` for this call
@@ -149,7 +135,7 @@ impl Council<'_> {
         if let Some(tp) = traceparent {
             headers.push(("traceparent", tp.to_string()));
         }
-        self.client
+        self
             .json(Method::POST, "/council/v2/decisions", Some(to_body(request)?), &headers, timeout, 200, "decision")
             .await
     }
@@ -157,7 +143,7 @@ impl Council<'_> {
     /// `POST /council/v2/reads`.
     pub async fn reads(&self, request: &ReadsRequest, timeout: Duration) -> Result<ReadsResponse, CouncilError> {
         request.validate()?;
-        self.client
+        self
             .json(Method::POST, "/council/v2/reads", Some(to_body(request)?), &[], timeout, 200, "reads")
             .await
     }
@@ -168,7 +154,7 @@ impl Council<'_> {
     /// [`CouncilError::Status`] with the parameter it names. `timeout` bounds the
     /// whole call.
     pub async fn embeddings(&self, request: &EmbeddingsRequest, timeout: Duration) -> Result<EmbeddingsResponse, CouncilError> {
-        self.client
+        self
             .json(Method::POST, "/council/v2/embeddings", Some(to_body(request)?), &[], timeout, 200, "embeddings")
             .await
     }
@@ -179,7 +165,7 @@ impl Council<'_> {
     pub async fn generate(&self, request: &GenerationRequest, timeout: Duration) -> Result<GenerationDone, CouncilError> {
         let request = GenerationRequest { stream: Some(false), ..request.clone() };
         request.validate()?;
-        self.client
+        self
             .json(Method::POST, "/council/v2/generations", Some(to_body(&request)?), &[], timeout, 200, "done")
             .await
     }
@@ -192,7 +178,7 @@ impl Council<'_> {
     pub async fn generate_stream(&self, request: &GenerationRequest, idle: Duration) -> Result<GenerationStream, CouncilError> {
         let request = GenerationRequest { stream: Some(true), ..request.clone() };
         request.validate()?;
-        self.client.open_stream("/council/v2/generations", to_body(&request)?, idle).await
+        self.open_stream("/council/v2/generations", to_body(&request)?, idle).await
     }
 }
 
@@ -263,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn the_fake_reports_its_identity() {
         let (_server, c) = fake();
-        let id = c.council().identity().await.unwrap();
+        let id = c.identity().await.unwrap();
         assert!(id.has(gogi_proto::identity::Capability::Pins));
         let toy = id.route("toy").unwrap();
         assert_eq!(toy.model, TOY);
@@ -275,14 +261,14 @@ mod tests {
     #[tokio::test]
     async fn a_second_build_feeds_nothing() {
         let (_server, c) = fake();
-        let first = c.council().build_context(TOY, &chat(), false).await.unwrap();
+        let first = c.build_context(TOY, &chat(), false).await.unwrap();
         assert!(first.usage.fed > 0 && first.from.is_none() && !first.dry_run);
         first.usage.check().unwrap();
-        let again = c.council().build_context(TOY, &chat(), false).await.unwrap();
+        let again = c.build_context(TOY, &chat(), false).await.unwrap();
         assert_eq!((again.usage.fed, &again.head), (0, &first.head));
         let mut longer = chat();
         longer.messages.push(Message::assistant("fine").snapped());
-        let dry = c.council().build_context(TOY, &longer, true).await.unwrap();
+        let dry = c.build_context(TOY, &longer, true).await.unwrap();
         assert!(dry.dry_run && dry.usage.kept == first.usage.prompt && dry.usage.fed > 0, "{dry:?}");
     }
 
@@ -292,20 +278,20 @@ mod tests {
     async fn a_model_that_is_not_ready_is_a_503_naming_it() {
         let (server, c) = fake();
         server.set_status(TOY, gogi_fake::ModelStatus::Loading).unwrap();
-        let err = c.council().build_context(TOY, &chat(), false).await.unwrap_err();
+        let err = c.build_context(TOY, &chat(), false).await.unwrap_err();
         let CouncilError::Status { status: 503, error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!((e.r#type, e.model.as_deref(), e.status), (ErrorType::ModelUnavailable, Some(TOY), Some(gogi_fake::ModelStatus::Loading)));
         server.set_status(TOY, gogi_fake::ModelStatus::Ready).unwrap();
-        c.council().build_context(TOY, &chat(), false).await.unwrap();
+        c.build_context(TOY, &chat(), false).await.unwrap();
     }
 
     #[tokio::test]
     async fn a_spec_posts_under_its_canonical_id_and_reads_back() {
         let (_server, c) = fake();
         let spec = gate_spec();
-        let held = c.council().post_spec(&spec).await.unwrap();
+        let held = c.post_spec(&spec).await.unwrap();
         assert_eq!(held.spec_id.as_str(), spec.id());
-        let again = c.council().get_spec(&held.spec_id).await.unwrap();
+        let again = c.get_spec(&held.spec_id).await.unwrap();
         assert_eq!(again.spec, spec.value);
     }
 
@@ -314,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn a_decision_reads_each_context_and_its_numbers_verify() {
         let (_server, c) = fake();
-        let held = c.council().post_spec(&gate_spec()).await.unwrap();
+        let held = c.post_spec(&gate_spec()).await.unwrap();
         let mut other = chat();
         other.messages.push(Message::assistant("never push to main").snapped());
         let request = DecisionRequest {
@@ -324,7 +310,7 @@ mod tests {
             contexts: vec![chat(), other],
             ..DecisionRequest::default()
         };
-        let response = c.council().decide_traced(&request, Duration::from_secs(5), Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")).await.unwrap();
+        let response = c.decide_traced(&request, Duration::from_secs(5), Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")).await.unwrap();
         gogi_proto::math::verify(&response, &request.expect()).unwrap();
         assert_eq!(response.reads.iter().map(|r| r.context.clone()).collect::<Vec<_>>(), [Some(0), Some(1)]);
         assert_eq!(response.identity.spec_id.as_ref(), Some(&held.spec_id));
@@ -335,15 +321,15 @@ mod tests {
     #[tokio::test]
     async fn pins_hold_list_and_drop() {
         let (_server, c) = fake();
-        let head = c.council().build_context(TOY, &chat(), false).await.unwrap().head;
-        let put = c.council().put_pins("kernel 1", &PinsPut { snapshots: vec![head.to_string()], ttl_s: 60 }).await.unwrap();
+        let head = c.build_context(TOY, &chat(), false).await.unwrap().head;
+        let put = c.put_pins("kernel 1", &PinsPut { snapshots: vec![head.to_string()], ttl_s: 60 }).await.unwrap();
         assert!(put.snapshots[0].held && put.expires_in_s.is_some());
-        assert_eq!(c.council().get_pins("kernel 1").await.unwrap().snapshots, [head.to_string()]);
-        let detail = c.council().snapshot(&head).await.unwrap();
+        assert_eq!(c.get_pins("kernel 1").await.unwrap().snapshots, [head.to_string()]);
+        let detail = c.snapshot(&head).await.unwrap();
         assert_eq!(detail.pins.iter().map(|p| p.owner.as_str()).collect::<Vec<_>>(), ["kernel 1"]);
         assert_ne!(detail.tier, Tier::Unknown);
-        c.council().delete_pins("kernel 1").await.unwrap();
-        assert_eq!(c.council().get_pins("kernel 1").await.unwrap_err().status(), Some(404));
+        c.delete_pins("kernel 1").await.unwrap();
+        assert_eq!(c.get_pins("kernel 1").await.unwrap_err().status(), Some(404));
     }
 
     #[tokio::test]
@@ -358,7 +344,7 @@ mod tests {
             class: None,
             priority: None,
         };
-        let r = c.council().reads(&request, Duration::from_secs(5)).await.unwrap();
+        let r = c.reads(&request, Duration::from_secs(5)).await.unwrap();
         assert_eq!(r.reads.iter().map(|r| (r.context, r.suffix)).collect::<Vec<_>>(), [(0, 0), (0, 1)]);
         assert_eq!(r.reads[0].logprobs.keys().collect::<Vec<_>>(), ["A", "B"]);
     }
@@ -395,11 +381,11 @@ mod tests {
     #[tokio::test]
     async fn embeddings_return_one_unit_vector_per_input_with_the_identity() {
         let (_server, c) = fake_embedder(None);
-        let identity = c.council().identity().await.unwrap();
+        let identity = c.identity().await.unwrap();
         let served = identity.route(EMBED).unwrap();
         let offered = served.embeddings.as_ref().expect("an embedding model lists what it embeds");
         let task = offered.tasks[0].clone();
-        let r = c.council().embeddings(&embed_request(&task, &["alpha", "beta beta"]), Duration::from_secs(5)).await.unwrap();
+        let r = c.embeddings(&embed_request(&task, &["alpha", "beta beta"]), Duration::from_secs(5)).await.unwrap();
         assert_eq!((r.model.as_str(), r.task.as_str()), (EMBED, task.as_str()));
         assert_eq!(r.dimensions, *offered.dimensions.iter().max().unwrap());
         assert_eq!(r.embeddings.iter().map(|e| e.index).collect::<Vec<_>>(), [0, 1]);
@@ -415,10 +401,10 @@ mod tests {
     #[tokio::test]
     async fn an_embeddings_dry_run_counts_tokens_and_returns_no_vectors() {
         let (_server, c) = fake_embedder(None);
-        let identity = c.council().identity().await.unwrap();
+        let identity = c.identity().await.unwrap();
         let task = identity.route(EMBED).unwrap().embeddings.as_ref().unwrap().tasks[0].clone();
         let request = EmbeddingsRequest { dry_run: true, ..embed_request(&task, &["alpha"]) };
-        let r = c.council().embeddings(&request, Duration::from_secs(5)).await.unwrap();
+        let r = c.embeddings(&request, Duration::from_secs(5)).await.unwrap();
         assert!(r.embeddings[0].vector.is_none() && r.embeddings[0].tokens > 0, "{r:?}");
     }
 
@@ -428,14 +414,14 @@ mod tests {
     #[tokio::test]
     async fn the_servers_refusals_name_their_parameter() {
         let (_server, c) = fake_embedder(Some(64));
-        let err = c.council().embeddings(&embed_request("no-such-task", &["alpha"]), Duration::from_secs(5)).await.unwrap_err();
+        let err = c.embeddings(&embed_request("no-such-task", &["alpha"]), Duration::from_secs(5)).await.unwrap_err();
         let CouncilError::Status { status: 400, error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!(e.param.as_deref(), Some("task"));
 
-        let identity = c.council().identity().await.unwrap();
+        let identity = c.identity().await.unwrap();
         let task = identity.route(EMBED).unwrap().embeddings.as_ref().unwrap().tasks[0].clone();
         let long = "x".repeat(10_000);
-        let err = c.council().embeddings(&embed_request(&task, &[&long]), Duration::from_secs(5)).await.unwrap_err();
+        let err = c.embeddings(&embed_request(&task, &[&long]), Duration::from_secs(5)).await.unwrap_err();
         let CouncilError::Status { status: 413, error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!((e.r#type, e.param.as_deref()), (ErrorType::TooLarge, Some("context_tokens")));
     }
@@ -448,8 +434,8 @@ mod tests {
     async fn a_streamed_reply_matches_the_plain_one_and_extends_the_context() {
         let (_server, c) = fake();
         let chat = || Context { thinking: false, ..chat() };
-        let plain = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
-        let mut s = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
+        let plain = c.generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
+        let mut s = c.generate_stream(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
         let mut tokens = 0;
         let done = loop {
             match s.next().await.unwrap().unwrap() {
@@ -463,7 +449,7 @@ mod tests {
         let mut next = chat();
         next.messages.push(done.as_message().expect("the reply made no unparsed call"));
         next.messages.push(Message::user("and then?"));
-        let built = c.council().build_context(TOY, &next, false).await.unwrap();
+        let built = c.build_context(TOY, &next, false).await.unwrap();
         assert!(built.usage.kept > done.usage.prompt, "{built:?} after {:?}", done.usage);
     }
 
@@ -474,13 +460,13 @@ mod tests {
         let (_server, c) = fake();
         let tool = gogi_proto::Tool::new("ls", json!({"type": "object", "properties": {}}));
         let context = Context { tools: vec![tool], ..Context::new(true, vec![Message::user("CALL ls")]) };
-        let done = c.council().generate(&greedy(context.clone()), Duration::from_secs(5)).await.unwrap();
+        let done = c.generate(&greedy(context.clone()), Duration::from_secs(5)).await.unwrap();
         let [ReplyToolCall::Parsed { id, name, .. }] = done.tool_calls.as_slice() else { panic!("{:?}", done.tool_calls) };
         assert_eq!(name, "ls");
         let mut next = context;
         next.messages.push(done.as_message().unwrap());
         next.messages.push(Message::tool(id.clone(), "a b c"));
-        c.council().build_context(TOY, &next, false).await.unwrap();
+        c.build_context(TOY, &next, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -488,15 +474,15 @@ mod tests {
         let (base, seen) = serve(vec![]).await;
         let c = client(&base);
         let user_reasoning = Context::new(true, vec![Message { reasoning: Some("r".into()), ..Message::user("u") }]);
-        assert!(matches!(c.council().build_context(TOY, &user_reasoning, false).await, Err(CouncilError::Request(_))));
-        assert!(matches!(c.council().build_context(TOY, &Context::new(true, vec![]), false).await, Err(CouncilError::Request(_))));
-        assert!(matches!(c.council().get_pins("a/b").await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.build_context(TOY, &user_reasoning, false).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.build_context(TOY, &Context::new(true, vec![]), false).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.get_pins("a/b").await, Err(CouncilError::Request(_))));
         let forever = PinsPut { snapshots: vec![], ttl_s: 86_401 };
-        assert!(matches!(c.council().put_pins("k", &forever).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.put_pins("k", &forever).await, Err(CouncilError::Request(_))));
         let empty = GenerationRequest { max_tokens: 0, ..greedy(chat()) };
-        assert!(matches!(c.council().generate(&empty, Duration::from_secs(1)).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.generate(&empty, Duration::from_secs(1)).await, Err(CouncilError::Request(_))));
         let number = DecisionRequest { model: TOY.into(), case: json!(3), spec_id: gate_spec().id(), ..DecisionRequest::default() };
-        assert!(matches!(c.council().decide_traced(&number, Duration::from_secs(1), None).await, Err(CouncilError::Request(_))));
+        assert!(matches!(c.decide_traced(&number, Duration::from_secs(1), None).await, Err(CouncilError::Request(_))));
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -505,7 +491,7 @@ mod tests {
         let spec = gate_spec();
         let held = json!({"spec_id": format!("blake3:{}", "0".repeat(64)), "spec": spec.value});
         let (base, _) = serve(vec![reply(200, held.to_string())]).await;
-        let err = client(&base).council().post_spec(&spec).await.unwrap_err();
+        let err = client(&base).post_spec(&spec).await.unwrap_err();
         assert!(matches!(&err, CouncilError::SpecIdMismatch { computed, .. } if *computed == spec.id()), "{err:?}");
     }
 
@@ -522,13 +508,13 @@ mod tests {
         let too_large = json!({"error": {"type": "too_large", "message": "case", "param": "case_bytes"}}).to_string();
         let (base, _) = serve(vec![reply(413, full.clone()), reply(413, full), reply(413, too_large)]).await;
         let c = client(&base);
-        let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
+        let err = c.generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
         let CouncilError::ContextFull { message, body, .. } = &err else { panic!("{err:?}") };
         assert!(message.contains("32760") && body.contains("context_tokens"), "{message} {body}");
         assert_eq!(err.status(), Some(413));
-        let err = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
+        let err = c.generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
         assert!(matches!(err, CouncilError::ContextFull { .. }), "{err:?}");
-        let err = c.council().generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
+        let err = c.generate(&greedy(chat()), Duration::from_secs(5)).await.unwrap_err();
         assert!(matches!(err, CouncilError::Status { status: 413, .. }), "another 413 stays a status: {err:?}");
     }
 
@@ -539,7 +525,7 @@ mod tests {
         let server = Server::start(Config { context_tokens: 256, ..Config::default() }).unwrap();
         let c = client(&server.url());
         let long = Context::new(true, vec![Message::user("x".repeat(400))]);
-        let err = c.council().generate(&greedy(long), Duration::from_secs(5)).await.unwrap_err();
+        let err = c.generate(&greedy(long), Duration::from_secs(5)).await.unwrap_err();
         assert!(matches!(err, CouncilError::ContextFull { .. }), "{err:?}");
     }
 
@@ -556,7 +542,7 @@ mod tests {
         let (base, _) = serve(vec![sse(token.clone()), sse(format!("{token}event: error\ndata: {error}\n\n"))]).await;
         let c = client(&base);
         for want_stream_error in [false, true] {
-            let mut s = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
+            let mut s = c.generate_stream(&greedy(chat()), Duration::from_secs(5)).await.unwrap();
             let Some(Ok(GenerationEvent::Token(t))) = s.next().await else { panic!("a token first") };
             assert_eq!(t.phase, gogi_proto::generation::Phase::Content);
             let last = s.next().await.unwrap();
@@ -588,7 +574,7 @@ mod tests {
         late.delay = Duration::from_millis(800);
         let (base, _) = serve(vec![slow, late]).await;
         let c = client(&base);
-        let mut s = c.council().generate_stream(&greedy(chat()), Duration::from_millis(150)).await.unwrap();
+        let mut s = c.generate_stream(&greedy(chat()), Duration::from_millis(150)).await.unwrap();
         let last = loop {
             match s.next().await.unwrap() {
                 Ok(GenerationEvent::Token(_)) => continue,
@@ -596,7 +582,7 @@ mod tests {
             }
         };
         assert!(matches!(last, Err(CouncilError::Timeout)), "{last:?}");
-        let err = c.council().generate_stream(&greedy(chat()), Duration::from_millis(150)).await.err().unwrap();
+        let err = c.generate_stream(&greedy(chat()), Duration::from_millis(150)).await.err().unwrap();
         assert!(matches!(err, CouncilError::Timeout), "{err:?}");
     }
 
@@ -607,9 +593,9 @@ mod tests {
         let accepted = crate::test_server::Reply { status: 202, ..sse("event: ping\ndata: {}\n\n") };
         let (base, _) = serve(vec![reply(200, "{}"), accepted]).await;
         let c = client(&base);
-        let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
+        let err = c.generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
         assert!(matches!(err, CouncilError::Decode { what: "content type", .. }), "{err:?}");
-        let err = c.council().generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
+        let err = c.generate_stream(&greedy(chat()), Duration::from_secs(5)).await.err().unwrap();
         assert!(matches!(err, CouncilError::Decode { what: "status", .. }), "{err:?}");
     }
 
@@ -622,7 +608,7 @@ mod tests {
         let (base, _) = serve(vec![with_header, reply(429, busy)]).await;
         let c = client(&base);
         for want in ["req_head", "req_body"] {
-            let err = c.council().identity().await.unwrap_err();
+            let err = c.identity().await.unwrap_err();
             assert!(matches!(&err, CouncilError::Status { status: 429, request_id: Some(id), .. } if id == want), "{err:?}");
             assert!(err.to_string().ends_with(&format!("(request {want})")), "{err}");
         }

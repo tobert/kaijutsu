@@ -3869,7 +3869,7 @@ enabled = false
     /// Falsified by adding `server` back to `CouncilToml`.
     #[test]
     fn a_council_server_or_model_key_is_refused_as_unknown() {
-        for key in ["server = \"http://zorak:8090\"", "model = \"gemma-4\""] {
+        for key in ["server = \"http://nagaya:8091\"", "model = \"gemma-4\""] {
             let m = council_err(&council_with("deadline_ms = 700", &format!("deadline_ms = 700\n{key}")));
             let name = key.split(' ').next().unwrap();
             assert!(m.contains("unknown field") && m.contains(name), "{key}: {m}");

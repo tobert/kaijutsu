@@ -39,10 +39,10 @@ kj character create lfm3 --model spaceghost/lfm3 --max-tokens 4096 --rc assistan
 Only `kaijutsu-kernel` and `kaijutsu-index` depend on it. The kernel's own
 `council/` module is the gate's policy, not the client.
 
-- `CouncilClient` holds the transport: base URL, timeout, `traceparent`,
-  request send, and status-to-error mapping. Each route family adds its
-  calls in its own module: identity, context builds, snapshots, pins,
-  specs, decisions, reads, embeddings, and generations.
+- `CouncilClient` holds the transport (base URL, timeout, `traceparent`,
+  request send, and status-to-error mapping) and has one method per route:
+  identity, context builds, snapshots, pins, specs, decisions, reads,
+  embeddings, and generations (`calls.rs`).
 - **One error type.** A transport failure, a non-2xx status, a body that
   does not match its schema, a mid-stream `error` event, and a stream that
   ends without `done` are different variants. None of them becomes an

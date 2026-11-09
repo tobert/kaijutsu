@@ -853,9 +853,9 @@ enabled = false                # this character keeps its directory's tiers but 
 ```
 
 `gate.toml` names no council server and no served model. A context decides on its own `gate` slot:
-`kj character slot set coder gate mk-zorak/gemma-4` sends the gate decisions of every
+`kj character slot set coder gate nagaya/gemma-4` sends the gate decisions of every
 context `coder` plays, made after the slot was set, to the served model `gemma-4` on the council server at
-backend `mk-zorak`'s `base_url`. A context copies the slot when it is made or rotated, so a slot change moves no
+backend `nagaya`'s `base_url`. A context copies the slot when it is made or rotated, so a slot change moves no
 running context. A context with no `gate` slot has no council: its gate decides without one, whatever `gate.toml`
 enables. A `[council] server` or `[council] model` key is refused as an unknown field. The slot's backend must have
 kind `council` and a `base_url`; any other backend makes every decision on the submission a miss that names the
@@ -952,7 +952,7 @@ would put an authority decision in a script.
 ## Rollout, smallest first
 
 1. **The contract.** gogi holds it: its documents, `gogi-proto`, and the
-   `gogi-conformance` suite a server runs. mkviolet serves council v2.
+   `gogi-conformance` suite a server runs. The nagaya serves council v2.
 2. **The gate, enforcing.** The parser change, the kernel port, the record
    tables, one spec, the system-rules context and Amy's council context sent before a
    decision that reads them, traces, the report event, and a report interrupting an

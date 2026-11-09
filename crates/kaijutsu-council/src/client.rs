@@ -349,7 +349,7 @@ mod tests {
         });
         let client = CouncilClient::new(&base, Duration::from_secs(5)).unwrap();
         for _ in 0..2 {
-            let error = client.council().identity().await.unwrap_err();
+            let error = client.identity().await.unwrap_err();
             assert_eq!(error.status(), Some(429));
             assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
         }

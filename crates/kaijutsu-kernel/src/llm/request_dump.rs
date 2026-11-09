@@ -53,12 +53,6 @@ impl RequestTrace {
         Self { context, turn, step, attempt: 1, dump_dir, warned: Arc::new(AtomicBool::new(false)) }
     }
 
-    /// The same trace with the dump turned off, for a provider whose request
-    /// is not a serializable body.
-    pub fn summary_only(&self) -> Self {
-        Self { dump_dir: None, ..self.clone() }
-    }
-
     /// The same turn at another step, on its first attempt.
     pub fn at_step(&self, step: u32) -> Self {
         Self { step, attempt: 1, ..self.clone() }

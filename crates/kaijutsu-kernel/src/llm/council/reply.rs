@@ -2,11 +2,11 @@
 //!
 //! Each token names its phase, so [`Reply::phased`] routes each piece by
 //! it and reads no markers. Each phase is trimmed the way the server trims
-//! it, so the streamed blocks hold exactly `done`'s text. [`Reply::done_v2`]
+//! it, so the streamed blocks hold exactly `done`'s text. [`Reply::done`]
 //! checks that at the end: a difference is an error, never a block that
 //! disagrees with what the server holds as the reply.
 
-use gogi_proto::generation::{Finish as V2Finish, GenerationDone, Phase as V2Phase, ReplyToolCall};
+use gogi_proto::generation::{Finish as CouncilFinish, GenerationDone, Phase as CouncilPhase, ReplyToolCall};
 use kaijutsu_council::Json;
 
 use crate::llm::stream::{CouncilUsageExtra, StreamEvent, UsageExtra};
@@ -15,7 +15,7 @@ use crate::llm::stream::{CouncilUsageExtra, StreamEvent, UsageExtra};
 /// marks council reasoning as replayable, so the runtime and hydration send it back
 /// as `reasoning_content` and the template decides what to keep. Opaque: only
 /// its presence is read.
-pub(super) const REASONING_SIGNATURE: &str = "mk-reasoning";
+pub(super) const REASONING_SIGNATURE: &str = "council-reasoning";
 
 /// The name a call gets when the server could not read one.
 pub(super) const UNNAMED_CALL: &str = "unnamed_tool_call";
@@ -53,13 +53,13 @@ impl Reply {
     /// A council v2 piece in `phase`. A change of phase closes the block of
     /// the phase before it; a call's pieces and a phase this kernel does not
     /// know add no text.
-    pub(super) fn phased(&mut self, phase: V2Phase, piece: &str) -> Vec<StreamEvent> {
+    pub(super) fn phased(&mut self, phase: CouncilPhase, piece: &str) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         let phase = match phase {
-            V2Phase::Reasoning => Phase::Think,
-            V2Phase::Content => Phase::Answer,
-            V2Phase::Call => Phase::Tool,
-            V2Phase::Unknown => return out,
+            CouncilPhase::Reasoning => Phase::Think,
+            CouncilPhase::Content => Phase::Answer,
+            CouncilPhase::Call => Phase::Tool,
+            CouncilPhase::Unknown => return out,
         };
         if phase != self.phase {
             match self.phase {
@@ -84,7 +84,7 @@ impl Reply {
     /// The events that end a council v2 generation. Its calls keep the ids
     /// the server gave them, which the next turn's tool results name.
     /// `model` and `weight_hash` are the server's identity.
-    pub(super) fn done_v2(
+    pub(super) fn done(
         self,
         done: GenerationDone,
         model: &str,
@@ -115,9 +115,9 @@ impl Reply {
         let usage = (done.usage.prompt, done.usage.completion, extra);
         // A reply cut at the context's end is cut like one at max_tokens.
         let stop_reason = match done.finish {
-            V2Finish::EndTurn => "end_turn",
-            V2Finish::ToolUse => "tool_use",
-            V2Finish::MaxTokens | V2Finish::ContextFull => "max_tokens",
+            CouncilFinish::EndTurn => "end_turn",
+            CouncilFinish::ToolUse => "tool_use",
+            CouncilFinish::MaxTokens | CouncilFinish::ContextFull => "max_tokens",
         };
         self.end(&done.reasoning, &done.content, stop_reason, calls, usage)
     }
@@ -264,17 +264,17 @@ mod tests {
         (think, answer)
     }
 
-    fn v2_done(reasoning: &str, content: &str, finish: &str) -> GenerationDone {
+    fn done_event(reasoning: &str, content: &str, finish: &str) -> GenerationDone {
         serde_json::from_value(serde_json::json!({"model": "m", "content": content, "reasoning": reasoning, "tool_calls": [],
             "finish": finish, "usage": {"prompt": 9, "kept": 4, "fed": 5, "completion": 6, "reasoning": 2},
             "head": null, "snapshots": [], "seed": 5}))
         .unwrap()
     }
 
-    fn run(thinking: bool, pieces: &[(V2Phase, &str)], done: GenerationDone) -> Result<Vec<StreamEvent>, String> {
+    fn run(thinking: bool, pieces: &[(CouncilPhase, &str)], done: GenerationDone) -> Result<Vec<StreamEvent>, String> {
         let mut reply = Reply::new(thinking);
         let mut out: Vec<StreamEvent> = pieces.iter().flat_map(|(phase, piece)| reply.phased(*phase, piece)).collect();
-        out.extend(reply.done_v2(done, "m", "w", Timing::default())?);
+        out.extend(reply.done(done, "m", "w", Timing::default())?);
         Ok(out)
     }
 
@@ -286,14 +286,14 @@ mod tests {
     /// Falsified by routing pieces through a marker split, or a
     /// `context_full` reply that reads as a finished turn.
     #[test]
-    fn v2_pieces_follow_their_phase_and_finish_maps_to_a_stop_reason() {
-        let pieces = [(V2Phase::Reasoning, "why </think>"), (V2Phase::Content, " Yes"), (V2Phase::Call, "ls(")];
-        let out = run(true, &pieces, v2_done("why </think>", "Yes", "context_full")).unwrap();
+    fn pieces_follow_their_phase_and_finish_maps_to_a_stop_reason() {
+        let pieces = [(CouncilPhase::Reasoning, "why </think>"), (CouncilPhase::Content, " Yes"), (CouncilPhase::Call, "ls(")];
+        let out = run(true, &pieces, done_event("why </think>", "Yes", "context_full")).unwrap();
         assert_eq!(texts(&out), ("why </think>".into(), "Yes".into()));
         let StreamEvent::Done { stop_reason, extra: Some(UsageExtra::Council(x)), .. } = out.last().unwrap() else { panic!("{out:?}") };
         assert_eq!((stop_reason.as_deref(), x.seed), (Some("max_tokens"), Some(5)));
         for (finish, want) in [("end_turn", "end_turn"), ("tool_use", "tool_use"), ("max_tokens", "max_tokens")] {
-            let events = Reply::new(false).done_v2(v2_done("", "", finish), "m", "w", Timing::default()).unwrap();
+            let events = Reply::new(false).done(done_event("", "", finish), "m", "w", Timing::default()).unwrap();
             assert!(matches!(events.last(), Some(StreamEvent::Done { stop_reason: Some(s), .. }) if s == want), "{finish}: {events:?}");
         }
     }
@@ -302,8 +302,8 @@ mod tests {
     /// signature that marks it replayable.
     #[test]
     fn thinking_closes_before_the_answer_and_is_signed() {
-        let pieces = [(V2Phase::Reasoning, "six times seven"), (V2Phase::Content, "42")];
-        let events = run(true, &pieces, v2_done("six times seven", "42", "end_turn")).unwrap();
+        let pieces = [(CouncilPhase::Reasoning, "six times seven"), (CouncilPhase::Content, "42")];
+        let events = run(true, &pieces, done_event("six times seven", "42", "end_turn")).unwrap();
         let order: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
@@ -325,17 +325,17 @@ mod tests {
 
     #[test]
     fn inner_white_space_is_kept_and_python_separators_are_trimmed() {
-        let pieces = [(V2Phase::Content, "\u{1f}a"), (V2Phase::Content, "\n\n"), (V2Phase::Content, "b"), (V2Phase::Content, " \u{1c}")];
-        let events = run(false, &pieces, v2_done("", "a\n\nb", "end_turn")).unwrap();
+        let pieces = [(CouncilPhase::Content, "\u{1f}a"), (CouncilPhase::Content, "\n\n"), (CouncilPhase::Content, "b"), (CouncilPhase::Content, " \u{1c}")];
+        let events = run(false, &pieces, done_event("", "a\n\nb", "end_turn")).unwrap();
         assert_eq!(texts(&events).1, "a\n\nb");
     }
 
     #[test]
     fn text_that_differs_from_done_is_an_error() {
-        let err = run(false, &[(V2Phase::Content, "blue")], v2_done("", "Blue", "end_turn")).unwrap_err();
+        let err = run(false, &[(CouncilPhase::Content, "blue")], done_event("", "Blue", "end_turn")).unwrap_err();
         assert!(err.contains("answer differs"), "{err}");
-        let pieces = [(V2Phase::Reasoning, "a"), (V2Phase::Content, "b")];
-        let err = run(true, &pieces, v2_done("x", "b", "end_turn")).unwrap_err();
+        let pieces = [(CouncilPhase::Reasoning, "a"), (CouncilPhase::Content, "b")];
+        let err = run(true, &pieces, done_event("x", "b", "end_turn")).unwrap_err();
         assert!(err.contains("thinking differs"), "{err}");
     }
 
@@ -343,7 +343,7 @@ mod tests {
     /// call, and one whose name did not parse gets a name.
     #[test]
     fn calls_keep_their_ids_and_unparsed_ones_become_invalid_calls() {
-        let mut done = v2_done("", "", "tool_use");
+        let mut done = done_event("", "", "tool_use");
         let input = serde_json::json!({"path": "/tmp"}).as_object().unwrap().clone();
         done.tool_calls = vec![
             ReplyToolCall::Parsed { id: "c0".into(), name: "ls".into(), input, stats: None },

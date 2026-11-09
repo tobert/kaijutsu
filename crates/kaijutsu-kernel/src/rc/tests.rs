@@ -4006,13 +4006,13 @@ esac
                 mcp_hub_ctx: None, principal_id: judge_character, name: "judge".into(), created_at: 0,
                 retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: "mk-judge".into(), kind: "council".into(), base_url: None,
+            let nagaya = db.upsert_backend(&crate::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: "nagaya".into(), kind: "council".into(), base_url: None,
                 api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
                 idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
             }).unwrap();
             db.set_character_model(&crate::kernel_db::CharacterModelRow {
-                principal_id: judge_character, backend_id: mk.backend_id, model: "gemma".into(), max_tokens: None,
+                principal_id: judge_character, backend_id: nagaya.backend_id, model: "gemma".into(), max_tokens: None,
                 temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
             }).unwrap();
         }

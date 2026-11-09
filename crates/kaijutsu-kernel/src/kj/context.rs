@@ -3939,14 +3939,14 @@ mod tests {
             }).unwrap();
         }
         db.seed_test_slots(banto, "mock", "mock-banto", &["model"]).unwrap();
-        let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-            backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("council"),
-            base_url: Some(s("http://zorak:8090")), api_key_env: None, api_key_file: None, key_optional: true,
+        let nagaya = db.upsert_backend(&crate::kernel_db::BackendRow {
+            backend_id: kaijutsu_types::BackendId::new(), name: s("nagaya"), kind: s("council"),
+            base_url: Some(s("http://nagaya:8091")), api_key_env: None, api_key_file: None, key_optional: true,
             request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
             created_by: PrincipalId::system(),
         }).unwrap();
         db.set_character_model(&crate::kernel_db::CharacterModelRow {
-            principal_id: judge, backend_id: mk.backend_id, model: s("judge-model"),
+            principal_id: judge, backend_id: nagaya.backend_id, model: s("judge-model"),
             max_tokens: judge_max_tokens, temperature: None, top_p: None, effort: None,
             thinking_budget: None, thinking_style: None,
         }).unwrap();
@@ -4014,7 +4014,7 @@ mod tests {
         let db = d.kernel_db().lock();
         match crate::model_resolution::context_model(&db, shadow).unwrap() {
             crate::model_resolution::ContextModelLookup::Model(m) => {
-                assert_eq!((m.backend.as_str(), m.model.as_str(), m.max_tokens), ("mk-zorak", "judge-model", 2048));
+                assert_eq!((m.backend.as_str(), m.model.as_str(), m.max_tokens), ("nagaya", "judge-model", 2048));
             }
             other => panic!("a council model with max_tokens runs chat turns: {other:?}"),
         }
@@ -8112,7 +8112,7 @@ mod tests {
     async fn a_distill_slot_on_a_council_server_with_no_max_tokens_refuses_naming_the_fix() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context_with_model(&d, Some("mk-distill"), None, principal, &[]);
+        let source = register_context_with_model(&d, Some("council-distill"), None, principal, &[]);
         d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
         d.block_store()
             .insert_block(
@@ -8122,14 +8122,14 @@ mod tests {
             .unwrap();
         let name = {
             let db = d.kernel_db().lock();
-            let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("council"), base_url: None,
+            let nagaya = db.upsert_backend(&crate::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: s("nagaya"), kind: s("council"), base_url: None,
                 api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
                 idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
             }).unwrap();
             db.conn_for_ledger().execute(
                 "INSERT INTO context_slots (context_id, role, backend_id, model) VALUES (?1, 'distill', ?2, 'gemma')",
-                rusqlite::params![source.as_bytes().to_vec(), mk.backend_id.as_bytes().to_vec()],
+                rusqlite::params![source.as_bytes().to_vec(), nagaya.backend_id.as_bytes().to_vec()],
             ).unwrap();
             db.get_character(principal).unwrap().unwrap().name
         };
@@ -8137,7 +8137,7 @@ mod tests {
         assert!(!fork.is_ok(), "{}", fork.message());
         let msg = fork.message();
         assert!(msg.contains("cannot distill") && msg.contains("has no max_tokens"), "{msg}");
-        assert!(msg.contains(&format!("`kj character slot set {name} distill mk-zorak/gemma --max-tokens <n>`")), "{msg}");
+        assert!(msg.contains(&format!("`kj character slot set {name} distill nagaya/gemma --max-tokens <n>`")), "{msg}");
     }
     /// The flip side: once `LlmRegistry::context_window_for` resolves a real
     /// window (mirroring how it's populated from the backend model metadata in

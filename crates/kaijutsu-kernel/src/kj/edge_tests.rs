@@ -146,14 +146,14 @@ async fn write_gate_toml(d: &KjDispatcher, text: &str) {
 /// Give the character `judge` a model on a council server (a backend of kind `council`).
 fn give_judge_a_council_model(d: &KjDispatcher) -> PrincipalId {
     let db = d.kernel_db().lock();
-    let mk = db.upsert_backend(&crate::kernel_db::BackendRow {
-        backend_id: kaijutsu_types::BackendId::new(), name: s("mk-zorak"), kind: s("council"), base_url: None,
+    let nagaya = db.upsert_backend(&crate::kernel_db::BackendRow {
+        backend_id: kaijutsu_types::BackendId::new(), name: s("nagaya"), kind: s("council"), base_url: None,
         api_key_env: None, api_key_file: None, key_optional: true, request_timeout_secs: None,
         idle_timeout_secs: None, max_concurrent: None, created_at: 0, created_by: PrincipalId::system(),
     }).unwrap();
     let judge = db.get_character_by_name("judge").unwrap().unwrap().principal_id;
     db.set_character_model(&crate::kernel_db::CharacterModelRow {
-        principal_id: judge, backend_id: mk.backend_id, model: s("gemma"), max_tokens: None,
+        principal_id: judge, backend_id: nagaya.backend_id, model: s("gemma"), max_tokens: None,
         temperature: None, top_p: None, effort: None, thinking_budget: None, thinking_style: None,
     }).unwrap();
     judge

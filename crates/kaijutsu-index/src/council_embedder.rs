@@ -78,7 +78,7 @@ impl CouncilEmbedder {
             return Err(failure("the model name is empty"));
         }
         let client = CouncilClient::new(config.base_url.as_str(), config.timeout).map_err(failure)?;
-        let identity = client.council().identity().await.map_err(failure)?;
+        let identity = client.identity().await.map_err(failure)?;
         let served = identity.route(&config.model).map_err(|e| failure(e.message))?;
         let offered = match &served.embeddings {
             Some(offered) if served.has(Capability::Embed) => offered,
@@ -139,7 +139,7 @@ impl CouncilEmbedder {
         // waiting indefinitely before the request's own timeout starts.
         tokio::time::timeout(self.timeout, async {
             let _permit = self.permits.acquire().await.map_err(failure)?;
-            self.client.council().embeddings(&request, self.timeout).await.map_err(failure)
+            self.client.embeddings(&request, self.timeout).await.map_err(failure)
         }).await.map_err(|_| failure("embedding request timed out (including queue time)"))?
     }
 

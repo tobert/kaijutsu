@@ -185,8 +185,8 @@ fn a_console_on_a_council_server_slot_is_rotated() {
         bootstrap(&config, &options(&config, None)).await.expect("bootstrap without a backend");
         let before = {
             let db = kernel_db(&config);
-            let mk = db.upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
-                backend_id: kaijutsu_types::BackendId::new(), name: "mk-zorak".into(), kind: "council".into(),
+            let nagaya = db.upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
+                backend_id: kaijutsu_types::BackendId::new(), name: "nagaya".into(), kind: "council".into(),
                 base_url: None, api_key_env: None, api_key_file: None, key_optional: true,
                 request_timeout_secs: None, idle_timeout_secs: None, max_concurrent: None, created_at: 0,
                 created_by: kaijutsu_types::PrincipalId::system(),
@@ -195,7 +195,7 @@ fn a_console_on_a_council_server_slot_is_rotated() {
             let conn = rusqlite::Connection::open(config.data_dir.as_ref().unwrap().join("kernel.db")).unwrap();
             conn.execute(
                 "INSERT INTO context_slots (context_id, role, backend_id, model) VALUES (?1, 'model', ?2, 'gemma')",
-                rusqlite::params![console.as_bytes().to_vec(), mk.backend_id.as_bytes().to_vec()],
+                rusqlite::params![console.as_bytes().to_vec(), nagaya.backend_id.as_bytes().to_vec()],
             ).unwrap();
             console
         };

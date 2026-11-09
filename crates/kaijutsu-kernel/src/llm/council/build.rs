@@ -12,7 +12,7 @@
 //!   keep.
 //! - The server takes text only. An image becomes a visible marker.
 
-use gogi_proto::{Message as V2Message, Role as V2Role, Tool as V2Tool, ToolCall as V2ToolCall};
+use gogi_proto::{Message as CouncilMessage, Role as CouncilRole, Tool as CouncilTool, ToolCall as CouncilToolCall};
 use kaijutsu_council::Json;
 
 use crate::llm::{ContentBlock, LlmError, LlmResult, Message, MessageContent, Role, ToolDefinition};
@@ -35,11 +35,11 @@ pub(super) fn effort(effort: Option<&str>) -> LlmResult<Option<bool>> {
 
 /// The tool definitions as council v2 tools. An input schema that is not a
 /// JSON object is refused.
-pub(super) fn tools_v2(tools: &[ToolDefinition]) -> LlmResult<Vec<V2Tool>> {
+pub(super) fn tools(tools: &[ToolDefinition]) -> LlmResult<Vec<CouncilTool>> {
     tools
         .iter()
         .map(|t| match &t.input_schema {
-            serde_json::Value::Object(schema) => Ok(V2Tool {
+            serde_json::Value::Object(schema) => Ok(CouncilTool {
                 name: t.name.clone(),
                 description: (!t.description.is_empty()).then(|| t.description.clone()),
                 input_schema: schema.clone(),
@@ -59,35 +59,35 @@ pub(super) fn tools_v2(tools: &[ToolDefinition]) -> LlmResult<Vec<V2Tool>> {
 /// last message of all. A later system message is marked as a user message
 /// is. A flag depends only on the messages up to the next
 /// assistant message, so a later turn never moves an earlier boundary.
-pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<V2Message>> {
-    let mut out: Vec<V2Message> = walk(system, history)?
+pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<CouncilMessage>> {
+    let mut out: Vec<CouncilMessage> = walk(system, history)?
         .into_iter()
-        .map(|m| -> LlmResult<V2Message> { Ok(match m {
-            Walked::System(text) => V2Message::system(text),
-            Walked::User(text) => V2Message::user(text),
-            Walked::Assistant { content, reasoning, calls } => V2Message {
+        .map(|m| -> LlmResult<CouncilMessage> { Ok(match m {
+            Walked::System(text) => CouncilMessage::system(text),
+            Walked::User(text) => CouncilMessage::user(text),
+            Walked::Assistant { content, reasoning, calls } => CouncilMessage {
                 content: content.filter(|c| !c.is_empty()).map(Into::into),
                 reasoning,
                 tool_calls: calls
                     .into_iter()
                     .map(|(id, name, arguments)| match serde_json::to_value(&arguments) {
-                        Ok(serde_json::Value::Object(input)) => Ok(V2ToolCall { id, name, input }),
+                        Ok(serde_json::Value::Object(input)) => Ok(CouncilToolCall { id, name, input }),
                         _ => Err(LlmError::InvalidRequest(format!("tool call {id} arguments are not a JSON object"))),
                     })
                     .collect::<LlmResult<_>>()?,
-                ..V2Message::assistant("")
+                ..CouncilMessage::assistant("")
             },
-            Walked::Tool { id, content, is_error: true } => V2Message::tool_error(id, content),
-            Walked::Tool { id, content, .. } => V2Message::tool(id, content),
+            Walked::Tool { id, content, is_error: true } => CouncilMessage::tool_error(id, content),
+            Walked::Tool { id, content, .. } => CouncilMessage::tool(id, content),
         }) })
         .collect::<LlmResult<_>>()?;
     for i in 0..out.len() {
         let next = out.get(i + 1).map(|m| m.role);
         out[i].snap = match out[i].role {
-            V2Role::System if i == 0 => true,
-            V2Role::Assistant => false,
-            V2Role::User | V2Role::System => matches!(next, None | Some(V2Role::Assistant)),
-            V2Role::Tool => !matches!(next, Some(V2Role::Tool)),
+            CouncilRole::System if i == 0 => true,
+            CouncilRole::Assistant => false,
+            CouncilRole::User | CouncilRole::System => matches!(next, None | Some(CouncilRole::Assistant)),
+            CouncilRole::Tool => !matches!(next, Some(CouncilRole::Tool)),
         };
     }
     Ok(out)
@@ -259,7 +259,7 @@ mod tests {
     }
 
     fn wire(system: Option<&str>, history: &[Message]) -> serde_json::Value {
-        serde_json::to_value(messages_v2(system, history).unwrap()).unwrap()
+        serde_json::to_value(messages(system, history).unwrap()).unwrap()
     }
 
     #[test]
@@ -268,8 +268,8 @@ mod tests {
             wire(Some("rules"), &[Message::user("hi")]),
             json!([{"role": "system", "content": "rules", "snap": true}, {"role": "user", "content": "hi", "snap": true}])
         );
-        assert_eq!(messages_v2(Some(""), &[Message::user("hi")]).unwrap().len(), 1);
-        assert_eq!(messages_v2(None, &[Message::user("hi")]).unwrap().len(), 1);
+        assert_eq!(messages(Some(""), &[Message::user("hi")]).unwrap().len(), 1);
+        assert_eq!(messages(None, &[Message::user("hi")]).unwrap().len(), 1);
     }
 
     #[test]
@@ -291,7 +291,7 @@ mod tests {
     /// Falsified by a builder that drops ids, snaps an assistant message, or
     /// snaps each of several tool results.
     #[test]
-    fn v2_messages_keep_call_ids_and_snap_the_ends_of_user_turns() {
+    fn messages_keep_call_ids_and_snap_the_ends_of_user_turns() {
         let mut history = vec![
             Message::user("look"),
             said(vec![
@@ -305,7 +305,7 @@ mod tests {
                 ContentBlock::Text { text: "and hurry".into() },
             ]),
         ];
-        let first = messages_v2(Some("rules"), &history).unwrap();
+        let first = messages(Some("rules"), &history).unwrap();
         assert_eq!(
             serde_json::to_value(&first).unwrap(),
             json!([
@@ -321,7 +321,7 @@ mod tests {
         );
         history.push(said(vec![ContentBlock::Text { text: "done".into() }]));
         history.push(Message::user("thanks"));
-        let second = messages_v2(Some("rules"), &history).unwrap();
+        let second = messages(Some("rules"), &history).unwrap();
         assert_eq!(second[..first.len()], first[..], "appending a turn moves no earlier boundary");
         assert_eq!(serde_json::to_value(&second[6]).unwrap(), json!({"role": "assistant", "content": "done"}));
         assert!(second[7].snap);
@@ -347,7 +347,7 @@ mod tests {
             ])
         );
         let unanswered = [Message::user("x"), said(vec![call("a", "ls", json!({}))]), Message::system("s")];
-        assert!(matches!(messages_v2(None, &unanswered), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(messages(None, &unanswered), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod tests {
             vec![Message::user("x"), ask()],
             vec![Message::user("x"), ask(), ask()],
         ] {
-            assert!(matches!(messages_v2(None, &history), Err(LlmError::InvalidRequest(_))), "{history:?}");
+            assert!(matches!(messages(None, &history), Err(LlmError::InvalidRequest(_))), "{history:?}");
         }
     }
 
@@ -389,7 +389,7 @@ mod tests {
             said(vec![call("a", "ls", json!("not an object"))]),
             Message::tool_results(vec![result("a", "", false)]),
         ];
-        assert!(matches!(messages_v2(None, &history), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(messages(None, &history), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]
@@ -411,13 +411,13 @@ mod tests {
             ToolDefinition { name: "pwd".into(), description: String::new(), input_schema: json!({"type": "object"}) },
         ];
         assert_eq!(
-            serde_json::to_value(tools_v2(&defs).unwrap()).unwrap(),
+            serde_json::to_value(tools(&defs).unwrap()).unwrap(),
             json!([
                 {"name": "ls", "description": "List.", "input_schema": {"type": "object"}},
                 {"name": "pwd", "input_schema": {"type": "object"}},
             ])
         );
         let bad = [ToolDefinition { name: "x".into(), description: String::new(), input_schema: json!(true) }];
-        assert!(matches!(tools_v2(&bad), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(tools(&bad), Err(LlmError::InvalidRequest(_))));
     }
 }

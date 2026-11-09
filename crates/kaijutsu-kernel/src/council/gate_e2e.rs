@@ -321,7 +321,7 @@ async fn serve() -> Mock {
                     ("POST", "/council/v2/specs") => {
                         let spec: serde_json::Value = serde_json::from_str(&body).unwrap();
                         let id = gogi_proto::spec_id_of(&spec).unwrap();
-                        Reply::ok(serde_json::json!({"spec_id": id, "spec": spec, "template": "mk-letters-1:0123456789abcdef"}))
+                        Reply::ok(serde_json::json!({"spec_id": id, "spec": spec, "template": "letters-1:0123456789abcdef"}))
                     }
                     ("POST", "/council/v2/contexts") => {
                         let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -594,7 +594,7 @@ fn bind_seat(
         handoff_ctx: None, root_ctx: None, root: false,
     })
     .unwrap();
-    let gate = gate.cloned().unwrap_or(SlotSpec::council("gate-mk", Base::Gate));
+    let gate = gate.cloned().unwrap_or(SlotSpec::council("gate-council", Base::Gate));
     let backend = spec_backend(db, gate_server, &gate);
     if gate.kind != "council" {
         // A gate slot on a chat backend is refused when it is written; one
@@ -1217,7 +1217,7 @@ async fn a_council_report_asks_and_emits_the_report_event() {
 /// Limits the council server's endpoint to one request in flight, as `kj
 /// backend set` does for a council backend at the same address.
 async fn limit_council_to_one(rig: &Rig) {
-    let argv: Vec<String> = ["backend", "set", "council-mk", "--kind", "council", "--base-url", rig.mock.base.as_str(), "--max-concurrent", "1"]
+    let argv: Vec<String> = ["backend", "set", "nagaya", "--kind", "council", "--base-url", rig.mock.base.as_str(), "--max-concurrent", "1"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -3431,7 +3431,7 @@ async fn a_bump_is_recorded_in_the_shadow_with_its_flavor() {
 #[tokio::test]
 async fn a_council_that_names_no_judge_makes_no_shadow() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
-    bind_judge(&rig.d.kernel_db().lock(), &rig.gate_server, &SlotSpec::council("judge-mk", Base::Gate));
+    bind_judge(&rig.d.kernel_db().lock(), &rig.gate_server, &SlotSpec::council("judge-council", Base::Gate));
     rig.submit("echo static").await.unwrap();
     assert!(judge_shadows(&rig).is_empty());
     assert!(rig.d.kernel_db().lock().fork_children(rig.ctx.context_id).unwrap().is_empty(), "no child at all");
@@ -3538,7 +3538,7 @@ async fn a_shadow_whose_label_is_taken_takes_the_next_free_one() {
 /// Falsified by archiving the seat alone, or by archiving every child.
 #[tokio::test]
 async fn archiving_a_judged_seat_archives_its_shadow() {
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), chain: true, ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-council", Base::Gate)), chain: true, ..Setup::default() }).await;
     rig.submit("echo before").await.unwrap();
     let shadow = shadows_of(&rig, rig.ctx.context_id)[0].context_id;
     let fork = crate::kj::test_helpers::register_context(&rig.d, Some("seat-fork"), Some(rig.ctx.context_id), rig.ctx.actor_id);
@@ -3559,7 +3559,7 @@ async fn archiving_a_judged_seat_archives_its_shadow() {
 /// character and the verb that gives it a model.
 #[tokio::test]
 async fn a_judge_with_no_model_records_a_miss_naming_the_fix() {
-    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-council", Base::Gate)), ..Setup::default() }).await;
     {
         let db = rig.d.kernel_db().lock();
         let judge = db.get_character_by_name(super::shadow::JUDGE).unwrap().unwrap();
@@ -3587,7 +3587,7 @@ async fn a_judge_with_no_model_records_a_miss_naming_the_fix() {
 /// and the `judge` rc directory's stance.
 #[tokio::test]
 async fn a_judge_on_a_council_server_is_primed_with_each_call() {
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-council", Base::Gate)), ..Setup::default() }).await;
     rig.submit("echo one").await.unwrap();
     assert!(!judge_shadows(&rig).is_empty(), "the seat has a shadow");
     let puts = rig.mock.wait_for_builds("shadow", 1).await;
@@ -3617,7 +3617,7 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
 #[tokio::test]
 async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     const JUDGE_ASKS: [[f64; 3]; 3] = [[-4.0, -0.03, -5.0], [-3.5, -0.04, -5.0], [-4.0, -0.02, -6.0]];
-    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-council", Base::Gate)), ..Setup::default() }).await;
     rig.mock.set(|req| {
         if Rig::read_ids(req).len() == 3 { Reply::ok(answer(req, &JUDGE_ASKS)) } else { allow_each(req) }
     });
@@ -3681,7 +3681,7 @@ async fn a_slot_change_moves_neither_the_gate_nor_the_judge_of_a_running_context
 #[tokio::test]
 async fn a_shadow_without_its_stance_is_not_primed() {
     use crate::vfs::VfsOps;
-    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-council", Base::Gate)), ..Setup::default() }).await;
     for (path, _) in JUDGE_RC {
         rig.d.kernel().vfs().unlink(std::path::Path::new(path)).await.unwrap();
     }
@@ -3862,7 +3862,7 @@ async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observation
 #[tokio::test]
 async fn a_judge_reads_on_its_model_s_server_and_the_gate_decides_on_the_other() {
     let judge_server = serve().await;
-    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-council", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
     judge_server.set(allow_each);
     rig.mock.set(allow_each);
     rig.submit("echo two-servers").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
@@ -3903,7 +3903,7 @@ async fn council_build_plans_the_judge_on_the_judge_s_server() {
             data.as_array().unwrap().iter().filter(|b| b["server"] == base.as_str()).cloned().collect::<Vec<_>>()
         }
     };
-    let judged = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
+    let judged = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", judge: Some(SlotSpec::council("judge-council", Base::Url(judge_server.base.clone()))), ..Setup::default() }).await;
     judge_server.set(allow_each);
     let before = judge_builds(&judged).await;
     assert_eq!(before.len(), 1, "the judge's seats are planned before its shadow exists: {before:?}");
@@ -3914,7 +3914,7 @@ async fn council_build_plans_the_judge_on_the_judge_s_server() {
     judged.finish().await;
 
     let unjudged = rig(Via::Tool, Setup::default()).await;
-    bind_judge(&unjudged.d.kernel_db().lock(), &unjudged.gate_server, &SlotSpec::council("judge-mk", Base::Url(judge_server.base.clone())));
+    bind_judge(&unjudged.d.kernel_db().lock(), &unjudged.gate_server, &SlotSpec::council("judge-council", Base::Url(judge_server.base.clone())));
     let none = judge_builds(&unjudged).await;
     assert!(none.is_empty(), "no judge key, no judge build, though a character named judge exists: {none:?}");
     unjudged.finish().await;
@@ -3929,7 +3929,7 @@ async fn council_build_plans_the_judge_on_the_judge_s_server() {
 /// sends a request over the limit.
 #[tokio::test]
 async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
-    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::Gate)), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-council", Base::Gate)), ..Setup::default() }).await;
     rig.mock.limit_contexts(2);
     rig.mock.set(allow_each);
     rig.submit("echo at-limit").await.unwrap_or_else(|e| panic!("a decision at the limit still allows: {e:?}"));
@@ -3954,7 +3954,7 @@ async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
 /// Falsified by dropping the judge silently: no observation is recorded.
 #[tokio::test]
 async fn a_judge_model_with_no_council_address_records_a_miss_naming_it() {
-    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-mk", Base::None)), ..Setup::default() }).await;
+    let rig = rig(Via::Tool, Setup { judge: Some(SlotSpec::council("judge-council", Base::None)), ..Setup::default() }).await;
     rig.mock.set(allow_each);
     rig.submit("echo no-address").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
     let decision = the_decision(&rig, &rig.only_ask());
@@ -3964,7 +3964,7 @@ async fn a_judge_model_with_no_council_address_records_a_miss_naming_it() {
     assert_eq!(o.reviewer_label, "judge-council-seat");
     assert_eq!(o.outcome, CouncilObservationOutcome::Miss, "{o:?}");
     let cause = o.miss_cause.clone().unwrap();
-    assert!(cause.contains("backend judge-mk") && cause.contains("has no base URL"), "{cause}");
+    assert!(cause.contains("backend judge-council") && cause.contains("has no base URL"), "{cause}");
     assert_eq!(rig.mock.decisions().len(), 1, "only the gate's decision is sent");
     rig.finish().await;
 }

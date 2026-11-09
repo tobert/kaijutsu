@@ -179,9 +179,9 @@ instructions (`llm/hydrate.rs`, `is_kernel_instruction`), and a drift is a
   `{"messages":[]}`.
 - `SystemText`, for every other context. Each message is
   `llm::Role::System` at its point in the history; a drift keeps its
-  `[push from context 1a2b3c4d]` prefix. Council v2 and `/mk/v1`
-  send it as a `system` message, which mkviolet renders as its own system
-  turn. Hosted OpenAI sends a `system` message. Anthropic sends a
+  `[push from context 1a2b3c4d]` prefix. A council server gets
+  a `system` message, which the served model's template renders as its own
+  system turn. Hosted OpenAI sends a `system` message. Anthropic sends a
   `role: "system"` message on models that take one mid-conversation (Fable,
   Mythos, Opus 4.8 and later, Sonnet 5.5 and later, Haiku 5.5 and later),
   where the API allows it: right after a user turn, and as the last message

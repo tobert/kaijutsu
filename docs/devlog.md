@@ -3481,8 +3481,8 @@ conversation every turn and keeps nothing; the council builds each seat with
 `POST /council/v2/contexts`, sends it whole in every decision, and pins the
 heads under `kernel-<kernel id>`, renewed every 20 minutes. On mkviolet a
 ten-inference tool loop fed 308 of its 5,912 prompt tokens, so sending
-everything costs rendering, not prefill. See `docs/mk.md`, "Council v2" and
-`docs/council.md`, "Council v2 seats".
+everything costs rendering, not prefill. See `docs/council-backend.md`,
+"Chat turns" and `docs/council.md`, "Council v2 seats".
 
 kaijutsu then dropped council v1 and its own wire types (October 18). The
 contract lives in gogi (github.com/tobert/gogi), and `gogi-proto` supplies
@@ -3743,3 +3743,11 @@ the old rule before renaming the kind, which is exact for old data because
 no chat context could run on `mk` before it. A council slot with
 `max_tokens` is a chat model; one without, a judge's, runs no chat turn and
 says how to give it one.
+
+The next day's sweep took out what read as two APIs. The crate's calls are
+`CouncilClient` methods, with no `council()` view; the provider's `v2` names
+became what they do (`generation.rs`, `served_model`); the thinking marker
+is `council-reasoning`, safe to rename because only its presence is read.
+A council turn now writes its request body to the request dump like the
+other providers, since a generation is a JSON body. The bass prototype on
+`/council/v1` (`contrib/chameleon-s1/`) was removed.
