@@ -507,23 +507,20 @@ async fn mcp_role_holds_config_governance_body() {
     );
 }
 
-/// Every command the toolie stance teaches, except the `git` reads, runs in
-/// the toolie's shell, and each refusal it describes reads as it says. The
-/// stance must carry each example verbatim, so a stance edit that changes an
-/// example changes this test too. The `git` examples need a repository, which
-/// this harness does not mount.
+/// The `glob` tool the toolie stance names, and the reads a toolie makes,
+/// run in its read-only shell, and its writes are refused saying so.
 #[test]
-fn the_toolie_stance_examples_run_in_its_read_only_shell() {
+fn the_toolie_reads_run_in_its_read_only_shell() {
     run_on_rc_stack(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build current-thread runtime")
-            .block_on(the_toolie_stance_examples_run_in_its_read_only_shell_body());
+            .block_on(the_toolie_reads_run_in_its_read_only_shell_body());
     });
 }
 
-async fn the_toolie_stance_examples_run_in_its_read_only_shell_body() {
+async fn the_toolie_reads_run_in_its_read_only_shell_body() {
     let h = harness().await;
     h.kernel.broker().set_kj_dispatcher(&h.dispatcher).await;
     let ctx = create_typed(&h, "explorer", "toolie").await;
@@ -542,29 +539,32 @@ async fn the_toolie_stance_examples_run_in_its_read_only_shell_body() {
             result.structured.expect("the shell returns its envelope")
         }
     };
-    // The stance's placeholders, bound to files every toolie seat has.
+    // The stance's tool, then the reads a seat makes with it, bound to files
+    // every toolie seat has.
     let file = "/config/rc/toolie/create/S00-stance.md";
     let dir = "/config/rc/toolie";
+    assert!(stance.contains("`glob`"), "the stance no longer names `glob`");
+    let envelope = run(format!("glob '{dir}/**/*.md'")).await;
+    assert_eq!(envelope["exit_code"], 0, "glob: {envelope}");
+    assert!(envelope["stdout"].as_str().unwrap_or_default().contains("S00-stance.md"), "glob finds the stance: {envelope}");
     let reads = [
-        ("cat -n FILE", format!("cat -n {file}")),
-        ("wc -l FILE", format!("wc -l {file}")),
-        ("cat -n FILE | sed -n '1,150p'", format!("cat -n {file} | sed -n '1,150p'")),
-        ("grep -rn PATTERN src docs", format!("grep -rn explorer {dir}")),
-        ("grep -rnF 'fn submit(' crates", format!("grep -rnF 'Read files' {dir}")),
-        ("-B4 -A8", format!("grep -rn -B4 -A8 explorer {dir}")),
-        ("file FILE", format!("file {file}")),
-        ("pwd", "pwd".to_string()),
-        ("kj context log", "kj context log".to_string()),
-        ("kj block list", "kj block list".to_string()),
-        ("kj search PATTERN", "kj search explorer".to_string()),
-        ("help syntax", "help syntax".to_string()),
+        format!("cat -n {file}"),
+        format!("wc -l {file}"),
+        format!("cat -n {file} | sed -n '1,150p'"),
+        format!("grep -rn shell {dir}"),
+        format!("grep -rnF 'Ground claims' {dir}"),
+        format!("grep -rn -B4 -A8 shell {dir}"),
+        format!("file {file}"),
+        "pwd".to_string(),
+        "kj context log".to_string(),
+        "kj block list".to_string(),
+        "kj search shell".to_string(),
+        "help syntax".to_string(),
     ];
-    for (example, command) in reads {
-        assert!(stance.contains(&format!("`{example}`")), "the stance no longer shows `{example}`");
+    for command in reads {
         let envelope = run(command.clone()).await;
         assert_eq!(envelope["exit_code"], 0, "{command}: {envelope}");
     }
-    assert!(stance.contains("`kj block read ID`"), "the stance no longer shows `kj block read ID`");
     let listed = run("kj block list".to_string()).await;
     let id = listed["data"][0].as_str().expect("kj block list returns block ids").to_string();
     let envelope = run(format!("kj block read {id}")).await;

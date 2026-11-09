@@ -93,7 +93,7 @@ pub(crate) fn move_missing_cwd(
 ) -> Result<Option<std::path::PathBuf>, String> {
     let stored = read_context_cwd(db, context_id)?;
     if stored.as_deref() != Some(missing) {
-        return Ok(Some(stored.unwrap_or_else(kaish_kernel::home_dir)));
+        return Ok(Some(stored.unwrap_or_else(no_cwd_dir)));
     }
     db.upsert_context_shell(&ContextShellRow {
         context_id,
@@ -154,8 +154,35 @@ pub(crate) fn validate_cwd(cwd: Option<&std::path::Path>) -> Result<(), String> 
     Ok(())
 }
 
+/// Where a context with no cwd runs: the kernel process's working
+/// directory, the place its deployment declares (`WORKDIR /workspace` in
+/// the image, `WorkingDirectory=` in a host service), or the home directory
+/// when that is `/` or cannot be read.
+pub fn no_cwd_dir() -> std::path::PathBuf {
+    no_cwd_dir_from(std::env::current_dir().ok().as_deref(), &kaish_kernel::home_dir())
+}
+
+fn no_cwd_dir_from(process: Option<&std::path::Path>, home: &std::path::Path) -> std::path::PathBuf {
+    match process {
+        Some(dir) if dir.is_absolute() && dir.parent().is_some() => dir.to_path_buf(),
+        _ => home.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A context with no cwd runs where the kernel runs, unless that is `/`
+    /// or unknown; then it runs in the home directory.
+    ///
+    /// Falsified by always answering the home directory.
+    #[test]
+    fn a_context_with_no_cwd_runs_where_the_kernel_runs() {
+        let home = std::path::Path::new("/var/lib/kaijutsu");
+        assert_eq!(no_cwd_dir_from(Some(std::path::Path::new("/workspace")), home), std::path::Path::new("/workspace"));
+        assert_eq!(no_cwd_dir_from(Some(std::path::Path::new("/")), home), home, "`/` is almost always a mistake");
+        assert_eq!(no_cwd_dir_from(None, home), home);
+    }
     use super::*;
     use crate::kj::test_helpers::{register_context, test_dispatcher};
     use kaijutsu_types::PrincipalId;

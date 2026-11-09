@@ -2352,15 +2352,15 @@ set a cwd; `kj fork` checks an inherited cwd; `cd` follows a symlink to a
 directory; a shell result says `[cwd now DIR]` when the call changed it.
 Still open:
 
-4. **A context with no cwd runs its shell in the kernel's `$HOME`**, or in
-   `/tmp` when `HOME` is unset (`runtime/context_shell.rs`). The file tools
-   refuse a missing cwd; the shell does not, and should not: `cd` and `kj
-   context set` run inside the shell being refused, a read-only seat
-   discards `cd`, and kaijutsu-mcp against a remote kernel would lose its
-   shell. A coder created without a cwd is told so by its create
-   orientation. Other context types are not told. Paths that still create
-   one: a create from a context with no cwd (root consoles have none), and
-   a client directory the kernel refused.
+4. **A context with no cwd runs where the kernel runs** (`no_cwd_dir`,
+   `runtime/shell_state.rs`): the process working directory the deployment
+   declares (`/workspace` in the image), or `$HOME` when that is `/`. The
+   shell, the gate's path facts, and the council's house-rules walk use the
+   same rule. Still open: in the image `/workspace` sits under the read-only
+   `/` mount, so a seat there reads but cannot write until a mount makes it
+   writable. Paths that still create a context with no cwd: a create from a
+   context with no cwd (root consoles have none), and a client directory the
+   kernel refused.
 5. **`/` policy: decided and shipped.** Amy, 2026-10-02: "/ should be
    allowed as cwd by kaish, but not by kaijutsu. kaijutsu can make noise
    any time cwd is /, it's almost always a mistake." `/` stays accepted,

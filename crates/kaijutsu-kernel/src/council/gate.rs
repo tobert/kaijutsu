@@ -1880,7 +1880,7 @@ pub(crate) async fn consult(
         SeatRoute::Council(routed, chain) => (routed, chain),
     };
     let council = &routed;
-    let resolve_cwd = cwd.clone().unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
+    let resolve_cwd = cwd.clone().unwrap_or_else(|| crate::runtime::shell_state::no_cwd_dir().to_string_lossy().into_owned());
     let facts = super::shell_case::gather(kernel, caller, context_id, command, &spec.planned, &resolve_cwd).await;
     let submission = Submission {
         command,

@@ -3799,7 +3799,7 @@ esac
         assert!(text.chars().count() < 600, "a two-file directory needs a short block:\n{text}");
     }
 
-    /// Without a context cwd the shell starts in the kernel's own home
+    /// Without a context cwd the shell starts in the kernel's own working
     /// directory, which says nothing about the work. The model is told so,
     /// with the way to set one, instead of an orientation.
     #[test]

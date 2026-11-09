@@ -265,7 +265,7 @@ impl EmbeddedKaish {
                                 "context cwd '{}' no longer exists, and no directory above it except `/` does; \
                                  nothing was run. The context now has no working directory, so the next command \
                                  runs in '{}'. `cd DIR` sets a new one.",
-                                path.display(), kaish_kernel::home_dir().display()),
+                                path.display(), super::shell_state::no_cwd_dir().display()),
                         }
                     }
                 };
@@ -541,7 +541,7 @@ mod tests {
             assert!(!error.contains("now '/'"), "{error}");
             assert_eq!(stored_cwd(&d, ctx), None, "{missing}: the cwd is cleared, not moved to /");
             let kaish = context_shell(&d, ctx, principal).await.expect("a context without a cwd runs");
-            assert_eq!(kaish.cwd().await, kaish_kernel::home_dir());
+            assert_eq!(kaish.cwd().await, crate::runtime::shell_state::no_cwd_dir());
         }
     }
 
@@ -560,7 +560,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: ctx, session: SessionId::new(),
             }, ShellPolicy::Agent, ShellCwd::Captured(pinned.clone()), None, Arc::new(NoopBlockSource)).await.unwrap();
-            let expected = pinned.unwrap_or_else(kaish_kernel::home_dir);
+            let expected = pinned.unwrap_or_else(crate::runtime::shell_state::no_cwd_dir);
             assert_eq!(kaish.cwd().await, expected, "captured state wins, including an unset cwd");
         }
     }

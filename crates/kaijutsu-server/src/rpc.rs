@@ -1322,6 +1322,36 @@ fn bootstrap_discovered_context(
     }
 }
 
+/// The read-write `~/src` mount under `home`, or `None` when `home` has no
+/// `src` directory. A mount over a missing directory lists as `src` and fails
+/// every read of it, so it is skipped with a warning.
+fn home_src_mount(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let src = home.join("src");
+    if src.is_dir() {
+        Some(src)
+    } else {
+        log::warn!("no {} directory; not mounting it", src.display());
+        None
+    }
+}
+
+#[cfg(test)]
+mod home_src_mount_tests {
+    use super::*;
+
+    /// `~/src` is mounted read-write only when it exists. A missing one
+    /// would list as `src` under home and fail every read of it.
+    ///
+    /// Falsified by mounting `~/src` whether or not it exists.
+    #[test]
+    fn home_src_is_mounted_only_when_it_exists() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(home_src_mount(home.path()), None, "a home with no src has no src mount");
+        std::fs::create_dir(home.path().join("src")).unwrap();
+        assert_eq!(home_src_mount(home.path()), Some(home.path().join("src")));
+    }
+}
+
 #[cfg(test)]
 mod context_bootstrap_tests {
     use super::*;
@@ -1744,14 +1774,9 @@ pub async fn create_shared_kernel_in(
         .await;
 
     // Read-write ~/src (longest-prefix wins over /)
-    let home = kaish_kernel::home_dir();
-    let src_dir = home.join("src");
-    kernel
-        .mount(
-            &format!("{}", src_dir.display()),
-            LocalBackend::new(&src_dir),
-        )
-        .await;
+    if let Some(src_dir) = home_src_mount(&kaish_kernel::home_dir()) {
+        kernel.mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir)).await;
+    }
 
     // Read-write /tmp for scratch/interop with external tools.
     // NOTE: tests/vfs_activity_wire.rs depends on this exact mount (it

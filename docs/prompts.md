@@ -302,7 +302,7 @@ program, so it works under any loadout. Sections:
   each cut at 160 characters.
 
 An empty section is omitted. A context with no cwd gets a one-line
-notification instead: its shell starts in the kernel's home directory, and
+notification instead: its shell starts in the kernel's working directory, and
 `cd DIR` in `shell_write` gives it one. The whole block is cut at 6000
 characters and says so. Measured on this repository it is about 2000
 characters; a two-file directory is about 350.

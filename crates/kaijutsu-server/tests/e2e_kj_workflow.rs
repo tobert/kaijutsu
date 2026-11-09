@@ -544,7 +544,8 @@ fn test_shell_cd_and_export_persist_across_commands() {
         let ctx = create_context(&kernel, "cwd-persist-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
-        let target = env!("CARGO_MANIFEST_DIR");
+        // A directory below the crate, where `cargo test` starts the kernel.
+        let target = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
 
         // Baseline: capture the starting cwd so we can prove it actually moves.
         let (_, before, before_status) = shell_exec_wait(&kernel, "pwd", ctx).await;

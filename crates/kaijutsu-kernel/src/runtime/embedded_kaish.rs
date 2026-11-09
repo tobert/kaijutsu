@@ -451,9 +451,7 @@ impl EmbeddedKaish {
             .with_kill_children_on_parent_death(true)
             // Output cap by consumer, not by trust — see `OutputProfile`.
             .with_output_limit(output.to_config());
-        if let Some(root) = project_root {
-            config = config.with_cwd(root);
-        }
+        config = config.with_cwd(project_root.unwrap_or_else(super::shell_state::no_cwd_dir));
 
         // Apply kernel-wide kaish-script default timeout. Per-call sites
         // (rc lifecycle, hook bodies, init scripts) can override via
@@ -1559,8 +1557,8 @@ mod tests {
         let kaish = EmbeddedKaish::new("test-cwd-home", blocks, kernel, None).unwrap();
 
         let cwd = kaish.cwd().await;
-        // KaishConfig::named() sets cwd to home_dir(). We can't control HOME
-        // in parallel tests, so just verify it's a real existing directory.
+        // With no project root the shell starts in `no_cwd_dir()`, which
+        // follows the process cwd; just verify it's a real existing directory.
         assert!(
             cwd.is_dir(),
             "cwd should be an existing directory, got {:?}",

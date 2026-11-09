@@ -272,7 +272,7 @@ impl Default for CouncilSync {
 }
 
 /// The seat's house rules: the first `AGENTS.md` found walking up from its
-/// working directory (the home directory when it has none), read through the
+/// working directory (`no_cwd_dir` when it has none), read through the
 /// kernel VFS, up to one byte past the budget so the projection can mark a
 /// cut. A file that cannot be read, or is not UTF-8, is skipped with a
 /// warning; the decision reads no house-rules context rather than missing.
@@ -285,7 +285,7 @@ async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_rules_tokens
             return None;
         }
     }
-    .unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
+    .unwrap_or_else(|| crate::runtime::shell_state::no_cwd_dir().to_string_lossy().into_owned());
     let limit = u32::try_from(house_rules_tokens.saturating_mul(HOUSE_RULES_BYTES_PER_TOKEN).saturating_add(1)).unwrap_or(u32::MAX);
     for dir in std::path::Path::new(&cwd).ancestors() {
         let path = dir.join("AGENTS.md");
