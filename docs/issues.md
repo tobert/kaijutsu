@@ -6,6 +6,46 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## A submitted draft can come back onto the tui's compose line (2026-11-10)
+
+Two pty tests failed for about twenty minutes and then stopped:
+`ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs` (the
+command ran, the draft stayed) and
+`switching_through_the_picker_loads_the_new_contexts_draft` (the picker
+never closed). They failed on a clean checkout of a commit that had passed,
+so the cause was not that day's edits. An Opus lane traced the first with
+client and server logs. Contributing factors:
+
+- **The draft's late echo is accepted after the submit.** When Enter is
+  pressed before the mirror has seen the draft block, `current_draft_id()`
+  is `None`, so `mark_submitted` records the submit's own block instead
+  (`run/act.rs`, `compose_key`). `Compose::reset` restarts the draft ledger
+  with nothing acknowledged, so the feed's late `BlockInserted` for the
+  draft passes `reconcile_draft` and puts the text back. When the draft is
+  then deleted, `reconcile_draft` returns early for a context with no draft
+  block (`run/feeds.rs`) and the text stays. A player can hit it: type
+  quickly in a new context, most easily a `Ctrl+Z` shell child, and press
+  Enter before the first keystroke has echoed. A second Enter would submit
+  the line again. The lane's unit test for it is in the devlog chapter's
+  commit message and went red; no fix has landed.
+- **The tui's local tasks sometimes do not run for hundreds of
+  milliseconds.** The draft outbox writer, the actor and the RPC system are
+  `spawn_local` tasks inside `local.run_until` (`main.rs`), so they run only
+  when the event loop's future returns pending. In the failing run nothing
+  reached the kernel for 283 ms while five keys were handled. This is what
+  opens the window above. What stalls them is unknown; a `select!` arm that
+  is always ready is one guess, unconfirmed. Load did not predict it: runs
+  passed at load 142 and failed at load 4.
+- **The picker failure is unexplained.** After Enter on the picker row,
+  `switch_seat` never reached the kernel, though the loop was alive. Picker
+  keys are handled before the `kaijutsu_tui::keys` trace, so the log cannot
+  say whether Enter was read. Add the trace to `handle_picker_key`.
+
+The harness now gives each test tui its own XDG directories and prints the
+client log's tail on a failure; `KAIJUTSU_TEST_TUI_LOG` raises the level
+for a run. The test tui had been reading the host's `tui-client-id`, which
+was not the cause.
+
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)
 
 Folds and the reader's block landed in both clients (`docs/tui.md`, "Folds"
@@ -14,31 +54,22 @@ clients are under "Folds: what the app and the terminal client still read
 differently". Nobody has yet looked at either change in a real terminal or
 the running app. Left from the survey:
 
-- **The tui's `asks.rs` is 2,700 lines** with five concerns in one file:
-  keys, render, state, fold and landing, and the desktop notification. It
-  splits the way `run/` did, with no behavior change. `render.rs`, `app.rs`
-  and `present.rs` have smaller splits of the same kind (transcript and
-  band; views, liveness and roster; palette, wrap, ANSI and links).
+- **`render.rs`, `app.rs` and `present.rs` have smaller splits of the same
+  kind as `run/` and `asks/`** (transcript and band; views, liveness and
+  roster; palette, wrap, ANSI and links).
 - **Four tui tests read the `run` module's source as text**
   (`run.rs`'s `module_source`): they find functions by column-0 `fn` text
   and end a body at the first column-0 `}`. A helper turned into a method, or
   a new visibility prefix `top_level_fn_name` does not know, drops out of the
   scan without failing it.
-- **Logic both clients carry.** `follow_target` is the same function in
-  `kaijutsu-app/src/view/sync.rs` and `kaijutsu-tui/src/run/seat.rs`. The ask to
-  tool-call join (`chrome.rs` `waiting_on_asks`, `inflight::ask_index`),
-  short age and count formatting, and the picker's head and tail lines are
-  near copies. `kaijutsu-client` or `kaijutsu-present` is the home; "The `:`
-  line parses vi paths in two places" below is the same kind.
+- **Logic both clients carry.** The ask to tool-call join (`chrome.rs`
+  `waiting_on_asks`, `inflight::ask_index`), short age and count formatting,
+  and the picker's head and tail lines are near copies. `kaijutsu-client` or
+  `kaijutsu-present` is the home. `:kj` is still parsed twice (see "The `:`
+  line parses `:kj` in two places" below).
 - **Two layouts of tool output.** The app lays `OutputData` out with
   `kaijutsu_present::format::compute_output_layout`; the tui has its own
   `layout::layout_output`.
-- **Dead after the app cleanup.** `ActorHandle::cherry_pick_block` and
-  `rpc::cherry_pick_block` in `kaijutsu-client` have no caller since the
-  app's timeline module went; the server RPC remains.
-  `kaijutsu_present::kaish::tokenize`, `SpannedToken` and `TokenKind` have
-  none either. `kaijutsu-app/src/kaish/mod.rs` says both clients validate
-  shell input; the tui does not call `kaish::validate`.
 - **The tui's `:kj` completion draws no popup.** `Tab` rewrites the bar; the
   popup renderer was never called and was deleted. Decide whether the
   candidates should show.
@@ -1228,14 +1259,13 @@ operator and motion) closes the gap. Scrolls other than page and half page
   go to the first line; a settled window height would need a session-level
   size from the client.
 
-## The `:` line parses vi paths in two places (2026-10-12)
+## The `:` line parses `:kj` in two places, and a second `:vi` is undecided (2026-10-12)
 
-`:vi <args>` landed in both clients as the shell statement `vi <args>`. The
-tui's `cmdline::parse` and the app's `colon_vi_statement`
-(`input/compose/mod.rs`) each carry the same rule. Nothing shares the function,
-because the tui does not depend on the app's Bevy stack. Both carry tests for
-the rule. A shared home (`kaijutsu-types` or `kaijutsu-client`) would remove
-the second copy; `:kj` is parsed the same two ways.
+`:vi <args>` is one rule, `kaijutsu_client::vi_statement`. `:kj <args>` is
+still two: the tui's `cmdline::parse` needs `kj` at the start of the line
+followed by one space or the end, and the app's `shell_kj_argv` takes any line
+whose first whitespace-separated word is `kj` (leading spaces and tabs
+included). Both split the argv on whitespace without shell quoting.
 
 Open: what a second `:vi` does while a session is already on screen
 (replace, refuse, or stack). Neither client decides it yet.

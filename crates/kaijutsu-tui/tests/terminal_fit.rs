@@ -1536,6 +1536,24 @@ fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// m2. The client under test shares no state with the host
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The client under test keeps its per-installation state beside its key,
+/// not in the data directory of whoever runs the suite: the client id it
+/// seeds there is the one a real client on the same host would read
+/// (`crates/kaijutsu-tui/src/client_id.rs`).
+#[test]
+fn the_client_under_test_keeps_its_state_out_of_the_host_directories() {
+    let _serial = serial();
+    let (_server, key_dir, mut session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    let seeded = TuiSession::xdg_home(&key_dir.path().join("id_ed25519"), "data").join("kaijutsu").join("tui-client-id");
+    assert!(seeded.is_file(), "no client id was seeded at {}: {}", seeded.display(), session.dump("attached"));
+    quit(&mut session);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // n. The client never asks the terminal where the cursor is
 // ────────────────────────────────────────────────────────────────────────────
 

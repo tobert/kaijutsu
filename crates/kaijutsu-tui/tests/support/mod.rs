@@ -315,9 +315,15 @@ pub struct TuiSession {
     /// BEL`) seen so far. A yank is the only caller, so this is exactly what
     /// went to the clipboard.
     clipboard: Arc<Mutex<Vec<String>>>,
+    /// The client's own log ([`Self::log_path`]); [`Self::dump`] ends with
+    /// its tail.
+    log: PathBuf,
     rows: u16,
     cols: u16,
 }
+
+/// How many lines of the client's log [`TuiSession::dump`] appends.
+const LOG_TAIL_LINES: usize = 40;
 
 /// How much scrollback the parser keeps. Generous relative to what any
 /// probe here prints — a few completed blocks plus the picker's own churn.
@@ -352,10 +358,19 @@ impl TuiSession {
     }
 
     /// Where `--log` sends the client's diagnostics: beside the key, so a
-    /// probe can read what the client recorded about itself. The level is
-    /// `warn` unless the probe raised `RUST_LOG`.
+    /// probe can read what the client recorded about itself, and a failing
+    /// probe's [`Self::dump`] shows its tail. The level is
+    /// `warn,kaijutsu_tui=debug` unless the probe sets `RUST_LOG`, or the run
+    /// sets `KAIJUTSU_TEST_TUI_LOG` for every session.
     pub fn log_path(key_path: &Path) -> PathBuf {
         key_path.with_file_name("tui.log")
+    }
+
+    /// The directory the client under test is given as `XDG_<kind>_HOME`
+    /// (`data`, `state`, `cache`, `config`): beside its key, so nothing it
+    /// reads or seeds is shared with a real client on the same host.
+    pub fn xdg_home(key_path: &Path, kind: &str) -> PathBuf {
+        key_path.with_file_name("xdg").join(kind)
     }
 
     fn spawn_with(
@@ -408,11 +423,27 @@ impl TuiSession {
         // The log goes beside the key rather than into the state directory
         // of whoever runs the suite; a failing probe can read it there.
         cmd.arg("--log");
-        cmd.arg(key_path.with_file_name("tui.log"));
+        cmd.arg(Self::log_path(key_path));
         for arg in args {
             cmd.arg(arg);
         }
-        cmd.env("RUST_LOG", "warn");
+        // `kaijutsu_tui=debug` names the key-path decisions (a submit, a
+        // context watched), so a failing probe's dump says what the client
+        // did. `KAIJUTSU_TEST_TUI_LOG` raises it for a whole run, for
+        // example with `kaijutsu_client=debug`.
+        let level = std::env::var("KAIJUTSU_TEST_TUI_LOG").unwrap_or_else(|_| "warn,kaijutsu_tui=debug".into());
+        cmd.env("RUST_LOG", level);
+        // The client's per-installation state (its client id, log directory,
+        // CAS cache) lives beside the key rather than in the directories of
+        // whoever runs the suite, which a real client on the host shares.
+        for (var, kind) in [
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_CONFIG_HOME", "config"),
+        ] {
+            cmd.env(var, Self::xdg_home(key_path, kind));
+        }
         cmd.env("TERM", "xterm-256color");
         // These probes inspect SGR styling. Individual probes can opt into
         // a monochrome environment through the overrides below.
@@ -480,6 +511,7 @@ impl TuiSession {
             keyboard_off_screen,
             notifications,
             clipboard,
+            log: Self::log_path(key_path),
             rows,
             cols,
         }
@@ -691,6 +723,13 @@ impl TuiSession {
         let mut out = format!("--- {label} ({}x{}) ---\n", self.rows, self.cols);
         for (i, line) in self.screen_text().iter().enumerate() {
             out.push_str(&format!("{i:3} | {line}\n"));
+        }
+        let log = std::fs::read_to_string(&self.log).unwrap_or_else(|e| format!("(unreadable: {e})\n"));
+        let lines: Vec<&str> = log.lines().collect();
+        out.push_str(&format!("--- client log tail ({}) ---\n", self.log.display()));
+        for line in &lines[lines.len().saturating_sub(LOG_TAIL_LINES)..] {
+            out.push_str(line);
+            out.push('\n');
         }
         out
     }
