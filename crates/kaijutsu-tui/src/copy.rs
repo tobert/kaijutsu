@@ -250,7 +250,9 @@ impl Scrolled {
         };
     }
 
-    /// A screen's worth of rows, as the last frame drew it.
+    /// A screen's worth of rows, as the last frame drew it. Tests read it to
+    /// see where a reader was left.
+    #[cfg(test)]
     pub fn page(&self) -> usize {
         self.body_h
     }

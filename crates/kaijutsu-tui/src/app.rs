@@ -18,7 +18,7 @@ use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
 use kaijutsu_client::{DraftOutbox, EditorOutbox};
-use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
+use crate::present::{Palette, WrapCache, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 
 /// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
@@ -231,7 +231,7 @@ pub struct App {
     /// The `kj` command catalog (`get_kj_command_catalog`), fetched once at
     /// connect and cached for `:kj ` completion (`completion.rs`).
     pub kj_catalog: Vec<kaijutsu_client::rpc::KjCommandInfo>,
-    /// The `:kj ` completion popup, when `Tab` has one open.
+    /// The `:kj ` completion candidates, when `Tab` has opened them.
     pub completion: Option<crate::completion::KjCompletion>,
     /// The last `listTracks` answer, refreshed on [`crate::run`]'s
     /// [`REFRESH`](crate::run) cadence — feeds the picker's TRACKS section
@@ -551,37 +551,6 @@ impl App {
             Role::System => "system".to_string(),
             Role::Tool => block.tool_name.clone().unwrap_or_else(|| "tool".to_string()),
             Role::Asset => "asset".to_string(),
-        }
-    }
-
-    /// The view a block renders under. `stamp` is the block's wallclock,
-    /// formatted at the edge (see [`crate::render::wallclock`]).
-    pub fn block_view<'a>(
-        &'a self,
-        block: &'a BlockSnapshot,
-        speaker: &'a str,
-        stamp: &'a str,
-        show_divider: bool,
-    ) -> BlockView<'a> {
-        let ctx = block.id.context_id;
-        let (tool, arg) = tool_header(block);
-        BlockView {
-            speaker,
-            performer: self
-                .info(ctx)
-                .and_then(|c| c.performer.as_deref())
-                .unwrap_or(NO_PERFORMER),
-            stamp,
-            show_divider,
-            tool,
-            arg,
-            lineage: self.lineage_for(block),
-            collapsed: self
-                .views
-                .get(&ctx)
-                .map(|v| v.is_collapsed(block))
-                .unwrap_or_else(|| block.collapsed || collapses_by_default(block.kind)),
-            local_ctx: Some(ctx),
         }
     }
 
@@ -909,6 +878,7 @@ fn model_leaf(model: &str) -> &str {
 mod tests {
     use super::*;
     use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, PrincipalId, Status};
+    use crate::present::BlockView;
 
     fn ctx(label: &str) -> ContextInfo {
         ContextInfo {

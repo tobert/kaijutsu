@@ -62,8 +62,8 @@ pub enum Intent {
     OpenDiff,
     /// `Ctrl+A l` — open the ledger view (`docs/tui.md`, "The ledger").
     OpenLedger,
-    /// Bare `Tab`. Only meaningful when the compose draft starts with `/`
-    /// (`crate::completion`); the caller decides that, not this module —
+    /// Bare `Tab`. Completes the verb when the `:` bar holds `kj ` and a
+    /// partial verb (`crate::completion`); the caller decides that, not this module —
     /// `Keys::interpret` has no view of the compose line.
     Tab,
     /// `Ctrl+A "` / `Ctrl+A w` — open or close the picker
@@ -179,8 +179,9 @@ impl Keys {
             // Everything else belongs to the input region. Control chords go
             // too: `<C-w>` and `<C-r>` are vi keys, and the two this client
             // reserves are already claimed above.
-            // Bare `Tab` is completion when the draft is a `/` command and
-            // compose text otherwise; `run.rs` decides, this module cannot.
+            // Bare `Tab` is completion when the `:` bar holds `kj ` and a
+            // partial verb, and compose text otherwise; `run.rs` decides,
+            // this module cannot.
             KeyCode::Tab if !ctrl => Intent::Tab,
             _ => Intent::InputKey(key),
         }

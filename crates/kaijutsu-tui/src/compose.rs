@@ -281,7 +281,9 @@ impl Compose {
         CursorShape::for_mode(self.editor.mode().as_deref())
     }
 
-    /// Edits sent for this draft and not yet landed.
+    /// Edits sent for this draft and not yet landed. Tests read it to see a
+    /// lost edit settle.
+    #[cfg(test)]
     pub fn edits_in_flight(&self) -> usize {
         self.ledger.in_flight()
     }

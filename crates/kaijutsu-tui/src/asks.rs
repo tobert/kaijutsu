@@ -324,9 +324,6 @@ pub enum RedeemedMark {
     Never,
     /// This exact ask's decision was redeemed once, at this wallclock.
     At(String),
-    /// A standing rule born from this decision has been redeemed this many
-    /// times (`allow always`'s `×3`).
-    Count(u64),
 }
 
 impl RedeemedMark {
@@ -334,7 +331,6 @@ impl RedeemedMark {
         match self {
             Self::Never => "—".to_string(),
             Self::At(when) => format!("redeemed {when}"),
-            Self::Count(n) => format!("redeemed ×{n}"),
         }
     }
 }
@@ -1803,14 +1799,6 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("p1") && l.contains("shell_write")));
         assert!(text.iter().any(|l| l.contains("a1") && l.contains("redeemed 13:58")));
         assert_eq!(text.last().unwrap(), "a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back");
-    }
-
-    #[test]
-    fn a_redeem_count_renders_as_a_multiplier() {
-        let rows = vec![answered("a1", "kaish", RedeemedMark::Count(3))];
-        let lines = render_ledger(&rows, "", 0, 100, &Palette::builtin());
-        let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(text.iter().any(|l| l.contains("redeemed ×3")), "got {text:?}");
     }
 
     #[test]

@@ -71,13 +71,10 @@ impl DiffScreen {
         }
     }
 
-    /// Total rendered rows, for the header's position figure.
+    /// Total rendered rows. Tests read it to check the scroll stops.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.lines.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
     }
 
     /// The body height of the last frame drawn.

@@ -10,9 +10,6 @@
 //! [`KjCompletion`] from `run.rs`, reading `Compose::kj_typed`.
 
 use kaijutsu_client::rpc::KjCommandInfo;
-use ratatui::text::{Line, Span};
-
-use crate::present::Palette;
 
 /// One completion candidate: the bare command name and its one-line help.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,16 +36,12 @@ impl KjCompletion {
     }
 
     /// Advance to the next candidate, wrapping — repeated `Tab` cycles the
-    /// popup instead of leaving it stuck on the first match.
+    /// selection instead of leaving it stuck on the first match.
     pub fn cycle(&mut self) {
         if self.candidates.is_empty() {
             return;
         }
         self.selected = (self.selected + 1) % self.candidates.len();
-    }
-
-    pub fn selected_index(&self) -> usize {
-        self.selected
     }
 }
 
@@ -80,45 +73,6 @@ pub fn accept(name: &str, input_hint_is_empty: bool) -> String {
         format!("kj {name}")
     } else {
         format!("kj {name} ")
-    }
-}
-
-/// The popup: one line per candidate, the selected one highlighted, above
-/// the compose line — `docs/tui.md`'s grown-view treatment does not name
-/// this one explicitly (it rides compose, not a chord), so it stays small: a
-/// handful of rows, never the whole catalog.
-const MAX_ROWS: usize = 8;
-
-pub fn render_popup(completion: &KjCompletion, width: u16, palette: &Palette) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
-    if completion.candidates.is_empty() {
-        return vec![Line::from(Span::styled(
-            format!("  (no command matches :kj {})", completion.prefix),
-            palette.divider(),
-        ))];
-    }
-    completion
-        .candidates
-        .iter()
-        .take(MAX_ROWS)
-        .enumerate()
-        .map(|(i, c)| {
-            let style = if i == completion.selected_index() { palette.warning() } else { palette.status() };
-            let text = clip(&format!("  {}  {}", c.name, c.help), width);
-            Line::from(Span::styled(text, style))
-        })
-        .collect()
-}
-
-fn clip(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        s.to_string()
-    } else if width == 0 {
-        String::new()
-    } else {
-        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -190,27 +144,5 @@ mod tests {
     fn accept_appends_a_trailing_space_only_when_the_command_takes_input() {
         assert_eq!(accept("stage", false), "kj stage ");
         assert_eq!(accept("status", true), "kj status");
-    }
-
-    #[test]
-    fn the_popup_highlights_the_selected_candidate() {
-        let mut completion = complete("", &catalog()).expect("some completion");
-        completion.cycle();
-        let lines = render_popup(&completion, 80, &Palette::builtin());
-        assert_eq!(lines.len(), 3);
-        let text: Vec<String> = lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-            .collect();
-        assert!(text[1].contains("stage"), "got {text:?}");
-    }
-
-    #[test]
-    fn an_empty_match_says_so_in_the_popup() {
-        let completion = complete("zzz", &catalog()).expect("some completion");
-        let lines = render_popup(&completion, 80, &Palette::builtin());
-        assert_eq!(lines.len(), 1);
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("no command matches"), "got {text:?}");
     }
 }

@@ -13,7 +13,7 @@ use kaijutsu_client::start_candidate;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId};
+use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -335,12 +335,6 @@ impl KernelBridge {
             .with_context(|| format!("get_blocks_versioned for {}", context_id.short()))
     }
 
-    /// This client's own principal, which selects its draft block out of the
-    /// mirror.
-    pub async fn principal(&self) -> Result<PrincipalId> {
-        Ok(self.actor.whoami().await.context("whoami")?.principal_id)
-    }
-
     /// The authenticated character identity for this terminal seat.
     pub async fn identity(&self) -> Result<kaijutsu_client::Identity> {
         self.actor.whoami().await.context("whoami")
@@ -392,7 +386,7 @@ impl KernelBridge {
     }
 
     /// The context's authoritative, loadout-filtered `kj` command surface —
-    /// what `completion.rs`'s slash completion offers.
+    /// what `completion.rs`'s `:kj ` completion offers.
     pub async fn kj_command_catalog(
         &self,
         context_id: ContextId,

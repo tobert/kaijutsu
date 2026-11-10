@@ -327,7 +327,7 @@ impl TuiSession {
     /// Spawn `kaijutsu-tui` against `server`, authenticating with the key at
     /// `key_path`, inside a `rows`x`cols` pty.
     pub fn spawn(server: SocketAddr, key_path: &Path, rows: u16, cols: u16) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, 0, &[], &[])
+        Self::spawn_with(server, key_path, rows, cols, &[], &[])
     }
 
     /// Like [`spawn`](Self::spawn), as the root character itself: no
@@ -335,20 +335,20 @@ impl TuiSession {
     /// console, the way a person starts it on a new install.
     #[allow(dead_code)] // Shared helper: not every test binary that compiles `support` uses it.
     pub fn spawn_as_root(server: SocketAddr, key_path: &Path, rows: u16, cols: u16) -> Self {
-        Self::spawn_seat(server, key_path, rows, cols, 0, &[], &[], false)
+        Self::spawn_seat(server, key_path, rows, cols, &[], &[], false)
     }
 
     /// Like [`spawn`](Self::spawn), with extra environment for the binary —
     /// the probe hooks `run.rs` reads at startup (`KAIJUTSU_TUI_PROBE_PANIC`)
     /// and `RUST_LOG`, which raises what reaches [`Self::log_path`].
     pub fn spawn_with_env(server: SocketAddr, key_path: &Path, rows: u16, cols: u16, env: &[(&str, &str)]) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, 0, env, &[])
+        Self::spawn_with(server, key_path, rows, cols, env, &[])
     }
 
     /// Like [`spawn`](Self::spawn), with extra CLI arguments — `--kitty-
     /// keyboard`, for the probes that need the flag on.
     pub fn spawn_with_args(server: SocketAddr, key_path: &Path, rows: u16, cols: u16, args: &[&str]) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, 0, &[], args)
+        Self::spawn_with(server, key_path, rows, cols, &[], args)
     }
 
     /// Where `--log` sends the client's diagnostics: beside the key, so a
@@ -358,42 +358,24 @@ impl TuiSession {
         key_path.with_file_name("tui.log")
     }
 
-    /// Like [`spawn`](Self::spawn), but the cursor starts `newlines` rows
-    /// down the screen when the binary takes over — the shape of launching
-    /// from a shell whose prompt sits mid-screen. A fresh pty starts at
-    /// row 0, so a `sh` wrapper prints the newlines and then `exec`s the
-    /// binary in the same pty.
-    pub fn spawn_after_newlines(
-        server: SocketAddr,
-        key_path: &Path,
-        rows: u16,
-        cols: u16,
-        newlines: u16,
-    ) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, newlines, &[], &[])
-    }
-
     fn spawn_with(
         server: SocketAddr,
         key_path: &Path,
         rows: u16,
         cols: u16,
-        newlines: u16,
         env: &[(&str, &str)],
         args: &[&str],
     ) -> Self {
-        Self::spawn_seat(server, key_path, rows, cols, newlines, env, args, true)
+        Self::spawn_seat(server, key_path, rows, cols, env, args, true)
     }
 
     /// `as_performer`: open `probe` as [`kaijutsu_server::SshServerConfig::EPHEMERAL_PERFORMER`];
     /// otherwise open the root's own console with no `--character`.
-    #[allow(clippy::too_many_arguments)]
     fn spawn_seat(
         server: SocketAddr,
         key_path: &Path,
         rows: u16,
         cols: u16,
-        newlines: u16,
         env: &[(&str, &str)],
         args: &[&str],
         as_performer: bool,
@@ -403,17 +385,7 @@ impl TuiSession {
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .expect("open pty");
 
-        let mut cmd = if newlines == 0 {
-            CommandBuilder::new(env!("CARGO_BIN_EXE_kaijutsu-tui"))
-        } else {
-            let mut cmd = CommandBuilder::new("sh");
-            cmd.arg("-c");
-            cmd.arg(format!(
-                "i=0; while [ \"$i\" -lt {newlines} ]; do echo; i=$((i + 1)); done; exec \"$0\" \"$@\""
-            ));
-            cmd.arg(env!("CARGO_BIN_EXE_kaijutsu-tui"));
-            cmd
-        };
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kaijutsu-tui"));
         cmd.arg("--host");
         cmd.arg(server.ip().to_string());
         cmd.arg("--port");

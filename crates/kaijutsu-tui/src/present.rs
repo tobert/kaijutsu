@@ -321,20 +321,12 @@ pub fn block_version(block: &BlockSnapshot, collapsed: bool) -> u64 {
     v
 }
 
-/// The role divider: `─ claude · coder ────────────────── 14:02:11`, or for
-/// a tool call the pair header `─ claude · shell ─ kj ledger list ─── 14:02:11`
+/// The role divider text: `─ claude · coder ────────────────── 14:02:11`, or
+/// for a tool call the pair header `─ claude · shell ─ kj ledger list ─── 14:02:11`
 /// — who called, the tool, and the one-line argument when the input is one.
-///
-/// One ruled line, never a box: a selection of the text under it pastes
-/// clean.
-pub fn divider_line(view: &BlockView<'_>, width: u16, palette: &Palette) -> Line<'static> {
-    let (text, _) = divider_text(view, width);
-    Line::from(Span::styled(text, palette.divider()))
-}
-
-/// [`divider_line`]'s text, and whether the header carried the whole
-/// argument. `false` when the argument was clipped to fit or the block has
-/// none — the call body then prints, so nothing is lost to the header.
+/// Also whether the header carried the whole argument: `false` when the
+/// argument was clipped to fit or the block has none — the call body then
+/// prints, so nothing is lost to the header.
 pub fn divider_text(view: &BlockView<'_>, width: u16) -> (String, bool) {
     let width = usize::from(width.max(1));
     let tail = format!(" {}", view.stamp);
@@ -814,10 +806,13 @@ impl WrapCache {
         self.entries.retain(|id, _| id.context_id != context_id);
     }
 
+    /// Entries held, for the tests that watch what a release or an edit drops.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1254,8 +1249,7 @@ mod tests {
 
     #[test]
     fn the_divider_names_speaker_performer_and_wallclock() {
-        let line = divider_line(&view(), 60, &Palette::builtin());
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let (text, _) = divider_text(&view(), 60);
         assert_eq!(text.chars().count(), 60, "the rule fills the width");
         assert!(text.starts_with("─ claude · coder ─"), "got {text:?}");
         assert!(text.ends_with(" 14:02:11"), "got {text:?}");
@@ -1263,8 +1257,7 @@ mod tests {
 
     #[test]
     fn a_narrow_divider_keeps_the_identity_over_the_stamp() {
-        let line = divider_line(&view(), 12, &Palette::builtin());
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let (text, _) = divider_text(&view(), 12);
         assert!(text.contains("claude"), "got {text:?}");
         assert!(!text.contains("14:02:11"), "got {text:?}");
     }
