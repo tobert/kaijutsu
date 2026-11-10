@@ -684,7 +684,6 @@ mod tests {
                 x_offset: 18.0,
                 y_offset: 4.0,
                 width: 40.0,
-                height: 12.0,
             },
         );
 

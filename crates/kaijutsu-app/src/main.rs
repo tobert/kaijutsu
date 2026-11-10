@@ -313,8 +313,6 @@ fn main() {
         // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
         .add_plugins(view::editor::EditorPlugin)
         .add_plugins(view::diff_view::DiffViewPlugin)
-        // Timeline navigation - temporal scrubbing through history
-        .add_plugins(ui::timeline::TimelinePlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.toml
         .insert_resource(theme)
         .register_type::<ui::theme::Theme>()

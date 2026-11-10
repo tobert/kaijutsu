@@ -12,7 +12,7 @@
 //! that whole rebuild, including carrying `collapsed` forward across it so a
 //! local toggle survives streaming elsewhere in the document.
 //! `RenderBlockStore` keeps the methods the app calls — `blocks_ordered`,
-//! `block_ids_ordered`, `get_block_snapshot`, `full_text`, `is_empty`,
+//! `block_ids_ordered`, `get_block_snapshot`,
 //! `version`, `set_version`, `principal_id`, `set_collapsed`,
 //! `insert_block`, `insert_from_snapshot`, `rebuild` — over a `Vec` plus an
 //! id-to-index map.
@@ -148,10 +148,6 @@ impl RenderBlockStore {
         self.version = v;
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
     pub fn get_block_snapshot(&self, id: &BlockId) -> Option<BlockSnapshot> {
         self.index.get(id).map(|&i| self.blocks[i].clone())
     }
@@ -165,14 +161,6 @@ impl RenderBlockStore {
 
     pub fn block_ids_ordered(&self) -> Vec<BlockId> {
         self.blocks.iter().map(|b| b.id).collect()
-    }
-
-    pub fn full_text(&self) -> String {
-        self.blocks
-            .iter()
-            .map(|b| b.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
     }
 
     /// Insert a new block authored by this store's principal, after `after`

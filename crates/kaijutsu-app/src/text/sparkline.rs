@@ -28,8 +28,6 @@ use crate::text::msdf::geometry::{GeometryVertex, rect_quad, stroke_line_quad};
 #[derive(Clone, Debug)]
 pub struct SparklineData {
     pub values: Vec<f64>,
-    #[allow(dead_code)] // Phase 2: sparkline labels
-    pub label: Option<String>,
 }
 
 /// Colors for sparkline rendering.
@@ -104,7 +102,6 @@ pub fn try_parse_sparkline(text: &str) -> Option<SparklineData> {
 
     Some(SparklineData {
         values,
-        label: None,
     })
 }
 
@@ -394,7 +391,6 @@ mod tests {
         let input = "```sparkline\n1, 3, 7, 2, 5\n```";
         let data = try_parse_sparkline(input).expect("should parse");
         assert_eq!(data.values, vec![1.0, 3.0, 7.0, 2.0, 5.0]);
-        assert!(data.label.is_none());
     }
 
     #[test]
@@ -474,7 +470,6 @@ mod tests {
     fn build_paths_basic() {
         let data = SparklineData {
             values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(!paths.line.elements().is_empty());
@@ -485,7 +480,6 @@ mod tests {
     fn build_paths_single_value() {
         let data = SparklineData {
             values: vec![42.0],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(!paths.line.elements().is_empty());
@@ -496,7 +490,6 @@ mod tests {
     fn build_paths_empty() {
         let data = SparklineData {
             values: vec![],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(paths.line.elements().is_empty());
@@ -506,7 +499,6 @@ mod tests {
     fn build_paths_flat_values() {
         let data = SparklineData {
             values: vec![5.0, 5.0, 5.0, 5.0],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(!paths.line.elements().is_empty());
@@ -518,7 +510,6 @@ mod tests {
     fn golden_basic_sparkline() {
         let data = SparklineData {
             values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
@@ -529,7 +520,6 @@ mod tests {
     fn golden_single_sparkline() {
         let data = SparklineData {
             values: vec![42.0],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
@@ -540,7 +530,6 @@ mod tests {
     fn golden_flat_sparkline() {
         let data = SparklineData {
             values: vec![5.0, 5.0, 5.0, 5.0],
-            label: None,
         };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
@@ -565,14 +554,14 @@ mod tests {
 
     #[test]
     fn vertices_empty_data_yields_nothing() {
-        let data = SparklineData { values: vec![], label: None };
+        let data = SparklineData { values: vec![] };
         let v = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
         assert!(v.is_empty());
     }
 
     #[test]
     fn vertices_single_value_is_one_dash_quad_no_fill() {
-        let data = SparklineData { values: vec![42.0], label: None };
+        let data = SparklineData { values: vec![42.0] };
         let v = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
         assert_eq!(v.len(), 6, "one quad = two triangles");
         assert!(v.iter().all(|vx| vx.color == LINE), "a lone sample has no fill area");
@@ -588,7 +577,6 @@ mod tests {
     fn vertices_counts_per_lane() {
         let data = SparklineData {
             values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
-            label: None,
         };
         let with_fill =
             build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
@@ -608,7 +596,6 @@ mod tests {
     fn vertices_stroke_quads_recover_data_points() {
         let data = SparklineData {
             values: vec![2.0, 9.0, 3.0],
-            label: None,
         };
         let (w, h, pad) = (80.0_f32, 20.0_f32, 2.0_f32);
         let v = build_sparkline_vertices(&data, w, h, pad, (0.0, 0.0), LINE, None);
@@ -638,7 +625,6 @@ mod tests {
     fn vertices_fill_trapezoids_span_points_to_baseline() {
         let data = SparklineData {
             values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
-            label: None,
         };
         let (w, h, pad) = (80.0_f32, 20.0_f32, 2.0_f32);
         let v = build_sparkline_vertices(&data, w, h, pad, (0.0, 0.0), LINE, Some(FILL));
@@ -662,7 +648,6 @@ mod tests {
     fn vertices_offset_shifts_everything() {
         let data = SparklineData {
             values: vec![1.0, 3.0, 7.0, 2.0],
-            label: None,
         };
         let base = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
         let moved =
@@ -681,7 +666,7 @@ mod tests {
     #[test]
     fn vertices_finite_for_degenerate_inputs() {
         for values in [vec![5.0, 5.0, 5.0], vec![0.0], vec![-3.0, -3.0]] {
-            let data = SparklineData { values, label: None };
+            let data = SparklineData { values };
             let v = build_sparkline_vertices(&data, 80.0, 20.0, 2.0, (0.0, 0.0), LINE, Some(FILL));
             for vx in &v {
                 assert!(

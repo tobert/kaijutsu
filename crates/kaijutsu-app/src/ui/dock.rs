@@ -48,7 +48,6 @@ impl DockSparkline {
         Self {
             data: SparklineData {
                 values: Vec::with_capacity(capacity),
-                label: None,
             },
             capacity,
         }
@@ -295,20 +294,6 @@ pub(crate) fn measure_text(text: &str, font_size: f32, font: &VelloFont) -> f64 
     };
     let layout = font.layout(text, &style, VelloTextAlign::Left, None);
     layout.width() as f64
-}
-
-/// Measure text width, falling back to a heuristic if no font is available.
-#[allow(dead_code)] // Available for use when font hasn't loaded yet
-fn measure_text_or_heuristic(text: &str, font_size: f32, font: Option<&VelloFont>) -> f64 {
-    if text.is_empty() {
-        return 0.0;
-    }
-    if let Some(f) = font {
-        measure_text(text, font_size, f)
-    } else {
-        // Heuristic: monospace at given size ≈ 0.6 * font_size per char
-        text.len() as f64 * font_size as f64 * 0.6
-    }
 }
 
 /// Append a dock sparkline at `(x, y)` as flat-colored triangles — drawn into

@@ -81,17 +81,11 @@ pub enum RichContentKind {
         width: f32,
         /// Original SVG height (for aspect-ratio scaling).
         height: f32,
-        /// Raw SVG source, retained for diagnostics / future re-parse.
-        #[allow(dead_code)] // Not read yet — kept for error-path diagnostics.
-        source: Arc<String>,
     },
     /// ABC music notation — rendered via MSDF glyphs + flat-colored
     /// geometry from engraving IR (see `text::msdf::music_bridge`), not
     /// Vello.
     Abc {
-        /// Raw ABC source text.
-        #[allow(dead_code)] // Retained for re-parse / source inspection; render uses `tune`.
-        source: Arc<String>,
         /// Parsed AST (avoids re-parsing on resize).
         tune: Arc<kaijutsu_abc::Tune>,
     },
@@ -409,7 +403,7 @@ fn try_parse_svg(
     text: &str,
     svg_fontdb: Option<&super::SvgFontDb>,
     is_streaming: bool,
-) -> Option<(Arc<usvg::Tree>, f32, f32, Arc<String>)> {
+) -> Option<(Arc<usvg::Tree>, f32, f32)> {
     let svg_str = if text.trim_start().starts_with("<svg") {
         text.trim()
     } else { extract_fenced_block(text, "svg")? };
@@ -447,8 +441,7 @@ fn try_parse_svg(
                 );
                 return None;
             }
-            let source = Arc::new(svg_str.to_string());
-            Some((Arc::new(tree), size.width(), size.height(), source))
+            Some((Arc::new(tree), size.width(), size.height()))
         }
         Err(e) => {
             if is_streaming {
@@ -582,7 +575,7 @@ pub fn detect_rich_content_typed(
     // If content type is declared, use it directly
     match content_type {
         ContentType::Svg => {
-            if let Some((tree, width, height, source)) =
+            if let Some((tree, width, height)) =
                 try_parse_svg(text, svg_fontdb, is_streaming)
             {
                 return Some(RichContent {
@@ -590,7 +583,6 @@ pub fn detect_rich_content_typed(
                         tree,
                         width,
                         height,
-                        source,
                     },
                 });
             }
@@ -619,7 +611,6 @@ pub fn detect_rich_content_typed(
                 .unwrap_or_default();
             return Some(RichContent {
                 kind: RichContentKind::Abc {
-                    source: Arc::new(text.to_string()),
                     tune: Arc::new(tune),
                 },
             });
@@ -659,13 +650,12 @@ pub fn detect_rich_content_typed(
     }
 
     // Try SVG
-    if let Some((tree, width, height, source)) = try_parse_svg(text, svg_fontdb, is_streaming) {
+    if let Some((tree, width, height)) = try_parse_svg(text, svg_fontdb, is_streaming) {
         return Some(RichContent {
             kind: RichContentKind::Svg {
                 tree,
                 width,
                 height,
-                source,
             },
         });
     }

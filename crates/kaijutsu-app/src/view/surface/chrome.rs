@@ -212,7 +212,7 @@ impl BlockChromeCache {
         self.container_width
     }
 
-    #[allow(dead_code)] // Model accessor, exercised by tests and diagnostics.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
@@ -221,7 +221,6 @@ impl BlockChromeCache {
     // instance tests moved to building the cache through `chrome_cache`; kept
     // because the surface's other test modules reach for the same shape.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn insert_for_test(&mut self, id: BlockId, chrome: BlockChrome) {
         self.blocks.insert(id, chrome);
     }
@@ -380,12 +379,8 @@ pub fn waiting_on_asks(open: &[kaijutsu_types::AskSummary]) -> std::collections:
 
 /// Border kind, as the shader's `BK_*` constants. Same numbering as
 /// `block_fx.wesl` so the two shaders can be read side by side.
-// The shader's `BK_NONE`: a block with no border never reaches the instance
-// buffer at all, so nothing on this side emits it. It stays for parity with
-// `surface_chrome.wgsl`'s constant block — a gap in the numbering would make
-// the two impossible to read side by side.
-#[allow(dead_code)]
-pub const CHROME_KIND_NONE: u32 = 0;
+// The shader's `BK_NONE` (0) has no Rust counterpart: a block with no border
+// never reaches the instance buffer at all, so nothing on this side emits it.
 pub const CHROME_KIND_FULL: u32 = 1;
 pub const CHROME_KIND_TOP_ACCENT: u32 = 2;
 pub const CHROME_KIND_DASHED: u32 = 3;

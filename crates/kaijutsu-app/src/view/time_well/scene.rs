@@ -508,10 +508,7 @@ pub struct StationCenterPlacement {
 /// PRODUCTION placement by [`STATION_CENTER_PLACEMENT`] (Slice C) — kept
 /// alive for its own `placement_*` no-op tests below, the same role
 /// `IDENTITY_PLACEMENT`-shaped constants play as a baseline proof elsewhere.
-/// `#[allow(dead_code)]`: its only reachable caller now is `#[cfg(test)]`
-/// code, which a plain `cargo build` doesn't compile — not unused in
-/// `cargo test`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub const IDENTITY_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
     translation: Vec3::ZERO,
     scale: 1.0,

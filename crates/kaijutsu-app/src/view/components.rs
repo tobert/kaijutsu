@@ -44,31 +44,6 @@ pub struct ViewingConversation {
 }
 
 // ============================================================================
-// CURSOR TYPES
-// ============================================================================
-
-/// Cursor position within a block document.
-#[derive(Debug, Clone, Default, Reflect)]
-#[allow(dead_code)]
-pub struct BlockCursor {
-    /// Which block the cursor is in.
-    #[reflect(ignore)]
-    pub block_id: Option<BlockId>,
-    /// Character offset within the block.
-    pub offset: usize,
-}
-
-impl BlockCursor {
-    /// Create a cursor at a specific position.
-    pub fn at(block_id: BlockId, offset: usize) -> Self {
-        Self {
-            block_id: Some(block_id),
-            offset,
-        }
-    }
-}
-
-// ============================================================================
 // CELL EDITOR COMPONENT
 // ============================================================================
 
@@ -84,13 +59,9 @@ impl BlockCursor {
 /// Note: Not reflectable due to `RenderBlockStore` lacking Default.
 /// Use query filters to find CellEditor entities instead of BRP inspection.
 #[derive(Component)]
-#[allow(dead_code)]
 pub struct CellEditor {
     /// Block store - local render buffer.
     pub store: RenderBlockStore,
-
-    /// Cursor position within the document.
-    pub cursor: BlockCursor,
 }
 
 impl Default for CellEditor {
@@ -104,15 +75,14 @@ impl CellEditor {
     pub fn new() -> Self {
         Self {
             store: RenderBlockStore::new(ContextId::new(), PrincipalId::new()),
-            cursor: BlockCursor::default(),
         }
     }
 
     /// Builder: set initial text content (creates a single text block).
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
-        if !text.is_empty()
-            && let Ok(block_id) = self.store.insert_block(
+        if !text.is_empty() {
+            let _ = self.store.insert_block(
                 None,
                 None,
                 Role::User,
@@ -120,9 +90,7 @@ impl CellEditor {
                 &text,
                 Status::Done,
                 ContentType::Plain,
-            )
-        {
-            self.cursor = BlockCursor::at(block_id, text.len());
+            );
         }
         self
     }
@@ -130,12 +98,6 @@ impl CellEditor {
     // =========================================================================
     // TEXT ACCESS
     // =========================================================================
-
-    /// Get the full text content (concatenation of all blocks).
-    #[allow(dead_code)]
-    pub fn text(&self) -> String {
-        self.store.full_text()
-    }
 
     /// Get the current document version.
     pub fn version(&self) -> u64 {
@@ -148,12 +110,6 @@ impl CellEditor {
     /// version alone can't report.
     pub fn store_generation(&self) -> u64 {
         self.store.generation()
-    }
-
-    /// Check if the editor has any blocks.
-    #[allow(dead_code)]
-    pub fn has_blocks(&self) -> bool {
-        !self.store.is_empty()
     }
 
     /// Get blocks in order.
@@ -214,15 +170,8 @@ pub struct FocusTarget {
 
 impl FocusTarget {
     /// Check if a specific block is focused.
-    #[allow(dead_code)]
     pub fn is_block_focused(&self, block_id: &BlockId) -> bool {
         self.block_id.as_ref() == Some(block_id)
-    }
-
-    /// Clear all focus state.
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.block_id = None;
     }
 
     /// Set focus to a block (for j/k navigation).

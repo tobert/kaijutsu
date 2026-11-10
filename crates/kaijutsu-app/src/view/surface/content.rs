@@ -263,11 +263,6 @@ impl BlockContentCache {
         self.blocks.len()
     }
 
-    #[allow(dead_code)] // Symmetry with `len`; the extractor will want it.
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
     /// Drop one block, simulating the document removing it. Test-only:
     /// `super::shape_cache`'s retain-on-drop bookkeeping (`shaped.len() >
     /// content.len()`) needs the content cache to shrink out from under an

@@ -12,9 +12,7 @@
 use bevy::prelude::*;
 use std::path::Path;
 
-use crate::input::binding::Binding;
 use crate::input::bindings_config;
-use crate::input::defaults::default_bindings;
 use crate::ui::theme::Theme;
 use crate::view::components::GlobalErrorQueue;
 
@@ -33,16 +31,13 @@ pub struct StartupConfigErrors(pub Vec<String>);
 /// problem without the app refusing to launch.
 pub struct AppConfig {
     pub theme: Theme,
-    #[allow(dead_code)]
-    pub bindings: Vec<Binding>,
     pub errors: Vec<String>,
 }
 
-/// Load bindings from user config.
+/// Load app config and collect its errors.
 ///
-/// Reads `bindings.toml` from `~/.config/kaijutsu/` (merged over the
-/// built-in defaults). The theme never touches host disk: it starts on
-/// `Theme::default()` and the kernel-owned `theme.toml` arrives over RPC on
+/// Checks `bindings.toml` in `~/.config/kaijutsu/` for errors. The theme
+/// never touches host disk: it starts on `Theme::default()` and the kernel-owned `theme.toml` arrives over RPC on
 /// connect. File-level and per-entry errors are accumulated in
 /// `AppConfig::errors`; good values still load and the app continues to boot.
 pub fn load_app_config() -> AppConfig {
@@ -50,7 +45,6 @@ pub fn load_app_config() -> AppConfig {
         info!("No config directory available, using defaults for theme and bindings");
         return AppConfig {
             theme: Theme::default(),
-            bindings: default_bindings(),
             errors: Vec::new(),
         };
     };
@@ -58,13 +52,11 @@ pub fn load_app_config() -> AppConfig {
     let mut errors = Vec::new();
     // Theme is kernel-owned and fetched over RPC on connect; start on the default.
     let theme = Theme::default();
-    let bindings = load_bindings_toml(&config_dir, &mut errors);
+    // `InputMap` loads the bindings themselves; this pass only surfaces
+    // the load errors through `StartupConfigErrors`.
+    report_bindings_toml_errors(&config_dir, &mut errors);
 
-    AppConfig {
-        theme,
-        bindings,
-        errors,
-    }
+    AppConfig { theme, errors }
 }
 
 /// Drain `StartupConfigErrors` into `GlobalErrorQueue` so users see
@@ -83,7 +75,7 @@ pub fn drain_startup_errors(
     }
 }
 
-fn load_bindings_toml(config_dir: &Path, errors: &mut Vec<String>) -> Vec<Binding> {
+fn report_bindings_toml_errors(config_dir: &Path, errors: &mut Vec<String>) {
     let bindings_path = config_dir.join("bindings.toml");
     match bindings_config::load_bindings_from_path(&bindings_path) {
         Ok(loaded) => {
@@ -91,12 +83,10 @@ fn load_bindings_toml(config_dir: &Path, errors: &mut Vec<String>) -> Vec<Bindin
                 error!("bindings.toml: {entry_err}");
                 errors.push(format!("bindings.toml: {entry_err}"));
             }
-            loaded.bindings
         }
         Err(e) => {
             error!("{e}");
             errors.push(e.to_string());
-            default_bindings()
         }
     }
 }

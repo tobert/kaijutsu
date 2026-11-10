@@ -277,7 +277,7 @@ fn premultiplied_target() -> ColorTargetState {
 /// Deliberately has no Rust caller — the GPU does this at draw time. It exists
 /// so the formula is *testable*, which is the only way a shader line that
 /// decides whether text swims can be pinned at all.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn snap_baseline_phys(doc_y: f32, scroll: f32, scale: f32) -> f32 {
     ((doc_y - scroll) * scale).round()
 }

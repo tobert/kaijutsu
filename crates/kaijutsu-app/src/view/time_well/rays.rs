@@ -432,12 +432,11 @@ pub fn sync_track_rays(
 /// `state.ray_entities.len() == state.tracks.len()` guard) doesn't compare
 /// against dangling entity ids and skip the respawn.
 ///
-/// No production caller left as of Slice D (`Screen::TimeWell`'s `OnExit`
-/// registration, its only caller, is gone — `arm_well` covers the same
-/// clearing duty on room re-entry via `clear_ray_entities` directly); kept
-/// for the `rays_respawn_after_exit_even_with_an_unchanged_roster` test
-/// below, which calls it directly to simulate the old exit path.
-#[allow(dead_code)] // only reachable from the test below (see doc above)
+/// Test-only: `arm_well` covers the same clearing duty on room re-entry via
+/// `clear_ray_entities` directly; the
+/// `rays_respawn_after_exit_even_with_an_unchanged_roster` test calls this to
+/// simulate the old exit path.
+#[cfg(test)]
 pub fn despawn_track_rays(mut state: ResMut<WellTracks>) {
     state.clear_ray_entities();
 }

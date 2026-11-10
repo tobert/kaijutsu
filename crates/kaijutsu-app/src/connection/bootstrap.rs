@@ -33,7 +33,6 @@ pub enum BootstrapCommand {
 }
 
 /// Result sent from bootstrap thread → Bevy.
-#[allow(dead_code)]
 pub enum BootstrapResult {
     /// Actor spawned successfully.
     ActorReady {
@@ -42,9 +41,6 @@ pub enum BootstrapResult {
         kernel_id: Option<KernelId>,
         context_id: Option<ContextId>,
     },
-    /// Spawn failed (e.g. initial SSH connect failure).
-    /// The actor will retry internally, but we report the first error.
-    Error(String),
 }
 
 /// Channel pair for Bevy ↔ bootstrap thread communication.

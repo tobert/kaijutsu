@@ -383,11 +383,6 @@ impl SvgRasterCache {
         self.entries.is_empty()
     }
 
-    #[allow(dead_code)] // Model accessor for tests and diagnostics.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Whether a raster for `(version, physical)` is already held — the
     /// staleness rule, split out so it can be tested without a GPU or an
     /// asset server.
@@ -650,7 +645,6 @@ mod tests {
                 tree: svg_tree(),
                 width: 100.0,
                 height: 50.0,
-                source: Arc::new(String::new()),
             },
             "",
             400.0,
@@ -672,7 +666,6 @@ mod tests {
 
         let wide = shape_one(
             &RichContentKind::Abc {
-                source: Arc::new(String::new()),
                 tune: tune.clone(),
             },
             "",
@@ -685,7 +678,6 @@ mod tests {
         // Half the column, same tune: scale-to-fit means half the height.
         let narrow = shape_one(
             &RichContentKind::Abc {
-                source: Arc::new(String::new()),
                 tune,
             },
             "",

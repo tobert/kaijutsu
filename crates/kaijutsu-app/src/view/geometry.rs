@@ -68,13 +68,6 @@ pub struct GeomRow {
     pub collapsed: bool,
     /// Indent level (parent nesting).
     pub indent_level: u32,
-    /// Document version when this row was first created.
-    ///
-    /// Write-only outside this module's tests: nothing dims blocks by
-    /// timeline position. Kept because it costs nothing to carry and is what
-    /// a timeline-dimming implementation would read first.
-    #[allow(dead_code)]
-    pub created_at_version: u64,
 }
 
 /// Inputs captured from a `BlockSnapshot` for a row the geometry has never
@@ -220,7 +213,6 @@ impl ConversationGeometry {
     /// structure changes without any offset moving (a row is replaced by one
     /// of identical height, so every prefix sum and the content height come
     /// out the same while the row → block mapping is different).
-    #[allow(dead_code)] // Model accessor; exercised by tests, no prod caller yet.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -241,7 +233,6 @@ impl ConversationGeometry {
     ///
     /// Offsets must be current — call after
     /// [`recompute_offsets`](Self::recompute_offsets).
-    #[allow(dead_code)] // Model accessor; exercised by tests, no prod caller yet.
     pub fn visible_rows(&self, top: f32, height: f32, slack: f32) -> std::ops::Range<usize> {
         debug_assert!(
             !self.dirty,
@@ -261,7 +252,6 @@ impl ConversationGeometry {
 
     /// Look up the header row preceding block `id`, if that block starts a
     /// role run.
-    #[allow(dead_code)] // Model accessor; exercised by tests, no prod caller yet.
     pub fn header_row(&self, id: &BlockId) -> Option<&GeomRow> {
         let &i = self.block_index.get(id)?;
         if i == 0 {
@@ -344,7 +334,6 @@ impl ConversationGeometry {
                         kind: seed.kind,
                         collapsed: seed.collapsed,
                         indent_level,
-                        created_at_version: doc_version,
                     }
                 }
             };
@@ -368,7 +357,6 @@ impl ConversationGeometry {
                         kind: block_row.kind,
                         collapsed: false,
                         indent_level: 0,
-                        created_at_version: doc_version,
                     });
                     rows.push(header);
                 }
@@ -779,7 +767,6 @@ mod tests {
             ]
         );
         assert!(g.rows().iter().all(|r| r.measured_version == 0));
-        assert!(g.rows().iter().all(|r| r.created_at_version == 7));
     }
 
     #[test]
@@ -824,10 +811,6 @@ mod tests {
         let row = g.block_row(&bid(1)).unwrap();
         assert_eq!(row.height, 123.0);
         assert_eq!(row.measured_version, 5);
-        // Creation stamp also survives.
-        assert_eq!(row.created_at_version, 1);
-        // The new block is an estimate stamped with the new version.
-        assert_eq!(g.block_row(&bid(3)).unwrap().created_at_version, 6);
     }
 
     #[test]

@@ -43,7 +43,6 @@ pub enum WritingDirection {
     #[default]
     Horizontal,
     /// Vertical right-to-left (日本語 tategaki)
-    #[allow(dead_code)] // Phase 4: vertical nihongo compose pane
     VerticalRl,
 }
 
@@ -54,7 +53,6 @@ pub enum PaneContent {
     /// A conversation view bound to a document.
     Conversation { document_id: String },
     /// A text file editor.
-    #[allow(dead_code)] // Phase 4: tab containers for stacking views
     Editor { path: String },
 
     // ── Inputs ─────────────────────────────────────────────────────────
@@ -65,7 +63,6 @@ pub enum PaneContent {
         writing_direction: WritingDirection,
     },
     /// Kaish shell input.
-    #[allow(dead_code)] // Phase 4: shell pane content type
     Shell,
 
     // ── Layout ────────────────────────────────────────────────────────
@@ -74,11 +71,6 @@ pub enum PaneContent {
 }
 
 impl PaneContent {
-    /// Whether this content type is a conversation view.
-    #[allow(dead_code)] // used in tests + future per-pane dispatch
-    pub fn is_conversation(&self) -> bool {
-        matches!(self, PaneContent::Conversation { .. })
-    }
 }
 
 // ============================================================================
@@ -147,20 +139,6 @@ impl TileNode {
         }
     }
 
-    /// Recursively collect all PaneIds in this subtree.
-    #[allow(dead_code)] // used in tests
-    pub fn collect_ids(&self, out: &mut Vec<PaneId>) {
-        out.push(self.id());
-        match self {
-            TileNode::Split { children, .. } => {
-                for child in children {
-                    child.collect_ids(out);
-                }
-            }
-            TileNode::Leaf { .. } => {}
-        }
-    }
-
     /// Find a node by PaneId (immutable).
     pub fn find(&self, target: PaneId) -> Option<&TileNode> {
         if self.id() == target {
@@ -221,18 +199,6 @@ impl TileNode {
         let mut out = Vec::new();
         self.collect_conversations(&mut out);
         out
-    }
-
-    /// Check if this subtree contains a pane with the given ID.
-    #[allow(dead_code)] // used in tests
-    pub fn contains_pane(&self, target: PaneId) -> bool {
-        if self.id() == target {
-            return true;
-        }
-        match self {
-            TileNode::Split { children, .. } => children.iter().any(|c| c.contains_pane(target)),
-            TileNode::Leaf { .. } => false,
-        }
     }
 
     /// Find the first conversation PaneId in this subtree (depth-first).
@@ -525,81 +491,6 @@ impl TilingTree {
         true
     }
 
-    /// Swap two conversation groups in the tree.
-    ///
-    /// PaneIds travel with content — the two groups exchange positions
-    /// in the tree while keeping their identities. Works for siblings
-    /// in the same split or groups in different splits.
-    #[allow(dead_code)] // Phase 2: Mod+Shift+hjkl will wire this up
-    pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
-        // Find both nodes' parents
-        let Some((parent_a, idx_a)) = self.root.find_parent(a) else {
-            return false;
-        };
-        let Some((parent_b, idx_b)) = self.root.find_parent(b) else {
-            return false;
-        };
-
-        if parent_a == parent_b {
-            // Siblings: swap in place within the same children vec
-            let parent = match self.root.find_mut(parent_a) {
-                Some(p) => p,
-                None => return false,
-            };
-            if let TileNode::Split {
-                children, ratios, ..
-            } = parent
-            {
-                if idx_a < children.len() && idx_b < children.len() {
-                    children.swap(idx_a, idx_b);
-                    ratios.swap(idx_a, idx_b);
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        } else {
-            // Different parents: clone both nodes, then replace via parents.
-            // We must not use find_mut(b) after mutating a's slot, because
-            // find_mut does DFS and could match the node we just placed.
-            let node_a = match self.root.find(a) {
-                Some(n) => n.clone(),
-                None => return false,
-            };
-            let node_b = match self.root.find(b) {
-                Some(n) => n.clone(),
-                None => return false,
-            };
-
-            // Replace a's slot with b's clone via parent_a
-            if let Some(TileNode::Split { children, .. }) = self.root.find_mut(parent_a) {
-                if idx_a < children.len() {
-                    children[idx_a] = node_b;
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-
-            // Replace b's slot with a's clone via parent_b
-            // Safe: parent_a != parent_b, so the first mutation didn't affect parent_b's children
-            if let Some(TileNode::Split { children, .. }) = self.root.find_mut(parent_b) {
-                if idx_b < children.len() {
-                    children[idx_b] = node_a;
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-
-        self.bump_structural();
-        true
-    }
-
     /// Move focus in a spatial direction.
     ///
     /// Walks up from the focused pane to find a Split with the matching
@@ -798,13 +689,12 @@ impl TilingTree {
     // ════════════════════════════════════════════════════════════════════
 
     /// Find the first conversation pane (by tree order).
-    #[allow(dead_code)] // used in tests + Phase 3 preset loading
+    #[cfg(test)]
     pub fn first_conversation_pane(&self) -> Option<PaneId> {
         self.root.conversation_panes().first().map(|(id, _)| *id)
     }
 
     /// Update the document_id for a conversation pane.
-    #[allow(dead_code)] // used in tests + context join wiring
     pub fn set_conversation_document(&mut self, pane: PaneId, document_id: &str) {
         if let Some(node) = self.root.find_mut(pane)
             && let TileNode::Leaf {
@@ -821,7 +711,7 @@ impl TilingTree {
     }
 
     /// Get the document_id for the focused pane (if it's a Conversation).
-    #[allow(dead_code)] // used in tests + context join wiring
+    #[cfg(test)]
     pub fn focused_conversation_document(&self) -> Option<&str> {
         let node = self.root.find(self.focused)?;
         match node {
@@ -951,18 +841,6 @@ mod tests {
         let tree = TilingTree::default_layout();
         let found = tree.root.find(tree.focused);
         assert!(found.is_some(), "Should find the focused pane");
-    }
-
-    #[test]
-    fn collect_all_ids() {
-        let tree = TilingTree::default_layout();
-        let mut ids = Vec::new();
-        tree.root.collect_ids(&mut ids);
-        // Default layout is a single conversation leaf (docks are in DockPlugin now)
-        assert_eq!(ids.len(), 1, "Default layout should have one node");
-        // All IDs should be unique
-        let deduped: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(ids.len(), deduped.len(), "All PaneIds should be unique");
     }
 
     #[test]
@@ -1144,14 +1022,6 @@ mod tests {
 
     // ── contains_pane tests ─────────────────────────────────────────
 
-    #[test]
-    fn contains_pane_finds_nested() {
-        let tree = TilingTree::default_layout();
-        let conv = tree.first_conversation_pane().unwrap();
-        assert!(tree.root.contains_pane(conv));
-        assert!(!tree.root.contains_pane(PaneId(9999)));
-    }
-
     // ── Generation split tests ─────────────────────────────────────
 
     #[test]
@@ -1219,73 +1089,6 @@ mod tests {
     }
 
     // ── Swap tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn swap_cross_parent() {
-        // Create a layout with 3 panes: split conv1 horizontally, then split conv2 vertically
-        // This gives us panes in different parent Splits.
-        let mut tree = TilingTree::default_layout();
-        let conv1 = tree.first_conversation_pane().unwrap();
-        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
-        let conv3 = tree.split(conv2, SplitDirection::Column).unwrap();
-
-        // conv2 and conv3 share a parent (Column split), conv1 is in a different parent (Row split)
-        // Swap conv1 and conv3 (cross-parent)
-        let gen_before = tree.structural_gen;
-        assert!(tree.swap(conv1, conv3), "Cross-parent swap should succeed");
-        assert!(
-            tree.structural_gen > gen_before,
-            "Swap should bump structural_gen"
-        );
-
-        // After swap, both panes should still be findable in the tree
-        assert!(
-            tree.root.find(conv1).is_some(),
-            "conv1 should still exist after swap"
-        );
-        assert!(
-            tree.root.find(conv3).is_some(),
-            "conv3 should still exist after swap"
-        );
-        assert!(
-            tree.root.find(conv2).is_some(),
-            "conv2 should be unaffected"
-        );
-
-        // All three conversations should still exist
-        let convs = tree.root.conversation_panes();
-        assert_eq!(
-            convs.len(),
-            3,
-            "Should still have 3 conversations after swap"
-        );
-
-        // All IDs should be unique (no corruption from DFS collision)
-        let mut ids = Vec::new();
-        tree.root.collect_ids(&mut ids);
-        let deduped: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(
-            ids.len(),
-            deduped.len(),
-            "All PaneIds should remain unique after swap"
-        );
-    }
-
-    #[test]
-    fn swap_siblings() {
-        let mut tree = TilingTree::default_layout();
-        let conv1 = tree.first_conversation_pane().unwrap();
-        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
-
-        assert!(tree.swap(conv1, conv2), "Sibling swap should succeed");
-
-        let convs = tree.root.conversation_panes();
-        assert_eq!(
-            convs.len(),
-            2,
-            "Should still have 2 conversations after swap"
-        );
-    }
 
     // ── Close focuses neighbor test ───────────────────────────────────
 

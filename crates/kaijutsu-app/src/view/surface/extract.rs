@@ -234,7 +234,7 @@ impl SurfaceGpuBuffers {
     }
 
     /// Allocated capacity in instances (0 when never allocated).
-    #[allow(dead_code)] // Buffer-growth accessor for tests and diagnostics.
+    #[cfg(test)]
     pub fn capacity(&self, surface: Entity) -> usize {
         self.entries.get(&surface).map_or(0, |e| e.capacity)
     }

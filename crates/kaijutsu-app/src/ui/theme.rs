@@ -117,7 +117,6 @@ impl AnsiColors {
 /// Syntax highlighting colors for kaish shell input.
 ///
 /// Defaults are derived from the ANSI palette (Tokyo Night).
-#[allow(dead_code)] // Phase 4: syntax highlighting via Parley spans
 #[derive(Clone, Debug, Reflect)]
 pub struct SyntaxColors {
     pub keyword: Color,     // if, for, fn, while
@@ -140,7 +139,6 @@ pub struct SyntaxColors {
 /// to vim-style mode colors and cursor colors.
 #[derive(Resource, Clone, Reflect)]
 #[reflect(Resource)]
-#[allow(dead_code)]
 pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Base UI colors
@@ -232,7 +230,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Syntax highlighting (kaish shell input) — Phase 4: per-span styling via Parley
     // ═══════════════════════════════════════════════════════════════════════
-    #[allow(dead_code)]
     pub syntax: SyntaxColors,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1020,29 +1017,6 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
         theme.label_pad = td.label_pad;
 
         theme
-    }
-}
-
-/// Map a provider string to an agent color from the theme.
-///
-/// Uses substring matching: "anthropic" or "claude" → claude color, etc.
-/// Returns `agent_color_default` for unknown providers.
-#[allow(dead_code)] // Provider→color mapping; not yet wired to participant rendering (time-well).
-pub fn agent_color_for_provider(theme: &Theme, provider: Option<&str>) -> Color {
-    let Some(p) = provider else {
-        return theme.agent_color_default;
-    };
-    let p_lower = p.to_ascii_lowercase();
-    if p_lower.contains("anthropic") || p_lower.contains("claude") {
-        theme.agent_color_claude
-    } else if p_lower.contains("google") || p_lower.contains("gemini") {
-        theme.agent_color_gemini
-    } else if p_lower.contains("deepseek") {
-        theme.agent_color_deepseek
-    } else if p_lower.contains("ollama") || p_lower.contains("local") || p_lower.contains("llama") {
-        theme.agent_color_local
-    } else {
-        theme.agent_color_default
     }
 }
 

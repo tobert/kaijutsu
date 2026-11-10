@@ -11,7 +11,7 @@
 //!
 //! **HUD-melt slice 3** (`docs/timewell.md`): [`reading_card_glyphs`] absorbs
 //! the reference material the retired edge HUD's East (specs) and West
-//! (ancestry) panels used to carry — [`specs_text`]/[`ancestry_text`] are
+//! (ancestry) panels used to carry — [`reading_specs_text`]/[`ancestry_text`] are
 //! that content's pure composition, extracted from those panels' own bodies
 //! so both the HUD panels (retired in slice 4) and the reading card rendered
 //! byte-identical text from one place.
@@ -157,58 +157,20 @@ fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> 
 // HUD-MELT SLICE 3: absorbed panel content (pure text, no Bevy)
 // ============================================================================
 //
-// [`specs_text`] and [`ancestry_text`] are the retired edge HUD's East/West
+// [`reading_specs_text`] and [`ancestry_text`] are the retired edge HUD's East/West
 // panels' own bodies, extracted so both those panels (retired in slice 4) and
 // the reading card's absorbed content ([`reading_card_glyphs`]) composed from
 // the same pure text, byte-for-byte — the HUD's East/West panels became thin
 // wrappers over these before their own retirement, so their tests (and
 // output) never moved.
 
-/// Specs block: model, fork kind, band, keywords, cluster, and the live
+/// The reading card's specs block: band, keywords, cluster, and the live
 /// transport line for the track this context rides (`docs/tracks.md`). The
 /// longest line sorts to the top, tapering to the shortest, so the block
-/// nests into its top corner instead of ragging unevenly.
-///
-/// The track transport line rides along here until timewell Stage 3 gives it
-/// a real home on a track surface — see `docs/timewell.md`.
-#[allow(dead_code)] // orphaned by the HUD-melt slice 4 retirement (its only
-// caller was the retired HUD East panel) — kept as a tested pure primitive
-// pending a real home (see the doc comment above) or deletion.
-pub fn specs_text(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
-    let keys = if d.keywords.is_empty() {
-        "—".to_string()
-    } else {
-        d.keywords.join(", ")
-    };
-    let mut lines = vec![
-        format!("model    {}", if d.model_badge.is_empty() { "—" } else { &d.model_badge }),
-        format!("fork     {}", d.fork_badge.as_deref().unwrap_or("—")),
-        format!("band     {}", band_label(d.band)),
-        format!("keywords {keys}"),
-    ];
-    if let Some(c) = &d.cluster_label {
-        lines.push(format!("cluster  ◇ {c}"));
-    }
-    if let Some(t) = track {
-        let bpm = (60_000_000f64 / t.period_us.max(1) as f64).round() as u64;
-        let transport = if t.playing {
-            format!("▶ ♩{bpm} · tick {}", t.playhead_tick)
-        } else {
-            "■ stopped".to_string()
-        };
-        lines.push(format!("track    ♪ {} {transport}", t.id));
-    }
-    lines.sort_by_key(|l| std::cmp::Reverse(l.chars().count()));
-    format!("SPECS\n{}", lines.join("\n"))
-}
-
-/// The reading card's specs block: [`specs_text`] minus the model and fork
-/// lines — the card's own header (title, model badge, fork badge) sits
-/// directly above the block on that face, and repeating them spent vertical
-/// budget the ancestry chain + tail cut need (live-verified 2026-07-12: the
-/// duplicated lines pushed both past `y_limit` on typical content).
-/// [`specs_text`] itself stays the full block — the retired HUD East panel
-/// had no header of its own to lean on.
+/// nests into its top corner instead of ragging unevenly. The card's own
+/// header (title, model badge, fork badge) sits directly above the block on
+/// that face, so those are not repeated here: they spent vertical budget the
+/// ancestry chain + tail cut need.
 pub fn reading_specs_text(
     d: &super::card::CardData,
     track: Option<&kaijutsu_client::TrackInfo>,
@@ -533,7 +495,7 @@ fn card_text_glyphs(
 
 /// Lay out one of the reading card's absorbed blocks (specs, ancestry, or the
 /// deeper tail cut — HUD-melt slice 3) at `y`. `has_header` splits a leading
-/// `"HEADER\nbody"` line (the shape [`specs_text`]/[`ancestry_text`] return)
+/// `"HEADER\nbody"` line (the shape [`reading_specs_text`]/[`ancestry_text`] return)
 /// into a brighter [`READING_BLOCK_HEADER_SIZE`] label and a dim
 /// [`READING_BLOCK_BODY_SIZE`] body; `false` renders the whole string as one
 /// dim run (the tail cut carries no such label, same as the rim card's own
@@ -594,7 +556,7 @@ fn layout_reading_block(
 
 /// The reading (focus) card's own text composition (HUD-melt slice 3): the
 /// shared title/badges header ([`card_header_glyphs`]), then the specs block
-/// ([`specs_text`]), the ancestry chain ([`ancestry_text`]), and a deeper
+/// ([`reading_specs_text`]), the ancestry chain ([`ancestry_text`]), and a deeper
 /// tail cut ([`READING_TAIL_LINES`]) than the rim card's live-tail band — the
 /// reference material the edge HUD's East/West/South panels carried before
 /// the melt, retired in slice 4.
@@ -941,7 +903,7 @@ mod tests {
         assert!(w.ends_with('…'), "overflow past line 1 is elided: {w:?}");
     }
 
-    // ── specs_text (HUD-melt slice 3: formerly the East/West HUD panel's body; panels retired slice 4) ──
+    // ── reading_specs_text (HUD-melt slice 3: formerly the East/West HUD panel's body; panels retired slice 4) ──
 
     fn card_data(band: Band) -> super::super::card::CardData {
         super::super::card::CardData {
@@ -959,22 +921,6 @@ mod tests {
     }
 
     #[test]
-    fn specs_text_lists_fields_with_dash_fallbacks() {
-        let mut d = card_data(Band::Recent);
-        d.model_badge = String::new();
-        d.fork_badge = None;
-        d.keywords = vec![];
-        let s = specs_text(&d, None);
-        assert!(s.starts_with("SPECS\n"), "headed block: {s}");
-        assert!(s.contains("model    —"), "empty model → dash: {s}");
-        assert!(s.contains("fork     —"), "no fork → dash: {s}");
-        assert!(s.contains("keywords —"), "no keywords → dash: {s}");
-        assert!(s.contains("band     recent"), "band labeled: {s}");
-        assert!(!s.contains("cluster"), "no cluster line when unclustered: {s}");
-        assert!(!s.contains("track"), "no track line when unattached: {s}");
-    }
-
-    #[test]
     fn reading_specs_text_omits_the_header_duplicated_lines() {
         let mut d = card_data(Band::Recent);
         d.cluster_label = Some("storage".into());
@@ -988,16 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn specs_text_shows_cluster_only_when_present() {
-        let mut d = card_data(Band::Recent);
-        d.cluster_label = Some("storage".into());
-        let s = specs_text(&d, None);
-        assert!(s.contains("cluster  ◇ storage"), "cluster line present: {s}");
-        assert!(s.contains("rings, pulse"), "keywords joined: {s}");
-    }
-
-    #[test]
-    fn specs_text_shows_the_track_line_with_live_transport() {
+    fn reading_specs_text_shows_the_track_line_with_live_transport() {
         let mut t = kaijutsu_client::TrackInfo {
             id: "bass".into(),
             score_context_id: ContextId::from_bytes([9; 16]),
@@ -1010,11 +947,11 @@ mod tests {
             clock_kind: "system".into(),
             attached: vec![],
         };
-        let s = specs_text(&card_data(Band::Active), Some(&t));
+        let s = reading_specs_text(&card_data(Band::Active), Some(&t));
         assert!(s.contains("track    ♪ bass ▶ ♩120 · tick 128"), "playing: {s}");
 
         t.playing = false;
-        let s = specs_text(&card_data(Band::Active), Some(&t));
+        let s = reading_specs_text(&card_data(Band::Active), Some(&t));
         assert!(s.contains("track    ♪ bass ■ stopped"), "stopped: {s}");
     }
 

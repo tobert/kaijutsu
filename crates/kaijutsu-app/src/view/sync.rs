@@ -323,11 +323,6 @@ pub fn sync_main_cell_to_conversation(
     store.set_version(sync_version);
     editor.store = store;
 
-    if let Some(last_block) = editor.blocks().last() {
-        let len = last_block.content.len();
-        editor.cursor = crate::cell::BlockCursor::at(last_block.id, len);
-    }
-
     match viewing_opt {
         Some(mut viewing) => {
             viewing.conversation_id = ctx_id;

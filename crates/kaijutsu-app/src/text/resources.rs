@@ -58,7 +58,6 @@ pub struct ShapingFonts {
 /// `cell_line_height` and `cell_char_width` start as reasonable defaults
 /// and are updated from the actual font metrics once the font asset loads.
 #[derive(Resource, Clone)]
-#[allow(dead_code)]
 pub struct TextMetrics {
     /// Base font size for content cells (blocks, code). Default: 16.0
     pub cell_font_size: f32,

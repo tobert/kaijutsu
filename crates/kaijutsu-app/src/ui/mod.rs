@@ -10,4 +10,3 @@ pub mod theme;
 pub mod theme_loader;
 pub mod tiling;
 pub mod tiling_reconciler;
-pub mod timeline;

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::{
-    ActorHandle, CallError, ContextMembership, Identity, KernelInfo, ServerEvent, SshConfig,
+    ActorHandle, CallError, ContextMembership, Identity, ServerEvent, SshConfig,
 };
 use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
@@ -76,7 +76,6 @@ pub(crate) async fn hydrate_context(
 /// Consumer systems use `actor.handle.clone()` + `IoTaskPool::get().spawn()`
 /// for async RPC calls.
 #[derive(Resource)]
-#[allow(dead_code)]
 pub struct RpcActor {
     pub handle: ActorHandle,
     pub generation: u64,
@@ -90,7 +89,6 @@ pub struct RpcConnectionState {
     /// Transport that supplied `identity`. A later transport must discover
     /// its own identity before it can author or restore local drafts.
     identity_source: Option<IdentitySource>,
-    pub current_kernel: Option<KernelInfo>,
     /// SSH config (for display and respawn)
     pub ssh_config: SshConfig,
     /// Reconnect attempt counter (0 = connected or idle)
@@ -269,7 +267,7 @@ pub struct ConnectionStatusMessage {
 /// Sent via `RpcResultChannel` from async tasks, polled and written as
 /// Bevy messages by `poll_rpc_results`.
 ///
-/// Not `Clone`: `ContextJoined`/`ContextRehydrated` carry a live
+/// Not `Clone`: `ContextJoined` carries a live
 /// `mpsc::Receiver<FeedEvent>` (the change feed, docs/change-feed.md), and a
 /// receiver cannot be duplicated.
 /// Why a roster read failed, classified where the type still exists.
@@ -287,10 +285,7 @@ pub struct RosterReadError {
 }
 
 #[derive(Message, Debug)]
-#[allow(dead_code)]
 pub enum RpcResultMessage {
-    /// Kernel info received after attach/reconnect.
-    KernelAttached(Result<KernelInfo, String>),
     /// Identity received from one connected transport of an actor generation.
     IdentityReceived {
         generation: u64,
@@ -329,14 +324,6 @@ pub enum RpcResultMessage {
     ContextJoined {
         membership: ContextMembership,
     },
-    /// Context left.
-    ContextLeft,
-    /// Cherry-pick completed.
-    CherryPicked {
-        success: bool,
-        new_block_id: Option<kaijutsu_types::BlockId>,
-        error: Option<String>,
-    },
     /// Drift contexts list received (from periodic polling).
     DriftContextsReceived {
         contexts: Vec<kaijutsu_client::ContextInfo>,
@@ -372,8 +359,6 @@ pub enum RpcResultMessage {
     TracksReceived {
         tracks: Vec<kaijutsu_client::TrackInfo>,
     },
-    /// Context created on server — spawn an actor to join it.
-    ContextCreated(ContextId),
     /// The `Ctrl+Z` context toggle resolved on the kernel: the context to
     /// switch to (a live shell child, a shell's root, or one just created),
     /// or why the toggle refused or failed. Drained by
@@ -406,31 +391,6 @@ pub enum RpcResultMessage {
     },
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
-    /// A followed context's change feed ended and does not resume
-    /// (`FeedEvent::Terminated`) — re-subscribed from scratch and
-    /// re-hydrated (`view::sync::drain_context_feeds`). Installed wholesale
-    /// via `DocumentStore::install`, replacing both the dead receiver and
-    /// the mirror it fed.
-    ContextRehydrated {
-        context_id: ContextId,
-        mirror: kaijutsu_client::ContextMirror,
-        feed: mpsc::Receiver<kaijutsu_client::FeedEvent>,
-    },
-    /// A followed context's mirror was re-fetched from a fresh snapshot
-    /// while KEEPING its existing feed receiver — the
-    /// `FeedEvent::Resubscribed`/`Desynced` recovery
-    /// (`view::sync::drain_context_feeds`). Installed via
-    /// `DocumentStore::apply_snapshot`.
-    ContextSnapshotReady {
-        context_id: ContextId,
-        blocks: Vec<kaijutsu_types::BlockSnapshot>,
-        version: u64,
-    },
-    /// The per-client metronome config (`/config/client/<id>/metronome.toml`,
-    /// cascading to the shared `/config/client/default/metronome.toml`), fetched over RPC on
-    /// (re)connect. Drained by [`crate::metronome::apply_metronome_config`] into
-    /// the `Metronome` resource. Carries the resolved TOML body.
-    MetronomeConfigReceived(String),
     /// The per-client mouse-wheel scroll config (`/config/client/<id>/scroll.toml`,
     /// cascading to the shared `/config/client/default/scroll.toml`), fetched over RPC on
     /// (re)connect. Drained by
@@ -511,7 +471,7 @@ impl Plugin for ActorPlugin {
 // drained by `view::sync::drain_context_feeds` — replacing both this system
 // and `view::sync::check_cache_staleness`.
 
-/// Re-fetch the authenticated identity and theme/metronome/scroll config trio whenever the actor
+/// Re-fetch the authenticated identity and theme/scroll config pair whenever the actor
 /// reports a reconnect. Uses the SAME `ServerEvent::Reconnected` trigger the
 /// now-deleted `bump_sync_generation_on_reconnect` used to (see the comment
 /// just above) — the actor's one canonical "we came back from an outage"
@@ -520,7 +480,7 @@ impl Plugin for ActorPlugin {
 ///
 /// Before this system existed, [`fetch_startup_configs`] only ran once, from
 /// `poll_bootstrap_results`'s `ActorReady` arm. That is correct for cold
-/// start but leaves the app silently running whatever theme/metronome/scroll
+/// start but leaves the app silently running whatever theme/scroll
 /// config it booted with even after a kernel bounce onto a fresh or edited
 /// config (a reseed, a config wipe, a different kernel instance on
 /// the same port during dev) — reconnected at the transport layer but not
@@ -541,7 +501,7 @@ fn refetch_config_on_reconnect(
     if !reconnected {
         return;
     }
-    log::info!("reconnect signalled — refreshing identity and theme/metronome/scroll config");
+    log::info!("reconnect signalled — refreshing identity and theme/scroll config");
     let h = actor.handle.clone();
     let generation = actor.generation;
     let connection_epoch = h.connection_epoch();
@@ -573,12 +533,12 @@ fn refetch_config_on_reconnect(
         .detach();
 }
 
-/// Fetch the kernel-owned per-client config trio (theme, metronome, scroll)
+/// Fetch the kernel-owned per-client config pair (theme, scroll)
 /// and forward each into its existing `RpcResultMessage` sink
-/// (`apply_theme_from_rpc` below; `kaijutsu-audio-runtime`'s `dj::thread`
-/// `MetronomeConfigReceived` handler; `input::scroll_config::apply_scroll_config`).
+/// (`apply_theme_from_rpc` below; `input::scroll_config::apply_scroll_config`).
+/// The audio runtime fetches the metronome config itself.
 ///
-/// The ONE fetch path for this trio — called from both the initial
+/// The ONE fetch path for this pair — called from both the initial
 /// `ActorReady` bootstrap (cold start, `visible_on_failure = false`) and
 /// [`refetch_config_on_reconnect`] (every actor-internal reconnect,
 /// `visible_on_failure = true`). See that fn's doc comment for why a
@@ -635,16 +595,6 @@ async fn fetch_startup_configs_with<F, Fut>(
     fetch_layered_config(
         fetch,
         client_id,
-        "metronome.toml",
-        tx,
-        visible_on_failure,
-        RpcResultMessage::MetronomeConfigReceived,
-    )
-    .await;
-
-    fetch_layered_config(
-        fetch,
-        client_id,
         "scroll.toml",
         tx,
         visible_on_failure,
@@ -654,7 +604,7 @@ async fn fetch_startup_configs_with<F, Fut>(
 }
 
 /// Shared two-layer (`/config/client/<id>/<name>` then `/config/client/<name>`)
-/// config fetch used by both the metronome and scroll-gain legs of
+/// config fetch used by the scroll-gain leg of
 /// [`fetch_startup_configs_with`]. Only surfaces a failure (log + optional
 /// toast) when at least one layer actually errored — both layers coming back
 /// empty is the expected, silent common case (a bare kernel with no
@@ -794,9 +744,9 @@ mod reconnect_config_refetch_tests {
     #[tokio::test]
     async fn theme_fetch_success_sends_theme_received() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // `fetch_startup_configs_with` calls this for theme, then metronome,
-        // then scroll — only theme.toml gets real content here, so the
-        // others fall through both layers to an empty/silent no-op.
+        // `fetch_startup_configs_with` calls this for theme, then scroll —
+        // only theme.toml gets real content here, so scroll falls through
+        // both layers to an empty/silent no-op.
         let fetch = |path: String| async move {
             if path == "theme.toml" {
                 Ok("scheme = \"dark\"".to_string())
@@ -964,16 +914,14 @@ mod reconnect_config_refetch_tests {
         assert!(msgs.is_empty(), "cold start must not toast: {msgs:?}");
     }
 
-    /// The full trio in one call, exercising `fetch_startup_configs_with`
-    /// end to end with a single fetch closure that answers all three names.
+    /// Theme and scroll in one call, exercising `fetch_startup_configs_with`
+    /// end to end with a single fetch closure that answers both names.
     #[tokio::test]
-    async fn fetch_startup_configs_with_delivers_all_three_on_success() {
+    async fn fetch_startup_configs_with_delivers_both_on_success() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let fetch = |path: String| async move {
             if path == "theme.toml" {
                 Ok("scheme = \"dark\"".to_string())
-            } else if path.contains("metronome") {
-                Ok("enabled = true".to_string())
             } else if path.contains("scroll") {
                 Ok("line_gain = 2.0".to_string())
             } else {
@@ -983,7 +931,6 @@ mod reconnect_config_refetch_tests {
         fetch_startup_configs_with(&fetch, "client-1", &tx, false).await;
         let msgs = drain(&mut rx);
         assert!(msgs.iter().any(|m| matches!(m, RpcResultMessage::ThemeReceived(_))));
-        assert!(msgs.iter().any(|m| matches!(m, RpcResultMessage::MetronomeConfigReceived(_))));
         assert!(msgs.iter().any(|m| matches!(m, RpcResultMessage::ScrollConfigReceived(_))));
     }
 }
@@ -1323,9 +1270,6 @@ fn poll_bootstrap_results(
 
                 commands.insert_resource(RpcActor { handle, generation });
             }
-            bootstrap::BootstrapResult::Error(e) => {
-                log::warn!("Bootstrap error: {}", e);
-            }
         }
     }
     if received_any {
@@ -1545,7 +1489,6 @@ fn update_connection_state(
             kaijutsu_client::ConnectionStatus::Terminal { reason } => {
                 state.connected = false;
                 state.last_error = Some(reason.clone());
-                state.current_kernel = None;
                 clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
             }
         }
@@ -1553,9 +1496,6 @@ fn update_connection_state(
 
     for result in result_events.read() {
         match result {
-            RpcResultMessage::KernelAttached(Ok(info)) => {
-                state.current_kernel = Some(info.clone());
-            }
             RpcResultMessage::IdentityReceived {
                 generation,
                 connection_epoch,

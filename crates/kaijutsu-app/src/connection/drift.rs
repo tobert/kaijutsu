@@ -40,11 +40,6 @@ pub struct DriftState {
 }
 
 impl DriftState {
-    /// Get context info by short ID (used by Phase 4 constellation navigation).
-    #[allow(dead_code)]
-    pub fn context_by_id(&self, short_id: &str) -> Option<&ContextInfo> {
-        self.contexts.iter().find(|c| c.id.short() == short_id)
-    }
 
     /// Count of staged drifts.
     pub fn staged_count(&self) -> usize {

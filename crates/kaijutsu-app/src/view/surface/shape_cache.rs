@@ -418,20 +418,10 @@ impl ShapedBlockCache {
         self.blocks.len()
     }
 
-    #[allow(dead_code)] // Symmetry with `len`; exercised by tests.
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
     /// Total glyphs held across every cached block — what eviction budgets
     /// against, and what diagnostics report.
     pub fn total_glyphs(&self) -> usize {
         self.total_glyphs
-    }
-
-    #[allow(dead_code)] // Model accessor for tests and diagnostics.
-    pub fn tick(&self) -> u64 {
-        self.tick
     }
 
     /// See the field doc on [`Self::generation`] — a `WindowKey` input.
@@ -501,12 +491,6 @@ pub struct ShapedLabel {
     /// centered on the divider line.
     pub y_offset: f32,
     pub width: f32,
-    /// Measured label height. Unread on the drawing path — the label is
-    /// positioned by `y_offset`, which already centred it in the header row —
-    /// but it is what that centring was computed from, and dropping it would
-    /// leave the arithmetic in `shape_role_label` unexplained.
-    #[allow(dead_code)]
-    pub height: f32,
 }
 
 /// Shaped USER/ASSISTANT/… labels, keyed by `(role, metrics_epoch)`.
@@ -545,7 +529,7 @@ impl HeaderLabelCache {
         self.labels.get(&(role_index(role), metrics_epoch))
     }
 
-    #[allow(dead_code)] // Model accessor, exercised by tests.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.labels.len()
     }
@@ -1784,7 +1768,6 @@ fn shape_role_label(
             x_offset: div.label_x as f32,
             y_offset,
             width,
-            height,
         },
     );
 }
@@ -2977,7 +2960,6 @@ mod tests {
                 x_offset: 0.0,
                 y_offset: 0.0,
                 width: 10.0,
-                height: 10.0,
             },
         );
         assert_eq!(headers.len(), 1);

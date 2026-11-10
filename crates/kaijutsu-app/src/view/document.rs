@@ -4,17 +4,13 @@
 //! it — lives in [`kaijutsu_client::DocumentStore`]; the app holds it as a Bevy
 //! `Resource` and reads snapshots to render. [`DocumentCache`] is a thin newtype
 //! so existing call-sites (`doc_cache.active_id()`, `.get_mut()`, …) keep working
-//! through `Deref`, and [`CachedDocument`] is just the client's `DocumentEntry`.
+//! through `Deref`.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
-
-/// The cached per-context document (document text + compose input + bookkeeping).
-/// Lives in the client now; re-exported under the historical name.
-pub use kaijutsu_client::DocumentEntry as CachedDocument;
 
 /// Per-context conversation scroll offset — pure *view* state, so it lives
 /// app-side rather than on the client's document store (which owns document

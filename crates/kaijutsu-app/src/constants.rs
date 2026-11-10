@@ -33,9 +33,6 @@ pub struct ZLayer;
 impl ZLayer {
     /// Main content area (dashboard columns, conversation blocks)
     pub const CONTENT: i32 = 10;
-    /// Cursor overlay (reserved, cursor now drawn in Vello scene)
-    #[allow(dead_code)]
-    pub const CURSOR: i32 = 20;
     /// HUD panels (agent status, keybinds, etc.)
     pub const HUD: i32 = 50;
     /// The quick-context overlay (`ui::quick_context`) — above the HUD it
@@ -62,15 +59,6 @@ impl ZLayer {
     /// The ledger ribbon (`ui::ledger_ribbon`), which is what the sheet's
     /// `v` opens — so it paints over the sheet, as it outranks it for keys.
     pub const LEDGER_RIBBON: i32 = 160;
-    /// Dropdown menus (above modals). No user today: the quick-context
-    /// overlay deliberately takes [`Self::QUICK_CONTEXT`] instead (see
-    /// there), so this stays reserved rather than deleted — a real dropdown
-    /// over a modal is still the layer it describes.
-    #[allow(dead_code)]
-    pub const DROPDOWN: i32 = 200;
-    /// Toast notifications
-    #[allow(dead_code)]
-    pub const TOAST: i32 = 250;
 }
 
 // Usage: ZIndex(ZLayer::CONTENT)

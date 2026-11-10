@@ -325,7 +325,7 @@ pub fn band_ring(band: Band) -> (f32, f32) {
 ///
 /// This is the zero-rotation convenience / documented reference form; the live
 /// placement path uses [`ring_seat_rotated`] with the ring's eased spin.
-#[allow(dead_code)] // documented reference form + test entry; runtime uses ring_seat_rotated
+#[cfg(test)]
 pub fn ring_seat(band: Band, within_index: usize, band_count: usize) -> Vec3 {
     ring_seat_rotated(band, within_index, band_count, 0.0)
 }

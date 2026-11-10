@@ -180,7 +180,7 @@ pub struct LabelPlacement {
 
 impl LabelPlacement {
     /// Width of the stroke-suppressed range.
-    #[allow(dead_code)] // Model accessor, exercised by the placement tests.
+    #[cfg(test)]
     pub fn gap_width(&self) -> f32 {
         self.gap_x1 - self.gap_x0
     }
@@ -325,7 +325,7 @@ impl BlockLabels {
     /// Whether anything is here to draw. A borderless block still has a
     /// checkbox, so this is false only before the first shape pass reaches
     /// the block.
-    #[allow(dead_code)] // Model accessor, exercised by tests.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.top.is_none() && self.bottom.is_none() && self.checkbox.is_none()
     }
@@ -381,12 +381,11 @@ impl LabelRunCache {
     }
 
     /// Distinct runs held, across every color.
-    #[allow(dead_code)] // Model accessor for tests and diagnostics.
     pub fn len(&self) -> usize {
         self.runs.values().map(HashMap::len).sum()
     }
 
-    #[allow(dead_code)] // Symmetry with `len`; exercised by tests.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.runs.values().all(HashMap::is_empty)
     }

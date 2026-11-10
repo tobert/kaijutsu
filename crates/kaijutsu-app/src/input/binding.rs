@@ -53,14 +53,6 @@ impl Modifiers {
         super_key: false,
     };
 
-    #[allow(dead_code)] // Completes the modifier-constant set; no binding uses it yet.
-    pub const CTRL_SHIFT: Modifiers = Modifiers {
-        ctrl: true,
-        shift: true,
-        alt: false,
-        super_key: false,
-    };
-
     /// Check if the currently-held keys match these modifiers.
     pub fn matches(&self, keys: &ButtonInput<KeyCode>) -> bool {
         let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);

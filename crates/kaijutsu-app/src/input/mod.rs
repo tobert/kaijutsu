@@ -49,18 +49,10 @@ pub mod tap;
 pub mod vim;
 
 // Re-export core types for ergonomic use.
-// FocusArea is consumed by cell, dock, timeline, conversation, frame_assembly.
-// others are pub API for future external consumers.
-#[allow(unused_imports)]
 pub use kaijutsu_present::action::Action;
-#[allow(unused_imports)]
 pub use context::InputContext;
-#[allow(unused_imports)]
 pub use events::ActionFired;
 pub use focus::FocusArea;
-#[allow(unused_imports)]
-pub use map::InputMap;
-#[allow(unused_imports)]
 pub use scroll_config::ScrollConfig;
 
 use bevy::prelude::*;

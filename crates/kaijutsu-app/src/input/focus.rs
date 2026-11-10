@@ -37,24 +37,6 @@ pub enum FocusArea {
     Dialog,
 }
 
-impl FocusArea {
-    /// Check if focus is on navigation (Conversation blocks).
-    #[allow(dead_code)] // Useful for domain guards
-    pub fn is_navigation(&self) -> bool {
-        matches!(self, FocusArea::Conversation)
-    }
-
-    /// Human-readable name for the current focus area (for hint widget).
-    #[allow(dead_code)] // Hint widget not yet wired to this label.
-    pub fn name(&self) -> &'static str {
-        match self {
-            FocusArea::Compose => "COMPOSE",
-            FocusArea::Conversation => "NAVIGATE",
-            FocusArea::Dialog => "DIALOG",
-        }
-    }
-}
-
 // ============================================================================
 // ACTIVE SURFACE — which input surface has focus within Compose
 // ============================================================================
@@ -77,16 +59,4 @@ impl ActiveSurface {
     pub fn is_shell(&self) -> bool {
         matches!(self, Self::Shell)
     }
-}
-
-/// System run condition: ActiveSurface is Shell.
-#[allow(dead_code)] // Used by Phase 2 shell dock systems
-pub fn on_shell_surface(surface: Res<ActiveSurface>) -> bool {
-    surface.is_shell()
-}
-
-/// System run condition: ActiveSurface is Chat.
-#[allow(dead_code)] // Used by Phase 2 shell dock systems
-pub fn on_chat_surface(surface: Res<ActiveSurface>) -> bool {
-    !surface.is_shell()
 }
