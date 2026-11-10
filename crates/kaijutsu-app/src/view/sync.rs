@@ -19,7 +19,7 @@ use crate::cell::{
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
 use kaijutsu_client::ServerEvent;
-use kaijutsu_types::{BlockId, ContextId, PrincipalId};
+use kaijutsu_types::{ContextId, PrincipalId};
 
 /// The `Screen` a *landed* context switch should reveal, or `None` if the
 /// current screen already shows the active context.
@@ -255,26 +255,13 @@ fn needs_render_sync(
     }
 }
 
-/// The block a fold must leave open: the focused block, while the viewer has
-/// scrolled away from the tail to read it. While the view follows the tail
-/// nothing is held, and every followed block folds.
-pub(crate) fn fold_held_block(
-    scroll_state: &ConversationScrollState,
-    focus: &FocusTarget,
-) -> Option<BlockId> {
-    if scroll_state.following {
-        None
-    } else {
-        focus.block_id
-    }
-}
-
 pub fn sync_main_cell_to_conversation(
     doc_cache: Res<crate::cell::DocumentCache>,
     entities: Res<EditorEntities>,
     session_principal: Res<crate::cell::SessionPrincipal>,
     scroll_state: Res<ConversationScrollState>,
     focus: Res<FocusTarget>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
 ) {
@@ -325,7 +312,8 @@ pub fn sync_main_cell_to_conversation(
     // alone deliberately: watching a neighbor type is a feature, not a bug
     // (see `block_border.rs`'s `Status::Draft` handling).
     let principal_id = session_principal.0.unwrap_or_else(|| editor.store.principal_id());
-    let held = fold_held_block(&scroll_state, &focus);
+    // A fold leaves open the block the reader is on.
+    let held = focus.reader_block(&scroll_state, geometries.get(entity).ok());
     let rebuilt = editor.rebuild_from(
         ctx_id,
         principal_id,
@@ -568,24 +556,6 @@ pub fn follow_kj_results(
 mod tests {
     use super::*;
 
-    /// A fold leaves the focused block open only while the viewer has
-    /// scrolled away from the tail; following the tail, everything folds.
-    #[test]
-    fn the_focused_block_is_held_open_only_off_the_tail() {
-        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
-        let mut focus = FocusTarget::default();
-        focus.focus_block(id);
-        let mut scroll = ConversationScrollState::default();
-
-        scroll.following = true;
-        assert_eq!(fold_held_block(&scroll, &focus), None);
-
-        scroll.following = false;
-        assert_eq!(fold_held_block(&scroll, &focus), Some(id));
-
-        assert_eq!(fold_held_block(&scroll, &FocusTarget::default()), None);
-    }
-
     /// The viewer's folds belong to the context: switching to another
     /// context and back keeps a block the viewer reopened open.
     #[test]
@@ -594,7 +564,7 @@ mod tests {
 
         let principal = PrincipalId::new();
         let block = |ctx, seq, kind| {
-            BlockSnapshotBuilder::new(BlockId::new(ctx, principal, seq), kind)
+            BlockSnapshotBuilder::new(kaijutsu_types::BlockId::new(ctx, principal, seq), kind)
                 .status(Status::Done)
                 .content("x")
                 .build()

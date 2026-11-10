@@ -180,6 +180,9 @@ own rustdoc carries the implementation detail that shipped alongside it.
    role/kind hydration branches.
 4. **SHIPPED.** App preview: rich-content arm + render arm + fence sniff + theme.
 5. **SHIPPED.** `Screen::Diff` + `DiffCore` + grab/bindings + yank→clipboard.
+   Opened by `v` or `Ctrl+A v` on the diff under the reader: the nearest diff
+   at or above the focused block, the newest with no focus (`docs/input.md`,
+   "The reader's block").
    **Freeze-on-open**: the viewer binds to `(block_id, content
    version/hash)`; if the block changes underneath, show a stale banner with
    explicit refresh — never silently rebind, and yank always reads the frozen

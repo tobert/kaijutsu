@@ -2,7 +2,8 @@
 //!
 //! `docs/diff.md` Decision 4/5 and slice 5. The inline preview
 //! (`text::diff` + the `Diff` arm of `view::block_render`) stays exactly as it
-//! is; this is the other surface, reached by `v` on a focused diff block, and
+//! is; this is the other surface, reached by `v` or `Ctrl+A v` on the diff under the
+//! reader (`docs/input.md`, "The reader's block"), and
 //! it renders the *whole* diff with vi motions and yank-to-clipboard.
 //!
 //! Three contracts shape everything here:
@@ -30,7 +31,9 @@ use kaijutsu_types::BlockId;
 use kaijutsu_diff::{DiffCore, DiffIntent, limits::MAX_RENDER_BYTES};
 use kaijutsu_types::ContentType;
 
-use crate::cell::{CellEditor, EditorEntities, FocusTarget, MainCell};
+use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, FocusTarget, MainCell};
+use crate::view::components::GlobalErrorQueue;
+use crate::view::geometry::ConversationGeometry;
 use crate::input::events::GrabbedKey;
 use crate::input::{ActionFired, ClipboardWriter};
 use crate::ui::screen::Screen;
@@ -196,14 +199,19 @@ pub fn open_session(
     }
 }
 
-/// `v` on a focused block: open the viewer if that block is a diff.
+/// `v` (Navigation) or `Ctrl+A v`: open the viewer on the diff under the
+/// reader, found by [`diff_target`]. When none fits, a notice says which case.
 fn handle_open_diff_viewer(
     mut actions: MessageReader<ActionFired>,
     focus: Res<FocusTarget>,
+    scroll_state: Res<ConversationScrollState>,
+    geometries: Query<&ConversationGeometry, With<MainCell>>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut active: ResMut<ActiveDiffView>,
     mut next_screen: ResMut<NextState<Screen>>,
+    mut errors: ResMut<GlobalErrorQueue>,
+    time: Res<Time>,
 ) {
     let mut asked = false;
     for ActionFired { action, .. } in actions.read() {
@@ -215,28 +223,40 @@ fn handle_open_diff_viewer(
         return;
     }
 
-    let Some(block_id) = focus.block_id else {
-        return;
-    };
     let Some(main_ent) = entities.main_cell else {
         return;
     };
     let Ok(editor) = main_cells.get(main_ent) else {
         return;
     };
+    let reader = focus.reader_block(&scroll_state, geometries.get(main_ent).ok());
+    let Some(block_id) = diff_target(&editor.blocks(), reader) else {
+        let message = if reader.is_some() {
+            "No diff at or above the focused block."
+        } else {
+            "No diff in this conversation."
+        };
+        errors.push("diff viewer", message, time.elapsed_secs_f64());
+        return;
+    };
     let Some(block) = editor.block_snapshot(&block_id) else {
         return;
     };
-
     let Some(how) = openable_diff(block.content_type, &block.content) else {
-        // Not a diff — say so rather than flashing an empty screen.
-        info!("diff viewer: block {block_id:?} is not a diff; nothing to open");
         return;
     };
 
     let title = diff_title(&block);
     active.session = Some(open_session(block_id, title, &block.content, &how));
     next_screen.set(Screen::Diff);
+}
+
+/// The diff the viewer opens: the nearest block at or above the reader's
+/// block that [`openable_diff`] accepts (`kaijutsu_present::reader::target`).
+fn diff_target(blocks: &[kaijutsu_types::BlockSnapshot], reader: Option<BlockId>) -> Option<BlockId> {
+    kaijutsu_present::reader::target(blocks, reader, |b| {
+        openable_diff(b.content_type, &b.content).is_some()
+    })
 }
 
 /// A one-line title for the header strip: the tool that produced the block if
@@ -414,7 +434,9 @@ impl Plugin for DiffViewPlugin {
         app.init_resource::<ActiveDiffView>()
             .add_systems(
                 Update,
-                handle_open_diff_viewer.after(crate::input::InputPhase::Dispatch),
+                handle_open_diff_viewer
+                    .after(crate::input::InputPhase::Dispatch)
+                    .run_if(in_state(Screen::Conversation)),
             )
             .add_systems(
                 Update,
@@ -614,6 +636,94 @@ mod tests {
                 .starts_with(kaijutsu_diff::TRUNCATION_MARKER_PREFIX),
             "the marker must lead the text a yank would copy",
         );
+    }
+
+    // ── the diff under the reader ───────────────────────────────────────────
+
+    /// A headless app running only `handle_open_diff_viewer` over a main
+    /// cell holding the given blocks, scrolled off the tail so a focus is the
+    /// reader's. A `true` block is a declared diff.
+    fn open_app(blocks: &[bool]) -> (App, Vec<BlockId>) {
+        use crate::input::events::ActionFired;
+        use crate::view::EditorEntities;
+        use kaijutsu_types::{BlockKind, Role, Status};
+
+        let mut app = App::new();
+        app.add_plugins(bevy::state::app::StatesPlugin)
+            .init_state::<Screen>()
+            .add_message::<ActionFired>()
+            .init_resource::<EditorEntities>()
+            .init_resource::<FocusTarget>()
+            .init_resource::<ActiveDiffView>()
+            .init_resource::<GlobalErrorQueue>()
+            .init_resource::<Time>()
+            .insert_resource(ConversationScrollState { following: false, ..Default::default() })
+            .add_systems(Update, handle_open_diff_viewer);
+
+        let mut editor = CellEditor::new();
+        let mut ids: Vec<BlockId> = Vec::new();
+        for is_diff in blocks {
+            let (content, ct) = if *is_diff {
+                ("--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n", ContentType::Diff)
+            } else {
+                ("prose", ContentType::Plain)
+            };
+            let id = editor
+                .store
+                .insert_block(None, ids.last(), Role::Model, BlockKind::Text, content, Status::Done, ct)
+                .expect("insert block");
+            ids.push(id);
+        }
+        let main_ent = app.world_mut().spawn((editor, MainCell)).id();
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+        app.update();
+        (app, ids)
+    }
+
+    /// Press the open action, and return the block the viewer opened on.
+    fn press_open(app: &mut App) -> Option<BlockId> {
+        use crate::input::events::ActionFired;
+        use crate::input::{Action, context::InputContext};
+
+        app.world_mut()
+            .write_message(ActionFired::new(Action::OpenDiffViewer, InputContext::Navigation));
+        app.update();
+        app.update();
+        app.world().resource::<ActiveDiffView>().session.as_ref().map(|s| s.block_id)
+    }
+
+    fn notices(app: &App) -> Vec<String> {
+        app.world().resource::<GlobalErrorQueue>().entries.iter().map(|e| e.message.clone()).collect()
+    }
+
+    #[test]
+    fn a_focus_between_two_diffs_opens_the_one_above() {
+        let (mut app, ids) = open_app(&[true, false, true]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[1]);
+        assert_eq!(press_open(&mut app), Some(ids[0]));
+        assert_eq!(*app.world().resource::<State<Screen>>().get(), Screen::Diff);
+    }
+
+    #[test]
+    fn no_focus_opens_the_newest_diff() {
+        let (mut app, ids) = open_app(&[true, false, true, false]);
+        assert_eq!(press_open(&mut app), Some(ids[2]));
+    }
+
+    #[test]
+    fn a_focus_above_every_diff_says_so_and_leaves_the_screen() {
+        let (mut app, ids) = open_app(&[false, true]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[0]);
+        assert_eq!(press_open(&mut app), None);
+        assert_eq!(*app.world().resource::<State<Screen>>().get(), Screen::Conversation);
+        assert_eq!(notices(&app), vec!["No diff at or above the focused block.".to_string()]);
+    }
+
+    #[test]
+    fn no_diff_at_all_says_so_in_other_words() {
+        let (mut app, _) = open_app(&[false, false]);
+        assert_eq!(press_open(&mut app), None);
+        assert_eq!(notices(&app), vec!["No diff in this conversation.".to_string()]);
     }
 
     // ── the leave hatch in the error state ──────────────────────────────────

@@ -2657,8 +2657,8 @@ kernel's extractive summary (`kaijutsu_types::summarize_thinking`, on
 `BlockSnapshot.summary`) is what a folded reasoning block shows.
 
 The app applies the rule in `RenderBlockStore::rebuild`, keeps folds per
-context in `CellEditor` (`ContextFolds`), holds open the focused block while
-the view is off the tail, draws `▸ thinking · N lines · <summary>` and
+context in `CellEditor` (`ContextFolds`), holds open the reader's block (the focused
+block; see `docs/input.md`, "The reader's block"), draws `▸ thinking · N lines · <summary>` and
 `▸ N lines · <last line>` (`present::format::fold_line`), and toggles one
 block on `c` or `Ctrl+O` (`docs/input.md`, "Folds"). Open:
 
@@ -2668,10 +2668,22 @@ block on `c` or `Ctrl+O` (`docs/input.md`, "Folds"). Open:
 - **The app has no turn liveness and no in-flight strip.** The tui knows
   when a turn is live and shows its in-flight strip (`docs/tui.md`); the app
   shows neither.
+- **A wheel-scrolled reader keeps the old focus.** The app's reader is its
+  focused block (`FocusTarget::reader_block`); the tui's is the line the view
+  rests on. A reader who scrolls off the focus with the wheel, off the tail,
+  still acts on the focused block, which may be off screen. A reader taken
+  from the viewport would match the tui.
 - **Only the focused block is held.** A reader who scrolled with the wheel
   has no focused block, so a block that straddles the viewport top can fold
   under them and move the text. A block entirely above the viewport is
   anchor-compensated (`apply_measurements`).
+- **The app keeps a context's folds after the context is gone.**
+  `CellEditor.folds` is keyed by context and never pruned, so it grows with
+  the contexts visited in a session.
+- **A collapsed block of another kind reads differently.** The tui draws any
+  block the kernel flags `collapsed` as a `▸ <first line>` stub; the app's
+  `fold_line` covers reasoning and tool results only, so a flagged text or
+  file block renders whole there.
 - **The app clips a fold line at 160 characters**
   (`FOLD_LINE_MAX_CHARS`), not at the pane width, so a narrow pane wraps it
   to a second line.

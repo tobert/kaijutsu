@@ -138,6 +138,7 @@ list.
 | `Ctrl+A n` / `p` | Next / previous ring-0 seat | next/prev |
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
+| `Ctrl+A v` | Open the diff viewer on the diff under the reader (`v` in Navigation does the same; see "The reader's block"). Conversation screen only | (new) |
 | `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last 20 answered asks (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
 
@@ -206,13 +207,49 @@ through the kernel's open signal. A failed edit or submit shows as an error
 toast; a failed chat submit reads the kernel's draft back, since the kernel
 keeps it.
 
+## The reader's block
+
+An act on one block of the conversation applies to the reader's block: the
+last block that fits the act, at or above the block the reader is on. On the
+live tail, where the reader is on no block, it is the newest that fits.
+`kaijutsu_present::reader::target` is that rule, and both clients call it.
+Amy, 2026-11-10: *"let's have a single 'block under the reader' in both app
+and tui, and use it consistently."*
+
+In the app the reader's block is `FocusTarget.block_id` (moved by `j`/`k`),
+named by `FocusTarget::reader_block`. Focus is never cleared by following the
+tail, by a submit, or by a context switch, so a focus the view has scrolled
+away from while following the tail is stale. `reader_block` returns it only
+while its row is in the viewport; otherwise the reader is on the tail. While
+the view is scrolled off the tail, the focused block is the reader's wherever
+it is, including off screen. (Open: a reader who scrolls off the focus with
+the wheel keeps the old focus; see `docs/issues.md`, "Folds".)
+
+| Act | Keys | Fits |
+|---|---|---|
+| Fold or unfold | `c`, `Ctrl+O` | a block with a fold: folded now, reasoning, or a result over 12 lines (`fold::has_fold`) |
+| Open the diff viewer | `v`, `Ctrl+A v` | a block that is a diff (`openable_diff`) |
+
+When no block fits, the fold toggle does nothing; the diff viewer shows a
+notice, "No diff at or above the focused block." with a focus, "No diff in
+this conversation." without. `Ctrl+A v` works on the conversation screen
+only.
+
+`x` (exclude from the next turn) does not use the reader's block. It acts on
+the focused block only, and does nothing without one: a block excluded from
+the model's context is a change the viewer must have seen made, and the
+nearest match could be a block they were not looking at. `e` jumps to the
+newest error; it moves the reader and acts on nothing.
+
 ## Folds
 
-`c` or `Ctrl+O` folds or unfolds one block while the conversation has the
-keys (`Navigation`): the focused block when it can fold (reasoning, a tool
-result, an error), else the newest block that can. `Ctrl+O` is the terminal
-client's key for the same toggle. Under a keyboard grab (compose, the vi
-editor) `Ctrl+O` belongs to vi.
+`c` or `Ctrl+O` folds or unfolds the reader's block while the conversation
+has the keys (`Navigation`): the nearest block with a fold at or above it,
+never one below it. A short result that is open has no fold and is passed
+over. In the app `Ctrl+O` is the toggle only outside a keyboard grab; under
+one (compose, the vi editor) it belongs to vi. In the terminal client
+`Ctrl+O` is the toggle in every compose mode, and only the full-screen
+editor keeps vim's (`docs/tui.md`, "Keys").
 
 A folded block is one line: `▸ thinking · 14 lines · <summary>`,
 `▸ 312 lines · <last line>`, or an error's stub. Blocks also fold on their
@@ -266,7 +303,8 @@ releases the hold instead.
 | LedgerRibbon (`Ctrl+A l`) | `a`/`A`/`c`/`C`/`d`/`e`/`t` answer the selected pending row (same keys as the sheet; each shows only when the ask's predicates allow it) · `j/k` (and `↑/↓`) move · `/` filter (typing edits the filter; `Enter` keeps it, `Esc` stops typing) · `Enter` open the sheet on any row, answered ones read-only · `Esc` close |
 
 `Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,
-so its keys never reach the binding table. `v` in Navigation opens it; inside,
+so its keys never reach the binding table. `v` in Navigation and `Ctrl+A v`
+open it on the diff under the reader; inside,
 `DiffCore` owns everything (`j/k` `gg/G` counts · `]c`/`[c` hunks · `zo/zc/za`
 folds · `V` visual-line · `y` yank to clipboard · `R` reload a stale view ·
 `q`/`ZQ`/`:q` close).

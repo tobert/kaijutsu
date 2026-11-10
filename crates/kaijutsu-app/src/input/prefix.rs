@@ -114,6 +114,9 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // l — the ledger ribbon (docs/tui.md, "The ledger"): every pending
         // ask across every context. A toggle; the surface latches.
         KeyCode::KeyL => Some(Action::OpenLedger),
+        // v — view the diff under the reader full-screen (the terminal
+        // client's chord for the same act).
+        KeyCode::KeyV => Some(Action::OpenDiffViewer),
         // Esc cancels the pending prefix quietly.
         KeyCode::Escape => None,
         _ => None,
@@ -224,6 +227,15 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyH, true, false),
             Some(Action::HoldQuickContext)
+        );
+    }
+
+    /// `v` opens the diff viewer, as it does in the terminal client.
+    #[test]
+    fn v_opens_the_diff_viewer() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyV, false, false),
+            Some(Action::OpenDiffViewer)
         );
     }
 

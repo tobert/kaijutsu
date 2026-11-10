@@ -206,6 +206,31 @@ impl FocusTarget {
     pub fn focus_block(&mut self, block_id: BlockId) {
         self.block_id = Some(block_id);
     }
+
+    /// The reader's block: the block an act on the conversation applies to
+    /// (`docs/input.md`, "The reader's block"), or `None` when the reader is
+    /// on the live tail. Every act that takes a block from the reader asks
+    /// here, then hands the answer to `kaijutsu_present::reader::target`.
+    ///
+    /// The focused block is the reader's block while the view is scrolled
+    /// away from the tail. While the view follows the tail, focus is never
+    /// cleared by following, submitting, or switching context, so a focus that
+    /// has scrolled off screen is a stale one: it counts only while its row is
+    /// in the viewport.
+    pub fn reader_block(
+        &self,
+        scroll: &ConversationScrollState,
+        geometry: Option<&crate::view::geometry::ConversationGeometry>,
+    ) -> Option<BlockId> {
+        let id = self.block_id?;
+        if !scroll.following {
+            return Some(id);
+        }
+        let row = geometry?.block_row(&id)?;
+        let on_screen = row.y_offset + row.height > scroll.offset
+            && row.y_offset < scroll.offset + scroll.visible_height;
+        on_screen.then_some(id)
+    }
 }
 
 // ============================================================================
@@ -607,6 +632,73 @@ impl GlobalErrorQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three blocks stacked in a geometry, the viewport placed over `shown`.
+    fn reader_fixture(shown: usize, following: bool) -> (Vec<BlockId>, ConversationScrollState, crate::view::geometry::ConversationGeometry) {
+        use crate::view::geometry::{ConversationGeometry, EstimateParams, RowSeed};
+        use kaijutsu_types::{BlockKind, ContextId, PrincipalId, Role};
+
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let ids: Vec<BlockId> = (1..=3).map(|seq| BlockId::new(ctx, principal, seq)).collect();
+        let mut geom = ConversationGeometry::default();
+        geom.reconcile(
+            &ids,
+            |_| {
+                Some(RowSeed {
+                    text_len: 10,
+                    newline_count: 0,
+                    role: Role::User,
+                    kind: BlockKind::Text,
+                    collapsed: false,
+                    parent_id: None,
+                })
+            },
+            &EstimateParams::default(),
+            1,
+        );
+        geom.recompute_offsets();
+        let row = geom.block_row(&ids[shown]).expect("row");
+        let scroll = ConversationScrollState {
+            offset: row.y_offset,
+            visible_height: row.height,
+            following,
+            ..Default::default()
+        };
+        (ids, scroll, geom)
+    }
+
+    #[test]
+    fn no_focus_means_the_reader_is_on_the_tail() {
+        let (_, scroll, geom) = reader_fixture(2, false);
+        assert_eq!(FocusTarget::default().reader_block(&scroll, Some(&geom)), None);
+    }
+
+    #[test]
+    fn off_the_tail_the_focused_block_is_the_readers_wherever_it_is() {
+        let (ids, scroll, geom) = reader_fixture(2, false);
+        let mut focus = FocusTarget::default();
+        focus.focus_block(ids[0]);
+        assert_eq!(focus.reader_block(&scroll, Some(&geom)), Some(ids[0]));
+    }
+
+    #[test]
+    fn following_the_tail_a_focus_scrolled_off_screen_is_stale() {
+        let (ids, scroll, geom) = reader_fixture(2, true);
+        let mut focus = FocusTarget::default();
+        focus.focus_block(ids[0]);
+        assert_eq!(focus.reader_block(&scroll, Some(&geom)), None);
+        // Nor does one the geometry does not know.
+        assert_eq!(focus.reader_block(&scroll, None), None);
+    }
+
+    #[test]
+    fn following_the_tail_a_focus_on_screen_is_the_readers() {
+        let (ids, scroll, geom) = reader_fixture(2, true);
+        let mut focus = FocusTarget::default();
+        focus.focus_block(ids[2]);
+        assert_eq!(focus.reader_block(&scroll, Some(&geom)), Some(ids[2]));
+    }
 
     fn scroll_state(
         content_height: f32,

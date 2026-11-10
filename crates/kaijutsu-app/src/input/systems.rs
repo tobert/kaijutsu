@@ -419,7 +419,8 @@ pub fn handle_scroll(
 // ============================================================================
 
 /// Handle the fold toggle (`Action::CollapseToggle`, `c` and `Ctrl+O` in
-/// Navigation): fold or unfold one block, chosen by [`fold_toggle_target`].
+/// Navigation): fold or unfold the block under the reader, chosen by
+/// [`fold_toggle_target`].
 ///
 /// The fold is the viewer's own (`CellEditor::toggle_fold`); nothing is sent
 /// to the kernel. The editor is the MainCell's, found through
@@ -428,6 +429,8 @@ pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
     entities: Res<EditorEntities>,
     focus: Res<FocusTarget>,
+    scroll_state: Res<ConversationScrollState>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
     mut cells: Query<&mut CellEditor>,
 ) {
     for ActionFired { action, .. } in actions.read() {
@@ -437,11 +440,12 @@ pub fn handle_collapse_toggle(
         let Some(main_ent) = entities.main_cell else {
             continue;
         };
+        let reader = focus.reader_block(&scroll_state, geometries.get(main_ent).ok());
         let Ok(mut editor) = cells.get_mut(main_ent) else {
             continue;
         };
-        let Some(target) = fold_toggle_target(&editor.blocks(), focus.block_id) else {
-            debug!("fold toggle: no block in this conversation can fold");
+        let Some(target) = fold_toggle_target(&editor.blocks(), reader) else {
+            debug!("fold toggle: no block at or above the reader has a fold");
             continue;
         };
         if let Some(folded) = editor.toggle_fold(&target) {
@@ -450,19 +454,15 @@ pub fn handle_collapse_toggle(
     }
 }
 
-/// The block the fold toggle moves: the focused block when it can fold
-/// (`kaijutsu_present::fold::foldable`), else the newest block that can.
+/// The block the fold toggle moves: the nearest block with a fold at or above
+/// the reader's block (`kaijutsu_present::reader::target`).
 fn fold_toggle_target(
     blocks: &[kaijutsu_types::BlockSnapshot],
-    focused: Option<kaijutsu_types::BlockId>,
+    reader: Option<kaijutsu_types::BlockId>,
 ) -> Option<kaijutsu_types::BlockId> {
-    use kaijutsu_present::fold::foldable;
-
-    focused
-        .and_then(|id| blocks.iter().find(|b| b.id == id))
-        .filter(|b| foldable(b))
-        .or_else(|| blocks.iter().rev().find(|b| foldable(b)))
-        .map(|b| b.id)
+    kaijutsu_present::reader::target(blocks, reader, |b| {
+        kaijutsu_present::fold::has_fold(b, b.collapsed)
+    })
 }
 
 /// Handle ToggleBlockExcluded action — x in Navigation.
@@ -623,6 +623,14 @@ mod tests {
     /// A headless app running only `handle_collapse_toggle` over a main cell
     /// holding one block of each kind given, in order.
     fn fold_toggle_app(kinds: &[BlockKind]) -> (bevy::prelude::App, Vec<BlockId>) {
+        let blocks: Vec<(BlockKind, String)> =
+            kinds.iter().map(|kind| (*kind, "line".to_string())).collect();
+        fold_toggle_app_with(&blocks)
+    }
+
+    /// Like [`fold_toggle_app`], with each block's content given. The view is
+    /// scrolled off the tail, so the focused block is the reader's.
+    fn fold_toggle_app_with(blocks: &[(BlockKind, String)]) -> (bevy::prelude::App, Vec<BlockId>) {
         use bevy::prelude::*;
 
         use super::handle_collapse_toggle;
@@ -634,11 +642,12 @@ mod tests {
         app.add_message::<ActionFired>();
         app.init_resource::<EditorEntities>();
         app.init_resource::<FocusTarget>();
+        app.insert_resource(ConversationScrollState { following: false, ..Default::default() });
         app.add_systems(Update, handle_collapse_toggle);
 
         let mut editor = CellEditor::new();
         let mut ids: Vec<BlockId> = Vec::new();
-        for kind in kinds {
+        for (kind, content) in blocks {
             let id = editor
                 .store
                 .insert_block(
@@ -646,7 +655,7 @@ mod tests {
                     ids.last(),
                     Role::Model,
                     *kind,
-                    "line",
+                    content.as_str(),
                     Status::Done,
                     ContentType::Plain,
                 )
@@ -702,8 +711,38 @@ mod tests {
         assert!(!folded(&app, ids[0]), "a second press opens it again");
     }
 
+    /// A text block between two reasoning blocks: the toggle takes the
+    /// reasoning above the focus and never jumps to the newest below it.
     #[test]
-    fn the_fold_toggle_moves_the_newest_foldable_block_when_focus_cannot_fold() {
+    fn the_fold_toggle_takes_the_nearest_fold_above_the_focus() {
+        use crate::view::FocusTarget;
+
+        let (mut app, ids) = fold_toggle_app(&[
+            BlockKind::Thinking,
+            BlockKind::Text,
+            BlockKind::Thinking,
+        ]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[1]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[0]), "the reasoning above the focus folds");
+        assert!(!folded(&app, ids[2]), "the newest, below the focus, does not move");
+    }
+
+    #[test]
+    fn the_fold_toggle_without_focus_takes_the_newest_block_with_a_fold() {
+        let (mut app, ids) = fold_toggle_app(&[
+            BlockKind::Thinking,
+            BlockKind::Thinking,
+            BlockKind::Text,
+        ]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[1]), "the newest reasoning folds");
+        assert!(!folded(&app, ids[0]));
+        assert!(!folded(&app, ids[2]));
+    }
+
+    #[test]
+    fn the_fold_toggle_passes_over_a_short_open_result() {
         use crate::view::FocusTarget;
 
         let (mut app, ids) = fold_toggle_app(&[
@@ -713,9 +752,47 @@ mod tests {
         ]);
         app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[2]);
         press_fold_toggle(&mut app);
-        assert!(folded(&app, ids[1]), "the newest foldable block folds");
-        assert!(!folded(&app, ids[0]), "older blocks do not move");
-        assert!(!folded(&app, ids[2]));
+        assert!(folded(&app, ids[0]), "the short result has nothing worth folding");
+        assert!(!folded(&app, ids[1]));
+    }
+
+    #[test]
+    fn the_fold_toggle_takes_a_long_result_and_reopens_a_folded_short_one() {
+        let long: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let (mut app, ids) = fold_toggle_app_with(&[
+            (BlockKind::ToolResult, "ok".to_string()),
+            (BlockKind::ToolResult, long),
+        ]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[1]), "the long result folds");
+        assert!(!folded(&app, ids[0]));
+
+        // Fold the short one by hand: it has a fold now, so the toggle
+        // reaches it from a focus on it.
+        {
+            use crate::view::{CellEditor, EditorEntities, FocusTarget};
+            let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
+            app.world_mut().get_mut::<CellEditor>(main_ent).unwrap().toggle_fold(&ids[0]);
+            app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[0]);
+        }
+        assert!(folded(&app, ids[0]));
+        press_fold_toggle(&mut app);
+        assert!(!folded(&app, ids[0]), "a folded block can always be opened");
+    }
+
+    /// A focus the view has scrolled away from while following the tail is
+    /// stale: the toggle reads the reader as on the tail.
+    #[test]
+    fn the_fold_toggle_ignores_a_stale_focus_while_following() {
+        use crate::view::FocusTarget;
+
+        let (mut app, ids) =
+            fold_toggle_app(&[BlockKind::Thinking, BlockKind::Text, BlockKind::Thinking]);
+        app.world_mut().resource_mut::<ConversationScrollState>().following = true;
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[0]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[2]), "no geometry row on screen: the tail's newest folds");
+        assert!(!folded(&app, ids[0]));
     }
 
     #[test]
