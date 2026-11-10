@@ -227,7 +227,7 @@ the wheel keeps the old focus; see `docs/issues.md`, "Folds".)
 
 | Act | Keys | Fits |
 |---|---|---|
-| Fold or unfold | `c`, `Ctrl+O` | a block with a fold: folded now, reasoning, or a result over 12 lines (`fold::has_fold`) |
+| Fold or unfold | `c`, `Ctrl+O` | a block with a fold: folded now, reasoning, an error, or a result over 12 lines (`fold::has_fold`) |
 | Open the diff viewer | `v`, `Ctrl+A v` | a block that is a diff (`openable_diff`) |
 
 When no block fits, the fold toggle does nothing; the diff viewer shows a

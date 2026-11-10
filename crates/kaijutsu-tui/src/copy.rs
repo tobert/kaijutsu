@@ -264,6 +264,12 @@ impl Scrolled {
         self.refold = true;
     }
 
+    /// Whether a fold is waiting on the next settle, cleared by the read.
+    #[cfg(test)]
+    pub fn take_refold(&mut self) -> bool {
+        std::mem::take(&mut self.refold)
+    }
+
     /// Ask the next frame to scroll by `rows` — how `Up` and `PageUp` leave
     /// the tail, one line and one screen.
     pub fn scroll(&mut self, rows: isize) {

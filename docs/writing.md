@@ -146,6 +146,7 @@ a collision appears in real prose, not in advance.
 | console | noun | The model console a person talks to, the context `characters.console_ctx` names (bootstrap labels it `console`), performed by a non-root character and answering to the person's root console. Not "ROOT" and not "root console". |
 | seat | noun | Only the council's: the context whose calls the council gates (`docs/council.md`). For a context a character plays, say "context"; for the character in operation, say "performer". |
 | gate | noun, verb | The check that stops a statement to ask its assigned reviewer. The one place that authority lives. |
+| reader's block | noun | The block an act on "the block I am looking at" applies to: the last block that fits the act, at or above the reader's line, or the newest that fits on the live tail (`kaijutsu_present::reader::target`, `docs/tui.md`, "The reader's block"). Not the edge, which is where the player's submit says the context ended. |
 | ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
 | continuation window | noun | Policy window for automatically resuming a model conversation after it yields. It lasts 30 minutes from the last actual provider inference request, not a yield. It expresses KV-cache and cost expectations, not a guaranteed cache lifetime or an ask expiry; see `docs/approval-identity.md`, "Continuation windows and async work". |
 | fork | noun, verb | Making a child context. Its parent is `forked_from`; the context graph is a forest. |

@@ -54,8 +54,9 @@ pub enum Intent {
     Unbound(KeyCode),
     /// The prefix was armed or cancelled; the legend line changed.
     LegendChanged,
-    /// `Ctrl+A v` — open the diff viewer on the newest diff block in the
-    /// current context. The app's `v`-on-a-focused-block gesture, ported:
+    /// `Ctrl+A v` — open the diff viewer on the diff at or above the
+    /// reader's line, the newest on the live tail (`docs/tui.md`, "The
+    /// reader's block"). The app's `v`-on-a-focused-block gesture, ported:
     /// nothing on the wire opens a diff view, so this is a local decision
     /// about a block the context already holds (`docs/tui.md`, "Editor and
     /// diff").
@@ -77,8 +78,8 @@ pub enum Intent {
     /// `PageUp` and the wheel reach the same state.
     CopyMode,
     /// `Ctrl+O` — open or close the fold nearest the reader: the last
-    /// foldable block at or above the reader's line, which on the live tail
-    /// is the context's newest (`docs/tui.md`, "Folds"). It never snaps a
+    /// block with a fold at or above the reader's line, which on the live
+    /// tail is the context's newest (`docs/tui.md`, "The reader's block"). It never snaps a
     /// scrolled view back to the tail.
     ToggleFold,
 }

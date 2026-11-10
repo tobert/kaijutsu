@@ -133,12 +133,14 @@ impl ContextView {
 
     /// Open `block` if it is folded and fold it if it is open — `Ctrl+O`.
     /// The fold is this viewer's: nothing is sent to the kernel. `false`
-    /// when the mirror does not hold the block.
+    /// when the mirror does not hold the block. The viewer's move settles
+    /// the block's fold: the rule never folds it again (`AutoFold::decide`).
     pub fn toggle_fold(&mut self, block: BlockId) -> bool {
         let Some(folded) = self.mirror.block(&block).map(|b| self.is_collapsed(b)) else {
             return false;
         };
         self.collapsed.insert(block, !folded);
+        self.folds.decide(block);
         if let Some(scrolled) = self.transcript.scrolled.as_mut() {
             scrolled.refolded();
         }
@@ -760,7 +762,14 @@ impl App {
         if let ContextChange::CollapsedChanged { block_id, collapsed } = change
             && let Some(view) = self.views.get_mut(&context_id)
         {
-            view.collapsed.insert(*block_id, *collapsed);
+            let was = view.collapsed.insert(*block_id, *collapsed);
+            // A fold moved by a sibling changes row counts like any other:
+            // the reader's line stays where it is.
+            if was != Some(*collapsed)
+                && let Some(scrolled) = view.transcript.scrolled.as_mut()
+            {
+                scrolled.refolded();
+            }
         }
     }
 
@@ -1318,6 +1327,24 @@ mod tests {
         assert!(!view.is_collapsed(&thinking), "a later delivery left it open");
     }
 
+    /// A block the viewer folds and reopens before anything follows it is
+    /// the viewer's: the delivery that follows does not fold it again.
+    #[test]
+    fn a_fold_the_viewer_moved_is_not_folded_again_by_the_rule() {
+        let aid = ContextId::new();
+        let thinking = settled(aid, 1, BlockKind::Thinking, Role::Model, "hmm");
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        land(&mut view, vec![thinking.clone()]);
+        assert!(!view.is_collapsed(&thinking), "settled reasoning at the tail stays open");
+
+        assert!(view.toggle_fold(thinking.id));
+        assert!(view.toggle_fold(thinking.id));
+        assert!(!view.is_collapsed(&thinking), "folded and reopened by hand");
+        let answer = settled(aid, 2, BlockKind::Text, Role::Model, "ok");
+        land(&mut view, vec![thinking.clone(), answer]);
+        assert!(!view.is_collapsed(&thinking), "the delivery after it did not fold it");
+    }
+
     /// A fold never moves the text under a reader who has scrolled into the
     /// block: the block they are reading is left open.
     #[test]
@@ -1370,6 +1397,31 @@ mod tests {
             },
         );
         assert!(app.views[&aid].is_collapsed(&call), "the sibling's collapse landed");
+    }
+
+    /// A sibling's fold lands while this viewer is scrolled: the next settle
+    /// places the view from the reader's line, as it does for a local fold.
+    #[test]
+    fn a_siblings_fold_keeps_a_scrolled_readers_place() {
+        let (mut app, aid, _) = app_with_two();
+        let mut mirror = ContextMirror::new(aid);
+        let call = block(aid, 1, BlockKind::ToolCall, Role::Model);
+        mirror
+            .apply_snapshot(vec![call.clone()], 1)
+            .expect("snapshot applies");
+        let mut view = ContextView::new(mirror);
+        view.transcript.scrolled = Some(crate::copy::Scrolled::entering(10));
+        app.views.insert(aid, view);
+
+        let change = ContextChange::CollapsedChanged { block_id: call.id, collapsed: true };
+        app.apply_collapse_change(aid, &change);
+        let scrolled = app.views.get_mut(&aid).and_then(|v| v.transcript.scrolled.as_mut()).expect("still scrolled");
+        assert!(scrolled.take_refold(), "the fold asked the next settle to hold the reader");
+
+        // The same value again changes no rows and asks for nothing.
+        app.apply_collapse_change(aid, &change);
+        let scrolled = app.views.get_mut(&aid).and_then(|v| v.transcript.scrolled.as_mut()).expect("still scrolled");
+        assert!(!scrolled.take_refold());
     }
 
     /// A `CollapsedChanged` for a context with no watched view is not a bug

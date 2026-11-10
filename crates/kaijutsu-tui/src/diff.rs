@@ -3,9 +3,9 @@
 //! **Nothing on the wire opens a diff view.** `kj diff` authors a block whose
 //! `ContentType` is `Diff`, and a client decides for itself to open on it; the
 //! Bevy app does that with `v` on a focused block. The TUI's gesture is
-//! `Ctrl+A v`, which opens on the newest openable diff block in the current
-//! context, and `--diff <a> [b]` runs `kj diff` at startup and opens on its
-//! output.
+//! `Ctrl+A v`, which opens on the reader's block: the diff at or above the
+//! reader's line, the newest on the live tail. The other is `--diff <a> [b]`, which runs `kj diff` at startup and opens on
+//! its output.
 //!
 //! Two contracts from `kaijutsu-diff` shape this module, and both are the
 //! crate's, not this renderer's:

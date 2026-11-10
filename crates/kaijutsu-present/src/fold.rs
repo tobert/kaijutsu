@@ -66,12 +66,6 @@ pub fn has_fold(block: &BlockSnapshot, folded: bool) -> bool {
         }
 }
 
-/// Whether the viewer's toggle applies to `block` at all: the kinds that
-/// fold on their own, plus `Error`, whatever their length or status.
-pub fn foldable(block: &BlockSnapshot) -> bool {
-    matches!(block.kind, BlockKind::Thinking | BlockKind::ToolResult | BlockKind::Error)
-}
-
 /// The once-per-block fold decision for one context.
 #[derive(Debug, Default, Clone)]
 pub struct AutoFold {
@@ -270,14 +264,6 @@ mod tests {
         auto.sweep([&thinking, &answer], None);
         auto.retain(&HashSet::new());
         assert_eq!(auto.sweep([&thinking, &answer], None), vec![thinking.id]);
-    }
-
-    #[test]
-    fn the_toggle_reaches_errors_and_short_results_too() {
-        let ctx = ContextId::new();
-        assert!(foldable(&block(ctx, 1, BlockKind::Error, Status::Error, "boom")));
-        assert!(foldable(&block(ctx, 2, BlockKind::ToolResult, Status::Running, "x")));
-        assert!(!foldable(&block(ctx, 3, BlockKind::Text, Status::Done, "x")));
     }
 
     #[test]

@@ -1444,13 +1444,7 @@ async fn act(
             Some(id) => switch_seat(bridge, app, id, feeds).await,
             None => app.note("no previous context"),
         },
-        Intent::OpenDiff => match open_diff(app) {
-            Some(screen) => {
-                app.screen = ScreenMode::Diff(screen);
-                app.clear_notice();
-            }
-            None => app.note("no diff block in this context"),
-        },
+        Intent::OpenDiff => act_open_diff(app, width),
         Intent::CopyMode => match app.current {
             // Already off the tail: the chord is where the reader is, not a
             // second entry that would re-anchor them at the live tail.
@@ -2910,18 +2904,33 @@ fn write_osc52(term_lock: &TermLock, text: &str) -> io::Result<()> {
     stdout.flush()
 }
 
-/// `Ctrl+A v` — the newest block of the current context the diff viewer opens
-/// on, frozen into a screen.
+/// `Ctrl+A v` — open the diff viewer, or say why it did not.
+fn act_open_diff(app: &mut App, width: u16) {
+    match open_diff(app, width) {
+        Some(screen) => {
+            app.screen = ScreenMode::Diff(screen);
+            app.clear_notice();
+        }
+        None if app.following() => app.note("no diff block in this context"),
+        None => app.note("no diff block at or above this line"),
+    }
+}
+
+/// The diff at the reader's block (`render::reader_target`), frozen into a
+/// screen: the nearest diff block at or above the reader's line while
+/// scrolled, the newest on the live tail. The scrolled view is left as it
+/// is, so closing the viewer returns the reader to the line they left.
 ///
 /// Nothing on the wire opens a diff view: `kj diff` authors a
 /// `ContentType::Diff` block and the client decides. The rule is the app's
 /// [`crate::diff::openable_diff`], so the two clients never disagree about
 /// what is a diff.
-fn open_diff(app: &App) -> Option<crate::diff::DiffScreen> {
-    let view = app.current_view()?;
-    let (block, how) = view.mirror.blocks().iter().rev().find_map(|b| {
-        crate::diff::openable_diff(b.content_type, &b.content).map(|how| (b, how))
+fn open_diff(app: &mut App, width: u16) -> Option<crate::diff::DiffScreen> {
+    let target = render::reader_target(app, width, |_, b| {
+        crate::diff::openable_diff(b.content_type, &b.content).is_some()
     })?;
+    let block = app.current_view()?.mirror.block(&target)?;
+    let how = crate::diff::openable_diff(block.content_type, &block.content)?;
     let title = format!("block #{}", block.id.seq);
     Some(match crate::diff::parse_open(&how, &block.content) {
         Ok(model) => crate::diff::DiffScreen::new(title, &model, &app.palette),
@@ -3102,6 +3111,90 @@ mod tests {
         let event = ServerEvent::TurnStarted { turn_id: kaijutsu_types::TurnId::new(), context_id: id, principal_id: PrincipalId::new() };
         assert!(mark_turn_liveness(&mut app, &event));
         assert!(app.turn_running(id));
+    }
+
+    /// Two diff blocks with prose between and after; the context on screen.
+    fn two_diffs() -> (App, Vec<kaijutsu_types::BlockSnapshot>) {
+        use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContentType, Role, Status};
+        let id = ContextId::new();
+        let mk = |seq: u64, kind: BlockKind, text: &str| {
+            BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), seq), kind)
+                .role(Role::Model)
+                .status(Status::Done)
+                .content(text)
+                .build()
+        };
+        let diff = |seq: u64, file: &str| {
+            let text = format!("--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-old\n+new\n");
+            let mut b = mk(seq, BlockKind::Text, &text);
+            b.content_type = ContentType::Diff;
+            b
+        };
+        let long = (0..30).map(|n| format!("prose {n}")).collect::<Vec<_>>().join("\n");
+        let blocks = vec![
+            mk(1, BlockKind::Text, "first"),
+            diff(2, "one.rs"),
+            mk(3, BlockKind::Text, &long),
+            diff(4, "two.rs"),
+            mk(5, BlockKind::Text, &long),
+        ];
+        let mut app = App::new("amy");
+        app.screen_rows = 12;
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(blocks.clone(), 1).expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+        (app, blocks)
+    }
+
+    fn diff_title(app: &App) -> Option<String> {
+        match &app.screen {
+            ScreenMode::Diff(screen) => Some(screen.title.clone()),
+            _ => None,
+        }
+    }
+
+    /// Scrolled, `Ctrl+A v` opens the diff at or above the reader's line,
+    /// not the newest; on the tail it opens the newest; above every diff it
+    /// says so and changes no screen.
+    #[test]
+    fn the_diff_viewer_opens_on_the_diff_at_or_above_the_reader() {
+        let (mut app, blocks) = two_diffs();
+        act_open_diff(&mut app, 80);
+        assert_eq!(diff_title(&app), Some(format!("block #{}", blocks[3].id.seq)), "the tail: the newest diff");
+        app.screen = ScreenMode::Conversation;
+
+        let rows = render::transcript_all_lines(&mut app, 80)
+            .iter()
+            .map(copy::line_text)
+            .collect::<Vec<_>>();
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).expect(needle);
+        let mut scrolled = copy::Scrolled::entering(6);
+        scrolled.jump_to(row_of("prose 3"));
+        assert!(app.set_scrolled(scrolled));
+        act_open_diff(&mut app, 80);
+        assert_eq!(diff_title(&app), Some(format!("block #{}", blocks[1].id.seq)), "the diff above the reader, not the newest");
+        let place = app.scrolled().map(|s| s.reader_block());
+        assert_eq!(place, Some(Some(blocks[2].id)), "opening the viewer left the reader where they were");
+        app.screen = ScreenMode::Conversation;
+        assert_eq!(render::reader_block(&mut app, 80), Some(blocks[2].id), "and closing it did too");
+
+        app.scrolled_mut().expect("scrolled").jump_to(row_of("first"));
+        act_open_diff(&mut app, 80);
+        assert!(matches!(app.screen, ScreenMode::Conversation), "nothing opened");
+        assert_eq!(app.notice(), Some("no diff block at or above this line"));
+    }
+
+    /// A context with no diff block says so on the tail.
+    #[test]
+    fn the_diff_viewer_on_a_tail_with_no_diff_says_so() {
+        let mut app = App::new("amy");
+        let id = ContextId::new();
+        watched(&mut app, id);
+        app.switch_to(id);
+        act_open_diff(&mut app, 80);
+        assert!(matches!(app.screen, ScreenMode::Conversation));
+        assert_eq!(app.notice(), Some("no diff block in this context"));
     }
 
     /// `Ctrl+O` is never one of copy mode's keys: it folds where the reader

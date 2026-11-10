@@ -142,41 +142,47 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     out
 }
 
-/// The block `Ctrl+O` acts on: the last foldable block at or above the
-/// reader's line (`docs/tui.md`, "Folds"). On the live tail the reader's
-/// line is the transcript's last row, so it is the context's newest
-/// foldable block. Off the tail the view is settled first, so a key that
-/// arrived since the last frame has moved the reader already.
-///
-/// Only blocks the transcript draws count: a call or a held result in the
-/// in-flight strip is not on screen to open.
-pub fn fold_target(app: &mut App, width: u16) -> Option<kaijutsu_types::BlockId> {
-    let reader = if app.scrolled().is_some() {
-        let index = row_index(app, width);
-        let height = transcript_height(app, width);
-        let scrolled = app.scrolled_mut()?;
-        scrolled.settle(&index, height);
-        Some(scrolled.reader_block()?)
-    } else {
-        None
-    };
+/// The reader's block: the block holding the line the scrolled view rests
+/// on, and `None` on the live tail (`docs/tui.md`, "The reader's block").
+/// The view is settled first, so a key that arrived since the last frame
+/// has moved the reader already. Every act that needs a block asks
+/// [`reader_target`], which asks here.
+pub fn reader_block(app: &mut App, width: u16) -> Option<kaijutsu_types::BlockId> {
+    app.scrolled()?;
+    let index = row_index(app, width);
+    let height = transcript_height(app, width);
+    let scrolled = app.scrolled_mut()?;
+    scrolled.settle(&index, height);
+    scrolled.reader_block()
+}
+
+/// The block an act applies to: `kaijutsu_present::reader::target` over the
+/// blocks the transcript draws, from the reader's block. A call or a held
+/// result in the in-flight strip is not on screen, so it is not offered.
+pub fn reader_target(
+    app: &mut App,
+    width: u16,
+    fits: impl Fn(&crate::app::ContextView, &BlockSnapshot) -> bool,
+) -> Option<kaijutsu_types::BlockId> {
+    let reader = reader_block(app, width);
+    let view = app.current_view()?;
     let plan = transcript_plan(app);
-    let end = match reader {
-        Some(block) => plan.iter().position(|(b, _)| b.id == block)? + 1,
-        None => plan.len(),
-    };
-    plan[..end]
-        .iter()
-        .rev()
-        .find(|(block, _)| kaijutsu_present::fold::foldable(block))
-        .map(|(block, _)| block.id)
+    kaijutsu_present::reader::target(plan.iter().map(|(b, _)| b), reader, |b| fits(view, b))
+}
+
+/// The block `Ctrl+O` acts on: the reader's block, or the nearest block
+/// above it with a fold worth reaching for (`docs/tui.md`, "Folds").
+pub fn fold_target(app: &mut App, width: u16) -> Option<kaijutsu_types::BlockId> {
+    reader_target(app, width, |view, block| {
+        kaijutsu_present::fold::has_fold(block, view.is_collapsed(block))
+    })
 }
 
 /// Open or close the fold [`fold_target`] names, on this viewer only — no
 /// RPC. `Err` says why nothing changed, for the status line.
 pub fn toggle_fold(app: &mut App, width: u16) -> Result<kaijutsu_types::BlockId, &'static str> {
     let context_id = app.current.ok_or("no context on screen")?;
-    let target = fold_target(app, width).ok_or("nothing to fold: no reasoning, tool result or error at or above the reader")?;
+    let target = fold_target(app, width).ok_or("nothing to fold: no reasoning, error or long result at or above the reader")?;
     let view = app.views.get_mut(&context_id).ok_or("no transcript here; Ctrl+A <digit> reattaches")?;
     let toggled = view.toggle_fold(target);
     assert!(toggled, "the fold target {target:?} came from this context's own mirror");
@@ -1733,6 +1739,46 @@ mod tests {
         snapshot(&mut app, id, vec![thinking, answer, next]);
         let rows = transcript_text(&mut app, 80);
         assert!(rows.iter().any(|r| r == "thought 2"), "the next delivery left it open: {rows:?}");
+    }
+
+    /// On the tail the toggle passes over a short open result — nothing to
+    /// open there — and reaches the reasoning stub above it.
+    #[test]
+    fn the_toggle_on_the_tail_passes_over_a_short_open_result() {
+        let (mut app, id) = fixture();
+        let thinking = reasoning(id, 8, Status::Done, 3);
+        let mut blocks = vec![thinking.clone()];
+        blocks.extend(long_result(id, 3));
+        let result = blocks.last().expect("the result").clone();
+        snapshot(&mut app, id, blocks);
+        assert_eq!(fold_target(&mut app, 80), Some(thinking.id), "the stub, not the short result");
+
+        toggle_fold(&mut app, 80).expect("a fold to toggle");
+        let view = app.current_view().expect("view");
+        assert!(!view.is_collapsed(&thinking), "the stub opened");
+        assert!(!view.is_collapsed(&result), "the short result was left alone");
+    }
+
+    /// The reader's block is `None` on the tail and the block holding the
+    /// reader's line while scrolled.
+    #[test]
+    fn the_readers_block_is_none_on_the_tail_and_the_line_holder_when_scrolled() {
+        let (mut app, id) = fixture();
+        let thinking = reasoning(id, 9, Status::Done, 30);
+        let answer = block(id, 10, BlockKind::Text, Role::Model, Status::Done, &(0..30).map(|n| format!("answer {n}")).collect::<Vec<_>>().join("\n"));
+        snapshot(&mut app, id, vec![thinking.clone(), answer.clone()]);
+        assert_eq!(reader_block(&mut app, 80), None, "the tail has no reader's block");
+
+        let rows = text_of(&transcript_all_lines(&mut app, 80));
+        let at = rows.iter().position(|r| r == "answer 3").expect("answer row");
+        let mut scrolled = crate::copy::Scrolled::entering(10);
+        scrolled.jump_to(at);
+        assert!(app.set_scrolled(scrolled));
+        assert_eq!(reader_block(&mut app, 80), Some(answer.id), "no frame drew first; the call settles");
+
+        let stub = rows.iter().position(|r| r.starts_with("▸ thinking")).expect("stub row");
+        app.scrolled_mut().expect("scrolled").jump_to(stub);
+        assert_eq!(reader_block(&mut app, 80), Some(thinking.id));
     }
 
     /// With nothing to fold, the toggle says so rather than doing nothing

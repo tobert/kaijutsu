@@ -427,7 +427,7 @@ Rules the figure carries:
 - `▸` marks a folded block, and `✗` a folded `Error`. Folds are this
   viewer's own and follow the shared rule ("Folds"): reasoning and long
   results fold when the next block arrives, an `Error` arrives folded, and
-  `Ctrl+O` toggles the fold nearest the reader.
+  `Ctrl+O` toggles the fold at the reader's block.
 - `Thinking` streams dim and italic in the transcript, at the tail, in
   document order, and folds to `▸ thinking · N lines · …` when the answer
   begins ("Folds").
@@ -615,16 +615,19 @@ Rules the figure carries:
   stubs.
 - **An `Error` arrives folded,** as its one `✗` line; opened, it shows its
   whole text.
-- **`Ctrl+O` toggles the fold nearest the reader:** the last foldable
-  block (reasoning, a tool result, an error) at or above the reader's line,
-  open or folded. On the live tail that is the context's newest foldable
-  block. In copy mode it is the block under the reader's line, else the
-  nearest one above it, and the view stays scrolled. The reader stays on
-  that block: on its stub when it folds, on its first line when it opens.
-  With nothing to fold, the status line says so.
+- **`Ctrl+O` toggles the fold at the reader's block** ("The reader's
+  block"): the last block at or above the reader's line that has a fold
+  worth reaching for, meaning it is folded now, or it is reasoning or an
+  error, or it is a result long enough to fold. A short open result is passed over, so
+  on the live tail `Ctrl+O` reaches the reasoning stub above it. In copy
+  mode it is the block under the reader's line when that block has a fold,
+  else the nearest one above it, and the view stays scrolled. The reader
+  stays on that block: on its stub when it folds, on its first line when
+  it opens. With nothing to fold, the status line says so.
 - **The automatic fold is decided once.** After it, only `Ctrl+O` or a
   sibling's `CollapsedChanged` moves a fold, so a fold you opened stays
-  open through every later delivery.
+  open through every later delivery. A block you folded and reopened
+  before anything followed it counts as decided too (`AutoFold::decide`).
 - **A fold never moves the text under a scrolled reader.** The block the
   reader is inside is decided and left open when something follows it, so
   scrolling away later does not fold it behind them. A fold above or below
@@ -643,13 +646,41 @@ Rules the figure carries:
 
 **The machinery, named.** Nothing on the wire: the rule is
 `kaijutsu_present::fold`, shared with the app (`folds_when_followed`,
-`foldable`, `collapses_by_default`, `AutoFold`, `thinking_stub`,
+`has_fold`, `collapses_by_default`, `AutoFold`, `thinking_stub`,
 `tool_result_stub`). `ContextView::collapsed` holds this viewer's folds,
 and `ContextView::auto_fold` runs `AutoFold::sweep` after every change to
 the mirror — a delivery (`run::apply_delivery`), a rehydrate landing, a new
 view — holding the block `copy::Scrolled::reader_block` names.
 `Intent::ToggleFold` runs `render::toggle_fold`, which acts on
-`render::fold_target`.
+`render::fold_target`, one use of `render::reader_target`.
+
+### The reader's block
+
+Amy, 2026-11-10: *"let's have a single 'block under the reader' in both app
+and tui, and use it consistently"*.
+
+An act on "the block I am looking at" applies to **the last block that fits
+the act, at or above the reader's block**; on the live tail the reader has
+no block, so it is the newest block that fits. The rule is
+`kaijutsu_present::reader::target`, shared with the app, whose reader is its
+focused block. Here the reader's block is the block holding the line the
+scrolled view rests on (`render::reader_block`, which settles the view
+first, so a key that arrived since the last frame has already moved the
+reader). Only blocks the transcript draws are offered: not the draft, and
+not a call or a held result in the in-flight strip.
+
+Two acts use it, each with its own idea of what fits:
+
+- `Ctrl+O` toggles the fold ("Folds"): fits when the block has a fold
+  (`kaijutsu_present::fold::has_fold`).
+- `Ctrl+A v` opens the diff viewer ("Editor and diff"): fits when the block
+  is an openable diff. With none at or above the reader's line the status
+  line says `no diff block at or above this line`; on the tail it says
+  `no diff block in this context`.
+
+The edge on submit (`docs/prompts.md`, "The submit verb") is a different
+thing: it is the newest block the transcript showed, wherever the reader
+was, and no reader's block moves it.
 
 ### The in-flight strip
 
@@ -958,7 +989,7 @@ Rules the figure carries:
   decision. The `Ctrl+A` prefix is the exception: both halves of the chord
   are claimed away from the scrolled transcript (`Keys::claims`), so a
   seat switch never snaps.
-- **`Ctrl+O` opens or closes the fold at or above the reader's line and
+- **`Ctrl+O` opens or closes the fold at the reader's block and
   does not snap** (`Keys::toggles_fold`, "Folds"). The reader stays on
   that block, on its stub when it folds and on its first line when it
   opens.
@@ -1360,8 +1391,11 @@ arrives, and leaves on a `ConnectionStatus::Terminal`.
 
 **Nothing on the wire opens a diff view.** `kj diff` authors a
 `ContentType::Diff` block and each client decides for itself; the app's gesture
-is `v` on a focused block. The TUI's are `Ctrl+A v`, which opens on the newest
-openable block in the current context, and `kaijutsu-tui --diff <A> [B]`, which
+is `v` on a focused block. The TUI has two. One is `Ctrl+A v`, which opens on the reader's block
+("The reader's block"): the nearest openable block at or above the
+reader's line while scrolled, the newest in the context on the live tail.
+Closing the viewer returns to the conversation with the reader where it was.
+The other is `kaijutsu-tui --diff <A> [B]`, which
 runs `kj diff` through `execute_kj` and opens on its output. The open rule is
 the app's `openable_diff`, ported: a declared diff always opens (an error state
 when it will not parse), and `Plain` opens only when its text — or a leading
@@ -1457,7 +1491,7 @@ compose row while a prefix is pending — never the status line, whose seat digi
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
-`Ctrl+O` opens or closes the fold nearest the reader ("Folds"), on the live
+`Ctrl+O` opens or closes the fold at the reader's block ("The reader's block"), on the live
 tail and in copy mode, and under an armed ask card too. It is claimed
 before the draft sees it, in every vi mode and on the `:` bar, so vim's own
 `Ctrl+O` — jump back in normal mode, one normal-mode command from insert
@@ -1484,7 +1518,7 @@ ledger) ends with its own key line for the same reason.
 | `/`, `?`, `n`/`N` | search, step to the next/previous match |
 | `v` | mark the reader's line |
 | `y`, `Enter` | copy the marked range (or the reader's line), then the tail |
-| `Ctrl+O` | open or close the fold at or above the reader's line, without snapping |
+| `Ctrl+O` | open or close the fold at the reader's block, without snapping |
 | `q`, `Esc` | back to the live tail |
 | any other key | snap to the tail and handle it there (except `Ctrl+A` and its chord, which switch seats without snapping) |
 
