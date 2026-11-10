@@ -69,10 +69,12 @@ kaijutsu-server / kernel
    fullscreen: the editor, the diff, copy mode (since 2026-09-13 copy mode is
    the scrolled transcript itself, not a screen of its own). Amy: *"I almost hit ctrl-a
    [ to start scrolling up in this window so what if we put that in?"*
-   Tool output is never collapsed in the tui; a block is read whole, and
-   reading it better is a print-time problem (a formatter over kaish
-   `.data`, longer-term), never a redraw — copy mode is how a long result
-   is read, the way `less` would be. Two things differ from tmux, named:
+   A long tool result folds to one line once the next block arrives, and
+   `Ctrl+O` opens it in place ("Folds"; until 2026-11-10 tool output was
+   never folded here). A running result streams whole. Reading an open
+   result better is a print-time problem (a formatter over kaish `.data`,
+   longer-term), never a redraw — copy mode is how a long result is read,
+   the way `less` would be. Two things differ from tmux, named:
    the buffer is the tui's own (the context mirror, so it holds the whole
    context and search crosses all of it, not only what was printed), and
    the mouse wheel stays the terminal's — since 2026-09-13 it arrives as
@@ -257,7 +259,13 @@ went with it — the scrollback-only cut (`render::cap_tool_result`) that
 kept a live-tail print to one screenful and relied on copy mode's separate,
 uncapped render of the same block to make the rest reachable; with one
 view for both, a long result renders whole and the transcript scrolls
-("Conversation").
+("Conversation"). Since 2026-11-10 a long settled result folds once
+something follows it ("Folds").
+
+The thinking pane went on 2026-11-10: `App::observe_thinking` and its
+latch, `render::thinking_pane` and `thinking_band_lines`, and the
+transcript's rule that settled reasoning is always a stub. Reasoning is a
+transcript block that folds ("Folds").
 
 ### Slices
 
@@ -345,9 +353,9 @@ grammar, and a new surface arrives in the same shape:
   cannot name its kernel path is not designed yet.
 - **Every surface is drawn on the owned screen.** The conversation is the
   transcript area: a scrolling view over the current context's mirror,
-  bottom-aligned above the band. An overlay (picker, ledger, an ask card,
-  the thinking pane) takes rows at the transcript area's foot, between the
-  transcript and the band, and gives them back on dismiss. A full-screen
+  bottom-aligned above the band. An overlay (picker, ledger, an ask card)
+  takes rows at the transcript area's foot, between the transcript and the
+  band, and gives them back on dismiss. A full-screen
   surface (vi, diff) takes the whole screen. The band — the in-flight
   strip, a blank row, the draft, the status line — is always drawn; only a
   full-screen surface replaces it. Copy mode is neither: it is the
@@ -358,8 +366,9 @@ Three sanctioned deviations: compose's figure is the `❯` line inside the
 conversation figure — it is part of that frame, not an overlay; the
 in-flight strip is one fixed row of that same frame ("The in-flight
 strip"); and editor/diff has no figure because its look is vim's,
-specified by `EditorState` rather than by this document. Cache health and Images are
-rendering concerns that ride other surfaces, not surfaces of their own.
+specified by `EditorState` rather than by this document. Folds, Cache
+health and Images are rendering concerns that ride other surfaces, not
+surfaces of their own; Folds keeps a figure because its rule is visual.
 
 ### Conversation
 
@@ -406,24 +415,22 @@ Rules the figure carries:
   (Amy, 2026-09-04: *"could `tool` be the actual tool name? maybe
   principal name far left … possibly some args inline?"* — option 2 of
   three.)
-- **A long tool result renders whole, and the transcript scrolls.** A
-  coder turn is mostly tool output and a `cargo build` runs to thousands of
-  lines; there is no print-time cap and no cut — the tool-result cap that
-  once capped a result to one screenful on the live tail is deleted
-  ("What went"). Scrolling up (`Up`, `PageUp`, or `Ctrl+A [`) is how the
-  rest of a long result is read, the way `less` would. The divider still
-  survives however far the result runs — a result you cannot attribute is
-  worse than a long one.
-- `▸` is a collapsed block; only `Error` collapses by default (tool output
-  prints whole, guidance 7) and
-  `Error` is a one-line stub, per the app's error-render policy. Collapse is
-  kernel state (`CollapsedChanged`), so a sibling's expand is yours too. A
-  completed `Thinking` block is the one block that prints as a `▸` stub
-  regardless ("The thinking pane").
-- `Thinking` streams dim and italic in the thinking pane and leaves a
-  `▸ thinking · N lines · …` stub in the transcript when it completes, a
-  stub whether the view is scrolled or not; `kj block read` is what reads
-  the whole text once the pane has closed ("The thinking pane").
+- **A long tool result streams whole, then folds once something follows
+  it.** A coder turn is mostly tool output and a `cargo build` runs to
+  thousands of lines. While the result runs, every line prints; there is no
+  print-time cap and no cut. Once it settles and the next block arrives, a
+  result over 12 lines folds to `▸ 312 lines · <last line>` under its
+  call's header, and `Ctrl+O` opens it in place ("Folds"). An open long
+  result is read by scrolling (`Up`, `PageUp`, or `Ctrl+A [`), the way
+  `less` would. The header survives however far the result runs — a
+  result you cannot attribute is worse than a long one.
+- `▸` marks a folded block, and `✗` a folded `Error`. Folds are this
+  viewer's own and follow the shared rule ("Folds"): reasoning and long
+  results fold when the next block arrives, an `Error` arrives folded, and
+  `Ctrl+O` toggles the fold nearest the reader.
+- `Thinking` streams dim and italic in the transcript, at the tail, in
+  document order, and folds to `▸ thinking · N lines · …` when the answer
+  begins ("Folds").
 - A `ToolResult` with structured output (`OutputData` — headers, a flat list,
   a tree, `rich_json`) lays out at the terminal's real width in the tui: a
   table, `ls -C` columns, or an indented tree (`layout::layout_output`).
@@ -495,9 +502,9 @@ Rules the figure carries:
   wraps at the width by character, as vim wraps, and continuation rows
   indent under the prompt; Enter in insert mode is a newline. Every row
   past the first grows the band by one, taking that row from the
-  transcript area, up to a third of the screen (`render::third_of_screen`,
-  the same ceiling the thinking band takes): the transcript is redrawn one
-  row shorter, never rebuilt or scrolled to make room, and a grow tied to
+  transcript area, up to a third of the screen (`render::third_of_screen`):
+  the transcript is redrawn one row shorter, never rebuilt or scrolled to
+  make room, and a grow tied to
   a keystroke reads as the line editor growing, not as a jump. Past the
   cap the draft scrolls around the cursor, as vim's command line does. The
   band shrinks once, when the draft is submitted or cleared — never
@@ -551,74 +558,98 @@ Rules the figure carries:
   mode, and the bar
   closes into normal mode.
 
-### The thinking pane
+### Folds
 
 ```text
-  ─ claude · coder ─────────────────────────────────────────────── 14:02:11
-  The unlink bug was in resolve(): it canonicalized the final ▍
+  ─ amy · coder ──────────────────────────────────────────────────── 14:02:04
+  and getattr?
 
+  ─ claude · coder ───────────────────────────────────────────────── 14:02:06
   The unlink bug: resolve() canonicalizes the final component, so the
   symlink's target is what gets removed. Check resolve_nofollow first,
-  then whether rename and getattr share the cause. The test that would
-  show it is vfs::unlink_symlink; run that before touching rename.
+  then whether rename and getattr share the cause ▍
 
   ❯                                                                -- NORMAL --
   0 kaijutsu*  1 kaish@  2 scout  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
 ```
 
-…and once the block completes, scrollback holds one line in its place:
-the kernel's summary, computed once at completion. The pane wraps the block
-for the screen; the summarizer reads the block's own text, whose first
-sentence runs to "removed":
+…and when the answer's first words arrive, the reasoning folds to one line
+with the answer directly under it:
 
 ```text
-  ▸ thinking · 14 lines · The unlink bug: resolve() canonicalizes the final component, so the symlink's target is what gets removed
+  ─ claude · coder ───────────────────────────────────────────────── 14:02:06
+  ▸ thinking · 3 lines · The unlink bug: resolve() canonicalizes the final c…
+  The unlink bug was in resolve(): it canonicalized the final ▍
 ```
 
-Reasoning pops up while the turn runs and gets out of the way when the
-turn is done, without ceasing to be findable (Amy: *"those would pop up
-while thinking runs then get out of the way, but still be findable"*).
+Reasoning streams in the transcript, in document order, and gets out of
+the way once the answer begins. Amy, 2026-11-10: *"because the thinking
+stays on screen while the output arrives, it scrolls the top of the screen
+and is hard to read. If we go to inline thinking with folding, it'll
+improve this. fold should happen when post-thinking output begins. ctrl-o
+to expand if it's open"*. She asked for tool results to fold the same way,
+because their output drowns the turn. This replaced the thinking pane, an
+overlay a third of the screen tall that held a turn's reasoning under the
+streaming answer until the turn ended.
 
 Rules the figure carries:
 
-- **The pane is the turn's, not the block's.** It opens at the first
-  `Thinking` block of a turn this client knows is running (`turns_running`,
-  the partial signal under "The `:` line") and holds until that turn ends.
-  A fast model thinks for 400 ms; a pane that closed with the block was a
-  flap that redrew the whole screen twice per block, measured on
-  deepseek-v4-flash (`App::observe_thinking` is the latch, cleared by
-  `mark_turn_ended`; a block that completed inside one delivery latches
-  too, as long as its stub has not printed).
-- **The pane is an overlay of its own rows, a third of the screen at most**
-  (`render::thinking_pane`, `render::thinking_band_lines`,
-  `render::third_of_screen`: 8 rows on a 24-row terminal, 20 on a 60-row
-  one). It sits at the foot of the transcript area, below the streaming
-  answer and above the band, and the latest reasoning's tail fills it, dim
-  and italic. Because the pane is its own region rather than part of the
-  transcript, the answer streaming in above it never scrolls the reasoning
-  away, and a later thinking block in the same turn replaces the earlier
-  one in place. One size, taken once and given back once.
-- The turn-liveness half is what closes a pane a lost turn would otherwise
-  hold open: a block left `Running` by a dropped stream shows in the
-  ordinary band, never in a stuck pane (`forget_turn_liveness` clears the
-  latch with the flags).
-- **The block completing prints the stub**, in document order, so
-  scrollback reads in sequence while the pane still holds the text: one
-  `▸ thinking · N lines · <summary>` line (`present::thinking_stub_line`),
-  where `<summary>` is the kernel's extractive summary of the block
-  (`kaijutsu_types::summarize_thinking`, stamped on the block when it
-  settles), with the block's own first line as the fallback when no
-  summary exists. Thinking blocks leave the stream while the pane holds
-  them, so nothing draws twice.
-- **The reasoning is not readable in a copy buffer.** There is no second
-  buffer to render it whole into: the scrolled view is the same transcript
-  the live tail draws, and a completed `Thinking` block is one `▸` stub
-  there regardless of scroll position, collapse state ignored for
-  `Thinking`. `kj block read` is the way to read the settled reasoning
-  whole once the pane closes.
-- No tui-side truncation, no kernel budget: what prints is what the
-  provider sent (Claude's adaptive summarized thinking is the API's own
-  summary; DeepSeek gets `reasoning_effort`).
+- **Reasoning is a block like any other.** It streams at the tail, dim and
+  italic under the model's divider, wrapped at the width, the way the
+  answer streams. It is drawn once; no overlay takes rows for it.
+- **A block folds once, when the next block arrives.** Settled reasoning
+  folds to `▸ thinking · N lines · <summary>` the moment a later block
+  lands, usually the answer's first words, so the answer's first line sits
+  directly under the stub. `<summary>` is the kernel's extractive summary
+  of the block (`kaijutsu_types::summarize_thinking`, stamped when it
+  settles), or its first line when there is none. Reasoning that is the
+  context's last block, as after an interrupted turn, stays open until
+  something follows it. A block still streaming never folds.
+- **A long tool result folds the same way.** A settled result over 12
+  lines (`TOOL_RESULT_FOLD_LINES`) folds to `▸ 312 lines · <last line>`
+  when the next block arrives, under its call's header; the last line is
+  where a build or a test run puts its verdict. A running result streams
+  whole, and a short one never folds.
+- **History arrives folded.** A context hydrated on a switch, or rebuilt
+  after a reconnect, shows its earlier reasoning and long results as
+  stubs.
+- **An `Error` arrives folded,** as its one `✗` line; opened, it shows its
+  whole text.
+- **`Ctrl+O` toggles the fold nearest the reader:** the last foldable
+  block (reasoning, a tool result, an error) at or above the reader's line,
+  open or folded. On the live tail that is the context's newest foldable
+  block. In copy mode it is the block under the reader's line, else the
+  nearest one above it, and the view stays scrolled. The reader stays on
+  that block: on its stub when it folds, on its first line when it opens.
+  With nothing to fold, the status line says so.
+- **The automatic fold is decided once.** After it, only `Ctrl+O` or a
+  sibling's `CollapsedChanged` moves a fold, so a fold you opened stays
+  open through every later delivery.
+- **A fold never moves the text under a scrolled reader.** The block the
+  reader is inside is decided and left open when something follows it, so
+  scrolling away later does not fold it behind them. A fold above or below
+  the reader keeps the reader's line on its screen row.
+- **Folds are this viewer's own.** `Ctrl+O` sends nothing to the kernel,
+  and another client keeps its own folds. A sibling that sets a block's
+  `collapsed` field (`ContextChange::CollapsedChanged`) still moves the
+  fold here.
+- Folded text is not on screen, so copy mode's search and yank do not
+  reach it until it is opened; `kj block read` reads any block whole. A
+  submit whose newest shown block is folded sends that block as the edge
+  with no character count (`docs/prompts.md`, "The submit verb").
+- No tui-side truncation of open reasoning and no kernel budget: what
+  prints is what the provider sent (Claude's adaptive summarized thinking
+  is the API's own summary; DeepSeek gets `reasoning_effort`).
+
+**The machinery, named.** Nothing on the wire: the rule is
+`kaijutsu_present::fold`, shared with the app (`folds_when_followed`,
+`foldable`, `collapses_by_default`, `AutoFold`, `thinking_stub`,
+`tool_result_stub`). `ContextView::collapsed` holds this viewer's folds,
+and `ContextView::auto_fold` runs `AutoFold::sweep` after every change to
+the mirror — a delivery (`run::apply_delivery`), a rehydrate landing, a new
+view — holding the block `copy::Scrolled::reader_block` names.
+`Intent::ToggleFold` runs `render::toggle_fold`, which acts on
+`render::fold_target`.
 
 ### The in-flight strip
 
@@ -645,16 +676,17 @@ Rules the figure carries:
   row, the blank row, one draft row, the status line — a wrapped draft
   takes more, up to a third of the screen ("Compose"). A tool call coming
   or going changes the strip's text and nothing else — never the band's
-  height, so the transcript never shifts for it. The thinking pane is the
-  one overlay that takes rows from the transcript area for its own reason,
-  once per turn (`render::band_frame` builds the band; `render::overlay_lines`
-  is separate). (Amy, 2026-09-04: *"the screen seems to be jumpy with the
+  height, so the transcript never shifts for it. Only an overlay the player
+  opened, or an ask card, takes rows from the transcript area
+  (`render::band_frame` builds the band; `render::overlay_lines` is
+  separate). (Amy, 2026-09-04: *"the screen seems to be jumpy with the
   tool call pinning like that"* — every unsettled body used to sit in the
   band with its divider, and wrapped or completed at its own pace.)
 - **What leaves the stream:** an unsettled `ToolCall`, and a `ToolResult`
   a gate holds (`waiting`/`pending`). A `Running` result stays in the
   stream, because that is the tool's output streaming in and Amy wants to
-  watch it. Bodies print to scrollback when they settle, as before.
+  watch it; it folds only after it settles and the next block arrives
+  ("Folds"). A call's body joins the transcript when it settles.
 - **The entry is the call's**; its result refines it through
   `tool_call_id`. A held result whose call is gone is an entry on its own.
   The ask id comes from the ledger, not from the gate's text: the strip
@@ -854,10 +886,9 @@ entering copy mode, and reaching the tail again is leaving it
 moving; `Up` at the draft's edge, `PageUp`, and the wheel arriving as
 arrow keys leave and scroll the same way. The transcript is not frozen and
 not full-screen: it is the same scrolling view over `ContextView`'s mirror
-that the live tail draws, now under vi motions — how a long tool result is
-read whole now that tool output no longer collapses by default
-(`present::collapses_by_default`), and how the conversation is scrolled
-from the keyboard.
+that the live tail draws, now under vi motions — how an open long tool
+result is read whole, and how the conversation is scrolled from the
+keyboard.
 
 ```text
   ─ claude · coder ──────────────────────────────────────────────  14:02:11
@@ -867,7 +898,7 @@ from the keyboard.
   ▸ shell  cargo test -p kaijutsu-kernel vfs::                     running 4s
 
   ❯ and getattr? _                                                  -- INSERT --
-  line 1204/1207   j/k  ^D/^U  gg/G  / search  v mark  y copy  q leave
+  line 1204/1207   j/k  ^D/^U  gg/G  / search  v mark  y copy  ^O fold  q leave
 ```
 
 The reader's line and a marked range paint over the transcript rows
@@ -927,6 +958,10 @@ Rules the figure carries:
   decision. The `Ctrl+A` prefix is the exception: both halves of the chord
   are claimed away from the scrolled transcript (`Keys::claims`), so a
   seat switch never snaps.
+- **`Ctrl+O` opens or closes the fold at or above the reader's line and
+  does not snap** (`Keys::toggles_fold`, "Folds"). The reader stays on
+  that block, on its stub when it folds and on its first line when it
+  opens.
 - **Each context keeps its own scrolled place across a switch** — the
   scrolled state lives on that context's `ContextView`, not on the screen,
   so a context left scrolled is still scrolled on return and one left at
@@ -1422,6 +1457,12 @@ compose row while a prefix is pending — never the status line, whose seat digi
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
+`Ctrl+O` opens or closes the fold nearest the reader ("Folds"), on the live
+tail and in copy mode, and under an armed ask card too. It is claimed
+before the draft sees it, in every vi mode and on the `:` bar, so vim's own
+`Ctrl+O` — jump back in normal mode, one normal-mode command from insert
+mode — is given up in the draft. The full-screen editor keeps vim's
+meaning, and the picker and the ledger keep the key for themselves.
 `Ctrl+Z` toggles a root console or the console and the person's context under it (below). A second
 `Ctrl+Z` within 500 ms suspends the process (`raise SIGTSTP`; `fg` or
 `SIGCONT` brings it back). `:q` (warns first if a turn is known
@@ -1443,6 +1484,7 @@ ledger) ends with its own key line for the same reason.
 | `/`, `?`, `n`/`N` | search, step to the next/previous match |
 | `v` | mark the reader's line |
 | `y`, `Enter` | copy the marked range (or the reader's line), then the tail |
+| `Ctrl+O` | open or close the fold at or above the reader's line, without snapping |
 | `q`, `Esc` | back to the live tail |
 | any other key | snap to the tail and handle it there (except `Ctrl+A` and its chord, which switch seats without snapping) |
 
@@ -1498,7 +1540,9 @@ Lifted with a small de-Bevy into `kaijutsu-present`, the presentation crate
 both clients consume — the thin-client move that falls out of this work:
 `view/format.rs` (block → text), `text/markdown.rs` (pulldown-cmark →
 `RichSpan`), `kaish/mod.rs` (syntax validation, already Bevy-free), the
-`Action` enum, `WellBeats`.
+`Action` enum, `WellBeats`. Written there for both clients rather than
+lifted: `fold.rs`, the rule for which blocks fold, when, and what a stub
+says ("Folds").
 
 **Color is the seam, and it is semantic.** A block resolves to a `BlockTone`
 and a markdown span to a `SpanTone` — one variant per color a theme has a name

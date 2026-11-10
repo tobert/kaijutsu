@@ -10,7 +10,7 @@
 //! the same frames a real terminal gets.
 
 use chrono::{Local, TimeZone};
-use kaijutsu_types::{BlockKind, BlockSnapshot, Status};
+use kaijutsu_types::{BlockSnapshot, Status};
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -34,25 +34,10 @@ pub fn band_rows(app: &App, width: u16) -> u16 {
     BAND_ROWS.saturating_sub(1).saturating_add(u16::try_from(draft).unwrap_or(u16::MAX))
 }
 
-/// A grown region's ceiling: a third of the screen. The compose region
-/// grows toward it a row at a time; the thinking band takes it whole,
-/// once, when a turn's reasoning starts (`docs/tui.md`, "The thinking
-/// pane" and "Compose").
+/// The compose region's ceiling: a third of the screen, which it grows
+/// toward a row at a time (`docs/tui.md`, "Compose").
 pub fn third_of_screen(app: &App) -> u16 {
     (app.screen_rows / 3).max(1)
-}
-
-/// Rows the thinking pane takes above the band while it is open.
-pub fn thinking_band_lines(app: &App) -> u16 {
-    third_of_screen(app)
-}
-
-/// Whether the thinking pane is open: the current context's turn is running
-/// and has shown a `Thinking` block (`App::thinking_pane_latched`). The
-/// turn-liveness half is what keeps a block left `Running` by a lost turn
-/// from holding the pane open forever (`App::forget_turn_liveness`).
-pub fn thinking_pane_open(app: &App) -> bool {
-    app.current.is_some_and(|context_id| app.thinking_pane_latched(context_id))
 }
 
 /// Whether the in-flight strip has a running entry to animate — the event
@@ -69,19 +54,6 @@ pub fn strip_animating(app: &App) -> bool {
         return false;
     };
     crate::inflight::animating(&crate::inflight::entries(view.mirror.blocks().iter(), 0, &Default::default()))
-}
-
-/// The turn's latest `Thinking` block, in document order, whatever its
-/// status — the pane shows the newest reasoning until the turn ends.
-fn latest_thinking(app: &App) -> Option<BlockSnapshot> {
-    let context_id = app.current?;
-    let view = app.views.get(&context_id)?;
-    view.mirror
-        .blocks()
-        .iter()
-        .rev()
-        .find(|b| b.kind == BlockKind::Thinking)
-        .cloned()
 }
 
 /// `1756819331000` → `14:02:11`, in the terminal's own timezone.
@@ -125,13 +97,13 @@ struct BlockPlan {
 }
 
 /// Every block of the current context that belongs in the transcript, with
-/// its speaker, stamp, divider decision and collapse resolved.
+/// its speaker, stamp, divider decision and fold resolved.
 ///
 /// The draft is not one of them — it is the compose line. Neither is a block
-/// the in-flight strip has taken (`inflight::takes_from_stream`) or the one
-/// the thinking pane is holding: a block is on screen once. A hidden block
-/// still moves the divider decision along, so a call in the strip and its
-/// result still read as one unit when the pair lands.
+/// the in-flight strip has taken (`inflight::takes_from_stream`): a block is
+/// on screen once. A hidden block still moves the divider decision along, so
+/// a call in the strip and its result still read as one unit when the pair
+/// lands.
 fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     let Some(context_id) = app.current else {
         return Vec::new();
@@ -139,10 +111,6 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     let Some(view) = app.views.get(&context_id) else {
         return Vec::new();
     };
-    let pane_block = thinking_pane_open(app)
-        .then(|| latest_thinking(app))
-        .flatten()
-        .map(|b| b.id);
     let info = app.info(context_id);
     let mut out = Vec::new();
     let mut last_speaker: Option<String> = None;
@@ -157,7 +125,7 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
         let gap = !pair && speaker_gap(show_divider, last_speaker.as_deref());
         last_speaker = Some(speaker.clone());
         last_block = Some((block.id, block.kind));
-        if crate::inflight::takes_from_stream(block) || Some(block.id) == pane_block {
+        if crate::inflight::takes_from_stream(block) {
             continue;
         }
         out.push((
@@ -167,15 +135,52 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
                 stamp: wallclock(block.created_at),
                 show_divider,
                 gap,
-                // A `Thinking` block is one `▸` stub in the transcript
-                // whatever its collapse state: the reasoning was read as it
-                // streamed in the pane, and `kj block read` keeps the whole
-                // text (`docs/tui.md`, "The thinking pane").
-                collapsed: view.is_collapsed(block) || block.kind == BlockKind::Thinking,
+                collapsed: view.is_collapsed(block),
             },
         ));
     }
     out
+}
+
+/// The block `Ctrl+O` acts on: the last foldable block at or above the
+/// reader's line (`docs/tui.md`, "Folds"). On the live tail the reader's
+/// line is the transcript's last row, so it is the context's newest
+/// foldable block. Off the tail the view is settled first, so a key that
+/// arrived since the last frame has moved the reader already.
+///
+/// Only blocks the transcript draws count: a call or a held result in the
+/// in-flight strip is not on screen to open.
+pub fn fold_target(app: &mut App, width: u16) -> Option<kaijutsu_types::BlockId> {
+    let reader = if app.scrolled().is_some() {
+        let index = row_index(app, width);
+        let height = transcript_height(app, width);
+        let scrolled = app.scrolled_mut()?;
+        scrolled.settle(&index, height);
+        Some(scrolled.reader_block()?)
+    } else {
+        None
+    };
+    let plan = transcript_plan(app);
+    let end = match reader {
+        Some(block) => plan.iter().position(|(b, _)| b.id == block)? + 1,
+        None => plan.len(),
+    };
+    plan[..end]
+        .iter()
+        .rev()
+        .find(|(block, _)| kaijutsu_present::fold::foldable(block))
+        .map(|(block, _)| block.id)
+}
+
+/// Open or close the fold [`fold_target`] names, on this viewer only — no
+/// RPC. `Err` says why nothing changed, for the status line.
+pub fn toggle_fold(app: &mut App, width: u16) -> Result<kaijutsu_types::BlockId, &'static str> {
+    let context_id = app.current.ok_or("no context on screen")?;
+    let target = fold_target(app, width).ok_or("nothing to fold: no reasoning, tool result or error at or above the reader")?;
+    let view = app.views.get_mut(&context_id).ok_or("no transcript here; Ctrl+A <digit> reattaches")?;
+    let toggled = view.toggle_fold(target);
+    assert!(toggled, "the fold target {target:?} came from this context's own mirror");
+    Ok(target)
 }
 
 /// The performer the current context's blocks render under.
@@ -259,11 +264,12 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
         let room = height - lines.len();
         // The head may be above the window without hiding anything the
         // player is reading; a tail the window could not fit is a different
-        // matter.
+        // matter, and so is a fold, whose text was never drawn.
         let cropped = drawn.len() > room;
         drawn.truncate(room);
         if !drawn.is_empty() {
-            edge = Some((block.id, (!cropped).then(|| block.content.chars().count() as u64)));
+            let whole = !cropped && !item.collapsed;
+            edge = Some((block.id, whole.then(|| block.content.chars().count() as u64)));
         }
         lines.extend(drawn);
         row += block_rows;
@@ -422,8 +428,8 @@ fn block_view<'a>(
 
 /// Record the player's edge of context: the block that ended the window,
 /// and how many of its characters were actually drawn — `None` when the
-/// window cropped its tail, because the kernel never guesses one
-/// (`ContextView::edge`, `docs/prompts.md`, "The submit verb").
+/// window cropped its tail or the block is folded, because the kernel never
+/// guesses one (`ContextView::edge`, `docs/prompts.md`, "The submit verb").
 ///
 /// A frame that drew no transcript row records nothing: what the player last
 /// saw is still what they last saw.
@@ -529,48 +535,14 @@ fn overlay_holds_keys(app: &App) -> bool {
     app.picker.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
 }
 
-/// The overlay's rows: the picker, an ask card, the ledger view or the
-/// thinking pane, whichever is open, and empty when none is. One overlay at
-/// a time, drawn between the transcript and the band (`docs/tui.md`, "The
-/// owned screen").
+/// The overlay's rows: the picker, or an ask card or the ledger view,
+/// whichever is open, and empty when none is. One overlay at a time, drawn
+/// between the transcript and the band (`docs/tui.md`, "The owned screen").
 pub fn overlay_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
     if let Some(picker) = &app.picker {
         return crate::picker::render(picker, width, &app.palette);
     }
-    if let Some(lines) = crate::asks::active_view_lines(app, width) {
-        return lines;
-    }
-    thinking_pane(app, width)
-}
-
-/// The thinking pane: the tail of the turn's latest reasoning, dim and
-/// italic, a third of the screen at most, so the answer streaming in never
-/// scrolls the reasoning out of it (`docs/tui.md`, "The thinking pane").
-fn thinking_pane(app: &mut App, width: u16) -> Vec<Line<'static>> {
-    if !thinking_pane_open(app) {
-        return Vec::new();
-    }
-    let Some(block) = latest_thinking(app) else {
-        return Vec::new();
-    };
-    let palette = app.palette;
-    let performer = performer_of(app);
-    let stamp = wallclock(block.created_at);
-    let view = crate::present::BlockView {
-        speaker: "",
-        performer: &performer,
-        stamp: &stamp,
-        show_divider: false,
-        tool: None,
-        arg: None,
-        lineage: Vec::new(),
-        collapsed: false,
-        local_ctx: Some(block.id.context_id),
-    };
-    let rows = usize::from(thinking_band_lines(app));
-    let rendered = app.wrap.lines(&block, &view, width, &palette);
-    let keep = rows.min(rendered.len());
-    rendered[rendered.len() - keep..].to_vec()
+    crate::asks::active_view_lines(app, width).unwrap_or_default()
 }
 
 /// One frame of the owned screen: the transcript on top, the band at the
@@ -766,7 +738,7 @@ mod tests {
         match app.views.get_mut(&id) {
             Some(view) => {
                 view.mirror = mirror;
-                view.seed_collapse();
+                view.auto_fold();
             }
             None => {
                 app.views.insert(id, ContextView::new(mirror));
@@ -1180,13 +1152,12 @@ mod tests {
         vec![call, result]
     }
 
-    /// Tool output is never collapsed in the tui; a block is read whole
-    /// (`docs/tui.md`, guidance 7). The cap that cut a long result to one
-    /// screenful only existed because scrollback could not be read again;
-    /// the transcript scrolls now, so a `cargo build`'s worth of output
-    /// renders every line and gains no footer.
+    /// A long result that nothing follows yet renders whole: it folds only
+    /// once the next block arrives (`docs/tui.md`, "Folds"). There is no
+    /// cap and no footer — the transcript scrolls, so a `cargo build`'s
+    /// worth of output renders every line.
     #[test]
-    fn a_long_tool_result_renders_whole() {
+    fn a_long_tool_result_renders_whole_until_something_follows_it() {
         let (mut app, id) = fixture();
         app.screen_rows = 30;
         snapshot(&mut app, id, long_result(id, 500));
@@ -1641,175 +1612,196 @@ mod tests {
         assert!(overlay.iter().any(|l| l.contains("p0") && l.contains("shell_write")), "got {overlay:?}");
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // The thinking pane (docs/tui.md, "The thinking pane")
-    // ────────────────────────────────────────────────────────────────────
-
-    /// A completed `Thinking` block is one `▸` stub in the transcript,
-    /// naming its size and first line, whatever its collapse state.
-    #[test]
-    fn a_completed_thinking_block_renders_as_a_stub() {
-        let (mut app, id) = fixture();
-        snapshot(
-            &mut app,
-            id,
-            vec![block(
-                id,
-                9,
-                BlockKind::Thinking,
-                Role::Model,
-                Status::Done,
-                "first the unlink path\nthen rename\nthen getattr",
-            )],
-        );
-        let rows = transcript_text(&mut app, 80);
-        let stub = rows.last().expect("a stub row");
-        assert!(stub.starts_with("▸ thinking · 3 lines · first the unlink path"), "got {stub:?}");
-        assert!(!rows.iter().any(|r| r.contains("then rename")), "the body stays out: {rows:?}");
-    }
-
-    /// A `Thinking` block is one stub wherever the transcript is read: the
-    /// scrolled view is that same transcript, so the whole reasoning is
-    /// `kj block read`'s now, not a second buffer's
-    /// (`docs/tui.md`, "The thinking pane").
-    #[test]
-    fn thinking_stays_a_stub_in_the_whole_transcript() {
-        let (mut app, id) = fixture();
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(
-                    id,
-                    9,
-                    BlockKind::Thinking,
-                    Role::Model,
-                    Status::Done,
-                    "first the unlink path\nthen rename",
-                )],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-        let rows = text_of(&transcript_all_lines(&mut app, 80));
-        assert!(rows.iter().any(|r| r.starts_with("▸ thinking")), "got {rows:?}");
-        assert!(!rows.iter().any(|r| r == "then rename"), "the body stays out: {rows:?}");
-    }
-
-    /// A turn whose reasoning is still streaming. Returns the thinking
-    /// block's id — what a delivery names as touched.
-    fn streaming_thinking(app: &mut App, id: ContextId, lines: usize) -> BlockId {
-        let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
-        let thinking = block(id, 9, BlockKind::Thinking, Role::Model, Status::Running, &body);
-        let block_id = thinking.id;
-        snapshot(app, id, vec![thinking]);
-        block_id
-    }
-
-    /// A turn whose reasoning already completed and whose answer is now
-    /// streaming: a `Done` Thinking block of `lines` rows, then a `Running`
-    /// Text block.
-    fn thinking_then_answer(app: &mut App, id: ContextId, lines: usize) -> BlockId {
-        let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
-        let thinking = block(id, 9, BlockKind::Thinking, Role::Model, Status::Done, &body);
-        let block_id = thinking.id;
-        snapshot(
-            app,
-            id,
-            vec![
-                thinking,
-                block(id, 10, BlockKind::Text, Role::Model, Status::Running, "The unlink bug"),
-            ],
-        );
-        block_id
-    }
-
-    /// The pane opens at a running turn's first `Thinking` block and holds
-    /// until the turn ends — not until the block does, which on a fast
-    /// model is 400 ms later. A turn this client cannot see running never
-    /// opens it.
-    #[test]
-    fn the_pane_latches_at_the_turns_first_thinking_and_holds_to_its_end() {
-        let (mut app, id) = fixture();
-        let thinking = streaming_thinking(&mut app, id, 3);
-        assert!(!app.observe_thinking(id, &[thinking]), "no known turn: nothing to latch");
-        assert!(overlay_lines(&mut app, 80).is_empty(), "no known turn: no pane");
-        app.mark_turn_running(id);
-        assert!(app.observe_thinking(id, &[thinking]));
-        assert!(!overlay_lines(&mut app, 80).is_empty());
-
-        let done = thinking_then_answer(&mut app, id, 3);
-        assert!(!overlay_lines(&mut app, 80).is_empty(), "the block completing is not the dismiss");
-        assert_eq!(done.seq, thinking.seq, "the same block, now settled");
-        app.mark_turn_ended(id);
-        assert!(overlay_lines(&mut app, 80).is_empty(), "the turn's end closes it");
-    }
-
-    /// Reasoning an earlier turn left in the mirror does not open the pane:
-    /// the latch is on a block this delivery touched.
     /// The key path and the frame divide the screen with one function, so an
     /// overlay's rows come out of the transcript's for both. Measured
     /// against the taller screen a page step overshoots, and the reader's
-    /// offset slides the moment the pane opens.
+    /// offset slides the moment an overlay opens.
     #[test]
     fn an_open_overlay_shortens_the_transcript_for_the_key_path_too() {
-        let (mut app, id) = fixture();
+        let (mut app, _id) = fixture();
         app.screen_rows = 24;
         let bare = transcript_height(&mut app, 80);
         assert_eq!(bare, 24 - usize::from(band_rows(&app, 80)));
 
-        let thinking = streaming_thinking(&mut app, id, 6);
-        app.mark_turn_running(id);
-        assert!(app.observe_thinking(id, &[thinking]));
+        app.ledger_view = Some(ledger_view(2));
         let overlay = overlay_lines(&mut app, 80).len();
-        assert!(overlay > 0, "the thinking pane is open");
+        assert!(overlay > 0, "the ledger is open");
         assert_eq!(
             transcript_height(&mut app, 80),
             bare - overlay,
-            "the pane's rows come out of the transcript's"
+            "the overlay's rows come out of the transcript's"
         );
     }
 
-    #[test]
-    fn stale_reasoning_does_not_latch_a_new_turn() {
-        let (mut app, id) = fixture();
-        let _stale = streaming_thinking(&mut app, id, 3);
-        app.mark_turn_running(id);
-        assert!(!app.observe_thinking(id, &[]), "a delivery that touched no thinking block");
-        assert!(overlay_lines(&mut app, 80).is_empty(), "no pane for reasoning nobody sent");
+    // ────────────────────────────────────────────────────────────────────
+    // Folds (docs/tui.md, "Folds")
+    // ────────────────────────────────────────────────────────────────────
+
+    fn reasoning(id: ContextId, seq: u64, status: Status, lines: usize) -> BlockSnapshot {
+        let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
+        block(id, seq, BlockKind::Thinking, Role::Model, status, &body)
     }
 
-    /// A completed thinking block seen only after it completed — one
-    /// delivery carried the whole thing — still opens the pane.
+    /// Streaming reasoning is an ordinary block at the tail: it renders
+    /// whole, in document order under the model's divider, once — no pane
+    /// holds a second copy, and no overlay takes rows for it.
     #[test]
-    fn a_thinking_block_that_completed_inside_one_delivery_still_latches() {
+    fn streaming_reasoning_renders_inline_once() {
         let (mut app, id) = fixture();
         app.mark_turn_running(id);
-        let thinking = thinking_then_answer(&mut app, id, 3);
-        assert!(app.observe_thinking(id, &[thinking]));
+        let question = block(id, 1, BlockKind::Text, Role::User, Status::Done, "and getattr?");
+        snapshot(&mut app, id, vec![question, reasoning(id, 2, Status::Running, 3)]);
+
+        let rows = transcript_text(&mut app, 80);
+        let first = rows.iter().position(|r| r == "thought 0").unwrap_or_else(|| panic!("inline: {rows:?}"));
+        assert_eq!(rows[first + 1], "thought 1", "{rows:?}");
+        assert_eq!(rows[first + 2], "thought 2", "{rows:?}");
+        assert!(rows[first - 1].starts_with("─ deepseek-v4 · coder ─"), "under the model's divider: {rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.starts_with("thought")).count(), 3, "drawn once: {rows:?}");
+        assert!(overlay_lines(&mut app, 80).is_empty(), "no overlay takes rows for it");
     }
 
-    /// The pane holds the reasoning's tail, a third of the screen, and the
-    /// block it is showing is not repeated in the transcript below it.
+    /// Settled reasoning that is the newest block stays open; the moment the
+    /// answer follows it, it is one stub with the answer's first line
+    /// directly under it.
     #[test]
-    fn the_pane_holds_the_latest_reasoning_and_the_transcript_drops_it() {
+    fn the_answer_lands_directly_under_folded_reasoning() {
         let (mut app, id) = fixture();
-        app.mark_turn_running(id);
-        let thinking = thinking_then_answer(&mut app, id, 30);
-        assert!(app.observe_thinking(id, &[thinking]));
+        let thinking = reasoning(id, 9, Status::Done, 3);
+        snapshot(&mut app, id, vec![thinking.clone()]);
+        let open = transcript_text(&mut app, 80);
+        assert!(open.iter().any(|r| r == "thought 2"), "settled and last: still open: {open:?}");
 
-        // A 24-row screen gives the pane a third: eight rows of tail.
-        assert_eq!(thinking_band_lines(&app), 8);
-        let pane = text_of(&overlay_lines(&mut app, 80));
-        assert_eq!(pane.len(), 8, "got {pane:?}");
-        assert_eq!(pane.first().map(String::as_str), Some("thought 22"), "got {pane:?}");
-        assert_eq!(pane.last().map(String::as_str), Some("thought 29"), "got {pane:?}");
+        let answer = block(id, 10, BlockKind::Text, Role::Model, Status::Running, "The unlink bug");
+        snapshot(&mut app, id, vec![thinking, answer]);
+        let rows = transcript_text(&mut app, 80);
+        let stub = rows
+            .iter()
+            .position(|r| r.starts_with("▸ thinking · 3 lines · thought 0"))
+            .unwrap_or_else(|| panic!("a stub: {rows:?}"));
+        assert_eq!(rows[stub + 1], "The unlink bug", "the answer is directly under the stub: {rows:?}");
+        assert!(!rows.iter().any(|r| r == "thought 2"), "the body folded away: {rows:?}");
+    }
 
-        let transcript = transcript_text(&mut app, 80);
-        assert!(transcript.iter().any(|r| r.contains("The unlink bug")), "the answer streams: {transcript:?}");
-        assert!(
-            !transcript.iter().any(|r| r.starts_with("▸ thinking")),
-            "the pane's block is not repeated as a stub: {transcript:?}"
-        );
+    /// A long settled result folds once something follows it; its call's
+    /// header stays and the stub is its one body line. A short result and
+    /// a running one render whole.
+    #[test]
+    fn only_a_long_settled_result_folds_and_its_header_stays() {
+        let (mut app, id) = fixture();
+        let after = block(id, 20, BlockKind::Text, Role::Model, Status::Done, "Built.");
+        let mut blocks = long_result(id, 40);
+        blocks.push(after.clone());
+        snapshot(&mut app, id, blocks);
+        let rows = transcript_text(&mut app, 80);
+        let header = rows
+            .iter()
+            .position(|r| r.starts_with("─ deepseek-v4 · builtin.shell.shell ─ cargo build"))
+            .unwrap_or_else(|| panic!("the call's header: {rows:?}"));
+        assert_eq!(rows[header + 1], "▸ 40 lines · line 39", "{rows:?}");
+        assert!(!rows.iter().any(|r| r == "line 20"), "{rows:?}");
+
+        let mut blocks = long_result(id, 3);
+        blocks.push(after.clone());
+        snapshot(&mut app, id, blocks);
+        let rows = transcript_text(&mut app, 80);
+        assert!(rows.iter().any(|r| r == "line 2"), "a short result renders whole: {rows:?}");
+
+        let mut blocks = long_result(id, 40);
+        blocks[1].status = Status::Running;
+        blocks.push(after);
+        snapshot(&mut app, id, blocks);
+        let rows = transcript_text(&mut app, 80);
+        assert!(rows.iter().any(|r| r == "line 20"), "a running result streams whole: {rows:?}");
+    }
+
+    /// `Ctrl+O` on the live tail opens the newest fold, and the delivery
+    /// after it does not fold it again: the fold is decided once.
+    #[test]
+    fn the_toggle_on_the_tail_opens_the_newest_fold_for_good() {
+        let (mut app, id) = fixture();
+        let thinking = reasoning(id, 9, Status::Done, 3);
+        let answer = block(id, 10, BlockKind::Text, Role::Model, Status::Done, "The unlink bug");
+        snapshot(&mut app, id, vec![thinking.clone(), answer.clone()]);
+        assert_eq!(fold_target(&mut app, 80), Some(thinking.id), "the newest foldable block");
+
+        toggle_fold(&mut app, 80).expect("a fold to toggle");
+        let rows = transcript_text(&mut app, 80);
+        assert!(rows.iter().any(|r| r == "thought 2"), "opened: {rows:?}");
+
+        let next = block(id, 11, BlockKind::Text, Role::User, Status::Done, "and then?");
+        snapshot(&mut app, id, vec![thinking, answer, next]);
+        let rows = transcript_text(&mut app, 80);
+        assert!(rows.iter().any(|r| r == "thought 2"), "the next delivery left it open: {rows:?}");
+    }
+
+    /// With nothing to fold, the toggle says so rather than doing nothing
+    /// silently.
+    #[test]
+    fn the_toggle_with_nothing_foldable_says_so() {
+        let (mut app, _id) = fixture();
+        assert_eq!(fold_target(&mut app, 80), None);
+        assert!(toggle_fold(&mut app, 80).is_err());
+    }
+
+    /// Scrolled, the toggle acts on the block under the reader, the view
+    /// stays scrolled, and the reader is still on that block — on its stub
+    /// once it folds, on its first line once it opens.
+    #[test]
+    fn the_toggle_while_scrolled_acts_under_the_reader_and_keeps_the_place() {
+        let (mut app, id) = fixture();
+        let thinking = reasoning(id, 9, Status::Done, 30);
+        let answer = block(id, 10, BlockKind::Text, Role::Model, Status::Done, &(0..30).map(|n| format!("answer {n}")).collect::<Vec<_>>().join("\n"));
+        snapshot(&mut app, id, vec![thinking.clone(), answer]);
+        let stub_row = text_of(&transcript_all_lines(&mut app, 80))
+            .iter()
+            .position(|r| r.starts_with("▸ thinking"))
+            .expect("folded");
+        let mut scrolled = crate::copy::Scrolled::entering(10);
+        scrolled.jump_to(stub_row);
+        assert!(app.set_scrolled(scrolled));
+        let _ = transcript_window(&mut app, 80, 10);
+        assert_eq!(app.scrolled().and_then(|s| s.reader_block()), Some(thinking.id));
+
+        toggle_fold(&mut app, 80).expect("a fold to toggle");
+        let window = transcript_window(&mut app, 80, 10);
+        assert!(app.scrolled().is_some(), "the toggle did not snap to the tail");
+        assert_eq!(reader_line(&window), "thought 0", "the reader is on the block's first line");
+        assert_eq!(app.scrolled().and_then(|s| s.reader_block()), Some(thinking.id));
+
+        toggle_fold(&mut app, 80).expect("a fold to toggle");
+        let window = transcript_window(&mut app, 80, 10);
+        assert!(reader_line(&window).starts_with("▸ thinking"), "back on the stub");
+    }
+
+    /// The row index the key path settles against agrees with the rows a
+    /// frame draws once a block folds, so search and yank address what is
+    /// on screen.
+    #[test]
+    fn the_row_index_agrees_with_the_drawn_rows_after_a_fold() {
+        let (mut app, id) = fixture();
+        let mut blocks = vec![reasoning(id, 8, Status::Done, 12)];
+        blocks.extend(long_result(id, 40));
+        blocks.push(block(id, 20, BlockKind::Text, Role::Model, Status::Done, "Built."));
+        snapshot(&mut app, id, blocks);
+        let drawn = transcript_all_lines(&mut app, 80);
+        assert!(text_of(&drawn).iter().any(|r| r.starts_with("▸ 40 lines")), "folded: {:?}", text_of(&drawn));
+        assert_eq!(row_index(&mut app, 80).total(), drawn.len());
+        assert_eq!(text_of(&drawn), text_of(&transcript_window(&mut app, 80, u16::MAX)));
+    }
+
+    /// A folded block's text was not shown, so an edge that ends on one
+    /// carries the block and no count (`docs/prompts.md`, "The submit
+    /// verb").
+    #[test]
+    fn a_folded_tail_block_sends_no_count() {
+        let (mut app, id) = fixture();
+        let error = block(id, 9, BlockKind::Error, Role::System, Status::Error, "the kernel restarted");
+        snapshot(&mut app, id, vec![error.clone()]);
+        let _ = transcript_window(&mut app, 80, u16::MAX);
+        let edge = app.views[&id].edge().expect("the error was drawn");
+        assert_eq!(edge.block, error.id);
+        assert_eq!(edge.shown, None, "a stub is not the text");
     }
 
     /// An unfocused terminal shows nobody the spinner, so the loop stops

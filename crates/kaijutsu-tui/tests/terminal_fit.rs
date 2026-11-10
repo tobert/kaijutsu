@@ -1088,6 +1088,64 @@ fn colon_bang_runs_one_kaish_statement_and_lands_its_output() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// i2. Folds
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Whether a transcript row reads exactly `line`, trailing blanks aside.
+fn transcript_row_is(screen: &vt100::Screen, line: &str) -> bool {
+    screen.rows(0, screen.size().1).take(TRANSCRIPT_ROWS).any(|l| l.trim_end() == line)
+}
+
+/// A long result renders whole while it is the newest block, folds to one
+/// line once the next block lands, and `Ctrl+O` in copy mode opens it where
+/// the reader is without leaving copy mode (`docs/tui.md`, "Folds").
+#[test]
+fn a_long_result_folds_when_the_next_block_lands_and_ctrl_o_opens_it_in_place() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(150));
+    session.send(":!seq 1 40 | sed 's/^/row-/'\r");
+    let whole = session.wait_until(Duration::from_secs(20), |screen| transcript_row_is(screen, "row-40"));
+    assert!(whole, "the newest result renders whole: {}", session.dump("after seq"));
+
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(150));
+    session.send(":!echo fold-marker\r");
+    let folded = session.wait_until(Duration::from_secs(20), |screen| {
+        transcript_holds(screen, "▸ 40 lines · row-40") && transcript_row_is(screen, "fold-marker")
+    });
+    assert!(folded, "the next block folds the long result: {}", session.dump("after echo"));
+    assert!(
+        !session.wait_until(Duration::from_millis(300), |screen| transcript_row_is(screen, "row-20")),
+        "the folded body is off screen: {}",
+        session.dump("folded")
+    );
+
+    // Copy mode, the reader onto the stub, then the toggle.
+    session.send("\x01[");
+    wait_for_scrolled(&session, "after Ctrl+A [");
+    session.send("?40 lines\r");
+    let on_stub = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        reader_rows(screen, TRANSCRIPT_ROWS).first().is_some_and(|&row| rows[row].contains("▸ 40 lines"))
+    });
+    assert!(on_stub, "the search put the reader on the stub: {}", session.dump("after ?"));
+
+    session.send("\x0f");
+    let opened = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        reader_rows(screen, TRANSCRIPT_ROWS).first().is_some_and(|&row| rows[row].trim_end() == "row-1")
+            && transcript_row_is(screen, "row-2")
+    });
+    assert!(opened, "Ctrl+O opened the fold under the reader: {}", session.dump("after Ctrl+O"));
+    let rows = session.screen_text();
+    assert!(rows[23].contains("q leave"), "Ctrl+O did not snap to the tail: {}", session.dump("after Ctrl+O"));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // j. `:q` and `:q!` quit
 // ────────────────────────────────────────────────────────────────────────────
 

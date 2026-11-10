@@ -217,6 +217,11 @@ pub struct Scrolled {
     /// `g` pressed once, waiting for a second `g` (vi's `gg`).
     pending_g: bool,
     search: SearchState,
+    /// The reader's line, anchored the way the top is, and the screen row
+    /// it was on when the last frame took it. `None` until a frame settles.
+    reader: Option<(Anchor, usize)>,
+    /// A fold changed since the last frame ([`Self::refolded`]).
+    refold: bool,
 }
 
 impl Scrolled {
@@ -238,7 +243,25 @@ impl Scrolled {
             body_h: body_h.max(1),
             pending_g: false,
             search: SearchState::default(),
+            reader: None,
+            refold: false,
         }
+    }
+
+    /// The block holding the reader's line, as the last frame settled it.
+    /// It is the block a fold sweep leaves open and the place `Ctrl+O`
+    /// looks from (`docs/tui.md`, "Folds").
+    pub fn reader_block(&self) -> Option<BlockId> {
+        self.reader.map(|(anchor, _)| anchor.block)
+    }
+
+    /// A fold opened or closed in this transcript. The next settle keeps the
+    /// reader's own line on its screen row, rather than the top row's: a
+    /// fold changes how many rows a block takes, and the reader is what
+    /// must not move. A reader whose own line folded away lands on the
+    /// block's stub.
+    pub fn refolded(&mut self) {
+        self.refold = true;
     }
 
     /// Ask the next frame to scroll by `rows` — how `Up` and `PageUp` leave
@@ -284,17 +307,34 @@ impl Scrolled {
     /// The anchor is resolved first, so a block that grew above the reader
     /// moves the row number without moving the screen; the key path's
     /// pending move is applied to that fresh position, and the anchor and
-    /// the mark are re-taken from where the view landed.
+    /// the mark are re-taken from where the view landed. After a fold
+    /// ([`Self::refolded`]) the reader's anchor places the view instead of
+    /// the top's.
     pub fn settle(&mut self, index: &RowIndex, body_h: usize) -> usize {
         let total = index.total();
         let body_h = body_h.max(1);
         let last_top = total.saturating_sub(body_h);
-        let base = self
-            .top
-            .as_ref()
-            .and_then(|anchor| index.row_of_or_neighbour(anchor))
-            .unwrap_or(self.top_row)
-            .min(last_top);
+        let held = std::mem::take(&mut self.refold)
+            .then_some(self.reader)
+            .flatten()
+            .and_then(|(anchor, screen_row)| Some((index.row_of(&anchor)?, screen_row)));
+        let base = match held {
+            // The top that keeps the reader's line on the screen row it was
+            // on. Where the view cannot go that far, the reader's offset
+            // takes up the difference, so the line stays theirs.
+            Some((reader, screen_row)) => {
+                let want = reader as isize - screen_row as isize;
+                let base = want.clamp(0, last_top as isize);
+                self.reader_offset = (self.reader_offset as isize + (want - base)).max(0) as usize;
+                base as usize
+            }
+            None => self
+                .top
+                .as_ref()
+                .and_then(|anchor| index.row_of_or_neighbour(anchor))
+                .unwrap_or(self.top_row)
+                .min(last_top),
+        };
 
         let (start, reader_offset) = match std::mem::take(&mut self.pending) {
             Pending::Rows(delta) => (base.saturating_add_signed(delta).min(last_top), self.reader_offset),
@@ -319,6 +359,9 @@ impl Scrolled {
             .min(body_h - 1)
             .min(total.saturating_sub(start).saturating_sub(1));
         self.top = index.anchor_at(start);
+        self.reader = index
+            .anchor_at(start + self.reader_offset)
+            .map(|anchor| (anchor, self.reader_offset));
         // A mark whose block is gone is gone with it: there is no line left
         // to copy, and a range that silently slid onto a neighbour would
         // yank text nobody marked.
@@ -383,7 +426,7 @@ impl Scrolled {
             format!("line {}/{}", self.reader_row() + 1, self.total_rows)
         };
         let lead = format!("{position}   ");
-        let full = "j/k  ^D/^U  gg/G  / search  v mark  y copy  q leave";
+        let full = "j/k  ^D/^U  gg/G  / search  v mark  y copy  ^O fold  q leave";
         let short = "v mark  y copy  q leave";
         let room = usize::from(width).saturating_sub(lead.chars().count());
         let keys = if full.chars().count() <= room { full } else { short };
@@ -918,6 +961,63 @@ mod tests {
         assert_eq!(view.range(), (reader, reader));
     }
 
+    // ── folds ───────────────────────────────────────────────────────────
+
+    /// The settled reader names the block it is reading — what a fold
+    /// sweep leaves open and what `Ctrl+O` toggles.
+    #[test]
+    fn the_reader_names_the_block_under_it() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-12);
+        view.settle(&index, 10);
+        assert_eq!(view.reader_row(), 17);
+        assert_eq!(view.reader_block(), Some(block(1)));
+    }
+
+    /// The reader's own block folds to one stub row: the line they were on
+    /// no longer exists, so they land on the stub.
+    #[test]
+    fn a_fold_under_the_reader_lands_on_its_stub() {
+        let index = led_index(&[(0, 10), (1, 11), (0, 10)]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-13);
+        view.settle(&index, 10);
+        assert_eq!(view.reader_row(), 17, "line 6 of block 1");
+        assert_eq!(view.reader_block(), Some(block(1)));
+
+        // Block 1 folds to its divider and one stub row.
+        let folded = led_index(&[(0, 10), (1, 2), (0, 10)]);
+        view.refolded();
+        view.settle(&folded, 10);
+        assert_eq!(view.reader_row(), 11, "the stub row, under the divider");
+        assert_eq!(view.reader_block(), Some(block(1)));
+
+        // It opens again: the reader is on its first line.
+        view.refolded();
+        view.settle(&index, 10);
+        assert_eq!(view.reader_row(), 11, "the stub's line is the block's first line");
+        assert_eq!(view.reader_block(), Some(block(1)));
+    }
+
+    /// A block holding the top row folds while the reader sits in the next
+    /// one: the reader's own text stays under them, where an anchor on the
+    /// top row would have slid them down the next block.
+    #[test]
+    fn a_fold_above_the_reader_keeps_the_reader_on_their_text() {
+        let index = led_index(&[(0, 20), (1, 11)]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-6);
+        view.settle(&index, 10);
+        assert_eq!(view.reader_row(), 24, "line 3 of block 1");
+
+        let folded = led_index(&[(0, 1), (1, 11)]);
+        view.refolded();
+        view.settle(&folded, 10);
+        assert_eq!(view.reader_block(), Some(block(1)));
+        assert_eq!(view.reader_row(), 5, "still line 3 of block 1");
+    }
+
     // ── motions ─────────────────────────────────────────────────────────
 
     /// `k` is vim's cursor motion: it walks the reader up the screen and
@@ -1172,6 +1272,8 @@ mod tests {
                 hint.chars().count()
             );
         }
+        let wide = line_text(&view.hint_line(120, &palette));
+        assert!(wide.contains("^O fold"), "the fold toggle is named: {wide:?}");
     }
 
     #[test]

@@ -18,7 +18,8 @@ use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
 use kaijutsu_client::{DraftOutbox, EditorOutbox};
-use crate::present::{Palette, WrapCache, collapses_by_default};
+use crate::present::{Palette, WrapCache};
+use kaijutsu_present::fold::{AutoFold, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 
 /// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
@@ -64,10 +65,14 @@ impl TranscriptView {
 /// One watched context: its mirror, and how this client is showing it.
 pub struct ContextView {
     pub mirror: ContextMirror,
-    /// Per-block collapse, seeded from [`collapses_by_default`] on first
-    /// arrival and then carried forward, so a later expand is not wiped by
-    /// the next redraw.
+    /// Per-block fold, this viewer's own: seeded from the block's `collapsed`
+    /// field and [`collapses_by_default`] on first arrival, closed by
+    /// [`Self::auto_fold`], and moved by `Ctrl+O` ([`Self::toggle_fold`]) or
+    /// a sibling's `CollapsedChanged`. Carried forward per block, so a
+    /// later change is not wiped by the next redraw.
     pub collapsed: HashMap<BlockId, bool>,
+    /// Which blocks have had their fold decided (`kaijutsu_present::fold`).
+    folds: AutoFold,
     /// Activity since this context was last on screen — screen's `@` flag.
     pub activity: bool,
     /// The block that ended the last transcript frame, and how many of its
@@ -88,22 +93,56 @@ impl ContextView {
         let mut view = Self {
             mirror,
             collapsed: HashMap::new(),
+            folds: AutoFold::default(),
             activity: false,
             shown_tail: None,
             transcript: TranscriptView::default(),
         };
-        view.seed_collapse();
+        view.auto_fold();
         view
     }
 
-    /// Apply the first-arrival collapse default to every block that has not
-    /// been seen before.
-    pub fn seed_collapse(&mut self) {
+    /// Bring the folds up to date with the mirror. Run after every change
+    /// to it: a delivery, a rehydrate landing, a new view.
+    ///
+    /// A block seen for the first time takes its first-arrival fold. Then
+    /// each block that [`folds_when_followed`](kaijutsu_present::fold::folds_when_followed)
+    /// and now has a block after it folds, once (`AutoFold::sweep`) — except
+    /// the block a scrolled reader is reading, which is decided and left
+    /// open, so a fold never moves the text under the reader
+    /// (`docs/tui.md`, "Folds").
+    pub fn auto_fold(&mut self) {
         for block in self.mirror.blocks() {
             self.collapsed
                 .entry(block.id)
                 .or_insert_with(|| block.collapsed || collapses_by_default(block.kind));
         }
+        let held = self.transcript.scrolled.as_ref().and_then(crate::copy::Scrolled::reader_block);
+        let fold = self.folds.sweep(self.mirror.blocks(), held);
+        if !fold.is_empty() {
+            for id in fold {
+                self.collapsed.insert(id, true);
+            }
+            if let Some(scrolled) = self.transcript.scrolled.as_mut() {
+                scrolled.refolded();
+            }
+        }
+        let live: HashSet<BlockId> = self.mirror.blocks().iter().map(|b| b.id).collect();
+        self.folds.retain(&live);
+    }
+
+    /// Open `block` if it is folded and fold it if it is open — `Ctrl+O`.
+    /// The fold is this viewer's: nothing is sent to the kernel. `false`
+    /// when the mirror does not hold the block.
+    pub fn toggle_fold(&mut self, block: BlockId) -> bool {
+        let Some(folded) = self.mirror.block(&block).map(|b| self.is_collapsed(b)) else {
+            return false;
+        };
+        self.collapsed.insert(block, !folded);
+        if let Some(scrolled) = self.transcript.scrolled.as_mut() {
+            scrolled.refolded();
+        }
+        true
     }
 
     /// Whether a block renders collapsed right now.
@@ -171,10 +210,6 @@ pub struct App {
     /// — it is what `Ctrl+C`'s ladder and `:q`'s warning read, not an
     /// authoritative turn registry.
     pub turns_running: HashSet<ContextId>,
-    /// Contexts whose running turn has shown a `Thinking` block — the
-    /// thinking pane's latch (`docs/tui.md`, "The thinking pane"). Set by
-    /// [`Self::observe_thinking`] as the feed lands, cleared with the turn.
-    thinking_turns: HashSet<ContextId>,
     /// The draft block this client last submitted. A submit promotes the
     /// draft in place — the kernel flips its status to `Done` rather than
     /// deleting it — and a keystroke echo still on the feed can arrive before
@@ -287,7 +322,6 @@ impl App {
             principal: None,
             notice: None,
             turns_running: HashSet::new(),
-            thinking_turns: HashSet::new(),
             submitted_draft: None,
             paste_buffer: None,
             screen: crate::editor::ScreenMode::Conversation,
@@ -594,38 +628,8 @@ impl App {
     }
 
     /// Mark `context_id`'s turn as ended. Returns whether the set changed.
-    /// The thinking pane's latch ends with the turn.
     pub fn mark_turn_ended(&mut self, context_id: ContextId) -> bool {
-        self.thinking_turns.remove(&context_id);
         self.turns_running.remove(&context_id)
-    }
-
-    /// Latch the thinking pane for `context_id` when its turn is running and
-    /// one of the blocks `touched` by this delivery is `Thinking` — a block
-    /// that completed inside one delivery counts, so a fast model's
-    /// reasoning opens the pane as surely as a slow one's. Reasoning left in
-    /// the mirror by an earlier turn does not: the pane is the turn's.
-    /// Returns whether it latched now.
-    pub fn observe_thinking(&mut self, context_id: ContextId, touched: &[BlockId]) -> bool {
-        if !self.turn_running(context_id) || self.thinking_turns.contains(&context_id) {
-            return false;
-        }
-        let seen = self.views.get(&context_id).is_some_and(|view| {
-            view.mirror
-                .blocks()
-                .iter()
-                .any(|b| b.kind == BlockKind::Thinking && touched.contains(&b.id))
-        });
-        if seen {
-            self.thinking_turns.insert(context_id);
-        }
-        seen
-    }
-
-    /// Whether the thinking pane is latched open for `context_id`: its
-    /// turn is running and has shown reasoning.
-    pub fn thinking_pane_latched(&self, context_id: ContextId) -> bool {
-        self.turn_running(context_id) && self.thinking_turns.contains(&context_id)
     }
 
     /// Forget every turn this client believed was running. The event stream
@@ -636,7 +640,6 @@ impl App {
     pub fn forget_turn_liveness(&mut self) -> bool {
         let had = !self.turns_running.is_empty();
         self.turns_running.clear();
-        self.thinking_turns.clear();
         had
     }
 
@@ -748,11 +751,11 @@ impl App {
         self.focused = true;
     }
 
-    /// Sync a still-live block's collapse state from the feed. Collapse is
-    /// kernel state (`docs/tui.md`, "Conversation": "a sibling's expand is
-    /// yours too") — this is what makes `ContextChange::CollapsedChanged`
-    /// actually reach [`ContextView::collapsed`] for a sibling's manual
-    /// toggle; the transcript redraws from the map on the next frame.
+    /// Sync a still-live block's collapse state from the feed: a sibling that
+    /// sets a block's `collapsed` field moves this viewer's fold too
+    /// (`docs/tui.md`, "Folds"). This is what makes
+    /// `ContextChange::CollapsedChanged` reach [`ContextView::collapsed`];
+    /// the transcript redraws from the map on the next frame.
     pub fn apply_collapse_change(&mut self, context_id: ContextId, change: &ContextChange) {
         if let ContextChange::CollapsedChanged { block_id, collapsed } = change
             && let Some(view) = self.views.get_mut(&context_id)
@@ -841,24 +844,6 @@ impl App {
     }
 }
 
-/// The block a change touches, whether it adds, moves, edits or removes it.
-pub fn touched_block(change: &ContextChange) -> BlockId {
-    match change {
-        ContextChange::BlockInserted { block, .. } => block.id,
-        ContextChange::BlockDeleted { block_id }
-        | ContextChange::BlockMoved { block_id, .. }
-        | ContextChange::TextAppended { block_id, .. }
-        | ContextChange::TextReplaced { block_id, .. }
-        | ContextChange::StatusChanged { block_id, .. }
-        | ContextChange::CollapsedChanged { block_id, .. }
-        | ContextChange::ExcludedChanged { block_id, .. }
-        | ContextChange::MetadataChanged { block_id, .. }
-        | ContextChange::OutputChanged { block_id, .. }
-        | ContextChange::SpansChanged { block_id, .. } => *block_id,
-    }
-}
-
-/// `"deepseek/deepseek-v4"` → `"deepseek-v4"`.
 /// A tool call's header parts — its tool name and its one-line argument —
 /// or `(None, None)` for any other block (`present::BlockView::tool`).
 pub fn tool_header(block: &BlockSnapshot) -> (Option<&str>, Option<String>) {
@@ -870,6 +855,7 @@ pub fn tool_header(block: &BlockSnapshot) -> (Option<&str>, Option<String>) {
     (tool, crate::inflight::one_line_arg(input))
 }
 
+/// `"deepseek/deepseek-v4"` → `"deepseek-v4"`.
 fn model_leaf(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
@@ -1212,7 +1198,7 @@ mod tests {
         assert!(view.is_collapsed(&error), "an error keeps its stub");
 
         view.collapsed.insert(call.id, true);
-        view.seed_collapse();
+        view.auto_fold();
         assert!(view.is_collapsed(&call), "a collapse is carried forward");
     }
 
@@ -1238,11 +1224,11 @@ mod tests {
         assert_eq!(app.speaker_for(&b, app.info(aid)), "shell");
     }
 
-    /// `Thinking` never collapses on its own: `collapses_by_default`
-    /// excludes it, and nothing collapses it at the turn's end, so reasoning
-    /// prints whole (`docs/tui.md`, "Conversation").
+    /// Reasoning does not arrive folded: `collapses_by_default` excludes it,
+    /// and with nothing after it there is nothing to fold it for
+    /// (`docs/tui.md`, "Folds").
     #[test]
-    fn thinking_stays_expanded() {
+    fn reasoning_with_nothing_after_it_arrives_open() {
         let (_, aid, _) = app_with_two();
         let mut mirror = ContextMirror::new(aid);
         let thinking = block(aid, 1, BlockKind::Thinking, Role::Model);
@@ -1253,10 +1239,117 @@ mod tests {
         assert!(!view.is_collapsed(&thinking));
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // Folds (docs/tui.md, "Folds")
+    // ────────────────────────────────────────────────────────────────────
+
+    fn settled(context: ContextId, seq: u64, kind: BlockKind, role: Role, content: &str) -> BlockSnapshot {
+        BlockSnapshotBuilder::new(BlockId::new(context, PrincipalId::new(), seq), kind)
+            .role(role)
+            .status(Status::Done)
+            .content(content)
+            .build()
+    }
+
+    fn lines(n: usize) -> String {
+        (0..n).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Land `blocks` as the view's whole mirror, the way a delivery or a
+    /// rehydrate changes it, then run the fold rule.
+    fn land(view: &mut ContextView, blocks: Vec<BlockSnapshot>) {
+        let mut mirror = ContextMirror::new(view.mirror.context_id());
+        mirror.apply_snapshot(blocks, 1).expect("snapshot applies");
+        view.mirror = mirror;
+        view.auto_fold();
+    }
+
+    /// Settled reasoning stays open while it is the newest block — an
+    /// interrupted turn leaves it there — and folds the moment the next
+    /// block arrives.
+    #[test]
+    fn reasoning_folds_when_the_next_block_arrives() {
+        let aid = ContextId::new();
+        let thinking = settled(aid, 1, BlockKind::Thinking, Role::Model, "hmm\nthen what");
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        land(&mut view, vec![thinking.clone()]);
+        assert!(!view.is_collapsed(&thinking), "nothing follows it yet");
+
+        let next = settled(aid, 2, BlockKind::Text, Role::User, "go on");
+        land(&mut view, vec![thinking.clone(), next]);
+        assert!(view.is_collapsed(&thinking), "the next block folds it");
+    }
+
+    /// A context hydrated from history arrives with its reasoning and its
+    /// long tool results folded, and everything else whole.
+    #[test]
+    fn a_hydrated_context_arrives_with_its_history_folded() {
+        let aid = ContextId::new();
+        let thinking = settled(aid, 1, BlockKind::Thinking, Role::Model, "hmm");
+        let long = settled(aid, 2, BlockKind::ToolResult, Role::Tool, &lines(40));
+        let short = settled(aid, 3, BlockKind::ToolResult, Role::Tool, &lines(3));
+        let answer = settled(aid, 4, BlockKind::Text, Role::Model, &lines(40));
+        let mut mirror = ContextMirror::new(aid);
+        mirror
+            .apply_snapshot(vec![thinking.clone(), long.clone(), short.clone(), answer.clone()], 1)
+            .expect("snapshot applies");
+        let view = ContextView::new(mirror);
+        assert!(view.is_collapsed(&thinking));
+        assert!(view.is_collapsed(&long));
+        assert!(!view.is_collapsed(&short), "a short result is cheaper to read than to open");
+        assert!(!view.is_collapsed(&answer));
+    }
+
+    /// The fold is decided once: a fold the viewer opened stays open
+    /// through every later delivery.
+    #[test]
+    fn a_reopened_fold_stays_open_through_later_deliveries() {
+        let aid = ContextId::new();
+        let thinking = settled(aid, 1, BlockKind::Thinking, Role::Model, "hmm");
+        let answer = settled(aid, 2, BlockKind::Text, Role::Model, "ok");
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        land(&mut view, vec![thinking.clone(), answer.clone()]);
+        assert!(view.is_collapsed(&thinking));
+
+        assert!(view.toggle_fold(thinking.id), "the block is in the mirror");
+        assert!(!view.is_collapsed(&thinking), "the toggle opened it");
+        let more = settled(aid, 3, BlockKind::Text, Role::User, "and then?");
+        land(&mut view, vec![thinking.clone(), answer, more]);
+        assert!(!view.is_collapsed(&thinking), "a later delivery left it open");
+    }
+
+    /// A fold never moves the text under a reader who has scrolled into the
+    /// block: the block they are reading is left open.
+    #[test]
+    fn the_block_under_the_scrolled_reader_is_left_open() {
+        let aid = ContextId::new();
+        let thinking = settled(aid, 1, BlockKind::Thinking, Role::Model, "a\nb\nc");
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        land(&mut view, vec![thinking.clone()]);
+        // The reader is on the reasoning's last line.
+        let mut scrolled = crate::copy::Scrolled::entering(10);
+        scrolled.settle(
+            &crate::copy::RowIndex::new(vec![crate::copy::RowBlock { block: thinking.id, leading: 1, rows: 4 }]),
+            10,
+        );
+        view.transcript.scrolled = Some(scrolled);
+
+        let answer = settled(aid, 2, BlockKind::Text, Role::Model, "ok");
+        land(&mut view, vec![thinking.clone(), answer]);
+        assert!(!view.is_collapsed(&thinking), "the reader's block stayed open");
+    }
+
+    /// The toggle names a block the mirror holds, or says it could not.
+    #[test]
+    fn toggling_a_block_the_mirror_does_not_hold_changes_nothing() {
+        let aid = ContextId::new();
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        assert!(!view.toggle_fold(BlockId::new(aid, PrincipalId::new(), 9)));
+        assert!(view.collapsed.is_empty());
+    }
+
     /// `ContextChange::CollapsedChanged` is what makes a sibling's collapse
-    /// visible on a still-live block —
-    /// `docs/tui.md`: "Collapse is kernel state ... so a sibling's expand is
-    /// yours too."
+    /// visible on a still-live block (`docs/tui.md`, "Folds").
     #[test]
     fn a_collapsed_change_updates_a_still_live_blocks_collapse_state() {
         let (mut app, aid, _) = app_with_two();

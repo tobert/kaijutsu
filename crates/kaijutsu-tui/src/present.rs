@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use kaijutsu_present::fold::{thinking_stub, tool_result_stub};
 use kaijutsu_present::format::{BlockTone, block_tone, format_single_block};
 use kaijutsu_present::markdown::{SpanTone, parse_to_rich_spans};
 use kaijutsu_types::{
@@ -284,22 +285,11 @@ pub struct BlockView<'a> {
     /// (#12)`). Resolved by the caller from the context mirror; empty when
     /// nothing above the block is known, and the line then says so.
     pub lineage: Vec<BlockSnapshot>,
-    /// Render collapsed. Kernel state (`CollapsedChanged`) after first
-    /// arrival; [`collapses_by_default`] supplies the first-arrival value.
+    /// Render folded: the viewer's fold for this block
+    /// (`crate::app::ContextView::collapsed`, `docs/tui.md`, "Folds").
     pub collapsed: bool,
     /// The context being rendered, for drift push/pull direction.
     pub local_ctx: Option<ContextId>,
-}
-
-/// Whether a block of this kind renders collapsed the first time it is seen.
-///
-/// Only `Error`. Tool calls and results render whole: reading a long one
-/// is `kj block read`'s job (`docs/tui.md`, "The thinking pane"). The kernel's `collapsed` field has no per-kind default, so
-/// the default is the client's to apply — once, on first arrival, then
-/// carried forward per block id so a later change is not wiped by the next
-/// redraw.
-pub fn collapses_by_default(kind: BlockKind) -> bool {
-    matches!(kind, BlockKind::Error)
 }
 
 /// A block's wrap-cache version: every field whose change alters the
@@ -368,10 +358,12 @@ pub fn continues_pair(last: Option<(BlockId, BlockKind)>, block: &BlockSnapshot)
 
 /// One block as styled lines, wrapped to `width`.
 ///
-/// A collapsed `ToolCall`/`ToolResult` is one `▸` line; a collapsed
-/// `Thinking` block is one `▸ thinking · N lines · …` line; an `Error`
-/// block is one `✗` stub line; `Thinking` renders dim through its tone.
-/// Everything else is the block's formatted text, word-wrapped, flush-left.
+/// A folded block is one line under its divider: `▸ thinking · N lines · …`
+/// for reasoning, `▸ N lines · <last line>` for a tool result, a `✗` stub
+/// for an `Error`, and `▸ <first line>` for any other block a sibling
+/// folded. `Thinking` renders dim through its tone. Everything else is the
+/// block's formatted text, word-wrapped, flush-left (`docs/tui.md`,
+/// "Folds").
 pub fn render_block(
     block: &BlockSnapshot,
     view: &BlockView<'_>,
@@ -382,7 +374,7 @@ pub fn render_block(
     let base = palette.block(block_tone(block));
     // A `Thinking` block is its raw content: the divider names the speaker
     // and the tone says what it is, so the formatter's `Thinking` header
-    // line (`kaijutsu_present::format`) would only cost the pane a row.
+    // line (`kaijutsu_present::format`) would only cost a row.
     let text = if block.kind == BlockKind::Thinking {
         block.content.trim_end().to_string()
     } else {
@@ -406,21 +398,16 @@ pub fn render_block(
         }
     }
 
-    if block.kind == BlockKind::Error {
-        lines.push(stub_line(ERROR_MARK, &text, width, base));
-        return lines;
-    }
     if view.collapsed {
-        if block.kind == BlockKind::Thinking {
-            lines.push(thinking_stub_line(
-                block.summary.as_deref(),
-                text.trim(),
-                width,
-                base,
-            ));
-        } else {
-            lines.push(stub_line(COLLAPSED_MARK, &text, width, base));
-        }
+        let stub = match block.kind {
+            BlockKind::Error => stub_line(ERROR_MARK, &text, width, base),
+            BlockKind::Thinking => {
+                marked_line(&thinking_stub(block.summary.as_deref(), &text), width, base)
+            }
+            BlockKind::ToolResult => marked_line(&tool_result_stub(&text), width, base),
+            _ => stub_line(COLLAPSED_MARK, &text, width, base),
+        };
+        lines.push(stub);
         return lines;
     }
 
@@ -587,27 +574,14 @@ fn stub_line(mark: &str, text: &str, width: u16, style: Style) -> Line<'static> 
     Line::from(Span::styled(body, style))
 }
 
-/// The thinking pane's stub: `▸ thinking · 14 lines · The unlink bug…`,
-/// cut with `…` rather than wrapped. The size says how much reasoning the
-/// stub stands for; `summary` — the kernel's extractive summary, stamped on
-/// the block when it settles — says what it was about, with the block's own
-/// first line as the fallback when no summary exists (docs/issues.md,
-/// "Thinking folds to a summary line once the player has moved on").
-fn thinking_stub_line(summary: Option<&str>, text: &str, width: u16, style: Style) -> Line<'static> {
-    let count = text.lines().count();
-    let detail = summary
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| text.lines().next().map(str::trim_end));
-    let body = match detail {
-        // A provider can return a thinking block with no text to show.
-        None | Some("") => format!("{COLLAPSED_MARK} thinking · nothing to show"),
-        Some(detail) => {
-            let noun = if count == 1 { "line" } else { "lines" };
-            format!("{COLLAPSED_MARK} thinking · {count} {noun} · {detail}")
-        }
-    };
-    Line::from(Span::styled(truncate(&body, usize::from(width)), style))
+/// A fold's one line: the `▸` mark, then what the shared fold rule says
+/// the block holds (`kaijutsu_present::fold`), cut with `…` rather than
+/// wrapped.
+fn marked_line(what: &str, width: u16, style: Style) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate(&format!("{COLLAPSED_MARK} {what}"), usize::from(width)),
+        style,
+    ))
 }
 
 /// Greedy word wrap over a styled character stream.
@@ -1262,16 +1236,6 @@ mod tests {
         assert!(!text.contains("14:02:11"), "got {text:?}");
     }
 
-    /// Tool output renders whole; only `Error` keeps its one-line stub.
-    #[test]
-    fn only_errors_collapse_by_default() {
-        assert!(!collapses_by_default(BlockKind::ToolCall));
-        assert!(!collapses_by_default(BlockKind::ToolResult));
-        assert!(collapses_by_default(BlockKind::Error));
-        assert!(!collapses_by_default(BlockKind::Text));
-        assert!(!collapses_by_default(BlockKind::Thinking));
-    }
-
     #[test]
     fn a_collapsed_block_renders_one_marked_line() {
         let mut b = block(BlockKind::ToolResult, Role::Tool, "line one\nline two\nline three");
@@ -1283,8 +1247,22 @@ mod tests {
         assert!(plain(&lines)[0].starts_with("▸ "), "got {:?}", plain(&lines));
     }
 
+    /// A folded tool result says how long it is and what its last line
+    /// says, where a build or a test run puts its verdict.
     #[test]
-    fn an_error_block_is_a_one_line_stub_even_when_expanded() {
+    fn a_folded_tool_result_says_its_length_and_its_last_line() {
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "Compiling\nRunning\ntest result: ok. 478 passed\n");
+        b.status = Status::Done;
+        let mut v = view();
+        v.collapsed = true;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        assert_eq!(plain(&lines), vec!["▸ 3 lines · test result: ok. 478 passed"]);
+    }
+
+    /// An `Error` honors the fold: folded, the default, it is one `✗` stub;
+    /// opened, it shows its whole text.
+    #[test]
+    fn a_folded_error_is_its_stub_and_an_open_one_is_whole() {
         let mut b = block(BlockKind::Error, Role::System, "boom");
         b.error = Some(kaijutsu_types::ErrorPayload {
             category: kaijutsu_types::ErrorCategory::Tool,
@@ -1297,10 +1275,16 @@ mod tests {
             source_kind: None,
         });
         let mut v = view();
-        v.collapsed = false;
+        v.collapsed = true;
         let lines = render_block(&b, &v, 60, &Palette::builtin());
         assert_eq!(lines.len(), 1, "got {:?}", plain(&lines));
         assert!(plain(&lines)[0].starts_with("✗ "), "got {:?}", plain(&lines));
+
+        v.collapsed = false;
+        let open = plain(&render_block(&b, &v, 60, &Palette::builtin()));
+        assert!(open.len() > 1, "the whole text: {open:?}");
+        assert!(open.iter().any(|l| l.contains("spread over several lines")), "the detail shows: {open:?}");
+        assert!(!open[0].starts_with("✗ "), "an open error is not its stub: {open:?}");
     }
 
     #[test]
@@ -1313,8 +1297,8 @@ mod tests {
     }
 
     /// The formatter's `Thinking` header line stays out of the tui: the
-    /// divider and the tone already say what the block is, and the pane
-    /// shows a short block whole (kaibo review, 2026-09-03).
+    /// divider and the tone already say what the block is, so the header
+    /// would only cost a row.
     #[test]
     fn thinking_renders_without_the_formatters_header_line() {
         let b = block(BlockKind::Thinking, Role::Model, "considering");

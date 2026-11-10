@@ -1041,23 +1041,6 @@ fn present(
     Ok(())
 }
 
-/// The `Thinking` blocks of `context_id` that are still streaming — what a
-/// rehydrated mirror offers the thinking pane's latch in place of the
-/// changed blocks a delivery names.
-fn streaming_thinking(app: &App, context_id: ContextId) -> Vec<kaijutsu_types::BlockId> {
-    let Some(view) = app.views.get(&context_id) else {
-        return Vec::new();
-    };
-    view.mirror
-        .blocks()
-        .iter()
-        .filter(|b| {
-            b.kind == kaijutsu_types::BlockKind::Thinking && !render::is_settled(b)
-        })
-        .map(|b| b.id)
-        .collect()
-}
-
 /// Fold one `ServerEvent::BeatSync` into `app.beats`, the same
 /// fold/touch/drop routing as the app's `time_well::live::ingest_live_events`
 /// (`docs/tui.md`, "TRACKS + beat"). `now_epoch_ns` is the kernel-domain
@@ -1356,15 +1339,9 @@ async fn act(
     } else {
         app.ask_card_takes_key(Instant::now())
     };
-    // Off the live tail the transcript owns copy mode's keys, and every
-    // other key snaps it back and is then handled here as if it had been
-    // typed at the tail (`docs/tui.md`, "Scrolling is copy mode"). An armed
-    // ask card keeps its own a/A/d/v/Esc: the card is the more urgent
-    // surface, and the scrolled view waits under it. The `Ctrl+A` prefix is not the
-    // transcript's either ([`Keys::claims`]): the chords that switch seats
-    // leave the view where the reader put it, which is what makes a context
-    // left scrolled still scrolled on return.
-    if app.scrolled().is_some() && !card_owns_key && !keys.claims(&key) {
+    // An armed ask card keeps its own a/A/d/v/Esc: the card is the more
+    // urgent surface, and the scrolled view waits under it.
+    if scrolled_takes_key(app, card_owns_key, keys, &key) {
         if scrolled_key(app, &key, term_lock, width) == ScrolledKey::Handled {
             return Ok(Acted::Continue);
         }
@@ -1512,8 +1489,27 @@ async fn act(
             }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
+        // A local view change: no RPC, and a scrolled view stays where the
+        // reader is (`docs/tui.md`, "Folds").
+        Intent::ToggleFold => match render::toggle_fold(app, width) {
+            Ok(_) => app.clear_notice(),
+            Err(why) => app.note(why),
+        },
     }
     Ok(Acted::Continue)
+}
+
+/// Whether the scrolled transcript takes `key` as one of copy mode's own.
+///
+/// Off the live tail the transcript owns copy mode's keys, and every other
+/// key snaps it back and is then handled as if typed at the tail
+/// (`docs/tui.md`, "Scrolling is copy mode"). Three kinds of key are never
+/// its: one an armed ask card owns; the `Ctrl+A` prefix and its chord
+/// ([`Keys::claims`]), so a seat switch leaves the reader's place where it
+/// was; and `Ctrl+O` ([`Keys::toggles_fold`]), which folds where the reader
+/// is rather than at the tail.
+fn scrolled_takes_key(app: &App, card_owns_key: bool, keys: &Keys, key: &crossterm::event::KeyEvent) -> bool {
+    app.scrolled().is_some() && !card_owns_key && !keys.claims(key) && !Keys::toggles_fold(key)
 }
 
 /// Whether the scrolled transcript took a key, or handed it back to the tail.
@@ -2158,16 +2154,7 @@ fn apply_kj_completion(app: &mut App) {
 /// submit) and cleared on `TurnCompleted`/`TurnFailed`.
 fn mark_turn_liveness(app: &mut App, event: &ServerEvent) -> bool {
     match event {
-        ServerEvent::TurnStarted { context_id, .. } => {
-            let started = app.mark_turn_running(*context_id);
-            // The start rides the kernel-wide event stream and the reasoning
-            // rides the context feed, so the reasoning can land first — when
-            // `observe_thinking` has no live turn to latch on and drops it.
-            // Latch here on the reasoning the mirror already holds.
-            let streaming = streaming_thinking(app, *context_id);
-            let latched = app.observe_thinking(*context_id, &streaming);
-            started || latched
-        }
+        ServerEvent::TurnStarted { context_id, .. } => app.mark_turn_running(*context_id),
         ServerEvent::TurnCompleted { context_id, .. } | ServerEvent::TurnFailed { context_id, .. } => {
             app.mark_turn_ended(*context_id)
         }
@@ -2464,8 +2451,6 @@ fn apply_delivery(
     }
     match event {
         FeedEvent::Changed(delivery) => {
-            let touched: Vec<kaijutsu_types::BlockId> =
-                delivery.changes().map(crate::app::touched_block).collect();
             for change in delivery.changes() {
                 // A block the kernel dropped will never render again, so its
                 // wrapped lines go with it.
@@ -2479,7 +2464,7 @@ fn apply_delivery(
                 if let Err(e) = view.mirror.receive(delivery) {
                     tracing::warn!(context = %context_id.short(), error = %e, "mirror rejected a delivery");
                 }
-                view.seed_collapse();
+                view.auto_fold();
                 hydrated = view.mirror.is_hydrated();
             }
             // While buffering (`ContextMirror::begin_rehydrate`), the
@@ -2495,7 +2480,6 @@ fn apply_delivery(
             if hydrated {
                 reconcile_draft(app, context_id);
             }
-            app.observe_thinking(context_id, &touched);
         }
         FeedEvent::Resubscribed => return Rehydrate::Needed,
         FeedEvent::Terminated { reason, .. } => {
@@ -2560,7 +2544,7 @@ fn land_rehydrate(
     };
     let applied = view.mirror.apply_snapshot(blocks, version);
     if applied.is_ok() {
-        view.seed_collapse();
+        view.auto_fold();
     }
     match applied {
         Ok(()) => {
@@ -2572,11 +2556,6 @@ fn land_rehydrate(
             // was running rather than carry a flag nothing clears
             // (`docs/tui.md`, "Turn liveness is a partial signal").
             app.forget_turn_liveness();
-            // A rebuilt mirror names no changed blocks, so the pane
-            // latches on reasoning that is still streaming — once a
-            // `TurnStarted` says a turn is running again.
-            let streaming = streaming_thinking(app, context_id);
-            app.observe_thinking(context_id, &streaming);
             app.note("reconnected; context rehydrated; turn liveness reset");
         }
         Err(e) => abandon_rehydrate(app, feeds, context_id, e),
@@ -3125,40 +3104,22 @@ mod tests {
         assert!(app.turn_running(id));
     }
 
-    /// The turn's start and its reasoning ride different channels — the
-    /// kernel-wide event stream and the context feed — so the reasoning can
-    /// land first, when `observe_thinking` has no live turn to latch on.
-    /// `TurnStarted` latches on what the mirror already holds.
+    /// `Ctrl+O` is never one of copy mode's keys: it folds where the reader
+    /// is, so the scrolled view must not take it and snap to the tail. A
+    /// motion still belongs to the view.
     #[test]
-    fn a_turn_that_starts_after_its_reasoning_still_opens_the_pane() {
-        use kaijutsu_client::ContextMirror;
-        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, Role, Status};
-
+    fn the_scrolled_transcript_leaves_ctrl_o_to_the_fold_toggle() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let id = ContextId::new();
         let mut app = App::new("amy");
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![
-                    BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 1), BlockKind::Thinking)
-                        .role(Role::Model)
-                        .status(Status::Running)
-                        .content("the unlink path first")
-                        .build(),
-                ],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        watched(&mut app, id);
         app.switch_to(id);
-        assert!(!app.thinking_pane_latched(id), "no turn is known running yet");
-
-        let event = ServerEvent::TurnStarted { turn_id: kaijutsu_types::TurnId::new(), context_id: id, principal_id: PrincipalId::new() };
-        assert!(mark_turn_liveness(&mut app, &event));
-        assert!(
-            app.thinking_pane_latched(id),
-            "the feed won the race and the pane never opened"
-        );
+        assert!(app.set_scrolled(copy::Scrolled::entering(10)));
+        let keys = Keys::new();
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!scrolled_takes_key(&app, false, &keys, &ctrl_o), "Ctrl+O folds in place");
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(scrolled_takes_key(&app, false, &keys, &j), "a motion is the view's");
     }
 
     #[test]

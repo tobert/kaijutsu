@@ -76,6 +76,11 @@ pub enum Intent {
     /// a search take over (`docs/tui.md`, "Scrolling is copy mode"). `Up`,
     /// `PageUp` and the wheel reach the same state.
     CopyMode,
+    /// `Ctrl+O` — open or close the fold nearest the reader: the last
+    /// foldable block at or above the reader's line, which on the live tail
+    /// is the context's newest (`docs/tui.md`, "Folds"). It never snaps a
+    /// scrolled view back to the tail.
+    ToggleFold,
 }
 
 /// A short name for a key, for the `Ctrl+A <key> is not bound` notice
@@ -122,6 +127,17 @@ impl Keys {
         }
         self.armed
             || (key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    /// Whether this key is `Ctrl+O`, the fold toggle. The scrolled
+    /// transcript asks before it claims a key, as it does for the prefix:
+    /// the toggle acts where the reader is and must not snap them to the
+    /// tail. It is not in [`Self::claims`], so the full-screen editor and
+    /// the overlays keep their own `Ctrl+O`.
+    pub fn toggles_fold(key: &KeyEvent) -> bool {
+        key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Char('o')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
     }
 
     /// Interpret one key event.
@@ -176,8 +192,11 @@ impl Keys {
             }
             KeyCode::Char('c') if ctrl => Intent::Interrupt,
             KeyCode::Char('z') if ctrl => Intent::CtrlZ,
+            // vim's jump back is given up in the draft (`docs/tui.md`,
+            // "Folds").
+            KeyCode::Char('o') if ctrl => Intent::ToggleFold,
             // Everything else belongs to the input region. Control chords go
-            // too: `<C-w>` and `<C-r>` are vi keys, and the two this client
+            // too: `<C-w>` and `<C-r>` are vi keys, and the ones this client
             // reserves are already claimed above.
             // Bare `Tab` is completion when the `:` bar holds `kj ` and a
             // partial verb, and compose text otherwise; `run.rs` decides,
@@ -325,6 +344,18 @@ mod tests {
     fn bare_tab_is_never_swallowed() {
         let mut keys = Keys::new();
         assert_eq!(keys.interpret(press(KeyCode::Tab)), Intent::Tab);
+    }
+
+    /// `Ctrl+O` toggles the fold nearest the reader, and compose never sees
+    /// it: vim's jump-list meaning is given up in the draft
+    /// (`docs/tui.md`, "Folds").
+    #[test]
+    fn ctrl_o_toggles_a_fold_before_compose_sees_it() {
+        let mut keys = Keys::new();
+        assert_eq!(keys.interpret(ctrl('o')), Intent::ToggleFold);
+        assert!(Keys::toggles_fold(&ctrl('o')));
+        assert!(!Keys::toggles_fold(&press(KeyCode::Char('o'))), "a bare o is vi's open-line");
+        assert!(!keys.claims(&ctrl('o')), "the toggle is not the prefix's: the editor keeps its Ctrl+O");
     }
 
     #[test]
