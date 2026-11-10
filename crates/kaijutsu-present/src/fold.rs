@@ -47,6 +47,24 @@ pub fn folds_when_followed(block: &BlockSnapshot) -> bool {
     }
 }
 
+/// Whether `block` has a fold worth reaching for: it is folded now, or it
+/// is a kind the rule folds — reasoning, or a result long enough to fold.
+///
+/// This is what the fold toggle looks for from the reader's place
+/// ([`crate::reader::target`]). A short open result is not one, so the
+/// toggle passes over it to the stub the viewer wants opened.
+pub fn has_fold(block: &BlockSnapshot, folded: bool) -> bool {
+    folded
+        || match block.kind {
+            BlockKind::Thinking => true,
+            BlockKind::ToolResult => {
+                matches!(block.content_type, ContentType::Plain | ContentType::Markdown)
+                    && block.content.lines().count() > TOOL_RESULT_FOLD_LINES
+            }
+            _ => false,
+        }
+}
+
 /// Whether the viewer's toggle applies to `block` at all: the kinds that
 /// fold on their own, plus `Error`, whatever their length or status.
 pub fn foldable(block: &BlockSnapshot) -> bool {
@@ -259,6 +277,18 @@ mod tests {
         assert!(foldable(&block(ctx, 1, BlockKind::Error, Status::Error, "boom")));
         assert!(foldable(&block(ctx, 2, BlockKind::ToolResult, Status::Running, "x")));
         assert!(!foldable(&block(ctx, 3, BlockKind::Text, Status::Done, "x")));
+    }
+
+    #[test]
+    fn the_toggle_passes_over_a_short_open_result() {
+        let ctx = ContextId::new();
+        let short = block(ctx, 1, BlockKind::ToolResult, Status::Done, "ok");
+        assert!(!has_fold(&short, false));
+        assert!(has_fold(&short, true), "a fold the viewer made by hand can be opened");
+        assert!(has_fold(&block(ctx, 2, BlockKind::Thinking, Status::Running, "hmm"), false));
+        assert!(has_fold(&block(ctx, 3, BlockKind::ToolResult, Status::Done, &lines(40)), false));
+        assert!(has_fold(&block(ctx, 4, BlockKind::Error, Status::Error, "boom"), true));
+        assert!(!has_fold(&block(ctx, 5, BlockKind::Text, Status::Done, &lines(40)), false));
     }
 
     #[test]
