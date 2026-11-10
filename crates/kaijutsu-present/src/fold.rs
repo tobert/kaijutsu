@@ -48,7 +48,8 @@ pub fn folds_when_followed(block: &BlockSnapshot) -> bool {
 }
 
 /// Whether `block` has a fold worth reaching for: it is folded now, or it
-/// is a kind the rule folds — reasoning, or a result long enough to fold.
+/// is a kind that folds — reasoning, an error, or a result long enough to
+/// fold.
 ///
 /// This is what the fold toggle looks for from the reader's place
 /// ([`crate::reader::target`]). A short open result is not one, so the
@@ -56,7 +57,7 @@ pub fn folds_when_followed(block: &BlockSnapshot) -> bool {
 pub fn has_fold(block: &BlockSnapshot, folded: bool) -> bool {
     folded
         || match block.kind {
-            BlockKind::Thinking => true,
+            BlockKind::Thinking | BlockKind::Error => true,
             BlockKind::ToolResult => {
                 matches!(block.content_type, ContentType::Plain | ContentType::Markdown)
                     && block.content.lines().count() > TOOL_RESULT_FOLD_LINES
@@ -287,7 +288,10 @@ mod tests {
         assert!(has_fold(&short, true), "a fold the viewer made by hand can be opened");
         assert!(has_fold(&block(ctx, 2, BlockKind::Thinking, Status::Running, "hmm"), false));
         assert!(has_fold(&block(ctx, 3, BlockKind::ToolResult, Status::Done, &lines(40)), false));
-        assert!(has_fold(&block(ctx, 4, BlockKind::Error, Status::Error, "boom"), true));
+        assert!(
+            has_fold(&block(ctx, 4, BlockKind::Error, Status::Error, "boom"), false),
+            "an error the viewer opened can be folded again"
+        );
         assert!(!has_fold(&block(ctx, 5, BlockKind::Text, Status::Done, &lines(40)), false));
     }
 
