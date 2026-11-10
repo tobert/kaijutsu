@@ -6,45 +6,66 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## A submitted draft can come back onto the tui's compose line (2026-11-10)
+## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 
 Two pty tests failed for about twenty minutes and then stopped:
 `ctrl_z_in_a_root_console_creates_a_shell_child_the_human_performs` (the
 command ran, the draft stayed) and
 `switching_through_the_picker_loads_the_new_contexts_draft` (the picker
 never closed). They failed on a clean checkout of a commit that had passed,
-so the cause was not that day's edits. An Opus lane traced the first with
-client and server logs. Contributing factors:
+so the cause was not that day's edits. The first was a submitted draft
+coming back onto the compose line; that is fixed (`docs/tui.md`, "Compose",
+"A submitted draft is never read back"). Still open:
 
-- **The draft's late echo is accepted after the submit.** When Enter is
-  pressed before the mirror has seen the draft block, `current_draft_id()`
-  is `None`, so `mark_submitted` records the submit's own block instead
-  (`run/act.rs`, `compose_key`). `Compose::reset` restarts the draft ledger
-  with nothing acknowledged, so the feed's late `BlockInserted` for the
-  draft passes `reconcile_draft` and puts the text back. When the draft is
-  then deleted, `reconcile_draft` returns early for a context with no draft
-  block (`run/feeds.rs`) and the text stays. A player can hit it: type
-  quickly in a new context, most easily a `Ctrl+Z` shell child, and press
-  Enter before the first keystroke has echoed. A second Enter would submit
-  the line again. The lane's unit test for it is in the devlog chapter's
-  commit message and went red; no fix has landed.
 - **The tui's local tasks sometimes do not run for hundreds of
   milliseconds.** The draft outbox writer, the actor and the RPC system are
-  `spawn_local` tasks inside `local.run_until` (`main.rs`), so they run only
-  when the event loop's future returns pending. In the failing run nothing
-  reached the kernel for 283 ms while five keys were handled. This is what
-  opens the window above. What stalls them is unknown; a `select!` arm that
-  is always ready is one guess, unconfirmed. Load did not predict it: runs
-  passed at load 142 and failed at load 4.
+  `spawn_local` tasks inside `local.run_until` (`main.rs`). A `LocalSet`
+  runs its tasks only when the future it was handed returns pending, and
+  `event_loop`'s `select!` (`run.rs`) returns pending only when no arm is
+  ready; a key read during the last draw is ready at once, so a burst of
+  typing is handled key, draw, key, draw without a yield, up to tokio's
+  budget of 128 ready operations. Each draw (`run/draw.rs`, `present`)
+  takes the blocking `term_lock` on the loop's thread, which the key reader
+  holds for up to `KEY_POLL` (20 ms) per poll (`run/terminal.rs`), and the
+  redraw and refresh intervals use tokio's default `Burst` catch-up, so
+  after one stall their missed ticks are all ready at once. These are
+  unmeasured candidates. In the failing run nothing reached the kernel for
+  283 ms while five keys were handled. Load did not predict it: runs passed
+  at load 142 and failed at load 4.
 - **The picker failure is unexplained.** After Enter on the picker row,
-  `switch_seat` never reached the kernel, though the loop was alive. Picker
-  keys are handled before the `kaijutsu_tui::keys` trace, so the log cannot
-  say whether Enter was read. Add the trace to `handle_picker_key`.
+  `switch_seat` never reached the kernel. Picker keys are now on the
+  `kaijutsu_tui::keys` trace with what each resolved to
+  (`handle_picker_key`, `outcome=`). Two readings fit. An Enter that
+  resolves to `Outcome::None`, which the picker does silently when the
+  section under the cursor has no visible row (the test counts its `Tab`s
+  from one screen, and a refresh round can move a row between sections
+  before the keys land). Or a `Switch` whose `switch_seat` waits on
+  `watch_context` and the draft outbox's `read` with the picker already
+  taken down in `App` but not yet drawn, which a stalled outbox writer or
+  actor (above) would leave on screen. The next failure's trace says which.
+- **A sibling's submit leaves our compose text behind.** When another
+  client of the same principal submits or clears the shared draft, the
+  mirror shows no draft of ours, and `reconcile_draft` (`run/feeds.rs`)
+  returns early, so the text stays on our line; the app's
+  `reconcile_chat_draft` does the same. Treating "no draft" as an empty
+  draft would clear it, but a switch loads the draft from `getInputState`
+  while the mirror can lag it, and the load restarts the ledger with no
+  floor. `getInputState` returns the version the read was taken at, and
+  `DraftSink::read` drops it; the load should take it as the floor first.
 
 The harness now gives each test tui its own XDG directories and prints the
 client log's tail on a failure; `KAIJUTSU_TEST_TUI_LOG` raises the level
 for a run. The test tui had been reading the host's `tui-client-id`, which
 was not the cause.
+
+- **No kernel test pins what the draft fix rests on.**
+  `kaijutsu_client::draft_ledger::draft_of` skips a draft numbered at or
+  below the block a submit answered with. That holds because a shell
+  submit's command block is made under the submitter after the draft and
+  before the draft is consumed (`block_store.rs` `start_shell_operation`,
+  `runtime/interactive.rs`). The order is read from code; a kernel test
+  should assert it, so a reordering there fails loudly instead of bringing
+  the bug back.
 
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)
 

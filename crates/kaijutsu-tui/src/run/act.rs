@@ -27,17 +27,25 @@ use super::terminal::{TermLock, write_osc52};
 /// Route one key to the open picker, then act on its [`PickerOutcome`].
 /// A placement verb that ran marks the roster changed (`App::roster_changed`)
 /// so the loop starts a refresh round now rather than on the next tick;
-/// the round's `apply` rebuilds the open picker.
+/// the round's `apply` rebuilds the open picker. `armed` is the `Ctrl+A`
+/// prefix's state, for the key trace.
 pub(super) async fn handle_picker_key(
     bridge: &KernelBridge,
     app: &mut App,
     key: crossterm::event::KeyEvent,
+    armed: bool,
     feeds: &mut Feeds,
 ) -> Result<()> {
     let Some(picker) = app.picker.as_mut() else {
         return Ok(());
     };
-    match picker.handle_key(key) {
+    let outcome = picker.handle_key(key);
+    // `act`'s key line, for the keys the picker reads before `act` would
+    // see them; `outcome` says what the key resolved to. Opt-in in the same
+    // way (`RUST_LOG=kaijutsu_tui::keys=trace`).
+    tracing::trace!(target: "kaijutsu_tui::keys", code = ?key.code, modifiers = ?key.modifiers,
+        kind = ?key.kind, armed, surface = "picker", ?outcome, "key");
+    match outcome {
         PickerOutcome::None => {}
         PickerOutcome::Dismiss => app.picker = None,
         PickerOutcome::Switch(id) => {
@@ -537,14 +545,13 @@ async fn compose_key(
         // view after the kernel has already moved it (`docs/prompts.md`,
         // "The submit verb").
         let edge = app.views.get(&ctx).and_then(|view| view.edge());
-        let draft_id = app.current_draft_id();
         // A person's context runs its draft as shell and starts no turn.
         let is_shell = app.current_info().is_some_and(|info| info.performed_by_person);
         // The kernel snapshots its own copy of the draft, so the submit queues
         // behind every keystroke still on the wire.
         match app.drafts.submit(ctx, edge).await {
             Ok(block_id) => {
-                app.mark_submitted(draft_id.unwrap_or(block_id));
+                app.mark_submitted(block_id);
                 app.compose.reset();
                 app.clear_notice();
                 // The partial turn-liveness signal (`docs/tui.md`, "Ctrl+C
@@ -642,7 +649,77 @@ mod tests {
     use super::*;
     use crate::editor::EditorOpen;
     use kaijutsu_types::ContextId;
-    use crate::run::feeds::tests::watched;
+    use crate::run::feeds::tests::{feeds_for_test, watched};
+
+    /// A writer the test reads back: what a subscriber logged.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A key the picker reads never reaches `act`'s key line, so the picker
+    /// logs its own on the same target, with what the key resolved to. An
+    /// Enter on a picker with no rows resolves to nothing, and says so.
+    #[test]
+    fn a_picker_key_is_on_the_key_trace_with_its_outcome() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("build a runtime");
+        let bridge = KernelBridge::never_answers_for_test();
+        let mut app = App::new("amy");
+        app.open_picker(0);
+        let (mut feeds, _hydrated) = feeds_for_test();
+        let enter = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(handle_picker_key(&bridge, &mut app, enter, false, &mut feeds)).expect("the key is handled");
+        });
+        let log = String::from_utf8(captured.0.lock().clone()).expect("utf-8");
+        let line = log.lines().find(|l| l.contains("kaijutsu_tui::keys")).unwrap_or_else(|| panic!("no key line: {log:?}"));
+        for field in ["code=Enter", "armed=false", "surface=\"picker\"", "outcome=None"] {
+            assert!(line.contains(field), "{field} missing from {line:?}");
+        }
+        assert!(app.picker.is_some(), "an Enter that resolved to nothing leaves the picker up");
+    }
+
+    /// A refused submit leaves the draft as typed and marks nothing, so the
+    /// kernel's copy is still the draft to read.
+    #[test]
+    fn a_refused_submit_leaves_the_draft_as_typed() {
+        use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
+        let id = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut app = App::new("amy");
+        app.principal = Some(principal);
+        app.current = Some(id);
+        let mut draft = BlockSnapshot::text(BlockId::new(id, principal, 1), None, Role::User, "echo hi");
+        draft.status = kaijutsu_types::Status::Draft;
+        let mut mirror = kaijutsu_client::ContextMirror::new(id);
+        mirror.apply_snapshot(vec![draft], 3).unwrap();
+        app.views.insert(id, crate::app::ContextView::new(mirror));
+        app.compose = crate::compose::Compose::over("echo hi");
+        // `App::new`'s outbox has no writer, so the submit is refused.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("build a runtime");
+        let bridge = KernelBridge::never_answers_for_test();
+        let (mut feeds, _hydrated) = feeds_for_test();
+        let enter = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        runtime.block_on(compose_key(&bridge, &mut app, enter, &mut feeds)).expect("the key is handled");
+        assert_eq!(app.compose.text(), "echo hi");
+        assert!(app.notice().is_some_and(|n| n.starts_with("submit failed")), "{:?}", app.notice());
+        assert_eq!(app.current_draft().map(|(text, _)| text).as_deref(), Some("echo hi"));
+    }
 
     #[test]
     fn over_a_full_screen_surface_the_prefix_moves_seats_and_feeds_vim() {

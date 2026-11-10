@@ -607,7 +607,7 @@ pub(super) mod tests {
     /// A `Feeds` with no tasks and nowhere to deliver but the test's own
     /// channels — enough for the paths that only read `hydrating` or stop a
     /// forwarder that was never started.
-    fn feeds_for_test() -> (Feeds, mpsc::Receiver<Hydrated>) {
+    pub(in crate::run) fn feeds_for_test() -> (Feeds, mpsc::Receiver<Hydrated>) {
         let (tx, _feed_rx) = mpsc::channel::<TaggedFeed>(4);
         let (hydrated_tx, hydrated_rx) = mpsc::channel::<Hydrated>(8);
         // Never answers and nobody reads it: `stop`'s unsubscribe is
@@ -802,6 +802,134 @@ pub(super) mod tests {
             "new",
             "a delivery against a still-buffering mirror must not overwrite the fresh draft"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // The draft after a submit (docs/tui.md, "Compose")
+    // ────────────────────────────────────────────────────────────────────
+
+    /// One change delivered to `id`'s feed at `version`.
+    fn deliver(app: &mut App, feeds: &mut Feeds, id: ContextId, version: u64, change: ContextChange) {
+        let delivery = ContextDelivery { context_id: id, events: vec![VersionedChange { version, change }], version };
+        apply_delivery(app, feeds, id, FeedEvent::Changed(delivery));
+    }
+
+    /// `principal`'s draft block in `id` with sequence number `seq`.
+    fn draft_block(id: ContextId, principal: PrincipalId, seq: u64, text: &str) -> BlockSnapshot {
+        let mut draft = BlockSnapshot::text(BlockId::new(id, principal, seq), None, Role::User, text);
+        draft.status = kaijutsu_types::Status::Draft;
+        draft
+    }
+
+    /// An app on `id` whose mirror is hydrated at version 3 with no draft
+    /// in it, as it is when Enter lands before the first keystroke echoes.
+    fn app_on_an_unechoed_draft(id: ContextId, principal: PrincipalId) -> App {
+        let mut app = App::new("amy");
+        app.principal = Some(principal);
+        app.current = Some(id);
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(vec![], 3).unwrap();
+        app.views.insert(id, ContextView::new(mirror));
+        app.compose = Compose::over("");
+        app
+    }
+
+    /// A shell submit answers with its command block, which the kernel
+    /// numbers after the draft it ran, so the draft's late echo is skipped
+    /// even though the mirror never showed it before the submit.
+    #[test]
+    fn a_draft_the_mirror_had_not_seen_at_submit_is_not_restored() {
+        let id = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut app = app_on_an_unechoed_draft(id, principal);
+        app.mark_submitted(BlockId::new(id, principal, 9)); // the shell submit's command block
+        app.compose.reset();
+        let draft = draft_block(id, principal, 1, "echo hi");
+        let (mut feeds, _h) = feeds_for_test();
+        deliver(&mut app, &mut feeds, id, 10, ContextChange::BlockInserted { block: Box::new(draft.clone()), after_id: None });
+        let after_insert = app.compose.text();
+        deliver(&mut app, &mut feeds, id, 11, ContextChange::BlockDeleted { block_id: draft.id });
+        assert_eq!((after_insert.as_str(), app.compose.text().as_str()), ("", ""));
+    }
+
+    /// The player starts the next draft before the submitted one's insert
+    /// and delete have arrived. The old text never replaces theirs, and the
+    /// new draft, numbered after the submit, is read again once it echoes.
+    #[test]
+    fn a_draft_typed_right_after_a_submit_keeps_its_text() {
+        let id = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut app = app_on_an_unechoed_draft(id, principal);
+        app.mark_submitted(BlockId::new(id, principal, 9));
+        app.compose = Compose::over("x");
+        let generation = app.compose.sent();
+        let (mut feeds, _h) = feeds_for_test();
+        let old = draft_block(id, principal, 1, "echo hi");
+        deliver(&mut app, &mut feeds, id, 10, ContextChange::BlockInserted { block: Box::new(old.clone()), after_id: None });
+        assert_eq!(app.compose.text(), "x", "the submitted draft's echo");
+        deliver(&mut app, &mut feeds, id, 11, ContextChange::BlockDeleted { block_id: old.id });
+        assert_eq!(app.compose.text(), "x", "the submitted draft's delete");
+        app.compose.landed(generation, Some(13));
+        let next = draft_block(id, principal, 10, "x");
+        deliver(&mut app, &mut feeds, id, 13, ContextChange::BlockInserted { block: Box::new(next.clone()), after_id: None });
+        assert_eq!(app.current_draft().map(|(text, _)| text).as_deref(), Some("x"), "the new draft is ours to read");
+        deliver(&mut app, &mut feeds, id, 14, ContextChange::TextAppended { block_id: next.id, suffix: "y".into() });
+        assert_eq!(app.compose.text(), "xy", "a sibling's newer edit to the new draft still lands");
+    }
+
+    /// After our submit, a sibling of the same principal starts the next
+    /// draft. It is numbered after the submit, so it is the draft, and its
+    /// text is newer than anything we sent.
+    #[test]
+    fn a_siblings_draft_started_after_our_submit_shows() {
+        let id = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut app = app_on_an_unechoed_draft(id, principal);
+        app.mark_submitted(BlockId::new(id, principal, 9));
+        app.compose.reset();
+        let (mut feeds, _h) = feeds_for_test();
+        let next = draft_block(id, principal, 10, "from the app");
+        deliver(&mut app, &mut feeds, id, 20, ContextChange::BlockInserted { block: Box::new(next), after_id: None });
+        assert_eq!(app.compose.text(), "from the app");
+    }
+
+    /// A reconnect lands a snapshot instead of the deltas. One taken before
+    /// the submitted draft was consumed still holds it; one taken after holds
+    /// whatever draft came next.
+    #[test]
+    fn a_rehydrate_snapshot_does_not_restore_the_submitted_draft() {
+        let id = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut app = app_on_an_unechoed_draft(id, principal);
+        app.mark_submitted(BlockId::new(id, principal, 9));
+        app.compose.reset();
+        let (mut feeds, _h) = feeds_for_test();
+        app.views.get_mut(&id).unwrap().mirror.begin_rehydrate();
+        assert!(land_rehydrate(&mut app, &mut feeds, id, vec![draft_block(id, principal, 1, "echo hi")], 10));
+        assert_eq!(app.compose.text(), "", "a snapshot from before the consume");
+        app.views.get_mut(&id).unwrap().mirror.begin_rehydrate();
+        assert!(land_rehydrate(&mut app, &mut feeds, id, vec![draft_block(id, principal, 10, "next")], 30));
+        assert_eq!(app.compose.text(), "next", "a snapshot from after it");
+    }
+
+    /// Each context keeps its own submit: a submit in another context while
+    /// this one's echo is still on the way does not let the echo back in.
+    #[test]
+    fn a_submit_elsewhere_does_not_forget_this_contexts_submit() {
+        let (a, b) = (ContextId::new(), ContextId::new());
+        let principal = PrincipalId::new();
+        let mut app = app_on_an_unechoed_draft(a, principal);
+        app.mark_submitted(BlockId::new(a, principal, 9));
+        app.compose.reset();
+        watched(&mut app, b);
+        app.current = Some(b);
+        app.mark_submitted(BlockId::new(b, principal, 4));
+        app.current = Some(a);
+        app.compose = Compose::over("");
+        let (mut feeds, _h) = feeds_for_test();
+        let old = draft_block(a, principal, 1, "echo hi");
+        deliver(&mut app, &mut feeds, a, 10, ContextChange::BlockInserted { block: Box::new(old), after_id: None });
+        assert_eq!(app.compose.text(), "");
     }
 
     /// `X` was released (`Terminated` or `release_cold`) while its rehydrate

@@ -12,9 +12,9 @@
 pub mod outbox;
 pub mod systems;
 
-use kaijutsu_client::draft_ledger::DraftLedger;
+use kaijutsu_client::draft_ledger::{DraftLedger, draft_of};
 use kaijutsu_editor::{EditOp, EditorCore};
-use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, PrincipalId, Status};
+use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, PrincipalId};
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::input::tap::TapCounter;
@@ -250,8 +250,10 @@ pub struct ComposeState {
     held: Vec<HeldInput>,
     /// Draft reads started, to tell the newest from a stale one.
     reads: u64,
-    /// The block the last submit became: a feed that still shows it as the
-    /// draft is stale, and it is never read back.
+    /// The block the last submit answered with: the promoted draft, or the
+    /// command block when the kernel ran the draft as shell. A feed that
+    /// still shows the draft it took is stale, and it is never read back
+    /// (`kaijutsu_client::draft_ledger::draft_of`).
     submitted: Option<BlockId>,
     /// The mirror version last offered to the ledger.
     offered: Option<u64>,
@@ -408,9 +410,9 @@ impl ComposeState {
         self.submits += 1;
     }
 
-    /// A submit was answered: `Some(block)` is the block the draft became,
-    /// never read back as the draft; `None` is a failure, after which the
-    /// caller reloads the kernel's draft.
+    /// A submit was answered: `Some(block)` is the block it answered with,
+    /// and the draft it took is never read back; `None` is a failure, after
+    /// which the caller reloads the kernel's draft.
     pub fn finish_submit(&mut self, block: Option<BlockId>) {
         self.submits = self.submits.checked_sub(1).expect("a submit was answered that was never sent");
         if block.is_some() {
@@ -438,13 +440,11 @@ impl ComposeState {
         self.ledger.offer(text, version) && self.chat.apply_remote_text(text)
     }
 
-    /// The draft block in `blocks` that belongs to `principal`, skipping the
-    /// block the last submit became.
+    /// The draft block in `blocks` that belongs to `principal`, skipping
+    /// every draft the last submit took
+    /// (`kaijutsu_client::draft_ledger::draft_of`).
     pub fn draft_in<'a>(&self, blocks: &'a [BlockSnapshot], principal: PrincipalId) -> Option<&'a str> {
-        blocks
-            .iter()
-            .find(|b| b.status == Status::Draft && b.id.principal_id == principal && Some(b.id) != self.submitted)
-            .map(|b| b.content.as_str())
+        draft_of(blocks, principal, self.submitted).map(|b| b.content.as_str())
     }
 }
 

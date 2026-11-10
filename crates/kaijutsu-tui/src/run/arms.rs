@@ -69,7 +69,7 @@ pub(super) async fn on_input(
             // The prefix is never the picker's key
             // ([`Keys::claims`]); `act` runs the chord over it.
             if app.picker.is_some() && !ls.key_state.keys.claims(&key) {
-                handle_picker_key(bridge, app, key, feeds).await?;
+                handle_picker_key(bridge, app, key, ls.key_state.keys.armed(), feeds).await?;
             } else {
                 let width = terminal.size()?.width;
                 if act(bridge, app, &mut ls.key_state, key, feeds, term_lock, width)

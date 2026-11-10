@@ -498,6 +498,18 @@ Rules the figure carries:
   the last edit lands (`kaijutsu_client::draft_ledger`, shared with the
   app). The feed and the acks travel
   separately, so the echo can arrive before its ack.
+- **A submitted draft is never read back.** The kernel answers a submit
+  with a block: the promoted draft for a prompt, the command block for a
+  draft run as shell. It numbers each principal's blocks in a context in
+  the order it makes them and keeps one draft per (context, principal), so
+  the submitted draft is numbered at or below that block and the next draft
+  above it. Compose skips every draft of ours numbered at or below the last
+  submit's block in that context (`kaijutsu_client::draft_ledger::draft_of`,
+  shared with the app). The reason: the feed can deliver the draft's insert
+  after the submit's answer, when Enter came before the first keystroke
+  echoed, and a reconnect's snapshot can still hold it. Matching only the
+  draft's own id missed a shell submit, whose answer names the command
+  block. Probe: `a_draft_the_mirror_had_not_seen_at_submit_is_not_restored`.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
   indent under the prompt; Enter in insert mode is a newline. Every row

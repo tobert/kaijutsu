@@ -12,12 +12,13 @@ use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
 use kaijutsu_types::{
-    AskSummary, BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role, Status,
+    AskSummary, BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role,
 };
 use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
 use kaijutsu_client::{DraftOutbox, EditorOutbox};
+use kaijutsu_client::draft_ledger::draft_of;
 use crate::present::{Palette, WrapCache};
 use kaijutsu_present::fold::{AutoFold, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
@@ -212,13 +213,13 @@ pub struct App {
     /// — it is what `Ctrl+C`'s ladder and `:q`'s warning read, not an
     /// authoritative turn registry.
     pub turns_running: HashSet<ContextId>,
-    /// The draft block this client last submitted. A submit promotes the
-    /// draft in place — the kernel flips its status to `Done` rather than
-    /// deleting it — and a keystroke echo still on the feed can arrive before
-    /// that flip, still `Draft` and still holding the sent text. Read as a
-    /// draft again it would refill the compose line the reset just cleared,
-    /// so [`Self::current_draft`] skips this one block by id.
-    submitted_draft: Option<BlockId>,
+    /// The block each context's last submit from this client answered with.
+    /// The feed can still show the submitted draft as a draft after the
+    /// answer, holding the sent text; read again, it would refill the compose
+    /// line the reset just cleared. [`Self::current_draft`] skips every draft
+    /// that submit took (`kaijutsu_client::draft_ledger::draft_of`). Kept per
+    /// context, so a submit elsewhere does not let this one's echo back in.
+    submitted: HashMap<ContextId, BlockId>,
     /// The last yank from the scrolled transcript, for `Ctrl+A ]` — tmux's
     /// paste buffer. The
     /// tui's own, so it never needs aligning with vim's registers or the OS
@@ -324,7 +325,7 @@ impl App {
             principal: None,
             notice: None,
             turns_running: HashSet::new(),
-            submitted_draft: None,
+            submitted: HashMap::new(),
             paste_buffer: None,
             screen: crate::editor::ScreenMode::Conversation,
             parked_screens: HashMap::new(),
@@ -673,26 +674,18 @@ impl App {
         Some((text, view.mirror.version()))
     }
 
-    /// The id of [`Self::current_draft`]'s block. A submit records this id:
-    /// a prompt submit promotes it in place and answers with the same id, but
-    /// a shell context's submit deletes it and answers with the command
-    /// block's id.
-    pub fn current_draft_id(&self) -> Option<BlockId> {
-        self.current_draft_block().map(|b| b.id)
-    }
-
     fn current_draft_block(&self) -> Option<&BlockSnapshot> {
         let principal = self.principal?;
-        let view = self.views.get(&self.current?)?;
-        view.mirror.blocks().iter().find(|b| {
-            b.status == Status::Draft && b.id.principal_id == principal && Some(b.id) != self.submitted_draft
-        })
+        let current = self.current?;
+        let view = self.views.get(&current)?;
+        draft_of(view.mirror.blocks(), principal, self.submitted.get(&current).copied())
     }
 
-    /// Record that `block_id` was just submitted, so a stale echo of it is
-    /// never read back as the draft.
+    /// Record the block a submit answered with — the promoted draft for a
+    /// prompt, the command block for a shell run — so the draft it took is
+    /// never read back, whether or not the mirror had shown it yet.
     pub fn mark_submitted(&mut self, block_id: BlockId) {
-        self.submitted_draft = Some(block_id);
+        self.submitted.insert(block_id.context_id, block_id);
     }
 
     /// Cache health for the context on screen.

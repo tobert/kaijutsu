@@ -8,9 +8,37 @@
 //! The two travel separately, so a mirror can arrive that predates our own
 //! keystrokes. Applying it would delete them. The ledger counts our edits
 //! and their acks and says when a mirror is safe to apply; the client's own
-//! editor does the applying.
+//! editor does the applying. [`draft_of`] picks which block in a mirror is
+//! the draft at all.
 //!
 //! Pure: no editor, no RPC, no clock.
+
+use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Status};
+
+/// `principal`'s draft among a mirror's `blocks`: their `Status::Draft`
+/// block, skipping any draft a submit already took.
+///
+/// `submitted` is the block the client's last submit in this context
+/// answered with: the promoted draft itself for a prompt, the command block
+/// for a draft run as shell. The kernel numbers each principal's blocks in a
+/// context in the order it makes them and keeps one draft per (context,
+/// principal). The draft a submit takes was made before the block the
+/// submit answers with, and the next draft is made after it, so a draft
+/// numbered at or below `submitted` is one already sent, however late its
+/// echo arrives, and one numbered above it is new.
+pub fn draft_of(blocks: &[BlockSnapshot], principal: PrincipalId, submitted: Option<BlockId>) -> Option<&BlockSnapshot> {
+    blocks.iter().find(|b| {
+        b.status == Status::Draft
+            && b.id.principal_id == principal
+            && !submitted.is_some_and(|sent| taken_by(b.id, sent))
+    })
+}
+
+/// Whether the submit that answered with `sent` took `draft`: the same
+/// context and principal, numbered no later.
+fn taken_by(draft: BlockId, sent: BlockId) -> bool {
+    draft.context_id == sent.context_id && draft.principal_id == sent.principal_id && draft.seq <= sent.seq
+}
 
 /// Our edits to one draft and the acks that came back for them.
 #[derive(Debug, Default)]
@@ -151,5 +179,39 @@ mod tests {
         let generation = ledger.sent();
         assert_eq!(ledger.landed(generation, None), None);
         assert!(ledger.offer("a sibling typed this", 3));
+    }
+
+    fn draft(context: kaijutsu_types::ContextId, principal: PrincipalId, seq: u64, text: &str) -> BlockSnapshot {
+        let mut block = BlockSnapshot::text(BlockId::new(context, principal, seq), None, kaijutsu_types::Role::User, text);
+        block.status = Status::Draft;
+        block
+    }
+
+    /// A prompt submit answers with the draft it promoted; a shell run
+    /// answers with its command block, numbered after the draft. Either way
+    /// the submitted draft is skipped and the next one is read.
+    #[test]
+    fn a_draft_a_submit_took_is_skipped_and_the_next_is_read() {
+        let (context, me) = (kaijutsu_types::ContextId::new(), PrincipalId::new());
+        let sent = draft(context, me, 4, "sent");
+        let next = draft(context, me, 7, "next");
+        let promoted = Some(sent.id);
+        let command = Some(BlockId::new(context, me, 6));
+        for submitted in [promoted, command] {
+            assert_eq!(draft_of(std::slice::from_ref(&sent), me, submitted), None, "{submitted:?}");
+            assert_eq!(draft_of(&[sent.clone(), next.clone()], me, submitted).map(|b| b.id), Some(next.id));
+        }
+        assert_eq!(draft_of(std::slice::from_ref(&sent), me, None).map(|b| b.id), Some(sent.id), "no submit yet");
+    }
+
+    /// The numbering is per context and per principal: a submit in another
+    /// context, or another principal's draft, says nothing about this one.
+    #[test]
+    fn a_submit_only_skips_drafts_in_its_own_lane() {
+        let (here, elsewhere, me) = (kaijutsu_types::ContextId::new(), kaijutsu_types::ContextId::new(), PrincipalId::new());
+        let mine = draft(here, me, 2, "mine");
+        assert_eq!(draft_of(std::slice::from_ref(&mine), me, Some(BlockId::new(elsewhere, me, 9))).map(|b| b.id), Some(mine.id));
+        let theirs = draft(here, PrincipalId::new(), 1, "theirs");
+        assert_eq!(draft_of(std::slice::from_ref(&theirs), me, None), None, "another principal's draft is never ours");
     }
 }

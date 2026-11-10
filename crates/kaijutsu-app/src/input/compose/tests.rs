@@ -1,4 +1,5 @@
 use super::*;
+use kaijutsu_types::Status;
 
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -226,6 +227,28 @@ fn a_submitted_draft_never_comes_back() {
     assert_eq!(state.draft_in(std::slice::from_ref(&old), me), None, "the submitted block is skipped");
     let next = block(Status::Draft, "next", me);
     assert_eq!(state.draft_in(&[old, next], me), Some("next"));
+}
+
+/// A chat submit in a context a person performs runs as shell and answers
+/// with the command block, not the draft. The kernel numbers the command
+/// block after the draft it ran, so the draft's late echo is still skipped,
+/// and the next draft, numbered after both, is read.
+#[test]
+fn a_draft_run_as_shell_never_comes_back() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "echo hi");
+    let (context, me) = (ContextId::new(), PrincipalId::new());
+    let numbered = |seq: u64, content: &str| {
+        kaijutsu_types::BlockSnapshotBuilder::new(BlockId::new(context, me, seq), kaijutsu_types::BlockKind::Text)
+            .status(Status::Draft)
+            .content(content)
+            .build()
+    };
+    state.begin_submit();
+    state.finish_submit(Some(BlockId::new(context, me, 5)));
+    let old = numbered(1, "echo hi");
+    assert_eq!(state.draft_in(std::slice::from_ref(&old), me), None, "the draft the shell ran is skipped");
+    assert_eq!(state.draft_in(&[old, numbered(6, "next")], me), Some("next"));
 }
 
 /// Clearing keeps the draft and returns the one edit that empties the
