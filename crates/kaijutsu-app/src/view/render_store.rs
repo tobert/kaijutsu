@@ -9,21 +9,61 @@
 //! writer (the sync system), and it is thrown away and rebuilt on every
 //! version bump — during live streaming, nearly every frame (`ContextMirror::
 //! apply` advances the version per event). [`RenderBlockStore::rebuild`] is
-//! that whole rebuild, including carrying `collapsed` forward across it so a
-//! local toggle survives streaming elsewhere in the document.
+//! that whole rebuild. Each block's `collapsed` comes from the viewer's
+//! [`ContextFolds`], not from the wire, so a fold survives streaming
+//! elsewhere in the document.
 //! `RenderBlockStore` keeps the methods the app calls — `blocks_ordered`,
 //! `block_ids_ordered`, `get_block_snapshot`,
 //! `version`, `set_version`, `principal_id`, `set_collapsed`,
-//! `insert_block`, `insert_from_snapshot`, `rebuild` — over a `Vec` plus an
-//! id-to-index map.
+//! `insert_block`, `rebuild` — over a `Vec` plus an id-to-index map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use kaijutsu_present::fold::{self, AutoFold};
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId,
     Role, Status,
 };
+
+/// The viewer's folds for one context.
+///
+/// A fold is the viewer's own: it is never written to the kernel, and one
+/// viewer folding a block does not fold it on another screen. The rule for
+/// which blocks fold on their own is `kaijutsu_present::fold`, shared with
+/// the terminal client so a conversation reads the same in both.
+#[derive(Debug, Default)]
+pub struct ContextFolds {
+    /// Each block's fold as this viewer last saw it. A block absent here has
+    /// not been shown yet.
+    folded: HashMap<BlockId, bool>,
+    auto: AutoFold,
+}
+
+impl ContextFolds {
+    /// The fold `block` renders with. The first time a block is shown it
+    /// takes the kernel's flag, or its kind's default
+    /// (`fold::collapses_by_default`); after that, only this viewer moves it.
+    fn resolve(&mut self, block: &BlockSnapshot) -> bool {
+        *self
+            .folded
+            .entry(block.id)
+            .or_insert_with(|| block.collapsed || fold::collapses_by_default(block.kind))
+    }
+
+    /// Record the viewer's fold for one block. The fold rule has no say
+    /// over it afterwards.
+    pub fn set(&mut self, id: BlockId, folded: bool) {
+        self.folded.insert(id, folded);
+        self.auto.decide(id);
+    }
+
+    /// Forget blocks that are no longer in the context.
+    fn retain(&mut self, live: &HashSet<BlockId>) {
+        self.folded.retain(|id, _| live.contains(id));
+        self.auto.retain(live);
+    }
+}
 
 /// A reference to a block this store does not hold.
 ///
@@ -60,9 +100,9 @@ impl std::error::Error for RenderStoreError {}
 static NEXT_STORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Ordered render buffer for one `CellEditor` — see the module doc.
-// TODO: Render live ContextMirror blocks with separate per-view collapse state
-// instead of rebuilding a second domain-block store on each version change.
-// Preserve welcome/offline content and the layout caches that consume this view.
+// TODO: Render live ContextMirror blocks over `ContextFolds` instead of
+// rebuilding a second domain-block store on each version change. Preserve
+// welcome/offline content and the layout caches that consume this view.
 // See docs/issues.md, "Render the live mirror".
 pub struct RenderBlockStore {
     context_id: ContextId,
@@ -192,56 +232,32 @@ impl RenderBlockStore {
     }
 
     /// Materialize a snapshot carried in from the change-feed mirror, after
-    /// `after` (`None` appends at the end).
-    ///
-    /// `Error` blocks default to collapsed on arrival (`view/format.rs`'s
-    /// stub rendering) — the kernel's `collapsed` field has no per-kind
-    /// default and `collapsed_at` isn't on the wire (kernel-internal only), so
-    /// this is the one place to bake it in. It only applies the default when
-    /// the incoming snapshot is still at the wire default (`collapsed ==
-    /// false`); a caller that already resolved a snapshot to `true` is left
-    /// alone.
-    ///
-    /// This store is rebuilt wholesale on every mirror version bump — during
-    /// live streaming that is nearly every frame (`ContextMirror::apply`
-    /// advances the version per event, so a `TextAppended` anywhere in the
-    /// document retriggers the rebuild), not just at hydration boundaries.
-    /// Called directly, this default would fire on every rebuild, not just
-    /// true first arrival, wiping a user's expand within a frame or two of
-    /// it happening — callers that rebuild the whole store on a cadence like
-    /// that should go through [`Self::rebuild`] instead, which carries
-    /// `collapsed` forward for ids that already existed and only lets this
-    /// default land on ids that didn't.
-    pub fn insert_from_snapshot(
+    /// `after` (`None` appends at the end), exactly as given.
+    fn insert_from_snapshot(
         &mut self,
-        mut snapshot: BlockSnapshot,
+        snapshot: BlockSnapshot,
         after: Option<&BlockId>,
     ) -> Result<BlockId, RenderStoreError> {
         let id = snapshot.id;
         if self.index.contains_key(&id) {
             return Err(RenderStoreError::DuplicateBlock(id));
         }
-        if snapshot.kind == BlockKind::Error && !snapshot.collapsed {
-            snapshot.collapsed = true;
-        }
         let position = self.position_after(after)?;
         self.insert_at(position, snapshot);
         Ok(id)
     }
 
-    /// Rebuild a fresh store from wire snapshots in document order —
+    /// Build a fresh store from wire snapshots in document order —
     /// `sync_main_cell_to_conversation`'s (`view/sync.rs`) whole job, pulled
     /// out here so it is unit-testable without a Bevy `App`.
     ///
-    /// `self` is the OUTGOING store: its `collapsed` per id is captured
-    /// before any inserts, then reapplied to the new store for every id
-    /// that already existed. That is what makes `insert_from_snapshot`'s
-    /// Error-defaults-collapsed rule mean "first time this block has ever
-    /// been seen" rather than "first time in *this* store" — see that
-    /// method's doc for why this store's rebuild cadence (nearly every
-    /// frame during live streaming) makes the distinction matter. A block
-    /// id absent from `self` (true first arrival, or `self` was empty) gets
-    /// no override, so `insert_from_snapshot`'s own default applies.
+    /// This runs on every mirror version bump, nearly every frame while a
+    /// block streams. Each block's `collapsed` is the viewer's fold from
+    /// `folds`, so a fold survives every rebuild. Then the shared auto-fold
+    /// rule (`kaijutsu_present::fold::AutoFold::sweep`) folds each block
+    /// that has just been followed: settled reasoning, and a long settled
+    /// tool result. `held` is the block the viewer is reading; it is left
+    /// open.
     ///
     /// `skip` filters snapshots that should never be materialized here (the
     /// local principal's own compose draft — already rendered in the
@@ -249,31 +265,34 @@ impl RenderBlockStore {
     /// continuing into an uncertain partial state; the caller should not
     /// swap it in on failure.
     pub fn rebuild<'a>(
-        &self,
         context_id: ContextId,
         principal_id: PrincipalId,
         snapshots: impl IntoIterator<Item = &'a BlockSnapshot>,
         mut skip: impl FnMut(&BlockSnapshot) -> bool,
+        folds: &mut ContextFolds,
+        held: Option<BlockId>,
     ) -> Result<RenderBlockStore, RenderStoreError> {
-        let prev_collapsed: HashMap<BlockId, bool> =
-            self.blocks.iter().map(|b| (b.id, b.collapsed)).collect();
-
         let mut store = RenderBlockStore::new(context_id, principal_id);
         let mut after = None;
         for block in snapshots {
             if skip(block) {
                 continue;
             }
-            let id = store.insert_from_snapshot(block.clone(), after.as_ref())?;
-            if let Some(&was_collapsed) = prev_collapsed.get(&id) {
-                store.set_collapsed(&id, was_collapsed)?;
-            }
+            let mut block = block.clone();
+            block.collapsed = folds.resolve(&block);
+            let id = store.insert_from_snapshot(block, after.as_ref())?;
             after = Some(id);
         }
+        for id in folds.auto.sweep(&store.blocks, held) {
+            folds.set(id, true);
+            store.set_collapsed(&id, true)?;
+        }
+        let live: HashSet<BlockId> = store.index.keys().copied().collect();
+        folds.retain(&live);
         Ok(store)
     }
 
-    /// Toggle the collapsed flag on a `Thinking` or `Error` block.
+    /// Set the collapsed flag on one block.
     pub fn set_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<(), RenderStoreError> {
         let &i = self
             .index
@@ -283,184 +302,197 @@ impl RenderBlockStore {
         self.version += 1;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaijutsu_present::fold::TOOL_RESULT_FOLD_LINES;
 
-    fn ctx_and_principal() -> (ContextId, PrincipalId) {
-        (ContextId::new(), PrincipalId::new())
+    struct Fixture {
+        ctx: ContextId,
+        principal: PrincipalId,
+        folds: ContextFolds,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                ctx: ContextId::new(),
+                principal: PrincipalId::new(),
+                folds: ContextFolds::default(),
+            }
+        }
+
+        fn block(&self, seq: u64, kind: BlockKind, status: Status, content: &str) -> BlockSnapshot {
+            BlockSnapshotBuilder::new(BlockId::new(self.ctx, self.principal, seq), kind)
+                .status(status)
+                .content(content)
+                .build()
+        }
+
+        fn rebuild(&mut self, blocks: &[&BlockSnapshot], held: Option<BlockId>) -> RenderBlockStore {
+            RenderBlockStore::rebuild(
+                self.ctx,
+                self.principal,
+                blocks.iter().copied(),
+                |_| false,
+                &mut self.folds,
+                held,
+            )
+            .expect("rebuild")
+        }
+    }
+
+    fn folded(store: &RenderBlockStore, id: BlockId) -> bool {
+        store.get_block_snapshot(&id).expect("block in store").collapsed
+    }
+
+    fn lines(n: usize) -> String {
+        (0..n).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")
     }
 
     #[test]
-    fn insert_from_snapshot_defaults_a_fresh_error_block_to_collapsed() {
-        let (ctx, agent) = ctx_and_principal();
-        let mut store = RenderBlockStore::new(ctx, agent);
-        let id = BlockId::new(ctx, agent, 0);
-        let block = BlockSnapshotBuilder::new(id, BlockKind::Error)
-            .content("boom")
-            .build();
-        assert!(!block.collapsed, "sanity: wire default is uncollapsed");
+    fn reasoning_stays_open_while_newest_and_folds_once_followed() {
+        let mut fx = Fixture::new();
+        let thinking = fx.block(1, BlockKind::Thinking, Status::Running, "considering");
+        let store = fx.rebuild(&[&thinking], None);
+        assert!(!folded(&store, thinking.id), "streaming reasoning is read as it streams");
 
-        store.insert_from_snapshot(block, None).unwrap();
-        assert!(
-            store.get_block_snapshot(&id).unwrap().collapsed,
-            "Error blocks should default to collapsed on arrival"
-        );
+        let settled = BlockSnapshot { status: Status::Done, ..thinking.clone() };
+        let store = fx.rebuild(&[&settled], None);
+        assert!(!folded(&store, thinking.id), "nothing follows it yet");
+
+        let answer = fx.block(2, BlockKind::Text, Status::Running, "The");
+        let store = fx.rebuild(&[&settled, &answer], None);
+        assert!(folded(&store, thinking.id), "the answer began, so the reasoning folds");
+        assert!(!folded(&store, answer.id));
     }
 
     #[test]
-    fn insert_from_snapshot_cannot_distinguish_explicit_false_from_wire_default() {
-        // `collapsed_at` (which would disambiguate "explicitly set to
-        // false" from "never set") is kernel-internal and not on the wire, so
-        // this is a known limitation, not a design goal: an Error snapshot
-        // that already carries `collapsed: false` is defaulted the same as
-        // one that never touched the field.
-        let (ctx, agent) = ctx_and_principal();
-        let mut store = RenderBlockStore::new(ctx, agent);
-        let id = BlockId::new(ctx, agent, 0);
-        let block = BlockSnapshotBuilder::new(id, BlockKind::Error)
-            .content("boom")
-            .collapsed(false)
-            .build();
-        store.insert_from_snapshot(block, None).unwrap();
-        assert!(store.get_block_snapshot(&id).unwrap().collapsed);
+    fn a_reopened_fold_stays_open_across_rebuilds() {
+        let mut fx = Fixture::new();
+        let thinking = fx.block(1, BlockKind::Thinking, Status::Done, "considering");
+        let answer = fx.block(2, BlockKind::Text, Status::Done, "ok");
+        let store = fx.rebuild(&[&thinking, &answer], None);
+        assert!(folded(&store, thinking.id));
+
+        fx.folds.set(thinking.id, false); // the viewer reopens it
+        let more = fx.block(3, BlockKind::Text, Status::Running, "and");
+        let store = fx.rebuild(&[&thinking, &answer, &more], None);
+        assert!(!folded(&store, thinking.id), "a reopened block is never folded again");
     }
 
     #[test]
-    fn insert_from_snapshot_does_not_collapse_non_error_kinds() {
-        let (ctx, agent) = ctx_and_principal();
-        let mut store = RenderBlockStore::new(ctx, agent);
-        let id = BlockId::new(ctx, agent, 0);
-        let block = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
-            .content("pondering")
-            .build();
-        store.insert_from_snapshot(block, None).unwrap();
-        assert!(!store.get_block_snapshot(&id).unwrap().collapsed);
+    fn a_fold_opened_by_hand_before_anything_follows_stays_open() {
+        let mut fx = Fixture::new();
+        let thinking = fx.block(1, BlockKind::Thinking, Status::Done, "considering");
+        fx.rebuild(&[&thinking], None);
+        fx.folds.set(thinking.id, true); // the viewer folds the newest block
+        fx.folds.set(thinking.id, false); // and opens it again
+
+        let answer = fx.block(2, BlockKind::Text, Status::Running, "The");
+        let store = fx.rebuild(&[&thinking, &answer], None);
+        assert!(!folded(&store, thinking.id), "the viewer's own fold is not decided again");
     }
 
     #[test]
-    fn insert_from_snapshot_respects_an_already_collapsed_error_block() {
-        let (ctx, agent) = ctx_and_principal();
-        let mut store = RenderBlockStore::new(ctx, agent);
-        let id = BlockId::new(ctx, agent, 0);
-        let block = BlockSnapshotBuilder::new(id, BlockKind::Error)
-            .content("boom")
-            .collapsed(true)
-            .build();
-        store.insert_from_snapshot(block, None).unwrap();
-        assert!(store.get_block_snapshot(&id).unwrap().collapsed);
-    }
+    fn a_hydrated_context_shows_its_history_folded() {
+        let mut fx = Fixture::new();
+        let thinking = fx.block(1, BlockKind::Thinking, Status::Done, "considering");
+        let answer = fx.block(2, BlockKind::Text, Status::Done, "ok");
+        let result = fx.block(3, BlockKind::ToolResult, Status::Done, &lines(40));
+        let last_thinking = fx.block(4, BlockKind::Thinking, Status::Done, "newest");
 
-    // ------------------------------------------------------------------
-    // rebuild — the sync.rs whole-document rebuild, carrying `collapsed`
-    // forward across it. This runs nearly every frame during live
-    // streaming (a `TextAppended` anywhere bumps the mirror version), so
-    // "survives one rebuild" is really "survives streaming elsewhere in
-    // the document," the bug a kaibo/gemini review caught.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn rebuild_carries_forward_a_user_expanded_error_block() {
-        let (ctx, agent) = ctx_and_principal();
-        let id = BlockId::new(ctx, agent, 0);
-
-        let mut old = RenderBlockStore::new(ctx, agent);
-        // The wire snapshot never carries collapsed:true for this block —
-        // `collapsed` is never round-tripped through the kernel — so the
-        // SAME snapshot arrives on every rebuild regardless of what the
-        // user did locally.
-        let wire = BlockSnapshotBuilder::new(id, BlockKind::Error)
-            .content("boom")
-            .build();
-        old.insert_from_snapshot(wire.clone(), None).unwrap();
-        assert!(
-            old.get_block_snapshot(&id).unwrap().collapsed,
-            "sanity: defaults collapsed on first arrival"
-        );
-        old.set_collapsed(&id, false).unwrap(); // user expanded it
-
-        let rebuilt = old
-            .rebuild(ctx, agent, std::iter::once(&wire), |_| false)
-            .unwrap();
-
-        assert!(
-            !rebuilt.get_block_snapshot(&id).unwrap().collapsed,
-            "user's expand must survive a rebuild, not be re-defaulted to collapsed"
-        );
+        let store = fx.rebuild(&[&thinking, &answer, &result, &last_thinking], None);
+        assert!(folded(&store, thinking.id));
+        assert!(folded(&store, result.id));
+        assert!(!folded(&store, answer.id));
+        assert!(!folded(&store, last_thinking.id), "the newest block stays open");
     }
 
     #[test]
-    fn rebuild_carries_forward_a_user_collapsed_thinking_block() {
-        let (ctx, agent) = ctx_and_principal();
-        let id = BlockId::new(ctx, agent, 0);
+    fn only_a_long_settled_tool_result_folds() {
+        let mut fx = Fixture::new();
+        let short = fx.block(1, BlockKind::ToolResult, Status::Done, &lines(TOOL_RESULT_FOLD_LINES));
+        let long = fx.block(2, BlockKind::ToolResult, Status::Done, &lines(TOOL_RESULT_FOLD_LINES + 1));
+        let running = fx.block(3, BlockKind::ToolResult, Status::Running, &lines(400));
+        let last = fx.block(4, BlockKind::Text, Status::Done, "end");
 
-        let mut old = RenderBlockStore::new(ctx, agent);
-        let wire = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
-            .content("pondering")
-            .build();
-        old.insert_from_snapshot(wire.clone(), None).unwrap();
-        old.set_collapsed(&id, true).unwrap(); // user collapsed it
-
-        let rebuilt = old
-            .rebuild(ctx, agent, std::iter::once(&wire), |_| false)
-            .unwrap();
-
-        assert!(
-            rebuilt.get_block_snapshot(&id).unwrap().collapsed,
-            "user's collapse must survive a rebuild, not be silently re-expanded"
-        );
+        let store = fx.rebuild(&[&short, &long, &running, &last], None);
+        assert!(!folded(&store, short.id), "a short result is cheaper to read than to open");
+        assert!(folded(&store, long.id));
+        assert!(!folded(&store, running.id), "a running result is still being read");
     }
 
     #[test]
-    fn rebuild_still_defaults_a_genuinely_new_error_block_to_collapsed() {
-        let (ctx, agent) = ctx_and_principal();
-        let old_id = BlockId::new(ctx, agent, 0);
-        let new_id = BlockId::new(ctx, agent, 1);
+    fn the_block_the_viewer_is_reading_is_left_open() {
+        let mut fx = Fixture::new();
+        let thinking = fx.block(1, BlockKind::Thinking, Status::Done, "considering");
+        let answer = fx.block(2, BlockKind::Text, Status::Running, "The");
 
-        let mut old = RenderBlockStore::new(ctx, agent);
-        let old_wire = BlockSnapshotBuilder::new(old_id, BlockKind::Text)
-            .content("hi")
-            .build();
-        old.insert_from_snapshot(old_wire.clone(), None).unwrap();
+        let store = fx.rebuild(&[&thinking, &answer], Some(thinking.id));
+        assert!(!folded(&store, thinking.id), "a fold never moves the text under the reader");
 
-        // A brand-new Error block arrives alongside the pre-existing one,
-        // in the same rebuild — its id was never in `old`, so it gets the
-        // real first-arrival default, not a carried-forward value.
-        let new_wire = BlockSnapshotBuilder::new(new_id, BlockKind::Error)
-            .content("boom")
-            .build();
-        let rebuilt = old
-            .rebuild(ctx, agent, vec![&old_wire, &new_wire], |_| false)
-            .unwrap();
+        let store = fx.rebuild(&[&thinking, &answer], None);
+        assert!(!folded(&store, thinking.id), "the reader leaving does not fold it behind them");
+    }
 
-        assert!(
-            rebuilt.get_block_snapshot(&new_id).unwrap().collapsed,
-            "a block never seen before should still default collapsed"
-        );
+    #[test]
+    fn an_error_block_is_folded_the_first_time_it_is_shown() {
+        let mut fx = Fixture::new();
+        let error = fx.block(1, BlockKind::Error, Status::Error, "boom");
+        assert!(!error.collapsed, "sanity: wire default is unfolded");
+        let store = fx.rebuild(&[&error], None);
+        assert!(folded(&store, error.id));
+    }
+
+    #[test]
+    fn the_viewers_expand_of_an_error_survives_a_rebuild() {
+        let mut fx = Fixture::new();
+        let error = fx.block(1, BlockKind::Error, Status::Error, "boom");
+        fx.rebuild(&[&error], None);
+        fx.folds.set(error.id, false);
+        let store = fx.rebuild(&[&error], None);
+        assert!(!folded(&store, error.id));
+    }
+
+    #[test]
+    fn the_viewers_fold_of_a_newest_block_survives_a_rebuild() {
+        let mut fx = Fixture::new();
+        let thinking = fx.block(1, BlockKind::Thinking, Status::Running, "considering");
+        fx.rebuild(&[&thinking], None);
+        fx.folds.set(thinking.id, true);
+        let store = fx.rebuild(&[&thinking], None);
+        assert!(folded(&store, thinking.id));
+    }
+
+    #[test]
+    fn a_kernel_folded_block_starts_folded() {
+        let mut fx = Fixture::new();
+        let mut text = fx.block(1, BlockKind::Text, Status::Done, "hi");
+        text.collapsed = true;
+        let store = fx.rebuild(&[&text], None);
+        assert!(folded(&store, text.id));
     }
 
     #[test]
     fn rebuild_skips_blocks_the_predicate_rejects() {
-        let (ctx, agent) = ctx_and_principal();
-        let draft_id = BlockId::new(ctx, agent, 0);
-        let keep_id = BlockId::new(ctx, agent, 1);
+        let mut fx = Fixture::new();
+        let draft = fx.block(0, BlockKind::Text, Status::Draft, "");
+        let keep = fx.block(1, BlockKind::Text, Status::Done, "");
 
-        let draft = BlockSnapshotBuilder::new(draft_id, BlockKind::Text)
-            .status(Status::Draft)
-            .build();
-        let keep = BlockSnapshotBuilder::new(keep_id, BlockKind::Text)
-            .status(Status::Done)
-            .build();
+        let store = RenderBlockStore::rebuild(
+            fx.ctx,
+            fx.principal,
+            [&draft, &keep],
+            |b| b.status == Status::Draft,
+            &mut fx.folds,
+            None,
+        )
+        .unwrap();
 
-        let old = RenderBlockStore::new(ctx, agent);
-        let rebuilt = old
-            .rebuild(ctx, agent, vec![&draft, &keep], |b| b.status == Status::Draft)
-            .unwrap();
-
-        assert!(rebuilt.get_block_snapshot(&draft_id).is_none());
-        assert!(rebuilt.get_block_snapshot(&keep_id).is_some());
+        assert!(store.get_block_snapshot(&draft.id).is_none());
+        assert!(store.get_block_snapshot(&keep.id).is_some());
     }
 }

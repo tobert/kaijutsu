@@ -231,15 +231,21 @@ pub fn default_bindings() -> Vec<Binding> {
         "Jump to latest error",
     ));
 
-    // Collapse toggle (Tab on thinking block — currently reuses Tab, but dispatch priority
-    // means CycleFocusForward fires first. CollapseToggle is bound to a dedicated key
-    // if needed, or handled by the Activate action on thinking blocks.)
-    // For now: 'c' to collapse/toggle (mnemonic: collapse)
+    // Fold toggle: one block, the focused one when it can fold, else the
+    // newest one that can. `c` for collapse; `Ctrl+O` is the terminal
+    // client's key for the same action.
     b.push(Binding::key(
         KeyCode::KeyC,
         InputContext::Navigation,
         Action::CollapseToggle,
-        "Toggle collapse",
+        "Fold or unfold a block",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::KeyO,
+        Modifiers::CTRL,
+        InputContext::Navigation,
+        Action::CollapseToggle,
+        "Fold or unfold a block",
     ));
 
     // Scroll
@@ -994,5 +1000,26 @@ mod tests {
             .map(|b| b.action)
             .collect();
         assert_eq!(on_ctrl_z, vec![Action::ToggleShellContext]);
+    }
+
+    /// The fold toggle answers on `c` and on the terminal client's `Ctrl+O`,
+    /// and nothing else in any context claims `Ctrl+O`.
+    #[test]
+    fn c_and_ctrl_o_toggle_a_fold_in_navigation() {
+        for mods in [Modifiers::NONE, Modifiers::CTRL] {
+            let key = if mods == Modifiers::CTRL { KeyCode::KeyO } else { KeyCode::KeyC };
+            let hit = default_bindings().into_iter().find(|b| {
+                b.context == InputContext::Navigation
+                    && b.source == InputSource::Key(key)
+                    && b.modifiers == mods
+            });
+            assert_eq!(hit.map(|b| b.action), Some(Action::CollapseToggle), "{key:?} {mods:?}");
+        }
+        let on_ctrl_o: Vec<Action> = default_bindings()
+            .into_iter()
+            .filter(|b| b.source == InputSource::Key(KeyCode::KeyO) && b.modifiers == Modifiers::CTRL)
+            .map(|b| b.action)
+            .collect();
+        assert_eq!(on_ctrl_o, vec![Action::CollapseToggle]);
     }
 }

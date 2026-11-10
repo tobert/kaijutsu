@@ -13,12 +13,13 @@
 use bevy::prelude::*;
 
 use crate::cell::{
-    CellEditor, ConversationScrollState, EditorEntities, MainCell, ViewingConversation,
+    CellEditor, ConversationScrollState, EditorEntities, FocusTarget, MainCell,
+    ViewingConversation,
 };
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
 use kaijutsu_client::ServerEvent;
-use kaijutsu_types::{ContextId, PrincipalId};
+use kaijutsu_types::{BlockId, ContextId, PrincipalId};
 
 /// The `Screen` a *landed* context switch should reveal, or `None` if the
 /// current screen already shows the active context.
@@ -254,10 +255,26 @@ fn needs_render_sync(
     }
 }
 
+/// The block a fold must leave open: the focused block, while the viewer has
+/// scrolled away from the tail to read it. While the view follows the tail
+/// nothing is held, and every followed block folds.
+pub(crate) fn fold_held_block(
+    scroll_state: &ConversationScrollState,
+    focus: &FocusTarget,
+) -> Option<BlockId> {
+    if scroll_state.following {
+        None
+    } else {
+        focus.block_id
+    }
+}
+
 pub fn sync_main_cell_to_conversation(
     doc_cache: Res<crate::cell::DocumentCache>,
     entities: Res<EditorEntities>,
     session_principal: Res<crate::cell::SessionPrincipal>,
+    scroll_state: Res<ConversationScrollState>,
+    focus: Res<FocusTarget>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
 ) {
@@ -293,12 +310,11 @@ pub fn sync_main_cell_to_conversation(
     // `CellEditor.store` is a `RenderBlockStore` (`view::render_store`) —
     // the local render buffer every other view system already reads
     // (block_border.rs, the view systems, diff_view, timeline, …). The change-feed
-    // mirror holds plain `BlockSnapshot`s, so
-    // `RenderBlockStore::rebuild` materializes them into a fresh store via
-    // `insert_from_snapshot`, carrying `collapsed` forward per id across the
-    // rebuild (see that method's doc — this runs nearly every frame during
-    // live streaming, not just at hydration boundaries, so without that a
-    // user's expand/collapse would be wiped within a frame or two).
+    // mirror holds plain `BlockSnapshot`s, so `CellEditor::rebuild_from`
+    // materializes them into a fresh store, folded by the viewer's folds for
+    // this context, and applies the shared auto-fold rule
+    // (`RenderBlockStore::rebuild`). This runs nearly every frame during
+    // live streaming, not just at hydration boundaries.
     // `ContextMirror::blocks()` is already document order, so a plain
     // left-to-right insert reproduces it.
     //
@@ -309,19 +325,22 @@ pub fn sync_main_cell_to_conversation(
     // alone deliberately: watching a neighbor type is a feature, not a bug
     // (see `block_border.rs`'s `Status::Draft` handling).
     let principal_id = session_principal.0.unwrap_or_else(|| editor.store.principal_id());
-    let store = editor.store.rebuild(ctx_id, principal_id, cached.mirror.blocks(), |block| {
-        block.status == kaijutsu_types::Status::Draft
-            && session_principal.0.is_some_and(|principal| block.id.principal_id == principal)
-    });
-    let mut store = match store {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::error!("Failed to materialize the render buffer: {e}");
-            return;
-        }
-    };
-    store.set_version(sync_version);
-    editor.store = store;
+    let held = fold_held_block(&scroll_state, &focus);
+    let rebuilt = editor.rebuild_from(
+        ctx_id,
+        principal_id,
+        cached.mirror.blocks(),
+        |block| {
+            block.status == kaijutsu_types::Status::Draft
+                && session_principal.0.is_some_and(|principal| block.id.principal_id == principal)
+        },
+        held,
+    );
+    if let Err(e) = rebuilt {
+        tracing::error!("Failed to materialize the render buffer: {e}");
+        return;
+    }
+    editor.store.set_version(sync_version);
 
     match viewing_opt {
         Some(mut viewing) => {
@@ -548,6 +567,51 @@ pub fn follow_kj_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fold leaves the focused block open only while the viewer has
+    /// scrolled away from the tail; following the tail, everything folds.
+    #[test]
+    fn the_focused_block_is_held_open_only_off_the_tail() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let mut focus = FocusTarget::default();
+        focus.focus_block(id);
+        let mut scroll = ConversationScrollState::default();
+
+        scroll.following = true;
+        assert_eq!(fold_held_block(&scroll, &focus), None);
+
+        scroll.following = false;
+        assert_eq!(fold_held_block(&scroll, &focus), Some(id));
+
+        assert_eq!(fold_held_block(&scroll, &FocusTarget::default()), None);
+    }
+
+    /// The viewer's folds belong to the context: switching to another
+    /// context and back keeps a block the viewer reopened open.
+    #[test]
+    fn a_reopened_fold_survives_a_switch_to_another_context_and_back() {
+        use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, Status};
+
+        let principal = PrincipalId::new();
+        let block = |ctx, seq, kind| {
+            BlockSnapshotBuilder::new(BlockId::new(ctx, principal, seq), kind)
+                .status(Status::Done)
+                .content("x")
+                .build()
+        };
+        let a = ContextId::new();
+        let b = ContextId::new();
+        let a_blocks = [block(a, 1, BlockKind::Thinking), block(a, 2, BlockKind::Text)];
+        let b_blocks = [block(b, 1, BlockKind::Text)];
+
+        let mut editor = CellEditor::new();
+        editor.rebuild_from(a, principal, a_blocks.iter(), |_| false, None).unwrap();
+        assert_eq!(editor.toggle_fold(&a_blocks[0].id), Some(false), "reopen it");
+
+        editor.rebuild_from(b, principal, b_blocks.iter(), |_| false, None).unwrap();
+        editor.rebuild_from(a, principal, a_blocks.iter(), |_| false, None).unwrap();
+        assert!(!editor.block_snapshot(&a_blocks[0].id).unwrap().collapsed);
+    }
 
     #[test]
     fn authenticated_principal_change_rebuilds_the_same_context_version() {

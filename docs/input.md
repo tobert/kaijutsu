@@ -206,6 +206,24 @@ through the kernel's open signal. A failed edit or submit shows as an error
 toast; a failed chat submit reads the kernel's draft back, since the kernel
 keeps it.
 
+## Folds
+
+`c` or `Ctrl+O` folds or unfolds one block while the conversation has the
+keys (`Navigation`): the focused block when it can fold (reasoning, a tool
+result, an error), else the newest block that can. `Ctrl+O` is the terminal
+client's key for the same toggle. Under a keyboard grab (compose, the vi
+editor) `Ctrl+O` belongs to vi.
+
+A folded block is one line: `▸ thinking · 14 lines · <summary>`,
+`▸ 312 lines · <last line>`, or an error's stub. Blocks also fold on their
+own by the rule both clients share (`kaijutsu_present::fold`): settled
+reasoning, and a settled tool result over 12 lines, fold when the next block
+arrives; an error starts folded; a block the viewer reopened stays open. The
+focused block stays open while the view is scrolled off the tail. Folds are
+the viewer's own and kept per context; nothing is sent to the kernel. Open
+gaps between the app and the terminal client are in `docs/issues.md`,
+"Folds: what the app and the terminal client still read differently".
+
 ## Escape — two meanings total
 
 Esc belongs to vi wherever a vi surface is live; everywhere else it is

@@ -119,12 +119,13 @@ impl Default for EstimateParams {
 /// and the real measurement replaces them just-in-time as the block enters
 /// the spawn band (before it becomes visible).
 ///
-/// Collapsed is a flat `line_height` for every kind except `Error`: a
+/// Collapsed is a flat `line_height` for every kind except `Error`: a folded
+/// block renders one fold line (`present::format::fold_line`), while a
 /// collapsed `Error` block renders `present::format::ERROR_STUB_MAX_LINES` lines
 /// (provenance, summary, up to 3 detail lines, a hint line — see
-/// `present::format::format_error_stub`), not the single-line `Thinking [collapsed]`
-/// stub, so sizing it like `Thinking` would under-reserve space and cause a
-/// visible jump when the row is first measured.
+/// `present::format::format_error_stub`), so sizing it like a fold line
+/// would under-reserve space and cause a visible jump when the row is first
+/// measured.
 pub fn estimate_block_height(
     text_len: usize,
     newline_count: usize,
@@ -710,7 +711,7 @@ mod tests {
     fn estimate_collapsed_error_uses_stub_line_budget() {
         // A collapsed Error stub renders more than one line (provenance,
         // summary, detail preview, hint) — sizing it like a one-line
-        // `Thinking [collapsed]` stub would under-reserve space.
+        // fold line would under-reserve space.
         assert_eq!(
             estimate_block_height(10_000, 99, true, BlockKind::Error, &params()),
             kaijutsu_present::format::ERROR_STUB_MAX_LINES as f32 * 30.0

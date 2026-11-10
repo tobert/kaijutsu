@@ -3,13 +3,15 @@
 //! Cells are the fundamental content primitive in Kaijutsu. Each cell contains
 //! structured content blocks (text, thinking, tool use/results) managed by the block store.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
 // Re-export vocabulary types for convenience
 pub use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, DriftKind, Role, Status};
 pub use kaijutsu_types::{ContextId, PrincipalId};
 
-use crate::view::render_store::RenderBlockStore;
+use crate::view::render_store::{ContextFolds, RenderBlockStore, RenderStoreError};
 
 /// Authenticated principal for this app connection.
 ///
@@ -53,7 +55,7 @@ pub struct ViewingConversation {
 /// local render buffer for this cell's blocks. Synced content arrives via
 /// `DocumentCache` (a `ContextMirror` per context, docs/change-feed.md —
 /// plain `BlockSnapshot`s) and is materialized into this editor's
-/// store via `insert_from_snapshot`
+/// store by [`CellEditor::rebuild_from`]
 /// (`view::sync::sync_main_cell_to_conversation`).
 ///
 /// Note: Not reflectable due to `RenderBlockStore` lacking Default.
@@ -62,6 +64,9 @@ pub struct ViewingConversation {
 pub struct CellEditor {
     /// Block store - local render buffer.
     pub store: RenderBlockStore,
+    /// The viewer's folds, per context, so a fold outlives a switch to
+    /// another context and back.
+    folds: HashMap<ContextId, ContextFolds>,
 }
 
 impl Default for CellEditor {
@@ -75,7 +80,26 @@ impl CellEditor {
     pub fn new() -> Self {
         Self {
             store: RenderBlockStore::new(ContextId::new(), PrincipalId::new()),
+            folds: HashMap::new(),
         }
+    }
+
+    /// Replace the store with one built from `snapshots` (one context's
+    /// blocks in document order), folded by this viewer's folds for that
+    /// context — see [`RenderBlockStore::rebuild`]. On error the old store
+    /// stays in place.
+    pub fn rebuild_from<'a>(
+        &mut self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        snapshots: impl IntoIterator<Item = &'a BlockSnapshot>,
+        skip: impl FnMut(&BlockSnapshot) -> bool,
+        held: Option<BlockId>,
+    ) -> Result<(), RenderStoreError> {
+        let folds = self.folds.entry(context_id).or_default();
+        self.store =
+            RenderBlockStore::rebuild(context_id, principal_id, snapshots, skip, folds, held)?;
+        Ok(())
     }
 
     /// Builder: set initial text content (creates a single text block).
@@ -129,12 +153,16 @@ impl CellEditor {
         self.store.get_block_snapshot(id)
     }
 
-    /// Toggle collapse state of a `Thinking` or `Error` block.
-    pub fn toggle_block_collapse(&mut self, block_id: &BlockId) {
-        if let Some(block) = self.store.get_block_snapshot(block_id) {
-            let new_state = !block.collapsed;
-            let _ = self.store.set_collapsed(block_id, new_state);
-        }
+    /// Fold or unfold one block, and remember it for the block's context.
+    /// Returns the new fold, or `None` when the store has no such block.
+    pub fn toggle_fold(&mut self, block_id: &BlockId) -> Option<bool> {
+        let folded = !self.store.get_block_snapshot(block_id)?.collapsed;
+        self.store.set_collapsed(block_id, folded).ok()?;
+        self.folds
+            .entry(block_id.context_id)
+            .or_default()
+            .set(*block_id, folded);
+        Some(folded)
     }
 }
 

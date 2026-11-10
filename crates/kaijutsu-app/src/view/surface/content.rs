@@ -34,7 +34,7 @@ use crate::cell::block_border::BorderInputs;
 use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, MainCell};
 use crate::text::rich::{RichContentKind, SpanBrush};
 use crate::ui::theme::Theme;
-use kaijutsu_present::format::format_single_block;
+use kaijutsu_present::format::{fold_line, format_single_block};
 use crate::view::geometry::{ConversationGeometry, RowKey};
 
 /// How many screens of slack, on each side of the viewport, keep a block's
@@ -416,7 +416,13 @@ pub fn sync_block_content(
             continue;
         };
 
-        let text = format_single_block(&block, local_ctx, &|pid| editor.block_snapshot(pid));
+        // A folded block with a fold line shapes that one line and nothing
+        // rich: its structured output or typed content is what the fold hides.
+        let fold = if block.collapsed { fold_line(&block) } else { None };
+        let folded = fold.is_some();
+        let text = fold.unwrap_or_else(|| {
+            format_single_block(&block, local_ctx, &|pid| editor.block_snapshot(pid))
+        });
 
         let color = theme.block_color(&block);
         let fingerprint = crate::text::rich::rich_input_fingerprint(&text, &block);
@@ -442,6 +448,13 @@ pub fn sync_block_content(
                 spans: prev.spans.clone(),
                 rich: prev.rich,
                 content: prev.rich_content.clone(),
+            }
+        } else if folded {
+            Detected {
+                text,
+                spans: Vec::new(),
+                rich: None,
+                content: None,
             }
         } else {
             detect(&block, text, &theme, &svg_fontdb)
@@ -710,12 +723,10 @@ mod tests {
                 snapshot.content = content.to_string();
             }
         }
-        let mut store = editor
-            .store
-            .rebuild(id.context_id, principal, snapshots.iter(), |_| false)
+        editor
+            .rebuild_from(id.context_id, principal, snapshots.iter(), |_| false, None)
             .expect("rebuild");
-        store.set_version(version + 1);
-        editor.store = store;
+        editor.store.set_version(version + 1);
     }
 
     #[test]
@@ -769,14 +780,16 @@ mod tests {
             let principal = editor.store.principal_id();
             let snapshots = editor.blocks();
             let dropped = ids[1];
-            let mut store = editor
-                .store
-                .rebuild(ids[0].context_id, principal, snapshots.iter(), |b| {
-                    b.id == dropped
-                })
+            editor
+                .rebuild_from(
+                    ids[0].context_id,
+                    principal,
+                    snapshots.iter(),
+                    |b| b.id == dropped,
+                    None,
+                )
                 .expect("rebuild");
-            store.set_version(version + 1);
-            editor.store = store;
+            editor.store.set_version(version + 1);
         }
         app.update();
 
@@ -913,6 +926,58 @@ mod tests {
         );
     }
 
+    /// A folded block shapes its one fold line: reasoning shows the kernel's
+    /// summary, and a folded structured result is not laid out as a table.
+    #[test]
+    fn a_folded_block_shapes_its_fold_line() {
+        use kaijutsu_types::{
+            BlockSnapshotBuilder, ContextId, OutputData, OutputEntryType, OutputNode, PrincipalId,
+        };
+
+        let mut app = content_app();
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let thinking = BlockSnapshotBuilder::new(BlockId::new(ctx, principal, 1), BlockKind::Thinking)
+            .status(Status::Done)
+            .content("first\nsecond")
+            .summary("Weigh the cache first")
+            .build();
+        let nodes: Vec<OutputNode> = (0..20)
+            .map(|i| OutputNode::new(format!("file{i}")).with_entry_type(OutputEntryType::File))
+            .collect();
+        let listing = (0..20).map(|i| format!("file{i}")).collect::<Vec<_>>().join("\n");
+        let result = BlockSnapshotBuilder::new(BlockId::new(ctx, principal, 2), BlockKind::ToolResult)
+            .role(Role::Tool)
+            .status(Status::Done)
+            .content(listing)
+            .output(OutputData::nodes(nodes))
+            .build();
+        let answer = BlockSnapshotBuilder::new(BlockId::new(ctx, principal, 3), BlockKind::Text)
+            .status(Status::Done)
+            .content("done")
+            .build();
+
+        let mut editor = CellEditor::new();
+        editor
+            .rebuild_from(ctx, principal, [&thinking, &result, &answer], |_| false, None)
+            .expect("rebuild");
+        let main_ent = app
+            .world_mut()
+            .spawn((editor, MainCell, ConversationGeometry::default()))
+            .id();
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+        app.update();
+
+        assert_eq!(
+            cache(&app).get(&thinking.id).unwrap().text,
+            "\u{25b8} thinking · 2 lines · Weigh the cache first"
+        );
+        let folded = cache(&app).get(&result.id).unwrap();
+        assert_eq!(folded.rich, None, "a folded result is not laid out");
+        assert!(folded.text.starts_with("\u{25b8} "), "{:?}", folded.text);
+        assert!(!folded.text.contains('\n'), "{:?}", folded.text);
+    }
+
     /// The routing rule the shaper branches on. Markdown and Output are rich
     /// only in their coloring and must keep every text fast path; the rest
     /// build drawings the glyph lane cannot express.
@@ -947,12 +1012,10 @@ mod tests {
                 snapshot.style_spans = spans.clone();
             }
         }
-        let mut store = editor
-            .store
-            .rebuild(id.context_id, principal, snapshots.iter(), |_| false)
+        editor
+            .rebuild_from(id.context_id, principal, snapshots.iter(), |_| false, None)
             .expect("rebuild");
-        store.set_version(version + 1);
-        editor.store = store;
+        editor.store.set_version(version + 1);
     }
 
     fn ansi_span(start: u32, end: u32) -> kaijutsu_types::StyleSpan {

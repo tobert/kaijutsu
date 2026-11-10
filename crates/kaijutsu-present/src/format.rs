@@ -770,6 +770,80 @@ fn format_tree_node(node: &OutputNode, depth: usize, lines: &mut Vec<String>) {
     }
 }
 
+/// The mark that leads a folded block's line.
+pub const FOLD_MARK: char = '\u{25b8}';
+
+/// The most characters a fold line shows, the mark included. A longer line
+/// is cut and ends in `…`. This module does not know the width it is drawn
+/// at, so the cap bounds the line's height rather than fitting it.
+pub const FOLD_LINE_MAX_CHARS: usize = 160;
+
+/// What a folded block shows: one line led by [`FOLD_MARK`].
+///
+/// `▸ thinking · 14 lines · <summary>` for reasoning
+/// (`crate::fold::thinking_stub`), and `▸ 312 lines · <last line>` for a
+/// tool result (`crate::fold::tool_result_stub`, over the text
+/// [`format_single_block`] shows for it, stderr included). `None` for every
+/// other kind; a folded `Error` block keeps its own stub.
+pub fn fold_line(block: &BlockSnapshot) -> Option<String> {
+    let stub = match block.kind {
+        BlockKind::Thinking => {
+            crate::fold::thinking_stub(block.summary.as_deref(), &block.content)
+        }
+        BlockKind::ToolResult => crate::fold::tool_result_stub(&tool_result_text(block)),
+        _ => return None,
+    };
+    let line: String = format!("{FOLD_MARK} {stub}")
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if line.chars().count() <= FOLD_LINE_MAX_CHARS {
+        return Some(line);
+    }
+    let mut clipped: String = line.chars().take(FOLD_LINE_MAX_CHARS - 1).collect();
+    clipped.push('\u{2026}');
+    Some(clipped)
+}
+
+/// The text a `ToolResult` block shows: its structured output, or its
+/// trimmed content, then its stderr; `✗` for a failure with neither.
+fn tool_result_text(block: &BlockSnapshot) -> String {
+    // Prefer structured OutputData when available
+    let body = if let Some(ref output) = block.output {
+        let formatted = format_output_data(output);
+        if formatted.is_empty() {
+            None
+        } else {
+            Some(formatted)
+        }
+    } else {
+        let trimmed = block.content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
+    // stderr is now stored separately from content (stdout). Surface it
+    // after the body so failures/warnings stay visible in the UI — it
+    // used to be merged into content at the source.
+    let body = match (body, block.stderr.as_deref().map(str::trim)) {
+        (Some(b), Some(err)) if !err.is_empty() => Some(format!("{b}\n{err}")),
+        (None, Some(err)) if !err.is_empty() => Some(err.to_string()),
+        (b, _) => b,
+    };
+
+    if block.is_error {
+        match body {
+            None => "\u{2717}".to_string(),
+            Some(text) => text,
+        }
+    } else {
+        body.unwrap_or_default()
+    }
+}
+
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
@@ -804,7 +878,7 @@ fn format_block_inner(
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
-                "Thinking [collapsed]".to_string()
+                fold_line(block).unwrap_or_default()
             } else {
                 format!("Thinking\n{}", block.content)
             }
@@ -864,42 +938,10 @@ fn format_block_inner(
             }
             name.to_string()
         }
-        BlockKind::ToolResult => {
-            // Prefer structured OutputData when available
-            let body = if let Some(ref output) = block.output {
-                let formatted = format_output_data(output);
-                if formatted.is_empty() {
-                    None
-                } else {
-                    Some(formatted)
-                }
-            } else {
-                let trimmed = block.content.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            };
-
-            // stderr is now stored separately from content (stdout). Surface it
-            // after the body so failures/warnings stay visible in the UI — it
-            // used to be merged into content at the source.
-            let body = match (body, block.stderr.as_deref().map(str::trim)) {
-                (Some(b), Some(err)) if !err.is_empty() => Some(format!("{b}\n{err}")),
-                (None, Some(err)) if !err.is_empty() => Some(err.to_string()),
-                (b, _) => b,
-            };
-
-            if block.is_error {
-                match body {
-                    None => "\u{2717}".to_string(),
-                    Some(text) => text,
-                }
-            } else {
-                body.unwrap_or_default()
-            }
-        }
+        // A folded tool result still formats whole: the terminal client
+        // draws its own fold stub over this text. A client that shows the
+        // fold line asks `fold_line` for it.
+        BlockKind::ToolResult => tool_result_text(block),
         BlockKind::File => {
             let path = block.file_path.as_deref().unwrap_or("file");
             format!("{}\n{}", path, block.content)
@@ -1613,5 +1655,83 @@ mod tests {
 
         let text = format_single_block(&error_block, None, &lookup);
         assert!(text.starts_with("tool error \u{2190} orphan (tool call not found)\n"));
+    }
+
+    // ---- fold lines ------------------------------------------------------
+
+    fn shell_result(content: &str) -> BlockSnapshot {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        BlockSnapshot::tool_result(
+            BlockId::new(ctx, agent, 1),
+            BlockId::new(ctx, agent, 0),
+            ToolKind::Shell,
+            content,
+            false,
+            Some(0),
+            None,
+        )
+    }
+
+    #[test]
+    fn folded_reasoning_shows_its_length_and_the_kernels_summary() {
+        let mut block = BlockSnapshot::text(test_block_id(), None, Role::Model, "a\nb\nc");
+        block.kind = BlockKind::Thinking;
+        block.summary = Some("Check resolve_nofollow first".to_string());
+        assert_eq!(
+            fold_line(&block).as_deref(),
+            Some("\u{25b8} thinking · 3 lines · Check resolve_nofollow first")
+        );
+
+        block.collapsed = true;
+        assert_eq!(
+            format_single_block(&block, None, &|_| None),
+            "\u{25b8} thinking · 3 lines · Check resolve_nofollow first",
+            "a folded Thinking block formats as its fold line"
+        );
+    }
+
+    #[test]
+    fn folded_tool_result_shows_its_length_and_last_line() {
+        let block = shell_result("Compiling\nRunning\ntest result: ok. 478 passed\n");
+        assert_eq!(
+            fold_line(&block).as_deref(),
+            Some("\u{25b8} 3 lines · test result: ok. 478 passed")
+        );
+    }
+
+    #[test]
+    fn a_folded_tool_results_last_line_includes_stderr() {
+        let mut block = shell_result("Compiling\n");
+        block.stderr = Some("error: could not compile\n".to_string());
+        assert_eq!(
+            fold_line(&block).as_deref(),
+            Some("\u{25b8} 2 lines · error: could not compile")
+        );
+    }
+
+    #[test]
+    fn a_fold_line_is_one_line_and_clipped() {
+        let block = shell_result(&format!("first\n{}", "x".repeat(FOLD_LINE_MAX_CHARS * 2)));
+        let line = fold_line(&block).unwrap();
+        assert!(!line.contains('\n'));
+        assert_eq!(line.chars().count(), FOLD_LINE_MAX_CHARS);
+        assert!(line.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn only_reasoning_and_tool_results_have_a_fold_line() {
+        let text = BlockSnapshot::text(test_block_id(), None, Role::Model, "hello");
+        assert_eq!(fold_line(&text), None);
+    }
+
+    #[test]
+    fn a_folded_tool_result_still_formats_whole() {
+        // The terminal client draws its own fold stub over this text, so the
+        // folded flag must not change what `format_single_block` returns for
+        // a tool result.
+        let mut block = shell_result("one\ntwo\n");
+        block.collapsed = true;
+        assert_eq!(format_single_block(&block, None, &|_| None), "one\ntwo");
     }
 }

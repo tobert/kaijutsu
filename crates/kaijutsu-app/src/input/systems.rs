@@ -418,71 +418,51 @@ pub fn handle_scroll(
 // COLLAPSE
 // ============================================================================
 
-/// Handle CollapseToggle action (toggle Thinking/Error block collapse).
+/// Handle the fold toggle (`Action::CollapseToggle`, `c` and `Ctrl+O` in
+/// Navigation): fold or unfold one block, chosen by [`fold_toggle_target`].
 ///
-/// Guarded to Conversation focus — CollapseToggle is Navigation-only. Toggles
-/// every collapsible block in the editor, each against its own current
-/// state (not a single shared target) — pre-existing behavior for
-/// `Thinking`, now shared by `Error` (task: error-render stub collapse).
+/// The fold is the viewer's own (`CellEditor::toggle_fold`); nothing is sent
+/// to the kernel. The editor is the MainCell's, found through
+/// `EditorEntities`.
 pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
     entities: Res<EditorEntities>,
+    focus: Res<FocusTarget>,
     mut cells: Query<&mut CellEditor>,
 ) {
     for ActionFired { action, .. } in actions.read() {
         if !matches!(action, Action::CollapseToggle) {
             continue;
         }
-
-        // The editor lives on the MainCell — resolved through
-        // `EditorEntities`, NOT `FocusTarget`: this used to read
-        // `FocusTarget.entity`, whose only writer died with the legacy focus
-        // plumbing, leaving `c` a silent no-op (found by the decapitation
-        // review, 2026-08-18). The toggle is document-wide by design (see
-        // above), so the main cell is the faithful target.
         let Some(main_ent) = entities.main_cell else {
             continue;
         };
-
         let Ok(mut editor) = cells.get_mut(main_ent) else {
             continue;
         };
-
-        // Find collapsible blocks (Thinking, Error) to toggle.
-        let collapsible_blocks: Vec<_> = editor
-            .blocks()
-            .iter()
-            .filter(|b| {
-                matches!(
-                    b.kind,
-                    kaijutsu_types::BlockKind::Thinking | kaijutsu_types::BlockKind::Error
-                )
-            })
-            .map(|b| b.id)
-            .collect();
-
-        if collapsible_blocks.is_empty() {
+        let Some(target) = fold_toggle_target(&editor.blocks(), focus.block_id) else {
+            debug!("fold toggle: no block in this conversation can fold");
             continue;
+        };
+        if let Some(folded) = editor.toggle_fold(&target) {
+            debug!("fold toggle: {target:?} {}", if folded { "folded" } else { "opened" });
         }
-        for block_id in &collapsible_blocks {
-            editor.toggle_block_collapse(block_id);
-        }
-        let collapsed = editor
-            .blocks()
-            .iter()
-            .find(|b| {
-                matches!(
-                    b.kind,
-                    kaijutsu_types::BlockKind::Thinking | kaijutsu_types::BlockKind::Error
-                )
-            })
-            .map(|b| b.collapsed)
-            .unwrap_or(false);
-        info!(
-            "Collapsible blocks: {}",
-            if collapsed { "collapsed" } else { "expanded" }
-        );
     }
+}
+
+/// The block the fold toggle moves: the focused block when it can fold
+/// (`kaijutsu_present::fold::foldable`), else the newest block that can.
+fn fold_toggle_target(
+    blocks: &[kaijutsu_types::BlockSnapshot],
+    focused: Option<kaijutsu_types::BlockId>,
+) -> Option<kaijutsu_types::BlockId> {
+    use kaijutsu_present::fold::foldable;
+
+    focused
+        .and_then(|id| blocks.iter().find(|b| b.id == id))
+        .filter(|b| foldable(b))
+        .or_else(|| blocks.iter().rev().find(|b| foldable(b)))
+        .map(|b| b.id)
 }
 
 /// Handle ToggleBlockExcluded action — x in Navigation.
@@ -640,54 +620,109 @@ mod tests {
     use crate::cell::ConversationScrollState;
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
 
-    /// `c` must toggle collapse with NOTHING but `EditorEntities.main_cell`
-    /// set. The handler used to key off `FocusTarget.entity`, whose only
-    /// writer died with the legacy focus plumbing — leaving CollapseToggle a
-    /// silent no-op (decapitation review, 2026-08-18).
-    #[test]
-    fn collapse_toggle_works_from_editor_entities_alone() {
+    /// A headless app running only `handle_collapse_toggle` over a main cell
+    /// holding one block of each kind given, in order.
+    fn fold_toggle_app(kinds: &[BlockKind]) -> (bevy::prelude::App, Vec<BlockId>) {
         use bevy::prelude::*;
 
         use super::handle_collapse_toggle;
         use crate::input::events::ActionFired;
-        use crate::input::{Action, context::InputContext};
-        use crate::view::{CellEditor, EditorEntities, MainCell};
-        use kaijutsu_types::{ContentType, Role, Status};
+        use crate::view::{CellEditor, EditorEntities, FocusTarget, MainCell};
+        use kaijutsu_types::{ContentType, Role};
 
         let mut app = App::new();
         app.add_message::<ActionFired>();
         app.init_resource::<EditorEntities>();
+        app.init_resource::<FocusTarget>();
         app.add_systems(Update, handle_collapse_toggle);
 
         let mut editor = CellEditor::new();
-        let thinking = editor
-            .store
-            .insert_block(
-                None,
-                None,
-                Role::Model,
-                BlockKind::Thinking,
-                "pondering",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .expect("insert thinking block");
+        let mut ids: Vec<BlockId> = Vec::new();
+        for kind in kinds {
+            let id = editor
+                .store
+                .insert_block(
+                    None,
+                    ids.last(),
+                    Role::Model,
+                    *kind,
+                    "line",
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert block");
+            ids.push(id);
+        }
 
         let main_ent = app.world_mut().spawn((editor, MainCell)).id();
         app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+        (app, ids)
+    }
+
+    fn press_fold_toggle(app: &mut bevy::prelude::App) {
+        use crate::input::events::ActionFired;
+        use crate::input::{Action, context::InputContext};
 
         app.world_mut().write_message(ActionFired::new(
             Action::CollapseToggle,
             InputContext::Navigation,
         ));
         app.update();
+    }
 
+    fn folded(app: &bevy::prelude::App, id: BlockId) -> bool {
+        use crate::view::{CellEditor, EditorEntities};
+
+        let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
         let editor = app.world().get::<CellEditor>(main_ent).unwrap();
-        let block = editor.store.get_block_snapshot(&thinking).unwrap();
-        assert!(
-            block.collapsed,
-            "CollapseToggle must reach the MainCell editor without FocusTarget.entity",
-        );
+        editor.store.get_block_snapshot(&id).unwrap().collapsed
+    }
+
+    /// The fold toggle must work with nothing but `EditorEntities.main_cell`
+    /// and no focused block: the editor is found through the main cell.
+    #[test]
+    fn the_fold_toggle_works_from_editor_entities_alone() {
+        let (mut app, ids) = fold_toggle_app(&[BlockKind::Thinking]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[0]), "the toggle must reach the MainCell editor");
+    }
+
+    #[test]
+    fn the_fold_toggle_moves_the_focused_foldable_block() {
+        use crate::view::FocusTarget;
+
+        let (mut app, ids) =
+            fold_toggle_app(&[BlockKind::Thinking, BlockKind::Text, BlockKind::Thinking]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[0]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[0]), "the focused block folds");
+        assert!(!folded(&app, ids[2]), "no other block moves, of any kind");
+
+        press_fold_toggle(&mut app);
+        assert!(!folded(&app, ids[0]), "a second press opens it again");
+    }
+
+    #[test]
+    fn the_fold_toggle_moves_the_newest_foldable_block_when_focus_cannot_fold() {
+        use crate::view::FocusTarget;
+
+        let (mut app, ids) = fold_toggle_app(&[
+            BlockKind::Thinking,
+            BlockKind::ToolResult,
+            BlockKind::Text,
+        ]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[2]);
+        press_fold_toggle(&mut app);
+        assert!(folded(&app, ids[1]), "the newest foldable block folds");
+        assert!(!folded(&app, ids[0]), "older blocks do not move");
+        assert!(!folded(&app, ids[2]));
+    }
+
+    #[test]
+    fn the_fold_toggle_does_nothing_without_a_foldable_block() {
+        let (mut app, ids) = fold_toggle_app(&[BlockKind::Text]);
+        press_fold_toggle(&mut app);
+        assert!(!folded(&app, ids[0]));
     }
 
     /// j/k must move focus reading only `ConversationGeometry` — no per-block

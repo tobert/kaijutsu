@@ -1604,8 +1604,9 @@ adopt the shared owner. Clients retain retry/release presentation choices.
 
 ### Render the live mirror
 
-Separate collapse/selection state from live `BlockSnapshot` copies, then let
-the app render its mirror without rebuilding `RenderBlockStore` per version.
+Fold state already lives apart from the blocks (`ContextFolds` in
+`CellEditor`); separate selection state too, then let the app render its
+mirror over both without rebuilding `RenderBlockStore` per version.
 Preserve welcome/offline sources and geometry/glyph caches. Reuse collapse
 regressions and check streaming plus context switching through the GUI runner
 and BRP. Keep this separate from the shared recovery migration.
@@ -2638,65 +2639,45 @@ cannot tell a human connection from a model principal holding its own
 credential, so the assumption that "a user block was typed by a human" is
 not yet enforced at the wire. That is the next design conversation.
 
-## Thinking folds to a summary line once the player has moved on (Amy, 2026-09-12)
+## Folds: what the app and the terminal client still read differently (2026-11-10)
 
-Amy: *"I'm watching y'all work, and you're thinking, I often read/scan it
-because I'm curious, but it takes up a lot of space, so I'd like to collapse
-it but keep *something* visible. so I want it to collapse in the app on
-hydrate or a second or two after the thinking ends and I've likely moved on.
-I think in the tui, the thinking preview thing would collapse to the
-summarized line on the terminal history."*
+A block folds to one line once the player has moved past it. Amy, 2026-09-12:
+*"I'd like to collapse it but keep *something* visible."* Amy, 2026-11-10,
+about the tui: *"fold should happen when post-thinking output begins. ctrl-o
+to expand if it's open"*; long tool results fold too. That second statement
+is the rule. It replaces the earlier plan to fold a second or two after the
+turn ends.
 
-**Shipped 2026-09-12, kernel/wire/tui half.** `kaijutsu_types::summarize_thinking`
-(sentence boundary needs trailing whitespace, 120-char cap, markdown
-markers stripped); `summary` on `BlockSnapshot`/`BlockMetadata` and the
-kernel's `BlockContent`, journaled as a full snapshot like `stderr`;
-capnp `BlockSnapshot.summary @45`, `BlockMetadata.summary @9`; set in the
-server's `ThinkingEnd` arm before the status flips to Done; the tui stub
-shows it; `kj block inspect --json` prints it. **Remaining: the app's
-per-viewer fold**, handed to the moltar session through the exomemory
-daily (fold on hydrate, fold a second or two after `onTurnCompleted`, an
-explicit toggle pins open, never `set_collapsed`).
+The rule is `kaijutsu_present::fold`, shared by both clients. Settled
+reasoning, and a settled tool result longer than `TOOL_RESULT_FOLD_LINES`
+(12), fold when the next block arrives. An `Error` block starts folded. The
+decision is made once per block; after it, only the viewer's toggle moves
+the fold. A fold is the viewer's own and is never written to the kernel. The
+kernel's extractive summary (`kaijutsu_types::summarize_thinking`, on
+`BlockSnapshot.summary`) is what a folded reasoning block shows.
 
-**Before.** The kernel keeps a durable `collapsed` flag per block, flipped
-only by an explicit toggle (`set_collapsed`, `CollapsedChanged`); nothing
-collapses on its own. The app shows thinking expanded until toggled. The tui
-holds the turn's thinking in its pane and, when the block completes, prints
-one stub into scrollback: `▸ thinking · N lines · <first line>`
-(`present::thinking_stub_line`). The first line is a poor stand-in for a
-summary. No block carries a summary today; `kaijutsu_index::synthesis`
-has an extractive `best_sentence` that could produce one without a model.
+The app applies the rule in `RenderBlockStore::rebuild`, keeps folds per
+context in `CellEditor` (`ContextFolds`), holds open the focused block while
+the view is off the tail, draws `▸ thinking · N lines · <summary>` and
+`▸ N lines · <last line>` (`present::format::fold_line`), and toggles one
+block on `c` or `Ctrl+O` (`docs/input.md`, "Folds"). Open:
 
-**The plan.**
-
-- **The kernel derives the summary, once, at completion.** When a
-  `Thinking` block settles, the kernel computes one line and stores it on
-  the block, published on `BlockSnapshot` as a new field and through the
-  change feed. Start extractive (`best_sentence` over the block, capped),
-  which is synchronous and free; a model-written summary, a small local
-  model or a flash-tier cloud model, is a later swap behind the same field and can be
-  driven by rc. Display only: the summary never enters hydration.
-- **The app folds locally.** A completed thinking block reads as collapsed
-  on hydrate, and a block that completes while watched folds a second or two
-  after it settles, showing the summary line. This is per-viewer
-  presentation state, not the durable `collapsed` flag: one player folding
-  must not fold a sibling's screen. An explicit toggle still works and pins
-  the block open. Timing constants live in one place and are relative to
-  settle, not to wall clock at hydrate.
-- **The tui's stub uses the summary.** Same stub, summary in place of the
-  first line, first line as the fallback when no summary exists. The stub
-  prints when the block completes, as now; an extractive summary is ready
-  by then. A model-written summary would arrive later, and the stub cannot
-  be redrawn once printed, so that path either delays the stub (risking
-  document order against a fast answer) or lands the summary elsewhere. Do
-  not ship a slow summary source without answering this.
-
-**Decided** (Amy, 2026-09-12): *"yes extractive now, model later. agreed no
-on durable flag, for now anyways. from turn end I think."* So: the summary
-is extractive in the first cut with a model source as a later swap; the fold
-never writes the durable `collapsed` flag; the app's fold delay counts from
-the turn ending, not from the block settling, which also matches the tui
-pane's lifetime.
+- **A remote fold is ignored after first sight.** The tui honors
+  `ContextChange::CollapsedChanged` for a block it already shows; the app
+  reads the kernel's `collapsed` flag only the first time it shows a block.
+- **The app has no turn liveness and no in-flight strip.** The tui knows
+  when a turn is live and shows its in-flight strip (`docs/tui.md`); the app
+  shows neither.
+- **Only the focused block is held.** A reader who scrolled with the wheel
+  has no focused block, so a block that straddles the viewport top can fold
+  under them and move the text. A block entirely above the viewport is
+  anchor-compensated (`apply_measurements`).
+- **The app clips a fold line at 160 characters**
+  (`FOLD_LINE_MAX_CHARS`), not at the pane width, so a narrow pane wraps it
+  to a second line.
+- **The summary is extractive.** Amy, 2026-09-12: *"yes extractive now,
+  model later."* A model-written summary is a swap behind the same
+  `summary` field; both clients redraw a fold line when it changes.
 
 ## The player's edge: what is still open (2026-09-13)
 

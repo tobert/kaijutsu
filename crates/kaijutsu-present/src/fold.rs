@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, Status};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Status};
 
 /// A settled tool result longer than this many lines folds once something
 /// follows it. A shorter result is cheaper to read than to open.
@@ -26,18 +26,23 @@ pub fn collapses_by_default(kind: BlockKind) -> bool {
 }
 
 /// Whether `block` folds on its own once a later block follows it: settled
-/// reasoning, and a settled tool result longer than
+/// reasoning, and a settled plain-text tool result longer than
 /// [`TOOL_RESULT_FOLD_LINES`].
 ///
 /// A block still streaming never folds: its text is what the viewer is
-/// reading.
+/// reading. Neither does a result a client draws rather than prints — a
+/// diff, a score, a drawing, an image — whose last line says nothing about
+/// it.
 pub fn folds_when_followed(block: &BlockSnapshot) -> bool {
     if !matches!(block.status, Status::Done | Status::Error) {
         return false;
     }
     match block.kind {
         BlockKind::Thinking => true,
-        BlockKind::ToolResult => block.content.lines().count() > TOOL_RESULT_FOLD_LINES,
+        BlockKind::ToolResult => {
+            matches!(block.content_type, ContentType::Plain | ContentType::Markdown)
+                && block.content.lines().count() > TOOL_RESULT_FOLD_LINES
+        }
         _ => false,
     }
 }
@@ -81,6 +86,13 @@ impl AutoFold {
             }
         }
         fold
+    }
+
+    /// The viewer moved this block's fold themselves, so the rule has no
+    /// say left: a block opened or folded by hand before anything followed
+    /// it stays as the viewer left it.
+    pub fn decide(&mut self, id: BlockId) {
+        self.decided.insert(id);
     }
 
     /// Forget blocks that are no longer in the context, so the set does not
@@ -206,6 +218,28 @@ mod tests {
         let last = block(ctx, 5, BlockKind::Text, Status::Done, "end");
         let mut auto = AutoFold::default();
         assert_eq!(auto.sweep([&short, &long, &running, &text, &last], None), vec![long.id]);
+    }
+
+    #[test]
+    fn a_drawn_result_does_not_fold_however_long() {
+        let ctx = ContextId::new();
+        let diff = BlockSnapshot {
+            content_type: ContentType::Diff,
+            ..block(ctx, 1, BlockKind::ToolResult, Status::Done, &lines(400))
+        };
+        let last = block(ctx, 2, BlockKind::Text, Status::Done, "end");
+        let mut auto = AutoFold::default();
+        assert!(auto.sweep([&diff, &last], None).is_empty());
+    }
+
+    #[test]
+    fn a_fold_the_viewer_moved_first_is_not_decided_again() {
+        let ctx = ContextId::new();
+        let thinking = block(ctx, 1, BlockKind::Thinking, Status::Done, "hmm");
+        let mut auto = AutoFold::default();
+        auto.decide(thinking.id);
+        let answer = block(ctx, 2, BlockKind::Text, Status::Done, "ok");
+        assert!(auto.sweep([&thinking, &answer], None).is_empty());
     }
 
     #[test]

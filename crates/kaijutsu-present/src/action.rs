@@ -52,7 +52,9 @@ pub enum Action {
     FocusFirstBlock,
     /// End / Shift+G — focus last block
     FocusLastBlock,
-    /// Tab on thinking block — toggle collapse
+    /// c / Ctrl+O — fold or unfold one block: the focused block when it can
+    /// fold (reasoning, a tool result, an error), else the newest block that
+    /// can.
     CollapseToggle,
     /// Jump to the most recent non-excluded `Status::Error` block and scroll
     /// it into view (error-render: the dock's "N failed" badge otherwise has

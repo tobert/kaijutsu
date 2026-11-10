@@ -125,7 +125,7 @@ unbounded-height Error block revealed top-anchored by follow mode. Policy
 category, **provenance** ("what is this connected to": resolve `parent_id` to
 the tool call / interrupted turn and say so; unresolvable parents are labeled
 orphans, which is also information), first lines of detail, expandable via the
-normal collapse toggle. The dock badge counts each failure once (a failed tool
+fold toggle (`docs/input.md`, "Folds"). The dock badge counts each failure once (a failed tool
 currently mints two `Status::Error` blocks — ToolResult + child Error block)
 and gains a jump-to-latest-error action. Kernel-side truth is untouched:
 error blocks stay whole in the document and hydrate to the LLM as before

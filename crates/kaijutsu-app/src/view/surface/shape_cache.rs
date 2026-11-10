@@ -222,7 +222,7 @@ pub struct ShapeKey {
     /// collapse toggle does not move this field. It is kept in the key
     /// because it is genuinely a shaping input, and because the toggle is
     /// covered anyway: collapsing rewrites the block's formatted text
-    /// (`Thinking [collapsed]`, the error stub), which moves
+    /// (the fold line, the error stub), which moves
     /// `content_version`. Do not add a re-shape rule that relies on this
     /// field alone without fixing the geometry seed first.
     pub collapsed: bool,
@@ -3164,6 +3164,26 @@ mod tests {
             "a late landing above the viewport must carry the viewport with it",
         );
         assert_eq!(state.target_offset, settled + 60.0);
+    }
+
+    /// **A fold above the viewport does not move the text being read.** A
+    /// block folding to one line shrinks its row; when that row is above the
+    /// viewport, the viewport moves up by the same amount.
+    #[test]
+    fn a_fold_above_the_viewport_pulls_the_offset_up_by_the_same_amount() {
+        let mut app = measure_app(false, 500.0);
+        install_geometry(&mut app, strip(4));
+        insert_shaped(&mut app, bid(1), 300.0); // the open block, measured
+        app.update();
+        let open = app.world().resource::<ConversationScrollState>().offset;
+
+        // The block folds; its re-shaped height is one line.
+        insert_shaped(&mut app, bid(1), 30.0);
+        app.update();
+
+        let state = app.world().resource::<ConversationScrollState>();
+        assert_eq!(state.offset, open - 270.0, "the text under the reader must not jump");
+        assert_eq!(state.target_offset, open - 270.0);
     }
 
     /// Follow mode is exempt: it re-clamps to the bottom every frame, and
