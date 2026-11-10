@@ -14,14 +14,18 @@ clients are under "Folds: what the app and the terminal client still read
 differently". Nobody has yet looked at either change in a real terminal or
 the running app. Left from the survey:
 
-- **The tui's `run.rs` is 4,000 lines.** `event_loop` is 400 lines with
-  about 20 locals, and `act` takes nine arguments. A split by responsibility
-  (terminal enter and leave, feeds and hydrate, key dispatch, seat acts,
-  drawing, ask plumbing, editor and diff surfaces, signals) and one key-state
-  struct would change no behavior. `asks.rs` (2,700 lines) splits the same
-  way: keys, render, state, fold, notify.
+- **The tui's `asks.rs` is 2,700 lines** with five concerns in one file:
+  keys, render, state, fold and landing, and the desktop notification. It
+  splits the way `run/` did, with no behavior change. `render.rs`, `app.rs`
+  and `present.rs` have smaller splits of the same kind (transcript and
+  band; views, liveness and roster; palette, wrap, ANSI and links).
+- **Four tui tests read the `run` module's source as text**
+  (`run.rs`'s `module_source`): they find functions by column-0 `fn` text
+  and end a body at the first column-0 `}`. A helper turned into a method, or
+  a new visibility prefix `top_level_fn_name` does not know, drops out of the
+  scan without failing it.
 - **Logic both clients carry.** `follow_target` is the same function in
-  `kaijutsu-app/src/view/sync.rs` and `kaijutsu-tui/src/run.rs`. The ask to
+  `kaijutsu-app/src/view/sync.rs` and `kaijutsu-tui/src/run/seat.rs`. The ask to
   tool-call join (`chrome.rs` `waiting_on_asks`, `inflight::ask_index`),
   short age and count formatting, and the picker's head and tail lines are
   near copies. `kaijutsu-client` or `kaijutsu-present` is the home; "The `:`
@@ -2993,14 +2997,14 @@ ever feels slow, stop cloning in the plan pass before adding a cap.
 ## Arrows cannot scroll from inside a wrapped one-line draft (2026-09-13)
 
 `Up` leaves the tail only from the draft's first visual row and `Down`
-is inert only on its last (`run::tail_key`, `Compose::cursor_visual_row`),
+is inert only on its last (`run::act::tail_key`, `Compose::cursor_visual_row`),
 so inside a long wrapped draft the arrows belong to the draft. But
 modalkit's `Up` is a logical-line motion with nowhere to go on a
 one-line draft, so on a long wrapped draft the arrows cannot scroll the
 transcript at all; `PageUp` and `Ctrl+A [` still can. The fix is vim's
 `gk`/`gj` display-line motion for `Up`/`Down` in the draft, which
 `kaijutsu-editor` does not expose yet. Pinned by
-`run::a_wrapped_one_line_draft_keeps_its_own_arrows`.
+`run::act::tests::a_wrapped_one_line_draft_keeps_its_own_arrows`.
 
 ## The open picker's cursor moved under a refresh in a probe (2026-09-13)
 
@@ -3436,7 +3440,7 @@ it through `DraftSink::read`, and seed the floor from it.
 
 The tui's `:kj` line reports the first stdout line and ignores a nonzero exit,
 so a refused `kj context rotate` reads as "done" on its status row
-(`kaijutsu-tui`'s `run::handle_colon_line`); the app shows the stderr.
+(`kaijutsu-tui`'s `run::seat::handle_colon_line`); the app shows the stderr.
 
 ## App compose: recovery edges left after the shared draft outbox (2026-09-12)
 

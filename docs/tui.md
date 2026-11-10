@@ -205,14 +205,14 @@ None is a commitment; the ones marked *now* ride the first slice.
   `restore_terminal`, and around a suspend). `App::focused` defaults to
   `true` and follows `Event::FocusGained`/`FocusLost`; while unfocused
   `render::strip_animating` holds the in-flight strip's spinner still and
-  the beat wake is disarmed (`run.rs`'s `FocusLost` arm sets `beat_wake =
-  None`), so the track pulse stops too. Gaining focus re-arms the beat
+  the beat wake is disarmed (`run/arms.rs`'s `on_input` sets `ls.beat.wake =
+  None` on `FocusLost`), so the track pulse stops too. Gaining focus re-arms the beat
   timer (`rearm_beat_wake`) and marks the frame dirty for a redraw.
 - *landed 2026-09-13* **Window title** (OSC 0): `<label> — kaijutsu` for
-  the context on screen (`run::wanted_title`), sent once per change under
-  the terminal lock (`run::title_to_send`/`set_title`). xterm's title
-  stack is pushed (`CSI 22;0t`, `run::TITLE_PUSH`) when the screen is
-  taken and popped (`CSI 23;0t`, `run::TITLE_POP`) on every exit path and
+  the context on screen (`run::terminal::wanted_title`), sent once per change under
+  the terminal lock (`run::terminal::title_to_send`/`set_title`). xterm's title
+  stack is pushed (`CSI 22;0t`, `run::terminal::TITLE_PUSH`) when the screen is
+  taken and popped (`CSI 23;0t`, `run::terminal::TITLE_POP`) on every exit path and
   around a suspend, so the shell's own title comes back as found.
 - *landed 2026-09-13* **Desktop notification** (OSC 9 / OSC 777) when an
   ask lands unfocused: `asks::ask_notification` fires once, for a ledger
@@ -649,7 +649,7 @@ Rules the figure carries:
 `has_fold`, `collapses_by_default`, `AutoFold`, `thinking_stub`,
 `tool_result_stub`). `ContextView::collapsed` holds this viewer's folds,
 and `ContextView::auto_fold` runs `AutoFold::sweep` after every change to
-the mirror — a delivery (`run::apply_delivery`), a rehydrate landing, a new
+the mirror — a delivery (`run::feeds::apply_delivery`), a rehydrate landing, a new
 view — holding the block `copy::Scrolled::reader_block` names.
 `Intent::ToggleFold` runs `render::toggle_fold`, which acts on
 `render::fold_target`, one use of `render::reader_target`.
@@ -880,7 +880,7 @@ the message prints on a cooked main screen; `SIGTERM` and `SIGHUP` reach it
 by ending the loop the way `:q` does. A panic inside a `spawn_local` task
 nobody joins — `Feeds::pump`'s forwarder, a hydrate round — does not unwind
 the loop, so the hook must not restore in place there
-(`run::panic_unwinds_the_loop`); it records the panic instead and the loop
+(`run::probe::panic_unwinds_the_loop`); it records the panic instead and the loop
 ends on it the next iteration, reaching `leave_terminal` the normal way.
 The key reader thread stops before raw mode
 goes, so keys typed at the prompt while the connection tears down reach
