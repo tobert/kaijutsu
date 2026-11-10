@@ -1406,10 +1406,11 @@ example `docs/conversation-session.md:26`, `docs/architecture/kernel.md:24`,
 
 ## Directory listing costs one `getattr` per entry (2026-10-12)
 
-`MountBackend::list` calls `getattr` on each entry after `readdir`, so
-`ls -l` reports real sizes, times, and permissions. A directory of N
-entries costs N + 1 VFS calls, made one at a time, even for a plain `ls`
-that shows only names. Open: whether the VFS `readdir` should return
+`MountBackend::list` calls `getattr` on each entry after `readdir`, and
+`readlink` on each symlink, so `ls -l` reports real sizes, times,
+permissions, and link targets. A directory of N entries costs at least
+N + 1 VFS calls, made one at a time, even for a plain `ls` that shows only
+names. Open: whether the VFS `readdir` should return
 attributes, or `list` should run its `getattr` calls concurrently, if a
 large directory or slow mount makes this visible.
 
@@ -2272,9 +2273,12 @@ on current main"):
   with `curl --write-out` in kaish-tools-curl.
 - **Builtin git is read-only and only in the read-only shell.** The
   writable shell reaches host `git` (absent until apt installed it in the
-  task container). kaish-extras' `commit` and `worktree` axes are designed
-  (`docs/design/architecture.md`, "depends on ledger") and not built. Amy:
-  "We should be providing the builtin git tools too."
+  task container). kaish-extras builds the commit profile behind its
+  `commit` cargo feature: `add`, `rm`, `mv`, `restore --staged`, `reset`,
+  `commit`, `var`, `switch -c`, `checkout -b`, with required `GitHooks` for
+  hooks and ref updates (kaish-extras `docs/embedding-git.md`). kaijutsu
+  does not enable it. The `worktree` axis is not built. Amy: "We should be
+  providing the builtin git tools too."
 - **The write boundary was invisible** (configure-git-webserver, about 70
   calls). A read-only error now lists the mounts (in progress, branch
   `ro-mount-errors`). Still open: whether the coder orientation names the
@@ -2471,11 +2475,6 @@ Still open:
    (`ContextShellInputs::environment`, pinned by a test); reserve `PWD` in
    env writes, or set it after exports. The kaijutsu-mcp `shell` envelope
    leaves `cwd` `null`, since its block snapshot carries none.
-
-Seen in the same trajectories, outside this entry: kaish `ls -la` printed
-one tab-separated `name  type  size` row per file, with every size 0. Several models called it "garbled" and
-fell back to `ls --json`. That costs calls and trust, not a walk; it is a
-kaish note.
 
 ## `rc_lifecycle_wire` flaked once under load (2026-10-02)
 
@@ -4964,12 +4963,23 @@ move. Re-check when that dependency's version changes.
 
 ### Kaish positional suffix expansion
 
-The locked kaish 0.17.2 expands `${0%.kai}` to an empty value, rather than
-stripping the suffix or rejecting unsupported syntax. The rc migration exposed
+kaish 0.19.0 expands `${0%.kai}` to an empty value at exit 0, rather than
+stripping the suffix or rejecting unsupported syntax; `x=a.kai; echo
+"${x%.kai}"` prints an empty line too (probed 2026-11-10). The rc migration exposed
 this as a failed companion-file read. Shipped scripts use `dirname "$0"` and
 `basename "$0" .kai` instead. Audit unsupported parameter expansion in kaish;
 keep it explicit rather than silently accepting a different expression.
 No upstream issue has been posted.
+
+### `ls -l` prints host owners as numbers (2026-11-10)
+
+`ls -l /home/u/src` prints `-rw-r--r-- 1 1000 1000 …`, where kaish's own
+`LocalFs` prints `amy amy`. `MountBackend` passes the host's uid and gid as
+`AccountId { name: None }`, and kaish prints the number for a missing name.
+kaish 0.19's uid and gid lookup, with its cache and blocking-pool call, is
+private to `kaish_vfs::local`. Export it from kaish, then fill `name` in
+`file_attr_to_dir_entry` (`runtime/mount_backend.rs`); a second lookup here
+would duplicate kaish's. Not posted upstream; Amy decides.
 
 ### OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
 

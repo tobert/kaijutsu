@@ -355,7 +355,8 @@ impl LocalBackend {
             generation,
             atime: meta.accessed().ok(),
             ctime: meta.created().ok(),
-            nlink: meta.nlink() as u32,
+            nlink: Some(meta.nlink() as u32),
+            blocks: Some(meta.blocks()),
             uid: Some(meta.uid()),
             gid: Some(meta.gid()),
         }
@@ -1194,7 +1195,7 @@ mod tests {
 
         // Both should show nlink >= 2
         let attr = backend.getattr(Path::new("original.txt")).await.unwrap();
-        assert!(attr.nlink >= 2);
+        assert!(attr.nlink.is_some_and(|n| n >= 2), "{:?}", attr.nlink);
     }
 
     #[tokio::test]

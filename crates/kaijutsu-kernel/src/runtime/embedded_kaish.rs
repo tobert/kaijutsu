@@ -1808,6 +1808,63 @@ mod tests {
         assert!(out.contains("/config/rc/S00.kai"), "{out}");
     }
 
+    /// `ls -l` on a host mount prints the host's link count, numeric owner
+    /// and group, a `total` line, and `link -> target` for a symlink. On a
+    /// memory mount, which tracks none
+    /// of those, it prints `?` and no `total` line.
+    #[tokio::test]
+    async fn ls_long_prints_host_owners_and_question_marks_for_untracked_fields() {
+        use std::os::unix::fs::MetadataExt;
+
+        let principal = kaijutsu_types::PrincipalId::system();
+        let blocks = shared_block_store(principal);
+        let kernel = test_kernel("test-ls-long").await;
+        let host = tempfile::TempDir::new().unwrap();
+        std::fs::write(host.path().join("a.txt"), "hello\n").unwrap();
+        std::fs::hard_link(host.path().join("a.txt"), host.path().join("b.txt")).unwrap();
+        std::os::unix::fs::symlink("a.txt", host.path().join("link")).unwrap();
+        let meta = std::fs::metadata(host.path().join("a.txt")).unwrap();
+        kernel.mount("/host", crate::vfs::backends::LocalBackend::new(host.path())).await;
+        kernel.mount("/mem", crate::vfs::backends::MemoryBackend::new()).await;
+
+        let shell = EmbeddedKaish::with_identity(
+            "test-ls-long",
+            blocks,
+            kernel.clone(),
+            Some(PathBuf::from("/")),
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
+            crate::runtime::context_engine::session_context_map(),
+            ExternalExec::Deny,
+            OutputProfile::Agent,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let run = |cmd: &'static str| {
+            let shell = &shell;
+            async move {
+                let r = shell.execute_with_options(cmd, ExecuteOptions::default()).await.unwrap();
+                assert_eq!(r.code, 0, "{cmd}: {}", r.err);
+                r.text_out().to_string()
+            }
+        };
+        let fields = |out: &str, name: &str| -> Vec<String> {
+            let line = out.lines().find(|l| l.ends_with(&format!(" {name}"))).unwrap_or_else(|| panic!("no {name} row: {out}"));
+            line.split_whitespace().map(str::to_string).collect()
+        };
+
+        let out = run("ls -l /host").await;
+        assert!(out.starts_with("total "), "every host entry reports blocks: {out}");
+        let (uid, gid) = (meta.uid().to_string(), meta.gid().to_string());
+        assert_eq!(fields(&out, "a.txt")[1..5], ["2", uid.as_str(), gid.as_str(), "6"], "{out}");
+        assert!(out.lines().any(|l| l.starts_with('l') && l.ends_with(" link -> a.txt")), "a symlink names its target: {out}");
+        assert!(run("ls /host").await.lines().any(|l| l == "link"), "plain ls prints a symlink's bare name");
+
+        run("echo hello > /mem/m.txt").await;
+        let out = run("ls -l /mem").await;
+        assert!(!out.contains("total"), "a memory mount reports no blocks: {out}");
+        assert_eq!(fields(&out, "m.txt")[1..5], ["?", "?", "?", "6"], "{out}");
+    }
+
     /// A builtin's write under the read-only host root says which mount
     /// refused it and lists the writable mounts, so one refusal maps the
     /// boundary. `docs/mounts.md`, "When a write is refused".

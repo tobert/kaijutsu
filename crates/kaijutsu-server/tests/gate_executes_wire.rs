@@ -944,7 +944,7 @@ fn approval_captures_default_environment_and_original_directory() {
         s.answer(&ask, true).await;
         wait_for("approved captured environment", || s.block(&output).status != Status::Waiting).await;
         assert_eq!(s.block(&output).status, Status::Done, "{:?}", s.block(&output).stderr);
-        assert_eq!(std::fs::read_to_string(original.marker()).unwrap(), format!("{}|{}\n{}",
+        assert_eq!(std::fs::read_to_string(original.marker()).unwrap(), format!("{}|{}\n{}\n",
             kaish_kernel::home_dir().display(), original.path().display(), original.path().display()));
         assert!(!moved.marker().exists(), "approval must not follow the newer context cwd");
         s.close().await;

@@ -19,7 +19,7 @@ use async_trait::async_trait;
 
 use kaish_kernel::backend::ConflictError;
 use kaish_kernel::tools::{ToolArgs, ToolCtx};
-use kaish_kernel::vfs::{DirEntry, DirEntryKind};
+use kaish_kernel::vfs::{AccountId, DirEntry, DirEntryKind};
 use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
@@ -99,6 +99,17 @@ impl MountBackend {
             actor,
             read_only: true,
         }
+    }
+
+    /// The entry `lstat(2)` would report for `path`, named `name`: a final
+    /// symlink stays a link and carries its own target, unresolved.
+    async fn lstat_entry(&self, path: &Path, name: &str) -> crate::vfs::VfsResult<DirEntry> {
+        let attr = self.mount_table.getattr(path).await?;
+        let mut entry = file_attr_to_dir_entry(name, &attr);
+        if attr.kind == FileType::Symlink {
+            entry.symlink_target = Some(self.mount_table.readlink(path).await?);
+        }
+        Ok(entry)
     }
 
     /// Take a write whose flush failed back out of the file cache
@@ -248,7 +259,10 @@ fn vfs_to_backend(err: VfsError) -> BackendError {
     }
 }
 
-/// Convert a kaijutsu `FileAttr` to a kaish `DirEntry`.
+/// Convert a kaijutsu `FileAttr` to a kaish `DirEntry`. Links, blocks,
+/// owner, and group pass through only when the backend reports them, so
+/// `ls -l` prints `?` rather than a made-up value. Owner and group carry
+/// numeric IDs; kaish prints the number when an `AccountId` has no name.
 fn file_attr_to_dir_entry(name: &str, attr: &crate::vfs::FileAttr) -> DirEntry {
     let kind = match attr.kind {
         FileType::File => DirEntryKind::File,
@@ -262,6 +276,10 @@ fn file_attr_to_dir_entry(name: &str, attr: &crate::vfs::FileAttr) -> DirEntry {
         modified: Some(attr.mtime),
         permissions: Some(attr.perm),
         symlink_target: None,
+        links: attr.nlink.map(u64::from),
+        blocks: attr.blocks,
+        owner: attr.uid.map(|id| AccountId { id, name: None }),
+        group: attr.gid.map(|id| AccountId { id, name: None }),
     }
 }
 
@@ -280,6 +298,10 @@ fn kj_dir_entry_to_kaish(entry: &crate::vfs::DirEntry) -> DirEntry {
         modified: None,
         permissions: None,
         symlink_target: None,
+        links: None,
+        blocks: None,
+        owner: None,
+        group: None,
     }
 }
 
@@ -518,8 +540,8 @@ impl KernelBackend for MountBackend {
     // =========================================================================
 
     /// List a directory with each entry's attributes, as `lstat` reports
-    /// them, because `ls -l` reads sizes and times from these entries. An
-    /// entry that vanishes after `readdir` is skipped. An entry whose
+    /// them, because `ls -l` reads sizes, times, and link targets from these
+    /// entries. An entry that vanishes after `readdir` is skipped. An entry whose
     /// attributes are refused keeps only its name and kind.
     async fn list(&self, path: &Path) -> BackendResult<Vec<DirEntry>> {
         let entries = self
@@ -529,8 +551,8 @@ impl KernelBackend for MountBackend {
             .map_err(vfs_to_backend)?;
         let mut listed = Vec::with_capacity(entries.len());
         for entry in &entries {
-            match self.mount_table.getattr(&path.join(&entry.name)).await {
-                Ok(attr) => listed.push(file_attr_to_dir_entry(&entry.name, &attr)),
+            match self.lstat_entry(&path.join(&entry.name), &entry.name).await {
+                Ok(listed_entry) => listed.push(listed_entry),
                 Err(e) if e.is_not_found() => continue,
                 Err(e) if e.is_permission_denied() => listed.push(kj_dir_entry_to_kaish(entry)),
                 Err(e) => return Err(vfs_to_backend(e)),
@@ -568,14 +590,10 @@ impl KernelBackend for MountBackend {
         )))
     }
 
-    /// Report a final symlink as a link, as `lstat(2)` does.
+    /// Report a final symlink as a link, as `lstat(2)` does, with its
+    /// target.
     async fn lstat(&self, path: &Path) -> BackendResult<DirEntry> {
-        let attr = self
-            .mount_table
-            .getattr(path)
-            .await
-            .map_err(vfs_to_backend)?;
-        Ok(file_attr_to_dir_entry(&path_name(path), &attr))
+        self.lstat_entry(path, &path_name(path)).await.map_err(vfs_to_backend)
     }
 
     async fn mkdir(&self, path: &Path) -> BackendResult<()> {
@@ -1228,6 +1246,70 @@ mod tests {
         }
     }
 
+    /// `ls -l` and `stat` print each entry's link count, 512-byte blocks,
+    /// owner, group, and a symlink's target. A host file reports what the
+    /// host's `lstat` says, with numeric IDs; a backend with no such facts
+    /// reports none, so kaish prints `?` instead of a made-up value.
+    #[tokio::test]
+    async fn host_entries_report_links_blocks_and_owner_and_synthetic_ones_report_none() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+        std::fs::hard_link(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+        std::os::unix::fs::symlink("a.txt", dir.join("link")).unwrap();
+        let meta = std::fs::symlink_metadata(dir.join("a.txt")).unwrap();
+        assert_eq!(meta.nlink(), 2, "the fixture's hard link");
+
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-host-details").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount(dir.to_str().unwrap(), LocalBackend::new(dir)).await;
+        mount_table.mount("/mem", MemoryBackend::new()).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache, PrincipalId::system());
+
+        let owner = Some(AccountId { id: meta.uid(), name: None });
+        let group = Some(AccountId { id: meta.gid(), name: None });
+        let listed = backend.list(dir).await.unwrap();
+        let from_list = listed.iter().find(|e| e.name == "a.txt").expect("a.txt is listed");
+        for (how, entry) in [("stat", &backend.stat(&dir.join("a.txt")).await.unwrap()), ("list", from_list)] {
+            assert_eq!(entry.links, Some(2), "{how}: the host's link count");
+            assert_eq!(entry.blocks, Some(meta.blocks()), "{how}: the host's 512-byte blocks");
+            assert_eq!(entry.owner, owner, "{how}: the host's uid");
+            assert_eq!(entry.group, group, "{how}: the host's gid");
+            assert_eq!(entry.symlink_target, None, "{how}: a file has no target");
+        }
+        let link_from_list = listed.iter().find(|e| e.name == "link").expect("link is listed");
+        for (how, entry) in [("lstat", &backend.lstat(&dir.join("link")).await.unwrap()), ("list", link_from_list)] {
+            assert!(entry.is_symlink(), "{how}: {entry:?}");
+            assert_eq!(entry.symlink_target.as_deref(), Some(Path::new("a.txt")), "{how}: the link's own target");
+        }
+        assert_eq!(backend.stat(&dir.join("link")).await.unwrap().symlink_target, None, "stat follows the link");
+
+        backend.write(Path::new("/mem/m.txt"), b"hello\n", WriteMode::Overwrite).await.unwrap();
+        backend.mkdir(Path::new("/mem/d")).await.unwrap();
+        let listed = backend.list(Path::new("/mem")).await.unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        for entry in listed.iter().chain([&backend.stat(Path::new("/mem/m.txt")).await.unwrap()]) {
+            assert_eq!(
+                (entry.links, entry.blocks, &entry.owner, &entry.group),
+                (None, None, &None, &None),
+                "{}: a memory backend has no links, blocks, or owner to report",
+                entry.name
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_backend_type() {
         let backend = test_mount_backend().await;
@@ -1290,9 +1372,6 @@ mod tests {
         );
     }
 
-    /// Read-only / OS mounts pass through the VFS and never touch the document
-    /// cache: reads work, writes are rejected cleanly, and a rejected write
-    /// must NOT leave a phantom edit that a later read would serve.
     /// On a host mount, `stat` follows a link to a directory and a recursive
     /// remove of the link removes the link alone: the target's files stay.
     #[tokio::test]
@@ -1329,6 +1408,9 @@ mod tests {
         }
     }
 
+    /// Read-only / OS mounts pass through the VFS and never touch the document
+    /// cache: reads work, writes are rejected cleanly, and a rejected write
+    /// must NOT leave a phantom edit that a later read would serve.
     #[tokio::test]
     async fn readonly_mount_passes_through_and_does_not_poison() {
         // tempfile: unique + RAII-cleaned (no leaked `/tmp` dir across runs, and

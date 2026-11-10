@@ -1543,7 +1543,7 @@ struct FileAttr {
   perm @2 :UInt32;
   mtimeSecs @3 :UInt64;        # Seconds since UNIX epoch
   mtimeNanos @4 :UInt32;       # Nanoseconds
-  nlink @5 :UInt32;
+  nlink @5 :UInt32;            # Hard links; 0 when the backend does not track them
   generation @6 :UInt64;       # Content version — the coherence primitive
                                 # (kernel FileAttr::generation). A client
                                 # compares this, not mtimeSecs/mtimeNanos, to

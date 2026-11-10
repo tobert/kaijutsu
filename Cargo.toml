@@ -77,7 +77,7 @@ kaijutsu-council = { path = "crates/kaijutsu-council" }
 gogi-proto = { git = "https://github.com/tobert/gogi", rev = "24ad402c7329db232ba30a8aac6fb509d8e817cd" }
 gogi-fake = { git = "https://github.com/tobert/gogi", rev = "24ad402c7329db232ba30a8aac6fb509d8e817cd" }
 
-# Kaish (execution engine + client) — published 0.15.
+# Kaish (execution engine + client), from crates.io.
 # `subprocess` compiles in host external-command execution; whether a given
 # shell may actually use it is decided per-context at materialization
 # (ExternalExec, gated on the `exec` loadout authority — deny by default).
@@ -98,10 +98,10 @@ gogi-fake = { git = "https://github.com/tobert/gogi", rev = "24ad402c7329db232ba
 # Re-linking to a worktree is legitimate when we need to consume kaish work
 # before it releases. If you do it, treat it as temporary, record the rev, and
 # put the crates.io line back the moment the release lands.
-kaish-kernel = { version = "0.18", features = ["subprocess"] }
-kaish-glob = { version = "0.18" }
-kaish-types = { version = "0.18" }
-kaish-help = { version = "0.18" }
+kaish-kernel = { version = "0.19", features = ["subprocess"] }
+kaish-glob = { version = "0.19" }
+kaish-types = { version = "0.19" }
+kaish-help = { version = "0.19" }
 
 
 # Cap'n Proto
@@ -236,15 +236,3 @@ tracing-opentelemetry = "0.32"
 
 # Testing
 tempfile = "3"
-
-# TEMPORARY (Amy, 2026-10-18: "we can switch to a hash temporarily, will probably be a few days before I do a
-# kaish release"). tobert/kaish PR #528 (bare `%` in words) at 94871e59. The patch also covers the
-# kaish crates that kaish-extras pulls from crates.io, so one copy of each is built. Remove this block when the
-# kaish release that carries #528 lands, and keep the version lines above.
-[patch.crates-io]
-kaish-glob = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
-kaish-help = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
-kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
-kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
-kaish-types = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }
-kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "94871e594204c5b1bf62bb962197666cb5ded687" }

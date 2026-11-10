@@ -631,7 +631,8 @@ fn from_wire_attrs(attrs: &FileAttributes, generation: u64, rw: bool) -> FileAtt
         generation,
         atime,
         ctime: None,
-        nlink: 1,
+        nlink: None,
+        blocks: None,
         uid: None,
         gid: None,
     }

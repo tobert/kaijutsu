@@ -9294,7 +9294,7 @@ fn set_file_attr(
         .unwrap_or_default();
     builder.set_mtime_secs(duration.as_secs());
     builder.set_mtime_nanos(duration.subsec_nanos());
-    builder.set_nlink(attr.nlink);
+    builder.set_nlink(attr.nlink.unwrap_or(0));
     builder.set_generation(attr.generation);
 }
 

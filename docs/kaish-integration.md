@@ -183,6 +183,14 @@ These are source observations, not promises that all paths behave alike.
   the host and workspace mounts and stop at `/config`, `/run`, `/v`, `/r`,
   and `/dev`. kaish adds its own `/v/*` and `/dev` mounts to that list. See
   `docs/mounts.md`, "Where a walk stops".
+- `ls -l` and `stat` print what `MountBackend` reports for each entry. A
+  host file (`LocalBackend`) reports its link count, 512-byte blocks, and
+  numeric owner and group from `lstat`. A symlink on any backend reports its
+  target:
+  `-rw-r--r-- 2 1000 1000 6 Nov 10 09:15 a.txt`, `link -> a.txt`. Other
+  backends track none of these four fields, so kaish prints `?` for each and
+  leaves out the `total` line. Owner and group print as numbers because
+  kaish's name lookup is private to its own `LocalFs`.
 - A `ShellPolicy::ReadOnly` shell gets the writable shell's `PATH` through
   `ExternalExec::LookupOnly`, so `which` reports what the host has. Running
   a host program there is refused, and the refusal names `shell_write`. A
@@ -739,8 +747,8 @@ of every instruction body.
 Tests cover regular and symlinked invocation paths, distinct creator/requester/
 performer identities, more than 4 MiB of exact UTF-8 input, missing and invalid
 input, executable snapshots versus live data reads, reseeding with custom
-Markdown, and rendered prompts for every migrated rc directory. The locked
-kaish API supplies positional parameters directly; no upstream API change was
+Markdown, and rendered prompts for every migrated rc directory. The kaish
+API supplies positional parameters directly; no upstream API change was
 needed. Its unsupported `${0%.kai}` expansion is recorded in `docs/issues.md`;
 the shipped scripts use supported `dirname` and `basename` builtins.
 

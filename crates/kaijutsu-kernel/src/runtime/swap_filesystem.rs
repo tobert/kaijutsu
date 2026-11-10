@@ -291,6 +291,10 @@ impl Filesystem for SwapFilesystem {
                 modified: Some(dirtied_at_to_system_time(buf.dirtied_at)),
                 permissions: Some(0o444),
                 symlink_target: None,
+                links: None,
+                blocks: None,
+                owner: None,
+                group: None,
             });
         }
 

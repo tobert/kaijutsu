@@ -91,9 +91,9 @@ kaish-kernel.workspace = true
 # (kj/readonly.rs) — kaish-kernel re-exports only part of this crate's plan
 # vocabulary, not the command/value types this module names directly.
 kaish-types.workspace = true
-# Composable kaish guidance (see the TODO at its workspace pin) — the shell
-# tool description and the `kj kaish primer` verb compose from this instead
-# of hand-writing kaish-language prose.
+# Composable kaish guidance: the shell tool description and the
+# `kj kaish primer` verb compose from this instead of hand-writing
+# kaish-language prose.
 kaish-help.workspace = true
 
 # HTTP tool for kaish (`curl`, docs/kj-help/ + runtime/curl_tool.rs), from the
@@ -101,18 +101,17 @@ kaish-help.workspace = true
 # crates.io, so this is a git dep — pinned by rev, never a path dep: a rev
 # resolves for anyone who clones, a path dep resolves only on a machine
 # holding that worktree (see the kaish-kernel comment above this block for
-# the cost of getting that wrong). `kaish-extras`' own workspace pins
-# kaish-tool-api/kaish-types to the same "0.18" this workspace pins above, so
-# the `Tool` trait objects unify — `cargo tree -i kaish-types` must show
-# exactly one version after this is added.
-kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "372c7f52f15367500517f2df84c300825c0f1ef6" }
+# the cost of getting that wrong). The kaish-extras rev must pin the same
+# kaish minor as the workspace pins above, so the `Tool` trait objects
+# unify: `cargo tree -i kaish-types` must show exactly one version.
+kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "7954260c28536ca3d09217d854a95eff37976c87" }
 
 # Read-only `git` tool for the read-only context shell (docs/kaish-integration.md,
 # runtime/git_tool.rs) — same rev as kaish-tools-curl above, same reasoning.
-# Default features (no `textdiff`): the read-only shell has no need for
-# unified patch text yet. See kaish-extras' docs/embedding-git.md for the
-# read-only guarantees and containment story.
-kaish-tools-git = { git = "https://github.com/tobert/kaish-extras", rev = "372c7f52f15367500517f2df84c300825c0f1ef6" }
+# Default features: `textdiff` (`git diff --patch`) and no `commit`, so this
+# build links no write verbs and no `GitHooks`. See kaish-extras'
+# docs/embedding-git.md for the read-only guarantees and containment story.
+kaish-tools-git = { git = "https://github.com/tobert/kaish-extras", rev = "7954260c28536ca3d09217d854a95eff37976c87" }
 
 # gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
 ignore.workspace = true

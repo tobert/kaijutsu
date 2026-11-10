@@ -69,8 +69,12 @@ pub struct FileAttr {
     pub atime: Option<SystemTime>,
     /// Creation time (optional).
     pub ctime: Option<SystemTime>,
-    /// Number of hard links.
-    pub nlink: u32,
+    /// Number of hard links (optional, for local fs). `None` when the
+    /// backend does not track links; kaish's `ls -l` prints `?` for it.
+    pub nlink: Option<u32>,
+    /// Space allocated, in 512-byte units (optional, for local fs).
+    #[serde(default)]
+    pub blocks: Option<u64>,
     /// User ID (optional, for local fs).
     pub uid: Option<u32>,
     /// Group ID (optional, for local fs).
@@ -89,7 +93,8 @@ impl FileAttr {
             generation: 0,
             atime: Some(now),
             ctime: Some(now),
-            nlink: 1,
+            nlink: None,
+            blocks: None,
             uid: None,
             gid: None,
         }
@@ -106,7 +111,8 @@ impl FileAttr {
             generation: 0,
             atime: Some(now),
             ctime: Some(now),
-            nlink: 2, // . and ..
+            nlink: None,
+            blocks: None,
             uid: None,
             gid: None,
         }
@@ -123,7 +129,8 @@ impl FileAttr {
             generation: 0,
             atime: Some(now),
             ctime: Some(now),
-            nlink: 1,
+            nlink: None,
+            blocks: None,
             uid: None,
             gid: None,
         }
@@ -412,7 +419,7 @@ mod tests {
         let dir = FileAttr::directory(0o755);
         assert!(dir.is_dir());
         assert_eq!(dir.perm, 0o755);
-        assert_eq!(dir.nlink, 2);
+        assert_eq!(dir.nlink, None, "a synthetic directory has no link count");
     }
 
     #[test]
