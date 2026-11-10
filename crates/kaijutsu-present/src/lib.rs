@@ -14,6 +14,7 @@
 //! | Module | What it maps |
 //! |---|---|
 //! | [`format`] | a `BlockSnapshot` to display text and a tone |
+//! | [`fold`] | which blocks fold, when, and what a folded block says |
 //! | [`markdown`] | markdown source to styled spans |
 //! | [`kaish`] | a kaish command to a validity verdict and tokens |
 //! | [`action`] | the user-intent vocabulary every input device maps onto |
@@ -21,6 +22,7 @@
 
 pub mod action;
 pub mod beats;
+pub mod fold;
 pub mod format;
 pub mod kaish;
 pub mod markdown;
