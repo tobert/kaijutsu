@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod ask_arming;
+pub mod colon;
 pub mod constants;
 pub mod context_create;
 pub mod shell_toggle;
@@ -13,6 +14,7 @@ pub mod document_store;
 pub mod draft_ledger;
 pub mod draft_outbox;
 pub mod editor_outbox;
+pub mod follow;
 pub mod kernel_clock;
 pub mod key_select;
 pub mod ledger;
@@ -53,6 +55,8 @@ pub use shell_toggle::{ShellToggle, shell_label, shell_toggle};
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
 pub use draft_outbox::{DraftEdit, DraftOutbox, DraftSink};
 pub use editor_outbox::{EditorOutbox, EditorSink};
+pub use colon::vi_statement;
+pub use follow::follow_target;
 pub use outbox_error::OutboxError;
 pub use ledger::{LedgerPush, LedgerState};
 pub use ask_arming::{ASK_ARM_DELAY, ASK_ARM_TYPING_HOLD, AskArming};

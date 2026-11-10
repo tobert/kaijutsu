@@ -1674,35 +1674,6 @@ impl KernelHandle {
     // Timeline / Fork operations
     // =========================================================================
 
-    /// Cherry-pick a block from one context into another.
-    ///
-    /// Returns the new block ID in the target context.
-    #[tracing::instrument(skip(self), name = "rpc_client.cherry_pick_block")]
-    pub async fn cherry_pick_block(
-        &self,
-        block_id: &BlockId,
-        target_context: ContextId,
-    ) -> Result<BlockId, RpcError> {
-        let mut request = self.kernel.cherry_pick_block_request();
-        {
-            let mut params = request.get();
-            let mut source = params.reborrow().init_source_block_id();
-            source.set_context_id(block_id.context_id.as_bytes());
-            source.set_principal_id(block_id.principal_id.as_bytes());
-            source.set_seq(block_id.seq);
-            params.set_target_context_id(target_context.as_bytes());
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let new_block = response.get()?.get_new_block_id()?;
-        parse_block_id(&new_block)
-    }
-
     /// Get document history (version snapshots).
     ///
     /// Returns a list of version snapshots for timeline navigation.

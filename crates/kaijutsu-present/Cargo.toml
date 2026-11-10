@@ -26,7 +26,6 @@ strum.workspace = true
 # kaish syntax validation runs in-process against the real lexer and parser —
 # same grammar the kernel executes, no subprocess.
 kaish-kernel.workspace = true
-logos = "0.16"
 
 # Version-locked to the `bevy` the app depends on: `register_type` only
 # accepts a registration built by the same bevy_reflect.

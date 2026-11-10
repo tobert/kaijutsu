@@ -6993,7 +6993,6 @@ dependencies = [
  "kaijutsu-audio",
  "kaijutsu-types",
  "kaish-kernel",
- "logos",
  "pulldown-cmark",
  "serde_json",
  "strum 0.26.3",

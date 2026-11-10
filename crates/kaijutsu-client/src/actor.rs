@@ -658,11 +658,6 @@ enum RpcCommand {
     },
 
     // ── Timeline ─────────────────────────────────────────────────────────
-    CherryPickBlock {
-        block_id: BlockId,
-        target_context: ContextId,
-        reply: oneshot::Sender<Result<BlockId, CallError>>,
-    },
     GetContextHistory {
         context_id: ContextId,
         limit: u32,
@@ -819,7 +814,6 @@ impl RpcCommand {
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetConfig { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::CherryPickBlock { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInfo { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::InterruptContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1814,20 +1808,6 @@ impl ActorHandle {
     }
 
     // ── Timeline ─────────────────────────────────────────────────────────
-
-    #[tracing::instrument(skip(self))]
-    pub async fn cherry_pick_block(
-        &self,
-        block_id: &BlockId,
-        target_context: ContextId,
-    ) -> Result<BlockId, CallError> {
-        self.send(|reply| RpcCommand::CherryPickBlock {
-            block_id: *block_id,
-            target_context,
-            reply,
-        })
-        .await
-    }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_context_history(
@@ -3829,14 +3809,6 @@ async fn dispatch_kernel_command(
         }
 
         // ── Timeline ──
-        RpcCommand::CherryPickBlock {
-            block_id, target_context, reply,
-        } => {
-            dispatch!(
-                kernel, reply, close_tx, k,
-                k.cherry_pick_block(&block_id, target_context)
-            );
-        }
         RpcCommand::GetContextHistory {
             context_id, limit, reply,
         } => {

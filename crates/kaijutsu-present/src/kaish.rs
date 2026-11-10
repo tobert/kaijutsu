@@ -1,14 +1,9 @@
 //! Kaish syntax validation, in process.
 //!
 //! Parses kaish commands with kaish-kernel's own lexer and parser — no
-//! subprocess, the same grammar the kernel executes — for:
-//! - Syntax validation (highlight errors as the user types)
-//! - Token classification (for syntax highlighting)
-//! - Completion hints (identify context for suggestions)
-//!
-//! A client validates on each keystroke and tints invalid input.
+//! subprocess, the same grammar the kernel executes — so a client can
+//! validate on each keystroke and tint invalid input.
 
-use kaish_kernel::lexer::{Token, TokenCategory};
 use kaish_kernel::parser;
 
 /// Result of validating a kaish command.
@@ -31,44 +26,6 @@ pub struct SyntaxError {
     pub end: usize,
     /// Human-readable error message.
     pub message: String,
-}
-
-/// Token with span information for syntax highlighting.
-#[derive(Debug, Clone)]
-pub struct SpannedToken {
-    /// The token kind.
-    pub kind: TokenKind,
-    /// Byte offset of the start.
-    pub start: usize,
-    /// Byte offset of the end.
-    pub end: usize,
-}
-
-/// Simplified token kinds for syntax highlighting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenKind {
-    /// Command or identifier.
-    Command,
-    /// String literal.
-    String,
-    /// Number literal.
-    Number,
-    /// Operator (|, &&, ||, etc.).
-    Operator,
-    /// Variable reference ($foo).
-    Variable,
-    /// Keyword (if, for, fn, etc.).
-    Keyword,
-    /// Flag (--flag, -f).
-    Flag,
-    /// Comment.
-    Comment,
-    /// Punctuation (, ; { } etc.).
-    Punctuation,
-    /// Path (/foo/bar).
-    Path,
-    /// Error token.
-    Error,
 }
 
 /// Validate a kaish command string.
@@ -117,51 +74,6 @@ pub fn validate(input: &str) -> ValidationResult {
     }
 }
 
-/// Tokenize input for syntax highlighting.
-///
-/// Returns a list of tokens with their spans and kinds.
-pub fn tokenize(input: &str) -> Vec<SpannedToken> {
-    use logos::Logos;
-
-    let mut tokens = Vec::new();
-    let lexer = Token::lexer(input);
-
-    for (result, span) in lexer.spanned() {
-        let kind = match result {
-            Ok(token) => classify_token(&token),
-            Err(_) => TokenKind::Error,
-        };
-
-        tokens.push(SpannedToken {
-            kind,
-            start: span.start,
-            end: span.end,
-        });
-    }
-
-    tokens
-}
-
-/// Classify a token for syntax highlighting.
-///
-/// Uses kaish's `TokenCategory` for stable classification that doesn't break
-/// when new tokens are added to the lexer.
-fn classify_token(token: &Token) -> TokenKind {
-    match token.category() {
-        TokenCategory::Keyword => TokenKind::Keyword,
-        TokenCategory::Operator => TokenKind::Operator,
-        TokenCategory::String => TokenKind::String,
-        TokenCategory::Number => TokenKind::Number,
-        TokenCategory::Variable => TokenKind::Variable,
-        TokenCategory::Flag => TokenKind::Flag,
-        TokenCategory::Punctuation => TokenKind::Punctuation,
-        TokenCategory::Comment => TokenKind::Comment,
-        TokenCategory::Path => TokenKind::Path,
-        TokenCategory::Command => TokenKind::Command,
-        TokenCategory::Error => TokenKind::Error,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,43 +96,5 @@ mod tests {
         let result = validate("");
         assert!(result.valid);
         assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_simple() {
-        let tokens = tokenize("echo hello");
-        assert!(!tokens.is_empty());
-        // First token should be a command
-        assert_eq!(tokens[0].kind, TokenKind::Command);
-    }
-
-    #[test]
-    fn test_tokenize_variable() {
-        let tokens = tokenize("echo $HOME");
-        let var_tokens: Vec<_> = tokens
-            .iter()
-            .filter(|t| t.kind == TokenKind::Variable)
-            .collect();
-        assert!(!var_tokens.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_pipe() {
-        let tokens = tokenize("ls | grep foo");
-        let pipe_tokens: Vec<_> = tokens
-            .iter()
-            .filter(|t| t.kind == TokenKind::Operator)
-            .collect();
-        assert!(!pipe_tokens.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_flags() {
-        let tokens = tokenize("ls -la --color");
-        let flag_tokens: Vec<_> = tokens
-            .iter()
-            .filter(|t| t.kind == TokenKind::Flag)
-            .collect();
-        assert_eq!(flag_tokens.len(), 2);
     }
 }

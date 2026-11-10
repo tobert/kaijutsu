@@ -3,13 +3,12 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use kaijutsu_types::ContextId;
 
 use crate::app::App;
 use crate::bridge::KernelBridge;
 use crate::cmdline::{self, ColonVerb};
-use kaijutsu_client::DraftEdit;
+use kaijutsu_client::{DraftEdit, follow_target};
 use kaijutsu_client::draft_outbox::Landed;
 use crate::completion;
 use kaijutsu_client::{ShellToggle, shell_toggle};
@@ -220,32 +219,6 @@ fn draft_edit_failure(error: &dyn std::fmt::Display) -> String {
     format!("draft edit failed: {error:#}")
 }
 
-/// Where a `kj` result moves this client. A structured run is pinned to the
-/// context it addressed, so the verb names the move in its data: `switched_to`
-/// (`kj context switch`, `kj fork`), or `rotated_from` with `context_id` when
-/// the seat on screen is the one that rotated. An id that does not parse is
-/// an error, never a stay.
-fn follow_target(data: Option<&serde_json::Value>, current: ContextId) -> Result<Option<ContextId>, String> {
-    let Some(data) = data else { return Ok(None) };
-    let id_at = |key: &str| -> Result<Option<ContextId>, String> {
-        match data.get(key) {
-            None => Ok(None),
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| format!("`{key}` is not a string"))
-                .and_then(|hex| ContextId::parse(hex).map_err(|e| format!("`{key}` {hex:?}: {e}")))
-                .map(Some),
-        }
-    };
-    if let Some(target) = id_at("switched_to")? {
-        return Ok((target != current).then_some(target));
-    }
-    if id_at("rotated_from")? == Some(current) {
-        return id_at("context_id")?.map(Some).ok_or_else(|| "rotate result names no successor".to_string());
-    }
-    Ok(None)
-}
-
 /// Dispatch one submitted `:` line (`docs/tui.md`, "The `:` line"). The tui
 /// parses it itself (`cmdline::parse`) — the core's own `:w`/`:q` ex-command
 /// dialect answers the alternate-screen editor, not this bar.
@@ -401,35 +374,6 @@ mod tests {
         let note = draft_edit_failure(&error);
         assert!(note.contains("edit input doc"));
         assert!(note.contains("context has no binding: edit_input is denied"), "{note}");
-    }
-
-    /// Rotating the seat on screen follows its successor; rotating another
-    /// seat by label leaves the screen where it is.
-    #[test]
-    fn a_rotate_result_follows_only_the_seat_on_screen() {
-        let (here, successor, elsewhere) = (ContextId::new(), ContextId::new(), ContextId::new());
-        let data = serde_json::json!({"context_id": successor.to_hex(), "rotated_from": here.to_hex()});
-        assert_eq!(follow_target(Some(&data), here), Ok(Some(successor)));
-        assert_eq!(follow_target(Some(&data), elsewhere), Ok(None));
-    }
-
-    #[test]
-    fn a_switch_result_follows_its_target() {
-        let (here, there) = (ContextId::new(), ContextId::new());
-        let data = serde_json::json!({"switched_to": there.to_hex()});
-        assert_eq!(follow_target(Some(&data), here), Ok(Some(there)));
-    }
-
-    /// A record that merely mentions a context id (`kj context info`) moves
-    /// nothing, and an id that does not parse is an error, never a stay.
-    #[test]
-    fn other_results_stay_and_a_bad_id_is_an_error() {
-        let here = ContextId::new();
-        let info = serde_json::json!({"context_id": ContextId::new().to_hex(), "label": "x"});
-        assert_eq!(follow_target(Some(&info), here), Ok(None));
-        assert_eq!(follow_target(None, here), Ok(None));
-        let bad = serde_json::json!({"switched_to": "not-an-id"});
-        assert!(follow_target(Some(&bad), here).is_err());
     }
 
     /// The place the reader scrolled to belongs to the context, not to the

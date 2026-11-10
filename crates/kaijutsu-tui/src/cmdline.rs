@@ -38,13 +38,8 @@ pub fn parse(line: &str) -> ColonVerb {
     if let Some(statement) = body.strip_prefix('!') {
         return ColonVerb::Shell(statement.to_string());
     }
-    // `:vi <args>` is `:!vi <args>`: the same shell statement, so the
-    // builtin's own argument rules apply.
-    if body == "vi" {
-        return ColonVerb::Shell("vi".to_string());
-    }
-    if let Some(rest) = body.strip_prefix("vi ") {
-        return ColonVerb::Shell(format!("vi {}", rest.trim()));
+    if let Some(statement) = kaijutsu_client::vi_statement(body) {
+        return ColonVerb::Shell(statement);
     }
     if let Some(rest) = body.strip_prefix("kj") {
         // A space must separate the verb from its argv — `:kjunk` is not

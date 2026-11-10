@@ -11,8 +11,7 @@ use modalkit::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers};
 
 use super::outbox::DraftOutboxState;
 use super::{
-    ComposeAction, ComposeBuffer, ComposeState, DraftTarget, HeldInput, LoadStarted, byte_offset, colon_vi_statement,
-    shell_kj_argv,
+    ComposeAction, ComposeBuffer, ComposeState, DraftTarget, HeldInput, LoadStarted, byte_offset, shell_kj_argv,
 };
 use crate::cell::{
     ComposeError, ConversationScrollState, DocumentCache, InputOverlay, InputOverlayMarker, SessionPrincipal,
@@ -79,7 +78,7 @@ impl ComposeIo<'_, '_> {
             self.send_chat_ops(&action.ops);
         }
         if let Some(line) = action.command {
-            match colon_vi_statement(&line) {
+            match line.strip_prefix(':').and_then(kaijutsu_client::vi_statement) {
                 Some(statement) => self.run_colon_vi(statement),
                 None => self.error("compose", format!("{line}: compose runs no `:` commands; Ctrl+Z opens the shell context")),
             }

@@ -18,7 +18,7 @@ use crate::cell::{
 };
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
-use kaijutsu_client::ServerEvent;
+use kaijutsu_client::{ServerEvent, follow_target};
 use kaijutsu_types::{ContextId, PrincipalId};
 
 /// The `Screen` a *landed* context switch should reveal, or `None` if the
@@ -468,36 +468,6 @@ pub fn handle_server_context_switch(
     }
 }
 
-/// Where a `kj` result run against `current` moves the view. A structured
-/// run stays addressed to its context, so a verb that moves the player
-/// names the move in its data: `switched_to` (`kj context switch`, `kj
-/// fork`), or `rotated_from` with `context_id` when the seat that rotated is
-/// `current`. Rotating another seat by label moves nothing. An id that does
-/// not parse is an error, never a stay. The tui follows the same rule
-/// (`kaijutsu-tui`'s `run::follow_target`).
-pub fn follow_target(data: Option<&serde_json::Value>, current: ContextId) -> Result<Option<ContextId>, String> {
-    let Some(data) = data else { return Ok(None) };
-    let id_at = |key: &str| -> Result<Option<ContextId>, String> {
-        match data.get(key) {
-            None => Ok(None),
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| format!("`{key}` is not a string"))
-                .and_then(|hex| ContextId::parse(hex).map_err(|e| format!("`{key}` {hex:?}: {e}")))
-                .map(Some),
-        }
-    };
-    if let Some(target) = id_at("switched_to")? {
-        return Ok((target != current).then_some(target));
-    }
-    if id_at("rotated_from")? == Some(current) {
-        return id_at("context_id")?
-            .map(Some)
-            .ok_or_else(|| "rotate result names no successor".to_string());
-    }
-    Ok(None)
-}
-
 /// Follow a finished `kj` line from the shell surface (`Ctrl+A r`'s
 /// `kj context rotate`, a typed `kj context switch`): switch to the context
 /// its data names, but only while the context it ran against is still the
@@ -625,29 +595,6 @@ mod tests {
 
     fn rotate_data(from: ContextId, successor: ContextId) -> serde_json::Value {
         serde_json::json!({"context_id": successor.to_hex(), "rotated_from": from.to_hex()})
-    }
-
-    /// Rotating the seat on screen follows its successor; rotating another
-    /// seat by label leaves the view where it is.
-    #[test]
-    fn a_rotate_result_follows_only_the_seat_it_ran_against() {
-        let (from, next, other) = (ContextId::new(), ContextId::new(), ContextId::new());
-        assert_eq!(follow_target(Some(&rotate_data(from, next)), from), Ok(Some(next)));
-        assert_eq!(follow_target(Some(&rotate_data(other, next)), from), Ok(None));
-        let no_successor = serde_json::json!({"rotated_from": from.to_hex()});
-        assert!(follow_target(Some(&no_successor), from).is_err());
-    }
-
-    #[test]
-    fn a_switch_result_follows_its_target_and_other_results_stay() {
-        let (here, there) = (ContextId::new(), ContextId::new());
-        let switched = serde_json::json!({"switched_to": there.to_hex()});
-        assert_eq!(follow_target(Some(&switched), here), Ok(Some(there)));
-        let info = serde_json::json!({"context_id": there.to_hex(), "label": "x"});
-        assert_eq!(follow_target(Some(&info), here), Ok(None));
-        assert_eq!(follow_target(None, here), Ok(None));
-        let bad = serde_json::json!({"switched_to": "not-an-id"});
-        assert!(follow_target(Some(&bad), here).is_err());
     }
 
     fn kj_app(active: ContextId) -> App {
