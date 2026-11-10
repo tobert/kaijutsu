@@ -18,7 +18,7 @@ use crate::view::render_store::{ContextFolds, RenderBlockStore, RenderStoreError
 /// `None` until `whoami` completes, and again while reconnecting. The app
 /// must not invent an author for a draft: the SSH connection is authoritative.
 /// Once known, this identifies the compose draft among ordinary blocks in a
-/// context's `ContextMirror` (`DocumentEntry::draft_text`).
+/// context's `ContextMirror` (`kaijutsu_client::draft_ledger::draft_of`).
 #[derive(Resource)]
 pub struct SessionPrincipal(pub Option<PrincipalId>);
 

@@ -182,6 +182,13 @@ draft: each edit is one `editInput`, queued in typed order on the draft
 outbox, so a submit always takes exactly what was typed before it
 (`docs/tui.md`, "Compose").
 
+The two surfaces share one set of vi registers, and it outlives every
+draft: `dd` in one context's draft, a switch, then `p` in another context's
+draft puts the line, and a yank on the shell line puts in the chat draft.
+Switching context, submitting and clearing keep the registers
+(`ComposeState` lends them to the surface for each key; `docs/vi.md`,
+"Registers").
+
 | Key | Does |
 |---|---|
 | `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |

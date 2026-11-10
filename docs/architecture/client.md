@@ -59,9 +59,9 @@ is fed by `ActorHandle::subscribe_context` plus `get_blocks_versioned`, and
 The compose draft is an ordinary block — `Role::User`, `Status::Draft`,
 `ephemeral`, one per `(context, principal)`. It is sent via
 `editInput`/`submitInput` and read back like any other block off the per-context
-change feed: it lands in `mirror.blocks()` and is exposed as
-[`DocumentEntry::draft_text`] (`src/document_store.rs:80`). There is no separate
-document type for it.
+change feed: it lands in `mirror.blocks()`, and `draft_ledger::draft_of`
+(`src/draft_ledger.rs`) picks the principal's draft out of it, skipping a
+draft its last submit took. There is no separate document type for it.
 
 ### `subscriptions.rs`
 

@@ -8,7 +8,7 @@
 //! `check_cache_staleness` poll. The compose draft (Lane C slice 3) rides
 //! this same mirror as an ordinary `Status::Draft` block — there is no more
 //! separate input-doc hydration or `InputTextOps`/`InputCleared` handling
-//! here; see `kaijutsu_client::DocumentEntry::draft_text`.
+//! here; see `kaijutsu_client::draft_ledger::draft_of`.
 
 use bevy::prelude::*;
 

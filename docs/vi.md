@@ -172,6 +172,9 @@ The contract everything else is tested against:
   break is part of a span. A peer merge (`apply_remote_text`) moves the
   anchor by the same rule as the cursor, so the selection keeps covering
   the same text and visual mode stays on.
+- Registers: `with_registers(text, registers)`, `take_registers()`,
+  `give_registers(registers)` move vi's registers from one core to the
+  next, and nothing else (see "Registers").
 
 **modalkit `0.0.25` pulls `crossterm 0.29` into the kernel/server dependency
 graph.** The key *types* don't need a live TTY, so this is sound — accepted
@@ -411,6 +414,45 @@ detection.
 The session also keeps the block's trailing terminator aside
 (`EditorSession.terminator`), so a newline-terminated block opens clean and
 `ZQ` re-applies the terminator.
+
+---
+
+## Registers
+
+Registers belong to the player, not to one editor. In the kernel, every vi
+session a player types in shares that player's registers, across sessions
+and contexts. In a client, compose keeps one set for the client, across
+drafts. `dd` in one, then `p` in another, puts the line below the cursor,
+linewise, as one vim would. Amy, 2026-11-10: *"it doesn't have to be one
+global, but like, I want to be able to dd while working in one context's
+editor, then go to another and 'p' when I type in the wrong spot."*
+
+- **Kernel.** `EditorSessions` keeps one `kaijutsu_editor::Registers` per
+  principal that sends keys: the invoking performer for `kj vi keys`, the
+  connection's principal for the `editorKeys` RPC — the same identity each
+  edit is attributed to. They are lent to the session's `EditorCore` for one
+  key batch and taken back after it, so two open sessions of one player see
+  each other's yanks at once, and a model's session never reads or
+  overwrites a person's registers. They are held in memory: a kernel restart
+  empties them.
+- **Compose.** The tui's `Compose::load_draft` moves the registers into each
+  new core (a seat switch, a submit, a clear). The app's `ComposeState` holds
+  them and lends them to the chat draft or the shell line for each key, so
+  its two surfaces share them. See `docs/tui.md`, "Compose", and
+  `docs/input.md`, "Compose keys".
+- **What moves.** `Registers` is modalkit's register store: the unnamed
+  register, `"0`, the delete ring `"1`–`"9`, `"-`, `"a`–`"z`, recorded
+  macros, and the last `:` line and search pattern. Nothing else in
+  modalkit's store moves: marks are keyed by a buffer id every
+  `EditorCore` shares, so a moved store would carry one text's marks into
+  another. The cursor, undo history, mode, and an open `:` line stay with
+  their core. The API is `EditorCore::with_registers`, `take_registers`
+  and `give_registers`.
+- **Not shared yet:** compose with the kernel's vi sessions, the tui with
+  the app, the tui's copy-mode buffer (`Ctrl+A ]`) with either, and the
+  system clipboard — `"+` and `"*` read empty because modalkit's
+  `clipboard` feature is off. See `docs/issues.md`, "vi registers: what
+  sharing leaves open".
 
 ---
 

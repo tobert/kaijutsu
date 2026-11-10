@@ -510,6 +510,18 @@ Rules the figure carries:
   echoed, and a reconnect's snapshot can still hold it. Matching only the
   draft's own id missed a shell submit, whose answer names the command
   block. Probe: `a_draft_the_mirror_had_not_seen_at_submit_is_not_restored`.
+- **The registers outlive the draft.** `dd` in one context's draft, a seat
+  switch, then `p` in another context's draft puts the line below the
+  cursor, linewise, as one vim would. A seat switch, a submit and a clear
+  each start a new `EditorCore`, and `Compose::load_draft` moves the old
+  core's registers into it (`kaijutsu_editor::EditorCore::with_registers`);
+  marks, undo history and the cursor stay with the old draft. Amy,
+  2026-11-10: *"it doesn't have to be one global, but like, I want to be
+  able to dd while working in one context's editor, then go to another and
+  'p' when I type in the wrong spot."* The registers are this client's: the
+  app, the kernel's vi sessions, copy mode's buffer (`Ctrl+A ]`) and the
+  system clipboard each keep their own (`docs/vi.md`, "Registers").
+  Probe: `a_deleted_line_survives_a_seat_switch`.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
   indent under the prompt; Enter in insert mode is a newline. Every row

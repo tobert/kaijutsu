@@ -6,6 +6,39 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## vi registers: what sharing leaves open (2026-11-10)
+
+Compose keeps one set of registers per client, and the kernel one per
+player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
+`dd`, switched, and `p` in a real terminal or the running app. Open:
+
+- **Compose and the kernel's vi sessions do not share.** A `dd` on the
+  compose line cannot be put in a `vi` session, or the other way. Sharing
+  needs a kernel-owned register store the clients reach over the wire, a
+  design conversation (a wire method or a VFS path) this work did not have.
+- **The tui and the app do not share,** for the same reason.
+- **Copy mode's buffer is separate from the registers.** Copy-mode `y` sets
+  `App::paste_buffer` and writes the clipboard with OSC 52; `Ctrl+A ]`
+  inserts `paste_buffer` as text. Making `y` also fill the compose
+  register `"` (linewise, since it yanks whole rows) is a small follow-up:
+  `kaijutsu_editor` needs a method that puts a string into the unnamed
+  register with a shape (modalkit's `RegisterStore::put` with a
+  `RegisterCell`), and `Compose` a pass-through. `Ctrl+A ]` could then
+  stay a paste of `paste_buffer`, or become `p`; deciding which is the
+  remaining design question.
+- **The system clipboard is not a register.** modalkit's `clipboard`
+  feature is off, so `"+` and `"*` read and write nothing. In the app,
+  turning it on (arboard) would make `"+y` and `"+p` reach the desktop
+  clipboard, at the cost of a clipboard connection per `EditorCore`
+  (modalkit opens one in `RegisterStore::default`). In the tui, OSC 52 can
+  write the clipboard but not read it in most terminals, so `"+p` cannot
+  work there. A kernel vi session cannot reach a person's desktop
+  clipboard at all. A clipboard register would let the app share with
+  other programs; it would not make the tui, the app and the kernel share
+  with each other.
+- **The kernel's register map is never pruned.** `EditorSessions` keeps an
+  entry for every principal that ever sent vi keys, until a restart.
+
 ## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 
 Two pty tests failed for about twenty minutes and then stopped:
@@ -58,14 +91,22 @@ client log's tail on a failure; `KAIJUTSU_TEST_TUI_LOG` raises the level
 for a run. The test tui had been reading the host's `tui-client-id`, which
 was not the cause.
 
-- **No kernel test pins what the draft fix rests on.**
-  `kaijutsu_client::draft_ledger::draft_of` skips a draft numbered at or
-  below the block a submit answered with. That holds because a shell
-  submit's command block is made under the submitter after the draft and
-  before the draft is consumed (`block_store.rs` `start_shell_operation`,
-  `runtime/interactive.rs`). The order is read from code; a kernel test
-  should assert it, so a reordering there fails loudly instead of bringing
-  the bug back.
+- **A draft that survives a shell submit is hidden from its submitter.**
+  When a second writer of the same principal (a sibling client) edits the
+  draft while a shell submit runs, the kernel's `consume_draft` sees the
+  revision move and leaves the draft in place (wire tests
+  `shell_submit_preserves_edits_during_submission` and its two siblings in
+  `compose_draft_wire.rs`). That draft is numbered below the command block
+  the submit answered with, so `kaijutsu_client::draft_ledger::draft_of`
+  skips it on the submitter's mirror until the next submit in that context
+  or a seat switch reads the kernel's draft again. Meanwhile the submitter's
+  compose line is empty while the kernel's draft is not, so a keystroke
+  there is addressed against text the line does not show (inferred from the
+  code, not observed). A fix needs the submit's answer to say whether the
+  draft was consumed.
+- **The tui's `submitted` map is never pruned.** `App::release` leaves the
+  context's entry in `App::submitted` (`app.rs`). Harmless while context
+  ids are never reused; it grows by one entry per context submitted in.
 
 ## App and tui tune-up: what the first pass leaves open (2026-11-10)
 

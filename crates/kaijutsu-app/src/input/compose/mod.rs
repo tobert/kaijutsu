@@ -12,8 +12,10 @@
 pub mod outbox;
 pub mod systems;
 
+use std::collections::HashMap;
+
 use kaijutsu_client::draft_ledger::{DraftLedger, draft_of};
-use kaijutsu_editor::{EditOp, EditorCore};
+use kaijutsu_editor::{EditOp, EditorCore, Registers};
 use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, PrincipalId};
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -180,6 +182,15 @@ impl ComposeBuffer {
     pub fn apply_remote_text(&mut self, text: &str) -> bool {
         self.editor.apply_remote_text(text)
     }
+
+    /// Run `act` with `registers` in this buffer's editor, then take them
+    /// back, so a yank or delete it makes outlives this buffer.
+    fn lending<R>(&mut self, registers: &mut Registers, act: impl FnOnce(&mut Self) -> R) -> R {
+        self.editor.give_registers(std::mem::take(registers));
+        let result = act(self);
+        *registers = self.editor.take_registers();
+        result
+    }
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -250,11 +261,11 @@ pub struct ComposeState {
     held: Vec<HeldInput>,
     /// Draft reads started, to tell the newest from a stale one.
     reads: u64,
-    /// The block the last submit answered with: the promoted draft, or the
-    /// command block when the kernel ran the draft as shell. A feed that
-    /// still shows the draft it took is stale, and it is never read back
-    /// (`kaijutsu_client::draft_ledger::draft_of`).
-    submitted: Option<BlockId>,
+    /// Per context, the block its last submit answered with: the promoted
+    /// draft, or the command block when the kernel ran the draft as shell.
+    /// A feed that still shows the draft it took is stale, and it is never
+    /// read back (`kaijutsu_client::draft_ledger::draft_of`).
+    submitted: HashMap<ContextId, BlockId>,
     /// The mirror version last offered to the ledger.
     offered: Option<u64>,
     /// Submits sent and not yet answered. Until one is, the feed may still
@@ -262,6 +273,10 @@ pub struct ComposeState {
     submits: usize,
     /// The double-Esc dismiss.
     escape: TapCounter,
+    /// The vi registers both surfaces share. They belong to compose, not to
+    /// one buffer: each key borrows them, so a switch, a submit or a clear,
+    /// which each build a new buffer, keeps them (`docs/vi.md`, "Registers").
+    registers: Registers,
 }
 
 // SAFETY: `EditorCore` holds a modalkit `ModalMachine`, whose only
@@ -282,10 +297,11 @@ impl Default for ComposeState {
             draft: DraftTarget::Detached,
             held: Vec::new(),
             reads: 0,
-            submitted: None,
+            submitted: HashMap::new(),
             offered: None,
             submits: 0,
             escape: TapCounter::new(ESCAPE_WINDOW_MS, 2),
+            registers: Registers::default(),
         }
     }
 }
@@ -316,12 +332,14 @@ impl ComposeState {
             self.held.push(HeldInput::Key(key));
             return None;
         }
-        Some(press_with_escape(&mut self.chat, &mut self.escape, Submit::FromNormalMode, key))
+        let escape = &mut self.escape;
+        Some(self.chat.lending(&mut self.registers, |chat| press_with_escape(chat, escape, Submit::FromNormalMode, key)))
     }
 
     /// One keystroke on the shell surface.
     pub fn press_shell(&mut self, key: KeyEvent) -> ComposeAction {
-        press_with_escape(&mut self.shell, &mut self.escape, Submit::FromAnyMode, key)
+        let escape = &mut self.escape;
+        self.shell.lending(&mut self.registers, |shell| press_with_escape(shell, escape, Submit::FromAnyMode, key))
     }
 
     /// A paste into the chat draft. `None` while the draft is loading: the
@@ -411,12 +429,13 @@ impl ComposeState {
     }
 
     /// A submit was answered: `Some(block)` is the block it answered with,
-    /// and the draft it took is never read back; `None` is a failure, after
-    /// which the caller reloads the kernel's draft.
+    /// and the draft it took in that block's context is never read back;
+    /// `None` is a failure, after which the caller reloads the kernel's
+    /// draft.
     pub fn finish_submit(&mut self, block: Option<BlockId>) {
         self.submits = self.submits.checked_sub(1).expect("a submit was answered that was never sent");
-        if block.is_some() {
-            self.submitted = block;
+        if let Some(block) = block {
+            self.submitted.insert(block.context_id, block);
         }
         self.offered = None;
     }
@@ -440,11 +459,11 @@ impl ComposeState {
         self.ledger.offer(text, version) && self.chat.apply_remote_text(text)
     }
 
-    /// The draft block in `blocks` that belongs to `principal`, skipping
-    /// every draft the last submit took
+    /// The draft block in `context`'s `blocks` that belongs to `principal`,
+    /// skipping every draft the last submit in `context` took
     /// (`kaijutsu_client::draft_ledger::draft_of`).
-    pub fn draft_in<'a>(&self, blocks: &'a [BlockSnapshot], principal: PrincipalId) -> Option<&'a str> {
-        draft_of(blocks, principal, self.submitted).map(|b| b.content.as_str())
+    pub fn draft_in<'a>(&self, blocks: &'a [BlockSnapshot], context: ContextId, principal: PrincipalId) -> Option<&'a str> {
+        draft_of(blocks, principal, self.submitted.get(&context).copied()).map(|b| b.content.as_str())
     }
 }
 

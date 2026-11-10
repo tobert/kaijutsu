@@ -148,7 +148,8 @@ pub struct Compose {
     /// The `:` line's local history — a session fact, not a per-draft one,
     /// so it survives [`Self::reset`] and [`Self::load_draft`] (both go
     /// through the same path) rather than being wiped every submit or
-    /// context switch.
+    /// context switch. The vi registers are kept the same way, inside
+    /// `editor`: [`Self::load_draft`] moves them into each new core.
     colon_history: ColonHistory,
 }
 
@@ -180,10 +181,11 @@ impl Compose {
     }
 
     /// Load a new draft in place — a context switch, or the fresh line
-    /// [`Self::reset`] leaves behind — keeping the `:` line's history, which
-    /// is this session's, not this draft's.
+    /// [`Self::reset`] leaves behind — keeping the `:` line's history and the
+    /// vi registers, which are this session's, not this draft's
+    /// (`docs/tui.md`, "Compose").
     pub fn load_draft(&mut self, text: &str) {
-        let mut editor = EditorCore::new(text);
+        let mut editor = EditorCore::with_registers(text, self.editor.take_registers());
         // The core opens in normal mode at the top; `G$` lands the cursor on
         // the last character, so `a` resumes a draft where it left off.
         editor.apply_keys("G$");
@@ -825,6 +827,29 @@ mod tests {
         compose.reset();
         assert_eq!(compose.text(), "");
         assert_eq!(compose.mode_banner(), "-- NORMAL --");
+    }
+
+    /// The registers are this client's, not one draft's: `dd` in one
+    /// context's draft, a seat switch, and `p` puts the line in the next,
+    /// on its own line below the cursor.
+    #[test]
+    fn a_deleted_line_survives_a_seat_switch() {
+        let mut compose = Compose::over("wrong spot\nkeep");
+        typed(&mut compose, "ggdd");
+        assert_eq!(compose.text(), "keep");
+        compose.load_draft("other draft");
+        typed(&mut compose, "p");
+        assert_eq!(compose.text(), "other draft\nwrong spot");
+    }
+
+    /// A submit starts a new draft and keeps the registers.
+    #[test]
+    fn a_yank_survives_a_submit() {
+        let mut compose = Compose::over("echo hi");
+        typed(&mut compose, "0yw");
+        compose.reset();
+        typed(&mut compose, "p");
+        assert_eq!(compose.text(), "echo ");
     }
 
     /// A resumed draft opens in normal mode with the cursor on its last

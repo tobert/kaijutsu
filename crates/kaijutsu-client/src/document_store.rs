@@ -25,13 +25,13 @@
 //! events. It is now an ordinary block (`Role::User`, `Status::Draft`,
 //! `ephemeral`, one per `(context, principal)`) that rides the same change
 //! feed as every other block, so it already lands in `mirror.blocks()` — see
-//! [`DocumentEntry::draft_text`]. `SyncedInput` and the input-doc wire events
+//! [`crate::draft_ledger::draft_of`]. `SyncedInput` and the input-doc wire events
 //! it depended on are deleted (2026-08-16); this store never held one.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use kaijutsu_types::{BlockSnapshot, ContextId, PrincipalId, Status};
+use kaijutsu_types::{BlockSnapshot, ContextId};
 use tokio::sync::mpsc;
 
 use crate::{ContextMirror, FeedEvent, MirrorError};
@@ -67,21 +67,6 @@ impl DocumentEntry {
             context_name,
             last_accessed: Instant::now(),
         }
-    }
-
-    /// `principal`'s compose draft, if it has one — the block in the mirror
-    /// with `status == Status::Draft` and `id.principal_id == principal`.
-    /// There is at most one per (context, principal) by construction
-    /// (`BlockStore::get_or_create_draft`), so the first match is the only
-    /// one. The mirror is version-ordered, so unlike the old (deleted)
-    /// `SyncedInput` kernel document there is no stale-arrival window to guard
-    /// against here.
-    pub fn draft_text(&self, principal: PrincipalId) -> Option<&str> {
-        self.mirror
-            .blocks()
-            .iter()
-            .find(|b| b.status == Status::Draft && b.id.principal_id == principal)
-            .map(|b| b.content.as_str())
     }
 
     /// Drain every event currently queued on this entry's feed, applying
@@ -356,15 +341,6 @@ mod tests {
         snap
     }
 
-    fn draft(context_id: ContextId, principal: PrincipalId, seq: u64, content: &str) -> BlockSnapshot {
-        let id = kaijutsu_types::BlockId::new(context_id, principal, seq);
-        let mut snap = BlockSnapshot::text(id, None, Role::User, content);
-        snap.kind = BlockKind::Text;
-        snap.status = Status::Draft;
-        snap.ephemeral = true;
-        snap
-    }
-
     /// A delivery batching several mutations, each carrying its OWN version —
     /// the real wire shape (`context_feed.rs`'s `apply()`: "two carried events
     /// never share a version"). A delivery with a single change just gives
@@ -526,33 +502,5 @@ mod tests {
         let entry = store.get(c).unwrap();
         assert!(!entry.mirror.is_hydrated());
         assert!(entry.feed.is_none(), "Terminated is not resumable — the dead receiver must be dropped");
-    }
-
-    /// The Lane C slice 3 seam: a draft is an ordinary block in the mirror
-    /// now, so `draft_text` finds it purely by `(Status::Draft, principal)` —
-    /// no text engine, no separate fetch, other principals' drafts and non-draft
-    /// blocks all ignored.
-    #[test]
-    fn draft_text_finds_the_calling_principals_draft_block_only() {
-        let c = ctx();
-        let me = PrincipalId::new();
-        let someone_else = PrincipalId::new();
-
-        let mut mirror = ContextMirror::new(c);
-        mirror
-            .apply_snapshot(
-                vec![
-                    block(c, 1, "an ordinary message"),
-                    draft(c, someone_else, 1, "a co-player's draft"),
-                    draft(c, me, 1, "my draft"),
-                ],
-                1,
-            )
-            .unwrap();
-        let entry = DocumentEntry::new(mirror, None, "ctx".into());
-
-        assert_eq!(entry.draft_text(me), Some("my draft"));
-        assert_eq!(entry.draft_text(someone_else), Some("a co-player's draft"));
-        assert_eq!(entry.draft_text(PrincipalId::new()), None, "a principal with no draft gets None");
     }
 }

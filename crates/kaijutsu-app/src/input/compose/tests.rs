@@ -224,9 +224,9 @@ fn a_submitted_draft_never_comes_back() {
     assert!(!state.offer_mirror("sent", 4), "no mirror while the submit is unanswered");
     assert_eq!(state.chat.text(), "");
     state.finish_submit(Some(old.id));
-    assert_eq!(state.draft_in(std::slice::from_ref(&old), me), None, "the submitted block is skipped");
+    assert_eq!(state.draft_in(std::slice::from_ref(&old), old.id.context_id, me), None, "the submitted block is skipped");
     let next = block(Status::Draft, "next", me);
-    assert_eq!(state.draft_in(&[old, next], me), Some("next"));
+    assert_eq!(state.draft_in(&[old.clone(), next], old.id.context_id, me), Some("next"));
 }
 
 /// A chat submit in a context a person performs runs as shell and answers
@@ -247,8 +247,86 @@ fn a_draft_run_as_shell_never_comes_back() {
     state.begin_submit();
     state.finish_submit(Some(BlockId::new(context, me, 5)));
     let old = numbered(1, "echo hi");
-    assert_eq!(state.draft_in(std::slice::from_ref(&old), me), None, "the draft the shell ran is skipped");
-    assert_eq!(state.draft_in(&[old, numbered(6, "next")], me), Some("next"));
+    assert_eq!(state.draft_in(std::slice::from_ref(&old), context, me), None, "the draft the shell ran is skipped");
+    assert_eq!(state.draft_in(&[old, numbered(6, "next")], context, me), Some("next"));
+}
+
+/// Each context keeps its own submit: a submit in B while A's echo is still
+/// on the way does not let A's submitted draft back onto the compose line.
+#[test]
+fn a_submit_elsewhere_does_not_forget_this_contexts_submit() {
+    let mut state = ComposeState::default();
+    let (a, b, me) = (ContextId::new(), ContextId::new(), PrincipalId::new());
+    let draft = |context: ContextId, seq: u64, content: &str| {
+        kaijutsu_types::BlockSnapshotBuilder::new(BlockId::new(context, me, seq), kaijutsu_types::BlockKind::Text)
+            .status(Status::Draft)
+            .content(content)
+            .build()
+    };
+    let read = state.begin_load(a, me).read;
+    state.finish_load(a, read, Some("echo hi"));
+    state.begin_submit();
+    state.finish_submit(Some(BlockId::new(a, me, 9)));
+    let read = state.begin_load(b, me).read;
+    state.finish_load(b, read, Some("ls"));
+    state.begin_submit();
+    state.finish_submit(Some(BlockId::new(b, me, 4)));
+    let read = state.begin_load(a, me).read;
+    state.finish_load(a, read, Some(""));
+
+    let mirror = [draft(a, 1, "echo hi")];
+    if let Some(text) = state.draft_in(&mirror, a, me).map(str::to_string) {
+        state.offer_mirror(&text, 10);
+    }
+    assert_eq!(state.chat.text(), "", "A's submitted draft came back after a submit in B");
+}
+
+/// Type `keys` on the chat surface through the compose state, one char at a
+/// time.
+fn chat_keys(state: &mut ComposeState, keys: &str) {
+    for c in keys.chars() {
+        state.press_chat(press(KeyCode::Char(c))).expect("the draft is loaded");
+    }
+}
+
+/// The registers are the app's, not one draft's: `dd` in one context's
+/// draft, a switch, and `p` puts the line in the next, on its own line.
+#[test]
+fn a_deleted_line_survives_a_context_switch() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "wrong spot\nkeep");
+    chat_keys(&mut state, "ggdd");
+    assert_eq!(state.chat.text(), "keep");
+    ready(&mut state, "other draft");
+    chat_keys(&mut state, "p");
+    assert_eq!(state.chat.text(), "other draft\nwrong spot");
+}
+
+/// A submit and a clear start a new draft and keep the registers.
+#[test]
+fn a_yank_survives_a_submit_and_a_clear() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "echo hi");
+    chat_keys(&mut state, "0yw");
+    state.begin_submit();
+    state.finish_submit(None);
+    chat_keys(&mut state, "p");
+    assert_eq!(state.chat.text(), "echo ");
+    state.clear_chat();
+    chat_keys(&mut state, "p");
+    assert_eq!(state.chat.text(), "echo ");
+}
+
+/// Both surfaces share the registers, as two buffers in one vim do.
+#[test]
+fn the_shell_line_and_the_chat_draft_share_registers() {
+    let mut state = ComposeState { shell: ComposeBuffer::over("ls -la"), ..Default::default() };
+    ready(&mut state, "");
+    for c in "0yw".chars() {
+        state.press_shell(press(KeyCode::Char(c)));
+    }
+    chat_keys(&mut state, "p");
+    assert_eq!(state.chat.text(), "ls ");
 }
 
 /// Clearing keeps the draft and returns the one edit that empties the

@@ -396,7 +396,7 @@ pub fn reconcile_chat_draft(mut compose: ResMut<ComposeState>, doc_cache: Res<Do
         return;
     };
     let version = cached.mirror.version();
-    let Some(text) = compose.draft_in(cached.mirror.blocks(), principal).map(str::to_string) else {
+    let Some(text) = compose.draft_in(cached.mirror.blocks(), context, principal).map(str::to_string) else {
         return;
     };
     compose.offer_mirror(&text, version);

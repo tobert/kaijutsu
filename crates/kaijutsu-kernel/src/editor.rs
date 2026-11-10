@@ -76,7 +76,7 @@ pub async fn resolve_editor_target(
 
 use std::collections::HashMap;
 
-use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo};
+use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo, Registers};
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
 /// A one-line census entry for an open session — what `kj vi list` shows.
@@ -288,6 +288,12 @@ struct EditorSession {
 pub struct EditorSessions {
     next_id: u64,
     sessions: HashMap<EditorSessionId, EditorSession>,
+    /// Each player's vi registers, keyed by the principal that sends the
+    /// keys. They are lent to a session's core for one key batch and taken
+    /// back after it, so every session a player types in shares them, and no
+    /// player reads or overwrites another's. Held in memory only: a kernel
+    /// restart empties them (`docs/vi.md`, "Registers").
+    registers: HashMap<PrincipalId, Registers>,
 }
 
 impl EditorSessions {
@@ -423,7 +429,9 @@ impl EditorSessions {
         let (close, commands) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
             let len_before = session.core.text().chars().count();
+            session.core.give_registers(self.registers.remove(&actor).unwrap_or_default());
             let ops = session.core.apply_keys(keys);
+            self.registers.insert(actor, session.core.take_registers());
             let buffer_after = session.core.text();
             mirror_ops(
                 &ops,
@@ -1822,5 +1830,45 @@ mod session_tests {
             st2.message.is_some(),
             "opening a path that already has a session must announce it"
         );
+    }
+
+    /// A player's registers outlive one session: `dd` in one live session
+    /// and `p` in another put the line, both ways, while both stay open.
+    #[tokio::test]
+    async fn a_players_sessions_share_registers_while_both_are_open() {
+        let (first_blocks, first_target) = seeded(b"one\ntwo").await;
+        let (second_blocks, second_target) = seeded(b"alpha").await;
+        let amy = PrincipalId::new();
+        let mut sessions = EditorSessions::new();
+        let (first, _) = sessions.open(RC_PATH, first_target, &first_blocks, None).unwrap();
+        let (second, _) = sessions.open(RC_PATH, second_target, &second_blocks, None).unwrap();
+
+        sessions.keys(first, "dd", &first_blocks, amy).unwrap();
+        let outcome = sessions.keys(second, "p", &second_blocks, amy).unwrap();
+        assert_eq!(outcome.state().text, "alpha\none", "the second session puts the first's delete");
+
+        sessions.keys(second, "ggyy", &second_blocks, amy).unwrap();
+        let outcome = sessions.keys(first, "p", &first_blocks, amy).unwrap();
+        assert_eq!(outcome.state().text, "two\nalpha", "the first session puts the second's yank");
+    }
+
+    /// Registers are keyed by the player who typed: another player's
+    /// session neither reads nor overwrites them.
+    #[tokio::test]
+    async fn another_players_session_never_touches_the_registers() {
+        let (first_blocks, first_target) = seeded(b"one\ntwo").await;
+        let (second_blocks, second_target) = seeded(b"alpha").await;
+        let (amy, model) = (PrincipalId::new(), PrincipalId::new());
+        let mut sessions = EditorSessions::new();
+        let (first, _) = sessions.open(RC_PATH, first_target, &first_blocks, None).unwrap();
+        let (second, _) = sessions.open(RC_PATH, second_target, &second_blocks, None).unwrap();
+
+        sessions.keys(first, "dd", &first_blocks, amy).unwrap();
+        let outcome = sessions.keys(second, "p", &second_blocks, model).unwrap();
+        assert_eq!(outcome.state().text, "alpha", "the model has nothing to put");
+
+        sessions.keys(second, "yy", &second_blocks, model).unwrap();
+        let outcome = sessions.keys(first, "p", &first_blocks, amy).unwrap();
+        assert_eq!(outcome.state().text, "two\none", "the model's yank left Amy's register alone");
     }
 }

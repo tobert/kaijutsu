@@ -28,7 +28,7 @@ use editor_types::{
 use modalkit::actions::Editable;
 use modalkit::editing::buffer::{CursorGroupId, EditBuffer};
 use modalkit::editing::cursor::{Cursor, CursorGroup, CursorState};
-use modalkit::editing::store::Store;
+use modalkit::editing::store::{RegisterStore, Store};
 use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
 use modalkit::env::vim::VimState;
 use modalkit::key::TerminalKey;
@@ -107,6 +107,19 @@ pub enum EditorIo {
     /// `:r !cmd` — run the command and insert its stdout at the cursor.
     ReadShell(String),
 }
+
+/// vi's registers, moved from one [`EditorCore`] to the next so a yank or
+/// delete outlives the editor it was made in: the unnamed register, `"0`,
+/// the numbered delete ring `"1`–`"9`, the small delete `"-`, the named
+/// registers `"a`–`"z`, recorded macros, and the last `:` line and search
+/// pattern.
+///
+/// Only the registers move. The rest of modalkit's store belongs to one
+/// buffer: marks are keyed by a buffer id that every `EditorCore` shares, so
+/// a moved store would carry one draft's marks into another's text.
+/// Cursors, undo history, the mode and an open `:` line stay with the core.
+#[derive(Default)]
+pub struct Registers(RegisterStore);
 
 /// A pure vi editor over one text buffer.
 pub struct EditorCore {
@@ -190,6 +203,24 @@ impl EditorCore {
             pending_substitution: None,
             pending_io: None,
         }
+    }
+
+    /// Open an editor on `text`, as [`Self::new`], holding `registers`: a
+    /// `p` here puts what was yanked or deleted in the editor they came from.
+    pub fn with_registers(text: &str, registers: Registers) -> Self {
+        let mut core = Self::new(text);
+        core.give_registers(registers);
+        core
+    }
+
+    /// Move this editor's registers out, leaving it empty ones.
+    pub fn take_registers(&mut self) -> Registers {
+        Registers(std::mem::take(&mut self.store.registers))
+    }
+
+    /// Replace this editor's registers with `registers`.
+    pub fn give_registers(&mut self, registers: Registers) {
+        self.store.registers = registers.0;
     }
 
     /// Take any `ZZ`/`ZQ` close intent the most recent `apply_keys` produced.
@@ -1699,6 +1730,77 @@ mod tests {
             ed.apply_keys("fw");
             assert_eq!(ed.text(), "hello world");
             assert_eq!(ed.cursor(), 6, "f w lands on the 'w' of world");
+        }
+    }
+
+    /// Registers move from one core to the next; everything that belongs to
+    /// one buffer stays behind.
+    mod registers {
+        use super::*;
+
+        /// `dd` in one draft, `p` in the next: the line lands on its own line
+        /// below the cursor, as one vim instance would put it.
+        #[test]
+        fn a_deleted_line_puts_linewise_in_the_next_core() {
+            let mut first = EditorCore::new("one\ntwo");
+            first.apply_keys("dd");
+            assert_eq!(first.text(), "two");
+            let mut next = EditorCore::with_registers("alpha\nbeta", first.take_registers());
+            next.apply_keys("p");
+            assert_eq!(next.text(), "alpha\none\nbeta");
+        }
+
+        #[test]
+        fn a_charwise_yank_stays_charwise() {
+            let mut first = EditorCore::new("hello world");
+            first.apply_keys("yw");
+            let mut next = EditorCore::with_registers("abc", first.take_registers());
+            next.apply_keys("p");
+            assert_eq!(next.text(), "ahello bc");
+        }
+
+        /// The numbered delete ring and the named registers move too.
+        #[test]
+        fn the_delete_ring_and_named_registers_move() {
+            let mut first = EditorCore::new("a\nb\nc");
+            first.apply_keys("\"qyydddd");
+            let mut next = EditorCore::with_registers("x", first.take_registers());
+            next.apply_keys("\"2p\"qp");
+            assert_eq!(next.text(), "x\na\na");
+        }
+
+        /// A register given to a live core replaces the one it had, and the
+        /// core it was taken from is left with empty registers.
+        #[test]
+        fn taking_leaves_empty_registers_and_giving_replaces() {
+            let mut first = EditorCore::new("kept");
+            first.apply_keys("yy");
+            let mut second = EditorCore::new("other");
+            second.apply_keys("yy");
+            second.give_registers(first.take_registers());
+            second.apply_keys("p");
+            assert_eq!(second.text(), "other\nkept");
+            first.apply_keys("p");
+            assert_eq!(first.text(), "kept", "the registers left with the take");
+        }
+
+        /// Cursor, marks, an open `:` line and undo history belong to one
+        /// buffer and never reach the next core.
+        #[test]
+        fn buffer_local_state_stays_behind() {
+            let mut first = EditorCore::new("one\ntwo\nthree");
+            first.apply_keys("jmaxyy:abc");
+            assert_eq!(first.command_line().as_deref(), Some(":abc"));
+            let mut next = EditorCore::with_registers("alpha\nbeta\ngamma\ndelta", first.take_registers());
+            assert_eq!(next.cursor(), 0, "the cursor starts at the top of the new text");
+            assert_eq!(next.command_line(), None, "the `:` line stays with its core");
+            assert_eq!(next.mode(), None);
+            next.apply_keys("u");
+            assert_eq!(next.text(), "alpha\nbeta\ngamma\ndelta", "nothing to undo in a new core");
+            next.apply_keys("G'a");
+            assert_eq!(next.cursor(), "alpha\nbeta\ngamma\n".chars().count(), "mark a was set in another buffer");
+            next.apply_keys("p");
+            assert_eq!(next.text(), "alpha\nbeta\ngamma\ndelta\nwo", "the registers did move");
         }
     }
 

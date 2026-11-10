@@ -681,21 +681,47 @@ fn an_empty_draft_is_refused_and_survives() {
     });
 }
 
+/// The block a shell submit answers with takes the draft it ran: it carries
+/// the submitter's principal and a seq above the draft's.
+/// `kaijutsu_client::draft_ledger::draft_of` skips every draft of the
+/// submitter numbered at or below the answered block, so both compose clients
+/// rely on this to keep a late echo of the submitted draft off the compose
+/// line.
+fn assert_answer_takes_the_draft(answer: BlockId, draft: BlockId, submitter: kaijutsu_types::PrincipalId) {
+    const DEPENDS: &str = "kaijutsu_client::draft_ledger::draft_of relies on this to never read a \
+        submitted draft back onto the compose line (the tui and the app); change it with draft_of";
+    assert_eq!(draft.principal_id, submitter, "the draft belongs to the connection that typed it");
+    assert_eq!(answer.context_id, draft.context_id, "the answered block is in the draft's context; {DEPENDS}");
+    assert_eq!(
+        answer.principal_id, submitter,
+        "the command block must be minted under the submitter's principal; {DEPENDS}"
+    );
+    assert!(
+        answer.seq > draft.seq,
+        "the command block (seq {}) must be numbered after the draft it ran (seq {}); {DEPENDS}",
+        answer.seq,
+        draft.seq
+    );
+}
+
 /// Shell mode cannot promote — a shell command is a `ToolCall` block, not the
 /// user's `Text`. So the draft is *consumed*, and the order is the assertion:
-/// the command block must exist before the draft is cleared.
+/// the command block must exist before the draft is cleared, under the
+/// submitter's principal and numbered after the draft.
 #[test]
 fn shell_submit_authors_the_command_before_clearing_the_draft() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
+        let me = client.whoami().await.unwrap().principal_id;
         let context_id = open_context(&kernel, "draft-shell").await;
 
         kernel
             .edit_input(context_id, 0, "echo hi", 0)
             .await
             .unwrap();
+        let before = draft(&kernel, context_id).await.expect("the draft exists before submit");
         let result = kernel.submit_input(context_id, true).await.unwrap();
 
         let all = blocks(&kernel, context_id).await;
@@ -708,6 +734,7 @@ fn shell_submit_authors_the_command_before_clearing_the_draft() {
             BlockKind::ToolCall,
             "shell submit authors a ToolCall, not the draft"
         );
+        assert_answer_takes_the_draft(result.block_id, before.id, me);
         assert!(
             draft(&kernel, context_id).await.is_none(),
             "the draft is consumed once the command block exists"
@@ -729,6 +756,7 @@ fn a_persons_context_chat_submit_runs_the_draft_as_shell() {
         kernel.join_context(context_id, "draft-test").await.unwrap();
 
         kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
+        let before = draft(&kernel, context_id).await.expect("the draft exists before submit");
         let result = kernel.submit_input(context_id, false).await.unwrap();
 
         let all = blocks(&kernel, context_id).await;
@@ -741,6 +769,8 @@ fn a_persons_context_chat_submit_runs_the_draft_as_shell() {
             BlockKind::ToolCall,
             "a shell context's submit authors the shell command, not a chat message"
         );
+        let me = client.whoami().await.unwrap().principal_id;
+        assert_answer_takes_the_draft(result.block_id, before.id, me);
         assert!(
             !all.iter().any(|b| b.role == Role::Model),
             "a shell context's submit starts no model turn"
