@@ -6,6 +6,46 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## App and tui tune-up: what the first pass leaves open (2026-11-10)
+
+Folds and the reader's block landed in both clients (`docs/tui.md`, "Folds"
+and "The reader's block"; `docs/input.md`). The fold gaps between the two
+clients are under "Folds: what the app and the terminal client still read
+differently". Nobody has yet looked at either change in a real terminal or
+the running app. Left from the survey:
+
+- **The tui's `run.rs` is 4,000 lines.** `event_loop` is 400 lines with
+  about 20 locals, and `act` takes nine arguments. A split by responsibility
+  (terminal enter and leave, feeds and hydrate, key dispatch, seat acts,
+  drawing, ask plumbing, editor and diff surfaces, signals) and one key-state
+  struct would change no behavior. `asks.rs` (2,700 lines) splits the same
+  way: keys, render, state, fold, notify.
+- **Logic both clients carry.** `follow_target` is the same function in
+  `kaijutsu-app/src/view/sync.rs` and `kaijutsu-tui/src/run.rs`. The ask to
+  tool-call join (`chrome.rs` `waiting_on_asks`, `inflight::ask_index`),
+  short age and count formatting, and the picker's head and tail lines are
+  near copies. `kaijutsu-client` or `kaijutsu-present` is the home; "The `:`
+  line parses vi paths in two places" below is the same kind.
+- **Two layouts of tool output.** The app lays `OutputData` out with
+  `kaijutsu_present::format::compute_output_layout`; the tui has its own
+  `layout::layout_output`.
+- **Dead after the app cleanup.** `ActorHandle::cherry_pick_block` and
+  `rpc::cherry_pick_block` in `kaijutsu-client` have no caller since the
+  app's timeline module went; the server RPC remains.
+  `kaijutsu_present::kaish::tokenize`, `SpannedToken` and `TokenKind` have
+  none either. `kaijutsu-app/src/kaish/mod.rs` says both clients validate
+  shell input; the tui does not call `kaish::validate`.
+- **The tui's `:kj` completion draws no popup.** `Tab` rewrites the bar; the
+  popup renderer was never called and was deleted. Decide whether the
+  candidates should show.
+- **`Ctrl+O` in the tui's draft is the fold toggle,** so vim's jump-back and
+  insert-mode one-shot are given up there. If copy mode grows a jump list,
+  `za` is the fold key vim already has.
+- **In the app:** `ui/tiling.rs` carries a tree API production uses little;
+  `cell/mod.rs` is a facade of re-exports; `bindings.toml` is parsed twice
+  (`config/mod.rs` for errors, `InputMap::default` for use); the
+  `agent_color_*` theme fields have no reader; `ui/dock.rs` is 2,700 lines.
+
 ## Council backend: what retiring mk leaves open (2026-11-08)
 
 - **Liveness during a long `call` phase.** A call's pieces add no text, so a

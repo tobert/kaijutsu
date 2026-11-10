@@ -3751,3 +3751,35 @@ is `council-reasoning`, safe to rename because only its presence is read.
 A council turn now writes its request body to the request dump like the
 other providers, since a generation is a JSON body. The bass prototype on
 `/council/v1` (`contrib/chameleon-s1/`) was removed.
+
+## The pane that held a third of the screen (November 10)
+
+The tui showed a turn's reasoning in a pane a third of the screen tall, under
+the answer, held until the turn ended. It was built for fast models, where a
+pane that opened and closed with each thinking block flapped. Amy runs slow
+local models and reads along: "because the thinking stays on screen while
+the output arrives, it scrolls the top of the screen and is hard to read."
+The answer had two thirds of the screen and the reasoning could not be read
+again once it closed.
+
+Reasoning is now an ordinary block in document order. It folds to its
+summary line "when post-thinking output begins", and a long tool result
+folds the same way, which reverses the earlier guidance that tool output is
+never collapsed. The rule lives in `kaijutsu-present` (`fold.rs`) so the app
+and the tui apply one decision: once per block, never under the reader, and
+a fold the viewer moves by hand is theirs. The app had toggled every
+thinking and error block at once and showed `Thinking [collapsed]`; it now
+toggles one block and shows the kernel's summary.
+
+A fold toggle needs to know which block. Amy asked for "a single 'block
+under the reader' in both app and tui", so `reader.rs` holds that rule too:
+the last block that fits at or above the reader, the newest on the tail.
+`Ctrl+O` and the diff viewer's `Ctrl+A v` use it in both clients. The app
+never cleared its focused block, so a focus scrolled off screen counts only
+while the view is off the tail.
+
+Lessons. A review that reads the worktree while a lane is editing reports
+the lane's half-finished state as a defect: kaibo's top finding was three
+tests that "cannot pass" in code a lane was still writing. Its real finds
+came from reading the settled half. And narrowing a lib's modules to
+`pub(crate)` for one build lets the dead-code lint see what `pub` hides.
