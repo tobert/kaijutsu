@@ -177,7 +177,7 @@ We read the relevant contract before changing these areas:
 |---|---|---|
 | Beat, clock, cue | Model the clock; stamp emissions and back-date sinks; reject stale data; never replay missed beats; scheduled-periodic kernel grid; local phasor free-runs inside its deadband | `docs/midi.md`, "The one timebase" |
 | App input | Central action table → `ActionFired` → handlers; add `InputContext` and bindings. Only the vi editor grabs raw keyboard input. Vi owns Esc where live; elsewhere one `PopLevel` | `docs/input.md` |
-| Tui | Transcript goes once into terminal scrollback; fixed-height live band changes text, not height. Thinking pane and picker/ledger dismissal have documented exceptions | `docs/tui.md`, "Surfaces" and "The in-flight strip" |
+| Tui | The tui owns the alternate screen; the transcript is its buffer and scrolling is copy mode. Reasoning and long tool results fold in place. Every act on a block uses the reader's block | `docs/tui.md`, "The owned screen", "Folds" and "The reader's block" |
 | Navigation and editing | Preserve screen/tmux `Ctrl+A` and vi muscle memory; document differences | `docs/input.md` and `docs/tui.md` |
 
 For Bevy APIs, we read `Cargo.lock` and the matching cargo cache source. A

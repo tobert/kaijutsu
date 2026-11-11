@@ -39,6 +39,13 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
     the same text twice writes the clipboard once. If another program
     took the clipboard in between, the second `y` does not take it back.
   - The tui's diff viewer has no yank; the app's fills the registers.
+- **The two clients differ where they need not.** The app has no
+  `Ctrl+A ]`; `p` is the only put there. The tui drops a failed search's
+  message ("Pattern not found") that the app shows as a notice:
+  `Compose::press` never reads `take_commands` outside the bar and the
+  tui's `ComposeAction` has no notice field. The tui's diff viewer has no
+  `y`. The app has no copy mode, so text in the conversation is yanked
+  only from the diff viewer.
 - **The kernel's register map is never pruned.** `EditorSessions` keeps an
   entry for every principal that ever sent vi keys, until a restart.
 

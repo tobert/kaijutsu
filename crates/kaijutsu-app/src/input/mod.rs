@@ -81,7 +81,7 @@ pub struct SystemClipboard(pub arboard::Clipboard);
 /// pasteable a minute later.
 ///
 /// Absent (like [`SystemClipboard`]) when no clipboard is available; senders
-/// then no-op, and a yank logs rather than silently vanishing.
+/// then no-op. A yank is in the vi registers either way.
 #[derive(Resource)]
 pub struct ClipboardWriter(crossbeam_channel::Sender<String>);
 
@@ -108,7 +108,7 @@ impl ClipboardWriter {
         let mut clipboard = match arboard::Clipboard::new() {
             Ok(c) => c,
             Err(e) => {
-                warn!("System clipboard unavailable for writes: {e}. Yank disabled.");
+                warn!("System clipboard unavailable for writes: {e}. Yanks stay in the vi registers.");
                 return None;
             }
         };
