@@ -117,6 +117,9 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // v — view the diff under the reader full-screen (the terminal
         // client's chord for the same act).
         KeyCode::KeyV => Some(Action::OpenDiffViewer),
+        // ] — put the unnamed vi register into the compose surface (the
+        // terminal client's chord for the same act).
+        KeyCode::BracketRight => Some(Action::PutRegister),
         // Esc cancels the pending prefix quietly.
         KeyCode::Escape => None,
         _ => None,
@@ -236,6 +239,15 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyV, false, false),
             Some(Action::OpenDiffViewer)
+        );
+    }
+
+    /// `]` puts the vi register, as the terminal client's chord does.
+    #[test]
+    fn right_bracket_puts_the_register() {
+        assert_eq!(
+            resolve_chord(KeyCode::BracketRight, false, false),
+            Some(Action::PutRegister)
         );
     }
 

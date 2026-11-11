@@ -147,6 +147,23 @@ impl ComposeBuffer {
         self.editor.insert_at_cursor(text)
     }
 
+    /// Put the unnamed register at the cursor (`Ctrl+A ]`; see
+    /// `EditorCore::put`). The action carries the edits, or the notice that
+    /// says why there are none: the `/`·`?`·`:` bar is open, or the
+    /// registers are empty.
+    pub fn put(&mut self, registers: &mut Registers) -> ComposeAction {
+        let mut action = ComposeAction::default();
+        if self.command_line().is_some() {
+            action.notice = Some("close the ':' line before putting".to_string());
+            return action;
+        }
+        action.ops = self.lending(registers, |buffer| buffer.editor.put());
+        if action.ops.is_empty() {
+            action.notice = Some("nothing to put".to_string());
+        }
+        action
+    }
+
     /// The mode a surface opens in: insert when it is empty, so typing starts
     /// at once; normal otherwise, so the text can be read before it is
     /// changed. Returns the edits leaving a mode made (normally none).
@@ -208,6 +225,8 @@ fn key(code: KeyCode) -> KeyEvent {
 pub enum HeldInput {
     Key(KeyEvent),
     Paste(String),
+    /// `Ctrl+A ]`: put the unnamed register.
+    Put,
 }
 
 /// A draft load just started.
@@ -361,6 +380,21 @@ impl ComposeState {
             return None;
         }
         Some(self.chat.paste(text))
+    }
+
+    /// `Ctrl+A ]` on the chat surface. `None` while the draft is loading: the
+    /// put is held and replayed with the keys.
+    pub fn put_chat(&mut self) -> Option<ComposeAction> {
+        if matches!(self.draft, DraftTarget::Loading { .. }) {
+            self.held.push(HeldInput::Put);
+            return None;
+        }
+        Some(self.chat.put(&mut self.registers))
+    }
+
+    /// `Ctrl+A ]` on the shell surface.
+    pub fn put_shell(&mut self) -> ComposeAction {
+        self.shell.put(&mut self.registers)
     }
 
     /// Count one chat edit as sent. Returns the generation to send with it.

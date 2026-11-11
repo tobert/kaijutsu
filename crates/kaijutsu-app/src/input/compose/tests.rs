@@ -340,6 +340,65 @@ fn an_outside_yank_puts_in_the_chat_draft() {
     assert_eq!(state.chat.text(), "draft\n+added");
 }
 
+/// `Ctrl+A ]` puts the unnamed register as `p` does, and returns the edits.
+#[test]
+fn put_places_the_register_in_the_chat_draft() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "draft");
+    state.yank(&kaijutsu_editor::Yank::lines("+added"));
+    let action = state.put_chat().expect("the draft is loaded");
+    assert_eq!(state.chat.text(), "draft\n+added");
+    assert!(!action.ops.is_empty() && action.notice.is_none());
+}
+
+/// The shell line puts from the same registers.
+#[test]
+fn put_places_the_register_in_the_shell_line() {
+    let mut state = ComposeState { shell: ComposeBuffer::over("ls"), ..Default::default() };
+    state.yank(&kaijutsu_editor::Yank { text: "-la".into(), linewise: false });
+    let action = state.put_shell();
+    assert_eq!(state.shell.text(), "ls-la");
+    assert!(action.notice.is_none());
+}
+
+/// Empty registers say so and edit nothing.
+#[test]
+fn put_with_nothing_yanked_is_a_notice() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "draft");
+    let action = state.put_chat().expect("the draft is loaded");
+    assert!(action.ops.is_empty());
+    assert_eq!(action.notice.as_deref(), Some("nothing to put"));
+    assert_eq!(state.chat.text(), "draft");
+}
+
+/// While the `:` bar is open the put is refused, and the bar keeps its line.
+#[test]
+fn put_with_the_bar_open_is_refused() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "draft");
+    state.yank(&kaijutsu_editor::Yank::lines("+added"));
+    chat_keys(&mut state, ":");
+    let action = state.put_chat().expect("the draft is loaded");
+    assert!(action.ops.is_empty());
+    assert_eq!(action.notice.as_deref(), Some("close the ':' line before putting"));
+    assert_eq!(state.chat.command_line().as_deref(), Some(":"));
+    assert_eq!(state.chat.text(), "draft");
+}
+
+/// A put while the draft loads is held like a key and replayed in order.
+#[test]
+fn a_put_while_the_draft_loads_is_held() {
+    let mut state = ComposeState::default();
+    state.yank(&kaijutsu_editor::Yank::lines("+added"));
+    let context = ContextId::new();
+    let read = state.begin_load(context, PrincipalId::new()).read;
+    assert!(state.press_chat(press(KeyCode::Char('a'))).is_none());
+    assert!(state.put_chat().is_none(), "held");
+    let held = state.finish_load(context, read, Some("kept")).expect("the newest read");
+    assert_eq!(held, vec![HeldInput::Key(press(KeyCode::Char('a'))), HeldInput::Put]);
+}
+
 /// Both surfaces share the registers, as two buffers in one vim do.
 #[test]
 fn the_shell_line_and_the_chat_draft_share_registers() {

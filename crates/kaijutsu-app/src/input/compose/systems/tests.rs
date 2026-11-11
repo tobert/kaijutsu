@@ -87,6 +87,7 @@ impl Harness {
                     handle_pop_level,
                     handle_prompt_prefill,
                     handle_compose_paste,
+                    handle_put_register,
                     crate::input::systems::handle_interrupt,
                     follow_draft_context,
                     drain_draft_acks,
@@ -554,6 +555,61 @@ fn prompt_prefill_opens_the_shell_line_typed_up_to_its_argument() {
     assert_eq!((h.surface(), h.focus()), (ActiveSurface::Shell, FocusArea::Compose));
     h.keys("banto");
     assert_eq!(h.compose().shell.text(), "kj context rotate banto");
+}
+
+/// `Ctrl+A ]` on the chat surface puts the register and sends the edit like a
+/// key's.
+#[test]
+fn put_register_edits_the_chat_draft_through_the_outbox() {
+    let mut h = Harness::new("draft");
+    h.load();
+    h.app.world_mut().resource_mut::<ComposeState>().yank(&kaijutsu_editor::Yank::lines("+added"));
+    h.fire(Action::PutRegister);
+    assert_eq!(h.overlay().text, "draft\n+added");
+    h.drain_the_writer();
+    assert_eq!(h.kernel.draft.borrow().as_str(), "draft\n+added");
+}
+
+/// On the shell surface the put lands in the shell line, never the draft.
+#[test]
+fn put_register_acts_on_the_shell_line_when_it_is_active() {
+    let mut h = Harness::new("draft");
+    h.load();
+    h.open_shell();
+    h.app.world_mut().resource_mut::<ComposeState>().yank(&kaijutsu_editor::Yank { text: "ls".into(), linewise: false });
+    h.fire(Action::PutRegister);
+    assert_eq!(h.compose().shell.text(), "ls");
+    assert_eq!(h.compose().chat.text(), "draft");
+}
+
+/// Empty registers and an open bar each say why nothing was put.
+#[test]
+fn put_register_says_why_it_put_nothing() {
+    let mut h = Harness::new("draft");
+    h.load();
+    h.fire(Action::PutRegister);
+    assert!(h.errors().iter().any(|e| e == "nothing to put"), "{:?}", h.errors());
+    h.app.world_mut().resource_mut::<ComposeState>().yank(&kaijutsu_editor::Yank::lines("+added"));
+    h.keys(":");
+    h.fire(Action::PutRegister);
+    assert!(h.errors().iter().any(|e| e == "close the ':' line before putting"), "{:?}", h.errors());
+    assert_eq!(h.compose().chat.text(), "draft");
+}
+
+/// A put fired while the draft loads waits for the read, then lands.
+#[test]
+fn a_put_while_the_draft_loads_lands_after_the_read() {
+    let mut h = Harness::new("half");
+    h.app.update();
+    h.app.world_mut().resource_mut::<ComposeState>().yank(&kaijutsu_editor::Yank::lines("+added"));
+    h.fire(Action::PutRegister);
+    assert_eq!(h.overlay().text, "", "nothing drawn before the draft is read");
+    let DraftTarget::Loading { read, .. } = h.app.world().resource::<ComposeState>().draft() else {
+        panic!("still loading");
+    };
+    h.app.world_mut().write_message(RpcResultMessage::DraftRead { context_id: h.context, read, result: Ok("half".into()) });
+    h.app.update();
+    assert_eq!(h.overlay().text, "half\n+added");
 }
 
 /// A paste with no clipboard says so.

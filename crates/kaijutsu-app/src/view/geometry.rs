@@ -251,6 +251,23 @@ impl ConversationGeometry {
         start..end.max(start)
     }
 
+    /// The block containing the document coordinate `top`: the first block
+    /// row whose extent (margin included) ends below it. A role header at
+    /// `top` yields the block it precedes. `None` past the end of the
+    /// document.
+    ///
+    /// Offsets must be current — call after
+    /// [`recompute_offsets`](Self::recompute_offsets).
+    pub fn block_at(&self, top: f32) -> Option<BlockId> {
+        let start = self
+            .rows
+            .partition_point(|r| r.y_offset + r.height + r.margin_bottom <= top);
+        self.rows[start..].iter().find_map(|r| match r.key {
+            RowKey::Block(id) => Some(id),
+            RowKey::Header(_) => None,
+        })
+    }
+
     /// Look up the header row preceding block `id`, if that block starts a
     /// role run.
     pub fn header_row(&self, id: &BlockId) -> Option<&GeomRow> {

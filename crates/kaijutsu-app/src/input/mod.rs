@@ -250,6 +250,7 @@ impl Plugin for InputPlugin {
                 systems::handle_detach,
                 compose::systems::handle_prompt_prefill,
                 compose::systems::handle_compose_paste,
+                compose::systems::handle_put_register,
                 systems::handle_interrupt,
                 // App-level actions (global)
                 systems::handle_quit,

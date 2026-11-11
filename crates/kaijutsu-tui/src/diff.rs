@@ -31,6 +31,8 @@ pub struct DiffScreen {
     pub title: String,
     /// The frozen render, built once at open.
     lines: Vec<Line<'static>>,
+    /// Where each hunk sits in `lines`, with its patch text. `y` reads it.
+    hunks: Vec<HunkSpan>,
     /// First rendered row on screen.
     top: usize,
     /// Body height of the last frame drawn. A page step and the bottom stop
@@ -41,9 +43,11 @@ pub struct DiffScreen {
 impl DiffScreen {
     /// Freeze `model` into rendered lines under `title`.
     pub fn new(title: impl Into<String>, model: &DiffModel, palette: &Palette) -> Self {
+        let (lines, hunks) = render(model, palette);
         Self {
             title: title.into(),
-            lines: diff_lines(model, palette),
+            lines,
+            hunks,
             top: 0,
             body_h: DEFAULT_BODY_LINES,
         }
@@ -66,9 +70,20 @@ impl DiffScreen {
         Self {
             title: title.into(),
             lines,
+            hunks: Vec::new(),
             top: 0,
             body_h: DEFAULT_BODY_LINES,
         }
+    }
+
+    /// The patch text of the hunk at the top of the viewport: the hunk whose
+    /// rows reach the first visible row, or the next one when that row is a
+    /// file heading. `None` past the last hunk or when nothing parsed.
+    pub fn yank_hunk(&self) -> Option<String> {
+        self.hunks
+            .iter()
+            .find(|h| h.end > self.top)
+            .map(|h| h.text.clone())
     }
 
     /// Total rendered rows. Tests read it to check the scroll stops.
@@ -125,7 +140,7 @@ impl DiffScreen {
             });
         }
         out.push(Line::from(Span::styled(
-            "j/k scroll  Ctrl+D/Ctrl+U page  g/G ends  q close".to_string(),
+            "j/k scroll  Ctrl+D/Ctrl+U page  g/G ends  y yank hunk  q close".to_string(),
             palette.status(),
         )));
         out
@@ -140,12 +155,15 @@ const CHROME_LINES: u16 = 2;
 const DEFAULT_BODY_LINES: usize = 20;
 
 /// What a key did to the diff screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffKey {
     /// `q` / `Esc` — give the conversation back.
     Close,
     /// The viewport moved.
     Scrolled,
+    /// `y` — the hunk at the top of the viewport as patch text, or `None`
+    /// when there is no hunk to take.
+    Yank(Option<String>),
     /// Nothing this screen answers.
     Ignored,
 }
@@ -186,6 +204,7 @@ pub fn handle_key(
             screen.scroll(-(body_h as isize), body_h);
             DiffKey::Scrolled
         }
+        KeyCode::Char('y') => DiffKey::Yank(screen.yank_hunk()),
         KeyCode::Char('g') | KeyCode::Home => {
             screen.scroll_to_top();
             DiffKey::Scrolled
@@ -201,7 +220,20 @@ pub fn handle_key(
 /// Render a whole model: a header per file, a `@@` line per hunk, and one row
 /// per diff line with its band color and its word spans lifted out of it.
 pub fn diff_lines(model: &DiffModel, palette: &Palette) -> Vec<Line<'static>> {
+    render(model, palette).0
+}
+
+/// One hunk's place in the rendered rows and its text as unified patch:
+/// the `@@` line, then each line with its prefix, newline-terminated.
+struct HunkSpan {
+    /// One past the hunk's last rendered row.
+    end: usize,
+    text: String,
+}
+
+fn render(model: &DiffModel, palette: &Palette) -> (Vec<Line<'static>>, Vec<HunkSpan>) {
     let mut out = Vec::new();
+    let mut spans = Vec::new();
     if let Some(truncation) = model.truncated {
         // A truncated model is not a patch, and must never look like one.
         out.push(Line::from(Span::styled(
@@ -228,17 +260,19 @@ pub fn diff_lines(model: &DiffModel, palette: &Palette) -> Vec<Line<'static>> {
                 .as_ref()
                 .map(|s| format!(" {s}"))
                 .unwrap_or_default();
-            out.push(Line::from(Span::styled(
-                format!(
-                    "@@ -{},{} +{},{} @@{section}",
-                    hunk.old_start,
-                    hunk.old_count(),
-                    hunk.new_start,
-                    hunk.new_count()
-                ),
-                palette.diff_hunk(),
-            )));
+            let header = format!(
+                "@@ -{},{} +{},{} @@{section}",
+                hunk.old_start,
+                hunk.old_count(),
+                hunk.new_start,
+                hunk.new_count()
+            );
+            let mut text = format!("{header}\n");
+            out.push(Line::from(Span::styled(header, palette.diff_hunk())));
             for line in &hunk.lines {
+                text.push(line.prefix());
+                text.push_str(&line.text);
+                text.push('\n');
                 out.push(diff_line(
                     line.prefix(),
                     &line.text,
@@ -247,15 +281,17 @@ pub fn diff_lines(model: &DiffModel, palette: &Palette) -> Vec<Line<'static>> {
                     palette,
                 ));
                 if line.no_newline {
+                    text.push_str("\\ No newline at end of file\n");
                     out.push(Line::from(Span::styled(
                         "\\ No newline at end of file".to_string(),
                         palette.diff_context(),
                     )));
                 }
             }
+            spans.push(HunkSpan { end: out.len(), text });
         }
     }
-    out
+    (out, spans)
 }
 
 /// One diff row: the band style over the whole line, with the changed word
@@ -392,6 +428,65 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    fn two_hunk_model() -> DiffModel {
+        let old: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 2\n", "line two\n").replace("line 29\n", "line twenty-nine\n");
+        let file = diff_file(&FileSpec::modified("n.txt", &old, &new), &DiffOptions::default()).expect("diff");
+        assert_eq!(file.hunks.len(), 2, "the fixture needs two hunks");
+        DiffModel::new(vec![file])
+    }
+
+    /// `y` takes the hunk at the top of the viewport as patch text.
+    #[test]
+    fn y_yanks_the_hunk_at_the_top_of_the_viewport() {
+        let palette = Palette::builtin();
+        let mut screen = DiffScreen::new("t", &two_hunk_model(), &palette);
+        let first = screen.yank_hunk().expect("a hunk at the top");
+        assert!(first.starts_with("@@ -1,"), "{first:?}");
+        assert!(first.contains("-line 2\n+line two\n"), "{first:?}");
+        assert!(!first.contains("twenty-nine"), "{first:?}");
+        screen.scroll_to_bottom(1);
+        let last = screen.yank_hunk().expect("a hunk at the bottom");
+        assert!(last.contains("+line twenty-nine\n"), "{last:?}");
+        assert!(!last.contains("line two"), "{last:?}");
+    }
+
+    /// Each hunk's recorded end row closes the rows its `@@` line opens.
+    #[test]
+    fn hunk_spans_cover_their_rendered_rows() {
+        let palette = Palette::builtin();
+        let (lines, hunks) = render(&two_hunk_model(), &palette);
+        assert_eq!(hunks.len(), 2);
+        let headers: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.spans.first().is_some_and(|s| s.content.starts_with("@@")))
+            .map(|(i, _)| i)
+            .collect();
+        for (hunk, header) in hunks.iter().zip(headers) {
+            assert_eq!(hunk.end - header, hunk.text.lines().count());
+        }
+    }
+
+    #[test]
+    fn y_with_no_hunk_yields_none() {
+        let palette = Palette::builtin();
+        let screen = DiffScreen::unparsed("t", "bad", "text", &palette);
+        assert_eq!(screen.yank_hunk(), None);
+    }
+
+    #[test]
+    fn the_y_key_asks_for_a_yank() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let palette = Palette::builtin();
+        let mut screen = DiffScreen::new("t", &two_hunk_model(), &palette);
+        let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        match handle_key(&mut screen, &key, 10) {
+            DiffKey::Yank(Some(text)) => assert!(text.starts_with("@@")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

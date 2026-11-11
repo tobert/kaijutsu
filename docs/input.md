@@ -139,6 +139,7 @@ list.
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
 | `Ctrl+A v` | Open the diff viewer on the diff under the reader (`v` in Navigation does the same; see "The reader's block"). Conversation screen only | (new) |
+| `Ctrl+A ]` | Put the unnamed vi register into the active compose surface (chat draft or shell line), as `p` does; the terminal client has the same chord. In insert mode the text goes in at the cursor and the mode stays. While the `/`·`?`·`:` bar is open it shows "close the ':' line before putting"; with empty registers, "nothing to put". Held while the chat draft loads, like a key | (new) |
 | `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last 20 answered asks (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
 
@@ -224,14 +225,21 @@ live tail, where the reader is on no block, it is the newest that fits.
 Amy, 2026-11-10: *"let's have a single 'block under the reader' in both app
 and tui, and use it consistently."*
 
-In the app the reader's block is `FocusTarget.block_id` (moved by `j`/`k`),
-named by `FocusTarget::reader_block`. Focus is never cleared by following the
-tail, by a submit, or by a context switch, so a focus the view has scrolled
-away from while following the tail is stale. `reader_block` returns it only
-while its row is in the viewport; otherwise the reader is on the tail. While
-the view is scrolled off the tail, the focused block is the reader's wherever
-it is, including off screen. (Open: a reader who scrolls off the focus with
-the wheel keeps the old focus; see `docs/issues.md`, "Folds".)
+In the app the reader's block comes from the viewport, named by
+`FocusTarget::reader_block`:
+
+- The focused block (`FocusTarget.block_id`, moved by `j`/`k`) when its row is
+  in the viewport.
+- Otherwise, while the view follows the tail, none: the reader is on the live
+  tail. Focus is never cleared by following, by a submit, or by a context
+  switch, so a focus the view has left is stale.
+- Otherwise, with the view scrolled away from the tail, the block containing
+  the viewport's top edge (`ConversationGeometry::block_at`). A role header at
+  the edge counts as the block it precedes.
+
+A reader who scrolls off the focus with the wheel therefore acts on what is
+at the top of the view. Both tests read the one row geometry the renderer
+uses.
 
 | Act | Keys | Fits |
 |---|---|---|
@@ -239,8 +247,8 @@ the wheel keeps the old focus; see `docs/issues.md`, "Folds".)
 | Open the diff viewer | `v`, `Ctrl+A v` | a block that is a diff (`openable_diff`) |
 
 When no block fits, the fold toggle does nothing; the diff viewer shows a
-notice, "No diff at or above the focused block." with a focus, "No diff in
-this conversation." without. `Ctrl+A v` works on the conversation screen
+notice, "No diff at or above where you are reading." off the tail, "No
+diff in this conversation." on it. `Ctrl+A v` works on the conversation screen
 only.
 
 `x` (exclude from the next turn) does not use the reader's block. It acts on

@@ -117,7 +117,7 @@ pub(super) async fn act(
     // vi surface has the screen every key belongs to it, `Ctrl+C` included,
     // except the `Ctrl+A` prefix and its chord ([`Keys::claims`]).
     if editor::route_key(app, keys.claims(&key)) == editor::KeyRoute::FullScreen {
-        act_full_screen(app, key);
+        act_full_screen(app, key, term_lock);
         return Ok(Acted::Continue);
     }
     // The ledger view captures its own keys while open — j/k/Esc are never
@@ -167,7 +167,7 @@ pub(super) async fn act(
         match chord_over_full_screen(&intent) {
             OverFullScreen::Run => {}
             OverFullScreen::ToSurface(key) => {
-                act_full_screen(app, key);
+                act_full_screen(app, key, term_lock);
                 return Ok(Acted::Continue);
             }
             OverFullScreen::Hold => {
@@ -542,6 +542,9 @@ async fn compose_key(
     {
         app.note(format!("clipboard write failed: {e}"));
     }
+    if let Some(message) = action.notice {
+        app.note(message);
+    }
     if let Some(line) = action.command {
         handle_colon_line(bridge, app, ctx, line, feeds).await;
         return Ok(());
@@ -631,7 +634,7 @@ fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool) -> OverOverla
 }
 
 /// A key while a full-screen surface has the screen.
-fn act_full_screen(app: &mut App, key: KeyEvent) {
+fn act_full_screen(app: &mut App, key: KeyEvent, term_lock: &TermLock) {
     if let Some(session) = app.screen.editor().map(|s| s.session) {
         // A key with no notation is refused rather than sent: the kernel's
         // `parse_keys` drops an unknown `<...>` token silently, so forwarding
@@ -649,8 +652,19 @@ fn act_full_screen(app: &mut App, key: KeyEvent) {
 
     if let ScreenMode::Diff(screen) = &mut app.screen {
         let body_h = screen.body_h();
-        if diff::handle_key(screen, &key, body_h) == DiffKey::Close {
-            app.screen = ScreenMode::Conversation;
+        match diff::handle_key(screen, &key, body_h) {
+            DiffKey::Close => app.screen = ScreenMode::Conversation,
+            // The registers take the hunk as whole lines, and the clipboard
+            // as copy mode's yank does.
+            DiffKey::Yank(Some(text)) => {
+                match write_osc52(term_lock, &text) {
+                    Ok(()) => app.note(format!("yanked {} lines — p or Ctrl+A ] puts", text.lines().count())),
+                    Err(e) => app.note(format!("clipboard write failed: {e}")),
+                }
+                app.compose.yank_lines(&text);
+            }
+            DiffKey::Yank(None) => app.note("no hunk to yank"),
+            DiffKey::Scrolled | DiffKey::Ignored => {}
         }
     }
 }

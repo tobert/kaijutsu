@@ -468,6 +468,82 @@ editor, then go to another and 'p' when I type in the wrong spot."*
 
 ---
 
+### A kernel-owned register store (design, not built)
+
+Amy, 2026-11-11, asked for this design after choosing that `p` always puts
+the vi register and never the system clipboard. The goal: `dd` in the tui
+and `p` in the app, and `dd` on the compose line and `p` in a `vi` session.
+
+Amy's working pattern, same day: *"I often `vi *.rs` and :n and :N through
+the files, and I can yank and put things across them pretty quickly."*
+That pattern stays inside the kernel's vi sessions, whose registers one
+person's sessions already share. What it lacks is an argument list: `vi`
+takes one path, and the `:` dialect has no `:n`, `:N` or `:args`
+(`docs/issues.md`, "vi registers: what sharing leaves open"). The argument
+list serves that pattern without this store; this store serves a yank that
+crosses from one client, or from the compose line, to another editor.
+
+Three sets of registers exist per person today: the tui's compose, the
+app's compose, and the kernel's vi sessions. Compose runs `EditorCore` in
+the client, so its registers never reach the kernel.
+
+**Constraints.**
+
+- `p` never waits on the wire. A client keeps its own `Registers` and puts
+  from them; the kernel's copy is what the clients converge on.
+- The store is per character, keyed as `EditorSessions.registers` is
+  already: the principal the edit is attributed to. A model's yank never
+  lands in a person's registers.
+- The kernel sequences writes. Two clients yanking at once resolve to the
+  later accepted write per register; nothing merges register text.
+- Only text registers move: the unnamed register, `"0`, `"1`–`"9`, `"-`
+  and `"a`–`"z`, each as text and a shape (charwise, linewise, blockwise).
+  Macros, the last `:` line and the search pattern stay with the client.
+
+**Two ways to carry it.**
+
+1. *Wire methods.* `registersPut(cells, since)` sends the cells a key
+   changed; `subscribeRegisters` pushes accepted cells to the person's
+   other connections with a kernel sequence number. `EditorSessions` lends
+   from the same store, so a vi session needs no new code path. A client
+   applies a pushed cell between keys, never inside a half-typed command,
+   and ignores the echo of its own write by sequence number. Cost: two
+   wire methods and a callback, and `EditorCore` must report which
+   registers a key changed (today only `last_yank` is readable).
+2. *VFS files.* Each register is a file under a per-character directory,
+   with the shape in a sidecar or a one-line header. Clients write through
+   the file RPCs and learn of changes through a watch. Scripts and models
+   could read a register with `cat` and fill one with a redirect, which is
+   new capability, not only plumbing. Cost: a watch path clients do not
+   have today, a file format for the shape, and a yank on every `x` and
+   `dw` becoming a file write.
+
+**Recommendation: the wire methods, held in memory.** Compose input is
+already an interaction-rate RPC path (`AGENTS.md`, "State and
+interfaces"), and a register changes on most normal-mode edits. The VFS
+form earns its cost only if scripts should reach registers, and the draft
+is the player's alone today: a delete from a draft would become readable
+at a path. If that reach is wanted later, a read-only `kj` verb over the
+same store is a smaller step than files.
+
+**Smallest useful slice.** Share the unnamed register and `"0` only. That
+covers `dd` here and `p` there, and needs one cell per message. The delete
+ring and the named registers follow once the push path has been played
+with.
+
+**Open questions.**
+
+- Durability. In memory, a kernel restart empties the kernel's copy while
+  each running client keeps its own; the first write after the restart
+  wins. A table would survive a restart and would store deleted draft
+  text on disk.
+- A client that was offline reconnects with newer local registers than
+  the kernel's. Either the kernel's copy wins on attach, or the client
+  pushes its own first. The kernel has no clock both sides trust.
+- Whether a model's character gets a store at all, or only people do.
+- The system clipboard stays a separate, outbound path: a yank is written
+  to it, and nothing here reads it.
+
 ## Command mode — the editor's `:` dialect
 
 Command mode extends the key-forwarder seam; it does **not** add an app input

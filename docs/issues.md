@@ -12,11 +12,17 @@ Compose keeps one set of registers per client, and the kernel one per
 player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
 `dd`, switched, and `p` in a real terminal or the running app. Open:
 
-- **Compose and the kernel's vi sessions do not share.** A `dd` on the
-  compose line cannot be put in a `vi` session, or the other way. Sharing
-  needs a kernel-owned register store the clients reach over the wire, a
-  design conversation (a wire method or a VFS path) this work did not have.
-- **The tui and the app do not share,** for the same reason.
+- **Compose and the kernel's vi sessions do not share,** and neither do
+  the tui and the app. The design is written and not built: `docs/vi.md`,
+  "A kernel-owned register store". It waits on Amy's read of its open
+  questions (durability, who wins on reconnect, models).
+- **`vi` has no argument list.** Amy, 2026-11-11: *"I often `vi *.rs` and
+  :n and :N through the files, and I can yank and put things across them
+  pretty quickly."* `vi` refuses more than one path
+  (`runtime/vi_builtin.rs`) and the dialect has no `:n`, `:N`, `:args` or
+  `:e`. One person's vi sessions already share registers, so the missing
+  piece is the list: one session that moves across files, with vim's
+  refusal to leave a dirty buffer without `!`.
 - **The system clipboard takes yanks and gives nothing back.** A compose
   `y`, copy mode's `y` and the app diff viewer's `y` are written to the
   system clipboard (OSC 52 in the tui, arboard in the app). Amy,
@@ -38,14 +44,10 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   - A client detects a yank by comparing `"0` across the key, so yanking
     the same text twice writes the clipboard once. If another program
     took the clipboard in between, the second `y` does not take it back.
-  - The tui's diff viewer has no yank; the app's fills the registers.
-- **The two clients differ where they need not.** The app has no
-  `Ctrl+A ]`; `p` is the only put there. The tui drops a failed search's
-  message ("Pattern not found") that the app shows as a notice:
-  `Compose::press` never reads `take_commands` outside the bar and the
-  tui's `ComposeAction` has no notice field. The tui's diff viewer has no
-  `y`. The app has no copy mode, so text in the conversation is yanked
-  only from the diff viewer.
+- **The two clients still differ on yank.** The tui's diff viewer yanks
+  the hunk at the top of the viewport; the app's has `DiffCore`'s cursor
+  and visual selections. The app has no copy mode, so text in the
+  conversation is yanked only from the diff viewer.
 - **The kernel's register map is never pruned.** `EditorSessions` keeps an
   entry for every principal that ever sent vi keys, until a restart.
 
@@ -2813,11 +2815,6 @@ block on `c` or `Ctrl+O` (`docs/input.md`, "Folds"). Open:
 - **The app has no turn liveness and no in-flight strip.** The tui knows
   when a turn is live and shows its in-flight strip (`docs/tui.md`); the app
   shows neither.
-- **A wheel-scrolled reader keeps the old focus.** The app's reader is its
-  focused block (`FocusTarget::reader_block`); the tui's is the line the view
-  rests on. A reader who scrolls off the focus with the wheel, off the tail,
-  still acts on the focused block, which may be off screen. A reader taken
-  from the viewport would match the tui.
 - **Only the focused block is held.** A reader who scrolled with the wheel
   has no focused block, so a block that straddles the viewport top can fold
   under them and move the text. A block entirely above the viewport is

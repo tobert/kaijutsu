@@ -212,24 +212,35 @@ impl FocusTarget {
     /// on the live tail. Every act that takes a block from the reader asks
     /// here, then hands the answer to `kaijutsu_present::reader::target`.
     ///
-    /// The focused block is the reader's block while the view is scrolled
-    /// away from the tail. While the view follows the tail, focus is never
-    /// cleared by following, submitting, or switching context, so a focus that
-    /// has scrolled off screen is a stale one: it counts only while its row is
-    /// in the viewport.
+    /// The reader's block is what the viewer is looking at:
+    ///
+    /// - While the view follows the tail, the focused block when its row is
+    ///   in the viewport, else `None` (the live tail). Focus is never cleared
+    ///   by following, submitting, or switching context, so an off-screen
+    ///   focus is stale.
+    /// - While the view is scrolled away from the tail, the focused block
+    ///   when its row is in the viewport, else the block containing the
+    ///   viewport's top edge (`ConversationGeometry::block_at`).
     pub fn reader_block(
         &self,
         scroll: &ConversationScrollState,
         geometry: Option<&crate::view::geometry::ConversationGeometry>,
     ) -> Option<BlockId> {
-        let id = self.block_id?;
-        if !scroll.following {
-            return Some(id);
+        // Without row geometry nothing can be placed on screen: the focus
+        // stands while scrolled away, and the tail is the reader otherwise.
+        let Some(geometry) = geometry else {
+            return if scroll.following { None } else { self.block_id };
+        };
+        let on_screen = self.block_id.filter(|id| {
+            geometry.block_row(id).is_some_and(|row| {
+                row.y_offset + row.height > scroll.offset
+                    && row.y_offset < scroll.offset + scroll.visible_height
+            })
+        });
+        if on_screen.is_some() || scroll.following {
+            return on_screen;
         }
-        let row = geometry?.block_row(&id)?;
-        let on_screen = row.y_offset + row.height > scroll.offset
-            && row.y_offset < scroll.offset + scroll.visible_height;
-        on_screen.then_some(id)
+        geometry.block_at(scroll.offset)
     }
 }
 
@@ -669,17 +680,50 @@ mod tests {
     }
 
     #[test]
-    fn no_focus_means_the_reader_is_on_the_tail() {
-        let (_, scroll, geom) = reader_fixture(2, false);
+    fn no_focus_following_the_tail_means_the_reader_is_on_the_tail() {
+        let (_, scroll, geom) = reader_fixture(2, true);
         assert_eq!(FocusTarget::default().reader_block(&scroll, Some(&geom)), None);
+        assert_eq!(FocusTarget::default().reader_block(&scroll, None), None);
     }
 
     #[test]
-    fn off_the_tail_the_focused_block_is_the_readers_wherever_it_is() {
+    fn without_geometry_the_focus_stands_only_off_the_tail() {
+        let (ids, scroll, _) = reader_fixture(2, false);
+        let mut focus = FocusTarget::default();
+        focus.focus_block(ids[0]);
+        assert_eq!(focus.reader_block(&scroll, None), Some(ids[0]));
+    }
+
+    #[test]
+    fn scrolled_away_a_focus_on_screen_is_the_readers() {
+        let (ids, scroll, geom) = reader_fixture(2, false);
+        let mut focus = FocusTarget::default();
+        focus.focus_block(ids[2]);
+        assert_eq!(focus.reader_block(&scroll, Some(&geom)), Some(ids[2]));
+    }
+
+    #[test]
+    fn scrolled_away_a_focus_off_screen_gives_the_viewports_top_block() {
         let (ids, scroll, geom) = reader_fixture(2, false);
         let mut focus = FocusTarget::default();
         focus.focus_block(ids[0]);
-        assert_eq!(focus.reader_block(&scroll, Some(&geom)), Some(ids[0]));
+        assert_eq!(focus.reader_block(&scroll, Some(&geom)), Some(ids[2]));
+        // With no focus the viewport is all there is to read.
+        assert_eq!(
+            FocusTarget::default().reader_block(&scroll, Some(&geom)),
+            Some(ids[2])
+        );
+    }
+
+    #[test]
+    fn the_viewports_top_block_is_the_one_containing_its_top_edge() {
+        let (ids, mut scroll, geom) = reader_fixture(1, false);
+        // Half way into the middle block, a different block is focused.
+        let row = geom.block_row(&ids[1]).expect("row");
+        scroll.offset = row.y_offset + row.height / 2.0;
+        let mut focus = FocusTarget::default();
+        focus.focus_block(ids[0]);
+        assert_eq!(focus.reader_block(&scroll, Some(&geom)), Some(ids[1]));
     }
 
     #[test]

@@ -232,7 +232,7 @@ fn handle_open_diff_viewer(
     let reader = focus.reader_block(&scroll_state, geometries.get(main_ent).ok());
     let Some(block_id) = diff_target(&editor.blocks(), reader) else {
         let message = if reader.is_some() {
-            "No diff at or above the focused block."
+            "No diff at or above where you are reading."
         } else {
             "No diff in this conversation."
         };
@@ -722,7 +722,7 @@ mod tests {
         app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[0]);
         assert_eq!(press_open(&mut app), None);
         assert_eq!(*app.world().resource::<State<Screen>>().get(), Screen::Conversation);
-        assert_eq!(notices(&app), vec!["No diff at or above the focused block.".to_string()]);
+        assert_eq!(notices(&app), vec!["No diff at or above where you are reading.".to_string()]);
     }
 
     #[test]

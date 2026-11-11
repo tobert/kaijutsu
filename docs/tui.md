@@ -814,6 +814,9 @@ compose's bar.
   instead (`:q!` quits regardless — the turn keeps running in the kernel).
   Anything else is a status-line notice naming the line verbatim, and the
   draft is untouched.
+- A `/` or `?` search that finds nothing (and `n`/`N` after it) shows the
+  core's message on the status line, as the app does. A `:` line never does:
+  the core's error for it is discarded because the tui parses the line.
 - The bar keeps a local history (`compose.rs`'s `ColonHistory` — the core
   surfaces no history hook of its own, so this is hand-rolled the way
   `shell.rs`'s used to be), walked by `Up`/`Down`. `:kj` and `:!` lines
@@ -1435,6 +1438,16 @@ the app's `openable_diff`, ported: a declared diff always opens (an error state
 when it will not parse), and `Plain` opens only when its text — or a leading
 ` ```diff ` fence — really parses. `q`/`Esc` closes; `j`/`k`, `Ctrl+D`/`Ctrl+U`
 and `g`/`G` move.
+
+**`y` yanks a hunk.** The viewer has a viewport and no cursor, so `y` takes
+the hunk at the top of the viewport (a file heading there takes the hunk
+below it) as unified patch text: the `@@` line and each line with its
+prefix. The text goes to the draft's vi registers as whole lines, where `p`
+and `Ctrl+A ]` put it, and to the system clipboard over OSC 52. The status
+line says `yanked N lines — p or Ctrl+A ] puts`, or `clipboard write failed`
+when the terminal refuses; past the last hunk, or on a diff that did not
+parse, it says `no hunk to yank`. The app's `DiffCore` has visual selections
+this screen does not.
 
 ### Images
 

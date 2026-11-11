@@ -155,6 +155,25 @@ impl ComposeIo<'_, '_> {
         }
     }
 
+    /// Put the unnamed register into the active surface, as a key's edits go.
+    fn put(&mut self) {
+        match *self.surface {
+            ActiveSurface::Chat => self.put_chat(),
+            ActiveSurface::Shell => {
+                let action = self.compose.put_shell();
+                self.act(ActiveSurface::Shell, action);
+            }
+        }
+    }
+
+    /// Put into the chat draft, whatever surface is active: a held put
+    /// replays here, never into the shell line.
+    fn put_chat(&mut self) {
+        if let Some(action) = self.compose.put_chat() {
+            self.act(ActiveSurface::Chat, action);
+        }
+    }
+
     fn paste_chat(&mut self, text: &str) {
         if let Some(ops) = self.compose.paste_chat(text) {
             self.send_chat_ops(&ops);
@@ -269,6 +288,7 @@ impl ComposeIo<'_, '_> {
                     match input {
                         HeldInput::Key(key) => self.press_chat(key),
                         HeldInput::Paste(text) => self.paste_chat(&text),
+                        HeldInput::Put => self.put_chat(),
                     }
                 }
             }
@@ -505,6 +525,16 @@ pub fn handle_compose_paste(
         match fetched {
             Ok(text) => io.paste(&text),
             Err(e) => io.error("paste", format!("paste failed: {e}")),
+        }
+    }
+}
+
+/// `Ctrl+A ]`: put the unnamed vi register into the active surface, as `p`
+/// does (`docs/input.md`, "The prefix table").
+pub fn handle_put_register(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {
+    for ActionFired { action, .. } in actions.read() {
+        if matches!(action, Action::PutRegister) {
+            io.put();
         }
     }
 }

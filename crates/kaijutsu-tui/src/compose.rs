@@ -55,6 +55,10 @@ pub struct ComposeAction {
     /// Text this key yanked (`y`, never a delete), for the caller to offer
     /// to the system clipboard.
     pub yanked: Option<String>,
+    /// A failed `/` or `?` search (`n` and `N` included), for the caller to
+    /// show. A `:` line's error is never reported here: the caller parses
+    /// that line itself.
+    pub notice: Option<String>,
 }
 
 /// Local `:` line history — modalkit's command bar surfaces no history hook
@@ -442,9 +446,14 @@ impl Compose {
         let before = self.editor.last_yank();
         let ops = self.editor.apply_key_event(key);
         let yanked = self.editor.last_yank().filter(|now| Some(now) != before.as_ref());
+        let notice = match self.editor.take_commands() {
+            Some(Err(message)) => Some(message),
+            _ => None,
+        };
         ComposeAction {
             ops,
             yanked: yanked.map(|yank| yank.text),
+            notice,
             ..ComposeAction::default()
         }
     }
@@ -459,13 +468,17 @@ impl Compose {
         match key.code {
             KeyCode::Enter => {
                 let ops = self.editor.apply_key_event(key);
-                let _ = self.editor.take_commands();
+                let reported = self.editor.take_commands();
                 // History stores the body alone (no `:` prefix) — the one
                 // shape both `older`/`newer` and `set_command_body` agree on.
                 // A `/` or `?` search ends in the core; only a `:` line is
                 // a command for the caller.
                 if !raw.starts_with(':') {
-                    return ComposeAction { ops, ..ComposeAction::default() };
+                    let notice = match reported {
+                        Some(Err(message)) => Some(message),
+                        _ => None,
+                    };
+                    return ComposeAction { ops, notice, ..ComposeAction::default() };
                 }
                 let body = raw.get(1..).unwrap_or("").to_string();
                 self.colon_history.record(body);
@@ -751,6 +764,36 @@ mod tests {
         let action = compose.press(press(KeyCode::Enter));
         assert_eq!(action.command, None);
         assert_eq!(compose.cursor(), 4);
+    }
+
+    /// A `/` search that finds nothing reports why; one that finds is quiet.
+    #[test]
+    fn a_failed_search_carries_a_notice() {
+        let mut compose = Compose::over("one two");
+        typed(&mut compose, "0/zzz");
+        let action = compose.press(press(KeyCode::Enter));
+        assert!(action.notice.is_some(), "a missed search needs a notice");
+        typed(&mut compose, "/two");
+        assert_eq!(compose.press(press(KeyCode::Enter)).notice, None);
+    }
+
+    /// `n` repeats the last search and reports when it now misses.
+    #[test]
+    fn n_after_a_failed_search_carries_a_notice() {
+        let mut compose = Compose::over("one two");
+        typed(&mut compose, "0/zzz");
+        compose.press(press(KeyCode::Enter));
+        assert!(compose.press(press(KeyCode::Char('n'))).notice.is_some());
+    }
+
+    /// A `:` line is the caller's to parse; its core error is not a notice.
+    #[test]
+    fn a_colon_line_carries_no_notice() {
+        let mut compose = Compose::over("one");
+        typed(&mut compose, ":kj fork");
+        let action = compose.press(press(KeyCode::Enter));
+        assert_eq!(action.notice, None);
+        assert_eq!(action.command.as_deref(), Some(":kj fork"));
     }
 
     #[test]
