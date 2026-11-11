@@ -262,6 +262,7 @@ impl Plugin for InputPlugin {
                 systems::handle_navigate_blocks.run_if(focus::in_conversation),
                 systems::handle_jump_to_latest_error.run_if(focus::in_conversation),
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
+                systems::handle_yank_block.run_if(focus::in_conversation),
                 systems::handle_toggle_block_excluded.run_if(focus::in_conversation),
                 // Scrolling (multi-context)
                 systems::handle_scroll.run_if(focus::scroll_context_active),

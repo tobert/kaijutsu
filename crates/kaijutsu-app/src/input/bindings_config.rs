@@ -377,6 +377,7 @@ fn action_to_str(a: &Action) -> String {
         Action::CollapseToggle => "CollapseToggle".into(),
         Action::JumpToLatestError => "JumpToLatestError".into(),
         Action::OpenDiffViewer => "OpenDiffViewer".into(),
+        Action::YankBlock => "YankBlock".into(),
         Action::PutRegister => "PutRegister".into(),
         Action::ScrollDelta(d) => format!("ScrollDelta:{d}"),
         Action::HalfPageUp => "HalfPageUp".into(),
@@ -476,6 +477,7 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "CollapseToggle" => Ok(Action::CollapseToggle),
         "JumpToLatestError" => Ok(Action::JumpToLatestError),
         "OpenDiffViewer" => Ok(Action::OpenDiffViewer),
+        "YankBlock" => Ok(Action::YankBlock),
         "PutRegister" => Ok(Action::PutRegister),
         "HalfPageUp" => Ok(Action::HalfPageUp),
         "HalfPageDown" => Ok(Action::HalfPageDown),
@@ -698,6 +700,7 @@ mod tests {
 
     const ALL_ACTIONS: &[&str] = &[
         "OpenDiffViewer",
+        "YankBlock",
         "PutRegister",
         "AskAllowOnce",
         "AskAllowAlways",

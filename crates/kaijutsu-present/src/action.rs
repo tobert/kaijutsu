@@ -66,6 +66,10 @@ pub enum Action {
     /// out-of-band conversation row. No-ops on a block that is not a diff
     /// (declared `ContentType::Diff` or a sniffed ` ```diff ` fence).
     OpenDiffViewer,
+    /// y (in Navigation) — yank the reader's block: its text, as whole lines,
+    /// into the compose vi registers and the system clipboard. The app yanks
+    /// by block where the terminal client yanks by line.
+    YankBlock,
 
     // ========================================================================
     // Scrolling

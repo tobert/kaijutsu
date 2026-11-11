@@ -139,7 +139,7 @@ list.
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
 | `Ctrl+A v` | Open the diff viewer on the diff under the reader (`v` in Navigation does the same; see "The reader's block"). Conversation screen only | (new) |
-| `Ctrl+A ]` | Put the unnamed vi register into the active compose surface (chat draft or shell line), as `p` does; the terminal client has the same chord. In insert mode the text goes in at the cursor and the mode stays. While the `/`·`?`·`:` bar is open it shows "close the ':' line before putting"; with empty registers, "nothing to put". Held while the chat draft loads, like a key | (new) |
+| `Ctrl+A ]` | Put the unnamed vi register into the active compose surface (chat draft or shell line), as `p` does (a `y` on a block in Navigation fills it too); the terminal client has the same chord. In insert mode the text goes in at the cursor and the mode stays. While the `/`·`?`·`:` bar is open it shows "close the ':' line before putting"; with empty registers, "nothing to put". Held while the chat draft loads, like a key | (new) |
 | `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last 20 answered asks (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
 
@@ -245,6 +245,14 @@ uses.
 |---|---|---|
 | Fold or unfold | `c`, `Ctrl+O` | a block with a fold: folded now, reasoning, an error, or a result over 12 lines (`fold::has_fold`) |
 | Open the diff viewer | `v`, `Ctrl+A v` | a block that is a diff (`openable_diff`) |
+| Yank | `y` | a block with text |
+
+`y` puts the block's plain text, as whole lines, in the compose vi registers
+(`p` or `Ctrl+A ]` puts it) and on the system clipboard when there is one,
+and a notice says "yanked N lines". With no block with text it says
+"nothing to yank here". The app yanks by block where the terminal client
+yanks by line (`docs/tui.md`, "Copy mode"): the conversation has no line
+cursor.
 
 When no block fits, the fold toggle does nothing; the diff viewer shows a
 notice, "No diff at or above where you are reading." off the tail, "No
@@ -333,7 +341,6 @@ folds · `V` visual-line · `y` yank to the clipboard and the compose vi registe
 | `Ctrl+V` | Paste CLIPBOARD into compose | compose only — in the editor it forwards to vi (visual block) |
 | `Ctrl+Shift+V` | Paste CLIPBOARD into the vi editor through `editor_insert` | editor; refused with a notice while the `:` line is open |
 | middle-click | Paste PRIMARY | in the editor through `editor_insert`, refused while the `:` line is open |
-| selection | Auto-copies to PRIMARY (mouse or vi visual) | |
 | `Ctrl+Z` | Root console↔person's context toggle; in the editor: suspend to shell | unix suspend metaphor |
 | `Ctrl+D/U` | Half-page scroll | unchanged |
 | `Ctrl+6` | Previous-pane toggle | unchanged |

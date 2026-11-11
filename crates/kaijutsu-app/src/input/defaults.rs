@@ -204,6 +204,15 @@ pub fn default_bindings() -> Vec<Binding> {
         "View diff full-screen",
     ));
 
+    // Yank the reader's block into the vi registers and the clipboard (the
+    // terminal client's copy mode yanks rows; the app yanks by block).
+    b.push(Binding::key(
+        KeyCode::KeyY,
+        InputContext::Navigation,
+        Action::YankBlock,
+        "Yank the block",
+    ));
+
     // Escape — pop (Compose→Conversation, etc.)
     b.push(Binding::key(
         KeyCode::Escape,
@@ -1021,5 +1030,17 @@ mod tests {
             .map(|b| b.action)
             .collect();
         assert_eq!(on_ctrl_o, vec![Action::CollapseToggle]);
+    }
+
+    /// `y` in Navigation yanks the reader's block, and is the only binding
+    /// on a bare `y`.
+    #[test]
+    fn y_yanks_the_block_in_navigation() {
+        let on_y: Vec<(InputContext, Action)> = default_bindings()
+            .into_iter()
+            .filter(|b| b.source == InputSource::Key(KeyCode::KeyY) && b.modifiers == Modifiers::NONE)
+            .map(|b| (b.context, b.action))
+            .collect();
+        assert_eq!(on_y, vec![(InputContext::Navigation, Action::YankBlock)]);
     }
 }

@@ -465,6 +465,53 @@ fn fold_toggle_target(
     })
 }
 
+/// Handle `Action::YankBlock` (`y` in Navigation): yank the reader's block.
+pub fn handle_yank_block(
+    mut actions: MessageReader<ActionFired>,
+    entities: Res<EditorEntities>,
+    focus: Res<FocusTarget>,
+    scroll_state: Res<ConversationScrollState>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
+    cells: Query<&CellEditor>,
+    mut compose: ResMut<crate::input::compose::ComposeState>,
+    clipboard: Option<Res<crate::input::ClipboardWriter>>,
+    mut errors: ResMut<crate::view::components::GlobalErrorQueue>,
+    time: Res<Time>,
+) {
+    for ActionFired { action, .. } in actions.read() {
+        if !matches!(action, Action::YankBlock) {
+            continue;
+        }
+        let Some(main_ent) = entities.main_cell else {
+            continue;
+        };
+        let reader = focus.reader_block(&scroll_state, geometries.get(main_ent).ok());
+        let Ok(editor) = cells.get(main_ent) else {
+            continue;
+        };
+        let Some(text) = yank_target(&editor.blocks(), reader).and_then(|id| editor.block_snapshot(&id)).map(|b| b.content) else {
+            errors.push("yank", "nothing to yank here", time.elapsed_secs_f64());
+            continue;
+        };
+        compose.yank(&kaijutsu_editor::Yank::lines(&text));
+        let lines = text.lines().count();
+        if let Some(writer) = clipboard.as_ref() {
+            writer.write(text);
+        }
+        let noun = if lines == 1 { "line" } else { "lines" };
+        errors.push("yank", format!("yanked {lines} {noun} \u{2014} p or Ctrl+A ] puts"), time.elapsed_secs_f64());
+    }
+}
+
+/// The block `y` yanks: the nearest block with text at or above the reader's
+/// block (`kaijutsu_present::reader::target`).
+fn yank_target(
+    blocks: &[kaijutsu_types::BlockSnapshot],
+    reader: Option<kaijutsu_types::BlockId>,
+) -> Option<kaijutsu_types::BlockId> {
+    kaijutsu_present::reader::target(blocks, reader, |b| !b.content.is_empty())
+}
+
 /// Handle ToggleBlockExcluded action — x in Navigation.
 ///
 /// Toggles the excluded flag on the focused block via set_block_excluded RPC.
@@ -685,6 +732,96 @@ mod tests {
         let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
         let editor = app.world().get::<CellEditor>(main_ent).unwrap();
         editor.store.get_block_snapshot(&id).unwrap().collapsed
+    }
+
+    /// The yank handler over the same main-cell harness as the fold toggle,
+    /// with compose, a clipboard writer and the notice queue.
+    fn yank_app(
+        blocks: &[(BlockKind, &str)],
+    ) -> (bevy::prelude::App, Vec<BlockId>, crossbeam_channel::Receiver<String>) {
+        use bevy::prelude::*;
+
+        let owned: Vec<(BlockKind, String)> =
+            blocks.iter().map(|(k, c)| (*k, c.to_string())).collect();
+        let (mut app, ids) = fold_toggle_app_with(&owned);
+        let (writer, written) = crate::input::ClipboardWriter::for_test();
+        app.insert_resource(writer);
+        app.init_resource::<crate::input::compose::ComposeState>();
+        app.init_resource::<crate::view::components::GlobalErrorQueue>();
+        app.init_resource::<Time>();
+        app.add_systems(Update, super::handle_yank_block);
+        (app, ids, written)
+    }
+
+    fn press_yank(app: &mut bevy::prelude::App) {
+        use crate::input::events::ActionFired;
+        use crate::input::{Action, context::InputContext};
+
+        app.world_mut().write_message(ActionFired::new(Action::YankBlock, InputContext::Navigation));
+        app.update();
+    }
+
+    fn notices(app: &bevy::prelude::App) -> Vec<String> {
+        app.world()
+            .resource::<crate::view::components::GlobalErrorQueue>()
+            .entries
+            .iter()
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    /// What `p` on the shell surface would put from the shared registers.
+    fn registers_put(app: &mut bevy::prelude::App) -> String {
+        let mut compose = app.world_mut().resource_mut::<crate::input::compose::ComposeState>();
+        compose.put_shell();
+        compose.shell.text()
+    }
+
+    /// `y` on the focused block puts its plain content, as whole lines, in the
+    /// vi registers and the clipboard, and says how many lines.
+    #[test]
+    fn yank_block_takes_the_focused_blocks_content() {
+        use crate::view::FocusTarget;
+
+        let (mut app, ids, written) =
+            yank_app(&[(BlockKind::Text, "one\ntwo"), (BlockKind::Text, "other")]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[0]);
+        press_yank(&mut app);
+        assert_eq!(written.try_iter().collect::<Vec<_>>(), vec!["one\ntwo".to_string()]);
+        assert_eq!(registers_put(&mut app), "one\ntwo");
+        assert_eq!(notices(&app), vec!["yanked 2 lines \u{2014} p or Ctrl+A ] puts".to_string()]);
+    }
+
+    /// A block with no text is passed over for the nearest one above with some.
+    #[test]
+    fn yank_block_passes_over_an_empty_block() {
+        use crate::view::FocusTarget;
+
+        let (mut app, ids, written) =
+            yank_app(&[(BlockKind::Text, "kept"), (BlockKind::Text, "")]);
+        app.world_mut().resource_mut::<FocusTarget>().focus_block(ids[1]);
+        press_yank(&mut app);
+        assert_eq!(written.try_iter().collect::<Vec<_>>(), vec!["kept".to_string()]);
+        assert_eq!(notices(&app), vec!["yanked 1 line \u{2014} p or Ctrl+A ] puts".to_string()]);
+    }
+
+    /// With no clipboard the registers still fill and nothing complains.
+    #[test]
+    fn yank_block_without_a_clipboard_still_fills_the_registers() {
+        let (mut app, _ids, _written) = yank_app(&[(BlockKind::Text, "text")]);
+        app.world_mut().remove_resource::<crate::input::ClipboardWriter>();
+        press_yank(&mut app);
+        assert_eq!(registers_put(&mut app), "text");
+    }
+
+    /// No block with text: a notice, and the clipboard and registers stay put.
+    #[test]
+    fn yank_block_with_nothing_to_yank_says_so() {
+        let (mut app, _ids, written) = yank_app(&[(BlockKind::Text, "")]);
+        press_yank(&mut app);
+        assert_eq!(written.try_iter().count(), 0);
+        assert_eq!(registers_put(&mut app), "");
+        assert_eq!(notices(&app), vec!["nothing to yank here".to_string()]);
     }
 
     /// The fold toggle must work with nothing but `EditorEntities.main_cell`

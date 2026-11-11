@@ -46,8 +46,17 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
     took the clipboard in between, the second `y` does not take it back.
 - **The two clients still differ on yank.** The tui's diff viewer yanks
   the hunk at the top of the viewport; the app's has `DiffCore`'s cursor
-  and visual selections. The app has no copy mode, so text in the
-  conversation is yanked only from the diff viewer.
+  and visual selections.
+- **The app yanks by block, the tui by line.** `y` in the app's
+  navigation yanks the reader's whole block. A line cursor needs a map
+  from shaped line to text range per block (`ConversationGeometry` holds
+  one row per block), a cursor with its own `InputContext` and motions,
+  and cursor and selection drawing; folds and streaming growth have to
+  agree with it. `Ctrl+A [` is unbound in the app: no action focuses the
+  conversation without toggling back on a second press.
+- **No selection is written to PRIMARY.** The app reads PRIMARY for
+  middle-click paste and never writes it; `docs/input.md` used to say a
+  selection auto-copies there.
 - **The kernel's register map is never pruned.** `EditorSessions` keeps an
   entry for every principal that ever sent vi keys, until a restart.
 
