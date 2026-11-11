@@ -213,7 +213,8 @@ before the first draft loads drops them, and an error toast says how many. A `:`
 refused with a notice: compose runs no ex commands, and the shell is
 `Ctrl+Z`. The one exception is `:vi <args>`, which runs as the shell statement
 `vi <args>` (the same as the tui's `:vi`), and the editor opens on this window
-through the kernel's open signal. A failed edit or submit shows as an error
+through the kernel's open signal. `:vi *.rs` opens one session over every
+file, and the mode line shows the current file and `(2 of 5)`. A failed edit or submit shows as an error
 toast; a failed chat submit reads the kernel's draft back, since the kernel
 keeps it.
 

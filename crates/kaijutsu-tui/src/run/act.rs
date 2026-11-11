@@ -906,7 +906,6 @@ mod tests {
         editor::enter_editor(
             &mut app,
             EditorOpen {
-                path: "notes.kai".to_string(),
                 state: kaijutsu_client::EditorState {
                     session: 7,
                     text: "hello".to_string(),
@@ -916,6 +915,9 @@ mod tests {
                     command_line: None,
                     message: None,
                     selection: None,
+                    path: "notes.kai".to_string(),
+                    arg_index: 0,
+                    arg_count: 1,
                 },
             },
         );

@@ -93,7 +93,7 @@ fn serve_invocations(rx: std::sync::mpsc::Receiver<PeerInvocation>, tx: mpsc::Se
                 Ok(open) => {
                     let echo = serde_json::json!({
                         "session": open.state.session,
-                        "path": open.path,
+                        "path": open.state.path,
                     });
                     if tx.blocking_send(open).is_err() {
                         return;

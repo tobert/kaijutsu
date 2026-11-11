@@ -94,6 +94,8 @@ fn dispatch_peer_action(
                 dirty: bool,
                 #[serde(default)]
                 command_line: Option<String>,
+                arg_index: u32,
+                arg_count: u32,
             }
             let p: Params =
                 serde_json::from_slice(params).map_err(|e| format!("invalid params: {e}"))?;
@@ -102,7 +104,6 @@ fn dispatch_peer_action(
             // (`view::editor::handle_editor_open`), mirroring how a context
             // switch drives Conversation — the editor owns its transition.
             editor_writer.write(EditorOpenRequested {
-                path: p.path.clone(),
                 state: kaijutsu_client::EditorState {
                     session: p.session,
                     text: p.text,
@@ -115,6 +116,9 @@ fn dispatch_peer_action(
                     message: None,
                     // A fresh session is in normal mode, so it selects nothing.
                     selection: None,
+                    path: p.path.clone(),
+                    arg_index: p.arg_index,
+                    arg_count: p.arg_count,
                 },
             });
 

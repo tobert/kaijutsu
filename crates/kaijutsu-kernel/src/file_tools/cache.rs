@@ -135,13 +135,14 @@ struct CachedFileDoc {
     /// true, `flush_one` refuses (rule 4, docs/file-buffers.md: not served
     /// as authoritative until acknowledged).
     swap_recovered: bool,
-    /// Count of callers holding this entry pinned against eviction — an
-    /// editor session pins its target for its whole lifetime (see
-    /// `docs/file-buffers.md`), so `evict_if_needed` must never drop an
-    /// entry with `pin_count > 0` even while clean. A count, not a bool,
-    /// because more than one session can bind the same path (two `vi`
-    /// windows on one file). `pin`/`unpin` maintain it; it starts at 0.
-    pin_count: u32,
+    /// The editor sessions holding this entry pinned against eviction, one
+    /// id per pin — a session pins each file it has loaded, current or
+    /// hidden, for its whole lifetime (see `docs/file-buffers.md`), so
+    /// `evict_if_needed` must never drop an entry with a pin even while
+    /// clean. A list, not a bool, because more than one session can bind the
+    /// same path (two `vi` windows on one file), and a refusal names them.
+    /// `pin`/`unpin` maintain it; it starts empty.
+    pinned_by: Vec<u64>,
     /// How many times [`mark_dirty`](FileDocumentCache::mark_dirty) has run on
     /// this entry. A flush or a rollback marks the entry clean only when this
     /// has not moved since it read the buffer; a newer edit keeps it dirty.
@@ -533,7 +534,7 @@ impl FileDocumentCache {
                             loaded_generation: row.loaded_generation,
                             disk_changed_since_load: false,
                             swap_recovered: true,
-                            pin_count: 0,
+                            pinned_by: Vec::new(),
                             marks: 0,
                         },
                     );
@@ -570,7 +571,7 @@ impl FileDocumentCache {
                     loaded_generation,
                     disk_changed_since_load: false,
                     swap_recovered: false,
-                    pin_count: 0,
+                    pinned_by: Vec::new(),
                     marks: 0,
                 },
             );
@@ -676,11 +677,7 @@ impl FileDocumentCache {
         let ctx_id = file_context_id(path);
         let mut cache = self.cache.write();
         match cache.get(&ctx_id) {
-            Some(entry) if entry.pin_count > 0 => Err(format!(
-                "{path}: {} open editor session(s) hold this buffer open — \
-                 close them (`ZZ`/`:q`), then retry",
-                entry.pin_count
-            )),
+            Some(entry) if !entry.pinned_by.is_empty() => Err(pinned_refusal(path, &entry.pinned_by)),
             _ => {
                 cache.remove(&ctx_id);
                 Ok(())
@@ -918,7 +915,7 @@ impl FileDocumentCache {
         let ctx_id = file_context_id(path);
         let Some(before) = before else {
             let only_this_write =
-                self.cache.read().get(&ctx_id).is_some_and(|e| e.marks == 1 && e.pin_count == 0);
+                self.cache.read().get(&ctx_id).is_some_and(|e| e.marks == 1 && e.pinned_by.is_empty());
             if !only_this_write {
                 return Err(format!(
                     "another writer opened {path} during the write; its buffer keeps this write's text as unsaved work"
@@ -1156,7 +1153,7 @@ impl FileDocumentCache {
                     loaded_generation: None,
                     disk_changed_since_load: false,
                     swap_recovered: false,
-                    pin_count: 0,
+                    pinned_by: Vec::new(),
                     marks: 0,
                 },
             );
@@ -1167,7 +1164,7 @@ impl FileDocumentCache {
 
     /// Evict oldest clean, unpinned entries if cache exceeds max size. Dirty
     /// entries are never evicted — they must be flushed first. Pinned entries
-    /// (`pin_count > 0`) are never evicted either, dirty or not — an editor
+    /// (a non-empty `pinned_by`) are never evicted either, dirty or not — an editor
     /// session pins its target for its whole open lifetime specifically so a
     /// clean buffer between open and its first edit can't be swept by
     /// unrelated reads (P1, `docs/issues.md` "Tech-debt audits, 2026-08-20";
@@ -1177,7 +1174,7 @@ impl FileDocumentCache {
             // Find oldest non-dirty, unpinned entry.
             let oldest_clean = cache
                 .iter()
-                .filter(|(_, e)| !e.dirty && e.pin_count == 0)
+                .filter(|(_, e)| !e.dirty && e.pinned_by.is_empty())
                 .min_by_key(|(_, e)| e.last_access)
                 .map(|(k, _)| *k);
 
@@ -1203,20 +1200,20 @@ impl FileDocumentCache {
     /// never drop it, regardless of dirty state — the fix for the P1 evicted-
     /// editor-buffer bug (`docs/issues.md` "Tech-debt audits, 2026-08-20";
     /// `docs/file-buffers.md`). An editor session calls this once at open
-    /// (after the target is loaded, so an entry to pin actually exists) and
-    /// [`unpin`](Self::unpin) once at close; a ref count, not a bool, because
-    /// more than one session can bind the same path.
+    /// for each file it loads (after the file is loaded, so an entry to pin
+    /// actually exists) and [`unpin`](Self::unpin) for each at close, with
+    /// its session id; a refusal to invalidate names the holders.
     ///
     /// Errors if `path` has no cache entry — pinning is meaningless without
     /// something to protect, and a silent no-op here would recreate exactly
     /// the bug this exists to close. Callers must load first
     /// (`try_get_or_load`).
-    pub fn pin(&self, path: &str) -> Result<(), String> {
+    pub fn pin(&self, path: &str, session: u64) -> Result<(), String> {
         let ctx_id = file_context_id(path);
         let mut cache = self.cache.write();
         match cache.get_mut(&ctx_id) {
             Some(entry) => {
-                entry.pin_count += 1;
+                entry.pinned_by.push(session);
                 Ok(())
             }
             None => Err(format!(
@@ -1230,15 +1227,33 @@ impl FileDocumentCache {
     /// [`invalidate`](Self::invalidate) and [`invalidate_document`](Self::invalidate_document)
     /// both refuse on a pinned entry rather than removing it — but calling
     /// `unpin` on a path that was never cached, or whose pin count already
-    /// unwound to zero, stays a harmless no-op rather than an error) or the
-    /// count is already zero.
-    pub fn unpin(&self, path: &str) {
+    /// unwound to zero, stays a harmless no-op rather than an error) or
+    /// `session` holds no pin on it.
+    pub fn unpin(&self, path: &str, session: u64) {
         let ctx_id = file_context_id(path);
         let mut cache = self.cache.write();
-        if let Some(entry) = cache.get_mut(&ctx_id) {
-            entry.pin_count = entry.pin_count.saturating_sub(1);
+        if let Some(entry) = cache.get_mut(&ctx_id)
+            && let Some(i) = entry.pinned_by.iter().position(|s| *s == session)
+        {
+            entry.pinned_by.swap_remove(i);
         }
     }
+}
+
+/// The refusal for invalidating a pinned path: it names the editor sessions
+/// holding it, and says the file may be a hidden file of an argument list,
+/// which the session's screen does not show.
+fn pinned_refusal(path: &str, sessions: &[u64]) -> String {
+    let mut ids: Vec<u64> = sessions.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let noun = if ids.len() == 1 { "session" } else { "sessions" };
+    let ids = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+    format!(
+        "{path}: held open by editor {noun} {ids}, perhaps as a hidden file of an \
+         argument list (`:args` lists it) — close the session (`:q`, `ZZ`, or \
+         `kj vi quit <session>`), then retry"
+    )
 }
 
 /// Derive a deterministic ContextId from a file path.
@@ -2452,7 +2467,7 @@ mod tests {
 
         vfs.write_all(p("/tmp/pinned.txt"), b"v1").await.unwrap();
         cache.try_read_content("/tmp/pinned.txt").await.unwrap();
-        cache.pin("/tmp/pinned.txt").expect("pin a cached entry");
+        cache.pin("/tmp/pinned.txt", 1).expect("pin a cached entry");
 
         // A second clean load would normally evict the only slot (cap=1) —
         // the pin must stop it.
@@ -2473,7 +2488,7 @@ mod tests {
             .expect("pinned entry must still be cached");
         cache.flush_one("/tmp/pinned.txt").await.unwrap();
 
-        cache.unpin("/tmp/pinned.txt");
+        cache.unpin("/tmp/pinned.txt", 1);
 
         // With the pin released, one more clean load evicts the
         // now-least-recently-used pinned.txt under the same cap=1 pressure.
@@ -2500,12 +2515,14 @@ mod tests {
 
         vfs.write_all(p("/tmp/held.txt"), b"v1").await.unwrap();
         cache.try_read_content("/tmp/held.txt").await.unwrap();
-        cache.pin("/tmp/held.txt").expect("pin a cached entry");
+        cache.pin("/tmp/held.txt", 7).expect("pin a cached entry");
 
         let err = cache
             .invalidate("/tmp/held.txt")
             .expect_err("invalidate must refuse a pinned entry");
         assert!(err.contains("/tmp/held.txt"), "error must name the path: {err}");
+        assert!(err.contains("editor session 7"), "error must name the session: {err}");
+        assert!(err.contains("argument list"), "error must name the hidden-buffer case: {err}");
         assert!(
             cache
                 .cache
@@ -2532,7 +2549,7 @@ mod tests {
         );
 
         // Once unpinned, both proceed normally.
-        cache.unpin("/tmp/held.txt");
+        cache.unpin("/tmp/held.txt", 7);
         cache
             .invalidate("/tmp/held.txt")
             .expect("invalidate must succeed once unpinned");

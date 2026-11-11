@@ -1061,7 +1061,7 @@ mod tests {
         let (backend, cache, db, faults) = faulty_mount_backend().await;
         let file = Path::new("/tmp/pinned.txt");
         backend.write(file, b"one\n", WriteMode::Overwrite).await.unwrap();
-        cache.pin("/tmp/pinned.txt").unwrap();
+        cache.pin("/tmp/pinned.txt", 1).unwrap();
 
         faults.fail_writes(true);
         assert!(backend.write(file, b"two\n", WriteMode::Overwrite).await.is_err());

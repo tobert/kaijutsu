@@ -1361,11 +1361,14 @@ this slice exposes, it does not guess.
 
 ### Editor and diff
 
-`vi <path>` (in the shell, or `:vi` on the bar) and `kj vi` open the
+`vi <path>...` (in the shell, or `:vi` on the bar) and `kj vi` open the
 kernel-owned editor session; the TUI
 forwards keys through `editor_keys` and draws the pushed `EditorState`
 (`kaijutsu.capnp`, `EditorState`). Both take the alternate screen and return
-on `:q`. `kaijutsu-editor` drives modalkit on
+on `:q`. The mode line draws `EditorState.path`, so `:n` and `:N` change it
+in place, and when the session's argument list holds more than one file it
+adds the position: `b.rs (2 of 5) [+]` (`docs/vi.md`, "The argument
+list"). `kaijutsu-editor` drives modalkit on
 `modalkit::crossterm::event::KeyEvent`, so the app's `keyconv.rs` translation
 is the identity here.
 

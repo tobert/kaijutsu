@@ -4313,6 +4313,12 @@ pub struct EditorState {
     /// The visual-mode selection as char spans to highlight; `None` outside
     /// visual mode. (docs/vi.md → Selection rects.)
     pub selection: Option<kaijutsu_types::editor::EditorSelection>,
+    /// The current file of the session's argument list.
+    pub path: String,
+    /// The current file's 0-based position in the argument list.
+    pub arg_index: u32,
+    /// How many files the argument list holds.
+    pub arg_count: u32,
 }
 
 /// Parse a capnp `EditorState` reader into the client struct. Shared by the
@@ -4344,6 +4350,9 @@ pub(crate) fn parse_editor_state(
         } else {
             None
         },
+        path: r.get_path()?.to_string()?,
+        arg_index: r.get_arg_index(),
+        arg_count: r.get_arg_count(),
     })
 }
 

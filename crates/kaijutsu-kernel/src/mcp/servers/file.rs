@@ -1250,7 +1250,7 @@ mod tests {
         let path = "/tmp/pinned.txt";
         let (broker, cache, vfs, db, faults) = broker_with_faulty_file(path, "alpha\n").await;
         cache.try_get_or_load(path).await.unwrap();
-        cache.pin(path).unwrap();
+        cache.pin(path, 1).unwrap();
         faults.fail_writes(true);
 
         let result = call(&broker, "edit", serde_json::json!({

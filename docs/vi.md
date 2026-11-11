@@ -96,7 +96,7 @@ and dot-repeat" under the `:` dialect).
   floats above the dock rather than integrating with its status row.
 
 Tracked in `docs/issues.md` (not repeated here): the slice-3 polish
-runner-verify and `:e <path>`.
+runner-verify, and argument-list recovery (`vi -r`).
 
 ---
 
@@ -183,8 +183,9 @@ graph.** The key *types* don't need a live TTY, so this is sound — accepted
 ### 2. Kernel editor sessions — the tool-shaped surface
 
 The kernel holds a registry of open editor sessions
-(`crates/kaijutsu-kernel/src/editor.rs`). Each session = one `EditorCore`
-bound to a `(context_id, block_id)`. Multi-user: many sessions (each its own
+(`crates/kaijutsu-kernel/src/editor.rs`). Each session is an argument list
+of files ("The argument list"); each loaded file is one `EditorCore` bound
+to a `(context_id, block_id)`. Multi-user: many sessions (each its own
 cursor/mode) can target one shared block; the kernel sequences every
 session's edits onto it, and siblings reconcile via the mechanism below.
 The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
@@ -193,7 +194,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 
 | Verb | Does |
 |---|---|
-| `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
+| `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_list(paths)` opens one session over an argument list, or joins the opener's session that holds one of the paths. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
 | `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. A dirty file-backed edit marks the swap row; a `:w`/`:wq`/`:x`/`ZZ` inside the batch flushes to disk too (`docs/file-buffers.md`). **Async** since `:r` (and now the flush) — sync-lock, release, await, sync-lock again; `EditorCore` never crosses the await, only the fetched `String`/flush result does. |
 | `editor_insert(session, text)` | A paste, not keystrokes: `EditorCore::insert_at_cursor` splices `text` at the live cursor and mirrors the edit onto the block, the same as a key batch's plain edit — no write intent, so nothing to flush. It never touches the vim state machine, so the mode is exactly what it was before the call: insert stays insert, normal stays normal. Refuses with the state unchanged while the `:` command line is open, reporting on `EditorState.message` — the same dialect-level channel a bad `:s` regex uses. Synchronous. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty/selection (what a renderer draws). |
@@ -202,7 +203,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`,
-`selection @7`) +
+`selection @7`, `path @8`, `argIndex @9`, `argCount @10`) +
 `editorOpen/Keys/State/Save/Quit @74–78` + `subscribeEditor @79` +
 `editorInsert @105` with `EditorEvents` callbacks. **The render channel is
 push, not poll** (decided
@@ -300,9 +301,10 @@ The same surface a test drives is what a model plays.
    `vi`.
    `edit` is kaish's hashline editor, not a vi front door, and the builtin is
    not registered under that name.
-   The builtin takes one path. kaish splits on whitespace, so `vi my notes.md`
-   is two words and is refused. Quote a path with a space: `vi "my notes.md"`,
-   in the shell and in the bars alike.
+   The builtin takes one or more paths, an argument list ("The argument
+   list"). kaish splits on whitespace, so `vi my notes.md` is two files.
+   Quote a path with a space: `vi "my notes.md"`, in the shell and in the
+   bars alike.
 2. **Save model: the session buffer binds to the block.** Typing lands as
    range edits (`block_store.edit_text`), never a whole-file replace. The
    kernel sequences every write, so concurrent merge into a block is
@@ -374,8 +376,9 @@ block.
 
 ## Rollback / checkpoint
 
-The checkpoint is the session's last-saved text (`EditorSession.saved_content`),
-set at `editor_open` and refreshed by `editor_save`.
+The checkpoint is a buffer's last-saved text (`Buffer.saved_content`), set
+when the file loads and refreshed by `editor_save`. Each file of an
+argument list has its own.
 
 - **`editor_save`/`ZZ`** sets the checkpoint to the current buffer text and
   clears the peer-wrote flag (see the entanglement guard below) — the
@@ -411,9 +414,9 @@ bus latency (flag not yet set, no sibling left to see) can still be clobbered.
 block-level peer-write race — closing this residual race still needs its own
 detection.
 
-The session also keeps the block's trailing terminator aside
-(`EditorSession.terminator`), so a newline-terminated block opens clean and
-`ZQ` re-applies the terminator.
+Each buffer also keeps its block's trailing terminator aside
+(`Buffer.terminator`), so a newline-terminated block opens clean and `ZQ`
+re-applies the terminator.
 
 ---
 
@@ -477,11 +480,9 @@ and `p` in the app, and `dd` on the compose line and `p` in a `vi` session.
 Amy's working pattern, same day: *"I often `vi *.rs` and :n and :N through
 the files, and I can yank and put things across them pretty quickly."*
 That pattern stays inside the kernel's vi sessions, whose registers one
-person's sessions already share. What it lacks is an argument list: `vi`
-takes one path, and the `:` dialect has no `:n`, `:N` or `:args`
-(`docs/issues.md`, "vi registers: what sharing leaves open"). The argument
-list serves that pattern without this store; this store serves a yank that
-crosses from one client, or from the compose line, to another editor.
+person's sessions already share, and the argument list serves it ("The
+argument list" below). This store serves a yank that crosses from one
+client, or from the compose line, to another editor.
 
 Three sets of registers exist per person today: the tui's compose, the
 app's compose, and the kernel's vi sessions. Compose runs `EditorCore` in
@@ -552,77 +553,112 @@ with.
 - The system clipboard stays a separate, outbound path: a yank is written
   to it, and nothing here reads it.
 
-### The argument list (design, not built)
+### The argument list
 
 Amy, 2026-11-11: *"I often `vi *.rs` and :n and :N through the files, and
 I can yank and put things across them pretty quickly."* She chose this
 ahead of the register store. One person's vi sessions already share
-registers, so this design adds only the list.
+registers, so the list is what this adds.
 
-**What exists.** `vi` takes one path and refuses more
-(`runtime/vi_builtin.rs`). An `EditorSession` is one `EditorCore` bound to
-one file document, with a checkpoint (`saved_content`) for `ZQ`. Unsaved
-text is already durable: a dirty file buffer is a swap file
-(`docs/file-buffers.md`). The session itself, its cursor and its place in
-any list are in memory.
+`vi a.rs b.rs c.rs` opens one session over the three files. kaish expands
+`vi *.rs` before the builtin sees it, and a path with a space is one word
+only when quoted. `:n` moves to `b.rs`, `:N` comes back, and `dd` in one
+file then `p` in another puts the line, because the registers belong to
+the player, not the buffer.
 
-**Two ways to build it.**
+**The session holds the list.** An `EditorSession` is an ordered list of
+files and a current index (`crates/kaijutsu-kernel/src/editor.rs`). Each
+loaded file is a buffer: an `EditorCore`, its document binding, its
+checkpoint and terminator, and its `peer_wrote` flag. The session id does
+not change as the index moves, so the renderer's screen and subscription
+stay. A file is loaded the first time it is visited: `begin_move` reports
+the path, the kernel resolves it outside the sessions lock (the async step
+`:r` uses), and `finish_load` loads it. A visited buffer keeps its core, so
+its undo history, marks and cursor are there on return, as vim's hidden
+buffers are. Each loaded file holds a file-cache pin until the session
+closes. The other design, one session per file with the client switching
+between them, would put the list, the dirty refusal and the `:` commands in
+every client; this project keeps derived logic in the kernel.
 
-1. *The session holds the list.* A session owns an ordered list of
-   buffers and a current index. Each buffer is what a session is today: a
-   core, its document binding, its checkpoint and terminator. `:n` and
-   `:N` change the index; the session id stays, so the renderer's screen
-   and its subscription stay. A buffer is loaded the first time it is
-   visited, through the async path `:r` already uses (an `EditorIo`
-   intent the kernel completes outside the session lock). A visited
-   buffer keeps its core, so its undo history, marks and cursor are there
-   on return, as vim's hidden buffers are.
-2. *The client holds the list.* `vi *.rs` opens one session per file and
-   the client switches which one it draws. The kernel changes little, and
-   each client reimplements the list, the dirty refusal and the `:`
-   commands. That is derived logic in the client, which this project
-   keeps in the kernel.
+**The dialect.** `kaijutsu-editor` parses the verbs into
+`CommandRequest::Go` and `CommandRequest::Args`; the kernel moves.
 
-**Recommendation: the session holds the list.**
+| Line | Does |
+|---|---|
+| `:n`, `:next` | Next file. `:2n` moves two. |
+| `:N`, `:Next`, `:prev`, `:previous` | Previous file. `:2N` moves two. |
+| `:first`, `:fir`, `:rew`, `:rewind` | First file. |
+| `:last`, `:la` | Last file. |
+| `:args`, `:ar` | Shows the list on `EditorState.message`, the current file in brackets: `a.rs [b.rs] c.rs`. |
+| `:wn`, `:wnext`, `:wN`, `:wNext`, `:wp`, `:wprevious` | Write, then move. A count works: `:2wn`. A failed write does not move. |
+| `:e path`, `:edit path` | Moves to `path`, appending it to the list when it is not in it (Amy: "add to the list"). A path already in the list adds nothing. |
 
-**The dialect.** `:n`/`:next`, `:N`/`:prev`, `:first`/`:rew`, `:last`,
-`:args` (shows the list with the current file bracketed, on
-`EditorState.message`), `:wn` and `:wN`. A count works as in vim (`:2n`).
-`:e path` appends a file to the list and moves to it (Amy: "add to the
-list"); vim keeps `:e` outside the argument list, and one list is simpler
-here. A path already in the list moves to it and adds nothing.
+Every verb but `:args` takes a `!` (`:n!`, `:e! path`); `:args!` is
+refused. A count of 0 is refused ("Positive
+count required"), and a count on a verb that takes none is refused ("No
+range allowed"). vim keeps `:e` outside the argument list; one list is
+simpler here. Every `:` line ends its key batch, as do `ZZ`, `ZQ` and a
+failed search: the kernel acts on the line, then runs the keys after it as
+the next batch (`EditorCore::take_rest`). So `x:w<CR>:n<CR>dd` writes this
+file, moves, and deletes a line of the next file; no line's intent is
+overwritten by a later one in the same batch.
 
-**One session per file, per person.** Opening a path that is already in
-one of the person's open sessions joins that session on that file (Amy:
-"join existing should be the default"). Any other paths in the same `vi`
-command are appended to that session's list. Another person's or a
-model's session over the same file is never joined: each keeps its own,
-and both see each edit as they do today.
+**Leaving a dirty buffer.** As vim, `:n`, `:N`, `:first`, `:last` and `:e`
+refuse with "No write since last change (add ! to override)" when the
+current buffer differs from its checkpoint. The `!` form leaves it dirty
+and hidden (Amy, 2026-11-11: "keep dirty"), where vim would discard: the
+text is already on the document and durable, and `ZQ`'s rollback stays the
+one way to discard. Moving to the current file is a no-op and refuses
+nothing. Past either end of the list: "Cannot go beyond last file" or
+"Cannot go before first file". `:wn` on the last file writes, then refuses.
+A file that cannot be opened reports on the status line and nothing moves;
+`:e` of such a path adds nothing to the list.
 
-**Leaving a dirty buffer.** As vim: `:n` refuses with "No write since last
-change (add ! to override)" when the buffer differs from its checkpoint.
-`:n!` leaves it dirty and hidden (Amy, 2026-11-11: "keep dirty"), where
-vim would discard: the text is
-already on the document and durable, and `ZQ`'s rollback stays the one way
-to discard. `:q` with dirty hidden buffers refuses and names the first
-one. `ZZ` saves the current buffer and closes the session only when no
-other buffer is dirty.
+**Closing.** `:q` with a dirty hidden buffer refuses and names the first
+one in list order: `No write since last change for buffer "a.rs"`.
+`:q!` and `ZQ` apply the rollback rule, with its entanglement guard, to
+every loaded file, then close. `ZZ`, `:wq` and `:x` save the current file
+and close only when no other file is dirty; otherwise they save and refuse
+to close with the same message.
 
-**The wire.** `EditorState` gains the current path and the list position
-("2 of 5"), which the status line draws. No new method: `:n` is keys.
+**One session per file, per person.** `vi` on a path that is already in one
+of the opener principal's sessions joins that session on that file (Amy:
+"join existing should be the default"). Any other paths in the same command
+are appended to that session's list, and the open signal names the joined
+session. Joining moves off a dirty buffer as `:n!` does, keeping it.
+Another person's or a model's session over the same file is never joined,
+and neither is a headless one (no opener): each keeps its own, and both see
+each edit as they do today. `:e` and `:n` inside a session do not join: a
+file another of the person's sessions holds opens in this one too, with
+the "already open in 1 other session" notice.
 
-**Recovery.** A session's list, index and per-buffer cursor go in a small
-table, written when they change. After a kernel restart no session is
-open and no client is reattached to one. `vi -r` lists what can be
-recovered and reopens it, with the dirty buffers' text coming from their
-swap documents. This is the same rule as the registers: nothing is
-restored unasked.
+**Peer edits reach hidden buffers.** `reconcile_block` merges a peer's
+write into every loaded buffer bound to the block, current or hidden, and
+sets that buffer's `peer_wrote`. A renderer is pushed a state only when the
+current buffer moved.
 
-**Open.**
+**The wire.** `EditorState` carries the current `path`, `argIndex` (0-based)
+and `argCount` (`kaijutsu.capnp`), and `EditorState::to_json` carries
+`path`, `arg_index` and `arg_count`. Both renderers draw the path and, when
+the list holds more than one file, `(2 of 5)` on the mode line
+(`kaijutsu_types::editor::arg_position_label`). No new method: `:n` is keys.
 
-- `kj vi` for models takes the same list or stays one path.
-- A path with a space arrives as one word only when quoted; the one-path
-  refusal that catches an unquoted one goes away with the list.
+**`kj vi` takes the list too.** `kj vi open a.rs b.rs` opens one session
+over both, with the same join rule for the caller's principal. `kj vi list`
+shows each session's current file, its place in the list, and every file
+with unsaved changes (`dirty_files`; `dirty` is true when any file is).
+`kj vi quit` names the files it closed and the ones it rolled back.
+
+**Not built.**
+
+- Recovery. A session's list, index and per-buffer cursor would go in a
+  small table, written when they change. After a kernel restart no session
+  is open and no client is reattached to one. `vi -r` would list what can
+  be recovered and reopen it, with the dirty buffers' text coming from
+  their swap documents. This is the same rule as the registers: nothing is
+  restored unasked.
+- vim's "N more files to edit" refusal of `:q` while unvisited files
+  remain. `:q` here closes once nothing loaded is dirty.
 
 ## Command mode — the editor's `:` dialect
 
@@ -662,6 +698,10 @@ push channel; the app renders it read-only.
   guard is W12: a plain `:w` refuses when disk moved past the buffer's load
   generation, reporting on the status line and leaving the session open and
   dirty; `:w!` sets `force` and overrides it.
+- **Argument list:** `:n :N :first :last :args :wn :wN :e path`, with
+  counts (`:2n`) and `!` forms. `:q` also refuses while another file of the
+  list is dirty, and `ZZ`/`:wq`/`:x` then save without closing. See "The
+  argument list" above for the table and the rules.
 - **Substitute:** `:s/old/new/`, `:%s/…/…/`, `:N,Ms/…/…/`. Hand-rolled
   (modalkit's `vim_cmd_substitute` is an explicit stub). **The dialect is Rust
   regex + Rust replacement syntax** (`$1` capture refs) — a deliberate choice

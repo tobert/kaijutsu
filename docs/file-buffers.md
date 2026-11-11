@@ -49,7 +49,7 @@ We had already built most of vim's *write* side and none of its *read* side.
 
 | vim | kaijutsu today |
 |---|---|
-| buffer dirty flag | `CachedFileDoc.dirty`, `EditorSessionInfo.dirty` |
+| buffer dirty flag | `CachedFileDoc.dirty`; per editor buffer, the checkpoint compare (`EditorSessionInfo.dirty_files` lists a session's dirty files) |
 | `:w` / `ZZ` | `editor_save`, `flush_one` |
 | last-written state | `EditorSession.saved_content` (the checkpoint) |
 | swap file | durable file document — but **silent**, which is the bug |
@@ -87,10 +87,12 @@ session's entry, and `mark_dirty`/`flush_one` used to treat "no entry" as
 "nothing to do" and return `Ok(())`: `:w` reported success while nothing
 reached disk (P1, `docs/issues.md` "Tech-debt audits, 2026-08-20"). The fix is
 two-sided: `mark_dirty`/`flush_one` now error (`FlushError::NotCached`) rather
-than silently no-op on an uncached path, and `Kernel::editor_open_as` pins the
-target's cache entry (`FileDocumentCache::pin`/`unpin`, ref-counted so two
-sessions on one path don't fight over the pin) for the session's whole open
-lifetime, released on close (`editor_keys`'s `Closed` arm, `editor_quit`). A
+than silently no-op on an uncached path, and an editor session pins the cache
+entry of every file it has loaded, current or hidden (`FileDocumentCache::pin`/
+`unpin`, keyed by session id so two sessions on one path don't fight over the
+pin), from the file's first visit until the session closes (`editor_keys`'s
+`Closed` arm, `editor_quit`). With an argument list (`docs/vi.md`, "The
+argument list"), that includes files the session's screen is not showing. A
 pinned entry is never evicted, dirty or not — the loud error is the backstop
 for every *other* caller, not the editor's steady-state path.
 
@@ -100,14 +102,18 @@ concurrent `invalidate`/`invalidate_document` (`kj swap discard`, a flush-
 failure rollback in `mount_backend.rs`, a binary write dropping a stale text
 shadow) still dropped a pinned entry outright, pulling the buffer out from
 under an open editor session. Both functions now refuse on a pinned entry
-instead of removing it, naming the path and the number of sessions holding it
-open. A caller in a best-effort position (mount_backend's binary-write
+instead of removing it, naming the path and the editor sessions holding it,
+and saying it may be a hidden file of an argument list. A caller in a best-effort position (mount_backend's binary-write
 paths) treats the refusal as informational —
 `tracing::warn!` and move on, since the entry surviving under a live session
 is the correct outcome, not a failure of the caller's own operation.
-`kj swap discard` on a path with an open editor session is the one
-production-reachable case today, and it now reports the refusal instead of
-silently orphaning the session's buffer.
+`kj swap discard` on a path an editor session holds reports the refusal
+instead of silently orphaning the session's buffer. The config writers that
+invalidate after a raw write (`kj rc add/rm`, `kj config reset`, through
+`Kernel::invalidate_config_file_cache`) only log the refusal and still
+report success, leaving the cached text stale (`docs/issues.md`). Since a
+session pins every file it has visited, a path can be held by a session
+showing another file.
 
 **A flush marks a buffer clean only if no edit arrived after it read the
 buffer.** Each entry counts its `mark_dirty` calls. `flush_one` records the

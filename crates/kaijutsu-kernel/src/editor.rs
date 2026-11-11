@@ -76,8 +76,20 @@ pub async fn resolve_editor_target(
 
 use std::collections::HashMap;
 
-use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo, Registers};
+use kaijutsu_editor::{
+    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, Registers,
+};
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
+
+/// Status-line message for leaving, or quitting, a buffer that differs from
+/// its checkpoint without `!` (vim's E37).
+pub const NO_WRITE_SINCE_LAST_CHANGE: &str = "No write since last change (add ! to override)";
+
+/// Status-line message for `:q`, `:wq`, `:x` or `ZZ` while another file of
+/// the argument list is dirty (vim's E162), naming the first such file.
+fn hidden_buffer_dirty(path: &str) -> String {
+    format!("No write since last change for buffer \"{path}\"")
+}
 
 /// A one-line census entry for an open session — what `kj vi list` shows.
 /// Full ids (never truncated), matching the `.data` convention every other
@@ -86,13 +98,21 @@ pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EditorSessionInfo {
     pub session: u64,
+    /// The current file of the session's argument list.
     pub path: String,
-    /// Full id string of the target document (`ContextId::to_hex`).
+    /// Full id string of the current file's document (`ContextId::to_hex`).
     pub context_id: String,
-    /// Full id string of the target block (`BlockId::to_key`).
+    /// Full id string of the current file's block (`BlockId::to_key`).
     pub block_id: String,
-    /// Whether the buffer differs from the last open/save checkpoint.
+    /// The current file's 0-based position in the argument list.
+    pub arg_index: usize,
+    /// How many files the argument list holds.
+    pub arg_count: usize,
+    /// Whether any file of the session differs from its checkpoint.
     pub dirty: bool,
+    /// The files that differ from their checkpoints, current or hidden, in
+    /// list order.
+    pub dirty_files: Vec<String>,
     pub mode: Option<String>,
     /// Full id string of the opener's principal, `None` for a headless open.
     pub opener: Option<String>,
@@ -120,8 +140,9 @@ pub enum KeysOutcome {
 /// For a `Closed` outcome it has (there is no separate flush step to gate
 /// on). For an `Updated` outcome — a plain `:w` that leaves the session
 /// open — it has **not**: `state.dirty` is still `true`, and the
-/// kernel layer must flush to disk first and only then checkpoint, or the
-/// buffer would read clean before the bytes land (docs/file-buffers.md).
+/// kernel layer must flush `path` to disk first and only then checkpoint
+/// buffer `buffer`, or the buffer would read clean before the bytes land
+/// (docs/file-buffers.md).
 ///
 /// `forced` carries `:w!`'s bang through to the kernel layer's W12
 /// changed-under-us guard (`FileDocumentCache::flush_one_guarded`,
@@ -130,21 +151,36 @@ pub enum KeysOutcome {
 /// overrides that refusal. This pure registry has no file cache to check
 /// against, so it only carries the bit — the kernel layer is what acts on it.
 ///
-/// `rolled_back` mirrors [`EditorSessions::quit`]'s return: `true` when a
-/// `ZQ`/`:q!`-style discard in this batch actually rewrote the block (the
-/// buffer held unsaved changes at the moment of quit), `false` for a `ZZ`
-/// close (which checkpoints before quitting, so quit's rewrite is always a
-/// no-op) and for every `Updated` outcome (no quit ran). The kernel layer
-/// marks a file-backed entry dirty whenever this is `true`, on top of
-/// `saved` — a discard's rollback writes the block via a raw `edit_text`
-/// call the file cache's own flush pipeline never sees, so the block can end
-/// up disagreeing with disk with nothing tracking it (docs/file-buffers.md).
+/// `quit` reports what a close did to every loaded file (see
+/// [`QuitReport`]); it is empty for every `Updated` outcome.
+///
+/// `go` is a move through the argument list the kernel layer performs after
+/// the batch's write has landed ([`EditorSessions::begin_move`]), and `rest`
+/// the keys the batch left unfed after the intent that ended it; the kernel
+/// layer feeds them to the current buffer once it has acted.
 #[derive(Debug)]
 pub struct KeysUpdate {
     pub state: EditorState,
+    /// The file the batch ran in, and its index in the argument list.
+    pub path: String,
+    pub buffer: usize,
     pub saved: bool,
     pub forced: bool,
-    pub rolled_back: bool,
+    pub quit: QuitReport,
+    pub go: Option<(ArgMove, bool)>,
+    pub rest: Option<PendingKeys>,
+}
+
+/// What closing a session did to its loaded files.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct QuitReport {
+    /// Every loaded file's path. The kernel layer pinned each at load and
+    /// releases the pins on close.
+    pub loaded: Vec<String>,
+    /// The files whose rollback rewrote their block. The kernel layer marks
+    /// each dirty in the file cache: the rollback is a raw block edit the
+    /// cache's flush pipeline never sees (docs/file-buffers.md).
+    pub rolled_back: Vec<String>,
 }
 
 impl KeysOutcome {
@@ -205,6 +241,12 @@ pub struct EditorState {
     /// The visual-mode selection as char spans to highlight; `None` outside
     /// visual mode. Rebuilt from `EditorCore` on every state.
     pub selection: Option<EditorSelection>,
+    /// The current file's path, as the opener named it.
+    pub path: String,
+    /// The current file's 0-based position in the session's argument list.
+    pub arg_index: usize,
+    /// How many files the argument list holds.
+    pub arg_count: usize,
 }
 
 impl EditorState {
@@ -222,20 +264,25 @@ impl EditorState {
             "command_line": self.command_line,
             "message": self.message,
             "selection": self.selection,
+            "path": self.path,
+            "arg_index": self.arg_index,
+            "arg_count": self.arg_count,
         })
     }
 }
 
 /// Who opened a session, and the shell context they opened from — captured at
 /// the front door (`vi`, `kj vi`) and recorded on the
-/// session. Two consumers:
+/// session. Three consumers:
 ///
 /// - **`fg`** re-foregrounds the caller's most-recent session by `principal`.
+/// - **`vi`** joins the `principal`'s session that already holds a named file.
 /// - **`:r !cmd`** preserves requester, performer, reviewer, session, and the
 ///   context at open. Later shell navigation does not retarget the read.
 ///
 /// `None` for a headless open (a test driver, the wire `editorOpen` handler):
-/// nobody to foreground, and `:r !cmd` then fails loud rather than guessing.
+/// nobody to foreground or join, and `:r !cmd` then fails loud rather than
+/// guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorOpener {
     pub principal: PrincipalId,
@@ -245,32 +292,21 @@ pub struct EditorOpener {
     pub session_id: SessionId,
 }
 
-/// One open editor: a pure [`EditorCore`] bound to the kernel block that owns the
-/// text, plus the rollback checkpoint.
-struct EditorSession {
+/// One loaded file: a pure [`EditorCore`] bound to the kernel block that owns
+/// the text, plus the rollback checkpoint.
+struct Buffer {
     core: EditorCore,
     target: EditorTarget,
-    /// The path the editor was opened on (as the caller named it — e.g. a
-    /// `coder/*` symlink, before resolution). Used to invalidate the shared
-    /// `FileDocumentCache` after a write so a kaish `cat` of this path re-reads
-    /// the just-edited block instead of a stale shadow copy.
-    path: String,
     /// Normalized (terminator-stripped) content as of the last open/save — the
     /// dirty/`ZQ` checkpoint. Matches `EditorCore`'s normalized view so dirty
     /// compares like-to-like (a newline-terminated block opens clean).
     saved_content: String,
-    /// The block's trailing terminator (`"\n"` or `""`) captured at open.
+    /// The block's trailing terminator (`"\n"` or `""`) captured at load.
     /// `EditorCore` strips modalkit's line terminator, so the terminator lives
     /// here; edits mirror as diffs (never touching it) and `ZQ` re-applies it.
     terminator: String,
-    /// Who opened the session + the context they opened from ([`EditorOpener`]).
-    /// `fg` finds the caller's suspended editor by `principal`; `:r !cmd` runs in
-    /// the opener's `(principal, context_id, session_id)`. Later edits use the
-    /// player who submitted each input, not this opener. `None` for a headless
-    /// open (test / wire `editorOpen` — no caller to capture).
-    opener: Option<EditorOpener>,
-    /// Whether a **peer's** write merged into this session since the last
-    /// open/save checkpoint — set by [`EditorSessions::reconcile_block`] (a
+    /// Whether a **peer's** write merged into this buffer since the last
+    /// load/save checkpoint — set by [`EditorSessions::reconcile_block`] (a
     /// non-self merge), reset when the checkpoint advances ([`EditorSessions::save`]).
     /// A `ZQ` rollback to the checkpoint would revert that peer work along with
     /// ours, so [`EditorSessions::quit`] skips the rollback when this is set:
@@ -278,11 +314,140 @@ struct EditorSession {
     peer_wrote: bool,
 }
 
+impl Buffer {
+    /// Load the block's current text as a fresh buffer and checkpoint.
+    fn load(target: EditorTarget, blocks: &SharedBlockStore) -> Result<Self, String> {
+        let raw = block_text(blocks, &target)?;
+        let core = EditorCore::new(&raw);
+        let terminator = if raw.ends_with('\n') { "\n" } else { "" }.to_string();
+        let saved_content = core.text();
+        Ok(Buffer { core, target, saved_content, terminator, peer_wrote: false })
+    }
+
+    fn dirty(&self) -> bool {
+        self.core.text() != self.saved_content
+    }
+}
+
+/// One file of a session's argument list.
+struct ArgFile {
+    /// The path as the opener named it (e.g. a `coder/*` symlink, before
+    /// resolution). The kernel layer flushes and pins the file cache by it.
+    path: String,
+    /// `None` until the file is first visited; a visited file keeps its
+    /// buffer, so its undo history, marks and cursor are there on return.
+    buffer: Option<Buffer>,
+}
+
+/// One open editor: an argument list of files and the current one. The
+/// current file is always loaded. The id never changes as the current file
+/// moves, so a renderer keeps its screen and subscription across `:n`.
+struct EditorSession {
+    files: Vec<ArgFile>,
+    current: usize,
+    /// Who opened the session + the context they opened from ([`EditorOpener`]).
+    /// `fg` finds the caller's suspended editor by `principal`; `:r !cmd` runs in
+    /// the opener's `(principal, context_id, session_id)`. Later edits use the
+    /// player who submitted each input, not this opener. `None` for a headless
+    /// open (test / wire `editorOpen` — no caller to capture).
+    opener: Option<EditorOpener>,
+}
+
+impl EditorSession {
+    fn path(&self) -> &str {
+        &self.files[self.current].path
+    }
+
+    /// The buffer at `index`. Every visited file is loaded; an unloaded one
+    /// here is a registry defect, reported rather than guessed past.
+    fn buffer_at(&mut self, index: usize) -> Result<&mut Buffer, String> {
+        self.files
+            .get_mut(index)
+            .and_then(|f| f.buffer.as_mut())
+            .ok_or_else(|| format!("editor: file {index} of the argument list is not loaded"))
+    }
+
+    fn buffer(&mut self) -> Result<&mut Buffer, String> {
+        self.buffer_at(self.current)
+    }
+
+    fn state(&mut self) -> Result<EditorState, String> {
+        let (path, arg_index, arg_count) =
+            (self.path().to_string(), self.current, self.files.len());
+        let buffer = self.buffer()?;
+        let checkpoint = buffer.saved_content.clone();
+        Ok(state_of(&mut buffer.core, &checkpoint, path, arg_index, arg_count))
+    }
+
+    /// The first file of the list, other than the current one, whose buffer
+    /// differs from its checkpoint.
+    fn first_other_dirty(&self) -> Option<&str> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.current)
+            .find(|(_, f)| f.buffer.as_ref().is_some_and(Buffer::dirty))
+            .map(|(_, f)| f.path.as_str())
+    }
+
+    fn position(&self, path: &str) -> Option<usize> {
+        self.files.iter().position(|f| f.path == path)
+    }
+
+    /// `:args` — the list with the current file in brackets, as vim prints it.
+    fn args_line(&self) -> String {
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if i == self.current { format!("[{}]", f.path) } else { f.path.clone() }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// The input of one key batch: typed keys, or the keys a previous batch left
+/// unfed.
+pub enum BatchInput<'a> {
+    Keys(&'a str),
+    Pending(PendingKeys),
+}
+
+/// The first step of a move through the argument list
+/// ([`EditorSessions::begin_move`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoveStep {
+    /// The move did not happen; the message goes on the status line.
+    Refused(String),
+    /// The move landed on a loaded buffer, or on the current one.
+    Moved,
+    /// The target file is not loaded yet. The kernel layer resolves `path`
+    /// (the async step) and completes the move with
+    /// [`EditorSessions::finish_load`].
+    Load { path: String },
+}
+
+/// How [`EditorSessions::finish_load`] completed a move.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadStep {
+    /// The buffer was loaded and is now current. `message` announces other
+    /// sessions bound to the same file.
+    Loaded { message: Option<String> },
+    /// Another batch loaded the file while this one resolved it; the session
+    /// moved to that buffer. The caller's pin for this load is surplus.
+    AlreadyLoaded,
+    /// The current buffer became dirty while the file resolved; nothing
+    /// moved and nothing loaded. The caller's pin for this load is surplus.
+    Refused(String),
+}
+
 /// The kernel's registry of open editor sessions.
 ///
 /// Every operation is **synchronous**: the `EditorCore` (which is `!Send` via
 /// modalkit) never crosses an `await`. The only async step — resolving a path —
-/// happens *before* [`open`](Self::open), not inside it. So once wired into the
+/// happens *before* [`open`](Self::open) and
+/// [`finish_load`](Self::finish_load), not inside them. So once wired into the
 /// shared kernel this registry can live behind a plain mutex.
 #[derive(Default)]
 pub struct EditorSessions {
@@ -301,56 +466,98 @@ impl EditorSessions {
         Self::default()
     }
 
-    /// Open an editor on a *pre-resolved* target (resolve with
-    /// [`resolve_editor_target`] first — the only async step). The block's
-    /// current text becomes the initial buffer and the rollback checkpoint.
+    /// Open an editor over the argument list `paths`, on a *pre-resolved*
+    /// target for the first of them (resolve with [`resolve_editor_target`]
+    /// first — the only async step). The first file's current text becomes
+    /// the initial buffer and its rollback checkpoint; the others load when
+    /// first visited. A path named twice is listed once.
     ///
     /// Two players on one block is a supported state (`docs/vi.md`) — this
     /// never refuses the open on that account. It only announces: when a
-    /// session is already bound to `target`, the returned state's `message`
-    /// names how many, the same status-line channel a bad `:s` regex uses, so
-    /// the caller can go back to the existing session or shut it down instead
-    /// of editing blind to it (Amy, 2026-08-19).
-    pub fn open(
+    /// buffer is already bound to `target`, the returned state's `message`
+    /// names how many sessions hold it, the same status-line channel a bad
+    /// `:s` regex uses, so the caller can go back to the existing session or
+    /// shut it down instead of editing blind to it (Amy, 2026-08-19).
+    pub fn open<S: AsRef<str>>(
         &mut self,
-        path: &str,
+        paths: &[S],
         target: EditorTarget,
         blocks: &SharedBlockStore,
         opener: Option<EditorOpener>,
     ) -> Result<(EditorSessionId, EditorState), String> {
-        let raw = block_text(blocks, &target)?;
-        let mut core = EditorCore::new(&raw);
-        // EditorCore strips modalkit's terminator; keep the block's own
-        // terminator aside so dirty/rollback compare against the normalized view.
-        let terminator = if raw.ends_with('\n') { "\n" } else { "" }.to_string();
-        let saved_content = core.text();
-        let mut state = state_of(&mut core, &saved_content);
-        let existing = self.sessions.values().filter(|s| s.target == target).count();
-        if existing > 0 {
-            state.message = Some(format!(
-                "already open in {existing} other session{} — edits from every session merge live",
-                if existing == 1 { "" } else { "s" }
-            ));
+        let first = paths
+            .first()
+            .ok_or_else(|| "open editor: no path given".to_string())?
+            .as_ref();
+        let buffer = Buffer::load(target, blocks)?;
+        let message = self.announce_bound(target);
+        let mut files = vec![ArgFile { path: first.to_string(), buffer: Some(buffer) }];
+        for path in &paths[1..] {
+            let path = path.as_ref();
+            if !files.iter().any(|f| f.path == path) {
+                files.push(ArgFile { path: path.to_string(), buffer: None });
+            }
         }
+        let mut session = EditorSession { files, current: 0, opener };
+        let mut state = session.state()?;
+        state.message = message;
         let id = EditorSessionId(self.next_id);
         self.next_id += 1;
-        self.sessions.insert(
-            id,
-            EditorSession {
-                core,
-                target,
-                path: path.to_string(),
-                saved_content,
-                terminator,
-                opener,
-                peer_wrote: false,
-            },
-        );
+        self.sessions.insert(id, session);
         Ok((id, state))
     }
 
+    /// The status-line notice that other sessions already hold `target`, or
+    /// `None` when none does. Counts sessions, not buffers.
+    fn announce_bound(&self, target: EditorTarget) -> Option<String> {
+        let existing = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.files.iter().any(|f| f.buffer.as_ref().is_some_and(|b| b.target == target))
+            })
+            .count();
+        (existing > 0).then(|| {
+            format!(
+                "already open in {existing} other session{} — edits from every session merge live",
+                if existing == 1 { "" } else { "s" }
+            )
+        })
+    }
+
+    /// The most recent session `principal` opened whose argument list holds
+    /// one of `paths`, and the first such path in `paths` order. Only that
+    /// principal's sessions count: `vi` joins a person's own session and
+    /// never another player's (`docs/vi.md`, "The argument list").
+    pub fn find_joinable<S: AsRef<str>>(
+        &self,
+        principal: PrincipalId,
+        paths: &[S],
+    ) -> Option<(EditorSessionId, String)> {
+        paths.iter().map(AsRef::as_ref).find_map(|path| {
+            self.sessions
+                .iter()
+                .filter(|(_, s)| s.opener.map(|o| o.principal) == Some(principal))
+                .filter(|(_, s)| s.position(path).is_some())
+                .max_by_key(|(id, _)| id.0)
+                .map(|(id, _)| (*id, path.to_string()))
+        })
+    }
+
+    /// Append `paths` to a session's argument list, skipping any it already
+    /// holds. The current file does not change.
+    pub fn append<S: AsRef<str>>(&mut self, id: EditorSessionId, paths: &[S]) -> Result<(), String> {
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        for path in paths.iter().map(AsRef::as_ref) {
+            if session.position(path).is_none() {
+                session.files.push(ArgFile { path: path.to_string(), buffer: None });
+            }
+        }
+        Ok(())
+    }
+
     /// The most-recently-opened session owned by `principal` (the highest id,
-    /// since ids increment monotonically) and the path it edits — what `fg`
+    /// since ids increment monotonically) and its current path — what `fg`
     /// re-foregrounds. `None` if the principal has no open editor (`fg` then
     /// reports "no editor session"). The job-control "most recent" semantics.
     pub fn latest_session_for(
@@ -361,7 +568,7 @@ impl EditorSessions {
             .iter()
             .filter(|(_, s)| s.opener.map(|o| o.principal) == Some(principal))
             .max_by_key(|(id, _)| id.0)
-            .map(|(id, s)| (*id, s.path.clone()))
+            .map(|(id, s)| (*id, s.path().to_string()))
     }
 
     /// The opener (`principal` + originating context) recorded for `id`, if any.
@@ -380,14 +587,14 @@ impl EditorSessions {
         self.sessions
             .iter()
             .max_by_key(|(id, _)| id.0)
-            .map(|(id, s)| (*id, s.path.clone()))
+            .map(|(id, s)| (*id, s.path().to_string()))
     }
 
-    /// The terminator this session set aside at open: the block's raw text is
-    /// this session's buffer text followed by it.
+    /// The terminator the current buffer set aside at load: the block's raw
+    /// text is the buffer text followed by it.
     #[cfg(test)]
-    fn terminator_for_test(&self, id: EditorSessionId) -> String {
-        self.sessions[&id].terminator.clone()
+    fn terminator_for_test(&mut self, id: EditorSessionId) -> String {
+        self.sessions.get_mut(&id).unwrap().buffer().unwrap().terminator.clone()
     }
 
     /// Feed keys to a session, mirror the produced edits onto the kernel block,
@@ -426,116 +633,163 @@ impl EditorSessions {
         actor: PrincipalId,
         can_write: bool,
     ) -> Result<KeysOutcome, String> {
-        let (close, commands) = {
+        self.batch(id, BatchInput::Keys(keys), blocks, actor, can_write)
+    }
+
+    /// [`keys_checked`](Self::keys_checked) for either input: typed keys, or
+    /// the keys a previous batch left unfed ([`KeysUpdate::rest`]), which run
+    /// in the session's current buffer, the one a move landed on.
+    pub fn batch(
+        &mut self,
+        id: EditorSessionId,
+        input: BatchInput<'_>,
+        blocks: &SharedBlockStore,
+        actor: PrincipalId,
+        can_write: bool,
+    ) -> Result<KeysOutcome, String> {
+        let (close, commands, rest) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-            let len_before = session.core.text().chars().count();
-            session.core.give_registers(self.registers.remove(&actor).unwrap_or_default());
-            let ops = session.core.apply_keys(keys);
-            self.registers.insert(actor, session.core.take_registers());
-            let buffer_after = session.core.text();
+            let buffer = session.buffer()?;
+            let len_before = buffer.core.text().chars().count();
+            buffer.core.give_registers(self.registers.remove(&actor).unwrap_or_default());
+            let ops = match input {
+                BatchInput::Keys(keys) => buffer.core.apply_keys(keys),
+                BatchInput::Pending(keys) => buffer.core.apply_pending(keys),
+            };
+            self.registers.insert(actor, buffer.core.take_registers());
+            let buffer_after = buffer.core.text();
             mirror_ops(
                 &ops,
-                &session.target,
-                &session.terminator,
+                &buffer.target,
+                &buffer.terminator,
                 len_before,
                 &buffer_after,
                 blocks,
                 actor,
                 "editor keys",
             )?;
-            (session.core.take_close(), session.core.take_commands())
+            (buffer.core.take_close(), buffer.core.take_commands(), buffer.core.take_rest())
         };
 
         // `ZZ`/`ZQ` close the session. The returned state is informational (the
         // last view before close); renderers react to the `Closed` push.
         if let Some(close) = close {
-            let (final_state, saved, rolled_back) = match close {
+            let (path, index) = self.current_file(id)?;
+            match close {
                 CloseRequest::Write => {
                     if !can_write {
                         return self.refuse_write(id);
+                    }
+                    // Another dirty file keeps the session open: save this
+                    // one (the kernel layer flushes, then checkpoints) and
+                    // name the first dirty file.
+                    if let Some(other) = self.first_other_dirty(id)? {
+                        let mut state = self.state(id)?;
+                        state.message = Some(hidden_buffer_dirty(&other));
+                        return Ok(KeysOutcome::Updated(KeysUpdate {
+                            state,
+                            path,
+                            buffer: index,
+                            saved: true,
+                            forced: false,
+                            quit: QuitReport::default(),
+                            go: None,
+                            rest: None,
+                        }));
                     }
                     // ZZ: checkpoint current as saved, then quit — the rollback
                     // to that just-taken checkpoint is a no-op. `saved: true`
                     // tells the kernel layer to flush a file-backed session.
                     let state = self.save(id)?;
-                    let rolled_back = self.quit(id, blocks, actor)?;
-                    (state, true, rolled_back)
+                    let quit = self.quit(id, blocks, actor)?;
+                    return Ok(KeysOutcome::Closed(KeysUpdate {
+                        state,
+                        path,
+                        buffer: index,
+                        saved: true,
+                        forced: false,
+                        quit,
+                        go: None,
+                        rest: None,
+                    }));
                 }
                 CloseRequest::Discard => {
-                    // ZQ: snapshot the view, then roll back to the last
-                    // checkpoint. Nothing to flush — the discard never advanced
-                    // the checkpoint. `rolled_back` tells the kernel layer
-                    // whether that rollback actually rewrote the block.
+                    // ZQ: snapshot the view, then roll every file back to its
+                    // last checkpoint. Nothing to flush — the discard never
+                    // advanced a checkpoint. `quit.rolled_back` tells the
+                    // kernel layer which rollbacks actually rewrote a block.
                     let state = self.state(id)?;
-                    let rolled_back = self.quit(id, blocks, actor)?;
-                    (state, false, rolled_back)
-                }
-            };
-            return Ok(KeysOutcome::Closed(KeysUpdate {
-                state: final_state,
-                saved,
-                forced: false,
-                rolled_back,
-            }));
-        }
-
-        // A submitted `:`-line (`:w`/`:wq`/`:q!`/…). A parsed batch runs in
-        // order; an unknown command or a bad `:s` regex (both arrive as
-        // `Some(Err)`) reports vim-style on the status line and keeps the session
-        // open — never errors the whole `editor_keys` call out from under the
-        // renderer (the front door would otherwise surface it as a hard failure).
-        if let Some(parsed) = commands {
-            match parsed {
-                Ok(cmds) => return self.run_commands(id, cmds, blocks, actor, can_write),
-                Err(msg) => {
-                    let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-                    let checkpoint = session.saved_content.clone();
-                    let mut state = state_of(&mut session.core, &checkpoint);
-                    state.message = Some(msg);
-                    return Ok(KeysOutcome::Updated(KeysUpdate {
+                    let quit = self.quit(id, blocks, actor)?;
+                    return Ok(KeysOutcome::Closed(KeysUpdate {
                         state,
+                        path,
+                        buffer: index,
                         saved: false,
                         forced: false,
-                        rolled_back: false,
+                        quit,
+                        go: None,
+                        rest: None,
                     }));
                 }
             }
         }
 
-        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let checkpoint = session.saved_content.clone();
-        Ok(KeysOutcome::Updated(KeysUpdate {
-            state: state_of(&mut session.core, &checkpoint),
+        // A submitted `:`-line (`:w`/`:wq`/`:q!`/`:n`/…). A parsed batch runs in
+        // order; an unknown command or a bad `:s` regex (both arrive as
+        // `Some(Err)`) reports vim-style on the status line and keeps the session
+        // open — never errors the whole `editor_keys` call out from under the
+        // renderer (the front door would otherwise surface it as a hard failure).
+        let mut outcome = match commands {
+            Some(Ok(cmds)) => self.run_commands(id, cmds, blocks, actor, can_write)?,
+            Some(Err(msg)) => {
+                let mut update = self.update(id)?;
+                update.state.message = Some(msg);
+                KeysOutcome::Updated(update)
+            }
+            None => KeysOutcome::Updated(self.update(id)?),
+        };
+        if let KeysOutcome::Updated(update) = &mut outcome {
+            update.rest = rest;
+        }
+        Ok(outcome)
+    }
+
+    /// A plain `Updated` for the session's current file: nothing to save,
+    /// close or move.
+    fn update(&mut self, id: EditorSessionId) -> Result<KeysUpdate, String> {
+        let (path, buffer) = self.current_file(id)?;
+        Ok(KeysUpdate {
+            state: self.state(id)?,
+            path,
+            buffer,
             saved: false,
             forced: false,
-            rolled_back: false,
-        }))
+            quit: QuitReport::default(),
+            go: None,
+            rest: None,
+        })
     }
 
     /// A write intent refused for lacking `Capability::Editor` — shared by
     /// [`keys_checked`](Self::keys_checked)'s `ZZ` arm and
     /// [`run_commands`](Self::run_commands)'s `Write`/`Quit` arm, so the
     /// outcome shape and message are identical everywhere a refusal can fire.
-    /// Nothing is mutated: no checkpoint, no quit, no flush — the session is
-    /// exactly as it was before this batch's write intent.
+    /// Nothing is mutated: no checkpoint, no quit, no flush, no move — the
+    /// session is exactly as it was before this batch's write intent.
     fn refuse_write(&mut self, id: EditorSessionId) -> Result<KeysOutcome, String> {
-        let mut state = self.state(id)?;
-        state.message = Some(WRITE_CAPABILITY_REFUSED.to_string());
-        Ok(KeysOutcome::Updated(KeysUpdate {
-            state,
-            saved: false,
-            forced: false,
-            rolled_back: false,
-        }))
+        let mut update = self.update(id)?;
+        update.state.message = Some(WRITE_CAPABILITY_REFUSED.to_string());
+        Ok(KeysOutcome::Updated(update))
     }
 
     /// Act on a parsed `:`-command batch (`docs/vi.md` → *Command mode*). `Quit`
     /// closes — refusing a dirty buffer without `!` (vim's E37 "No write since
     /// last change", reported on the status line like every dialect-level
-    /// failure). Returns [`KeysOutcome::Closed`] if a `Quit` ran, else
-    /// [`KeysOutcome::Updated`]. The returned `saved` flag (true whenever this
-    /// batch ran a `Write`, including inside `:wq`/`:x`) is the kernel layer's
-    /// cue to flush a file-backed session.
+    /// failure), and refusing while another file of the argument list is
+    /// dirty (vim's E162). Returns [`KeysOutcome::Closed`] if a `Quit` ran,
+    /// else [`KeysOutcome::Updated`]. The returned `saved` flag (true whenever
+    /// this batch ran a `Write`, including inside `:wq`/`:x`) is the kernel
+    /// layer's cue to flush a file-backed session.
     ///
     /// **`Write` does not checkpoint by itself.** The checkpoint must not
     /// advance until the write actually lands, and this pure registry has no
@@ -551,6 +805,10 @@ impl EditorSessions {
     /// as the existing session-lost hard error on `KeysOutcome::Closed`,
     /// never a reverted edit.
     ///
+    /// **`Go` does not move here either.** It rides out on
+    /// [`KeysUpdate::go`] so the kernel layer moves only after the batch's
+    /// write landed (`:wn`), and can resolve a file not yet loaded.
+    ///
     /// `can_write: false` refuses the `Write` command outright — same
     /// message and outcome shape as [`refuse_write`](Self::refuse_write) —
     /// before it can set `write_requested` or advance anything, so a `:wq`
@@ -563,8 +821,10 @@ impl EditorSessions {
         actor: PrincipalId,
         can_write: bool,
     ) -> Result<KeysOutcome, String> {
+        let (path, index) = self.current_file(id)?;
         let mut write_requested = false;
         let mut forced = false;
+        let mut message = None;
         for cmd in commands {
             match cmd {
                 // `force` rides through to the returned `KeysUpdate` for the
@@ -581,64 +841,176 @@ impl EditorSessions {
                     write_requested = true;
                     forced = force;
                 }
+                CommandRequest::Args => {
+                    let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
+                    message = Some(session.args_line());
+                }
+                CommandRequest::Go { to, force } => {
+                    let mut update = self.update(id)?;
+                    update.saved = write_requested;
+                    update.forced = forced;
+                    update.go = Some((to, force));
+                    return Ok(KeysOutcome::Updated(update));
+                }
                 CommandRequest::Quit { force } => {
-                    let state = if write_requested {
-                        self.save(id)?
+                    // A dialect-level refusal, not an RPC failure: ride the
+                    // status line (like E492) and keep the session open. A
+                    // hard error here never reaches the GUI and leaves the
+                    // renderer's `:`-strip showing the stale submitted line.
+                    let refusal = if force {
+                        None
+                    } else if !write_requested && self.state(id)?.dirty {
+                        Some(NO_WRITE_SINCE_LAST_CHANGE.to_string())
                     } else {
-                        self.state(id)?
+                        self.first_other_dirty(id)?.map(|other| hidden_buffer_dirty(&other))
                     };
-                    if !force && state.dirty {
-                        // A dialect-level refusal, not an RPC failure: ride the
-                        // status line (like E492) and keep the session open. A
-                        // hard error here never reaches the GUI and leaves the
-                        // renderer's `:`-strip showing the stale submitted line.
-                        let mut state = state;
-                        state.message =
-                            Some("No write since last change (add ! to override)".to_string());
-                        return Ok(KeysOutcome::Updated(KeysUpdate {
-                            state,
-                            saved: false,
-                            forced: false,
-                            rolled_back: false,
-                        }));
+                    if let Some(refusal) = refusal {
+                        // `:wq` still writes this file; the kernel layer
+                        // flushes, then checkpoints it.
+                        let mut update = self.update(id)?;
+                        update.state.message = Some(refusal);
+                        update.saved = write_requested;
+                        update.forced = forced;
+                        return Ok(KeysOutcome::Updated(update));
                     }
-                    let rolled_back = self.quit(id, blocks, actor)?;
+                    let state = if write_requested { self.save(id)? } else { self.state(id)? };
+                    let quit = self.quit(id, blocks, actor)?;
                     // `write_requested` covers `:wq`/`:x` (Write ran earlier
                     // in this same batch); a bare `:q`/`:q!` never set it, so
-                    // nothing to flush. `rolled_back` is independent of that —
-                    // a `:q!` discard can still have rewritten the block.
+                    // nothing to flush. `quit.rolled_back` is independent of
+                    // that — a `:q!` discard can still have rewritten blocks.
                     return Ok(KeysOutcome::Closed(KeysUpdate {
                         state,
+                        path,
+                        buffer: index,
                         saved: write_requested,
                         forced,
-                        rolled_back,
+                        quit,
+                        go: None,
+                        rest: None,
                     }));
                 }
             }
         }
-        // No `Quit` ran — a bare `:w`/`:w!`, or an empty `:` line. The
-        // checkpoint defers to the kernel layer's flush-then-checkpoint, so
-        // `state` here still reads dirty.
-        let state = self.state(id)?;
-        Ok(KeysOutcome::Updated(KeysUpdate {
-            state,
-            saved: write_requested,
-            forced,
-            rolled_back: false,
-        }))
+        // No `Quit` or `Go` ran — a bare `:w`/`:w!`, `:args`, or an empty `:`
+        // line. The checkpoint defers to the kernel layer's
+        // flush-then-checkpoint, so `state` here still reads dirty.
+        let mut update = self.update(id)?;
+        update.state.message = message;
+        update.saved = write_requested;
+        update.forced = forced;
+        Ok(KeysOutcome::Updated(update))
     }
 
-    /// Reconcile every open session bound to `(context_id, block_id)` against
-    /// the block's *current* text, after some **other** writer (a sibling editor
-    /// session, an MCP file edit, a streaming turn) mutated it. Returns the
-    /// `(id, new state)` of every session whose buffer actually changed — the
-    /// caller publishes those on the editor push channel.
+    /// The current file of a session: its path and its index in the list.
+    pub fn current_file(&self, id: EditorSessionId) -> Result<(String, usize), String> {
+        let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
+        Ok((session.path().to_string(), session.current))
+    }
+
+    /// The first file of a session's list, other than the current one, that
+    /// differs from its checkpoint.
+    fn first_other_dirty(&self, id: EditorSessionId) -> Result<Option<String>, String> {
+        let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
+        Ok(session.first_other_dirty().map(str::to_string))
+    }
+
+    /// Start a move through a session's argument list. A move to a loaded
+    /// buffer, or to the current file, completes here. Without `force`, it
+    /// refuses to leave a buffer that differs from its checkpoint (vim's
+    /// E37); with it, that buffer stays dirty and hidden — nothing is
+    /// discarded. A move past either end refuses with vim's message. A move
+    /// to a file not loaded yet returns [`MoveStep::Load`]; `:e` of a path
+    /// not in the list appends it only once it loads.
+    pub fn begin_move(
+        &mut self,
+        id: EditorSessionId,
+        to: &ArgMove,
+        force: bool,
+    ) -> Result<MoveStep, String> {
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let last = session.files.len() - 1;
+        let index = match to {
+            ArgMove::Next(n) => match session.current.checked_add(*n).filter(|i| *i <= last) {
+                Some(i) => Some(i),
+                None => return Ok(MoveStep::Refused("Cannot go beyond last file".to_string())),
+            },
+            ArgMove::Prev(n) => match session.current.checked_sub(*n) {
+                Some(i) => Some(i),
+                None => return Ok(MoveStep::Refused("Cannot go before first file".to_string())),
+            },
+            ArgMove::First => Some(0),
+            ArgMove::Last => Some(last),
+            ArgMove::Edit(path) => session.position(path),
+        };
+        if index == Some(session.current) {
+            return Ok(MoveStep::Moved);
+        }
+        if !force && session.buffer()?.dirty() {
+            return Ok(MoveStep::Refused(NO_WRITE_SINCE_LAST_CHANGE.to_string()));
+        }
+        match index {
+            Some(i) if session.files[i].buffer.is_some() => {
+                session.current = i;
+                Ok(MoveStep::Moved)
+            }
+            Some(i) => Ok(MoveStep::Load { path: session.files[i].path.clone() }),
+            None => match to {
+                ArgMove::Edit(path) => Ok(MoveStep::Load { path: path.clone() }),
+                _ => Err("editor: argument list move found no file".to_string()),
+            },
+        }
+    }
+
+    /// Complete a [`MoveStep::Load`] on a *pre-resolved* target: load the
+    /// file's buffer (appending the path to the list when it is not in it)
+    /// and make it current. Re-checks the current buffer's dirtiness, which
+    /// another batch may have changed while the path resolved.
+    pub fn finish_load(
+        &mut self,
+        id: EditorSessionId,
+        path: &str,
+        target: EditorTarget,
+        force: bool,
+        blocks: &SharedBlockStore,
+    ) -> Result<LoadStep, String> {
+        let message = self.announce_bound(target);
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        if session.position(path) == Some(session.current) {
+            return Ok(LoadStep::AlreadyLoaded);
+        }
+        if !force && session.buffer()?.dirty() {
+            return Ok(LoadStep::Refused(NO_WRITE_SINCE_LAST_CHANGE.to_string()));
+        }
+        let index = match session.position(path) {
+            Some(i) => i,
+            None => {
+                session.files.push(ArgFile { path: path.to_string(), buffer: None });
+                session.files.len() - 1
+            }
+        };
+        if session.files[index].buffer.is_some() {
+            session.current = index;
+            return Ok(LoadStep::AlreadyLoaded);
+        }
+        session.files[index].buffer = Some(Buffer::load(target, blocks)?);
+        session.current = index;
+        Ok(LoadStep::Loaded { message })
+    }
+
+    /// Reconcile every loaded buffer bound to `(context_id, block_id)`, in
+    /// every session, against the block's *current* text, after some
+    /// **other** writer (a sibling editor session, an MCP file edit, a
+    /// streaming turn) mutated it. Returns the `(id, new state)` of every
+    /// session whose current buffer actually changed — the caller publishes
+    /// those on the editor push channel. A hidden buffer merges too, so it
+    /// is current when its file is visited again.
     ///
-    /// A session whose buffer already matches the block is skipped: that is the
+    /// A buffer that already matches the block is skipped: that is the
     /// session's *own* mirror write echoing back through the block flow (the
     /// mirror is faithful, so its buffer equals the block), and reconciling it
     /// would jolt the cursor on every keystroke. Reads the block at most once,
-    /// and only when a session is actually bound here, so the hot path (no
+    /// and only when a buffer is actually bound here, so the hot path (no
     /// editor open, or an unrelated block) costs just the match scan.
     pub fn reconcile_block(
         &mut self,
@@ -646,21 +1018,18 @@ impl EditorSessions {
         block_id: BlockId,
         blocks: &SharedBlockStore,
     ) -> Vec<(EditorSessionId, EditorState)> {
-        let bound: Vec<EditorSessionId> = self
+        let bound = |b: &Buffer| b.target.context_id == context_id && b.target.block_id == block_id;
+        let Some(target) = self
             .sessions
-            .iter()
-            .filter(|(_, s)| s.target.context_id == context_id && s.target.block_id == block_id)
-            .map(|(id, _)| *id)
-            .collect();
-        if bound.is_empty() {
+            .values()
+            .flat_map(|s| s.files.iter().filter_map(|f| f.buffer.as_ref()))
+            .find(|b| bound(b))
+            .map(|b| b.target)
+        else {
             return Vec::new();
-        }
+        };
         // The block's text is the merged truth; reconcile against its normalized
         // (terminator-stripped) view, matching EditorCore's normalized buffer.
-        // Reuse a bound session's own target (every bound session shares this
-        // (context_id, block_id)) rather than constructing a fresh
-        // `EditorTarget`.
-        let target = self.sessions[&bound[0]].target;
         let raw = match block_text(blocks, &target) {
             Ok(t) => t,
             Err(_) => return Vec::new(), // block gone (deleted) — nothing to do
@@ -668,64 +1037,82 @@ impl EditorSessions {
         let merged = raw.strip_suffix('\n').unwrap_or(&raw);
 
         let mut changed = Vec::new();
-        for id in bound {
-            let session = self.sessions.get_mut(&id).expect("just collected");
-            if session.core.apply_remote_text(merged) {
-                // A non-self write merged in: this session's checkpoint no longer
-                // owns the block's delta, so a ZQ rollback would clobber peer
-                // work. Sticky until the checkpoint advances (save).
-                session.peer_wrote = true;
-                let saved = session.saved_content.clone();
-                changed.push((id, state_of(&mut session.core, &saved)));
+        for (id, session) in self.sessions.iter_mut() {
+            let mut current_moved = false;
+            for (index, file) in session.files.iter_mut().enumerate() {
+                let Some(buffer) = file.buffer.as_mut().filter(|b| bound(b)) else {
+                    continue;
+                };
+                if buffer.core.apply_remote_text(merged) {
+                    // A non-self write merged in: this buffer's checkpoint no
+                    // longer owns the block's delta, so a ZQ rollback would
+                    // clobber peer work. Sticky until the checkpoint advances.
+                    buffer.peer_wrote = true;
+                    current_moved |= index == session.current;
+                }
+            }
+            if current_moved && let Ok(state) = session.state() {
+                changed.push((*id, state));
             }
         }
         changed
     }
 
     /// Take any `:r` read intent the last [`keys`](Self::keys) batch surfaced on
-    /// a session (the kernel fulfills it asynchronously — fetch, then
-    /// [`insert_text`](Self::insert_text)). `None` if no such session or no
-    /// intent.
+    /// a session's current buffer (the kernel fulfills it asynchronously —
+    /// fetch, then [`insert_text`](Self::insert_text)). `None` if no such
+    /// session or no intent.
     pub fn take_io(&mut self, id: EditorSessionId) -> Option<EditorIo> {
-        self.sessions.get_mut(&id)?.core.take_io()
+        self.sessions.get_mut(&id)?.buffer().ok()?.core.take_io()
     }
 
-    /// The session's current leader-cursor char offset, or `None` if no such
-    /// session. The kernel captures this at `:r`-submit time so the async insert
-    /// lands where the command was issued, not wherever a concurrent keystroke
-    /// moved the cursor during the fetch.
-    pub fn session_cursor(&mut self, id: EditorSessionId) -> Option<usize> {
-        self.sessions.get_mut(&id).map(|s| s.core.cursor())
+    /// The session's current buffer index and its leader-cursor char offset,
+    /// or `None` if no such session. The kernel captures this at `:r`-submit
+    /// time so the async insert lands in that buffer, where the command was
+    /// issued, not wherever a concurrent batch moved the session or cursor
+    /// during the fetch.
+    pub fn session_cursor(&mut self, id: EditorSessionId) -> Option<(usize, usize)> {
+        let session = self.sessions.get_mut(&id)?;
+        let index = session.current;
+        Some((index, session.buffer().ok()?.core.cursor()))
     }
 
-    /// Insert kernel-fetched `text` at `offset` (the cursor captured when the
-    /// `:r` was submitted — see [`session_cursor`](Self::session_cursor)), mirror
-    /// the produced ops onto the owning kernel block, and return the new state.
-    /// Fails loud if the mirror write fails.
+    /// Insert kernel-fetched `text` at `offset` in buffer `index` (the buffer
+    /// and cursor captured when the `:r` was submitted — see
+    /// [`session_cursor`](Self::session_cursor)), mirror the produced ops onto
+    /// the owning kernel block, and return the session's new state. Fails loud
+    /// if the mirror write fails.
     pub fn insert_text(
         &mut self,
         id: EditorSessionId,
+        index: usize,
         text: &str,
         offset: usize,
         blocks: &SharedBlockStore,
         actor: PrincipalId,
     ) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let len_before = session.core.text().chars().count();
-        let ops = session.core.insert_at(text, offset);
-        let buffer_after = session.core.text();
+        let buffer = session.buffer_at(index)?;
+        let len_before = buffer.core.text().chars().count();
+        let ops = buffer.core.insert_at(text, offset);
+        let buffer_after = buffer.core.text();
         mirror_ops(
             &ops,
-            &session.target,
-            &session.terminator,
+            &buffer.target,
+            &buffer.terminator,
             len_before,
             &buffer_after,
             blocks,
             actor,
             "editor :r",
         )?;
-        let saved = session.saved_content.clone();
-        Ok(state_of(&mut session.core, &saved))
+        session.state()
+    }
+
+    /// Whether buffer `index` of a session differs from its checkpoint.
+    pub fn buffer_dirty(&mut self, id: EditorSessionId, index: usize) -> Result<bool, String> {
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        Ok(session.buffer_at(index)?.dirty())
     }
 
     /// Insert `text` at the session's *live* cursor — a paste, not
@@ -761,35 +1148,33 @@ impl EditorSessions {
             return Ok(state);
         }
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let len_before = session.core.text().chars().count();
-        let ops = session.core.insert_at_cursor(text);
-        let buffer_after = session.core.text();
+        let buffer = session.buffer()?;
+        let len_before = buffer.core.text().chars().count();
+        let ops = buffer.core.insert_at_cursor(text);
+        let buffer_after = buffer.core.text();
         mirror_ops(
             &ops,
-            &session.target,
-            &session.terminator,
+            &buffer.target,
+            &buffer.terminator,
             len_before,
             &buffer_after,
             blocks,
             actor,
             "editor insert",
         )?;
-        let saved = session.saved_content.clone();
-        Ok(state_of(&mut session.core, &saved))
+        session.state()
     }
 
     /// Current state of a session.
     pub fn state(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
-        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let saved = session.saved_content.clone();
-        Ok(state_of(&mut session.core, &saved))
+        self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?.state()
     }
 
-    /// The path a session was opened on, or `None` if no such session. Captured
-    /// before a `ZZ`/`ZQ` (which drops the session) so the caller can invalidate
-    /// the file cache for it afterward.
+    /// The current path of a session, or `None` if no such session. Captured
+    /// before a `ZZ`/`ZQ` (which drops the session) so the caller can
+    /// invalidate the file cache for it afterward.
     pub fn session_path(&self, id: EditorSessionId) -> Option<String> {
-        self.sessions.get(&id).map(|s| s.path.clone())
+        self.sessions.get(&id).map(|s| s.path().to_string())
     }
 
     /// `ZZ` — checkpoint the current buffer as saved, returning the now-clean
@@ -797,32 +1182,42 @@ impl EditorSessions {
     /// session registry does not) flushes it to disk after this call — see
     /// `Kernel::editor_save`/`Kernel::editor_keys`.
     pub fn save(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
-        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        session.saved_content = session.core.text();
-        // The checkpoint now contains every merged peer edit, so a rollback to
-        // it can no longer clobber them — the entanglement resets.
-        session.peer_wrote = false;
-        let saved = session.saved_content.clone();
-        Ok(state_of(&mut session.core, &saved))
+        let (_, index) = self.current_file(id)?;
+        self.save_at(id, index)
     }
 
-    /// `ZQ` — discard changes since the last checkpoint by writing the saved
-    /// text back onto the block (an inverse forward edit — the block log has no
-    /// history erasure), then drop the session.
+    /// Checkpoint buffer `index` of a session — the buffer a flush landed
+    /// for, which may no longer be current — and return the session's state.
+    pub fn save_at(&mut self, id: EditorSessionId, index: usize) -> Result<EditorState, String> {
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let buffer = session.buffer_at(index)?;
+        buffer.saved_content = buffer.core.text();
+        // The checkpoint now contains every merged peer edit, so a rollback to
+        // it can no longer clobber them — the entanglement resets.
+        buffer.peer_wrote = false;
+        session.state()
+    }
+
+    /// `ZQ` — discard changes since the last checkpoint by writing each loaded
+    /// file's saved text back onto its block (an inverse forward edit — the
+    /// block log has no history erasure), then drop the session.
     ///
-    /// **Entanglement guard: detach, don't retract.** The rollback runs only
-    /// when this session was provably alone with the block since its checkpoint.
-    /// If a sibling session is still bound to it, or a peer's write merged in
-    /// since the checkpoint ([`EditorSession::peer_wrote`]), the merged text is
-    /// shared work — rolling it back would clobber them. A shared-session `ZQ`
-    /// therefore just quits *this* player out of the doc and leaves the block's
-    /// merged truth for the others (Amy, 2026-07-07; `docs/vi.md` → Rollback).
+    /// **Entanglement guard: detach, don't retract.** A file's rollback runs
+    /// only when its buffer was provably alone with the block since its
+    /// checkpoint. If another buffer (in any session) is still bound to it,
+    /// or a peer's write merged in since the checkpoint ([`Buffer::peer_wrote`]),
+    /// the merged text is shared work — rolling it back would clobber them. A
+    /// shared-session `ZQ` therefore just quits *this* player out of the doc
+    /// and leaves the block's merged truth for the others (Amy, 2026-07-07;
+    /// `docs/vi.md` → Rollback).
     ///
-    /// Remove the session only after rollback succeeds. On failure, callers
-    /// retain both the session and its file-cache pin so the player can retry.
+    /// Remove the session only after every rollback succeeds. On failure,
+    /// callers retain both the session and its file-cache pins so the player
+    /// can retry.
     ///
-    /// Return whether rollback rewrote the block. The kernel uses this to mark
-    /// the file cache dirty; this registry has no file cache of its own.
+    /// The report names every loaded file and the ones whose rollback
+    /// rewrote the block. The kernel uses it to release pins and mark the
+    /// file cache dirty; this registry has no file cache of its own.
     /// Detaching after a peer write or restoring an unchanged checkpoint does
     /// not mutate the block.
     pub fn quit(
@@ -830,35 +1225,47 @@ impl EditorSessions {
         id: EditorSessionId,
         blocks: &SharedBlockStore,
         actor: PrincipalId,
-    ) -> Result<bool, String> {
+    ) -> Result<QuitReport, String> {
         let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
-        let sibling_bound = self
-            .sessions
-            .iter()
-            .any(|(sid, s)| *sid != id && s.target == session.target);
-        if sibling_bound || session.peer_wrote {
-            self.sessions.remove(&id);
-            return Ok(false);
-        }
-        // Restore the normalized checkpoint *plus* the block's terminator, so a
-        // rollback never strips a trailing newline the block opened with.
-        let restore = format!("{}{}", session.saved_content, session.terminator);
-        let current = block_text(blocks, &session.target)?;
-        let rolled_back = current != restore;
-        if rolled_back {
-            blocks
-                .edit_text_as(
-                    session.target.context_id,
-                    &session.target.block_id,
-                    0,
-                    &restore,
-                    current.chars().count(),
-                    Some(actor),
-                )
-                .map_err(|e| format!("editor quit: rollback failed: {e}"))?;
+        let mut report = QuitReport::default();
+        for (index, file) in session.files.iter().enumerate() {
+            let Some(buffer) = &file.buffer else { continue };
+            report.loaded.push(file.path.clone());
+            let sibling_bound = self.sessions.iter().any(|(sid, s)| {
+                s.files.iter().enumerate().any(|(i, f)| {
+                    (*sid != id || i != index)
+                        && f.buffer.as_ref().is_some_and(|b| b.target == buffer.target)
+                })
+            });
+            if sibling_bound || buffer.peer_wrote {
+                continue;
+            }
+            // Restore the normalized checkpoint *plus* the block's terminator,
+            // so a rollback never strips a trailing newline the block opened with.
+            let restore = format!("{}{}", buffer.saved_content, buffer.terminator);
+            let current = block_text(blocks, &buffer.target)?;
+            if current != restore {
+                blocks
+                    .edit_text_as(
+                        buffer.target.context_id,
+                        &buffer.target.block_id,
+                        0,
+                        &restore,
+                        current.chars().count(),
+                        Some(actor),
+                    )
+                    .map_err(|e| format!("editor quit: rollback of {} failed: {e}", file.path))?;
+                report.rolled_back.push(file.path.clone());
+            }
         }
         self.sessions.remove(&id);
-        Ok(rolled_back)
+        Ok(report)
+    }
+
+    /// Drop a session without touching any block: for a session that has
+    /// just opened and taken no input, when the kernel layer cannot pin it.
+    pub fn forget(&mut self, id: EditorSessionId) {
+        self.sessions.remove(&id);
     }
 
     /// Whether a session is still open.
@@ -875,14 +1282,26 @@ impl EditorSessions {
         let mut out: Vec<EditorSessionInfo> = self
             .sessions
             .iter()
-            .map(|(id, s)| EditorSessionInfo {
-                session: id.as_u64(),
-                path: s.path.clone(),
-                context_id: s.target.context_id.to_hex(),
-                block_id: s.target.block_id.to_key(),
-                dirty: s.core.text() != s.saved_content,
-                mode: s.core.mode(),
-                opener: s.opener.map(|o| o.principal.to_hex()),
+            .filter_map(|(id, s)| {
+                let buffer = s.files[s.current].buffer.as_ref()?;
+                let dirty_files: Vec<String> = s
+                    .files
+                    .iter()
+                    .filter(|f| f.buffer.as_ref().is_some_and(Buffer::dirty))
+                    .map(|f| f.path.clone())
+                    .collect();
+                Some(EditorSessionInfo {
+                    session: id.as_u64(),
+                    path: s.path().to_string(),
+                    context_id: buffer.target.context_id.to_hex(),
+                    block_id: buffer.target.block_id.to_key(),
+                    arg_index: s.current,
+                    arg_count: s.files.len(),
+                    dirty: !dirty_files.is_empty(),
+                    dirty_files,
+                    mode: buffer.core.mode(),
+                    opener: s.opener.map(|o| o.principal.to_hex()),
+                })
             })
             .collect();
         out.sort_by_key(|info| info.session);
@@ -906,7 +1325,13 @@ pub struct SendSessions(pub EditorSessions);
 unsafe impl Send for SendSessions {}
 
 /// Build a renderer-facing state, marking dirty against `checkpoint`.
-fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
+fn state_of(
+    core: &mut EditorCore,
+    checkpoint: &str,
+    path: String,
+    arg_index: usize,
+    arg_count: usize,
+) -> EditorState {
     let text = core.text();
     let dirty = text != checkpoint;
     let cursor = core.cursor();
@@ -923,8 +1348,12 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
         // A fresh state carries no status message; the command path sets one only
         // when a `:`-line errored, and it clears on the next keystroke batch.
         message: None,
+        path,
+        arg_index,
+        arg_count,
     }
 }
+
 /// Mirror a batch of buffer edits onto the kernel block, then reconcile the
 /// terminator boundary.
 ///
@@ -1073,7 +1502,7 @@ mod session_tests {
     async fn keystrokes_mirror_to_the_owning_block() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, st) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert_eq!(st.text, "hello");
         assert!(!st.dirty);
 
@@ -1094,7 +1523,7 @@ mod session_tests {
     async fn visual_selection_rides_the_state_and_its_json() {
         let (blocks, target) = seeded(b"hello world").await;
         let mut sessions = EditorSessions::new();
-        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, st) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert_eq!(st.selection, None);
 
         let outcome = sessions.keys(id, "wve", &blocks, PrincipalId::system()).unwrap();
@@ -1114,7 +1543,7 @@ mod session_tests {
     async fn save_clears_dirty_and_moves_the_checkpoint() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         let st = sessions.save(id).unwrap();
@@ -1126,7 +1555,7 @@ mod session_tests {
     async fn quit_rolls_the_block_back_to_the_open_checkpoint() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         // Delete the first char, mirror lands on the block...
         sessions.keys(id, "x", &blocks, PrincipalId::system()).unwrap();
@@ -1144,7 +1573,7 @@ mod session_tests {
         // checkpoints the edit and drops the session in one shot.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, "ZZ", &blocks, PrincipalId::system()).unwrap();
@@ -1161,7 +1590,7 @@ mod session_tests {
     async fn zq_through_keys_discards_and_closes() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, "ZQ", &blocks, PrincipalId::system()).unwrap();
@@ -1180,7 +1609,7 @@ mod session_tests {
         // mode state, so this never trips the close path.
         let (blocks, target) = seeded(b"").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, "iZZ", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Updated(_)));
@@ -1207,7 +1636,7 @@ mod session_tests {
     async fn quit_keeps_the_session_when_rollback_fails_instead_of_leaking_it() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         // Dirty the buffer so the rollback isn't a no-op (current != restore).
         sessions.keys(id, "x", &blocks, PrincipalId::system()).unwrap();
@@ -1244,7 +1673,7 @@ mod session_tests {
     async fn quit_rolls_back_to_last_save_not_to_original() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         sessions.save(id).unwrap(); // checkpoint = "Xhello"
@@ -1263,7 +1692,7 @@ mod session_tests {
         // its terminator through a quit-rollback.
         let (blocks, target) = seeded(b"hello\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, st) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert_eq!(st.text, "hello");
         assert!(!st.dirty, "a newline-terminated block must open clean");
 
@@ -1286,7 +1715,7 @@ mod session_tests {
         // block's end doubles the terminator").
         let (blocks, target) = seeded(b"end\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, st) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert_eq!(st.text, "end");
 
         sessions.keys(id, "A", &blocks, PrincipalId::system()).unwrap(); // cursor at true end
@@ -1311,7 +1740,7 @@ mod session_tests {
         for keys in ["X\n", "X"] {
             let (blocks, target) = seeded(b"end\n").await;
             let mut sessions = EditorSessions::new();
-            let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+            let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
             sessions.keys(id, "A", &blocks, PrincipalId::system()).unwrap();
             let st = sessions
                 .insert_at_cursor(id, keys, &blocks, PrincipalId::system())
@@ -1326,7 +1755,7 @@ mod session_tests {
 
         let (blocks, target) = seeded(b"end\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         let outcome = sessions
             .keys(id, "A<CR><Esc>", &blocks, PrincipalId::system())
             .unwrap();
@@ -1345,7 +1774,7 @@ mod session_tests {
         // own terminator must not eat the block's existing one.
         let (blocks, target) = seeded(b"end\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "A", &blocks, PrincipalId::system()).unwrap();
         sessions
@@ -1363,7 +1792,7 @@ mod session_tests {
         // lossy normalized text and drops one newline from its own view.
         let (blocks, target) = seeded(b"hello\n\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         sessions
             .insert_at_cursor(id, "X", &blocks, PrincipalId::system())
             .unwrap();
@@ -1382,7 +1811,7 @@ mod session_tests {
         // conflate them.
         let (blocks, target) = seeded(b"end\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         sessions
             .keys(id, "AX<CR><Esc>", &blocks, PrincipalId::system())
             .unwrap();
@@ -1400,8 +1829,8 @@ mod session_tests {
         // is faithful) and MERGE the stale sibling B, reporting only B.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (a, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(a, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
@@ -1427,8 +1856,8 @@ mod session_tests {
         // the merged truth — no rollback yanks the block out from under B.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (a, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(a, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(a, ":q!<CR>", &blocks, PrincipalId::system()).unwrap();
@@ -1449,8 +1878,8 @@ mod session_tests {
         // the rollback is skipped — B's saved work survives A's abort.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (a, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(b, "iB<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Bhello"
         // The server's reconciler drives this off the block flow; simulate it.
@@ -1473,8 +1902,8 @@ mod session_tests {
         // on the checkpoint that already contains B's work.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (a, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(b, "iB<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Bhello"
         sessions.reconcile_block(target.context_id, target.block_id, &blocks);
@@ -1503,7 +1932,7 @@ mod session_tests {
     async fn keys_on_a_dropped_session_fails_loud() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         sessions.quit(id, &blocks, PrincipalId::system()).unwrap();
         let err = sessions.keys(id, "x", &blocks, PrincipalId::system()).unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
@@ -1517,7 +1946,7 @@ mod session_tests {
         // session, keep the change on the block.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, ":wq<CR>", &blocks, PrincipalId::system()).unwrap();
@@ -1537,7 +1966,7 @@ mod session_tests {
         // renderer's `:`-strip kept showing the stale submitted `:q`.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // dirty
         let outcome = sessions.keys(id, ":q<CR>", &blocks, PrincipalId::system()).unwrap();
@@ -1568,7 +1997,7 @@ mod session_tests {
     async fn colon_q_bang_discards_and_closes() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, ":q!<CR>", &blocks, PrincipalId::system()).unwrap();
@@ -1588,7 +2017,7 @@ mod session_tests {
         // calls to clear dirty.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         let outcome = sessions.keys(id, ":w<CR>", &blocks, PrincipalId::system()).unwrap();
@@ -1618,7 +2047,7 @@ mod session_tests {
         // door would surface as a hard failure, popping the editor).
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, ":frobnicate<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(
@@ -1649,7 +2078,7 @@ mod session_tests {
         // keystroke, so a `cat`/exec of the path sees the substituted text.
         let (blocks, target) = seeded(b"alpha beta alpha").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, ":s/alpha/ALPHA/g<CR>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(outcome.state().text, "ALPHA beta ALPHA");
@@ -1662,7 +2091,7 @@ mod session_tests {
     async fn colon_percent_s_then_wq_persists() {
         let (blocks, target) = seeded(b"x y\nx y").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, ":%s/x/Z/g<CR>", &blocks, PrincipalId::system()).unwrap();
         let outcome = sessions.keys(id, ":wq<CR>", &blocks, PrincipalId::system()).unwrap();
@@ -1676,7 +2105,7 @@ mod session_tests {
         // A substitution followed by `:q!` discards it (rollback to checkpoint).
         let (blocks, target) = seeded(b"keep me").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(id, ":s/keep/DROP/<CR>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "DROP me");
@@ -1691,7 +2120,7 @@ mod session_tests {
         // open — the block is left untouched, no silent edit.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, ":s/[/x/<CR>", &blocks, PrincipalId::system()).unwrap();
         let msg = outcome
@@ -1710,7 +2139,7 @@ mod session_tests {
         // can draw the strip without tracking mode.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, ":w", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(
@@ -1737,8 +2166,8 @@ mod session_tests {
             })
         };
 
-        let (_a, _) = sessions.open(RC_PATH, target, &blocks, as_opener(me)).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, as_opener(me)).unwrap();
+        let (_a, _) = sessions.open(&[RC_PATH], target, &blocks, as_opener(me)).unwrap();
+        let (b, _) = sessions.open(&[RC_PATH], target, &blocks, as_opener(me)).unwrap();
 
         assert_eq!(
             sessions.latest_session_for(me).map(|(id, _)| id),
@@ -1751,7 +2180,7 @@ mod session_tests {
             "a principal with no editor has nothing to foreground"
         );
         // An opener-less (headless) session is owned by no principal.
-        let (_c, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (_c, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert_eq!(
             sessions.latest_session_for(me).map(|(id, _)| id),
             Some(b),
@@ -1769,8 +2198,8 @@ mod session_tests {
         // and_merges_a_sibling` covers; here we're only checking `list()`).
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (a, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
 
         sessions.keys(a, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello", dirties A only
 
@@ -1801,7 +2230,7 @@ mod session_tests {
             context_id: ContextId::new(),
             session_id: SessionId::new(),
         });
-        let (c, _) = sessions.open(RC_PATH, target, &blocks, opener).unwrap();
+        let (c, _) = sessions.open(&[RC_PATH], target, &blocks, opener).unwrap();
         let c_info = sessions
             .list()
             .into_iter()
@@ -1822,10 +2251,10 @@ mod session_tests {
         // holds the target.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (_first, st1) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (_first, st1) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert!(st1.message.is_none(), "the first open has nothing to announce");
 
-        let (_second, st2) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (_second, st2) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
         assert!(
             st2.message.is_some(),
             "opening a path that already has a session must announce it"
@@ -1840,8 +2269,8 @@ mod session_tests {
         let (second_blocks, second_target) = seeded(b"alpha").await;
         let amy = PrincipalId::new();
         let mut sessions = EditorSessions::new();
-        let (first, _) = sessions.open(RC_PATH, first_target, &first_blocks, None).unwrap();
-        let (second, _) = sessions.open(RC_PATH, second_target, &second_blocks, None).unwrap();
+        let (first, _) = sessions.open(&[RC_PATH], first_target, &first_blocks, None).unwrap();
+        let (second, _) = sessions.open(&[RC_PATH], second_target, &second_blocks, None).unwrap();
 
         sessions.keys(first, "dd", &first_blocks, amy).unwrap();
         let outcome = sessions.keys(second, "p", &second_blocks, amy).unwrap();
@@ -1860,8 +2289,8 @@ mod session_tests {
         let (second_blocks, second_target) = seeded(b"alpha").await;
         let (amy, model) = (PrincipalId::new(), PrincipalId::new());
         let mut sessions = EditorSessions::new();
-        let (first, _) = sessions.open(RC_PATH, first_target, &first_blocks, None).unwrap();
-        let (second, _) = sessions.open(RC_PATH, second_target, &second_blocks, None).unwrap();
+        let (first, _) = sessions.open(&[RC_PATH], first_target, &first_blocks, None).unwrap();
+        let (second, _) = sessions.open(&[RC_PATH], second_target, &second_blocks, None).unwrap();
 
         sessions.keys(first, "dd", &first_blocks, amy).unwrap();
         let outcome = sessions.keys(second, "p", &second_blocks, model).unwrap();

@@ -79,9 +79,10 @@ pub enum CloseRequest {
 /// pattern, now for the command line. The kernel consumes a batch via
 /// [`take_commands`](EditorCore::take_commands).
 ///
-/// Pass-1 dialect (`docs/vi.md` → *Command mode*): `:w :q :wq :q! :x :w!`.
-/// Substitute / shell / read / edit are later passes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The dialect is in `docs/vi.md`, "Command mode": `:w :q :wq :q! :x :w!`
+/// and the argument-list verbs. Substitute and read are handled in the core
+/// itself and never surface here.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandRequest {
     /// `:w` / `:w!` — checkpoint (save) the buffer; **stay open**. `force`
     /// (`!`) is not a no-op: a plain `:w` refuses when disk moved past the
@@ -95,7 +96,37 @@ pub enum CommandRequest {
     /// checkpoint; without it a *dirty* buffer must refuse (vim's "No write
     /// since last change"), which is the kernel's call to make.
     Quit { force: bool },
+    /// `:n`, `:N`, `:first`, `:last`, `:e path` — move to another file of the
+    /// session's argument list. Without `force` (`!`) the kernel refuses to
+    /// leave a buffer that differs from its checkpoint; with it, the buffer
+    /// stays dirty and hidden. Always the last request of its line.
+    Go { to: ArgMove, force: bool },
+    /// `:args` — show the argument list on the status line.
+    Args,
 }
+
+/// Where a [`CommandRequest::Go`] moves in the argument list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArgMove {
+    /// `:n` / `:Nn` — this many files forward.
+    Next(usize),
+    /// `:N` / `:prev` — this many files back.
+    Prev(usize),
+    /// `:first` / `:rew`.
+    First,
+    /// `:last`.
+    Last,
+    /// `:e path` — the file at `path`, appended to the list when it is not
+    /// already in it.
+    Edit(String),
+}
+
+/// Keys a batch did not feed because an intent for the kernel stopped it (see
+/// [`EditorCore::apply_keys`]). The kernel acts on the intent, then feeds them
+/// to the current buffer's core with [`EditorCore::apply_pending`]; after a
+/// move, that is the buffer the move landed on.
+#[derive(Debug)]
+pub struct PendingKeys(Vec<TerminalKey>);
 
 /// An **async** I/O intent the editor surfaced (`:r`) — content the kernel must
 /// fetch (it owns the VFS / `EmbeddedKaish`; `kaijutsu-editor` is pure), then
@@ -191,6 +222,9 @@ pub struct EditorCore {
     /// takes it via [`take_io`](EditorCore::take_io), fetches, and calls
     /// [`insert_at_cursor`](EditorCore::insert_at_cursor).
     pending_io: Option<EditorIo>,
+    /// The keys an intent for the kernel left unfed, awaiting the kernel via
+    /// [`take_rest`](EditorCore::take_rest).
+    pending_rest: Option<PendingKeys>,
 }
 
 impl EditorCore {
@@ -224,6 +258,7 @@ impl EditorCore {
             pending_commands: None,
             pending_substitution: None,
             pending_io: None,
+            pending_rest: None,
         }
     }
 
@@ -330,6 +365,14 @@ impl EditorCore {
     /// [`insert_at_cursor`](Self::insert_at_cursor).
     pub fn take_io(&mut self) -> Option<EditorIo> {
         self.pending_io.take()
+    }
+
+    /// Take the keys the last batch left unfed because an intent for the
+    /// kernel stopped it. `None` when the batch ran to its end. The kernel
+    /// acts on the intent, then feeds them to the current buffer (the one a
+    /// move landed on, or this one) with [`apply_pending`](Self::apply_pending).
+    pub fn take_rest(&mut self) -> Option<PendingKeys> {
+        self.pending_rest.take()
     }
 
     /// Insert `text` at the leader cursor, returning the char-indexed
@@ -466,13 +509,45 @@ impl EditorCore {
     /// Feed a key sequence in vim notation (`"ihello<Esc>"`, `"dw"`, `"<C-w>"`)
     /// and return the char-indexed [`EditOp`]s it produced — one per keystroke
     /// that changed the buffer (no-op keystrokes emit nothing).
+    ///
+    /// An intent for the kernel ends the batch: a submitted `:` line, a
+    /// failed search, `ZZ` or `ZQ`. The keys after it are kept for
+    /// [`take_rest`](Self::take_rest) rather than fed here, so the kernel acts
+    /// on each line before the next is typed, and the keys after a move run
+    /// in the buffer it lands on.
     pub fn apply_keys(&mut self, keys: &str) -> Vec<EditOp> {
+        self.feed_batch(parse_keys(keys))
+    }
+
+    /// Feed keys a previous batch left unfed ([`take_rest`](Self::take_rest)),
+    /// as one new batch with the same rules as [`apply_keys`](Self::apply_keys).
+    pub fn apply_pending(&mut self, keys: PendingKeys) -> Vec<EditOp> {
+        self.feed_batch(keys.0)
+    }
+
+    fn feed_batch(&mut self, keys: Vec<TerminalKey>) -> Vec<EditOp> {
         let mut ops = Vec::new();
         self.start_batch();
-        for key in parse_keys(keys) {
+        let mut keys = keys.into_iter();
+        while let Some(key) = keys.next() {
             ops.extend(self.feed_key(key));
+            if self.has_intent() {
+                let rest: Vec<TerminalKey> = keys.collect();
+                if !rest.is_empty() {
+                    self.pending_rest = Some(PendingKeys(rest));
+                }
+                break;
+            }
         }
         ops
+    }
+
+    /// Whether the batch so far left an intent for the kernel: a `ZZ`/`ZQ`,
+    /// a `:` line's commands or error, a failed search, or a `:r`. Each has
+    /// one slot, so the batch stops here rather than let a later key
+    /// overwrite it.
+    fn has_intent(&self) -> bool {
+        self.pending_close.is_some() || self.pending_commands.is_some() || self.pending_io.is_some()
     }
 
     /// Feed one already-decoded terminal key — the seam a crossterm client
@@ -496,6 +571,7 @@ impl EditorCore {
         self.pending_commands = None;
         self.pending_substitution = None;
         self.pending_io = None;
+        self.pending_rest = None;
     }
 
     /// One keystroke: feed the machine, drain the actions it produced, and
@@ -819,7 +895,7 @@ enum ParsedLine {
 /// exit` with an optional trailing `!` (force). A bare line is a no-op; an
 /// unknown verb is a fail-loud error the kernel surfaces.
 fn parse_ex_command(body: &str) -> Result<ParsedLine, String> {
-    use CommandRequest::{Quit, Write};
+    use CommandRequest::{Go, Quit, Write};
     let body = body.trim();
 
     if let Some(sub) = parse_substitute(body)? {
@@ -829,26 +905,73 @@ fn parse_ex_command(body: &str) -> Result<ParsedLine, String> {
         return Ok(ParsedLine::Io(io));
     }
 
-    // A trailing `!` (adjacent — `:w!`, not `:w !`) forces; strip it before
-    // matching the verb. Requiring adjacency keeps `:w !` from silently meaning
-    // force-write (in vim `:w !cmd` pipes to a command; a bare `:w !` here just
-    // fails loud as an unknown verb rather than quietly forcing).
-    let (verb, force) = match body
-        .strip_suffix('!')
-        .filter(|v| !v.ends_with(char::is_whitespace))
-    {
-        Some(v) => (v, true),
-        None => (body, false),
+    // The line is `[count]verb[!] [argument]`. A `!` forces only when it is
+    // adjacent to the verb (`:w!`, not `:w !`): in vim `:w !cmd` pipes to a
+    // command, so a bare `:w !` here fails loud as an unknown command rather
+    // than quietly forcing.
+    let (head, arg) = match body.split_once(char::is_whitespace) {
+        Some((head, arg)) => (head, arg.trim()),
+        None => (body, ""),
     };
+    let (verb, force) = match head.strip_suffix('!') {
+        Some(v) => (v, true),
+        None => (head, false),
+    };
+    let digits = verb.len() - verb.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (count, verb) = verb.split_at(digits);
+    let count = match count {
+        "" => None,
+        n => match n.parse::<usize>() {
+            Ok(0) => return Err("Positive count required".to_string()),
+            Ok(n) => Some(n),
+            Err(_) => return Err(format!("Not an editor command: :{body}")),
+        },
+    };
+    let unknown = || Err(format!("Not an editor command: :{body}"));
+    if matches!(verb, "e" | "edit") {
+        if count.is_some() {
+            return Err("No range allowed".to_string());
+        }
+        if arg.is_empty() {
+            return Err(format!("'{verb}' requires a file path"));
+        }
+        return Ok(ParsedLine::Commands(vec![Go { to: ArgMove::Edit(arg.to_string()), force }]));
+    }
+    if !arg.is_empty() {
+        return unknown();
+    }
+    let steps = count.unwrap_or(1);
     let cmds = match verb {
-        "" => Vec::new(),
+        "" if count.is_none() => Vec::new(),
+        "n" | "next" => vec![Go { to: ArgMove::Next(steps), force }],
+        "N" | "Next" | "prev" | "previous" => vec![Go { to: ArgMove::Prev(steps), force }],
+        "wn" | "wnext" => vec![Write { force }, Go { to: ArgMove::Next(steps), force }],
+        "wN" | "wNext" | "wp" | "wprevious" => {
+            vec![Write { force }, Go { to: ArgMove::Prev(steps), force }]
+        }
+        _ if count.is_some() && is_countless_verb(verb) => {
+            return Err("No range allowed".to_string());
+        }
         "w" | "write" => vec![Write { force }],
         "q" | "quit" => vec![Quit { force }],
         "wq" => vec![Write { force }, Quit { force }],
         "x" | "xit" | "exit" => vec![Write { force }, Quit { force }],
-        other => return Err(format!("Not an editor command: :{other}")),
+        "first" | "fir" | "rew" | "rewind" => vec![Go { to: ArgMove::First, force }],
+        "last" | "la" => vec![Go { to: ArgMove::Last, force }],
+        "args" | "ar" if !force => vec![CommandRequest::Args],
+        _ => return unknown(),
     };
     Ok(ParsedLine::Commands(cmds))
+}
+
+/// The verbs that take no count. A count on one is refused (vim's E481)
+/// rather than ignored.
+fn is_countless_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "w" | "write" | "q" | "quit" | "wq" | "x" | "xit" | "exit" | "first" | "fir" | "rew"
+            | "rewind" | "last" | "la" | "args" | "ar"
+    )
 }
 
 /// Which lines a `:s` touches.
@@ -1412,6 +1535,119 @@ mod tests {
         ]);
     }
 
+    // ── The argument list (`:n`, `:N`, `:e`, …) ─────────────────────────────
+
+    fn go(to: ArgMove, force: bool) -> CommandRequest {
+        CommandRequest::Go { to, force }
+    }
+
+    #[test]
+    fn argument_list_verbs_parse_into_moves() {
+        let cases: &[(&str, Vec<CommandRequest>)] = &[
+            (":n<CR>", vec![go(ArgMove::Next(1), false)]),
+            (":next<CR>", vec![go(ArgMove::Next(1), false)]),
+            (":n!<CR>", vec![go(ArgMove::Next(1), true)]),
+            (":2n<CR>", vec![go(ArgMove::Next(2), false)]),
+            (":N<CR>", vec![go(ArgMove::Prev(1), false)]),
+            (":Next<CR>", vec![go(ArgMove::Prev(1), false)]),
+            (":prev<CR>", vec![go(ArgMove::Prev(1), false)]),
+            (":previous!<CR>", vec![go(ArgMove::Prev(1), true)]),
+            (":3N<CR>", vec![go(ArgMove::Prev(3), false)]),
+            (":first<CR>", vec![go(ArgMove::First, false)]),
+            (":rew<CR>", vec![go(ArgMove::First, false)]),
+            (":rewind!<CR>", vec![go(ArgMove::First, true)]),
+            (":last<CR>", vec![go(ArgMove::Last, false)]),
+            (":la!<CR>", vec![go(ArgMove::Last, true)]),
+            (":args<CR>", vec![CommandRequest::Args]),
+            (
+                ":wn<CR>",
+                vec![CommandRequest::Write { force: false }, go(ArgMove::Next(1), false)],
+            ),
+            (
+                ":2wn<CR>",
+                vec![CommandRequest::Write { force: false }, go(ArgMove::Next(2), false)],
+            ),
+            (
+                ":wN<CR>",
+                vec![CommandRequest::Write { force: false }, go(ArgMove::Prev(1), false)],
+            ),
+            (":e notes.md<CR>", vec![go(ArgMove::Edit("notes.md".into()), false)]),
+            (":edit /a/b.rs<CR>", vec![go(ArgMove::Edit("/a/b.rs".into()), false)]),
+            (":e! b.rs<CR>", vec![go(ArgMove::Edit("b.rs".into()), true)]),
+        ];
+        for (keys, want) in cases {
+            let mut ed = EditorCore::new("hi");
+            ed.apply_keys(keys);
+            assert_eq!(&commands(&mut ed), want, "{keys}");
+        }
+    }
+
+    #[test]
+    fn argument_list_verbs_refuse_malformed_lines() {
+        for (keys, want) in [
+            (":e<CR>", "requires a file path"),
+            (":e!<CR>", "requires a file path"),
+            (":0n<CR>", "Positive count required"),
+            (":2w<CR>", "No range allowed"),
+            (":2first<CR>", "No range allowed"),
+            (":n foo<CR>", "Not an editor command"),
+            (":args foo<CR>", "Not an editor command"),
+        ] {
+            let mut ed = EditorCore::new("hi");
+            ed.apply_keys(keys);
+            let err = ed.take_commands().expect("submitted").expect_err(keys);
+            assert!(err.contains(want), "{keys}: {err}");
+        }
+    }
+
+    /// A move leaves this buffer, so the keys after it belong to the next
+    /// one: the batch stops at the move and hands the rest back.
+    #[test]
+    fn a_move_stops_the_batch_and_keeps_the_rest() {
+        let mut ed = EditorCore::new("one\ntwo");
+        ed.apply_keys(":n<CR>ddix<Esc>");
+        assert_eq!(ed.text(), "one\ntwo", "keys after :n must not edit this buffer");
+        assert_eq!(commands(&mut ed), vec![go(ArgMove::Next(1), false)]);
+        let rest = ed.take_rest().expect("the keys after :n come back");
+
+        let mut next = EditorCore::new("alpha\nbeta");
+        next.apply_pending(rest);
+        assert_eq!(next.text(), "xbeta", "the rest runs in the next buffer");
+        assert!(next.take_rest().is_none());
+    }
+
+    /// Every submitted `:` line ends its batch, so one line's intent is never
+    /// overwritten by the next: the rest comes back for the kernel to feed
+    /// after it has acted on this line.
+    #[test]
+    fn every_colon_line_stops_the_batch() {
+        let mut ed = EditorCore::new("one");
+        ed.apply_keys(":w<CR>:n<CR>");
+        assert_eq!(commands(&mut ed), vec![CommandRequest::Write { force: false }]);
+        let rest = ed.take_rest().expect("the :n comes back");
+        ed.apply_pending(rest);
+        assert_eq!(commands(&mut ed), vec![go(ArgMove::Next(1), false)]);
+
+        let mut ed = EditorCore::new("one");
+        ed.apply_keys(":r a<CR>:r b<CR>");
+        assert_eq!(ed.take_io(), Some(EditorIo::ReadFile("a".into())));
+        let rest = ed_rest(&mut ed);
+        ed.apply_pending(rest);
+        assert_eq!(ed.take_io(), Some(EditorIo::ReadFile("b".into())));
+
+        let mut ed = EditorCore::new("one");
+        ed.apply_keys(":args<CR>x");
+        assert_eq!(ed.text(), "one", "the x waits for the kernel");
+        let rest = ed_rest(&mut ed);
+        ed.apply_pending(rest);
+        assert_eq!(ed.text(), "ne");
+        assert!(ed.take_rest().is_none());
+    }
+
+    fn ed_rest(ed: &mut EditorCore) -> PendingKeys {
+        ed.take_rest().expect("keys after the line come back")
+    }
+
     #[test]
     fn typed_colon_in_insert_mode_is_text_not_command() {
         // A `:` in insert mode is literal — mode awareness lives in modalkit.
@@ -1767,9 +2003,14 @@ mod tests {
         use super::*;
 
         /// `(initial, keys, expected_text)` — assert the resulting buffer.
+        /// Feed `keys` as the kernel does: an intent ends a batch, and the
+        /// keys after it run as the next one.
         fn case(initial: &str, keys: &str, expected: &str) {
             let mut ed = EditorCore::new(initial);
             ed.apply_keys(keys);
+            while let Some(rest) = ed.take_rest() {
+                ed.apply_pending(rest);
+            }
             assert_eq!(ed.text(), expected, "keys {keys:?} on {initial:?}");
         }
 
@@ -2210,9 +2451,14 @@ baz");
     mod dot {
         use super::*;
 
+        /// Feed `keys` as the kernel does: an intent ends a batch, and the
+        /// keys after it run as the next one.
         fn case(initial: &str, keys: &str, expected: &str) {
             let mut ed = EditorCore::new(initial);
             ed.apply_keys(keys);
+            while let Some(rest) = ed.take_rest() {
+                ed.apply_pending(rest);
+            }
             assert_eq!(ed.text(), expected, "keys {keys:?} on {initial:?}");
         }
 

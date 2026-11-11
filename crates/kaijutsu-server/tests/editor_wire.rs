@@ -56,6 +56,54 @@ fn shared_editor_input_and_rollback_use_the_authenticated_player() {
     });
 }
 
+/// `vi a b` over the wire: one session over both files, `:n` moves it, the
+/// state carries the current path and the list position, and opening one of
+/// the files again as the same person joins that session.
+#[test]
+fn an_argument_list_moves_over_the_wire_and_a_second_open_joins_it() {
+    run_local(async {
+        const SECOND: &str = "/config/rc/coder/create/S10-binding.kai";
+        let (addr, owner) = common::start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (handle, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&handle, "editor-argument-list").await.unwrap();
+        let (callback, mut rx) = editor_events_channel(64);
+        handle.subscribe_editor(callback).await.unwrap();
+
+        let amy = kaijutsu_types::PrincipalId::new();
+        let opener = || kaijutsu_kernel::editor::EditorOpener {
+            principal: amy, performer: amy, reviewer: None, context_id: context,
+            session_id: kaijutsu_types::SessionId::new(),
+        };
+        let paths = vec![RC_PATH.to_string(), SECOND.to_string()];
+        let (session, _) = owner.kernel.editor_open_signaled(&paths, Some(opener())).await.unwrap();
+        let session = session.as_u64();
+
+        let state = handle.editor_state(session).await.unwrap();
+        assert_eq!((state.path.as_str(), state.arg_index, state.arg_count), (RC_PATH, 0, 2));
+
+        let moved = handle.editor_keys(session, ":n<CR>").await.unwrap();
+        assert_eq!((moved.path.as_str(), moved.arg_index, moved.arg_count), (SECOND, 1, 2));
+        assert_eq!(moved.session, session, "the session id survives the move");
+        let pushed = recv_state_for(&mut rx, session).await;
+        assert_eq!((pushed.path.as_str(), pushed.arg_index), (SECOND, 1));
+
+        let (joined, st) = owner
+            .kernel
+            .editor_open_signaled(&[RC_PATH.to_string()], Some(opener()))
+            .await
+            .unwrap();
+        assert_eq!(joined.as_u64(), session, "a second open of a listed file joins its session");
+        assert_eq!((st.path.as_str(), st.arg_index), (RC_PATH, 0));
+        let pushed = recv_state_for(&mut rx, session).await;
+        assert_eq!(pushed.path, RC_PATH, "renderers of the joined session follow the move");
+
+        handle.editor_quit(session).await.unwrap();
+        assert_eq!(recv_closed(&mut rx).await, session);
+        owner.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
 /// Drain the editor push channel until a `EditorStateChanged` arrives (or fail
 /// loud on timeout — a missing push is the bug this test exists to catch).
 async fn recv_state(rx: &mut Receiver<ServerEvent>) -> EditorState {

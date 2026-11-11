@@ -89,16 +89,23 @@ pub fn filler_rows(text_end_y: f32, body_bottom: f32, line_h: f32) -> usize {
     (((body_bottom - text_end_y) / line_h) + 1e-3).floor().max(0.0) as usize
 }
 
-/// The mode line's two halves: `foo.kai [+]` on the left, `-- INSERT --   12,3`
-/// on the right. Position is 1-based.
+/// The mode line's two halves: `foo.kai (2 of 5) [+]` on the left,
+/// `-- INSERT --   12,3` on the right. `args` is the current file's 0-based
+/// index and the argument list's length; a list of one shows no position.
+/// Position is 1-based.
 pub fn mode_line_parts(
     path: &str,
+    args: (usize, usize),
     dirty: bool,
     mode: Option<&str>,
     row: usize,
     col: usize,
 ) -> (String, String) {
     let mut left = path.to_string();
+    if let Some(position) = kaijutsu_types::editor::arg_position_label(args.0, args.1) {
+        left.push(' ');
+        left.push_str(&position);
+    }
     if dirty {
         left.push_str(" [+]");
     }
@@ -206,13 +213,23 @@ mod tests {
     #[test]
     fn mode_line_matches_the_tui() {
         assert_eq!(
-            mode_line_parts("foo.kai", true, Some("-- INSERT --"), 11, 2),
+            mode_line_parts("foo.kai", (0, 1), true, Some("-- INSERT --"), 11, 2),
             ("foo.kai [+]".to_string(), "-- INSERT --   12,3".to_string())
         );
         assert_eq!(
-            mode_line_parts("foo.kai", false, None, 0, 0),
+            mode_line_parts("foo.kai", (0, 1), false, None, 0, 0),
             ("foo.kai".to_string(), "1,1".to_string())
         );
-        assert_eq!(mode_line_parts("a", false, Some(""), 0, 0).1, "1,1");
+        assert_eq!(mode_line_parts("a", (0, 1), false, Some(""), 0, 0).1, "1,1");
+    }
+
+    /// A session over several files shows the current file's place in the
+    /// argument list after its path.
+    #[test]
+    fn mode_line_shows_the_argument_list_position() {
+        assert_eq!(
+            mode_line_parts("b.rs", (1, 5), true, None, 0, 0).0,
+            "b.rs (2 of 5) [+]"
+        );
     }
 }

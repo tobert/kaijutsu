@@ -218,6 +218,7 @@ mod tests {
                 Ok(EditorState {
                     session, text: String::new(), cursor: 0, mode: None, dirty: false,
                     command_line: None, message: None, selection: None,
+                    path: String::new(), arg_index: 0, arg_count: 1,
                 })
             }
         }

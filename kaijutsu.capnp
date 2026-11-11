@@ -1121,6 +1121,9 @@ struct EditorState {
   commandLine @5 :Text;  # the ":"-line while command mode is active (":wq"); "" = bar unfocused
   message @6 :Text;      # transient status/error line (vim E492); "" = none
   selection @7 :EditorSelection;  # visual-mode selection; unset outside visual mode
+  path @8 :Text;         # the current file of the session's argument list
+  argIndex @9 :UInt32;   # 0-based position of the current file in the argument list
+  argCount @10 :UInt32;  # number of files in the argument list
 }
 
 # The vim visual-mode kind a selection came from.

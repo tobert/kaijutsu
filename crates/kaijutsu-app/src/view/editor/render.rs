@@ -267,7 +267,8 @@ pub fn build_editor_surface(
         .or(active.notice.as_ref())
         .cloned();
     let (mode_left, mode_right) = viewport::mode_line_parts(
-        &view.path,
+        &view.state.path,
+        (view.state.arg_index as usize, view.state.arg_count as usize),
         view.state.dirty,
         view.state.mode.as_deref(),
         row,

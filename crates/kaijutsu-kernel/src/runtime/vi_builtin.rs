@@ -48,42 +48,40 @@ impl Tool for ViBuiltin {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             self.name,
-            "Open a vi editor session on a file or rc/config path (kernel-owned; \
-             drive it with `kj vi keys/state/save/quit`).",
+            "Open a vi editor session over one or more files (kernel-owned; \
+             drive it with `kj vi keys/state/save/quit`). Several paths make an \
+             argument list: `:n` and `:N` move through it. A path already open in \
+             one of your sessions joins that session.",
         )
         .param(
-            ParamSchema::required("path", "string", "File or rc/config path to edit").positional(),
+            ParamSchema::required("path", "string", "Files to edit; quote a path with spaces")
+                .positional(),
         )
         .example(
             "Edit a coder stance script",
             "vi /config/rc/coder/create/S00-stance.kai",
         )
+        .example("Edit every Rust file here, one after another", "vi *.rs")
     }
 
     async fn execute(&self, args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
-        // kaish splits on whitespace, so a path with a space arrives as
-        // several words. Taking only the first would open the wrong file.
-        if args.positional.len() > 1 {
+        // kaish expands globs before the builtin runs, so `vi *.rs` arrives
+        // as one word per file. A path with a space must be quoted to stay
+        // one word.
+        let paths: Vec<String> = args
+            .positional
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        if paths.is_empty() {
             return ExecResult::failure(
                 2,
-                format!(
-                    "{}: takes one path, got {} words — quote a path with spaces\nusage: {} <path>",
-                    self.name,
-                    args.positional.len(),
-                    self.name,
-                ),
+                format!("{}: missing path\nusage: {} <path>...", self.name, self.name),
             );
         }
-        let path = match args.positional.first() {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => format!("{other:?}"),
-            None => {
-                return ExecResult::failure(
-                    2,
-                    format!("{}: missing path\nusage: {} <path>", self.name, self.name),
-                );
-            }
-        };
 
         let Some(context_id) = self.session_contexts.current(&self.identity.session) else {
             return ExecResult::failure(1, format!("{}: no active context joined", self.name));
@@ -95,14 +93,18 @@ impl Tool for ViBuiltin {
         match self
             .dispatcher
             .kernel()
-            .editor_open_signaled(&path, Some(opener))
+            .editor_open_signaled(&paths, Some(opener))
             .await
         {
             Ok((id, st)) => {
                 let session = id.as_u64();
                 let mut result = ExecResult::success(format!(
-                    "opened editor session {session} on {path} \
+                    "opened editor session {session} on {}{} \
                      — drive it with `kj vi keys {session} …`",
+                    st.path,
+                    kaijutsu_types::editor::arg_position_label(st.arg_index, st.arg_count)
+                        .map(|p| format!(" {p}"))
+                        .unwrap_or_default(),
                 ));
                 // The one shared editor-state shape (`EditorState::to_json`), so
                 // a driver reads the session id + buffer the same way it would
@@ -240,26 +242,34 @@ mod tests {
         );
     }
 
-    /// `vi my notes.md` is two words to kaish. The builtin takes one path, so
-    /// it must refuse the second word and say to quote it — not open `my`.
+    /// `vi a b` opens one session over both files: the first is current and
+    /// the list holds two. An unquoted `vi my notes.md` is two files the same
+    /// way, so the path that does not exist fails when it is visited.
     #[tokio::test]
-    async fn vi_with_two_unquoted_words_fails_loud_and_names_the_fix() {
+    async fn vi_with_two_paths_opens_one_session_over_the_list() {
         let d = Arc::new(test_dispatcher_rc().await);
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let second = "/config/rc/vitest/create/S01-bar.kai";
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c).await;
+        d.dispatch(&[s("rc"), s("add"), s(second), s("--content"), s("world")], &c).await;
+
         let kaish = embedded_with_vi(d.clone(), ContextId::new()).await;
         let res = kaish
-            .execute_with_options(&format!("vi {P} extra"), ExecuteOptions::default())
+            .execute_with_options(&format!("vi {P} {second}"), ExecuteOptions::default())
             .await
             .expect("kaish exec");
 
-        assert!(!res.ok(), "two path words must not open a session: {res:?}");
-        let err = res.err.clone();
-        assert!(err.contains("one path"), "the refusal names the rule: {err}");
-        assert!(err.contains("quote"), "the refusal names the fix: {err}");
-        assert!(!res.text_out().contains("opened editor session"));
+        assert!(res.ok(), "two paths open one session: {res:?}");
+        assert!(res.text_out().contains("(1 of 2)"), "{}", res.text_out());
+        let json = kaish_kernel::interpreter::value_to_json(res.data.as_ref().expect("data"));
+        assert_eq!(json["text"], "hello");
+        assert_eq!(json["path"], P);
+        assert_eq!((json["arg_index"].as_u64(), json["arg_count"].as_u64()), (Some(0), Some(2)));
     }
 
-    /// A quoted path with a space is one word, so the word-count guard does
-    /// not refuse it. It fails here only because the file is not there.
+    /// A quoted path with a space is one word, so it names one file. It
+    /// fails here only because the file is not there.
     #[tokio::test]
     async fn vi_with_a_quoted_path_with_a_space_is_one_word() {
         let d = Arc::new(test_dispatcher_rc().await);
@@ -270,7 +280,7 @@ mod tests {
             .expect("kaish exec");
 
         assert!(!res.ok());
-        assert!(!res.err.contains("takes one path"), "one quoted word is one path: {}", res.err);
+        assert!(res.err.contains("S99 nope.kai"), "one quoted word is one path: {}", res.err);
     }
 
     /// A path that resolves to nothing fails loud (no empty editor) — the

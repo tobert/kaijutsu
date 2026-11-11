@@ -97,9 +97,8 @@ impl EditorOutboxState {
 /// draw the instant it lands — subsequent `editor_state` pushes carry updates.
 #[derive(Message, Clone, Debug)]
 pub struct EditorOpenRequested {
-    /// The path being edited (display / title).
-    pub path: String,
-    /// The initial editor state from the signal (carries the session id + text).
+    /// The initial editor state from the signal (carries the session id, the
+    /// current path and the text).
     pub state: EditorState,
 }
 
@@ -121,8 +120,6 @@ pub struct ActiveEditor {
 pub struct EditorSessionView {
     /// Kernel editor session handle (the currency of `editor_keys`/`editor_state`).
     pub session: u64,
-    /// The path being edited, shown on the mode line.
-    pub path: String,
     /// The [`RpcActor::generation`] the session is addressed through. An
     /// answer only acts on a session it carries the same generation for, so a
     /// late failure for a reused session id cannot pop a newer editor.
@@ -144,14 +141,13 @@ fn handle_editor_open(
     for ev in events.read() {
         info!(
             "open_editor: session {} on {}",
-            ev.state.session, ev.path
+            ev.state.session, ev.state.path
         );
         // A new session replaces the old one; keys already queued carry their
         // session, so they cannot leak into the new one.
         active.notice = None;
         active.session = Some(EditorSessionView {
             session: ev.state.session,
-            path: ev.path.clone(),
             generation: actor.as_ref().map_or(0, |a| a.generation),
             state: ev.state.clone(),
         });
@@ -701,6 +697,9 @@ mod tests {
             command_line: None,
             message: None,
             selection: None,
+            path: "p".to_string(),
+            arg_index: 0,
+            arg_count: 1,
         }
     }
 
@@ -726,7 +725,6 @@ mod tests {
     fn open_session(app: &mut App, session: u64, generation: u64) {
         app.world_mut().resource_mut::<ActiveEditor>().session = Some(EditorSessionView {
             session,
-            path: "p".to_string(),
             generation,
             state: EditorState { text: "original".to_string(), ..state(session) },
         });

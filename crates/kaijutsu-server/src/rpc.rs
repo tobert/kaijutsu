@@ -3114,7 +3114,7 @@ impl kernel::Server for KernelImpl {
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
         let actor = self.connection.borrow().principal;
         match self.kernel.kernel.editor_quit(id, actor) {
-            Ok(()) => Promise::ok(()),
+            Ok(_) => Promise::ok(()),
             Err(e) => Promise::err(capnp::Error::failed(format!("editor_quit failed: {e}"))),
         }
     }
@@ -8209,6 +8209,9 @@ fn set_editor_state(
     b.set_dirty(state.dirty);
     b.set_command_line(state.command_line.as_deref().unwrap_or(""));
     b.set_message(state.message.as_deref().unwrap_or(""));
+    b.set_path(&state.path);
+    b.set_arg_index(u32::try_from(state.arg_index).expect("argument list index fits u32"));
+    b.set_arg_count(u32::try_from(state.arg_count).expect("argument list length fits u32"));
     if let Some(selection) = &state.selection {
         use crate::kaijutsu_capnp::SelectionShape as Wire;
         use kaijutsu_kernel::editor::SelectionShape;

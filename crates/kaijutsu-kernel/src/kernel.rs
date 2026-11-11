@@ -261,6 +261,20 @@ fn default_flow_capacity() -> usize {
     crate::flows::configured_queue_depth()
 }
 
+/// How one key batch of `Kernel::editor_keys_checked` ended.
+enum EditorBatchEnd {
+    /// The batch closed the session; the last state before close.
+    Closed(crate::editor::EditorState),
+    /// The session is open. `go` is a move the batch requested, and `rest`
+    /// the keys after the intent that ended the batch, which run next in the
+    /// current buffer (the one a move landed on).
+    Open {
+        message: Option<String>,
+        go: Option<(kaijutsu_editor::ArgMove, bool)>,
+        rest: Option<kaijutsu_editor::PendingKeys>,
+    },
+}
+
 /// The vi status-line text for a failed editor flush. One source for all three
 /// editor flush sites (`editor_keys`' `Updated` and `Closed` arms,
 /// `editor_save`) — the strings are published text a model and a human both
@@ -1600,18 +1614,111 @@ impl Kernel {
         path: &str,
         opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        self.editor_open_list(&[path.to_string()], opener).await
+    }
+
+    /// Open an editor over the argument list `paths` (`vi a b c`). The first
+    /// file loads now; the others load when first visited.
+    ///
+    /// One session per file, per person: when one of `paths` is already in a
+    /// session the same opener principal opened, that session is joined on
+    /// the first such file instead, and the other paths are appended to its
+    /// list. A dirty current buffer stays dirty and hidden, as with `:n!`.
+    /// Another principal's session, or a headless one, is never joined. See
+    /// `docs/vi.md`, "The argument list".
+    pub async fn editor_open_list(
+        &self,
+        paths: &[String],
+        opener: Option<crate::editor::EditorOpener>,
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let first = paths.first().ok_or_else(|| "open editor: no path given".to_string())?;
+        if let Some(principal) = opener.map(|o| o.principal) {
+            let joinable = self.editor_sessions.lock().0.find_joinable(principal, paths);
+            if let Some((id, path)) = joinable {
+                return self.editor_join(id, &path, paths).await;
+            }
+        }
         let blocks = self.blocks();
         let file_cache = self.file_cache().clone();
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
         // `!Send` `EditorCore` never coexists with an await.
-        let target = crate::editor::resolve_editor_target(path, &file_cache).await?;
-        file_cache.pin(path)?;
-        let opened = self.editor_sessions.lock().0.open(path, target, blocks, opener);
-        if opened.is_err() {
-            // The session never came to exist — don't leak the pin.
-            file_cache.unpin(path);
+        let target = crate::editor::resolve_editor_target(first, &file_cache).await?;
+        let (id, state) = self.editor_sessions.lock().0.open(paths, target, blocks, opener)?;
+        if let Err(e) = file_cache.pin(first, id.as_u64()) {
+            // Unpinned, the entry could be evicted under the session: drop
+            // the session nobody has typed in yet, and fail.
+            self.editor_sessions.lock().0.forget(id);
+            return Err(e);
         }
-        opened
+        Ok((id, state))
+    }
+
+    /// Join an open session on `path`, appending the other `paths` to its
+    /// argument list, and publish the moved state to its renderers.
+    async fn editor_join(
+        &self,
+        id: crate::editor::EditorSessionId,
+        path: &str,
+        paths: &[String],
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let to = kaijutsu_editor::ArgMove::Edit(path.to_string());
+        let message = self
+            .editor_move(id, &to, true)
+            .await?
+            .map_err(|e| format!("open editor: cannot join session {}: {e}", id.as_u64()))?;
+        self.editor_sessions.lock().0.append(id, paths)?;
+        let state = self.publish_current_editor_state(id, message)?;
+        Ok((id, state))
+    }
+
+    /// Move a session through its argument list (`:n`, `:N`, `:first`,
+    /// `:last`, `:e`), resolving and pinning a file on its first visit. The
+    /// resolve is the async step and runs outside the sessions lock.
+    ///
+    /// The outer `Err` is a session or infrastructure failure. The inner
+    /// `Err` is a refusal for the status line: a dirty buffer without `!`,
+    /// a move past either end, or a file that cannot be opened; nothing
+    /// moved. The inner `Ok` carries a notice that other sessions hold the
+    /// file just loaded.
+    async fn editor_move(
+        &self,
+        id: crate::editor::EditorSessionId,
+        to: &kaijutsu_editor::ArgMove,
+        force: bool,
+    ) -> Result<Result<Option<String>, String>, String> {
+        use crate::editor::{LoadStep, MoveStep};
+        let step = self.editor_sessions.lock().0.begin_move(id, to, force)?;
+        let path = match step {
+            MoveStep::Refused(msg) => return Ok(Err(msg)),
+            MoveStep::Moved => return Ok(Ok(None)),
+            MoveStep::Load { path } => path,
+        };
+        let file_cache = self.file_cache().clone();
+        let target = match crate::editor::resolve_editor_target(&path, &file_cache).await {
+            Ok(target) => target,
+            Err(e) => return Ok(Err(e)),
+        };
+        file_cache.pin(&path, id.as_u64())?;
+        let loaded = self
+            .editor_sessions
+            .lock()
+            .0
+            .finish_load(id, &path, target, force, self.blocks());
+        match loaded {
+            Ok(LoadStep::Loaded { message }) => Ok(Ok(message)),
+            Ok(LoadStep::AlreadyLoaded) => {
+                file_cache.unpin(&path, id.as_u64());
+                Ok(Ok(None))
+            }
+            Ok(LoadStep::Refused(msg)) => {
+                file_cache.unpin(&path, id.as_u64());
+                Ok(Err(msg))
+            }
+            Err(e) => {
+                file_cache.unpin(&path, id.as_u64());
+                Err(e)
+            }
+        }
     }
 
     /// Feed keys to an open session, mirroring the edits onto the kernel block.
@@ -1655,69 +1762,70 @@ impl Kernel {
         actor: PrincipalId,
         can_write: bool,
     ) -> Result<crate::editor::EditorState, String> {
+        // A batch stops at each intent for the kernel (a `:` line, `ZZ`,
+        // `ZQ`): the kernel acts on it here — a move after the batch's write
+        // landed — and the keys after it run as a further batch in the
+        // current buffer, the one a move landed on. A status message from a
+        // later step replaces an earlier one; one state is published at the
+        // end.
+        let mut input = crate::editor::BatchInput::Keys(keys);
+        let mut message = None;
+        loop {
+            match self.editor_batch(id, input, actor, can_write).await? {
+                EditorBatchEnd::Closed(state) => return Ok(state),
+                EditorBatchEnd::Open { message: batch_message, go, rest } => {
+                    if batch_message.is_some() {
+                        message = batch_message;
+                    }
+                    if let Some((to, force)) = go {
+                        match self.editor_move(id, &to, force).await? {
+                            Ok(None) => {}
+                            Ok(Some(notice)) | Err(notice) => message = Some(notice),
+                        }
+                    }
+                    match rest {
+                        Some(rest) => input = crate::editor::BatchInput::Pending(rest),
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.publish_current_editor_state(id, message)
+    }
+
+    /// One key batch of [`editor_keys_checked`](Self::editor_keys_checked):
+    /// feed it, fulfill a `:r`, mark the swap row, flush a write, and close.
+    async fn editor_batch(
+        &self,
+        id: crate::editor::EditorSessionId,
+        input: crate::editor::BatchInput<'_>,
+        actor: PrincipalId,
+        can_write: bool,
+    ) -> Result<EditorBatchEnd, String> {
         let blocks = self.blocks();
-        // Capture the path and feed the keys under one lock — a ZZ/ZQ in the
-        // batch drops the session, so the path must be read first. A `:r` read
-        // intent is taken here too (only when the session is still open), then
-        // fulfilled below: the async fetch happens *outside* the lock, so the
-        // `!Send` `EditorCore` never crosses an await (the `SendSessions`
-        // invariant); only the fetched `String` does.
-        let (file_path, outcome, io, io_cursor, io_opener) = {
+        // Feed the keys under one lock — a ZZ/ZQ in the batch drops the
+        // session, so the outcome carries the path it ran in. A `:r` read
+        // intent is taken here too (only when the session is still open),
+        // then fulfilled below: the async fetch happens *outside* the lock,
+        // so the `!Send` `EditorCore` never crosses an await (the
+        // `SendSessions` invariant); only the fetched `String` does.
+        let (outcome, io, io_cursor, io_opener) = {
             let mut sessions = self.editor_sessions.lock();
-            // Captured now (session still exists) — `Closed` outcomes below
-            // drop the session before the kernel ever sees it again.
-            let file_path = sessions.0.session_path(id);
-            let outcome = sessions.0.keys_checked(id, keys, blocks, actor, can_write)?;
+            let outcome = sessions.0.batch(id, input, blocks, actor, can_write)?;
             let io = if matches!(outcome, crate::editor::KeysOutcome::Updated(_)) {
                 sessions.0.take_io(id)
             } else {
                 None
             };
-            // Capture the cursor NOW (at `:r` submit), so a keystroke that moves
-            // it while the fetch awaits can't make the read land at the wrong
-            // place (the "wandering cursor" race) — insert happens at this offset.
+            // Capture the buffer and cursor NOW (at `:r` submit), so a
+            // keystroke or a move while the fetch awaits can't make the read
+            // land at the wrong place (the "wandering cursor" race).
             let io_cursor = io.as_ref().and_then(|_| sessions.0.session_cursor(id));
             // The opener context, captured at submit too — `:r !cmd` shells out
             // in it (the caller's context/capabilities, not the edited block's).
             let io_opener = io.as_ref().and_then(|_| sessions.0.session_opener(id));
-            (file_path, outcome, io, io_cursor, io_opener)
+            (outcome, io, io_cursor, io_opener)
         };
-
-        // Fulfill a `:r` read: fetch the content, then splice it at the cursor
-        // captured above (not the live cursor, which may have moved). A failed
-        // fetch (missing file, failed/denied command, no opener) is a
-        // dialect-level failure: it reports on the `:` status line and keeps
-        // the session open — same channel as an unknown command or a bad `:s`
-        // regex. Hard errors out of here stay reserved for session and
-        // infrastructure failures (no such session, a block mirror failure);
-        // the app's session-lost detection keys on exactly that distinction.
-        if let Some(io) = io {
-            let state = match self.fetch_editor_io(io, io_opener).await {
-                Ok(content) => {
-                    let at = io_cursor.unwrap_or(0);
-                    let state = {
-                        let mut sessions = self.editor_sessions.lock();
-                        sessions.0.insert_text(id, &content, at, blocks, actor)?
-                    };
-                    state
-                }
-                Err(msg) => {
-                    let mut state = self.editor_sessions.lock().0.state(id)?;
-                    state.message = Some(msg);
-                    state
-                }
-            };
-            // `:r` is an edit, never a save — mark dirty, don't flush.
-            if let Some(fp) = file_path.as_deref()
-                && state.dirty
-            {
-                self.file_cache
-                    .mark_dirty(fp)
-                    .map_err(|e| format!("editor :r: failed to mark {fp} dirty: {e}"))?;
-            }
-            let state = self.publish_current_editor_state(id, state.message)?;
-            return Ok(state);
-        }
 
         // No cache invalidation here. An editor edit lands *through* the
         // file cache, so the cached entry is the authority, not a stale
@@ -1727,28 +1835,47 @@ impl Kernel {
         // see `invalidate_config_file_cache`.
         match outcome {
             crate::editor::KeysOutcome::Updated(update) => {
-                let mut state = update.state;
+                let fp = update.path.as_str();
+                let mut message = update.state.message.clone();
+                let mut go = update.go;
+                // Fulfill a `:r` read: fetch the content, then splice it at
+                // the buffer and cursor captured above. A failed fetch
+                // (missing file, failed/denied command, no opener) is a
+                // dialect-level failure: it reports on the `:` status line
+                // and keeps the session open — same channel as an unknown
+                // command or a bad `:s` regex. Hard errors out of here stay
+                // reserved for session and infrastructure failures (no such
+                // session, a block mirror failure); the app's session-lost
+                // detection keys on exactly that distinction.
+                if let Some(io) = io {
+                    let (index, at) = io_cursor.ok_or_else(|| {
+                        format!("{}: lost during ':r'", crate::editor::NO_SUCH_SESSION)
+                    })?;
+                    match self.fetch_editor_io(io, io_opener).await {
+                        Ok(content) => {
+                            self.editor_sessions
+                                .lock()
+                                .0
+                                .insert_text(id, index, &content, at, blocks, actor)?;
+                        }
+                        Err(msg) => message = Some(msg),
+                    }
+                }
                 // Mark dirty BEFORE any same-batch flush is attempted below —
                 // not just on the plain-edit path. `flush_one` treats a
                 // cache entry it never saw `mark_dirty` on as "clean,
                 // nothing to flush" and silently no-ops (P1: a single batch
                 // like `iX<Esc>:w<CR>` mirrors the edit onto the block, then
-                // went straight to `update.saved`'s flush branch below
-                // without ever recording the entry as dirty first — the
-                // checkpoint advanced, the caller saw success, and disk never
-                // moved). Splitting the edit and the `:w` into two separate
-                // `editor_keys` calls happened to route through the old
-                // plain-edit branch and never tripped it; one batch always
-                // must, so the mark now runs unconditionally here.
-                if let Some(fp) = file_path.as_deref()
-                    && state.dirty
-                {
-                    self.file_cache.mark_dirty(fp).map_err(|e| {
-                        format!("editor keys: failed to mark {fp} dirty: {e}")
-                    })?;
+                // went straight to the flush branch below without ever
+                // recording the entry as dirty first — the checkpoint
+                // advanced, the caller saw success, and disk never moved).
+                if self.editor_sessions.lock().0.buffer_dirty(id, update.buffer)? {
+                    self.file_cache
+                        .mark_dirty(fp)
+                        .map_err(|e| format!("editor keys: failed to mark {fp} dirty: {e}"))?;
                 }
-                if update.saved && let Some(fp) = file_path.as_deref() {
-                    // `state` still reads dirty here — `EditorSessions`
+                if update.saved {
+                    // The buffer still reads dirty here — `EditorSessions`
                     // deferred the checkpoint (see `KeysUpdate`). Flush to
                     // disk FIRST; the checkpoint must not advance unless the
                     // bytes actually landed. Guarded (docs/file-buffers.md
@@ -1763,14 +1890,15 @@ impl Kernel {
                         // correctly does) would turn a retry `:w` into a
                         // cold miss that recovers as an unacknowledged swap
                         // — the wrong error for a player retrying a write
-                        // that just failed.
-                        state.message = Some(flush_error_message(fp, &e, self.id()));
+                        // that just failed. A `:wn` whose write failed does
+                        // not move.
+                        message = Some(flush_error_message(fp, &e, self.id()));
+                        go = None;
                     } else {
-                        state = self.editor_sessions.lock().0.save(id)?;
+                        self.editor_sessions.lock().0.save_at(id, update.buffer)?;
                     }
                 }
-                let state = self.publish_current_editor_state(id, state.message)?;
-                Ok(state)
+                Ok(EditorBatchEnd::Open { message, go, rest: update.rest })
             }
             crate::editor::KeysOutcome::Closed(update) => {
                 // The session is already gone (ZZ/`:wq`/`:x`/ZQ dropped it
@@ -1794,43 +1922,50 @@ impl Kernel {
                 // into the same reported-error path as a flush failure
                 // rather than an early `?` return.
                 //
-                // `update.rolled_back` marks dirty on top of `update.saved`:
-                // a discard (`ZQ`, `:q!`) that actually rewrote the block —
-                // it held unsaved changes at quit time — rolls back via a
-                // raw `edit_text` call the file cache's flush pipeline never
-                // sees, so the block can end up disagreeing with disk with
-                // nothing tracking it (docs/file-buffers.md). A discard
-                // never flushes, only writes: nothing to send to disk, but
-                // the entry must become a recoverable swap.
-                let mark_err = if (update.saved || update.rolled_back)
-                    && let Some(fp) = file_path.as_deref()
-                    && let Err(e) = self.file_cache.mark_dirty(fp)
-                {
-                    Some(format!("editor keys: failed to mark {fp} dirty before close: {e}"))
-                } else {
-                    None
-                };
+                // `update.quit.rolled_back` marks dirty on top of
+                // `update.saved`: a discard (`ZQ`, `:q!`) that actually
+                // rewrote a block — it held unsaved changes at quit time —
+                // rolls back via a raw `edit_text` call the file cache's
+                // flush pipeline never sees, so the block can end up
+                // disagreeing with disk with nothing tracking it
+                // (docs/file-buffers.md). A discard never flushes, only
+                // writes: nothing to send to disk, but the entry must become
+                // a recoverable swap.
+                let fp = update.path.as_str();
+                let mark = update
+                    .saved
+                    .then_some(fp)
+                    .into_iter()
+                    .chain(update.quit.rolled_back.iter().map(String::as_str));
+                let mut mark_err = None;
+                for path in mark {
+                    if let Err(e) = self.file_cache.mark_dirty(path) {
+                        mark_err = Some(format!(
+                            "editor keys: failed to mark {path} dirty before close: {e}"
+                        ));
+                        break;
+                    }
+                }
                 let flush_err = if mark_err.is_none()
                     && update.saved
-                    && let Some(fp) = file_path.as_deref()
-                    && let Err(e) =
-                        self.file_cache.flush_one_guarded(fp, update.forced).await
+                    && let Err(e) = self.file_cache.flush_one_guarded(fp, update.forced).await
                 {
                     Some(flush_error_message(fp, &e, self.id()))
                 } else {
                     None
                 };
-                // The session is gone either way — release the pin taken at
-                // open (`editor_open_as`) so eviction can reclaim the entry.
-                if let Some(fp) = file_path.as_deref() {
-                    self.file_cache.unpin(fp);
+                // The session is gone either way — release the pins taken
+                // when each file loaded (`editor_open_list`, `editor_move`)
+                // so eviction can reclaim the entries.
+                for path in &update.quit.loaded {
+                    self.file_cache.unpin(path, id.as_u64());
                 }
                 self.editor_flows.publish(crate::flows::EditorFlow::Closed {
                     session_id: id.as_u64(),
                 });
                 match mark_err.or(flush_err) {
                     Some(e) => Err(e),
-                    None => Ok(update.state),
+                    None => Ok(EditorBatchEnd::Closed(update.state)),
                 }
             }
         }
@@ -1949,29 +2084,24 @@ impl Kernel {
         &self,
         id: crate::editor::EditorSessionId,
     ) -> Result<crate::editor::EditorState, String> {
-        let (file_path, mut state) = {
-            let mut sessions = self.editor_sessions.lock();
-            let file_path = sessions.0.session_path(id);
-            let state = sessions.0.state(id)?;
-            (file_path, state)
+        // The current file at the call: a move while the flush awaits must
+        // not checkpoint a different buffer.
+        let (fp, index) = self.editor_sessions.lock().0.current_file(id)?;
+        // Guarded, unforced: this direct-call path (the wire `editorSave`,
+        // `kj vi save`) carries no bang, so it is a plain `:w` and refuses on
+        // the W12 changed-under-us condition (docs/file-buffers.md rule 3).
+        let message = if let Err(e) = self.file_cache.flush_one_guarded(&fp, false).await {
+            Some(flush_error_message(&fp, &e, self.id()))
+        } else {
+            self.editor_sessions.lock().0.save_at(id, index)?;
+            None
         };
-        if let Some(fp) = file_path.as_deref() {
-            // Guarded, unforced: this direct-call path (the wire
-            // `editorSave`, `kj vi save`) carries no bang, so it is a
-            // plain `:w` and refuses on the W12 changed-under-us
-            // condition (docs/file-buffers.md rule 3).
-            if let Err(e) = self.file_cache.flush_one_guarded(fp, false).await {
-                state.message = Some(flush_error_message(fp, &e, self.id()));
-            } else {
-                state = self.editor_sessions.lock().0.save(id)?;
-            }
-        }
-        let state = self.publish_current_editor_state(id, state.message)?;
-        Ok(state)
+        self.publish_current_editor_state(id, message)
     }
 
-    /// `ZQ` — roll the block back to the session's checkpoint and close it.
-    /// Publishes `Closed` so renderers drop the session.
+    /// `ZQ` — roll every loaded file back to its checkpoint and close the
+    /// session. Publishes `Closed` so renderers drop the session. Returns
+    /// what the close did: every loaded file and the ones rolled back.
     ///
     /// A rollback that actually rewrote the block (`EditorSessions::quit`'s
     /// `rolled_back` return) marks the file-cache entry dirty afterward
@@ -1994,28 +2124,22 @@ impl Kernel {
         &self,
         id: crate::editor::EditorSessionId,
         actor: PrincipalId,
-    ) -> Result<(), String> {
-        let (file_path, rolled_back) = {
-            let mut sessions = self.editor_sessions.lock();
-            let file_path = sessions.0.session_path(id);
-            let rolled_back = sessions.0.quit(id, self.blocks(), actor)?;
-            (file_path, rolled_back)
-        };
-        let mark_err = if rolled_back
-            && let Some(fp) = file_path.as_deref()
-            && let Err(e) = self.file_cache.mark_dirty(fp)
-        {
-            Some(format!(
-                "editor quit: rollback landed but failed to mark {fp} dirty: {e}"
-            ))
-        } else {
-            None
-        };
-        // The session is gone — release the pin taken at open
-        // (`editor_open_as`, docs/file-buffers.md P1) so eviction can
-        // reclaim the entry.
-        if let Some(fp) = file_path.as_deref() {
-            self.file_cache.unpin(fp);
+    ) -> Result<crate::editor::QuitReport, String> {
+        let report = self.editor_sessions.lock().0.quit(id, self.blocks(), actor)?;
+        let mut mark_err = None;
+        for fp in &report.rolled_back {
+            if let Err(e) = self.file_cache.mark_dirty(fp) {
+                mark_err = Some(format!(
+                    "editor quit: rollback landed but failed to mark {fp} dirty: {e}"
+                ));
+                break;
+            }
+        }
+        // The session is gone — release the pin each file took when it
+        // loaded (`editor_open_list`, `editor_move`; docs/file-buffers.md
+        // P1) so eviction can reclaim the entries.
+        for fp in &report.loaded {
+            self.file_cache.unpin(fp, id.as_u64());
         }
         // Deliberately no cache invalidation — see `editor_keys`. The
         // unpin above is what used to let it through: `invalidate_document`
@@ -2026,7 +2150,7 @@ impl Kernel {
         });
         match mark_err {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => Ok(report),
         }
     }
 
@@ -2266,16 +2390,14 @@ impl Kernel {
     pub async fn signal_open_editor(
         &self,
         session: crate::editor::EditorSessionId,
-        path: &str,
         state: &crate::editor::EditorState,
         submitter: Option<kaijutsu_types::PrincipalId>,
     ) {
         // Carry the initial state in the signal so the renderer has text to draw
         // the instant it lands — no fetch, no race against the first push. Reuses
-        // the shared `EditorState::to_json` shape (`{session,text,cursor,mode,dirty}`)
-        // plus the path; subsequent `editor.state_changed` pushes carry updates.
-        let mut params_json = state.to_json(session);
-        params_json["path"] = serde_json::Value::String(path.to_string());
+        // the shared `EditorState::to_json` shape, which carries the current
+        // path; subsequent `editor.state_changed` pushes carry updates.
+        let params_json = state.to_json(session);
         let params = match serde_json::to_vec(&params_json) {
             Ok(p) => p,
             Err(e) => {
@@ -2322,17 +2444,20 @@ impl Kernel {
     /// renderer; the wire `editorOpen` handler and tests call the plain
     /// `editor_open` (they are the renderer / a driver and need no nudge). One
     /// signal site, threaded the submitter principal from each door's caller.
+    ///
+    /// Takes the argument list `paths`; a joined session is the one signaled
+    /// (`editor_open_list`).
     pub async fn editor_open_signaled(
         &self,
-        path: &str,
+        paths: &[String],
         opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         // Record the full opener so `fg` and `:r !cmd` can find the caller's
         // session + context later; the open_editor signal fans only to their
         // app windows, so it needs just the principal.
         let submitter = opener.map(|o| o.principal);
-        let (id, state) = self.editor_open_as(path, opener).await?;
-        self.signal_open_editor(id, path, &state, submitter).await;
+        let (id, state) = self.editor_open_list(paths, opener).await?;
+        self.signal_open_editor(id, &state, submitter).await;
         Ok((id, state))
     }
 
@@ -2346,7 +2471,7 @@ impl Kernel {
         &self,
         submitter: Option<kaijutsu_types::PrincipalId>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
-        let (id, path, state) = {
+        let (id, state) = {
             let mut sessions = self.editor_sessions.lock();
             // Prefer the caller's own most-recent session — now that the opener
             // is captured at construction on every materialized-shell front door,
@@ -2357,11 +2482,11 @@ impl Kernel {
             let found = submitter
                 .and_then(|p| sessions.0.latest_session_for(p))
                 .or_else(|| sessions.0.latest_session_any());
-            let (id, path) = found.ok_or_else(|| "fg: no editor session".to_string())?;
+            let (id, _) = found.ok_or_else(|| "fg: no editor session".to_string())?;
             let state = sessions.0.state(id)?;
-            (id, path, state)
+            (id, state)
         };
-        self.signal_open_editor(id, &path, &state, submitter).await;
+        self.signal_open_editor(id, &state, submitter).await;
         Ok((id, state))
     }
 
@@ -3586,4 +3711,388 @@ mod tests {
         assert!(!kernel.turn_in_flight(context));
     }
 
+
+    // ── The argument list (`vi a b c`, `:n`, `:N`, `:e`) ──────────────────
+
+    /// A kernel with `/mem/a.txt`, `/mem/b.txt` and `/mem/c.txt` holding
+    /// `alpha`, `beta` and `gamma` on their own lines.
+    async fn kernel_with_three_files() -> Kernel {
+        use crate::vfs::VfsOps as _;
+        let kernel = kernel_with_mem_fs().await;
+        for (name, text) in [("a", "alpha\none"), ("b", "beta\ntwo"), ("c", "gamma\nthree")] {
+            let path = format!("/mem/{name}.txt");
+            kernel.vfs().write_all(Path::new(&path), text.as_bytes()).await.unwrap();
+        }
+        kernel
+    }
+
+    fn abc() -> Vec<String> {
+        ["a", "b", "c"].iter().map(|n| format!("/mem/{n}.txt")).collect()
+    }
+
+    fn opener_for(principal: PrincipalId) -> crate::editor::EditorOpener {
+        crate::editor::EditorOpener {
+            principal,
+            performer: principal,
+            reviewer: None,
+            context_id: kaijutsu_types::ContextId::new(),
+            session_id: kaijutsu_types::SessionId::new(),
+        }
+    }
+
+    async fn disk(kernel: &Kernel, path: &str) -> String {
+        use crate::vfs::VfsOps as _;
+        String::from_utf8(kernel.vfs().read_all(Path::new(path)).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn vi_over_three_files_opens_one_session_and_n_moves_through_them() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, st) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        assert_eq!((st.path.as_str(), st.arg_index, st.arg_count), ("/mem/a.txt", 0, 3));
+        assert_eq!(st.text, "alpha\none");
+
+        let st = kernel.editor_keys(id, ":n<CR>", me).await.unwrap();
+        assert_eq!((st.path.as_str(), st.arg_index, st.text.as_str()), ("/mem/b.txt", 1, "beta\ntwo"));
+        let st = kernel.editor_keys(id, ":next<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/c.txt");
+        let st = kernel.editor_keys(id, ":N<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/b.txt");
+        let st = kernel.editor_keys(id, ":first<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/a.txt");
+        let st = kernel.editor_keys(id, ":last<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/c.txt");
+        let st = kernel.editor_keys(id, ":2N<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/a.txt");
+        let st = kernel.editor_keys(id, ":2n<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/c.txt");
+        let st = kernel.editor_keys(id, ":rew<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/a.txt");
+        assert_eq!(kernel.editor_list().len(), 1, "one session over the list");
+    }
+
+    #[tokio::test]
+    async fn moving_past_either_end_refuses_with_vims_message() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        let st = kernel.editor_keys(id, ":N<CR>", me).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some("Cannot go before first file"));
+        assert_eq!(st.path, "/mem/a.txt");
+        let st = kernel.editor_keys(id, ":3n<CR>", me).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some("Cannot go beyond last file"));
+        assert_eq!(st.path, "/mem/a.txt");
+    }
+
+    /// A visited buffer keeps its core: undo history and cursor are there
+    /// when the list comes back to it.
+    #[tokio::test]
+    async fn a_visited_buffer_keeps_its_undo_and_cursor() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, "jx", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", me).await.unwrap();
+        assert_eq!(st.text, "alpha\nne");
+        let cursor = st.cursor;
+        kernel.editor_keys(id, ":n<CR>", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":N<CR>", me).await.unwrap();
+        assert_eq!(st.cursor, cursor, "the cursor is where it was left");
+        let st = kernel.editor_keys(id, "u", me).await.unwrap();
+        assert_eq!(st.text, "alpha\none", "undo history survives the round trip");
+    }
+
+    #[tokio::test]
+    async fn leaving_a_dirty_buffer_refuses_and_the_bang_keeps_it_dirty() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        for line in [":n<CR>", ":last<CR>", ":e /mem/c.txt<CR>"] {
+            let st = kernel.editor_keys(id, line, me).await.unwrap();
+            assert_eq!(
+                st.message.as_deref(),
+                Some(crate::editor::NO_WRITE_SINCE_LAST_CHANGE),
+                "{line}"
+            );
+            assert_eq!(st.path, "/mem/a.txt", "{line} must not move");
+        }
+
+        let st = kernel.editor_keys(id, ":n!<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/b.txt");
+        let st = kernel.editor_keys(id, ":N<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/a.txt");
+        assert_eq!(st.text, "lpha\none", ":n! keeps the edit, it does not discard");
+        assert!(st.dirty, "the hidden buffer stayed dirty");
+        assert_eq!(disk(&kernel, "/mem/a.txt").await, "alpha\none", "and nothing was written");
+
+        // The same refusal toward a file already loaded.
+        let st = kernel.editor_keys(id, ":n<CR>", me).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some(crate::editor::NO_WRITE_SINCE_LAST_CHANGE));
+        assert_eq!(st.path, "/mem/a.txt");
+    }
+
+    /// A load that finds its file already loaded (another batch got there
+    /// while this one resolved) moves to that buffer and never replaces it.
+    #[tokio::test]
+    async fn a_racing_load_keeps_the_buffer_another_batch_loaded() {
+        use crate::editor::LoadStep;
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, ":n<CR>x:N!<CR>", me).await.unwrap();
+        let target = crate::editor::resolve_editor_target("/mem/b.txt", kernel.file_cache()).await.unwrap();
+        let loaded = kernel.editor_sessions.lock().0.finish_load(id, "/mem/b.txt", target, true, kernel.blocks());
+        assert_eq!(loaded, Ok(LoadStep::AlreadyLoaded));
+        let st = kernel.editor_state(id).unwrap();
+        assert_eq!((st.path.as_str(), st.text.as_str(), st.dirty), ("/mem/b.txt", "eta\ntwo", true));
+    }
+
+    /// Each `:` line of a batch runs: a write before a move lands, and the
+    /// move happens too.
+    #[tokio::test]
+    async fn a_write_then_a_move_in_one_batch_both_run() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>:n<CR>", me).await.unwrap();
+        assert_eq!(disk(&kernel, "/mem/a.txt").await, "lpha\none", "the :w landed");
+        assert_eq!(st.path, "/mem/b.txt", "and the :n moved");
+        let st = kernel.editor_keys(id, ":N<CR>", me).await.unwrap();
+        assert!(!st.dirty, "the first file was checkpointed");
+    }
+
+    #[tokio::test]
+    async fn two_reads_in_one_batch_both_land() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc()[..1], None).await.unwrap();
+        let st = kernel.editor_keys(id, "G$:r /mem/b.txt<CR>:r /mem/c.txt<CR>", me).await.unwrap();
+        assert!(st.text.contains("beta") && st.text.contains("gamma"), "{:?}", st.text);
+    }
+
+    #[tokio::test]
+    async fn args_then_a_move_in_one_batch_keeps_the_list_message() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        let st = kernel.editor_keys(id, ":args<CR>:n<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/b.txt");
+        assert_eq!(st.message.as_deref(), Some("[/mem/a.txt] /mem/b.txt /mem/c.txt"));
+    }
+
+    /// A buffer dirtied while the next file resolves still refuses the move:
+    /// the load re-checks, and loads nothing.
+    #[tokio::test]
+    async fn a_buffer_dirtied_while_the_next_file_resolves_still_refuses() {
+        use crate::editor::{LoadStep, MoveStep};
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        let step = kernel.editor_sessions.lock().0.begin_move(id, &kaijutsu_editor::ArgMove::Next(1), false);
+        assert_eq!(step, Ok(MoveStep::Load { path: "/mem/b.txt".to_string() }));
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        let target = crate::editor::resolve_editor_target("/mem/b.txt", kernel.file_cache()).await.unwrap();
+        let loaded = kernel.editor_sessions.lock().0.finish_load(id, "/mem/b.txt", target, false, kernel.blocks());
+        assert_eq!(loaded, Ok(LoadStep::Refused(crate::editor::NO_WRITE_SINCE_LAST_CHANGE.to_string())));
+        assert_eq!(kernel.editor_state(id).unwrap().path, "/mem/a.txt");
+    }
+
+    #[tokio::test]
+    async fn args_shows_the_list_with_the_current_file_bracketed() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, ":n<CR>", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":args<CR>", me).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some("/mem/a.txt [/mem/b.txt] /mem/c.txt"));
+    }
+
+    #[tokio::test]
+    async fn wn_writes_then_moves_and_on_the_last_file_writes_then_refuses() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":wn<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/b.txt");
+        assert_eq!(disk(&kernel, "/mem/a.txt").await, "lpha\none");
+
+        kernel.editor_keys(id, ":last<CR>", me).await.unwrap();
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":wn<CR>", me).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some("Cannot go beyond last file"));
+        assert_eq!(st.path, "/mem/c.txt");
+        assert!(!st.dirty, "the write landed and checkpointed");
+        assert_eq!(disk(&kernel, "/mem/c.txt").await, "amma\nthree");
+
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":wN<CR>", me).await.unwrap();
+        assert_eq!(st.path, "/mem/b.txt");
+        assert_eq!(disk(&kernel, "/mem/c.txt").await, "mma\nthree");
+    }
+
+    #[tokio::test]
+    async fn colon_e_appends_a_new_path_and_moves_to_a_listed_one() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc()[..2], None).await.unwrap();
+        let st = kernel.editor_keys(id, ":e /mem/c.txt<CR>", me).await.unwrap();
+        assert_eq!((st.path.as_str(), st.arg_index, st.arg_count), ("/mem/c.txt", 2, 3));
+        assert_eq!(st.text, "gamma\nthree");
+        let st = kernel.editor_keys(id, ":e /mem/a.txt<CR>", me).await.unwrap();
+        assert_eq!((st.path.as_str(), st.arg_index, st.arg_count), ("/mem/a.txt", 0, 3));
+
+        let st = kernel.editor_keys(id, ":e /mem/missing.txt<CR>", me).await.unwrap();
+        assert!(st.message.as_deref().is_some_and(|m| m.contains("missing.txt")), "{st:?}");
+        assert_eq!((st.path.as_str(), st.arg_count), ("/mem/a.txt", 3), "a failed :e adds nothing");
+    }
+
+    /// The keys after a move run in the buffer it landed on.
+    #[tokio::test]
+    async fn keys_after_a_move_in_one_batch_edit_the_next_file() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        let st = kernel.editor_keys(id, ":n<CR>dd", me).await.unwrap();
+        assert_eq!((st.path.as_str(), st.text.as_str()), ("/mem/b.txt", "two"));
+        let st = kernel.editor_keys(id, ":N!<CR>", me).await.unwrap();
+        assert_eq!(st.text, "alpha\none", "the first file is untouched");
+    }
+
+    #[tokio::test]
+    async fn q_refuses_while_a_hidden_buffer_is_dirty_and_q_bang_rolls_back_every_file() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, "x:n!<CR>", me).await.unwrap();
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        kernel.editor_keys(id, ":w<CR>", me).await.unwrap();
+        let st = kernel.editor_keys(id, ":q<CR>", me).await.unwrap();
+        assert_eq!(
+            st.message.as_deref(),
+            Some("No write since last change for buffer \"/mem/a.txt\"")
+        );
+        assert_eq!(kernel.editor_list().len(), 1, ":q must not close");
+
+        kernel.editor_keys(id, "x", me).await.unwrap();
+        kernel.editor_keys(id, ":q!<CR>", me).await.unwrap();
+        assert!(kernel.editor_list().is_empty());
+        assert_eq!(kernel.file_cache().try_read_content("/mem/a.txt").await.unwrap(), "alpha\none");
+        assert_eq!(kernel.file_cache().try_read_content("/mem/b.txt").await.unwrap(), "eta\ntwo");
+    }
+
+    #[tokio::test]
+    async fn zz_saves_but_keeps_the_session_open_while_another_file_is_dirty() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, "x:n!<CR>x", me).await.unwrap();
+        for close in ["ZZ", ":wq<CR>", ":x<CR>"] {
+            kernel.editor_keys(id, "x", me).await.unwrap();
+            let st = kernel.editor_keys(id, close, me).await.unwrap();
+            assert_eq!(
+                st.message.as_deref(),
+                Some("No write since last change for buffer \"/mem/a.txt\""),
+                "{close}"
+            );
+            assert!(!st.dirty, "{close} saved the current file");
+            assert_eq!(kernel.editor_list().len(), 1, "{close} must not close");
+        }
+        assert_eq!(disk(&kernel, "/mem/b.txt").await, "\ntwo", "each close form wrote its edit");
+
+        kernel.editor_keys(id, ":N<CR>:w<CR>", me).await.unwrap();
+        kernel.editor_keys(id, "ZZ", me).await.unwrap();
+        assert!(kernel.editor_list().is_empty(), "ZZ closes once nothing else is dirty");
+        assert_eq!(disk(&kernel, "/mem/a.txt").await, "lpha\none");
+    }
+
+    /// One session per file, per person: `vi` on a file already in one of
+    /// the person's sessions joins it there and appends the rest.
+    #[tokio::test]
+    async fn opening_a_file_in_your_own_session_joins_it_and_appends_the_rest() {
+        let kernel = kernel_with_three_files().await;
+        let (amy, model) = (PrincipalId::new(), PrincipalId::new());
+        let (first, _) = kernel.editor_open_list(&abc()[..2], Some(opener_for(amy))).await.unwrap();
+
+        let paths = vec!["/mem/c.txt".to_string(), "/mem/b.txt".to_string()];
+        let (joined, st) = kernel.editor_open_signaled(&paths, Some(opener_for(amy))).await.unwrap();
+        assert_eq!(joined, first, "the open lands on the existing session");
+        assert_eq!((st.path.as_str(), st.arg_index, st.arg_count), ("/mem/b.txt", 1, 3));
+        let st = kernel.editor_keys(joined, ":args<CR>", amy).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some("/mem/a.txt [/mem/b.txt] /mem/c.txt"));
+
+        let (other, _) = kernel.editor_open_list(&abc()[1..2], Some(opener_for(model))).await.unwrap();
+        assert_ne!(other, first, "another player's session is never joined");
+        let (headless, _) = kernel.editor_open_list(&abc()[1..2], None).await.unwrap();
+        assert_ne!(headless, first, "a headless open joins nothing");
+        assert_eq!(kernel.editor_list().len(), 3);
+    }
+
+    /// Joining moves off a dirty buffer without discarding it.
+    #[tokio::test]
+    async fn joining_keeps_a_dirty_current_buffer_hidden() {
+        let kernel = kernel_with_three_files().await;
+        let amy = PrincipalId::new();
+        let (id, _) = kernel.editor_open_list(&abc(), Some(opener_for(amy))).await.unwrap();
+        kernel.editor_keys(id, "x", amy).await.unwrap();
+        let (joined, st) =
+            kernel.editor_open_list(&["/mem/c.txt".to_string()], Some(opener_for(amy))).await.unwrap();
+        assert_eq!((joined, st.path.as_str()), (id, "/mem/c.txt"));
+        let st = kernel.editor_keys(id, ":first<CR>", amy).await.unwrap();
+        assert_eq!((st.text.as_str(), st.dirty), ("lpha\none", true));
+    }
+
+    /// Each visited file is pinned in the file cache while the session
+    /// holds it, and every pin is released on close.
+    #[tokio::test]
+    async fn every_visited_file_is_pinned_until_the_session_closes() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, ":n<CR>", me).await.unwrap();
+        for path in ["/mem/a.txt", "/mem/b.txt"] {
+            assert!(
+                kernel.file_cache().invalidate_document(path).is_err(),
+                "{path} is pinned while the session holds it"
+            );
+        }
+        kernel.editor_keys(id, ":q<CR>", me).await.unwrap();
+        assert!(kernel.editor_list().is_empty());
+        for path in ["/mem/a.txt", "/mem/b.txt"] {
+            kernel
+                .file_cache()
+                .invalidate_document(path)
+                .unwrap_or_else(|e| panic!("{path} must be unpinned after close: {e}"));
+        }
+    }
+
+    /// A peer's write merges into a hidden buffer too, so the file shows it
+    /// when visited, and the entanglement guard keeps `:q!` off it.
+    #[tokio::test]
+    async fn a_hidden_buffer_merges_a_peers_write_and_q_bang_leaves_it() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        kernel.editor_keys(id, ":n<CR>", me).await.unwrap();
+
+        let (peer, _) = kernel.editor_open("/mem/a.txt").await.unwrap();
+        kernel.editor_keys(peer, "iPEER<Esc>", me).await.unwrap();
+        kernel.editor_keys(peer, ":q!<CR>", me).await.unwrap();
+        let target = crate::editor::resolve_editor_target("/mem/a.txt", kernel.file_cache())
+            .await
+            .unwrap();
+        kernel.editor_reconcile_block(target.context_id, target.block_id);
+
+        let st = kernel.editor_keys(id, ":N<CR>", me).await.unwrap();
+        assert_eq!(st.text, "PEERalpha\none", "the hidden buffer merged the peer's write");
+        kernel.editor_keys(id, ":q!<CR>", me).await.unwrap();
+        assert_eq!(
+            kernel.file_cache().try_read_content("/mem/a.txt").await.unwrap(),
+            "PEERalpha\none",
+            "a :q! never retracts a peer's work"
+        );
+    }
 }

@@ -39,6 +39,14 @@ impl EditorSelection {
     }
 }
 
+/// The status-line label for the current file's place in an editor session's
+/// argument list: `"(2 of 5)"` for the second of five files, from a 0-based
+/// `index`. `None` when the list holds one file: a single file shows no
+/// position. See `docs/vi.md`, "The argument list".
+pub fn arg_position_label(index: usize, count: usize) -> Option<String> {
+    (count > 1).then(|| format!("({} of {count})", index + 1))
+}
+
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
 mod tests {
@@ -52,6 +60,13 @@ mod tests {
         };
         let inside: Vec<usize> = (0..10).filter(|&i| sel.contains(i)).collect();
         assert_eq!(inside, vec![1, 2, 6, 7]);
+    }
+
+    #[test]
+    fn arg_position_label_counts_from_one_and_hides_a_single_file() {
+        assert_eq!(arg_position_label(1, 5).as_deref(), Some("(2 of 5)"));
+        assert_eq!(arg_position_label(0, 2).as_deref(), Some("(1 of 2)"));
+        assert_eq!(arg_position_label(0, 1), None);
     }
 
     #[test]

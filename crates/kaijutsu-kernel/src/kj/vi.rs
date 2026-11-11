@@ -29,10 +29,13 @@ pub(crate) struct EditorArgs {
 
 #[derive(Subcommand, Debug)]
 enum EditorCommand {
-    /// Open an editor on a path, binding to the kernel block that owns it.
+    /// Open an editor on one or more paths, binding to the kernel block that
+    /// owns each. Several paths make an argument list: `:n` and `:N` move
+    /// through it. A path already in a session you opened joins that session.
     Open {
-        /// File or rc/config path to edit (e.g. /config/rc/coder/create/S00-stance.kai).
-        path: String,
+        /// Files or rc/config paths to edit (e.g. /config/rc/coder/create/S00-stance.kai).
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>"). Named keys
     /// are `<Esc> <CR> <BS> <Tab> <Space> <Del> <Left> <Right> <Up> <Down>
@@ -40,7 +43,9 @@ enum EditorCommand {
     /// `<` as `<lt>`. An unknown `<...>` is skipped; an unterminated `<` drops the
     /// rest of the batch. A batch
     /// that submits a write (`:w`, `:w!`, `:wq`, `:x`, `ZZ`, …) needs the
-    /// `editor` capability; plain edits and navigation don't.
+    /// `editor` capability; plain edits and navigation don't. Each `:` line
+    /// in a batch runs in order: `x:w<CR>:n<CR>dd` writes, moves to the next
+    /// file of the argument list, and deletes a line there.
     Keys {
         /// Session handle from `kj vi open`.
         session: u64,
@@ -60,24 +65,28 @@ enum EditorCommand {
         /// Text to splice at the cursor.
         text: String,
     },
-    /// Print a session's current buffer/cursor/mode/dirty state.
+    /// Print a session's current file, buffer, cursor, mode and dirty state.
     State {
         /// Session handle.
         session: u64,
     },
-    /// Checkpoint the buffer as saved (like `:w`; the session stays open); for a
-    /// file, also flush to disk.
+    /// Checkpoint the current file as saved and flush it to disk (like `:w`;
+    /// the session stays open).
     /// Needs the `editor` capability.
     Save {
         /// Session handle.
         session: u64,
     },
-    /// Roll the block back to the last checkpoint and close the session (`ZQ`).
+    /// Roll every file of the session back to its last checkpoint and close
+    /// it (`ZQ`); a file another session shares, or a peer wrote since the
+    /// checkpoint, is left as it is. Prints the files it closed and the ones
+    /// it rolled back.
     Quit {
         /// Session handle.
         session: u64,
     },
-    /// List open editor sessions (session, path, dirty, mode, opener).
+    /// List open editor sessions: session, current path and its place in
+    /// the argument list, the files with unsaved changes, mode, opener.
     List,
 }
 
@@ -88,12 +97,6 @@ enum EditorCommand {
 fn write_cap() -> Capability {
     Capability::Editor
 }
-
-/// The `:`-line verbs that report a write (`KeysUpdate.saved`,
-/// `crates/kaijutsu-kernel/src/editor.rs`): `parse_ex_command`
-/// (`crates/kaijutsu-editor/src/lib.rs`) matches these exactly, after
-/// stripping one adjacent trailing `!`. No abbreviations, no ranges — the
-/// dialect is this short list, verbatim.
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_vi(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -129,12 +132,19 @@ impl KjDispatcher {
             session_id: caller.session_id,
         });
         match parsed.command {
-            EditorCommand::Open { path } => match kernel
-                .editor_open_signaled(&path, opener)
+            EditorCommand::Open { paths } => match kernel
+                .editor_open_signaled(&paths, opener)
                 .await
             {
                 Ok((id, st)) => KjResult::ok_with_data(
-                    format!("opened editor session {} on {path}", id.as_u64()),
+                    format!(
+                        "opened editor session {} on {}{}",
+                        id.as_u64(),
+                        st.path,
+                        kaijutsu_types::editor::arg_position_label(st.arg_index, st.arg_count)
+                            .map(|p| format!(" {p}"))
+                            .unwrap_or_default(),
+                    ),
                     st.to_json(id),
                 ),
                 Err(e) => KjResult::Err(format!("kj vi open: {e}")),
@@ -222,9 +232,17 @@ impl KjDispatcher {
             EditorCommand::Quit { session } => {
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_quit(id, caller.actor_id) {
-                    Ok(()) => KjResult::ok(format!(
-                        "session {session}: closed (rolled back to checkpoint)"
-                    )),
+                    Ok(report) => {
+                        let rolled = if report.rolled_back.is_empty() {
+                            "nothing to roll back".to_string()
+                        } else {
+                            format!("rolled back {}", report.rolled_back.join(", "))
+                        };
+                        KjResult::ok(format!(
+                            "session {session}: closed {}; {rolled}",
+                            report.loaded.join(", ")
+                        ))
+                    }
                     Err(e) => KjResult::Err(format!("kj vi quit: {e}")),
                 }
             }
@@ -236,14 +254,22 @@ impl KjDispatcher {
                     sessions
                         .iter()
                         .map(|s| {
-                            let modified = if s.dirty { " [modified]" } else { "" };
+                            let modified = if s.dirty_files.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [modified: {}]", s.dirty_files.join(", "))
+                            };
+                            let position =
+                                kaijutsu_types::editor::arg_position_label(s.arg_index, s.arg_count)
+                                    .map(|p| format!(" {p}"))
+                                    .unwrap_or_default();
                             let opener = s
                                 .opener
                                 .as_deref()
                                 .map(|o| format!(" (opener {o})"))
                                 .unwrap_or_default();
                             format!(
-                                "session {}: {}{modified} {}{opener}",
+                                "session {}: {}{position}{modified} {}{opener}",
                                 s.session,
                                 s.path,
                                 mode_label_of(s.mode.as_deref()),
@@ -382,6 +408,46 @@ mod tests {
             Some("Xhello"),
             "kj vi quit must roll the rc doc back to the last save"
         );
+    }
+
+    /// The argument list through the model door: `open` takes two paths,
+    /// `keys` moves, `list` names the dirty hidden file, and `quit` names
+    /// what it closed and what it rolled back.
+    #[tokio::test]
+    async fn kj_vi_drives_an_argument_list_and_reports_what_quit_did() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        const P2: &str = "/config/rc/editortest/create/S01-bar.kai";
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c).await;
+        d.dispatch(&[s("rc"), s("add"), s(P2), s("--content"), s("world")], &c).await;
+
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P), s(P2)], &c).await;
+        let id = session_of(&opened);
+        let KjResult::Ok { message, data: Some(dd), .. } = &opened else { panic!("{opened:?}") };
+        assert!(message.contains("(1 of 2)"), "{message}");
+        assert_eq!((dd["path"].as_str(), dd["arg_count"].as_u64()), (Some(P), Some(2)));
+
+        let moved = d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("x:n!<CR>")], &c).await;
+        let KjResult::Ok { data: Some(dd), .. } = &moved else { panic!("{moved:?}") };
+        assert_eq!(dd["path"], P2);
+
+        let listed = d.dispatch(&[s("vi"), s("list")], &c).await;
+        let KjResult::Ok { message, data: Some(dd), .. } = &listed else { panic!("{listed:?}") };
+        assert_eq!(dd[0]["dirty_files"], serde_json::json!([P]), "{dd}");
+        assert_eq!(dd[0]["dirty"], true, "a dirty hidden file makes the session dirty");
+        assert!(message.contains(&format!("[modified: {P}]")), "{message}");
+
+        let quit = d.dispatch(&[s("vi"), s("quit"), id.to_string()], &c).await;
+        let KjResult::Ok { message, .. } = &quit else { panic!("{quit:?}") };
+        assert!(message.contains(&format!("closed {P}, {P2}")), "{message}");
+        assert!(message.contains(&format!("rolled back {P}")), "{message}");
+
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P)], &c).await;
+        let id = session_of(&opened);
+        let quit = d.dispatch(&[s("vi"), s("quit"), id.to_string()], &c).await;
+        let KjResult::Ok { message, .. } = &quit else { panic!("{quit:?}") };
+        assert!(message.contains("nothing to roll back"), "{message}");
     }
 
     /// `kj vi insert` is the paste path: it lands text at the cursor and

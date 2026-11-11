@@ -73,10 +73,9 @@ impl ScreenMode {
 pub struct EditorScreen {
     /// The kernel session handle — the currency of `editor_keys`.
     pub session: u64,
-    /// The path being edited, for the mode line.
-    pub path: String,
     /// The latest renderer-facing snapshot, seeded from the `open_editor`
-    /// signal and kept fresh by the `subscribeEditor` push.
+    /// signal and kept fresh by the `subscribeEditor` push. Its `path` is the
+    /// current file, which `:n` and `:N` move.
     pub state: EditorState,
     /// First buffer row drawn.
     top: usize,
@@ -86,10 +85,9 @@ pub struct EditorScreen {
 }
 
 impl EditorScreen {
-    pub fn new(session: u64, path: impl Into<String>, state: EditorState) -> Self {
+    pub fn new(session: u64, state: EditorState) -> Self {
         Self {
             session,
-            path: path.into(),
             state,
             top: 0,
             left: 0,
@@ -235,7 +233,10 @@ fn buffer_row(
     Line::from(spans)
 }
 
-/// `foo.kai [+]                          -- INSERT --            12,3`
+/// `foo.kai (2 of 5) [+]                 -- INSERT --            12,3`
+///
+/// The `(2 of 5)` is the current file's place in the session's argument
+/// list, shown only when the list holds more than one file.
 fn mode_line(
     screen: &EditorScreen,
     row: usize,
@@ -243,7 +244,12 @@ fn mode_line(
     cols: usize,
     palette: &Palette,
 ) -> Line<'static> {
-    let mut left = screen.path.clone();
+    let mut left = screen.state.path.clone();
+    let args = (screen.state.arg_index as usize, screen.state.arg_count as usize);
+    if let Some(position) = kaijutsu_types::editor::arg_position_label(args.0, args.1) {
+        left.push(' ');
+        left.push_str(&position);
+    }
     if screen.state.dirty {
         left.push_str(" [+]");
     }
@@ -343,7 +349,6 @@ pub fn key_notation(key: &KeyEvent) -> Option<String> {
 /// as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorOpen {
-    pub path: String,
     pub state: EditorState,
 }
 
@@ -364,11 +369,12 @@ pub fn parse_open_signal(params: &[u8]) -> Result<EditorOpen, String> {
         dirty: bool,
         #[serde(default)]
         command_line: Option<String>,
+        arg_index: u32,
+        arg_count: u32,
     }
     let signal: Signal =
         serde_json::from_slice(params).map_err(|e| format!("invalid open_editor params: {e}"))?;
     Ok(EditorOpen {
-        path: signal.path,
         state: EditorState {
             session: signal.session,
             text: signal.text,
@@ -379,6 +385,9 @@ pub fn parse_open_signal(params: &[u8]) -> Result<EditorOpen, String> {
             message: None,
             // A fresh session is in normal mode, so it selects nothing.
             selection: None,
+            path: signal.path,
+            arg_index: signal.arg_index,
+            arg_count: signal.arg_count,
         },
     })
 }
@@ -415,11 +424,7 @@ pub fn route_key(app: &crate::app::App, claimed: bool) -> KeyRoute {
 
 /// Land an `open_editor` signal: the alternate screen's editor takes over.
 pub fn enter_editor(app: &mut crate::app::App, open: EditorOpen) {
-    app.screen = ScreenMode::Editor(EditorScreen::new(
-        open.state.session,
-        open.path,
-        open.state,
-    ));
+    app.screen = ScreenMode::Editor(EditorScreen::new(open.state.session, open.state));
 }
 
 /// Apply an editor push. Returns whether the frame changed.
@@ -558,11 +563,14 @@ mod tests {
             command_line: None,
             message: None,
             selection: None,
+            path: "notes.kai".to_string(),
+            arg_index: 0,
+            arg_count: 1,
         }
     }
 
     fn screen(text: &str, cursor: u64) -> EditorScreen {
-        EditorScreen::new(7, "notes.kai", state(text, cursor))
+        EditorScreen::new(7, state(text, cursor))
     }
 
     /// Render a frame through a real ratatui backend and return its rows, so
@@ -696,6 +704,24 @@ mod tests {
         let out = rows(&mut s, 40, 4);
         assert!(out[2].starts_with("notes.kai [+]"), "{:?}", out[2]);
         assert!(out[2].contains("-- INSERT --"), "{:?}", out[2]);
+    }
+
+    /// A session over several files shows the current file's place in the
+    /// argument list after its path; a single file shows none.
+    #[test]
+    fn the_argument_list_position_reaches_the_mode_line() {
+        let mut s = screen("x", 0);
+        s.state.path = "b.rs".to_string();
+        s.state.arg_index = 1;
+        s.state.arg_count = 5;
+        s.state.dirty = true;
+        let out = rows(&mut s, 40, 4);
+        assert!(out[2].starts_with("b.rs (2 of 5) [+]"), "{:?}", out[2]);
+
+        s.state.arg_count = 1;
+        s.state.arg_index = 0;
+        let out = rows(&mut s, 40, 4);
+        assert!(out[2].starts_with("b.rs [+]"), "{:?}", out[2]);
     }
 
     #[test]
@@ -849,9 +875,10 @@ mod tests {
     #[test]
     fn an_open_signal_decodes_into_a_session_and_a_state() {
         let params = br#"{"session":4,"path":"/config/rc/coder/create/S00-stance.kai",
-            "text":"hello\n","cursor":0,"mode":null,"dirty":false}"#;
+            "text":"hello\n","cursor":0,"mode":null,"dirty":false,"arg_index":1,"arg_count":2}"#;
         let open = parse_open_signal(params).expect("decodes");
-        assert_eq!(open.path, "/config/rc/coder/create/S00-stance.kai");
+        assert_eq!(open.state.path, "/config/rc/coder/create/S00-stance.kai");
+        assert_eq!((open.state.arg_index, open.state.arg_count), (1, 2));
         assert_eq!(open.state.session, 4);
         assert_eq!(open.state.text, "hello\n");
         assert_eq!(open.state.message, None, "an open carries no message");
@@ -880,7 +907,6 @@ mod tests {
         enter_editor(
             &mut app,
             EditorOpen {
-                path: "notes.kai".to_string(),
                 state: state("hello\n", 0),
             },
         );
@@ -893,7 +919,7 @@ mod tests {
         assert!(app.screen.is_full_screen());
         let live = app.screen.editor().expect("an editor screen");
         assert_eq!(live.session, 7);
-        assert_eq!(live.path, "notes.kai");
+        assert_eq!(live.state.path, "notes.kai");
     }
 
     #[test]

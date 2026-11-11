@@ -17,15 +17,20 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   "A kernel-owned register store", with Amy's answers: a durable table,
   nothing restored unasked, models maybe later. It follows the argument
   list.
-- **`vi` has no argument list.** Amy, 2026-11-11: *"I often `vi *.rs` and
-  :n and :N through the files, and I can yank and put things across them
-  pretty quickly."* `vi` refuses more than one path
-  (`runtime/vi_builtin.rs`) and the dialect has no `:n`, `:N`, `:args` or
-  `:e`. One person's vi sessions already share registers, so the missing
-  piece is the list: one session that moves across files, with vim's
-  refusal to leave a dirty buffer without `!`. Designed, not built:
-  `docs/vi.md`, "The argument list". Amy put it ahead of the register
-  store.
+- **`vi` argument lists are not recoverable.** `vi *.rs`, `:n`, `:N`,
+  `:args`, `:wn` and `:e` shipped (`docs/vi.md`, "The argument list"). A
+  session's list, index and per-buffer cursors live in memory, so a kernel
+  restart loses them; the dirty text survives as swap documents. Left: a
+  small table written when the list or index changes, and `vi -r` to list
+  and reopen what can be recovered, restoring nothing unasked.
+- **A config write to a path an editor session holds leaves the cache
+  stale.** `kj rc add/rm` and `kj config reset` write the host file, then
+  `Kernel::invalidate_config_file_cache` drops the cached document; on a
+  pinned path that refuses, the kernel only logs a `warn!`, and the command
+  still reports success while a later read serves the old text. This held
+  for a session's current file before; an argument list pins every visited
+  file, so a session showing another file can hold the path too. Left:
+  report the refusal to the caller, or reload the held buffer from disk.
 - **A line cursor in the app conversation, eventually.** Amy, 2026-11-11:
   block yank "is ok for now, but line eventually."
 - **The system clipboard takes yanks and gives nothing back.** A compose
