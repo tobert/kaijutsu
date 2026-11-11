@@ -14,15 +14,20 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
 
 - **Compose and the kernel's vi sessions do not share,** and neither do
   the tui and the app. The design is written and not built: `docs/vi.md`,
-  "A kernel-owned register store". It waits on Amy's read of its open
-  questions (durability, who wins on reconnect, models).
+  "A kernel-owned register store", with Amy's answers: a durable table,
+  nothing restored unasked, models maybe later. It follows the argument
+  list.
 - **`vi` has no argument list.** Amy, 2026-11-11: *"I often `vi *.rs` and
   :n and :N through the files, and I can yank and put things across them
   pretty quickly."* `vi` refuses more than one path
   (`runtime/vi_builtin.rs`) and the dialect has no `:n`, `:N`, `:args` or
   `:e`. One person's vi sessions already share registers, so the missing
   piece is the list: one session that moves across files, with vim's
-  refusal to leave a dirty buffer without `!`.
+  refusal to leave a dirty buffer without `!`. Designed, not built:
+  `docs/vi.md`, "The argument list". Amy put it ahead of the register
+  store.
+- **A line cursor in the app conversation, eventually.** Amy, 2026-11-11:
+  block yank "is ok for now, but line eventually."
 - **The system clipboard takes yanks and gives nothing back.** A compose
   `y`, copy mode's `y` and the app diff viewer's `y` are written to the
   system clipboard (OSC 52 in the tui, arboard in the app). Amy,

@@ -531,18 +531,92 @@ covers `dd` here and `p` there, and needs one cell per message. The delete
 ring and the named registers follow once the push path has been played
 with.
 
-**Open questions.**
+**Amy's answers, 2026-11-11.**
 
-- Durability. In memory, a kernel restart empties the kernel's copy while
-  each running client keeps its own; the first write after the restart
-  wins. A table would survive a restart and would store deleted draft
-  text on disk.
-- A client that was offline reconnects with newer local registers than
-  the kernel's. Either the kernel's copy wins on attach, or the client
-  pushes its own first. The kernel has no clock both sides trust.
-- Whether a model's character gets a store at all, or only people do.
+- *Durability:* "the state should survive in some recoverable form even
+  if the vi session doesn't, basic power outage / kill -9 protection for
+  ongoing work." The store is a table, written through on each accepted
+  write.
+- *Reconnect:* "on reconnect nobody gets it, they can recover it." No
+  side wins by itself. A reconnecting client keeps its local registers and
+  the kernel keeps its copy; a person asks for the kernel's copy when they
+  want it. The verb for that is not chosen.
+- *Models:* "might be cool I suppose I was thinking about some short term
+  memory options." A model's character may get a store. As short-term
+  memory it is a separate idea from yank and put and wants its own design.
+
+**Still open.**
+
+- The recover verb: a `:` command, a `kj` verb, or both, and whether it
+  replaces the local registers or fills named ones.
 - The system clipboard stays a separate, outbound path: a yank is written
   to it, and nothing here reads it.
+
+### The argument list (design, not built)
+
+Amy, 2026-11-11: *"I often `vi *.rs` and :n and :N through the files, and
+I can yank and put things across them pretty quickly."* She chose this
+ahead of the register store. One person's vi sessions already share
+registers, so this design adds only the list.
+
+**What exists.** `vi` takes one path and refuses more
+(`runtime/vi_builtin.rs`). An `EditorSession` is one `EditorCore` bound to
+one file document, with a checkpoint (`saved_content`) for `ZQ`. Unsaved
+text is already durable: a dirty file buffer is a swap file
+(`docs/file-buffers.md`). The session itself, its cursor and its place in
+any list are in memory.
+
+**Two ways to build it.**
+
+1. *The session holds the list.* A session owns an ordered list of
+   buffers and a current index. Each buffer is what a session is today: a
+   core, its document binding, its checkpoint and terminator. `:n` and
+   `:N` change the index; the session id stays, so the renderer's screen
+   and its subscription stay. A buffer is loaded the first time it is
+   visited, through the async path `:r` already uses (an `EditorIo`
+   intent the kernel completes outside the session lock). A visited
+   buffer keeps its core, so its undo history, marks and cursor are there
+   on return, as vim's hidden buffers are.
+2. *The client holds the list.* `vi *.rs` opens one session per file and
+   the client switches which one it draws. The kernel changes little, and
+   each client reimplements the list, the dirty refusal and the `:`
+   commands. That is derived logic in the client, which this project
+   keeps in the kernel.
+
+**Recommendation: the session holds the list.**
+
+**The dialect.** `:n`/`:next`, `:N`/`:prev`, `:first`/`:rew`, `:last`,
+`:args` (shows the list with the current file bracketed, on
+`EditorState.message`), `:wn` and `:wN`. A count works as in vim (`:2n`).
+`:e path` appends a file to the list and moves to it; vim keeps `:e`
+outside the argument list, and one list is simpler here.
+
+**Leaving a dirty buffer.** As vim: `:n` refuses with "No write since last
+change (add ! to override)" when the buffer differs from its checkpoint.
+`:n!` leaves it dirty and hidden, where vim would discard: the text is
+already on the document and durable, and `ZQ`'s rollback stays the one way
+to discard. `:q` with dirty hidden buffers refuses and names the first
+one. `ZZ` saves the current buffer and closes the session only when no
+other buffer is dirty.
+
+**The wire.** `EditorState` gains the current path and the list position
+("2 of 5"), which the status line draws. No new method: `:n` is keys.
+
+**Recovery.** A session's list, index and per-buffer cursor go in a small
+table, written when they change. After a kernel restart no session is
+open and no client is reattached to one. `vi -r` lists what can be
+recovered and reopens it, with the dirty buffers' text coming from their
+swap documents. This is the same rule as the registers: nothing is
+restored unasked.
+
+**Open.**
+
+- Whether `vi a.rs` on a file that is already in another of the person's
+  sessions joins that session or opens a second one over the same
+  document. Today it opens a second one and both see each edit.
+- `kj vi` for models takes the same list or stays one path.
+- A path with a space arrives as one word only when quoted; the one-path
+  refusal that catches an unquoted one goes away with the list.
 
 ## Command mode — the editor's `:` dialect
 
