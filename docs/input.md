@@ -139,6 +139,7 @@ list.
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
 | `Ctrl+A v` | Open the diff viewer on the diff under the reader (`v` in Navigation does the same; see "The reader's block"). Conversation screen only | (new) |
+| `Ctrl+A [` | Focus the conversation, as tmux's copy-mode key and the terminal client's `Ctrl+A [` do. From compose it leaves in normal mode, as `Esc Esc` does; with the conversation already focused it does nothing, and it never scrolls or moves the focused block (the reader's block rule covers a missing focus). Conversation screen only | window copy-mode |
 | `Ctrl+A ]` | Put the unnamed vi register into the active compose surface (chat draft or shell line), as `p` does (a `y` on a block in Navigation fills it too); the terminal client has the same chord. In insert mode the text goes in at the cursor and the mode stays. While the `/`·`?`·`:` bar is open it shows "close the ':' line before putting"; with empty registers, "nothing to put". Held while the chat draft loads, like a key | (new) |
 | `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last 20 answered asks (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
@@ -194,7 +195,7 @@ clipboard when there is one; a delete is not.
 | Key | Does |
 |---|---|
 | `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |
-| `Esc Esc` | Leave compose, when the second Esc lands in normal mode within 500 ms |
+| `Esc Esc` | Leave compose, when the second Esc lands in normal mode within 500 ms (`Ctrl+A [` leaves it from any mode) |
 | `Ctrl+C` | The interrupt ladder; the third press clears the surface |
 | `Ctrl+Z` | Toggle a root console or the console and the context the person performs under it (`docs/tui.md`, "Keys"); each context keeps its own chat draft |
 | `Ctrl+V` / middle click | Paste CLIPBOARD / PRIMARY at the cursor as one edit |

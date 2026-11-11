@@ -466,6 +466,31 @@ pub fn handle_focus_compose(mut actions: MessageReader<ActionFired>, mut io: Com
     }
 }
 
+/// `Ctrl+A [`: focus the conversation from compose, leaving the compose
+/// surface as `PopLevel` does. Idempotent: with the conversation (or any
+/// other area) focused it does nothing, and it never scrolls.
+pub fn handle_focus_conversation(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {
+    for ActionFired { action, .. } in actions.read() {
+        if !matches!(action, Action::FocusConversation) || !matches!(*io.focus, FocusArea::Compose) {
+            continue;
+        }
+        leave_compose(&mut io);
+    }
+}
+
+/// Compose to the conversation in normal mode; the shell surface gives way
+/// to chat as the default.
+fn leave_compose(io: &mut ComposeIo) {
+    *io.focus = FocusArea::Conversation;
+    if io.surface.is_shell() {
+        io.compose.shell.leave_to_normal();
+        *io.surface = ActiveSurface::Chat;
+    } else {
+        let ops = io.compose.chat.leave_to_normal();
+        io.send_chat_ops(&ops);
+    }
+}
+
 /// `PopLevel` while composing: back to the conversation in normal mode, and
 /// from the shell surface back to chat as the default.
 pub fn handle_pop_level(mut actions: MessageReader<ActionFired>, mut io: ComposeIo) {
@@ -473,14 +498,7 @@ pub fn handle_pop_level(mut actions: MessageReader<ActionFired>, mut io: Compose
         if !matches!(action, Action::PopLevel) || !matches!(*io.focus, FocusArea::Compose) {
             continue;
         }
-        *io.focus = FocusArea::Conversation;
-        if io.surface.is_shell() {
-            io.compose.shell.leave_to_normal();
-            *io.surface = ActiveSurface::Chat;
-        } else {
-            let ops = io.compose.chat.leave_to_normal();
-            io.send_chat_ops(&ops);
-        }
+        leave_compose(&mut io);
     }
 }
 

@@ -57,8 +57,7 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   from shaped line to text range per block (`ConversationGeometry` holds
   one row per block), a cursor with its own `InputContext` and motions,
   and cursor and selection drawing; folds and streaming growth have to
-  agree with it. `Ctrl+A [` is unbound in the app: no action focuses the
-  conversation without toggling back on a second press.
+  agree with it.
 - **No selection is written to PRIMARY.** The app reads PRIMARY for
   middle-click paste and never writes it; `docs/input.md` used to say a
   selection auto-copies there.

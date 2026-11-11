@@ -85,6 +85,7 @@ impl Harness {
                     compose_dispatch_keys,
                     handle_focus_compose,
                     handle_pop_level,
+                    handle_focus_conversation,
                     handle_prompt_prefill,
                     handle_compose_paste,
                     handle_put_register,
@@ -545,6 +546,31 @@ fn pop_level_leaves_compose_in_normal_mode() {
     assert_eq!((h.focus(), h.surface()), (FocusArea::Conversation, ActiveSurface::Chat));
     assert!(h.compose().shell.in_normal_mode());
     assert_eq!(h.compose().shell.text(), "ls", "the line is kept");
+}
+
+/// `Ctrl+A [` from the shell surface leaves compose the way PopLevel does.
+#[test]
+fn focus_conversation_leaves_compose_in_normal_mode() {
+    let mut h = Harness::new("");
+    h.load();
+    h.open_shell();
+    h.keys("ls");
+    h.fire(Action::FocusConversation);
+    assert_eq!((h.focus(), h.surface()), (FocusArea::Conversation, ActiveSurface::Chat));
+    assert!(h.compose().shell.in_normal_mode());
+    assert_eq!(h.compose().shell.text(), "ls", "the line is kept");
+}
+
+/// With the conversation already focused, `Ctrl+A [` changes nothing, and
+/// firing it twice from compose lands where once did.
+#[test]
+fn focus_conversation_is_idempotent() {
+    let mut h = Harness::new("");
+    h.load();
+    h.fire(Action::FocusConversation);
+    assert_eq!(h.focus(), FocusArea::Conversation);
+    h.fire(Action::FocusConversation);
+    assert_eq!(h.focus(), FocusArea::Conversation);
 }
 
 #[test]

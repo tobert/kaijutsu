@@ -247,6 +247,8 @@ impl Plugin for InputPlugin {
                 systems::handle_focus_cycle,
                 compose::systems::handle_focus_compose,
                 compose::systems::handle_pop_level,
+                compose::systems::handle_focus_conversation
+                    .run_if(in_state(crate::ui::screen::Screen::Conversation)),
                 systems::handle_detach,
                 compose::systems::handle_prompt_prefill,
                 compose::systems::handle_compose_paste,

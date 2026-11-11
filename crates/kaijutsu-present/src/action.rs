@@ -226,6 +226,9 @@ pub enum Action {
     /// `Ctrl+A ]` — put the unnamed vi register into the active compose
     /// surface, as `p` does.
     PutRegister,
+    /// `Ctrl+A [` — focus the conversation, as tmux's copy-mode key does. Does
+    /// nothing when the conversation already has focus, and never scrolls.
+    FocusConversation,
     /// `Ctrl+A h` — hold (pin) the quick-context overlay up after the prefix
     /// clears, and promote it from the translucent peek to a solid panel.
     /// Firing it again releases the hold. The overlay itself needs no chord

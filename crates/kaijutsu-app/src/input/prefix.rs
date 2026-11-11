@@ -120,6 +120,9 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // ] — put the unnamed vi register into the compose surface (the
         // terminal client's chord for the same act).
         KeyCode::BracketRight => Some(Action::PutRegister),
+        // [ — focus the conversation (tmux's copy-mode key; the terminal
+        // client's `Ctrl+A [` leaves the live tail the same way).
+        KeyCode::BracketLeft => Some(Action::FocusConversation),
         // Esc cancels the pending prefix quietly.
         KeyCode::Escape => None,
         _ => None,
@@ -248,6 +251,15 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::BracketRight, false, false),
             Some(Action::PutRegister)
+        );
+    }
+
+    /// `[` focuses the conversation, as tmux's copy-mode key does.
+    #[test]
+    fn left_bracket_focuses_the_conversation() {
+        assert_eq!(
+            resolve_chord(KeyCode::BracketLeft, false, false),
+            Some(Action::FocusConversation)
         );
     }
 
