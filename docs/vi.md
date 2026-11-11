@@ -588,12 +588,21 @@ any list are in memory.
 **The dialect.** `:n`/`:next`, `:N`/`:prev`, `:first`/`:rew`, `:last`,
 `:args` (shows the list with the current file bracketed, on
 `EditorState.message`), `:wn` and `:wN`. A count works as in vim (`:2n`).
-`:e path` appends a file to the list and moves to it; vim keeps `:e`
-outside the argument list, and one list is simpler here.
+`:e path` appends a file to the list and moves to it (Amy: "add to the
+list"); vim keeps `:e` outside the argument list, and one list is simpler
+here. A path already in the list moves to it and adds nothing.
+
+**One session per file, per person.** Opening a path that is already in
+one of the person's open sessions joins that session on that file (Amy:
+"join existing should be the default"). Any other paths in the same `vi`
+command are appended to that session's list. Another person's or a
+model's session over the same file is never joined: each keeps its own,
+and both see each edit as they do today.
 
 **Leaving a dirty buffer.** As vim: `:n` refuses with "No write since last
 change (add ! to override)" when the buffer differs from its checkpoint.
-`:n!` leaves it dirty and hidden, where vim would discard: the text is
+`:n!` leaves it dirty and hidden (Amy, 2026-11-11: "keep dirty"), where
+vim would discard: the text is
 already on the document and durable, and `ZQ`'s rollback stays the one way
 to discard. `:q` with dirty hidden buffers refuses and names the first
 one. `ZZ` saves the current buffer and closes the session only when no
@@ -611,9 +620,6 @@ restored unasked.
 
 **Open.**
 
-- Whether `vi a.rs` on a file that is already in another of the person's
-  sessions joins that session or opens a second one over the same
-  document. Today it opens a second one and both see each edit.
 - `kj vi` for models takes the same list or stays one path.
 - A path with a space arrives as one word only when quoted; the one-path
   refusal that catches an unquoted one goes away with the list.
