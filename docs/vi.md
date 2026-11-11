@@ -448,10 +448,22 @@ editor, then go to another and 'p' when I type in the wrong spot."*
   another. The cursor, undo history, mode, and an open `:` line stay with
   their core. The API is `EditorCore::with_registers`, `take_registers`
   and `give_registers`.
-- **Not shared yet:** compose with the kernel's vi sessions, the tui with
-  the app, the tui's copy-mode buffer (`Ctrl+A ]`) with either, and the
-  system clipboard — `"+` and `"*` read empty because modalkit's
-  `clipboard` feature is off. See `docs/issues.md`, "vi registers: what
+- **Yanks from outside an editor.** `EditorCore::yank` puts text into the
+  unnamed register and `"0` with a shape, as a `y` would. The tui's copy
+  mode yanks whole rows this way and the app's diff viewer yanks a patch
+  (whole lines) or plain text (characters), so `p` in compose puts either.
+  `EditorCore::put` is `p` for a key that is not vi's own: the tui's
+  `Ctrl+A ]`.
+- **The system clipboard.** A compose `y` is also written to the system
+  clipboard: OSC 52 in the tui, arboard in the app. A client learns that a
+  key yanked by comparing `EditorCore::last_yank` (`"0`) across the key, so
+  a delete never goes out, and neither does a second yank of the same
+  text. Nothing reads the clipboard into a register: `"+` and `"*` read
+  empty because modalkit's `clipboard` feature is off, and paste from the
+  clipboard stays the terminal's bracketed paste and the app's `Ctrl+V`.
+- **Not shared yet:** compose with the kernel's vi sessions, and the tui
+  with the app. A yank in a kernel vi session does not reach the system
+  clipboard. See `docs/issues.md`, "vi registers: what
   sharing leaves open".
 
 ---

@@ -204,7 +204,7 @@ pub(super) async fn act(
             interrupt_ctrl_c(bridge, app, interrupt_ladder).await;
         }
         Intent::InputKey(key) => match tail_key(app, &key, width) {
-            TailKey::Draft => compose_key(bridge, app, key, feeds).await?,
+            TailKey::Draft => compose_key(bridge, app, key, feeds, term_lock).await?,
             // The tail is already on screen; there is nothing below it.
             TailKey::Nothing => {}
             TailKey::LeaveTail(step) => leave_tail(app, width, step),
@@ -225,13 +225,15 @@ pub(super) async fn act(
             Some(id) => switch_seat(bridge, app, id, feeds).await,
             None => app.note("no seats"),
         },
-        Intent::Paste => match (app.current, app.paste_buffer.clone()) {
-            (Some(ctx), Some(text)) => {
-                let ops = app.compose.paste(&text);
-                mirror_ops(app, ctx, &ops);
-            }
-            (None, _) => app.note("no context attached"),
-            (_, None) => app.note("paste buffer empty — scroll up, then v and y to fill it"),
+        // `Ctrl+A ]` is `p`: one register holds the draft's yanks and
+        // deletes and copy mode's yank.
+        Intent::Paste => match app.current {
+            Some(ctx) => match app.compose.put() {
+                Some(ops) if ops.is_empty() => app.note("nothing to put — yank in the draft, or scroll up, then v and y"),
+                Some(ops) => mirror_ops(app, ctx, &ops),
+                None => app.note("close the ':' line before putting"),
+            },
+            None => app.note("no context attached"),
         },
         // `switch_seat` re-watches, which is what makes the toggle work
         // after a feed ended and dropped the context's view: a context with
@@ -275,7 +277,7 @@ pub(super) async fn act(
                 // synthesized bare `Tab`: `keys.rs` only routes an
                 // unmodified `Tab` here today, and a future modifier should
                 // reach compose rather than be dropped on the floor.
-                compose_key(bridge, app, key, feeds).await?;
+                compose_key(bridge, app, key, feeds, term_lock).await?;
             }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
@@ -315,7 +317,7 @@ enum ScrolledKey {
 /// The motions, the mark and the prompt are `copy.rs`'s; the two acts that
 /// need more than the view are this side's — a search reads the whole
 /// transcript to find its row, and a yank renders the marked rows, writes
-/// them over OSC 52 and keeps them in the paste buffer.
+/// them over OSC 52 and yanks them into the draft's vi registers.
 fn scrolled_key(
     app: &mut App,
     key: &crossterm::event::KeyEvent,
@@ -364,10 +366,10 @@ fn scrolled_key(
             let text = render::transcript_rows_text(app, width, start, end);
             app.snap_transcript();
             match write_osc52(term_lock, &text) {
-                Ok(()) => app.note(format!("yanked {} lines — Ctrl+A ] pastes", text.lines().count())),
+                Ok(()) => app.note(format!("yanked {} lines — p or Ctrl+A ] puts", text.lines().count())),
                 Err(e) => app.note(format!("clipboard write failed: {e}")),
             }
-            app.paste_buffer = Some(text);
+            app.compose.yank_lines(&text);
             ScrolledKey::Handled
         }
     }
@@ -524,6 +526,7 @@ async fn compose_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
     feeds: &mut Feeds,
+    term_lock: &TermLock,
 ) -> Result<()> {
     let Some(ctx) = app.current else {
         app.note("no context attached");
@@ -531,6 +534,14 @@ async fn compose_key(
     };
     let action = app.compose.press(key);
     mirror_ops(app, ctx, &action.ops);
+    // A yank in the draft goes to the system clipboard as copy mode's does.
+    // The registers already hold it, so a terminal that drops OSC 52 loses
+    // only the copy out.
+    if let Some(text) = &action.yanked
+        && let Err(e) = write_osc52(term_lock, text)
+    {
+        app.note(format!("clipboard write failed: {e}"));
+    }
     if let Some(line) = action.command {
         handle_colon_line(bridge, app, ctx, line, feeds).await;
         return Ok(());
@@ -715,7 +726,8 @@ mod tests {
         let bridge = KernelBridge::never_answers_for_test();
         let (mut feeds, _hydrated) = feeds_for_test();
         let enter = KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
-        runtime.block_on(compose_key(&bridge, &mut app, enter, &mut feeds)).expect("the key is handled");
+        let term_lock = TermLock::default();
+        runtime.block_on(compose_key(&bridge, &mut app, enter, &mut feeds, &term_lock)).expect("the key is handled");
         assert_eq!(app.compose.text(), "echo hi");
         assert!(app.notice().is_some_and(|n| n.starts_with("submit failed")), "{:?}", app.notice());
         assert_eq!(app.current_draft().map(|(text, _)| text).as_deref(), Some("echo hi"));

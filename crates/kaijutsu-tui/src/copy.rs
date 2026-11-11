@@ -593,7 +593,7 @@ pub enum Outcome {
         skip_current: bool,
     },
     /// `y` or `Enter` — the caller assembles this inclusive row range's
-    /// text, writes it over OSC 52, keeps it in the paste buffer, and
+    /// text, writes it over OSC 52, yanks it into the vi registers, and
     /// returns to the tail.
     Yank(usize, usize),
     /// Every other key: snap the view to the tail and handle the key there

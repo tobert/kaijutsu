@@ -317,6 +317,29 @@ fn a_yank_survives_a_submit_and_a_clear() {
     assert_eq!(state.chat.text(), "echo ");
 }
 
+/// A `y` reports its text for the clipboard; a delete does not.
+#[test]
+fn a_yank_is_reported_and_a_delete_is_not() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "one\ntwo");
+    let last = |state: &mut ComposeState, keys: &str| {
+        keys.chars().map(|c| state.press_chat(press(KeyCode::Char(c))).expect("the draft is loaded").yanked).last().flatten()
+    };
+    assert_eq!(last(&mut state, "ggyy").as_deref(), Some("one\n"));
+    assert_eq!(last(&mut state, "j"), None);
+    assert_eq!(last(&mut state, "dd"), None, "a delete stays out of the clipboard");
+}
+
+/// A yank made outside compose puts on either surface.
+#[test]
+fn an_outside_yank_puts_in_the_chat_draft() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "draft");
+    state.yank(&kaijutsu_editor::Yank::lines("+added"));
+    chat_keys(&mut state, "p");
+    assert_eq!(state.chat.text(), "draft\n+added");
+}
+
 /// Both surfaces share the registers, as two buffers in one vim do.
 #[test]
 fn the_shell_line_and_the_chat_draft_share_registers() {

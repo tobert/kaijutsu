@@ -20,7 +20,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kaijutsu_client::draft_ledger::DraftLedger;
-use kaijutsu_editor::{EditOp, EditorCore};
+use kaijutsu_editor::{EditOp, EditorCore, Yank};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -52,6 +52,9 @@ pub struct ComposeAction {
     /// `run.rs` (`cmdline::parse`) decides what it means and runs it
     /// (`docs/tui.md`, "The `:` line").
     pub command: Option<String>,
+    /// Text this key yanked (`y`, never a delete), for the caller to offer
+    /// to the system clipboard.
+    pub yanked: Option<String>,
 }
 
 /// Local `:` line history — modalkit's command bar surfaces no history hook
@@ -391,11 +394,26 @@ impl Compose {
         ops
     }
 
-    /// Insert `text` at the cursor as one edit — `Ctrl+A ]`, the paste
-    /// buffer. Text, not keystrokes: a normal-mode draft never reads it as
-    /// commands, and one op keeps it one `edit_input`.
+    /// Insert `text` at the cursor as one edit: a bracketed paste. Text, not
+    /// keystrokes: a normal-mode draft never reads it as commands, and one
+    /// op keeps it one `edit_input`.
     pub fn paste(&mut self, text: &str) -> Vec<EditOp> {
         self.editor.insert_at_cursor(text)
+    }
+
+    /// Yank whole lines from outside the draft (copy mode's `y`) into the
+    /// vi registers, where `p` and `Ctrl+A ]` find them.
+    pub fn yank_lines(&mut self, text: &str) {
+        self.editor.yank(&Yank::lines(text));
+    }
+
+    /// `Ctrl+A ]`: put the unnamed register, as `p` does. `None` while the
+    /// `:` bar holds the keyboard, where a put has no meaning.
+    pub fn put(&mut self) -> Option<Vec<EditOp>> {
+        if self.editor.command_line().is_some() {
+            return None;
+        }
+        Some(self.editor.put())
     }
 
     /// Interpret one keystroke. Compose always holds the keyboard: there is
@@ -421,8 +439,12 @@ impl Compose {
             };
         }
 
+        let before = self.editor.last_yank();
+        let ops = self.editor.apply_key_event(key);
+        let yanked = self.editor.last_yank().filter(|now| Some(now) != before.as_ref());
         ComposeAction {
-            ops: self.editor.apply_key_event(key),
+            ops,
+            yanked: yanked.map(|yank| yank.text),
             ..ComposeAction::default()
         }
     }
@@ -440,6 +462,11 @@ impl Compose {
                 let _ = self.editor.take_commands();
                 // History stores the body alone (no `:` prefix) — the one
                 // shape both `older`/`newer` and `set_command_body` agree on.
+                // A `/` or `?` search ends in the core; only a `:` line is
+                // a command for the caller.
+                if !raw.starts_with(':') {
+                    return ComposeAction { ops, ..ComposeAction::default() };
+                }
                 let body = raw.get(1..).unwrap_or("").to_string();
                 self.colon_history.record(body);
                 ComposeAction { ops, command: Some(raw), ..ComposeAction::default() }
@@ -698,9 +725,60 @@ mod tests {
         assert_eq!(compose.text(), "h", "`x` deletes under the cursor");
     }
 
-    /// `Ctrl+A ]` — the paste buffer lands at the cursor as one edit, in
-    /// whatever mode the draft is in; it is text, not keystrokes, so a
-    /// normal-mode draft does not read it as commands.
+    /// `Ctrl+A ]` is `p`: it puts what the draft's own `dd` or `y` took,
+    /// and what copy mode yanked, whole lines on their own lines.
+    #[test]
+    fn put_is_p_over_the_drafts_registers_and_copy_modes_yank() {
+        let mut compose = Compose::over("one\ntwo");
+        typed(&mut compose, "ggdd");
+        let ops = compose.put().expect("the draft takes a put");
+        assert!(!ops.is_empty());
+        assert_eq!(compose.text(), "two\none");
+
+        compose.yank_lines("from\nabove");
+        compose.put();
+        assert_eq!(compose.text(), "two\none\nfrom\nabove");
+        typed(&mut compose, "p");
+        // A put leaves the cursor on its first line, so `p` lands under it.
+        assert_eq!(compose.text(), "two\none\nfrom\nfrom\nabove\nabove", "`p` and the chord read one register");
+    }
+
+    /// `Enter` on a `/` search moves the cursor and hands back no command.
+    #[test]
+    fn a_search_is_not_a_colon_command() {
+        let mut compose = Compose::over("one two");
+        typed(&mut compose, "0/two");
+        let action = compose.press(press(KeyCode::Enter));
+        assert_eq!(action.command, None);
+        assert_eq!(compose.cursor(), 4);
+    }
+
+    #[test]
+    fn put_is_refused_while_the_colon_bar_is_open() {
+        let mut compose = Compose::over("draft");
+        compose.yank_lines("x");
+        typed(&mut compose, ":");
+        assert_eq!(compose.put(), None);
+        assert_eq!(compose.command_line().as_deref(), Some(":"));
+        assert_eq!(compose.text(), "draft");
+    }
+
+    /// A `y` reports its text for the clipboard; a delete and a motion do
+    /// not.
+    #[test]
+    fn a_yank_is_reported_and_a_delete_is_not() {
+        let mut compose = Compose::over("one\ntwo");
+        typed(&mut compose, "gg");
+        assert_eq!(compose.press(press(KeyCode::Char('y'))).yanked, None, "`y` alone is half a command");
+        assert_eq!(compose.press(press(KeyCode::Char('y'))).yanked.as_deref(), Some("one\n"));
+        assert_eq!(compose.press(press(KeyCode::Char('j'))).yanked, None);
+        compose.press(press(KeyCode::Char('d')));
+        assert_eq!(compose.press(press(KeyCode::Char('d'))).yanked, None, "a delete stays out of the clipboard");
+    }
+
+    /// A bracketed paste lands at the cursor as one edit, in whatever mode
+    /// the draft is in; it is text, not keystrokes, so a normal-mode draft
+    /// does not read it as commands.
     #[test]
     fn paste_inserts_text_at_the_cursor_as_one_edit() {
         let mut compose = Compose::new();

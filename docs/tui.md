@@ -519,8 +519,9 @@ Rules the figure carries:
   2026-11-10: *"it doesn't have to be one global, but like, I want to be
   able to dd while working in one context's editor, then go to another and
   'p' when I type in the wrong spot."* The registers are this client's: the
-  app, the kernel's vi sessions, copy mode's buffer (`Ctrl+A ]`) and the
-  system clipboard each keep their own (`docs/vi.md`, "Registers").
+  app and the kernel's vi sessions each keep their own. Copy mode's `y`
+  fills them, and a yank is also written to the system clipboard
+  (`docs/vi.md`, "Registers").
   Probe: `a_deleted_line_survives_a_seat_switch`.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
@@ -1003,8 +1004,9 @@ Rules the figure carries:
   `v` clears it. `y` or `Enter` yanks the marked range — or the reader's
   own line when nothing is marked — to the clipboard over OSC 52
   (`ESC ] 52 ; c ; <base64> BEL`, written straight to stdout under the same
-  `term_lock` every other terminal write takes) and into `app.paste_buffer`
-  for `Ctrl+A ]`, then returns to the tail. `Esc` leaves whether or not a
+  `term_lock` every other terminal write takes) and into the draft's
+  unnamed vi register as whole lines (`Compose::yank_lines`), then returns
+  to the tail. `Esc` leaves whether or not a
   mark is active; a second `v` is what clears a mark.
 - **Every other key snaps the view to the tail and is handled as if typed
   there** — `Space` most of all (Amy: *"I often hit space just to do
@@ -1021,20 +1023,28 @@ Rules the figure carries:
   scrolled state lives on that context's `ContextView`, not on the screen,
   so a context left scrolled is still scrolled on return and one left at
   its tail is still at its tail (`docs/tui.md`, "The buffer").
-- **`Ctrl+A ]` pastes the last yank into the draft** at the cursor, as one
-  edit, in whatever mode the draft is in — tmux's `paste-buffer`. The
-  buffer is the tui's own, so it never needs aligning with vim's registers
-  or the OS clipboard (Amy: *"I always disliked trying to align copy
-  buffers between vim/tmux/os"*). The same yank also goes out over OSC 52,
-  one way; the tui never reads the OS clipboard back.
+- **`Ctrl+A ]` is `p`.** It puts the draft's unnamed vi register, the one
+  a copy-mode `y`, a draft `y` and a draft `dd` all fill, so there is one
+  buffer to think about (Amy, 2026-11-11: *"ctrl-a ] should unify with
+  p"*; earlier: *"I always disliked trying to align copy buffers between
+  vim/tmux/os"*). In normal mode it is exactly `p`: whole lines go on
+  their own lines below the cursor. In insert mode the text lands at the
+  cursor and the mode stays. An empty draft takes the text as its whole
+  content, with no blank line around it. While the `:` bar is open the
+  chord is refused with a notice (`EditorCore::put`, `Compose::put`).
+- **A yank also goes to the system clipboard**, over OSC 52: copy mode's
+  `y` and a `y` in the draft both (`ComposeAction::yanked`). A delete
+  stays in the registers and out of the clipboard. The write is one way;
+  the tui never reads the OS clipboard back, and a terminal that drops
+  OSC 52 loses only the copy out.
 - **The machinery, named.** Nothing on the wire opens copy mode: it is a
   local decision over the `ContextMirror` this client already holds, the
   same source `render::transcript_window` reads — there is no RPC round
   trip to enter it. `copy::Scrolled` holds the reader's place, the mark and
   the search state; `render::row_index` maps a rendered row to the block
   and line it belongs to (`copy::RowIndex`) and back; OSC 52 is the
-  clipboard write, and `app.paste_buffer` is where the last yank lives for
-  `Ctrl+A ]`.
+  clipboard write, and the draft's vi registers are where the last yank
+  lives for `p` and `Ctrl+A ]`.
 
 ### The picker (`Ctrl+A "`)
 
@@ -1508,7 +1518,7 @@ it. `h` is not this client's yet either and has no notice of its
 own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Three
 chords are this client's own, with no app equivalent yet: `Ctrl+A v` opens
 the diff viewer (the app opens it with `v` from its block list), `Ctrl+A ]`
-pastes the copy-mode yank buffer, and `Ctrl+A [` leaves the live tail
+puts the unnamed vi register as `p` does, and `Ctrl+A [` leaves the live tail
 without moving ("Copy mode (scroll, or `Ctrl+A [`)"). `Ctrl+A r` and
 `Ctrl+A l` work in both clients (`docs/input.md`, "The prefix table"). The legend takes the
 compose row while a prefix is pending — never the status line, whose seat digits are

@@ -26,8 +26,8 @@ pub enum Intent {
     /// screen, then back to the previous context (`docs/input.md`, "The
     /// prefix table").
     CloseAndDemote,
-    /// `Ctrl+A ]` — paste the last copy-mode yank into the draft, tmux's
-    /// `paste-buffer`. The buffer is the tui's own, never the OS clipboard.
+    /// `Ctrl+A ]` — put the unnamed vi register into the draft, as `p`
+    /// does. tmux's `paste-buffer` key; copy mode's yank fills the register.
     Paste,
     /// `Ctrl+C` — the caller decides whether this is the second press.
     Interrupt,

@@ -187,7 +187,8 @@ draft: `dd` in one context's draft, a switch, then `p` in another context's
 draft puts the line, and a yank on the shell line puts in the chat draft.
 Switching context, submitting and clearing keep the registers
 (`ComposeState` lends them to the surface for each key; `docs/vi.md`,
-"Registers").
+"Registers"). A `y` on either surface is also written to the system
+clipboard when there is one; a delete is not.
 
 | Key | Does |
 |---|---|
@@ -313,7 +314,7 @@ releases the hold instead.
 so its keys never reach the binding table. `v` in Navigation and `Ctrl+A v`
 open it on the diff under the reader; inside,
 `DiffCore` owns everything (`j/k` `gg/G` counts · `]c`/`[c` hunks · `zo/zc/za`
-folds · `V` visual-line · `y` yank to clipboard · `R` reload a stale view ·
+folds · `V` visual-line · `y` yank to the clipboard and the compose vi registers · `R` reload a stale view ·
 `q`/`ZQ`/`:q` close).
 
 ## Ctrl chords and clipboard (xterm-style)

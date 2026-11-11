@@ -297,9 +297,9 @@ pub fn restore_terminal() {
 }
 
 /// Write the OSC 52 clipboard sequence (`copy::osc52_sequence`) directly to
-/// stdout, under the same lock every other terminal write takes — a yank in
-/// the scrolled transcript is the only caller (`docs/tui.md`, "Scrolling is
-/// copy mode").
+/// stdout, under the same lock every other terminal write takes. A yank
+/// calls it, from the scrolled transcript or the draft (`docs/tui.md`,
+/// "Scrolling is copy mode").
 pub(super) fn write_osc52(term_lock: &TermLock, text: &str) -> io::Result<()> {
     use std::io::Write as _;
     let _guard = term_lock.lock();

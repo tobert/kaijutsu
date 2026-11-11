@@ -221,6 +221,29 @@ fn undo_reaches_the_overlay_and_the_kernel() {
     assert_eq!(h.kernel.draft.borrow().as_str(), "");
 }
 
+/// A yank in the draft is offered to the system clipboard; a delete is not.
+#[test]
+fn a_yank_reaches_the_clipboard_and_a_delete_does_not() {
+    let mut h = Harness::new("one\ntwo");
+    let (writer, written) = crate::input::ClipboardWriter::for_test();
+    h.app.insert_resource(writer);
+    h.load();
+    h.keys("ggyy");
+    assert_eq!(written.try_iter().collect::<Vec<_>>(), vec!["one\n".to_string()]);
+    h.keys("dd");
+    assert_eq!(written.try_iter().count(), 0, "a delete stays out of the clipboard");
+}
+
+/// With no clipboard a yank still fills the registers and says nothing.
+#[test]
+fn a_yank_with_no_clipboard_still_puts() {
+    let mut h = Harness::new("one");
+    h.load();
+    h.keys("yyp");
+    assert_eq!(h.overlay().text, "one\none");
+    assert!(h.errors().is_empty(), "{:?}", h.errors());
+}
+
 /// Visual `d` and `/` search through the app path. The overlay shows the
 /// bar's line while it is open and the cursor where the search left it.
 #[test]

@@ -28,7 +28,9 @@ use editor_types::{
 use modalkit::actions::Editable;
 use modalkit::editing::buffer::{CursorGroupId, EditBuffer};
 use modalkit::editing::cursor::{Cursor, CursorGroup, CursorState};
-use modalkit::editing::store::{RegisterStore, Store};
+use modalkit::editing::rope::EditRope;
+use modalkit::editing::store::{RegisterCell, RegisterPutFlags, RegisterStore, Store};
+use modalkit::prelude::Register;
 use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
 use modalkit::env::vim::VimState;
 use modalkit::key::TerminalKey;
@@ -120,6 +122,26 @@ pub enum EditorIo {
 /// Cursors, undo history, the mode and an open `:` line stay with the core.
 #[derive(Default)]
 pub struct Registers(RegisterStore);
+
+/// Text yanked: what the unnamed register holds after a `y`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Yank {
+    pub text: String,
+    /// Whole lines, which `p` puts on their own lines below the cursor.
+    /// Linewise text ends in a newline.
+    pub linewise: bool,
+}
+
+impl Yank {
+    /// Whole lines: `text` gains the closing newline linewise text carries.
+    pub fn lines(text: &str) -> Self {
+        let mut text = text.to_string();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        Yank { text, linewise: true }
+    }
+}
 
 /// A pure vi editor over one text buffer.
 pub struct EditorCore {
@@ -221,6 +243,69 @@ impl EditorCore {
     /// Replace this editor's registers with `registers`.
     pub fn give_registers(&mut self, registers: Registers) {
         self.store.registers = registers.0;
+    }
+
+    /// Yank `text` from outside this buffer into the unnamed register and
+    /// `"0`, as a `y` here would: the next `p` puts it. A client's own copy
+    /// surface (the terminal client's copy mode, the app's diff viewer) uses
+    /// this so its yank and the editor's are one.
+    pub fn yank(&mut self, yank: &Yank) {
+        let shape = if yank.linewise { TargetShape::LineWise } else { TargetShape::CharWise };
+        let cell = RegisterCell::new(shape, EditRope::from(yank.text.as_str()));
+        self.store
+            .registers
+            .put(&Register::Unnamed, cell, RegisterPutFlags::NONE)
+            .expect("the unnamed register accepts any text");
+    }
+
+    /// The last yank, vim's `"0`: what a `y` wrote, never what a delete did.
+    /// `None` before the first yank. A client compares this across a key to
+    /// learn that the key yanked, and offers the text to the system
+    /// clipboard.
+    pub fn last_yank(&self) -> Option<Yank> {
+        let cell = self.store.registers.get(&Register::LastYanked).ok()?;
+        let text = cell.value.to_string();
+        if text.is_empty() {
+            return None;
+        }
+        Some(Yank { text, linewise: cell.shape == TargetShape::LineWise })
+    }
+
+    /// Put the unnamed register, for a key that is not vi's own (`Ctrl+A ]`).
+    ///
+    /// In normal mode this is `p`, and a half-typed command (a count, an
+    /// operator, `r`, `f`, a register name) is dropped first so it cannot
+    /// read the put as its argument. In visual mode it is `p` over the
+    /// selection. In insert and replace mode the text is inserted at the
+    /// cursor and the mode stays. An empty buffer takes the text as its
+    /// whole content, so whole lines leave no blank line around them. While
+    /// the `:`·`/`·`?` bar is open nothing happens.
+    pub fn put(&mut self) -> Vec<EditOp> {
+        if self.cmdline_active {
+            return Vec::new();
+        }
+        let mut ops = Vec::new();
+        let empty = self.text().is_empty();
+        let inserting = self.mode().is_some_and(|m| m.contains("INSERT") || m.contains("REPLACE"));
+        if !inserting {
+            if self.mode().is_some() && !empty {
+                return self.apply_keys("p");
+            }
+            ops.extend(self.apply_keys("<Esc>"));
+            if !empty {
+                ops.extend(self.apply_keys("p"));
+                return ops;
+            }
+        }
+        let Ok(cell) = self.store.registers.get(&Register::Unnamed) else {
+            return ops;
+        };
+        let text = cell.value.to_string();
+        ops.extend(match (empty, cell.shape) {
+            (true, TargetShape::LineWise) => self.insert_at_cursor(text.strip_suffix('\n').unwrap_or(&text)),
+            _ => self.insert_at_cursor(&text),
+        });
+        ops
     }
 
     /// Take any `ZZ`/`ZQ` close intent the most recent `apply_keys` produced.
@@ -1767,6 +1852,109 @@ mod tests {
             let mut next = EditorCore::with_registers("x", first.take_registers());
             next.apply_keys("\"2p\"qp");
             assert_eq!(next.text(), "x\na\na");
+        }
+
+        /// A yank from outside the buffer puts like one made inside it.
+        #[test]
+        fn an_outside_yank_puts_linewise_and_charwise() {
+            let mut ed = EditorCore::new("alpha\nbeta");
+            ed.yank(&Yank::lines("one\ntwo"));
+            ed.apply_keys("p");
+            assert_eq!(ed.text(), "alpha\none\ntwo\nbeta");
+            let mut ed = EditorCore::new("abc");
+            ed.yank(&Yank { text: "XY".into(), linewise: false });
+            ed.apply_keys("p");
+            assert_eq!(ed.text(), "aXYbc");
+        }
+
+        /// `"0` is the last yank; a delete fills the unnamed register and
+        /// leaves it alone.
+        #[test]
+        fn last_yank_follows_y_and_ignores_a_delete() {
+            let mut ed = EditorCore::new("one\ntwo\nthree");
+            assert_eq!(ed.last_yank(), None);
+            ed.apply_keys("yy");
+            assert_eq!(ed.last_yank(), Some(Yank::lines("one")));
+            ed.apply_keys("jdd");
+            assert_eq!(ed.last_yank(), Some(Yank::lines("one")), "a delete is not a yank");
+            ed.apply_keys("yw");
+            assert_eq!(ed.last_yank(), Some(Yank { text: "three".into(), linewise: false }));
+            ed.yank(&Yank::lines("outside"));
+            assert_eq!(ed.last_yank(), Some(Yank::lines("outside")));
+        }
+
+        /// `put` is `p` in normal mode and typed text in insert mode.
+        #[test]
+        fn put_is_p_in_normal_mode_and_text_at_the_cursor_in_insert_mode() {
+            let mut ed = EditorCore::new("alpha\nbeta");
+            ed.yank(&Yank::lines("one"));
+            let ops = ed.put();
+            assert_eq!(ed.text(), "alpha\none\nbeta");
+            assert!(!ops.is_empty(), "the put is reported as edits");
+
+            let mut ed = EditorCore::new("ab");
+            ed.yank(&Yank { text: "XY".into(), linewise: false });
+            ed.apply_keys("a");
+            ed.put();
+            assert_eq!(ed.text(), "aXYb");
+            assert_eq!(ed.mode().as_deref(), Some("-- INSERT --"), "the put leaves insert mode alone");
+        }
+
+        #[test]
+        fn put_into_an_empty_buffer_leaves_no_blank_line() {
+            let mut ed = EditorCore::new("");
+            ed.yank(&Yank::lines("one\ntwo"));
+            ed.put();
+            assert_eq!(ed.text(), "one\ntwo");
+        }
+
+        /// A half-typed command never takes the put as its argument.
+        #[test]
+        fn put_drops_a_pending_command_first() {
+            for pending in ["r", "f", "3", "d", "\"", "m"] {
+                let mut ed = EditorCore::new("apple pie");
+                ed.yank(&Yank::lines("one"));
+                ed.apply_keys(pending);
+                ed.put();
+                assert_eq!(ed.text(), "apple pie\none", "after a pending `{pending}`");
+                ed.apply_keys("x");
+                assert_eq!(ed.text(), "apple pie\nne", "`{pending}` is gone, `x` deletes one char");
+            }
+            let mut ed = EditorCore::new("");
+            ed.yank(&Yank::lines("one"));
+            ed.apply_keys("3");
+            ed.put();
+            ed.apply_keys("0x");
+            assert_eq!(ed.text(), "ne", "a count before a put into an empty buffer is dropped");
+        }
+
+        /// Visual `p` replaces the selection, and the bar refuses a put.
+        #[test]
+        fn put_replaces_a_selection_and_the_bar_refuses_it() {
+            let mut ed = EditorCore::new("abc");
+            ed.yank(&Yank { text: "XY".into(), linewise: false });
+            ed.apply_keys("vl");
+            ed.put();
+            assert_eq!(ed.text(), "XYc");
+            assert_eq!(ed.mode(), None);
+
+            for bar in [":", "/"] {
+                let mut ed = EditorCore::new("abc");
+                ed.yank(&Yank::lines("one"));
+                ed.apply_keys(bar);
+                assert!(ed.put().is_empty());
+                assert_eq!(ed.text(), "abc");
+                assert_eq!(ed.command_line().as_deref(), Some(bar));
+            }
+        }
+
+        #[test]
+        fn put_with_empty_registers_changes_nothing() {
+            let mut ed = EditorCore::new("ab");
+            assert!(ed.put().is_empty());
+            ed.apply_keys("i");
+            assert!(ed.put().is_empty());
+            assert_eq!(ed.text(), "ab");
         }
 
         /// A register given to a live core replaces the one it had, and the

@@ -220,12 +220,6 @@ pub struct App {
     /// that submit took (`kaijutsu_client::draft_ledger::draft_of`). Kept per
     /// context, so a submit elsewhere does not let this one's echo back in.
     submitted: HashMap<ContextId, BlockId>,
-    /// The last yank from the scrolled transcript, for `Ctrl+A ]` — tmux's
-    /// paste buffer. The
-    /// tui's own, so it never needs aligning with vim's registers or the OS
-    /// clipboard (the yank also goes to the clipboard over OSC 52, but that
-    /// is a one-way emission the tui cannot read back).
-    pub paste_buffer: Option<String>,
     /// What the owned screen is showing. A full-screen surface — the
     /// editor, the diff viewer — takes the whole screen
     /// (`docs/tui.md`, "The owned screen"), and the key path early-returns
@@ -326,7 +320,6 @@ impl App {
             notice: None,
             turns_running: HashSet::new(),
             submitted: HashMap::new(),
-            paste_buffer: None,
             screen: crate::editor::ScreenMode::Conversation,
             parked_screens: HashMap::new(),
             open_asks: BTreeMap::new(),

@@ -28,7 +28,7 @@
 use bevy::prelude::*;
 
 use kaijutsu_types::BlockId;
-use kaijutsu_diff::{DiffCore, DiffIntent, limits::MAX_RENDER_BYTES};
+use kaijutsu_diff::{DiffCore, DiffIntent, YankKind, limits::MAX_RENDER_BYTES};
 use kaijutsu_types::ContentType;
 
 use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, FocusTarget, MainCell};
@@ -315,6 +315,7 @@ fn diff_view_dispatch_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut active: ResMut<ActiveDiffView>,
     clipboard: Option<Res<ClipboardWriter>>,
+    mut compose: ResMut<crate::input::compose::ComposeState>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut next_screen: ResMut<NextState<Screen>>,
@@ -353,7 +354,11 @@ fn diff_view_dispatch_keys(
     let mut refresh = false;
     for intent in core.apply_keys(terminal_keys) {
         match intent {
-            DiffIntent::Yank { text, kind } => match clipboard.as_ref() {
+            DiffIntent::Yank { text, kind } => {
+                // The vi registers take the yank too, so `p` in compose puts
+                // it: whole lines for a patch, characters for plain text.
+                compose.yank(&kaijutsu_editor::Yank { text: text.clone(), linewise: kind == YankKind::Patch });
+                match clipboard.as_ref() {
                 // Reads the FROZEN core, never the block's current content —
                 // copying a hunk that has since changed is a correctness bug
                 // you cannot see. `kind` says which of the two semantics the
@@ -363,8 +368,9 @@ fn diff_view_dispatch_keys(
                     debug!("diff viewer: yanked {} bytes as {kind:?}", text.len());
                     writer.write(text);
                 }
-                None => warn!("diff viewer: yank discarded — no clipboard available"),
-            },
+                None => debug!("diff viewer: no clipboard available; the yank is in the vi registers"),
+                }
+            }
             DiffIntent::Close => next_screen.set(Screen::Conversation),
             DiffIntent::Refresh => refresh = true,
         }

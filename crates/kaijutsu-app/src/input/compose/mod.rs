@@ -38,6 +38,9 @@ pub struct ComposeAction {
     pub command: Option<String>,
     /// Something the vi engine reported, such as `Pattern not found: x`.
     pub notice: Option<String>,
+    /// Text this key yanked (`y`, never a delete), offered to the system
+    /// clipboard.
+    pub yanked: Option<String>,
 }
 
 /// When `Enter` submits a surface, as the tui's two lines do it
@@ -129,7 +132,9 @@ impl ComposeBuffer {
             action.submit = true;
             return action;
         }
+        let before = self.editor.last_yank();
         action.ops = self.editor.apply_key_event(key);
+        action.yanked = self.editor.last_yank().filter(|now| Some(now) != before.as_ref()).map(|yank| yank.text);
         if let Some(Err(message)) = self.editor.take_commands() {
             action.notice = Some(message);
         }
@@ -334,6 +339,12 @@ impl ComposeState {
         }
         let escape = &mut self.escape;
         Some(self.chat.lending(&mut self.registers, |chat| press_with_escape(chat, escape, Submit::FromNormalMode, key)))
+    }
+
+    /// Yank text from outside compose (the diff viewer's `y`) into the vi
+    /// registers, where `p` on either surface finds it.
+    pub fn yank(&mut self, yank: &kaijutsu_editor::Yank) {
+        self.chat.lending(&mut self.registers, |chat| chat.editor.yank(yank));
     }
 
     /// One keystroke on the shell surface.

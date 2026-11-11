@@ -17,25 +17,28 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   needs a kernel-owned register store the clients reach over the wire, a
   design conversation (a wire method or a VFS path) this work did not have.
 - **The tui and the app do not share,** for the same reason.
-- **Copy mode's buffer is separate from the registers.** Copy-mode `y` sets
-  `App::paste_buffer` and writes the clipboard with OSC 52; `Ctrl+A ]`
-  inserts `paste_buffer` as text. Making `y` also fill the compose
-  register `"` (linewise, since it yanks whole rows) is a small follow-up:
-  `kaijutsu_editor` needs a method that puts a string into the unnamed
-  register with a shape (modalkit's `RegisterStore::put` with a
-  `RegisterCell`), and `Compose` a pass-through. `Ctrl+A ]` could then
-  stay a paste of `paste_buffer`, or become `p`; deciding which is the
-  remaining design question.
-- **The system clipboard is not a register.** modalkit's `clipboard`
-  feature is off, so `"+` and `"*` read and write nothing. In the app,
-  turning it on (arboard) would make `"+y` and `"+p` reach the desktop
-  clipboard, at the cost of a clipboard connection per `EditorCore`
-  (modalkit opens one in `RegisterStore::default`). In the tui, OSC 52 can
-  write the clipboard but not read it in most terminals, so `"+p` cannot
-  work there. A kernel vi session cannot reach a person's desktop
-  clipboard at all. A clipboard register would let the app share with
-  other programs; it would not make the tui, the app and the kernel share
-  with each other.
+- **The system clipboard takes yanks and gives nothing back.** A compose
+  `y`, copy mode's `y` and the app diff viewer's `y` are written to the
+  system clipboard (OSC 52 in the tui, arboard in the app). Amy,
+  2026-11-11: *"yank should try to poke it into the system clipboard when
+  available that would be most of what I want. middle click paste when we
+  get to it would prioritize the system clipboard when available. probably
+  needs more thinking through."* Open:
+  - A yank in a kernel vi session does not go out. The kernel cannot reach
+    a desktop; the client drawing the session would have to learn of the
+    yank (a field on `EditorState`, or the `"0` compare done kernel-side)
+    and write it itself.
+  - Middle-click paste. The app pastes PRIMARY on middle click already; the
+    tui leaves the mouse to the terminal. What it should prefer when the
+    system clipboard and the registers differ is not decided.
+  - Nothing reads the clipboard into a register: `"+` and `"*` read empty
+    (modalkit's `clipboard` feature is off; turning it on opens a
+    clipboard connection per `EditorCore`). OSC 52 cannot read in most
+    terminals, so the tui could not offer `"+p` either way.
+  - A client detects a yank by comparing `"0` across the key, so yanking
+    the same text twice writes the clipboard once. If another program
+    took the clipboard in between, the second `y` does not take it back.
+  - The tui's diff viewer has no yank; the app's fills the registers.
 - **The kernel's register map is never pruned.** `EditorSessions` keeps an
   entry for every principal that ever sent vi keys, until a restart.
 

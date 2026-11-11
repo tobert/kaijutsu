@@ -94,6 +94,14 @@ impl ClipboardWriter {
         }
     }
 
+    /// A writer whose texts arrive on the returned channel, with no thread
+    /// and no clipboard behind it.
+    #[cfg(test)]
+    pub fn for_test() -> (Self, crossbeam_channel::Receiver<String>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (Self(tx), rx)
+    }
+
     /// Start the writer thread, or `None` when the clipboard is unavailable.
     fn spawn() -> Option<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<String>();

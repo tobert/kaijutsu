@@ -375,7 +375,7 @@ pub fn transcript_all_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
 }
 
 /// The plain text of an inclusive range of transcript rows, newline-joined —
-/// what `y` puts on the clipboard and in the paste buffer.
+/// what `y` puts on the clipboard and in the vi registers.
 pub fn transcript_rows_text(app: &mut App, width: u16, start: usize, end: usize) -> String {
     let lines = transcript_all_lines(app, width);
     if lines.is_empty() {

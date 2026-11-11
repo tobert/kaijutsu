@@ -21,7 +21,7 @@ use crate::input::context::KeyboardGrab;
 use crate::input::events::{ActionFired, GrabbedKey, LiteralPrefix};
 use crate::input::focus::{ActiveSurface, FocusArea};
 use crate::input::vim::keyconv::bevy_to_key_event;
-use crate::input::{Action, InputContext, SystemClipboard};
+use crate::input::{Action, ClipboardWriter, InputContext, SystemClipboard};
 use crate::view::components::GlobalErrorQueue;
 use crate::view::shell_dock::ShellDockMarker;
 
@@ -38,6 +38,7 @@ pub struct ComposeIo<'w, 's> {
     rpc_results: Res<'w, RpcResultChannel>,
     scroll: ResMut<'w, ConversationScrollState>,
     errors: ResMut<'w, GlobalErrorQueue>,
+    clipboard_out: Option<Res<'w, ClipboardWriter>>,
     time: Res<'w, Time>,
     /// Actions a keystroke fires (`PopLevel`, the Ctrl bypasses), written
     /// by [`compose_dispatch_keys`]. The handlers that also take this
@@ -85,6 +86,11 @@ impl ComposeIo<'_, '_> {
         }
         if let Some(notice) = action.notice {
             self.error("compose", notice);
+        }
+        // A yank goes to the system clipboard when there is one. The vi
+        // registers hold it either way, so nothing is said when there is not.
+        if let (Some(text), Some(writer)) = (action.yanked, self.clipboard_out.as_ref()) {
+            writer.write(text);
         }
         if action.submit {
             match surface {

@@ -563,10 +563,10 @@ fn space_snaps_to_the_tail_and_typing_lands_in_the_draft() {
 }
 
 /// `v` marks, `j` extends the range by a line, and `y` copies both lines out
-/// over OSC 52 and into the tui's own paste buffer, which `Ctrl+A ]` pastes
-/// into the draft (`docs/tui.md`, "Scrolling is copy mode").
+/// over OSC 52 and into the draft's vi registers, which `Ctrl+A ]` and `p`
+/// put into the draft (`docs/tui.md`, "Scrolling is copy mode").
 #[test]
-fn v_then_j_then_y_copies_two_lines_over_osc52_and_into_the_paste_buffer() {
+fn v_then_j_then_y_copies_two_lines_over_osc52_and_into_the_vi_registers() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
