@@ -651,14 +651,79 @@ with unsaved changes (`dirty_files`; `dirty` is true when any file is).
 
 **Not built.**
 
-- Recovery. A session's list, index and per-buffer cursor would go in a
-  small table, written when they change. After a kernel restart no session
-  is open and no client is reattached to one. `vi -r` would list what can
-  be recovered and reopen it, with the dirty buffers' text coming from
-  their swap documents. This is the same rule as the registers: nothing is
-  restored unasked.
+- Recovery; see the design below.
 - vim's "N more files to edit" refusal of `:q` while unvisited files
   remain. `:q` here closes once nothing loaded is dirty.
+
+### Recovering an argument list (design, not built)
+
+Amy, 2026-11-11: *"the state should survive in some recoverable form even
+if the vi session doesn't, basic power outage / kill -9 protection for
+ongoing work. on reconnect nobody gets it, they can recover it."*
+
+**What survives a restart today.** The text does. A file buffer with
+unsaved changes has a `dirty_file_buffers` row and comes back as a
+recovered swap (`docs/file-buffers.md`, rule 2); a block's text is on its
+document. The session does not: its list, its index, each buffer's cursor
+and each buffer's checkpoint are memory. After a restart `vi a.rs` on a
+swapped path opens the swap's text as a clean buffer, and `:w` refuses
+until `kj swap ack a.rs`.
+
+**The record.** Two tables in `kernel.db`, one row per session and one row
+per file of its list:
+
+| Table | Columns |
+|---|---|
+| `editor_recovery_sessions` | `recovery_id` (UUIDv7), the opener's principal and context, `current_index`, `opened_at`, `updated_at` |
+| `editor_recovery_files` | `recovery_id`, `position`, `path`, `visited`, `cursor_line`, `cursor_col` |
+
+The kernel writes them when the session opens, when the list grows (`:e`, a
+join that appends), when the index moves, and on `:w`. A move and a `:w`
+record the cursor of the buffer they leave or save; keys between them do
+not write, so a crash loses the cursor's travel since the last one and
+nothing else. A close by any route (`:q`, `ZZ`, `ZQ`, `kj vi quit`) deletes
+the session's rows. A headless session (no opener) is not recorded: there
+is nobody to recover it. A write failure is reported on the status line and
+logged; the session keeps working, because the text's durability does not
+depend on this record.
+
+**After a restart.** Rows that remain belong to sessions that did not
+close. The kernel opens nothing and tells no client. `vi -r` lists the
+caller's recoverable lists, newest first: an index for picking, the age,
+the files with the current one in brackets, and a `+` on each file that has
+a swap. `vi -r 2` reopens the second: one session over the same list at the
+same index, each visited buffer's cursor restored when it is next loaded.
+`kj vi recover` and `kj vi recover <n>` do the same for a model or a
+script, and `kj vi recover --discard <n>` deletes a record without touching
+any swap. Reopening deletes the old record; the new session writes its own.
+A file that no longer resolves is dropped from the list with a message that
+names it, and a list with no file left is refused.
+
+**A recovered file buffer is dirty.** This is vim's `-r`: the buffer holds
+the swap's text and the file on disk is unchanged, so the checkpoint is the
+disk text, `:w` writes the buffer, and `ZQ` rolls back to disk. `vi -r`
+acknowledges the swap of each buffer it loads, because the person asked for
+the recovery by name, and the buffer stays dirty with its
+`dirty_file_buffers` row. The disk-moved check still applies to `:w`. A
+plain `vi a.rs` on a swapped path is unchanged, and it gains one line when
+a recovery record holds the path: `a.rs is in a recoverable list (vi -r)`.
+
+**What recovery does not restore.**
+
+- Undo history and marks. They live in the `EditorCore`.
+- The checkpoint of a block that is not a file. Its text is the document's
+  text, the recovered buffer opens clean, and `ZQ` has nothing to roll
+  back to.
+- Registers. They wait for the register store above.
+
+**Open.**
+
+- Whether `vi -r` acknowledging a swap is right, or whether it should keep
+  refusing `:w` until `kj swap ack`.
+- Whether a person sees only their own records. One trust boundary says a
+  `--all` flag would be honest; the default is the caller's own.
+- How long an unrecovered record stays. Nothing deletes one today except
+  recovery and `--discard`.
 
 ## Command mode — the editor's `:` dialect
 

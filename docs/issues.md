@@ -20,9 +20,9 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
 - **`vi` argument lists are not recoverable.** `vi *.rs`, `:n`, `:N`,
   `:args`, `:wn` and `:e` shipped (`docs/vi.md`, "The argument list"). A
   session's list, index and per-buffer cursors live in memory, so a kernel
-  restart loses them; the dirty text survives as swap documents. Left: a
-  small table written when the list or index changes, and `vi -r` to list
-  and reopen what can be recovered, restoring nothing unasked.
+  restart loses them; the dirty text survives as swap documents. The design
+  is written (`docs/vi.md`, "Recovering an argument list") with three open
+  choices; it is not built.
 - **A config write to a path an editor session holds leaves the cache
   stale.** `kj rc add/rm` and `kj config reset` write the host file, then
   `Kernel::invalidate_config_file_cache` drops the cached document; on a
