@@ -352,6 +352,19 @@ impl FileDocumentCache {
             })
     }
 
+    /// The text of `path` on disk, read through the VFS. Never consults or
+    /// fills the cache: a recovered buffer uses it as its checkpoint while the
+    /// cache holds the swap's text. Fails when the file is absent, not UTF-8,
+    /// or unreadable.
+    pub async fn read_disk_text(&self, path: &str) -> Result<String, String> {
+        let bytes = self
+            .vfs
+            .read_all(std::path::Path::new(path))
+            .await
+            .map_err(|e| format!("cannot read {path} from disk: {e}"))?;
+        String::from_utf8(bytes).map_err(|_| format!("cannot read {path} from disk: not UTF-8 text"))
+    }
+
     /// Get the context_id and block_id for a path, loading from VFS on cache
     /// miss. Classifies errors at the source so callers can act on benign
     /// misses separately from real backend failures.
@@ -865,6 +878,40 @@ impl FileDocumentCache {
                 .map_err(|e| format!("failed to keep the swap marker of a newer edit: {e}"))?;
         }
         Ok(())
+    }
+
+    /// After a rollback rewrote the buffer: when its text now equals the text
+    /// on disk, mark the entry clean and drop its swap marker, as a flush does
+    /// but without a write. Returns whether it did. A buffer that differs from
+    /// disk, a clean entry, an uncached path, or a disk that cannot be read
+    /// leaves the entry as it is (the unreadable case is logged).
+    pub async fn settle_if_disk_matches(&self, path: &str) -> Result<bool, String> {
+        let ctx_id = file_context_id(path);
+        let (block_id, marks) = match self.cache.read().get(&ctx_id) {
+            Some(entry) if entry.dirty => (entry.block_id, entry.marks),
+            _ => return Ok(false),
+        };
+        let text = self
+            .block_store
+            .block_snapshots(ctx_id)
+            .map_err(|e| format!("settle({path}): cannot read the buffer: {e}"))?
+            .into_iter()
+            .find(|s| s.id == block_id)
+            .map(|s| s.content)
+            .ok_or_else(|| format!("settle({path}): buffer block {block_id} is missing"))?;
+        let disk = match self.read_disk_text(path).await {
+            Ok(disk) => disk,
+            Err(e) => {
+                tracing::warn!("settle({path}): buffer stays dirty: {e}");
+                return Ok(false);
+            }
+        };
+        if disk != text {
+            return Ok(false);
+        }
+        let generation = self.vfs.getattr(std::path::Path::new(path)).await.ok().map(|a| a.generation);
+        self.settle_clean(path, marks, Some(generation))?;
+        Ok(true)
     }
 
     /// Read `path`'s buffer before a write changes it, for

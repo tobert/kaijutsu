@@ -17,12 +17,35 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   "A kernel-owned register store", with Amy's answers: a durable table,
   nothing restored unasked, models maybe later. It follows the argument
   list.
-- **`vi` argument lists are not recoverable.** `vi *.rs`, `:n`, `:N`,
-  `:args`, `:wn` and `:e` shipped (`docs/vi.md`, "The argument list"). A
-  session's list, index and per-buffer cursors live in memory, so a kernel
-  restart loses them; the dirty text survives as swap documents. The design
-  is written (`docs/vi.md`, "Recovering an argument list") with three open
-  choices; it is not built.
+- **A recovered buffer's dirty test compares normalized text.** The
+  checkpoint and the buffer drop one trailing newline, so a swap that
+  differs from the disk text only by its final newline reads clean after
+  `vi -r`, while the swap row is still there and `ZQ` restores the swap's
+  terminator, not the disk's. The same normalization applies to every
+  buffer (`Buffer.terminator`, `docs/vi.md`, "Rollback / checkpoint").
+- **The wire `editor_quit` drops recovery results.** The handler in
+  `kaijutsu-server` calls the synchronous `Kernel::editor_quit`, which
+  discards `QuitReport.recovery_error` (a record that failed to delete has
+  only a log line) and cannot run `Kernel::editor_settle_rolled_back`
+  (async), so an app-driven `ZQ`-style close of a recovered buffer can leave
+  its swap row where `kj vi quit` and a `ZQ` batch clear it.
+- **A `:e` whose load fails after the path resolved leaves the path in the
+  list.** `finish_load_over` appends the path before loading the buffer; a
+  `block_text` failure there returns an error with the path in memory and no
+  record write until the next write. (A path that does not resolve is never
+  appended.)
+- **Cursor restore lands one column short** when the cursor was past the last
+  character (insert mode at end of line): the restore is `{col}l` in normal
+  mode, which stops on the last character.
+- **`vi -r` restores a cursor by sending keys.** `EditorCore` has no
+  cursor setter, so a recovered buffer gets `{line}G0{col}l` as keys
+  (`editor.rs`, `Buffer::load_over`). A setter in `kaijutsu-editor` would
+  replace it.
+- **`vi -r` resolves every file of the list at reopen** to drop the ones
+  that no longer open. That loads each hidden file into the file cache, so
+  a hidden swap is cached, unacknowledged and unpinned until its first
+  visit; the cache keeps a dirty entry, a clean one may be evicted and read
+  again on the visit.
 - **A config write to a path an editor session holds leaves the cache
   stale.** `kj rc add/rm` and `kj config reset` write the host file, then
   `Kernel::invalidate_config_file_cache` drops the cached document; on a

@@ -51,17 +51,36 @@ impl Tool for ViBuiltin {
             "Open a vi editor session over one or more files (kernel-owned; \
              drive it with `kj vi keys/state/save/quit`). Several paths make an \
              argument list: `:n` and `:N` move through it. A path already open in \
-             one of your sessions joins that session.",
+             one of your sessions joins that session. `vi -r` lists the argument \
+             lists a restart cut off, newest first: number, recovery id, age, the \
+             character that opened it, and the files with the current one in \
+             brackets and a `+` after each file with unsaved changes. `vi -r <n>` \
+             reopens list n (digits: a number from that listing; otherwise a recovery id prefix) \
+             for you, at the same file with each cursor restored; a file with \
+             unsaved changes opens modified against the file on disk, so `:w` \
+             writes it and `ZQ` restores the disk text.",
         )
         .param(
-            ParamSchema::required("path", "string", "Files to edit; quote a path with spaces")
-                .positional(),
+            ParamSchema::optional(
+                "path",
+                "string",
+                Value::Null,
+                "Files to edit; quote a path with spaces. With -r: the list to reopen",
+            )
+            .positional(),
+        )
+        .param(
+            ParamSchema::new("recover", "bool")
+                .with_aliases(["r"])
+                .with_description("List recoverable argument lists, or reopen the one named"),
         )
         .example(
             "Edit a coder stance script",
             "vi /config/rc/coder/create/S00-stance.kai",
         )
         .example("Edit every Rust file here, one after another", "vi *.rs")
+        .example("List the lists a restart cut off", "vi -r")
+        .example("Reopen the second one", "vi -r 2")
     }
 
     async fn execute(&self, args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
@@ -71,11 +90,33 @@ impl Tool for ViBuiltin {
         let paths: Vec<String> = args
             .positional
             .iter()
-            .map(|v| match v {
+            .enumerate()
+            .map(|(i, v)| match v {
                 Value::String(s) => s.clone(),
+                // `vi -r 2`: the pick is a number, which arrives typed.
+                Value::Int(_) => args.positional_text(i).unwrap_or_default(),
                 other => format!("{other:?}"),
             })
             .collect();
+        let recover = args.has_flag("recover") || args.has_flag("r");
+        if recover && paths.is_empty() {
+            return match self.dispatcher.kernel().editor_recoveries() {
+                Ok(lists) => {
+                    let mut result =
+                        ExecResult::success(crate::kernel::render_recoverable_lists(&lists));
+                    let data = serde_json::to_value(&lists).expect("RecoverableList serializes");
+                    result.data = Some(kaish_kernel::interpreter::json_to_value(data));
+                    result
+                }
+                Err(e) => ExecResult::failure(1, format!("{}: {e}", self.name)),
+            };
+        }
+        if recover && paths.len() > 1 {
+            return ExecResult::failure(
+                2,
+                format!("{0}: -r takes one list\nusage: {0} -r [<n>]", self.name),
+            );
+        }
         if paths.is_empty() {
             return ExecResult::failure(
                 2,
@@ -90,17 +131,19 @@ impl Tool for ViBuiltin {
             principal: self.identity.requester, performer: self.identity.performer,
             reviewer: self.identity.reviewer, context_id, session_id: self.identity.session,
         };
-        match self
-            .dispatcher
-            .kernel()
-            .editor_open_signaled(&paths, Some(opener))
-            .await
-        {
+        let kernel = self.dispatcher.kernel();
+        let (opened, verb) = if recover {
+            (kernel.editor_recover_signaled(&paths[0], opener).await, "recovered")
+        } else {
+            (kernel.editor_open_signaled(&paths, Some(opener)).await, "opened")
+        };
+        match opened {
             Ok((id, st)) => {
                 let session = id.as_u64();
+                let note = st.message.as_deref().map(|m| format!("\n{m}")).unwrap_or_default();
                 let mut result = ExecResult::success(format!(
-                    "opened editor session {session} on {}{} \
-                     — drive it with `kj vi keys {session} …`",
+                    "{verb} editor session {session} on {}{} \
+                     — drive it with `kj vi keys {session} …`{note}",
                     st.path,
                     kaijutsu_types::editor::arg_position_label(st.arg_index, st.arg_count)
                         .map(|p| format!(" {p}"))
@@ -266,6 +309,50 @@ mod tests {
         assert_eq!(json["text"], "hello");
         assert_eq!(json["path"], P);
         assert_eq!((json["arg_index"].as_u64(), json["arg_count"].as_u64()), (Some(0), Some(2)));
+    }
+
+    /// `vi -r` lists the lists a restart cut off, `vi -r <n>` reopens one
+    /// for the caller, and a plain `vi` is not mistaken for either.
+    #[tokio::test]
+    async fn vi_dash_r_lists_and_reopens_a_recoverable_list() {
+        use crate::kernel_db::{RecoveryFile, RecoveryId};
+        let d = Arc::new(test_dispatcher_rc().await);
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let second = "/config/rc/vitest/create/S01-bar.kai";
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c).await;
+        d.dispatch(&[s("rc"), s("add"), s(second), s("--content"), s("one\ntwo")], &c).await;
+        let kaish = embedded_with_vi(d.clone(), ContextId::new()).await;
+
+        let none = kaish.execute_with_options("vi -r", ExecuteOptions::default()).await.expect("kaish exec");
+        assert!(none.ok(), "{none:?}");
+        assert_eq!(none.text_out().trim(), "no recoverable vi lists");
+
+        let id = RecoveryId::new();
+        let file = |path: &str, line| RecoveryFile { path: path.to_string(), visited: true, cursor_line: line, cursor_col: 1 };
+        d.kernel_db()
+            .lock()
+            .write_editor_recovery(id, PrincipalId::system(), ContextId::new(), 1, &[file(P, 0), file(second, 1)])
+            .unwrap();
+
+        let listed = kaish.execute_with_options("vi -r", ExecuteOptions::default()).await.expect("kaish exec");
+        assert!(listed.ok(), "{listed:?}");
+        assert!(listed.text_out().contains(&format!("1  {}  ", id.short())), "{}", listed.text_out());
+        assert!(listed.text_out().contains(&format!("system  {P} [{second}]")), "{}", listed.text_out());
+        let json = kaish_kernel::interpreter::value_to_json(listed.data.as_ref().expect("list data"));
+        assert_eq!(json[0]["recovery_id"], id.to_hex());
+
+        let two = kaish.execute_with_options("vi -r 1 2", ExecuteOptions::default()).await.expect("kaish exec");
+        assert!(!two.ok() && two.err.contains("takes one list"), "{two:?}");
+
+        let opened = kaish.execute_with_options("vi -r 1", ExecuteOptions::default()).await.expect("kaish exec");
+        assert!(opened.ok(), "{opened:?}");
+        assert!(opened.text_out().contains("recovered editor session") && opened.text_out().contains("(2 of 2)"), "{}", opened.text_out());
+        let json = kaish_kernel::interpreter::value_to_json(opened.data.as_ref().expect("session data"));
+        assert_eq!((json["path"].as_str(), json["cursor"].as_u64()), (Some(second), Some(5)));
+
+        let bad = kaish.execute_with_options("vi -r 1", ExecuteOptions::default()).await.expect("kaish exec");
+        assert!(!bad.ok() && bad.err.contains("no recoverable vi lists"), "{bad:?}");
     }
 
     /// A quoted path with a space is one word, so it names one file. It

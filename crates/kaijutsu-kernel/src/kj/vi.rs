@@ -18,7 +18,7 @@ use crate::mcp::Capability;
 #[derive(Parser, Debug)]
 #[command(
     name = "vi",
-    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list); the agent and scripting door, not the in-app entry",
+    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list/recover); the agent and scripting door, not the in-app entry",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -88,6 +88,27 @@ enum EditorCommand {
     /// List open editor sessions: session, current path and its place in
     /// the argument list, the files with unsaved changes, mode, opener.
     List,
+    /// Recover an argument list that a restart cut off. A session with an
+    /// opener keeps a record of its list, index and cursors until it closes;
+    /// the records that remain are the recoverable lists. With no argument,
+    /// lists them newest first: number, recovery id, age, the character that
+    /// opened it, and the files with the current one in brackets and a `+`
+    /// after each file with unsaved changes. With a pick, reopens that list
+    /// for you at the same file, restoring each file's cursor as it loads; a
+    /// file with unsaved changes opens modified against the file on disk, and
+    /// its swap is acknowledged when it loads. A path that no longer opens is
+    /// dropped and named; a list with nothing left is refused and kept.
+    Recover {
+        /// The list to reopen: a number from the listing (digits only, and
+        /// it must be in the listing), or a prefix of its recovery id as the
+        /// listing shows it. An id of only digits is picked by its full id.
+        /// Omit to list.
+        pick: Option<String>,
+        /// Delete the record named by `pick` instead of reopening it. No
+        /// swap is touched.
+        #[arg(long, requires = "pick")]
+        discard: bool,
+    },
 }
 
 /// The capability `kj vi save` gates on. A write reached through
@@ -149,6 +170,51 @@ impl KjDispatcher {
                 ),
                 Err(e) => KjResult::Err(format!("kj vi open: {e}")),
             },
+            EditorCommand::Recover { pick: None, .. } => match kernel.editor_recoveries() {
+                Ok(lists) => {
+                    let line = crate::kernel::render_recoverable_lists(&lists);
+                    let data = serde_json::to_value(&lists).expect("RecoverableList serializes");
+                    KjResult::ok_with_data(line, data)
+                }
+                Err(e) => KjResult::Err(format!("kj vi recover: {e}")),
+            },
+            EditorCommand::Recover { pick: Some(pick), discard: true } => {
+                match kernel.editor_recovery_discard(&pick) {
+                    Ok(list) => KjResult::ok_with_data(
+                        format!(
+                            "discarded recovery record {} ({}); no swap was touched",
+                            list.short_id,
+                            list.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(" ")
+                        ),
+                        serde_json::to_value(&list).expect("RecoverableList serializes"),
+                    ),
+                    Err(e) => KjResult::Err(format!("kj vi recover: {e}")),
+                }
+            }
+            EditorCommand::Recover { pick: Some(pick), discard: false } => {
+                let Some(opener) = opener else {
+                    return KjResult::Err(
+                        "kj vi recover: no active context joined, so there is no opener to recover for".into(),
+                    );
+                };
+                match kernel.editor_recover_signaled(&pick, opener).await {
+                    Ok((id, st)) => {
+                        let mut line = format!(
+                            "recovered editor session {} on {}{}",
+                            id.as_u64(),
+                            st.path,
+                            kaijutsu_types::editor::arg_position_label(st.arg_index, st.arg_count)
+                                .map(|p| format!(" {p}"))
+                                .unwrap_or_default(),
+                        );
+                        if let Some(msg) = &st.message {
+                            line.push_str(&format!(" — {msg}"));
+                        }
+                        KjResult::ok_with_data(line, st.to_json(id))
+                    }
+                    Err(e) => KjResult::Err(format!("kj vi recover: {e}")),
+                }
+            }
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
                 // Never pre-parse `keys` to guess whether this batch writes —
@@ -231,15 +297,26 @@ impl KjDispatcher {
             }
             EditorCommand::Quit { session } => {
                 let id = EditorSessionId::from_u64(session);
-                match kernel.editor_quit(id, caller.actor_id) {
+                let quit = match kernel.editor_quit(id, caller.actor_id) {
+                    Ok(report) => match kernel.editor_settle_rolled_back(&report.rolled_back).await {
+                        Ok(()) => Ok(report),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+                match quit {
                     Ok(report) => {
                         let rolled = if report.rolled_back.is_empty() {
                             "nothing to roll back".to_string()
                         } else {
                             format!("rolled back {}", report.rolled_back.join(", "))
                         };
+                        let record = report
+                            .recovery_error
+                            .map(|e| format!("; {e}"))
+                            .unwrap_or_default();
                         KjResult::ok(format!(
-                            "session {session}: closed {}; {rolled}",
+                            "session {session}: closed {}; {rolled}{record}",
                             report.loaded.join(", ")
                         ))
                     }
@@ -309,7 +386,9 @@ impl Classify for EditorArgs {
 impl Classify for EditorCommand {
     fn effect(&self) -> Effect {
         match self {
-            EditorCommand::State { .. } | EditorCommand::List => Effect::Read,
+            EditorCommand::State { .. }
+            | EditorCommand::List
+            | EditorCommand::Recover { pick: None, .. } => Effect::Read,
             // `open` allocates a new kernel-owned session (and signals it to
             // attached app windows) even though nothing here writes a file —
             // a side effect on kernel state, not a pure read.
@@ -317,7 +396,8 @@ impl Classify for EditorCommand {
             | EditorCommand::Keys { .. }
             | EditorCommand::Insert { .. }
             | EditorCommand::Save { .. }
-            | EditorCommand::Quit { .. } => Effect::Write,
+            | EditorCommand::Quit { .. }
+            | EditorCommand::Recover { pick: Some(_), .. } => Effect::Write,
         }
     }
 }
@@ -448,6 +528,105 @@ mod tests {
         let quit = d.dispatch(&[s("vi"), s("quit"), id.to_string()], &c).await;
         let KjResult::Ok { message, .. } = &quit else { panic!("{quit:?}") };
         assert!(message.contains("nothing to roll back"), "{message}");
+    }
+
+    /// A record a restart left, written the way a session writes it: the
+    /// list `P P2` at index 1 with a cursor on `P2`'s second line.
+    fn leave_a_record(d: &KjDispatcher, p2: &str) -> crate::kernel_db::RecoveryId {
+        use crate::kernel_db::{RecoveryFile, RecoveryId};
+        let id = RecoveryId::new();
+        let file = |path: &str, visited, line, col| RecoveryFile {
+            path: path.to_string(),
+            visited,
+            cursor_line: line,
+            cursor_col: col,
+        };
+        d.kernel_db()
+            .lock()
+            .write_editor_recovery(
+                id,
+                kaijutsu_types::PrincipalId::system(),
+                kaijutsu_types::ContextId::new(),
+                1,
+                &[file(P, true, 0, 0), file(p2, true, 1, 2)],
+            )
+            .unwrap();
+        id
+    }
+
+    /// `kj vi recover` lists, reopens and discards, with the `kj vi list`
+    /// shapes: an array of objects with full ids and 0-based indexes.
+    #[tokio::test]
+    async fn kj_vi_recover_lists_reopens_and_discards() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        const P2: &str = "/config/rc/editortest/create/S01-bar.kai";
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello\nthere")], &c).await;
+        d.dispatch(&[s("rc"), s("add"), s(P2), s("--content"), s("one\ntwo\nthree")], &c).await;
+
+        let none = d.dispatch(&[s("vi"), s("recover")], &c).await;
+        let KjResult::Ok { message, data: Some(dd), .. } = &none else { panic!("{none:?}") };
+        assert_eq!((message.as_str(), dd), ("no recoverable vi lists", &serde_json::json!([])));
+
+        let record = leave_a_record(&d, P2);
+        let listed = d.dispatch(&[s("vi"), s("recover")], &c).await;
+        let KjResult::Ok { message, data: Some(dd), .. } = &listed else { panic!("{listed:?}") };
+        assert!(message.starts_with(&format!("1  {}  ", record.short())), "{message}");
+        assert!(message.ends_with(&format!("system  {P} [{P2}]")), "{message}");
+        assert_eq!(dd[0]["recovery_id"], record.to_hex());
+        assert_eq!((dd[0]["pick"].as_u64(), dd[0]["arg_index"].as_u64(), dd[0]["arg_count"].as_u64()), (Some(1), Some(1), Some(2)));
+        assert_eq!(dd[0]["path"], P2);
+        assert_eq!(dd[0]["opener_name"], "system");
+        assert_eq!(dd[0]["dirty"], false);
+
+        // Reopen by a prefix of the recovery id: same list, same index, the
+        // second file's cursor restored.
+        let opened = d.dispatch(&[s("vi"), s("recover"), record.to_hex()], &c).await;
+        let KjResult::Ok { message, data: Some(dd), .. } = &opened else { panic!("{opened:?}") };
+        assert!(message.starts_with("recovered editor session"), "{message}");
+        assert!(message.contains("(2 of 2)"), "{message}");
+        assert_eq!((dd["path"].as_str(), dd["text"].as_str(), dd["cursor"].as_u64()), (Some(P2), Some("one\ntwo\nthree"), Some(6)));
+        let after = d.dispatch(&[s("vi"), s("recover")], &c).await;
+        let KjResult::Ok { data: Some(dd), .. } = &after else { panic!("{after:?}") };
+        assert_eq!(dd, &serde_json::json!([]), "the reopened record is replaced by the live session's own");
+
+        let bad = d.dispatch(&[s("vi"), s("recover"), s("1")], &c).await;
+        assert!(!bad.is_ok(), "nothing left to pick: {bad:?}");
+        assert!(bad.message().contains("no recoverable vi lists"), "{}", bad.message());
+    }
+
+    #[tokio::test]
+    async fn kj_vi_recover_discard_removes_the_record_and_needs_a_pick() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let record = leave_a_record(&d, "/config/rc/editortest/create/S01-bar.kai");
+
+        let no_pick = d.dispatch(&[s("vi"), s("recover"), s("--discard")], &c).await;
+        assert!(!no_pick.is_ok(), "--discard names a record: {no_pick:?}");
+        assert_eq!(d.kernel_db().lock().list_editor_recoveries().unwrap().len(), 1);
+
+        let unknown = d.dispatch(&[s("vi"), s("recover"), s("--discard"), s("zzzz")], &c).await;
+        assert!(unknown.message().contains("\"zzzz\""), "{}", unknown.message());
+
+        let done = d.dispatch(&[s("vi"), s("recover"), s("--discard"), s("1")], &c).await;
+        let KjResult::Ok { message, data: Some(dd), .. } = &done else { panic!("{done:?}") };
+        assert!(message.contains(&record.short()) && message.contains("no swap was touched"), "{message}");
+        assert_eq!(dd["recovery_id"], record.to_hex());
+        assert!(d.kernel_db().lock().list_editor_recoveries().unwrap().is_empty());
+    }
+
+    /// The emitted help is the documentation a model reads: it names the
+    /// listing, the pick, the dirty mark and `--discard`.
+    #[test]
+    fn kj_vi_recover_help_names_the_pick_and_discard() {
+        use clap::CommandFactory as _;
+        let mut cmd = super::EditorArgs::command();
+        let help = cmd.find_subcommand_mut("recover").expect("recover verb").render_long_help().to_string();
+        for needle in ["[PICK]", "--discard", "recovery id", "`+`", "dropped"] {
+            assert!(help.contains(needle), "`kj vi recover --help` lacks {needle:?}:\n{help}");
+        }
     }
 
     /// `kj vi insert` is the paste path: it lands text at the cursor and

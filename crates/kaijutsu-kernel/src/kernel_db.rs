@@ -45,6 +45,7 @@ mod kernel_meta;
 mod presets;
 mod hooks;
 mod client_state;
+mod editor_recovery;
 mod watches;
 pub use watches::WatchRow;
 mod well_known;
@@ -101,6 +102,7 @@ pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
+pub use editor_recovery::{RecoveryFile, RecoveryId, RecoverySession};
 pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, Demotion, PromoteOutcome, Retirement, RotationCommit};
 use schema::SCHEMA;
 

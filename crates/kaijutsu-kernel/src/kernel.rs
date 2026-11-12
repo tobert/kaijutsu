@@ -28,6 +28,12 @@ use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
 
+mod editor_recovery;
+pub use editor_recovery::{
+    RecoverableFile, RecoverableList, age_label, render_recoverable_lists,
+};
+use editor_recovery::join_notes;
+
 /// Outcome of [`Kernel::interrupt_context`]: whether a running turn was
 /// stopped and whether an open continuation epoch was closed to automatic
 /// resume. The two are independent — a caller with neither true made no
@@ -1643,12 +1649,21 @@ impl Kernel {
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
         // `!Send` `EditorCore` never coexists with an await.
         let target = crate::editor::resolve_editor_target(first, &file_cache).await?;
-        let (id, state) = self.editor_sessions.lock().0.open(paths, target, blocks, opener)?;
+        let (id, mut state) = self.editor_sessions.lock().0.open(paths, target, blocks, opener)?;
         if let Err(e) = file_cache.pin(first, id.as_u64()) {
             // Unpinned, the entry could be evicted under the session: drop
             // the session nobody has typed in yet, and fail.
-            self.editor_sessions.lock().0.forget(id);
+            let recovery = self.editor_sessions.lock().0.forget(id);
+            if let Some(recovery) = recovery {
+                self.delete_editor_recovery(recovery);
+            }
             return Err(e);
+        }
+        if opener.is_some() {
+            // A plain open of a path a recoverable list holds says so; the
+            // new session then writes its own record.
+            state.message = join_notes(state.message.take(), self.recovery_notice(paths));
+            state.message = join_notes(state.message.take(), self.write_editor_recovery(id));
         }
         Ok((id, state))
     }
@@ -1667,6 +1682,8 @@ impl Kernel {
             .await?
             .map_err(|e| format!("open editor: cannot join session {}: {e}", id.as_u64()))?;
         self.editor_sessions.lock().0.append(id, paths)?;
+        let message = join_notes(message, self.recovery_notice(paths));
+        let message = join_notes(message, self.write_editor_recovery(id));
         let state = self.publish_current_editor_state(id, message)?;
         Ok((id, state))
     }
@@ -1698,14 +1715,37 @@ impl Kernel {
             Ok(target) => target,
             Err(e) => return Ok(Err(e)),
         };
+        // A file a recovery brought back loads against its disk text when it
+        // has a swap: the buffer is the swap's text, unsaved.
+        let recovering = self.editor_sessions.lock().0.is_recovering(id, &path);
+        let swapped = recovering
+            && self
+                .db
+                .lock()
+                .get_dirty_file_buffer(&path)
+                .map_err(|e| format!("cannot read the swap marker of {path}: {e}"))?
+                .is_some();
+        let disk_text = if swapped {
+            match file_cache.read_disk_text(&path).await {
+                Ok(text) => Some(text),
+                Err(e) => return Ok(Err(e)),
+            }
+        } else {
+            None
+        };
         file_cache.pin(&path, id.as_u64())?;
         let loaded = self
             .editor_sessions
             .lock()
             .0
-            .finish_load(id, &path, target, force, self.blocks());
+            .finish_load_over(id, &path, target, force, self.blocks(), disk_text.as_deref());
         match loaded {
-            Ok(LoadStep::Loaded { message }) => Ok(Ok(message)),
+            Ok(LoadStep::Loaded { message }) => {
+                if swapped {
+                    file_cache.acknowledge_swap(&path);
+                }
+                Ok(Ok(message))
+            }
             Ok(LoadStep::AlreadyLoaded) => {
                 file_cache.unpin(&path, id.as_u64());
                 Ok(Ok(None))
@@ -1778,9 +1818,19 @@ impl Kernel {
                         message = batch_message;
                     }
                     if let Some((to, force)) = go {
+                        let mut moved = true;
                         match self.editor_move(id, &to, force).await? {
                             Ok(None) => {}
-                            Ok(Some(notice)) | Err(notice) => message = Some(notice),
+                            Ok(Some(notice)) => message = Some(notice),
+                            Err(notice) => {
+                                message = Some(notice);
+                                moved = false;
+                            }
+                        }
+                        if moved {
+                            // The move changed the index and the list, and the
+                            // cursor of the buffer it left is final.
+                            message = join_notes(message, self.write_editor_recovery(id));
                         }
                     }
                     match rest {
@@ -1896,6 +1946,7 @@ impl Kernel {
                         go = None;
                     } else {
                         self.editor_sessions.lock().0.save_at(id, update.buffer)?;
+                        message = join_notes(message, self.write_editor_recovery(id));
                     }
                 }
                 Ok(EditorBatchEnd::Open { message, go, rest: update.rest })
@@ -1954,6 +2005,11 @@ impl Kernel {
                 } else {
                     None
                 };
+                let settle_err = if mark_err.is_none() {
+                    self.editor_settle_rolled_back(&update.quit.rolled_back).await.err()
+                } else {
+                    None
+                };
                 // The session is gone either way — release the pins taken
                 // when each file loaded (`editor_open_list`, `editor_move`)
                 // so eviction can reclaim the entries.
@@ -1963,9 +2019,15 @@ impl Kernel {
                 self.editor_flows.publish(crate::flows::EditorFlow::Closed {
                     session_id: id.as_u64(),
                 });
-                match mark_err.or(flush_err) {
+                // Any close deletes the session's recovery record.
+                let recovery_error = update.quit.recovery.and_then(|rid| self.delete_editor_recovery(rid));
+                match mark_err.or(flush_err).or(settle_err) {
                     Some(e) => Err(e),
-                    None => Ok(EditorBatchEnd::Closed(update.state)),
+                    None => {
+                        let mut state = update.state;
+                        state.message = join_notes(state.message.take(), recovery_error);
+                        Ok(EditorBatchEnd::Closed(state))
+                    }
                 }
             }
         }
@@ -2094,7 +2156,7 @@ impl Kernel {
             Some(flush_error_message(&fp, &e, self.id()))
         } else {
             self.editor_sessions.lock().0.save_at(id, index)?;
-            None
+            self.write_editor_recovery(id)
         };
         self.publish_current_editor_state(id, message)
     }
@@ -2125,7 +2187,9 @@ impl Kernel {
         id: crate::editor::EditorSessionId,
         actor: PrincipalId,
     ) -> Result<crate::editor::QuitReport, String> {
-        let report = self.editor_sessions.lock().0.quit(id, self.blocks(), actor)?;
+        let mut report = self.editor_sessions.lock().0.quit(id, self.blocks(), actor)?;
+        // Any close deletes the session's recovery record.
+        report.recovery_error = report.recovery.and_then(|rid| self.delete_editor_recovery(rid));
         let mut mark_err = None;
         for fp in &report.rolled_back {
             if let Err(e) = self.file_cache.mark_dirty(fp) {
@@ -2152,6 +2216,21 @@ impl Kernel {
             Some(e) => Err(e),
             None => Ok(report),
         }
+    }
+
+    /// After a close rolled buffers back: a file whose text now equals its
+    /// text on disk ends clean with no swap marker, as after a flush. A file
+    /// that differs from disk (it moved, or an acknowledged flush wrote later
+    /// text) stays dirty, recoverable as a swap. `kj vi quit` and a `ZQ` batch
+    /// call this after [`editor_quit`](Self::editor_quit)'s marking.
+    pub async fn editor_settle_rolled_back(&self, paths: &[String]) -> Result<(), String> {
+        for path in paths {
+            self.file_cache
+                .settle_if_disk_matches(path)
+                .await
+                .map_err(|e| format!("editor quit: rollback landed but {e}"))?;
+        }
+        Ok(())
     }
 
     /// Invalidate the shared [`FileDocumentCache`] shadow for a **config**

@@ -76,7 +76,14 @@ serving it. We do the first not at all and the third silently.
    ack <path>` keeps the buffer (acknowledges + flushes it to disk in one
    move) and `kj swap discard <path>` drops it (disk wins on the next read).
    Both refuse loudly on a path with no swap. Read the buffer first at
-   `/v/swap/<kernel_id>/<path>` before choosing.
+   `/v/swap/<kernel_id>/<path>` before choosing. A third acknowledger is
+   `vi -r` (`kj vi recover`): reopening a recovered argument list is the
+   person naming the recovery, so each file the session loads, the current
+   one at reopen and the others on first visit, has its swap acknowledged
+   (`FileDocumentCache::acknowledge_swap`). That buffer opens dirty against
+   the disk text, so the `dirty_file_buffers` row stays until `:w` clears it,
+   and rule 3 still guards the write. `docs/vi.md`, "Recovering an argument
+   list". A plain `vi path` acknowledges nothing.
 
 **An open editor session pins its cache entry.** Rules 2-3 protect a *dirty*
 buffer — `evict_if_needed` already skips dirty entries — but a session sits

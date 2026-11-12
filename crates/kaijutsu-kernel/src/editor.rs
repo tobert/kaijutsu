@@ -81,6 +81,8 @@ use kaijutsu_editor::{
 };
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
+use crate::kernel_db::{RecoveryFile, RecoveryId};
+
 /// Status-line message for leaving, or quitting, a buffer that differs from
 /// its checkpoint without `!` (vim's E37).
 pub const NO_WRITE_SINCE_LAST_CHANGE: &str = "No write since last change (add ! to override)";
@@ -181,6 +183,12 @@ pub struct QuitReport {
     /// each dirty in the file cache: the rollback is a raw block edit the
     /// cache's flush pipeline never sees (docs/file-buffers.md).
     pub rolled_back: Vec<String>,
+    /// The session's recovery record, which the kernel layer deletes now that
+    /// the session is closed. `None` for a headless session.
+    pub recovery: Option<RecoveryId>,
+    /// Why the kernel layer could not delete that record, when it could not.
+    /// The record then stays listed for `vi -r`.
+    pub recovery_error: Option<String>,
 }
 
 impl KeysOutcome {
@@ -292,6 +300,32 @@ pub struct EditorOpener {
     pub session_id: SessionId,
 }
 
+/// What a session's recovery record holds at one moment
+/// ([`EditorSessions::recovery_snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySnapshot {
+    pub recovery_id: RecoveryId,
+    pub opener_principal: PrincipalId,
+    pub opener_context_id: ContextId,
+    pub current_index: usize,
+    pub files: Vec<RecoveryFile>,
+}
+
+/// The 0-based line and column of char offset `at` in `text`.
+fn line_col_of(text: &str, at: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+    for ch in text.chars().take(at) {
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// One loaded file: a pure [`EditorCore`] bound to the kernel block that owns
 /// the text, plus the rollback checkpoint.
 struct Buffer {
@@ -317,10 +351,30 @@ struct Buffer {
 impl Buffer {
     /// Load the block's current text as a fresh buffer and checkpoint.
     fn load(target: EditorTarget, blocks: &SharedBlockStore) -> Result<Self, String> {
+        Self::load_over(target, blocks, None, None)
+    }
+
+    /// [`load`](Self::load), for a buffer a recovery reopens. `disk_text`
+    /// replaces the checkpoint, so a swap's text loads as unsaved changes
+    /// against the file on disk; `cursor` is the recorded line and column.
+    fn load_over(
+        target: EditorTarget,
+        blocks: &SharedBlockStore,
+        disk_text: Option<&str>,
+        cursor: Option<(usize, usize)>,
+    ) -> Result<Self, String> {
         let raw = block_text(blocks, &target)?;
-        let core = EditorCore::new(&raw);
+        let mut core = EditorCore::new(&raw);
         let terminator = if raw.ends_with('\n') { "\n" } else { "" }.to_string();
-        let saved_content = core.text();
+        let saved_content = match disk_text {
+            Some(disk) => EditorCore::new(disk).text(),
+            None => core.text(),
+        };
+        if let Some((line, col)) = cursor {
+            // Plain motions: they change no text, so no edit op comes back.
+            let keys = format!("{}G0{}", line + 1, if col > 0 { format!("{col}l") } else { String::new() });
+            core.apply_keys(&keys);
+        }
         Ok(Buffer { core, target, saved_content, terminator, peer_wrote: false })
     }
 
@@ -337,6 +391,19 @@ struct ArgFile {
     /// `None` until the file is first visited; a visited file keeps its
     /// buffer, so its undo history, marks and cursor are there on return.
     buffer: Option<Buffer>,
+    /// A recovered file's recorded cursor (line, column), applied when the
+    /// file loads.
+    restore_cursor: Option<(usize, usize)>,
+    /// A file of a recovered session that has not loaded yet: its load takes
+    /// the disk text as checkpoint when the file has a swap, and
+    /// acknowledges that swap.
+    recovering: bool,
+}
+
+impl ArgFile {
+    fn unloaded(path: &str) -> Self {
+        ArgFile { path: path.to_string(), buffer: None, restore_cursor: None, recovering: false }
+    }
 }
 
 /// One open editor: an argument list of files and the current one. The
@@ -351,6 +418,9 @@ struct EditorSession {
     /// player who submitted each input, not this opener. `None` for a headless
     /// open (test / wire `editorOpen` — no caller to capture).
     opener: Option<EditorOpener>,
+    /// The id of this session's recovery record. `Some` exactly when the
+    /// session has an opener: a headless session has nobody to recover it.
+    recovery: Option<RecoveryId>,
 }
 
 impl EditorSession {
@@ -491,14 +561,15 @@ impl EditorSessions {
             .as_ref();
         let buffer = Buffer::load(target, blocks)?;
         let message = self.announce_bound(target);
-        let mut files = vec![ArgFile { path: first.to_string(), buffer: Some(buffer) }];
+        let mut files = vec![ArgFile { buffer: Some(buffer), ..ArgFile::unloaded(first) }];
         for path in &paths[1..] {
             let path = path.as_ref();
             if !files.iter().any(|f| f.path == path) {
-                files.push(ArgFile { path: path.to_string(), buffer: None });
+                files.push(ArgFile::unloaded(path));
             }
         }
-        let mut session = EditorSession { files, current: 0, opener };
+        let recovery = opener.map(|_| RecoveryId::new());
+        let mut session = EditorSession { files, current: 0, opener, recovery };
         let mut state = session.state()?;
         state.message = message;
         let id = EditorSessionId(self.next_id);
@@ -523,6 +594,120 @@ impl EditorSessions {
                 if existing == 1 { "" } else { "s" }
             )
         })
+    }
+
+    /// Open a session over a recovered argument list: `files` in list order,
+    /// the file at index `current` resolved to `target` and loaded now, the
+    /// others when first visited. The others keep their recorded cursors until
+    /// they load, and load as recovering ([`is_recovering`](Self::is_recovering)).
+    /// `disk_text` is the current file's checkpoint when the file has a swap:
+    /// the buffer holds the swap's text and reads as changed against the disk
+    /// text. The session carries `recovery`, the id of the record it reopens,
+    /// so its writes update that record; a live session already carrying it
+    /// refuses the open.
+    pub fn open_recovered(
+        &mut self,
+        files: &[RecoveryFile],
+        current: usize,
+        target: EditorTarget,
+        disk_text: Option<&str>,
+        blocks: &SharedBlockStore,
+        opener: EditorOpener,
+        recovery: RecoveryId,
+    ) -> Result<(EditorSessionId, EditorState), String> {
+        if let Some((live, _)) = self.sessions.iter().find(|(_, s)| s.recovery == Some(recovery)) {
+            return Err(format!(
+                "recovery record {} is already open in session {}",
+                recovery.short(),
+                live.0
+            ));
+        }
+        let first = files.get(current).ok_or_else(|| {
+            format!("open editor: recovered index {current} is outside a list of {}", files.len())
+        })?;
+        let buffer = Buffer::load_over(
+            target,
+            blocks,
+            disk_text,
+            Some((first.cursor_line, first.cursor_col)),
+        )?;
+        let message = self.announce_bound(target);
+        let mut buffer = Some(buffer);
+        let files = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if i == current {
+                    ArgFile { buffer: buffer.take(), ..ArgFile::unloaded(&f.path) }
+                } else {
+                    ArgFile {
+                        restore_cursor: f.visited.then_some((f.cursor_line, f.cursor_col)),
+                        recovering: true,
+                        ..ArgFile::unloaded(&f.path)
+                    }
+                }
+            })
+            .collect();
+        let mut session =
+            EditorSession { files, current, opener: Some(opener), recovery: Some(recovery) };
+        let mut state = session.state()?;
+        state.message = message;
+        let id = EditorSessionId(self.next_id);
+        self.next_id += 1;
+        self.sessions.insert(id, session);
+        Ok((id, state))
+    }
+
+    /// Whether `path` is a file of the session that has not loaded yet and
+    /// came from a recovery. Its load should take the disk text as checkpoint
+    /// when the file has a swap.
+    pub fn is_recovering(&self, id: EditorSessionId, path: &str) -> bool {
+        self.sessions.get(&id).is_some_and(|s| {
+            s.files.iter().any(|f| f.path == path && f.recovering && f.buffer.is_none())
+        })
+    }
+
+    /// What the recovery record of session `id` should say now: the list, the
+    /// index, and the live cursor of every loaded file (the recorded one for a
+    /// file not loaded yet). `None` for a headless session, which is not
+    /// recorded.
+    pub fn recovery_snapshot(&mut self, id: EditorSessionId) -> Result<Option<RecoverySnapshot>, String> {
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let (Some(recovery_id), Some(opener)) = (session.recovery, session.opener) else {
+            return Ok(None);
+        };
+        let files = session
+            .files
+            .iter_mut()
+            .map(|f| {
+                let (cursor_line, cursor_col) = match f.buffer.as_mut() {
+                    Some(b) => {
+                        let at = b.core.cursor();
+                        line_col_of(&b.core.text(), at)
+                    }
+                    None => f.restore_cursor.unwrap_or((0, 0)),
+                };
+                RecoveryFile {
+                    path: f.path.clone(),
+                    visited: f.buffer.is_some() || f.restore_cursor.is_some(),
+                    cursor_line,
+                    cursor_col,
+                }
+            })
+            .collect();
+        Ok(Some(RecoverySnapshot {
+            recovery_id,
+            opener_principal: opener.principal,
+            opener_context_id: opener.context_id,
+            current_index: session.current,
+            files,
+        }))
+    }
+
+    /// The recovery ids of the open sessions. A record whose id is here
+    /// belongs to a live session, not to one a restart cut off.
+    pub fn live_recovery_ids(&self) -> Vec<RecoveryId> {
+        self.sessions.values().filter_map(|s| s.recovery).collect()
     }
 
     /// The most recent session `principal` opened whose argument list holds
@@ -550,7 +735,7 @@ impl EditorSessions {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         for path in paths.iter().map(AsRef::as_ref) {
             if session.position(path).is_none() {
-                session.files.push(ArgFile { path: path.to_string(), buffer: None });
+                session.files.push(ArgFile::unloaded(path));
             }
         }
         Ok(())
@@ -974,6 +1159,22 @@ impl EditorSessions {
         force: bool,
         blocks: &SharedBlockStore,
     ) -> Result<LoadStep, String> {
+        self.finish_load_over(id, path, target, force, blocks, None)
+    }
+
+    /// [`finish_load`](Self::finish_load), with `disk_text` as the loaded
+    /// buffer's checkpoint when the file is one a recovery brought back
+    /// ([`is_recovering`](Self::is_recovering)). The file's recorded cursor
+    /// is restored on any load.
+    pub fn finish_load_over(
+        &mut self,
+        id: EditorSessionId,
+        path: &str,
+        target: EditorTarget,
+        force: bool,
+        blocks: &SharedBlockStore,
+        disk_text: Option<&str>,
+    ) -> Result<LoadStep, String> {
         let message = self.announce_bound(target);
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         if session.position(path) == Some(session.current) {
@@ -985,7 +1186,7 @@ impl EditorSessions {
         let index = match session.position(path) {
             Some(i) => i,
             None => {
-                session.files.push(ArgFile { path: path.to_string(), buffer: None });
+                session.files.push(ArgFile::unloaded(path));
                 session.files.len() - 1
             }
         };
@@ -993,7 +1194,10 @@ impl EditorSessions {
             session.current = index;
             return Ok(LoadStep::AlreadyLoaded);
         }
-        session.files[index].buffer = Some(Buffer::load(target, blocks)?);
+        let cursor = session.files[index].restore_cursor;
+        session.files[index].buffer = Some(Buffer::load_over(target, blocks, disk_text, cursor)?);
+        session.files[index].restore_cursor = None;
+        session.files[index].recovering = false;
         session.current = index;
         Ok(LoadStep::Loaded { message })
     }
@@ -1227,7 +1431,7 @@ impl EditorSessions {
         actor: PrincipalId,
     ) -> Result<QuitReport, String> {
         let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
-        let mut report = QuitReport::default();
+        let mut report = QuitReport { recovery: session.recovery, ..QuitReport::default() };
         for (index, file) in session.files.iter().enumerate() {
             let Some(buffer) = &file.buffer else { continue };
             report.loaded.push(file.path.clone());
@@ -1264,8 +1468,10 @@ impl EditorSessions {
 
     /// Drop a session without touching any block: for a session that has
     /// just opened and taken no input, when the kernel layer cannot pin it.
-    pub fn forget(&mut self, id: EditorSessionId) {
-        self.sessions.remove(&id);
+    /// Returns the session's recovery record id, for the kernel layer to
+    /// delete.
+    pub fn forget(&mut self, id: EditorSessionId) -> Option<RecoveryId> {
+        self.sessions.remove(&id).and_then(|s| s.recovery)
     }
 
     /// Whether a session is still open.

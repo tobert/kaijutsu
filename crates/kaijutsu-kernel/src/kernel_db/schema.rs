@@ -1063,6 +1063,43 @@ CREATE TABLE IF NOT EXISTS dirty_file_buffers (
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
+-- ── Editor recovery (docs/vi.md, "Recovering an argument list") ─
+-- What a vi session with an opener holds that a restart would lose: its
+-- argument list, its index and each file's cursor. A row exists from the
+-- session's open until any close deletes it; the rows that remain after a
+-- restart are the lists `vi -r` offers. The text of a dirty file is not
+-- here: it survives as a swap (`dirty_file_buffers`).
+--   recovery_id         UUIDv7 of the record, not the live session's handle.
+--   opener_principal    who opened the session.
+--   opener_context_id   the context the opener opened it from.
+--   current_index       0-based position in the list of the current file.
+--   opened_at           when the record was first written.
+--   updated_at          the latest write; no row is aged out.
+-- One row per file, in list order:
+--   position            0-based place in the list.
+--   path                the path as the opener named it.
+--   visited             whether the session had loaded the file.
+--   cursor_line         0-based line of the file's cursor at the latest
+--   cursor_col          write; 0-based column within that line.
+CREATE TABLE IF NOT EXISTS editor_recovery_sessions (
+    recovery_id       BLOB    NOT NULL PRIMARY KEY,
+    opener_principal  BLOB    NOT NULL,
+    opener_context_id BLOB    NOT NULL,
+    current_index     INTEGER NOT NULL CHECK (current_index >= 0),
+    opened_at         INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS editor_recovery_files (
+    recovery_id BLOB    NOT NULL
+        REFERENCES editor_recovery_sessions(recovery_id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL CHECK (position >= 0),
+    path        TEXT    NOT NULL,
+    visited     INTEGER NOT NULL CHECK (visited IN (0, 1)),
+    cursor_line INTEGER NOT NULL DEFAULT 0 CHECK (cursor_line >= 0),
+    cursor_col  INTEGER NOT NULL DEFAULT 0 CHECK (cursor_col >= 0),
+    PRIMARY KEY (recovery_id, position)
+);
+
 -- ── Context watches (docs/watch.md) ─────────────────────────────
 -- One row per thing a context watches. The status columns are the
 -- coalesced record since the last delivery: a prompt submit renders every
