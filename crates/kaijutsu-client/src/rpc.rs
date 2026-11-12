@@ -1364,8 +1364,16 @@ impl KernelHandle {
     }
 
     /// Feed vim-notation keys to an open session; returns the new state.
-    #[tracing::instrument(skip(self), name = "rpc_client.editor_keys")]
+    /// A caller that writes a system clipboard wants
+    /// [`editor_keys_reply`](Self::editor_keys_reply).
     pub async fn editor_keys(&self, session_id: u64, keys: &str) -> Result<EditorState, RpcError> {
+        Ok(self.editor_keys_reply(session_id, keys).await?.state)
+    }
+
+    /// Feed vim-notation keys to an open session; returns the new state and
+    /// the text the keys yanked, if they did.
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_keys")]
+    pub async fn editor_keys_reply(&self, session_id: u64, keys: &str) -> Result<EditorKeysReply, RpcError> {
         let mut request = self.kernel.editor_keys_request();
         request.get().set_session_id(session_id);
         request.get().set_keys(keys);
@@ -1376,7 +1384,11 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        parse_editor_state(response.get()?.get_state()?)
+        let response = response.get()?;
+        Ok(EditorKeysReply {
+            state: parse_editor_state(response.get_state()?)?,
+            yank: parse_editor_yank(&response)?,
+        })
     }
 
     /// Insert `text` at the session's cursor — a paste, not keystrokes
@@ -4319,6 +4331,35 @@ pub struct EditorState {
     pub arg_index: u32,
     /// How many files the argument list holds.
     pub arg_count: u32,
+}
+
+/// Text a key batch yanked into the unnamed register, for the caller's system
+/// clipboard (docs/vi.md, "Registers"). `linewise` text ends in a newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorYank {
+    pub text: String,
+    pub linewise: bool,
+}
+
+/// The answer to `editor_keys`: the session's state, and the yank the keys
+/// made. Only the caller that sent the keys gets the yank; the state pushes
+/// to other watchers never carry one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorKeysReply {
+    pub state: EditorState,
+    pub yank: Option<EditorYank>,
+}
+
+/// The `yank` of an `editorKeys` reply: `None` when the field is unset, which
+/// is how a kernel that predates it answers too.
+fn parse_editor_yank(
+    r: &crate::kaijutsu_capnp::kernel::editor_keys_results::Reader<'_>,
+) -> Result<Option<EditorYank>, RpcError> {
+    if !r.has_yank() {
+        return Ok(None);
+    }
+    let yank = r.get_yank()?;
+    Ok(Some(EditorYank { text: yank.get_text()?.to_string()?, linewise: yank.get_linewise() }))
 }
 
 /// Parse a capnp `EditorState` reader into the client struct. Shared by the

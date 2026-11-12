@@ -2082,6 +2082,53 @@ fn a_burst_into_the_editor_lands_in_order_with_a_paste_in_place() {
     assert!(back, "the editor did not close: {}", session.dump("quit"));
 }
 
+/// A `y` in a kernel vi session reaches the clipboard of the terminal that
+/// typed it, over OSC 52, once per yank; a motion and a delete write
+/// nothing (`docs/vi.md`, "Registers").
+#[test]
+fn a_yank_in_a_kernel_vi_session_is_copied_over_osc52() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    assert!(session.clipboard().is_empty(), "nothing has been yanked yet");
+
+    session.send(":!vi /config/rc/lib/create/S16-handoff.kai\r");
+    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S16-handoff.kai") && !screen_contains(screen, '\u{276f}');
+    assert!(session.wait_until(Duration::from_secs(15), in_editor), "vi never opened: {}", session.dump("vi"));
+    assert!(
+        session.wait_until(Duration::from_secs(15), |screen| screen_contains_str(screen, "inject a character")),
+        "the editor never drew the file: {}",
+        session.dump("vi loaded")
+    );
+
+    session.send("ggyy");
+    let copied = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if !session.clipboard().is_empty() || std::time::Instant::now() > deadline {
+                break session.clipboard();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(copied.len(), 1, "yy writes the clipboard once: {}", session.dump("after yy"));
+    assert!(copied[0].ends_with('\n'), "a line yank ends in a newline: {:?}", copied[0]);
+
+    // A motion and a delete yank nothing. The screen settling on the deleted
+    // line's absence proves the kernel answered both before the check.
+    let first = copied[0].trim_end().to_string();
+    session.send("jdd");
+    session.send("gg");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(session.clipboard(), copied, "a motion and a delete wrote the clipboard: {}", session.dump("after dd"));
+
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(":q!\r");
+    let back = session.wait_until(Duration::from_secs(10), |screen| screen_contains(screen, '\u{276f}'));
+    assert!(back, "the editor did not close ({first}): {}", session.dump("quit"));
+}
+
 /// The prefix pops over the full-screen editor: a seat chord shows the other
 /// context's conversation, the editor stays with the context it was opened
 /// in, and `Ctrl+A Ctrl+A` lands back in it (`docs/tui.md`, "Editor and

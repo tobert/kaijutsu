@@ -262,6 +262,7 @@ fn editor_drain_landed(
     mut state: ResMut<EditorOutboxState>,
     mut active: ResMut<ActiveEditor>,
     mut next_screen: ResMut<NextState<Screen>>,
+    clipboard: Option<Res<crate::input::ClipboardWriter>>,
 ) {
     let mut writer_stopped = false;
     let mut answers: Vec<(u64, Landed)> = Vec::new();
@@ -276,7 +277,7 @@ fn editor_drain_landed(
     // writer's drop guard lands is left behind.
     state.retiring.retain_mut(|rx| loop {
         match rx.try_recv() {
-            Ok(Landed { session, sent, result: Err(e) }) => {
+            Ok(Landed { session, sent, result: Err(e), .. }) => {
                 warn!("editor input {sent:?} for session {session} lost across reconnect: {e}");
                 lost_across_reconnect += 1;
             }
@@ -291,7 +292,14 @@ fn editor_drain_landed(
         ));
     }
 
-    for (generation, Landed { session, sent, result }) in answers {
+    for (generation, Landed { session, sent, result, yank }) in answers {
+        // A yank answers keys this client sent, so it goes to the system
+        // clipboard whichever session is on screen now; the kernel's
+        // registers hold it either way, so a missing clipboard loses only the
+        // copy out. A session this client merely watches never gets one.
+        if let (Some(yank), Some(writer)) = (yank, clipboard.as_ref()) {
+            writer.write(yank.text);
+        }
         let current = active
             .session
             .as_ref()
@@ -583,6 +591,7 @@ mod tests {
     use super::*;
     use bevy::state::app::StatesPlugin;
     use kaijutsu_client::editor_outbox::{EditorSink, WRITER_STOPPED};
+    use kaijutsu_client::{EditorKeysReply, EditorYank};
     use kaijutsu_kernel::editor::NO_SUCH_SESSION;
     use std::future::Future;
     use std::sync::Arc;
@@ -642,6 +651,8 @@ mod tests {
     #[derive(Clone)]
     enum Behavior {
         Ok,
+        /// Answer with a yank of this text.
+        Yank(String),
         Fail(String),
         /// Wait for the gate, then answer.
         Gated(Arc<AtomicBool>),
@@ -664,7 +675,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 match behavior {
-                    Behavior::Ok => Ok(state(session)),
+                    Behavior::Ok | Behavior::Yank(_) => Ok(state(session)),
                     Behavior::Fail(e) => Err(e),
                     Behavior::Gated(gate) => {
                         while !gate.load(Ordering::SeqCst) {
@@ -678,8 +689,13 @@ mod tests {
     }
 
     impl EditorSink for FakeSink {
-        fn keys(&self, session: u64, _keys: &str) -> impl Future<Output = Result<EditorState, String>> {
-            self.answer(session)
+        fn keys(&self, session: u64, _keys: &str) -> impl Future<Output = Result<EditorKeysReply, String>> {
+            let answer = self.answer(session);
+            let yank = match &self.behavior {
+                Behavior::Yank(text) => Some(EditorYank { text: text.clone(), linewise: false }),
+                _ => None,
+            };
+            async move { Ok(EditorKeysReply { state: answer.await?, yank }) }
         }
 
         fn insert(&self, session: u64, _text: &str) -> impl Future<Output = Result<EditorState, String>> {
@@ -767,6 +783,35 @@ mod tests {
         wait_for(&mut app, "a notice", |a| notice(a).is_some());
         assert!(notice(&app).unwrap().contains("boom"));
         assert!(!popped(&app), "a transient failure keeps the editor");
+    }
+
+    /// A yank in the answer to this client's keys is written to the system
+    /// clipboard; an answer without one writes nothing.
+    #[test]
+    fn a_yank_in_an_answer_is_written_to_the_clipboard() {
+        let (writer, written) = crate::input::ClipboardWriter::for_test();
+        let mut app = test_app();
+        app.insert_resource(writer);
+        open_session(&mut app, 7, 1);
+        install(&mut app, 1, FakeSink::new(Behavior::Yank("one\n".into())));
+        send(&mut app, 7, "yy");
+        let got = std::cell::RefCell::new(Vec::new());
+        wait_for(&mut app, "the clipboard write", |_| {
+            got.borrow_mut().extend(written.try_iter());
+            !got.borrow().is_empty()
+        });
+        assert_eq!(*got.borrow(), ["one\n"]);
+
+        let (writer, written) = crate::input::ClipboardWriter::for_test();
+        let mut app = test_app();
+        app.insert_resource(writer);
+        open_session(&mut app, 7, 1);
+        install(&mut app, 1, FakeSink::new(Behavior::Ok));
+        send(&mut app, 7, "j");
+        wait_for(&mut app, "the answer's state", |a| {
+            a.world().resource::<ActiveEditor>().session.as_ref().is_some_and(|v| v.state.text == "answered")
+        });
+        assert_eq!(written.try_iter().count(), 0, "keys that yanked nothing write nothing");
     }
 
     #[test]

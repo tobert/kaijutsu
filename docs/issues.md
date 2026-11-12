@@ -39,12 +39,12 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   again on the visit.
 - **A config write to a path an editor session holds leaves the cache
   stale.** `kj rc add/rm` and `kj config reset` write the host file, then
-  `Kernel::invalidate_config_file_cache` drops the cached document; on a
-  pinned path that refuses, the kernel only logs a `warn!`, and the command
-  still reports success while a later read serves the old text. This held
-  for a session's current file before; an argument list pins every visited
-  file, so a session showing another file can hold the path too. Left:
-  report the refusal to the caller, or reload the held buffer from disk.
+  `Kernel::invalidate_config_file_cache` refuses on a pinned path; the verbs
+  exit 1 and name the session. A session pins every file of its argument
+  list, so one showing another file can hold the path. Left: closing the
+  session releases the hold but does not refresh the cached copy, and
+  `kj rc add`/`rm` cannot run again on the path (`kj config reset` can).
+  Reload the held buffer, or the entry once released, from disk.
 - **A line cursor in the app conversation, eventually.** Amy, 2026-11-11:
   block yank "is ok for now, but line eventually."
 - **The system clipboard takes yanks and gives nothing back.** A compose
@@ -54,10 +54,6 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   available that would be most of what I want. middle click paste when we
   get to it would prioritize the system clipboard when available. probably
   needs more thinking through."* Open:
-  - A yank in a kernel vi session does not go out. The kernel cannot reach
-    a desktop; the client drawing the session would have to learn of the
-    yank (a field on `EditorState`, or the `"0` compare done kernel-side)
-    and write it itself.
   - Middle-click paste. The app pastes PRIMARY on middle click already; the
     tui leaves the mouse to the terminal. What it should prefer when the
     system clipboard and the registers differ is not decided.
@@ -65,9 +61,15 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
     (modalkit's `clipboard` feature is off; turning it on opens a
     clipboard connection per `EditorCore`). OSC 52 cannot read in most
     terminals, so the tui could not offer `"+p` either way.
-  - A client detects a yank by comparing `"0` across the key, so yanking
+  - A yank is detected by comparing `"0` across the keys, so yanking
     the same text twice writes the clipboard once. If another program
     took the clipboard in between, the second `y` does not take it back.
+  - A kernel vi yank rides the reply to its keys, so it is lost when that
+    reply is an error: a `yy` coalesced with a `:wq` whose write fails, or
+    a reply dropped by a timeout. The app also drops a yank that lands on
+    an outbox retired by a reconnect, and says nothing when it has no
+    clipboard writer, where the tui shows a note. The registers keep the
+    text in every case.
 - **The two clients still differ on yank.** The tui's diff viewer yanks
   the hunk at the top of the viewport; the app's has `DiffCore`'s cursor
   and visual selections.

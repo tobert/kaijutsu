@@ -10,6 +10,7 @@ use crate::app::App;
 use crate::bridge::KernelBridge;
 use kaijutsu_client::editor_outbox;
 use crate::render;
+use super::terminal::{TermLock, write_osc52};
 
 use kaijutsu_client::{PeerConfig, PeerInvocation};
 
@@ -29,8 +30,30 @@ const PEER_NICK: &str = "kaijutsu-tui";
 /// One answer from the editor outbox. A state is drawn on whichever screen
 /// holds its session, on screen or parked; a lost session gives the
 /// conversation back. Returns whether the screen changed.
-pub(super) fn land_editor_answer(app: &mut App, landed: editor_outbox::Landed) -> bool {
-    match landed.result {
+///
+/// A yank in the keys' reply goes to the system clipboard over OSC 52, as a
+/// yank in the draft does. Only this client's own keys carry one; a session
+/// it merely watches never writes its clipboard (`docs/vi.md`, "Registers").
+pub(super) fn land_editor_answer(app: &mut App, landed: editor_outbox::Landed, term_lock: &TermLock) -> bool {
+    land_editor_answer_with(app, landed, |text| write_osc52(term_lock, text))
+}
+
+/// [`land_editor_answer`] with the clipboard write passed in.
+fn land_editor_answer_with(
+    app: &mut App,
+    landed: editor_outbox::Landed,
+    write_clipboard: impl FnOnce(&str) -> std::io::Result<()>,
+) -> bool {
+    // The kernel's registers already hold the yank, so a terminal that drops
+    // OSC 52 loses only the copy out.
+    let mut noted = false;
+    if let Some(yank) = &landed.yank
+        && let Err(e) = write_clipboard(&yank.text)
+    {
+        app.note(format!("clipboard write failed: {e}"));
+        noted = true;
+    }
+    let drew = match landed.result {
         Ok(state) => editor::apply_state(app, state),
         Err(message) if editor::is_session_lost(&message) => {
             // A kernel restart: the sessions are in memory and the persisted
@@ -45,7 +68,8 @@ pub(super) fn land_editor_answer(app: &mut App, landed: editor_outbox::Landed) -
             app.note(format!("editor call failed: {message}"));
             true
         }
-    }
+    };
+    drew || noted
 }
 
 /// Attach as a peer so `vi <path>` and `kj vi` reach this terminal.
@@ -230,10 +254,44 @@ mod tests {
             session: 4,
             sent: "ab".into(),
             result: Err("the editor writer stopped before this call was answered".into()),
+            yank: None,
         };
-        assert!(land_editor_answer(&mut app, landed));
+        assert!(land_editor_answer_with(&mut app, landed, |_| panic!("no yank, no clipboard write")));
         let note = app.notice().unwrap_or_default().to_string();
         assert!(note.contains("editor call failed") && note.contains("writer stopped"), "{note}");
+    }
+
+    fn landed_with(yank: Option<kaijutsu_client::EditorYank>) -> editor_outbox::Landed {
+        let state = kaijutsu_client::EditorState {
+            session: 9, text: "one\n".into(), cursor: 0, mode: None, dirty: false,
+            command_line: None, message: None, selection: None,
+            path: "/x".into(), arg_index: 0, arg_count: 1,
+        };
+        editor_outbox::Landed { session: 9, sent: "yy".into(), result: Ok(state), yank }
+    }
+
+    /// A yank in the reply to this client's keys reaches the clipboard
+    /// write with its text; a reply without one writes nothing; a failed
+    /// write says so on the status row and asks for a redraw.
+    #[test]
+    fn a_yank_in_the_keys_reply_is_written_to_the_clipboard() {
+        let mut app = App::new("amy");
+        let mut written = Vec::new();
+        let yank = kaijutsu_client::EditorYank { text: "one\n".into(), linewise: true };
+        land_editor_answer_with(&mut app, landed_with(Some(yank)), |text| {
+            written.push(text.to_string());
+            Ok(())
+        });
+        assert_eq!(written, ["one\n"]);
+
+        land_editor_answer_with(&mut app, landed_with(None), |_| panic!("no yank, no clipboard write"));
+
+        let yank = kaijutsu_client::EditorYank { text: "two".into(), linewise: false };
+        let redraw = land_editor_answer_with(&mut app, landed_with(Some(yank)), |_| {
+            Err(std::io::Error::other("no tty"))
+        });
+        assert!(redraw, "the status row changed");
+        assert!(app.notice().unwrap_or_default().contains("clipboard write failed"));
     }
 
     /// Two diff blocks with prose between and after; the context on screen.

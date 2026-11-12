@@ -117,8 +117,10 @@ is the correct outcome, not a failure of the caller's own operation.
 `kj swap discard` on a path an editor session holds reports the refusal
 instead of silently orphaning the session's buffer. The config writers that
 invalidate after a raw write (`kj rc add/rm`, `kj config reset`, through
-`Kernel::invalidate_config_file_cache`) only log the refusal and still
-report success, leaving the cached text stale (`docs/issues.md`). Since a
+`Kernel::invalidate_config_file_cache`) log the refusal and return it: the
+host file is written, the cached text is not refreshed, and the verb exits 1
+with the refusal on stderr, naming the session (`docs/issues.md`). Closing
+the session releases the hold but does not refresh the cache. Since a
 session pins every file it has visited, a path can be held by a session
 showing another file.
 
@@ -277,7 +279,7 @@ All four editor methods already return `EditorState`, as does the
 
 ```capnp
 editorOpen  @74 -> (state :EditorState)
-editorKeys  @75 -> (state :EditorState)
+editorKeys  @75 -> (state :EditorState, yank :EditorYank)
 editorState @76 -> (state :EditorState)
 editorSave  @77 -> (state :EditorState)
 ```

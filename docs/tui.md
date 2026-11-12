@@ -1039,7 +1039,10 @@ Rules the figure carries:
   `y` and a `y` in the draft both (`ComposeAction::yanked`). A delete
   stays in the registers and out of the clipboard. The write is one way;
   the tui never reads the OS clipboard back, and a terminal that drops
-  OSC 52 loses only the copy out.
+  OSC 52 loses only the copy out. A `y` in a full-screen kernel vi
+  session goes out the same way: the `editorKeys` reply to this client's
+  keys carries the yank, and the answer is written under the terminal lock
+  as the draft's is (`docs/vi.md`, "Registers").
 - **The machinery, named.** Nothing on the wire opens copy mode: it is a
   local decision over the `ContextMirror` this client already holds, the
   same source `render::transcript_window` reads — there is no RPC round
@@ -1389,6 +1392,12 @@ pieces"), and the frame builder gives every cell inside a span the
 mark. A selected line break draws as one blank cell past the line's last
 char, as in vim, so a selected empty line still shows. The terminal cursor
 stays where the kernel puts it. The tui keeps no anchor of its own.
+
+**A yank goes to the clipboard.** The reply to a key batch carries what it
+yanked (`editor_outbox::Landed::yank`), and `land_editor_answer` writes it
+with `write_osc52`, the call the draft and copy mode use. A session this
+client only watches has no reply of its own, so it never writes the
+clipboard. The compose registers are not filled; a delete is not a yank.
 
 **Every key but the prefix goes to vim.** While the alternate screen is up a
 key goes to `editor_keys` verbatim, so `Ctrl+C` is vim's interrupt — the

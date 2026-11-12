@@ -254,9 +254,19 @@ impl KjDispatcher {
             RcCommand::Show { path } => self.rc_show(&path).await,
         };
         if let Some(path) = write_path
-            && matches!(result, KjResult::Ok { .. })
+            && let KjResult::Ok { message, .. } = &result
+            && let Err(refusal) = self.kernel().invalidate_config_file_cache(&path)
         {
-            self.kernel().invalidate_config_file_cache(&path);
+            // The host file changed and the cached copy did not, so this is
+            // not a clean success. Closing the session releases the hold but
+            // does not refresh the copy, and neither verb can run again on the
+            // same path (`add` finds it present, `rm` finds it gone).
+            return KjResult::Err(format!(
+                "{message}\n\
+                 kj rc: the host file changed, but its cached copy was not refreshed, so reads \
+                 still serve the old text: {refusal}. The copy refreshes when it is next \
+                 invalidated or the kernel restarts."
+            ));
         }
         result
     }
@@ -958,6 +968,52 @@ mod tests {
             cache.try_get_or_load(path).await.is_err(),
             "a removed rc script must not keep resolving through a stale shadow"
         );
+    }
+
+    /// `kj rc rm` on a path an editor session holds removes the host file but
+    /// cannot refresh the cached copy: it fails, names the session, and says
+    /// the file did change. A session showing another file of its argument
+    /// list holds the path too.
+    ///
+    /// Falsified by discarding the `Err` of `invalidate_config_file_cache` in
+    /// the dispatcher: the verb then reports plain success.
+    #[tokio::test]
+    async fn rc_rm_on_a_path_an_editor_session_holds_reports_the_stale_cache() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let held = "/config/rc/cachetest/create/S01-held.kai";
+        let other = "/config/rc/cachetest/create/S02-other.kai";
+        let hidden = "/config/rc/cachetest/create/S03-hidden.kai";
+        for path in [held, other, hidden] {
+            d.dispatch(&[s("rc"), s("add"), s(path), s("--content"), s("echo old")], &c).await;
+        }
+
+        // Held as the session's current file.
+        let (id, _) = d.kernel().editor_open(held).await.unwrap();
+        let refused = d.dispatch(&[s("rc"), s("rm"), s(held)], &c).await;
+        let KjResult::Err(message) = refused else { panic!("a stale cache is not a clean success: {refused:?}") };
+        assert!(message.contains("removed rc script"), "the file was removed: {message}");
+        assert!(message.contains("not refreshed"), "{message}");
+        assert!(message.contains(&format!("editor session {}", id.as_u64())), "names the session: {message}");
+        assert!(message.contains("kj vi quit"), "says how to release it: {message}");
+        assert!(!d.rc_exists(held).await, "the host file is gone");
+        assert!(d.kernel().editor_state(id).is_ok(), "the session survives");
+        d.kernel().editor_close(id, c.actor_id).await.unwrap();
+
+        // Held as a hidden file of an argument list: the session shows `other`.
+        let (id, _) = d.kernel().editor_open_list(&[other.to_string(), hidden.to_string()], None).await.unwrap();
+        d.kernel().editor_keys(id, ":n<CR>", c.actor_id).await.unwrap();
+        d.kernel().editor_keys(id, ":N<CR>", c.actor_id).await.unwrap();
+        d.kernel().editor_keys(id, ":n<CR>", c.actor_id).await.unwrap();
+        assert_eq!(d.kernel().editor_state(id).unwrap().path, hidden);
+        let refused = d.dispatch(&[s("rc"), s("rm"), s(other)], &c).await;
+        let KjResult::Err(message) = refused else { panic!("a hidden file also refuses: {refused:?}") };
+        assert!(message.contains(&format!("editor session {}", id.as_u64())), "{message}");
+        assert!(message.contains("hidden file"), "{message}");
     }
 
     /// `kj rc list` emits full absolute paths as iteration handles so

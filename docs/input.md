@@ -190,7 +190,9 @@ draft puts the line, and a yank on the shell line puts in the chat draft.
 Switching context, submitting and clearing keep the registers
 (`ComposeState` lends them to the surface for each key; `docs/vi.md`,
 "Registers"). A `y` on either surface is also written to the system
-clipboard when there is one; a delete is not.
+clipboard when there is one; a delete is not. A `y` in the full-screen vi
+editor is written to the system clipboard too (the reply to the keys carries
+the yank; the compose registers are not filled). `docs/vi.md`, "Registers".
 
 | Key | Does |
 |---|---|

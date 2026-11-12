@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 
 use common::{connect_client, run_local, start_server};
-use kaijutsu_client::{EditorState, PeerConfig, ServerEvent, editor_events_channel};
+use kaijutsu_client::{EditorState, EditorYank, PeerConfig, ServerEvent, editor_events_channel};
 
 /// A script the server seeds into rc on a fresh kernel — guaranteed to
 /// exist, so `editorOpen` binds to a real block backing an rc host file.
@@ -197,6 +197,47 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
         );
         assert!(!reopened.dirty, "the rolled-back block re-opens clean");
         kernel.editor_quit(reopened.session).await.unwrap();
+    });
+}
+
+/// A yank travels on the reply to the keys that made it. A delete and a
+/// plain motion reply with none. A second connection watching the session
+/// sees the state push for the yank, and `ServerEvent::EditorStateChanged`
+/// carries an `EditorState` with no yank field to write a clipboard from.
+#[test]
+fn a_yank_rides_the_reply_to_the_keys_that_made_it() {
+    run_local(async {
+        let addr = start_server().await;
+        let typist = connect_client(addr).await;
+        let (kernel, _) = typist.bind_kernel().await.unwrap();
+        let watcher = connect_client(addr).await;
+        let (watching, _) = watcher.bind_kernel().await.unwrap();
+        let (callback, mut rx) = editor_events_channel(64);
+        watching.subscribe_editor(callback).await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let first_line = opened.text.lines().next().unwrap().to_string();
+
+        let yanked = kernel.editor_keys_reply(session, "yy").await.unwrap();
+        assert_eq!(
+            yanked.yank,
+            Some(EditorYank { text: format!("{first_line}\n"), linewise: true }),
+            "yy replies with the line"
+        );
+        let pushed = recv_state_for(&mut rx, session).await;
+        assert_eq!(pushed.text, yanked.state.text, "the watcher still sees the state");
+
+        let word = kernel.editor_keys_reply(session, "yw").await.unwrap();
+        let yank = word.yank.expect("yw yanks");
+        assert!(!yank.linewise && !yank.text.is_empty());
+
+        let moved = kernel.editor_keys_reply(session, "j").await.unwrap();
+        assert_eq!(moved.yank, None, "a motion yanks nothing");
+        let deleted = kernel.editor_keys_reply(session, "dd").await.unwrap();
+        assert_eq!(deleted.yank, None, "a delete is not a yank");
+
+        kernel.editor_quit(session).await.unwrap();
     });
 }
 

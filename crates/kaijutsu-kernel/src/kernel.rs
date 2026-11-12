@@ -270,7 +270,7 @@ fn default_flow_capacity() -> usize {
 /// How one key batch of `Kernel::editor_keys_checked` ended.
 enum EditorBatchEnd {
     /// The batch closed the session; the last state before close.
-    Closed(crate::editor::EditorState),
+    Closed(crate::editor::EditorState, Option<kaijutsu_editor::Yank>),
     /// The session is open. `go` is a move the batch requested, and `rest`
     /// the keys after the intent that ended the batch, which run next in the
     /// current buffer (the one a move landed on).
@@ -278,7 +278,18 @@ enum EditorBatchEnd {
         message: Option<String>,
         go: Option<(kaijutsu_editor::ArgMove, bool)>,
         rest: Option<kaijutsu_editor::PendingKeys>,
+        yank: Option<kaijutsu_editor::Yank>,
     },
+}
+
+/// The answer to a key batch: the session's state, and the text the keys
+/// yanked, if they did. The yank goes to the player that sent the keys, who
+/// writes it to their system clipboard; it is never published on the
+/// session's push channel.
+#[derive(Debug, Clone)]
+pub struct EditorKeysReply {
+    pub state: crate::editor::EditorState,
+    pub yank: Option<kaijutsu_editor::Yank>,
 }
 
 /// The vi status-line text for a failed editor flush. One source for all three
@@ -1784,6 +1795,17 @@ impl Kernel {
         keys: &str,
         actor: PrincipalId,
     ) -> Result<crate::editor::EditorState, String> {
+        Ok(self.editor_keys_checked(id, keys, actor, true).await?.state)
+    }
+
+    /// [`editor_keys`](Self::editor_keys) with the yank the keys made: the
+    /// latest one from any part of a batch the kernel split at a `:` line.
+    pub async fn editor_keys_reply(
+        &self,
+        id: crate::editor::EditorSessionId,
+        keys: &str,
+        actor: PrincipalId,
+    ) -> Result<EditorKeysReply, String> {
         self.editor_keys_checked(id, keys, actor, true).await
     }
 
@@ -1801,7 +1823,7 @@ impl Kernel {
         keys: &str,
         actor: PrincipalId,
         can_write: bool,
-    ) -> Result<crate::editor::EditorState, String> {
+    ) -> Result<EditorKeysReply, String> {
         // A batch stops at each intent for the kernel (a `:` line, `ZZ`,
         // `ZQ`): the kernel acts on it here — a move after the batch's write
         // landed — and the keys after it run as a further batch in the
@@ -1810,10 +1832,16 @@ impl Kernel {
         // end.
         let mut input = crate::editor::BatchInput::Keys(keys);
         let mut message = None;
+        let mut yank = None;
         loop {
             match self.editor_batch(id, input, actor, can_write).await? {
-                EditorBatchEnd::Closed(state) => return Ok(state),
-                EditorBatchEnd::Open { message: batch_message, go, rest } => {
+                EditorBatchEnd::Closed(state, closing_yank) => {
+                    return Ok(EditorKeysReply { state, yank: closing_yank.or(yank) });
+                }
+                EditorBatchEnd::Open { message: batch_message, go, rest, yank: batch_yank } => {
+                    if batch_yank.is_some() {
+                        yank = batch_yank;
+                    }
                     if batch_message.is_some() {
                         message = batch_message;
                     }
@@ -1840,7 +1868,8 @@ impl Kernel {
                 }
             }
         }
-        self.publish_current_editor_state(id, message)
+        let state = self.publish_current_editor_state(id, message)?;
+        Ok(EditorKeysReply { state, yank })
     }
 
     /// One key batch of [`editor_keys_checked`](Self::editor_keys_checked):
@@ -1949,7 +1978,7 @@ impl Kernel {
                         message = join_notes(message, self.write_editor_recovery(id));
                     }
                 }
-                Ok(EditorBatchEnd::Open { message, go, rest: update.rest })
+                Ok(EditorBatchEnd::Open { message, go, rest: update.rest, yank: update.yank })
             }
             crate::editor::KeysOutcome::Closed(update) => {
                 // The session is already gone (ZZ/`:wq`/`:x`/ZQ dropped it
@@ -2026,7 +2055,7 @@ impl Kernel {
                     None => {
                         let mut state = update.state;
                         state.message = join_notes(state.message.take(), recovery_error);
-                        Ok(EditorBatchEnd::Closed(state))
+                        Ok(EditorBatchEnd::Closed(state, update.yank))
                     }
                 }
             }
@@ -2257,7 +2286,12 @@ impl Kernel {
     /// self-heal this: an rc write through a composition symlink doesn't
     /// necessarily move the mtime the check reads. Every such writer calls
     /// this so the next read reloads. A no-op for non-config paths.
-    pub fn invalidate_config_file_cache(&self, path: &str) {
+    ///
+    /// Returns the cache's refusal when an editor session holds the path
+    /// (it may be a hidden file of the session's argument list): the copy
+    /// stays as it was and reads keep serving it. The caller reports that to
+    /// its own caller; the refusal is logged here as well.
+    pub fn invalidate_config_file_cache(&self, path: &str) -> Result<(), String> {
         // Called from an open editor session and from callers with no
         // session in scope (`kj rc`/`kj config`, always on their own trees)
         // alike — the latter is why this stays a path predicate rather than
@@ -2269,7 +2303,9 @@ impl Kernel {
             // The cache shadow is now inconsistent with the written config block;
             // a later kaish `cat` could serve stale text. Loud, not swallowed.
             tracing::warn!("failed to invalidate file cache for {path}: {e}");
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Publish a session's state on the editor push channel, read and
@@ -3993,6 +4029,58 @@ mod tests {
         let loaded = kernel.editor_sessions.lock().0.finish_load(id, "/mem/b.txt", target, false, kernel.blocks());
         assert_eq!(loaded, Ok(LoadStep::Refused(crate::editor::NO_WRITE_SINCE_LAST_CHANGE.to_string())));
         assert_eq!(kernel.editor_state(id).unwrap().path, "/mem/a.txt");
+    }
+
+    /// A yank in a batch the `:` line splits is reported once, with the
+    /// text of the latest yank in any part; a later batch that yanks nothing
+    /// reports nothing, and a delete is not a yank.
+    #[tokio::test]
+    async fn a_yank_survives_a_batch_split_by_a_colon_line() {
+        use kaijutsu_editor::Yank;
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+
+        let reply = kernel.editor_keys_reply(id, "yy:w<CR>", me).await.unwrap();
+        assert_eq!(reply.yank, Some(Yank::lines("alpha")), "the yank before the split");
+        let reply = kernel.editor_keys_reply(id, "j:args<CR>", me).await.unwrap();
+        assert_eq!(reply.yank, None, "nothing yanked");
+        let reply = kernel.editor_keys_reply(id, "dd", me).await.unwrap();
+        assert_eq!(reply.yank, None, "a delete is not a yank");
+        let reply = kernel.editor_keys_reply(id, "yw:args<CR>yy", me).await.unwrap();
+        assert_eq!(reply.yank, Some(Yank::lines("alpha")), "the latest yank of the parts");
+    }
+
+    /// Registers belong to the player: a yank before `:n` is reported when
+    /// the batch crosses to another file, and a yank after it too.
+    #[tokio::test]
+    async fn a_yank_is_reported_across_a_move_in_the_argument_list() {
+        use kaijutsu_editor::Yank;
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+
+        let reply = kernel.editor_keys_reply(id, "yy:n<CR>", me).await.unwrap();
+        assert_eq!(reply.state.path, "/mem/b.txt");
+        assert_eq!(reply.yank, Some(Yank::lines("alpha")), "yanked in a.txt, reported after the move");
+        let reply = kernel.editor_keys_reply(id, "yy:n<CR>j", me).await.unwrap();
+        assert_eq!(reply.state.path, "/mem/c.txt");
+        assert_eq!(reply.yank, Some(Yank::lines("beta")), "a later part that yanks nothing keeps the yank");
+        let reply = kernel.editor_keys_reply(id, ":N<CR>j:n<CR>yw", me).await.unwrap();
+        assert_eq!(reply.state.path, "/mem/c.txt");
+        assert_eq!(reply.yank, Some(Yank { text: "three".into(), linewise: false }), "yanked after the move, in c.txt");
+        let reply = kernel.editor_keys_reply(id, ":N<CR>", me).await.unwrap();
+        assert_eq!(reply.yank, None, "moving alone yanks nothing");
+    }
+
+    /// A yank before a closing `:q` still reaches the caller.
+    #[tokio::test]
+    async fn a_yank_before_a_closing_colon_q_is_reported() {
+        let kernel = kernel_with_three_files().await;
+        let me = PrincipalId::system();
+        let (id, _) = kernel.editor_open_list(&abc(), None).await.unwrap();
+        let reply = kernel.editor_keys_reply(id, "yy:q<CR>", me).await.unwrap();
+        assert!(reply.yank.is_some());
     }
 
     #[tokio::test]

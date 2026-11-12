@@ -2198,8 +2198,13 @@ mod tests {
             assert_eq!(ed.last_yank(), Some(Yank::lines("one")));
             ed.apply_keys("jdd");
             assert_eq!(ed.last_yank(), Some(Yank::lines("one")), "a delete is not a yank");
+            for keys in ["x", "D", "cwz<Esc>", "S<Esc>", "\"add", "vld"] {
+                ed.apply_keys(keys);
+                assert_eq!(ed.last_yank(), Some(Yank::lines("one")), "{keys} is not a yank");
+            }
+            ed.apply_keys("ggOthree four<Esc>0");
             ed.apply_keys("yw");
-            assert_eq!(ed.last_yank(), Some(Yank { text: "three".into(), linewise: false }));
+            assert_eq!(ed.last_yank(), Some(Yank { text: "three ".into(), linewise: false }));
             ed.yank(&Yank::lines("outside"));
             assert_eq!(ed.last_yank(), Some(Yank::lines("outside")));
         }

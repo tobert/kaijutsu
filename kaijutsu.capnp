@@ -1126,6 +1126,14 @@ struct EditorState {
   argCount @10 :UInt32;  # number of files in the argument list
 }
 
+# Text a key batch yanked into the unnamed register. `editorKeys` returns it
+# to the client that sent the keys, so that client can write its system
+# clipboard; it is not part of `EditorState` and never rides a push.
+struct EditorYank {
+  text @0 :Text;
+  linewise @1 :Bool;     # whole lines: `text` ends in a newline
+}
+
 # The vim visual-mode kind a selection came from.
 enum SelectionShape {
   charwise @0;   # v
@@ -2581,7 +2589,9 @@ interface Kernel {
   # surface here loudly (crash over corruption).
 
   editorOpen @74 (path :Text, trace :TraceContext) -> (state :EditorState);
-  editorKeys @75 (sessionId :UInt64, keys :Text, trace :TraceContext) -> (state :EditorState);
+  # `yank` is set when the batch yanked (`y`, never a delete) and unset
+  # otherwise; check with `hasYank`. Only the caller that sent the keys gets it.
+  editorKeys @75 (sessionId :UInt64, keys :Text, trace :TraceContext) -> (state :EditorState, yank :EditorYank);
   editorState @76 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
   editorSave @77 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
   editorQuit @78 (sessionId :UInt64, trace :TraceContext) -> ();

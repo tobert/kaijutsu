@@ -319,7 +319,7 @@ async fn event_loop(
                 on_input(bridge, app, terminal, &mut wires.feeds, &wires.term_lock, wires.probe_panic, &mut ls, event).await?;
             }
             Some(landed) = wires.editor_landed.recv() => {
-                if land_editor_answer(app, landed) {
+                if land_editor_answer(app, landed, &wires.term_lock) {
                     ls.frame.dirty = true;
                     ls.frame.answer = true;
                 }

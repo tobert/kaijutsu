@@ -3025,9 +3025,17 @@ impl kernel::Server for KernelImpl {
         // A :r read awaits a VFS or kaish fetch; its eventual edit keeps this actor.
         Promise::from_future(
             async move {
-                match kernel.kernel.editor_keys(id, &keys, actor).await {
-                    Ok(state) => {
-                        set_editor_state(results.get().init_state(), session_id, &state);
+                match kernel.kernel.editor_keys_reply(id, &keys, actor).await {
+                    Ok(reply) => {
+                        let mut out = results.get();
+                        set_editor_state(out.reborrow().init_state(), session_id, &reply.state);
+                        // Set only when the keys yanked; only this reply
+                        // carries it, never the push to a session's watchers.
+                        if let Some(yank) = &reply.yank {
+                            let mut wire = out.init_yank();
+                            wire.set_text(&yank.text);
+                            wire.set_linewise(yank.linewise);
+                        }
                         Ok(())
                     }
                     Err(e) => Err(capnp::Error::failed(format!("editor_keys failed: {e}"))),

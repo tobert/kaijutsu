@@ -158,9 +158,17 @@ impl KjDispatcher {
             ConfigCommand::Reset { path } => self.config_reset(&path).await,
         };
         if let Some(canonical) = write_path
-            && matches!(result, KjResult::Ok { .. })
+            && let KjResult::Ok { message, .. } = &result
+            && let Err(refusal) = self.kernel().invalidate_config_file_cache(&canonical)
         {
-            self.kernel().invalidate_config_file_cache(&canonical);
+            // The host file was reset and the cached copy was not, so this is
+            // not a clean success.
+            return KjResult::Err(format!(
+                "{message}\n\
+                 kj config reset: the host file was written, but its cached copy was not \
+                 refreshed, so reads still serve the old text: {refusal}; then run \
+                 `kj config reset {canonical}` again."
+            ));
         }
         result
     }
@@ -562,6 +570,37 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    /// `kj config reset` on a path an editor session holds writes the default
+    /// and fails, naming the session; once the session is closed, running it
+    /// again succeeds and the cache serves the default.
+    ///
+    /// Falsified by discarding the `Err` of `invalidate_config_file_cache` in
+    /// the dispatcher: the verb then reports plain success.
+    #[tokio::test]
+    async fn reset_on_a_path_an_editor_session_holds_reports_the_stale_cache() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let path = "/config/kernel/theme.toml";
+        d.write_config_content(path, "# clobbered").await.unwrap();
+        let (id, _) = d.kernel().editor_open(path).await.unwrap();
+
+        let refused = d.dispatch(&[s("config"), s("reset"), s("theme.toml")], &c).await;
+        let KjResult::Err(message) = refused else { panic!("a stale cache is not a clean success: {refused:?}") };
+        assert!(message.contains("the host file was written"), "{message}");
+        assert!(message.contains(&format!("editor session {}", id.as_u64())), "names the session: {message}");
+        assert!(message.contains("kj config reset /config/kernel/theme.toml"), "says what to run: {message}");
+        assert_eq!(
+            d.read_config_content(path).await.unwrap().as_deref(),
+            Some(crate::config_seed::DEFAULT_THEME),
+            "the host file holds the default"
+        );
+        assert!(d.kernel().editor_state(id).is_ok(), "the session survives");
+
+        d.kernel().editor_close(id, c.actor_id).await.unwrap();
+        let again = d.dispatch(&[s("config"), s("reset"), s("theme.toml")], &c).await;
+        assert!(matches!(again, KjResult::Ok { .. }), "after the session closes: {again:?}");
     }
 
     /// `kj config reset` on an unknown file errors instead of silently no-oping.

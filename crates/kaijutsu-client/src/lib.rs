@@ -40,7 +40,7 @@ pub use actor::{
 pub use rpc::{
     AskAnswer, AskListing, AuthorBlock, Completion, CompletionKind, ContextCluster, ContextCost, ContextInfo, ContextMcpRefusal,
     ContextMcpServerDecl, ContextMembership,
-    EditorState, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
+    EditorKeysReply, EditorState, EditorYank, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     McpResource, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellSubmission, ShellValue, SimilarContext,
     SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolSchema, TrackInfo,

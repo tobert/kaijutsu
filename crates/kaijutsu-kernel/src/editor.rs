@@ -77,7 +77,7 @@ pub async fn resolve_editor_target(
 use std::collections::HashMap;
 
 use kaijutsu_editor::{
-    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, Registers,
+    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, Registers, Yank,
 };
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
@@ -171,6 +171,10 @@ pub struct KeysUpdate {
     pub quit: QuitReport,
     pub go: Option<(ArgMove, bool)>,
     pub rest: Option<PendingKeys>,
+    /// What the batch yanked into the player's registers, when it did: the
+    /// player's `"0` after the keys differs from before them. A delete is not
+    /// a yank, and yanking the text `"0` already held reports nothing.
+    pub yank: Option<Yank>,
 }
 
 /// What closing a session did to its loaded files.
@@ -197,6 +201,13 @@ impl KeysOutcome {
     pub fn state(&self) -> &EditorState {
         match self {
             Self::Updated(u) | Self::Closed(u) => &u.state,
+        }
+    }
+
+    /// What this batch yanked, if anything ([`KeysUpdate::yank`]).
+    pub fn yank(&self) -> Option<&Yank> {
+        match self {
+            Self::Updated(u) | Self::Closed(u) => u.yank.as_ref(),
         }
     }
 
@@ -830,15 +841,40 @@ impl EditorSessions {
         actor: PrincipalId,
         can_write: bool,
     ) -> Result<KeysOutcome, String> {
+        let mut yank = None;
+        let mut outcome = self.run_batch(id, input, blocks, actor, can_write, &mut yank)?;
+        match &mut outcome {
+            KeysOutcome::Updated(update) | KeysOutcome::Closed(update) => update.yank = yank,
+        }
+        Ok(outcome)
+    }
+
+    /// [`batch`](Self::batch)'s body. `yank` is set from the player's `"0`
+    /// before and after the keys; the registers belong to the player, not the
+    /// buffer, so the compare holds whichever buffer the keys ran in.
+    fn run_batch(
+        &mut self,
+        id: EditorSessionId,
+        input: BatchInput<'_>,
+        blocks: &SharedBlockStore,
+        actor: PrincipalId,
+        can_write: bool,
+        yank: &mut Option<Yank>,
+    ) -> Result<KeysOutcome, String> {
         let (close, commands, rest) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
             let buffer = session.buffer()?;
             let len_before = buffer.core.text().chars().count();
             buffer.core.give_registers(self.registers.remove(&actor).unwrap_or_default());
+            let yank_before = buffer.core.last_yank();
             let ops = match input {
                 BatchInput::Keys(keys) => buffer.core.apply_keys(keys),
                 BatchInput::Pending(keys) => buffer.core.apply_pending(keys),
             };
+            let yank_after = buffer.core.last_yank();
+            if yank_after != yank_before {
+                *yank = yank_after;
+            }
             self.registers.insert(actor, buffer.core.take_registers());
             let buffer_after = buffer.core.text();
             mirror_ops(
@@ -878,6 +914,7 @@ impl EditorSessions {
                             quit: QuitReport::default(),
                             go: None,
                             rest: None,
+                            yank: None,
                         }));
                     }
                     // ZZ: checkpoint current as saved, then quit — the rollback
@@ -894,6 +931,7 @@ impl EditorSessions {
                         quit,
                         go: None,
                         rest: None,
+                        yank: None,
                     }));
                 }
                 CloseRequest::Discard => {
@@ -912,6 +950,7 @@ impl EditorSessions {
                         quit,
                         go: None,
                         rest: None,
+                        yank: None,
                     }));
                 }
             }
@@ -950,6 +989,7 @@ impl EditorSessions {
             quit: QuitReport::default(),
             go: None,
             rest: None,
+            yank: None,
         })
     }
 
@@ -1071,6 +1111,7 @@ impl EditorSessions {
                         quit,
                         go: None,
                         rest: None,
+                        yank: None,
                     }));
                 }
             }
@@ -2503,5 +2544,54 @@ mod session_tests {
         sessions.keys(second, "yy", &second_blocks, model).unwrap();
         let outcome = sessions.keys(first, "p", &first_blocks, amy).unwrap();
         assert_eq!(outcome.state().text, "two\none", "the model's yank left Amy's register alone");
+    }
+
+    /// A batch that yanks reports the text; a delete is not a yank.
+    #[tokio::test]
+    async fn a_batch_reports_what_it_yanked() {
+        use kaijutsu_editor::Yank;
+        let (blocks, target) = seeded(b"one two\nthree").await;
+        let amy = PrincipalId::new();
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+
+        let yy = sessions.keys(id, "yy", &blocks, amy).unwrap();
+        assert_eq!(yy.yank(), Some(&Yank::lines("one two")));
+        let yw = sessions.keys(id, "yw", &blocks, amy).unwrap();
+        assert_eq!(yw.yank(), Some(&Yank { text: "one ".into(), linewise: false }));
+        let visual = sessions.keys(id, "jvly", &blocks, amy).unwrap();
+        assert_eq!(visual.yank(), Some(&Yank { text: "th".into(), linewise: false }));
+        let dd = sessions.keys(id, "dd", &blocks, amy).unwrap();
+        assert_eq!(dd.yank(), None, "a delete is not a yank");
+        let motion = sessions.keys(id, "l", &blocks, amy).unwrap();
+        assert_eq!(motion.yank(), None, "a key that yanks nothing reports nothing");
+    }
+
+    /// The compare reads the player's registers, not a buffer's: a yank that
+    /// ends a batch is reported once, and a later batch in another buffer
+    /// does not report it again.
+    #[tokio::test]
+    async fn a_yank_is_reported_by_the_batch_that_made_it_only() {
+        let (blocks, target) = seeded(b"alpha").await;
+        let (other_blocks, other_target) = seeded(b"beta").await;
+        let amy = PrincipalId::new();
+        let mut sessions = EditorSessions::new();
+        let (first, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let (second, _) = sessions.open(&[RC_PATH], other_target, &other_blocks, None).unwrap();
+        assert!(sessions.keys(first, "yy", &blocks, amy).unwrap().yank().is_some());
+        let later = sessions.keys(second, "l", &other_blocks, amy).unwrap();
+        assert_eq!(later.yank(), None, "another session's later batch yanked nothing");
+    }
+
+    /// A yank followed by the `ZZ` that closes the session is still reported.
+    #[tokio::test]
+    async fn a_yank_before_a_closing_key_is_reported() {
+        let (blocks, target) = seeded(b"alpha").await;
+        let amy = PrincipalId::new();
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let outcome = sessions.keys(id, "yyZQ", &blocks, amy).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Closed(_)));
+        assert!(outcome.yank().is_some());
     }
 }

@@ -1299,7 +1299,7 @@ fn pinned_refusal(path: &str, sessions: &[u64]) -> String {
     format!(
         "{path}: held open by editor {noun} {ids}, perhaps as a hidden file of an \
          argument list (`:args` lists it) — close the session (`:q`, `ZZ`, or \
-         `kj vi quit <session>`), then retry"
+         `kj vi quit <session>`)"
     )
 }
 

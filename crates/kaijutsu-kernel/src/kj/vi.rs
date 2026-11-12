@@ -45,7 +45,8 @@ enum EditorCommand {
     /// that submits a write (`:w`, `:w!`, `:wq`, `:x`, `ZZ`, …) needs the
     /// `editor` capability; plain edits and navigation don't. Each `:` line
     /// in a batch runs in order: `x:w<CR>:n<CR>dd` writes, moves to the next
-    /// file of the argument list, and deletes a line there.
+    /// file of the argument list, and deletes a line there. The structured
+    /// result's `yank` holds the text a `y` in the batch yanked, or null.
     Keys {
         /// Session handle from `kj vi open`.
         session: u64,
@@ -227,7 +228,8 @@ impl KjDispatcher {
                 // its own state machine finds one, not before.
                 let can_write = self.require_cap(caller, write_cap(), "editor keys").is_ok();
                 match kernel.editor_keys_checked(id, &keys, caller.actor_id, can_write).await {
-                    Ok(st) => {
+                    Ok(reply) => {
+                        let st = reply.state;
                         // A dialect-level failure (bad `:cmd`, dirty-`:q` refusal,
                         // failed `:r`) rides the status line, not the error path —
                         // surface it in the human line so a driver can't miss it.
@@ -239,7 +241,14 @@ impl KjDispatcher {
                         if let Some(msg) = &st.message {
                             line.push_str(&format!(" — {msg}"));
                         }
-                        KjResult::ok_with_data(line, st.to_json(id))
+                        // The yank rides the structured result for a driver;
+                        // nothing here writes a clipboard.
+                        let mut data = st.to_json(id);
+                        data["yank"] = match &reply.yank {
+                            Some(y) => serde_json::json!({ "text": y.text, "linewise": y.linewise }),
+                            None => serde_json::Value::Null,
+                        };
+                        KjResult::ok_with_data(line, data)
                     }
                     Err(e) => KjResult::Err(format!("kj vi keys: {e}")),
                 }
@@ -426,6 +435,31 @@ mod tests {
             .await
             .ok()?;
         String::from_utf8(bytes).ok()
+    }
+
+    /// `kj vi keys` carries a batch's yank in its structured result, `null`
+    /// when the batch yanked nothing.
+    #[tokio::test]
+    async fn kj_vi_keys_reports_the_yank_in_the_structured_result() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c).await;
+        let id = session_of(&d.dispatch(&[s("vi"), s("open"), s(P)], &c).await);
+
+        let yanked = d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("yy")], &c).await;
+        match yanked {
+            KjResult::Ok { data: Some(dd), .. } => {
+                assert_eq!(dd["yank"]["text"], "hello\n");
+                assert_eq!(dd["yank"]["linewise"], true);
+            }
+            other => panic!("expected keys data, got {other:?}"),
+        }
+        let moved = d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("l")], &c).await;
+        match moved {
+            KjResult::Ok { data: Some(dd), .. } => assert!(dd["yank"].is_null()),
+            other => panic!("expected keys data, got {other:?}"),
+        }
     }
 
     /// The headline e2e for the kj surface: `open` → `keys` mutates the *actual*

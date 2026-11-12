@@ -196,7 +196,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 | Verb | Does |
 |---|---|
 | `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_list(paths)` opens one session over an argument list, or joins the opener's session that holds one of the paths. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
-| `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. A dirty file-backed edit marks the swap row; a `:w`/`:wq`/`:x`/`ZZ` inside the batch flushes to disk too (`docs/file-buffers.md`). **Async** since `:r` (and now the flush) — sync-lock, release, await, sync-lock again; `EditorCore` never crosses the await, only the fetched `String`/flush result does. |
+| `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state and the yank (below). A dirty file-backed edit marks the swap row; a `:w`/`:wq`/`:x`/`ZZ` inside the batch flushes to disk too (`docs/file-buffers.md`). **Async** since `:r` (and now the flush) — sync-lock, release, await, sync-lock again; `EditorCore` never crosses the await, only the fetched `String`/flush result does. |
 | `editor_insert(session, text)` | A paste, not keystrokes: `EditorCore::insert_at_cursor` splices `text` at the live cursor and mirrors the edit onto the block, the same as a key batch's plain edit — no write intent, so nothing to flush. It never touches the vim state machine, so the mode is exactly what it was before the call: insert stays insert, normal stays normal. Refuses with the state unchanged while the `:` command line is open, reporting on `EditorState.message` — the same dialect-level channel a bad `:s` regex uses. Synchronous. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty/selection (what a renderer draws). |
 | `editor_save(session)` | `ZZ` / `:w` — flush the document to its owner; advance the checkpoint. |
@@ -206,7 +206,13 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`,
 `selection @7`, `path @8`, `argIndex @9`, `argCount @10`) +
 `editorOpen/Keys/State/Save/Quit @74–78` + `subscribeEditor @79` +
-`editorInsert @105` with `EditorEvents` callbacks. **The render channel is
+`editorInsert @105` with `EditorEvents` callbacks. `editorKeys` answers
+`(state, yank)`: `EditorYank` (`text`, `linewise`) is set when the batch
+yanked and unset otherwise (`has_yank`), so a client that predates the field
+reads no yank. It is on the reply only, never on `EditorState` or a
+`subscribeEditor` push: the client that sent the keys writes its system
+clipboard, and a client that only watches a session (a person watching a
+model's) never does. `editorInsert` is a text insert and cannot yank. **The render channel is
 push, not poll** (decided
 2026-06-23): a remote write landing in an open block must reach every renderer
 the instant it lands — collaborative editing is the point, and poll would lag
@@ -465,9 +471,20 @@ editor, then go to another and 'p' when I type in the wrong spot."*
   text. Nothing reads the clipboard into a register: `"+` and `"*` read
   empty because modalkit's `clipboard` feature is off, and paste from the
   clipboard stays the terminal's bracketed paste and the app's `Ctrl+V`.
+- **A yank in a kernel vi session** reaches the system clipboard of the
+  client that typed it. The kernel compares the player's `"0` before and
+  after each key batch, as the compose editors do across a key, and the
+  `editorKeys` reply carries the result (`EditorYank`). The compare is on
+  the player's registers, so it holds across a move to another file of the
+  argument list. A batch the kernel splits at a `:` line reports the latest
+  yank of any part. The tui writes it over OSC 52 and the app through its
+  clipboard writer; neither puts it in the compose registers. `kj vi keys`
+  returns it as `yank` (`{text, linewise}`, or null) in its structured
+  result and writes no clipboard. A delete is not a yank. Yanking text that
+  `"0` already holds reports nothing, so the second of two identical yanks
+  does not take the clipboard back.
 - **Not shared yet:** compose with the kernel's vi sessions, and the tui
-  with the app. A yank in a kernel vi session does not reach the system
-  clipboard. See `docs/issues.md`, "vi registers: what
+  with the app. See `docs/issues.md`, "vi registers: what
   sharing leaves open".
 
 ---

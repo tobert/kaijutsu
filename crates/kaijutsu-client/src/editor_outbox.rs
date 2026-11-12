@@ -20,18 +20,18 @@ use tokio::sync::mpsc;
 
 use crate::actor::ActorHandle;
 use crate::outbox_error::OutboxError;
-use crate::rpc::EditorState;
+use crate::rpc::{EditorKeysReply, EditorState, EditorYank};
 
 /// Where the writer sends editor input: the kernel, or a test's stand-in.
 pub trait EditorSink: 'static {
     /// Feed `keys`, in the kernel's vim notation, to `session`.
-    fn keys(&self, session: u64, keys: &str) -> impl Future<Output = Result<EditorState, String>>;
+    fn keys(&self, session: u64, keys: &str) -> impl Future<Output = Result<EditorKeysReply, String>>;
     /// Insert `text` at `session`'s cursor, as a paste.
     fn insert(&self, session: u64, text: &str) -> impl Future<Output = Result<EditorState, String>>;
 }
 
 impl EditorSink for ActorHandle {
-    fn keys(&self, session: u64, keys: &str) -> impl Future<Output = Result<EditorState, String>> {
+    fn keys(&self, session: u64, keys: &str) -> impl Future<Output = Result<EditorKeysReply, String>> {
         let actor = self.clone();
         let keys = keys.to_string();
         async move { actor.editor_keys(session, &keys).await.map_err(|e| e.to_string()) }
@@ -55,6 +55,10 @@ pub struct Landed {
     pub sent: String,
     /// The session's state after the call, or why it failed.
     pub result: Result<EditorState, String>,
+    /// What a key batch yanked, for the receiver to write to its system
+    /// clipboard. Only the reply to the keys carries it: a paste never yanks,
+    /// and a state pushed to a watcher never does.
+    pub yank: Option<EditorYank>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +90,7 @@ struct Writer {
 impl Writer {
     fn lost(&self, session: u64, sent: String) {
         let result = Err(WRITER_STOPPED.to_string());
-        let _ = self.landed_tx.send(Landed { session, sent, result });
+        let _ = self.landed_tx.send(Landed { session, sent, result, yank: None });
     }
 }
 
@@ -137,13 +141,16 @@ pub fn channel<S: EditorSink>(sink: S) -> (EditorOutbox, impl Future<Output = ()
                         }
                     }
                     writer.in_flight = Some((session, keys.clone()));
-                    let result = sink.keys(session, &keys).await;
-                    Landed { session, sent: keys, result }
+                    let (result, yank) = match sink.keys(session, &keys).await {
+                        Ok(reply) => (Ok(reply.state), reply.yank),
+                        Err(e) => (Err(e), None),
+                    };
+                    Landed { session, sent: keys, result, yank }
                 }
                 Outgoing::Insert { session, text } => {
                     writer.in_flight = Some((session, "paste".to_string()));
                     let result = sink.insert(session, &text).await;
-                    Landed { session, sent: "paste".to_string(), result }
+                    Landed { session, sent: "paste".to_string(), result, yank: None }
                 }
             };
             writer.in_flight = None;
@@ -225,8 +232,11 @@ mod tests {
     }
 
     impl EditorSink for GatedSink {
-        fn keys(&self, session: u64, keys: &str) -> impl Future<Output = Result<EditorState, String>> {
-            self.answer(Outgoing::Keys { session, keys: keys.to_string() })
+        fn keys(&self, session: u64, keys: &str) -> impl Future<Output = Result<EditorKeysReply, String>> {
+            let answer = self.answer(Outgoing::Keys { session, keys: keys.to_string() });
+            // A batch containing `y` yanks what the stand-in kernel names.
+            let yank = keys.contains('y').then(|| EditorYank { text: format!("yank of {keys}"), linewise: false });
+            async move { Ok(EditorKeysReply { state: answer.await?, yank }) }
         }
 
         fn insert(&self, session: u64, text: &str) -> impl Future<Output = Result<EditorState, String>> {
@@ -317,6 +327,25 @@ mod tests {
                 next(&mut landed).await;
             }
             assert_eq!(*sink.calls.borrow(), [keys(1, "a"), keys(1, "b"), keys(2, "cd")]);
+        });
+    }
+
+    /// The yank a key reply carries lands beside the state; a reply without
+    /// one, and a paste, land without.
+    #[test]
+    fn a_yank_in_the_reply_lands_with_the_state() {
+        local(async {
+            let sink = GatedSink::closed();
+            sink.gate.add_permits(3);
+            let (outbox, mut landed) = spawn_local(sink.clone());
+            outbox.keys(4, "yy").unwrap();
+            let yanked = next(&mut landed).await;
+            assert_eq!(yanked.yank, Some(EditorYank { text: "yank of yy".into(), linewise: false }));
+            assert!(yanked.result.is_ok());
+            outbox.keys(4, "j").unwrap();
+            assert_eq!(next(&mut landed).await.yank, None, "keys that yanked nothing");
+            outbox.insert(4, "PASTE").unwrap();
+            assert_eq!(next(&mut landed).await.yank, None, "a paste never yanks");
         });
     }
 

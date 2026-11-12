@@ -84,7 +84,7 @@ use crate::constants::{
 const CONTEXT_FEED_QUEUE: usize = 256;
 
 use crate::rpc::{
-    Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
+    Completion, ContextCluster, ContextInfo, EditorKeysReply, EditorState, HistoryEntry, Identity, InputState,
     KernelInfo, McpResource, PeerInfo, ShellValue, SimilarContext,
     StagedDriftInfo, SubmitResult, ToolSchema, VersionSnapshot,
 };
@@ -628,7 +628,7 @@ enum RpcCommand {
     EditorKeys {
         session_id: u64,
         keys: String,
-        reply: oneshot::Sender<Result<EditorState, CallError>>,
+        reply: oneshot::Sender<Result<EditorKeysReply, CallError>>,
     },
     EditorInsert {
         session_id: u64,
@@ -1730,15 +1730,16 @@ impl ActorHandle {
     // ── Editor (vi) ──────────────────────────────────────────────────────
 
     /// Feed a vi key sequence (kernel notation: `"i"`, `"<Esc>"`, `"dw"`) to an
-    /// open editor session and return the resulting [`EditorState`]. The push
-    /// subscription also echoes this state, so the renderer normally updates
-    /// from there; callers fire-and-forget.
+    /// open editor session and return the resulting [`EditorState`] with the
+    /// text the keys yanked, if any. The push subscription also echoes the
+    /// state, so the renderer normally updates from there; the yank comes
+    /// only on this reply.
     #[tracing::instrument(skip(self, keys))]
     pub async fn editor_keys(
         &self,
         session_id: u64,
         keys: &str,
-    ) -> Result<EditorState, CallError> {
+    ) -> Result<EditorKeysReply, CallError> {
         self.send(|reply| RpcCommand::EditorKeys {
             session_id,
             keys: keys.into(),
@@ -3780,7 +3781,7 @@ async fn dispatch_kernel_command(
 
         // ── Editor (vi) ──
         RpcCommand::EditorKeys { session_id, keys, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.editor_keys(session_id, &keys));
+            dispatch!(kernel, reply, close_tx, k, k.editor_keys_reply(session_id, &keys));
         }
         RpcCommand::EditorInsert { session_id, text, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.editor_insert(session_id, &text));
