@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::editor::{EditorOpener, EditorSessionId, EditorState};
-use crate::kernel_db::{RecoveryFile, RecoveryId, RecoverySession};
+use crate::kernel_db::{CorruptRecovery, KernelDb, RecoveryEntry, RecoveryFile, RecoveryId};
 
 /// One file of a [`RecoverableList`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -22,7 +22,8 @@ pub struct RecoverableFile {
 }
 
 /// One recoverable list, as `vi -r` and `kj vi recover` show it. Full ids,
-/// like `kj vi list`.
+/// like `kj vi list`. A corrupt record is a list with `error` set and no
+/// files: `--discard` picks it, a reopen refuses it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecoverableList {
     /// 1-based position in the listing: the number a pick takes.
@@ -50,6 +51,30 @@ pub struct RecoverableList {
     pub updated_at: i64,
     /// Seconds since `updated_at`, when listed.
     pub age_secs: i64,
+    /// Why the record cannot be reopened; `None` for a good record.
+    pub error: Option<String>,
+}
+
+/// The listing line of a corrupt record: what its head row says, no files.
+fn corrupt_list(db: &KernelDb, pick: usize, c: &CorruptRecovery, now: i64) -> RecoverableList {
+    RecoverableList {
+        pick,
+        recovery_id: c.recovery_id.to_hex(),
+        short_id: c.recovery_id.short(),
+        path: String::new(),
+        arg_index: 0,
+        arg_count: 0,
+        files: Vec::new(),
+        dirty_files: Vec::new(),
+        dirty: false,
+        opener: c.opener_principal.to_hex(),
+        opener_name: db.name_for(c.opener_principal),
+        context_id: c.opener_context_id.to_hex(),
+        opened_at: c.opened_at,
+        updated_at: c.updated_at,
+        age_secs: (now - c.updated_at) / 1000,
+        error: Some(c.reason.clone()),
+    }
 }
 
 /// `a` then `b`, as one status line.
@@ -80,6 +105,16 @@ pub fn render_recoverable_lists(lists: &[RecoverableList]) -> String {
     lists
         .iter()
         .map(|l| {
+            if let Some(error) = &l.error {
+                return format!(
+                    "{}  {}  {}  {}  corrupt: {error} (vi -r --discard {})",
+                    l.pick,
+                    l.short_id,
+                    age_label(l.age_secs),
+                    l.opener_name,
+                    l.short_id
+                );
+            }
             let files = l
                 .files
                 .iter()
@@ -141,14 +176,14 @@ impl Kernel {
 
     /// The records a restart left: every record except those of sessions open
     /// now, newest write first.
-    fn recoverable_records(&self) -> Result<Vec<RecoverySession>, String> {
+    fn recoverable_records(&self) -> Result<Vec<RecoveryEntry>, String> {
         let live = self.editor_sessions.lock().0.live_recovery_ids();
         let mut records = self
             .db
             .lock()
-            .list_editor_recoveries()
+            .list_editor_recovery_entries()
             .map_err(|e| format!("cannot read the editor recovery records: {e}"))?;
-        records.retain(|r| !live.contains(&r.recovery_id));
+        records.retain(|r| !live.contains(&r.recovery_id()));
         Ok(records)
     }
 
@@ -160,7 +195,7 @@ impl Kernel {
 
     /// The listing of `records`: `pick` is each record's 1-based position in
     /// the slice.
-    fn recoverable_lists(&self, records: &[RecoverySession]) -> Result<Vec<RecoverableList>, String> {
+    fn recoverable_lists(&self, records: &[RecoveryEntry]) -> Result<Vec<RecoverableList>, String> {
         let db = self.db.lock();
         let dirty: std::collections::HashSet<String> = db
             .list_dirty_file_buffers()
@@ -175,7 +210,11 @@ impl Kernel {
         Ok(records
             .iter()
             .enumerate()
-            .map(|(i, r)| {
+            .map(|(i, entry)| {
+                let r = match entry {
+                    RecoveryEntry::Valid(r) => r,
+                    RecoveryEntry::Corrupt(c) => return corrupt_list(&db, i + 1, c, now),
+                };
                 let files: Vec<RecoverableFile> = r
                     .files
                     .iter()
@@ -204,6 +243,7 @@ impl Kernel {
                     opened_at: r.opened_at,
                     updated_at: r.updated_at,
                     age_secs: (now - r.updated_at) / 1000,
+                    error: None,
                 }
             })
             .collect())
@@ -213,7 +253,7 @@ impl Kernel {
     /// in the listing and is refused when it is outside it; it never matches
     /// an id. Any other pick is a prefix of a record's short id, or a full
     /// id. An unknown or ambiguous pick is refused by name.
-    fn pick_recovery(records: &[RecoverySession], pick: &str) -> Result<usize, String> {
+    fn pick_recovery(records: &[RecoveryEntry], pick: &str) -> Result<usize, String> {
         if records.is_empty() {
             return Err("no recoverable vi lists".to_string());
         }
@@ -230,7 +270,7 @@ impl Kernel {
         let matches: Vec<usize> = records
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.recovery_id.matches_short(pick))
+            .filter(|(_, r)| r.recovery_id().matches_short(pick))
             .map(|(i, _)| i)
             .collect();
         match matches.as_slice() {
@@ -243,7 +283,7 @@ impl Kernel {
                 "\"{pick}\" matches {} recoverable lists ({}): name more of the id",
                 many.len(),
                 many.iter()
-                    .map(|i| records[*i].recovery_id.short())
+                    .map(|i| records[*i].recovery_id().short())
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
@@ -270,7 +310,17 @@ impl Kernel {
         opener: EditorOpener,
     ) -> Result<(EditorSessionId, EditorState), String> {
         let records = self.recoverable_records()?;
-        let record = &records[Self::pick_recovery(&records, pick)?];
+        let record = match &records[Self::pick_recovery(&records, pick)?] {
+            RecoveryEntry::Valid(record) => record,
+            RecoveryEntry::Corrupt(c) => {
+                return Err(format!(
+                    "recoverable list {} is corrupt ({}) and cannot be reopened; remove it with vi -r --discard {}",
+                    c.recovery_id.short(),
+                    c.reason,
+                    c.recovery_id.short()
+                ));
+            }
+        };
         let blocks = self.blocks();
         let file_cache = self.file_cache().clone();
 
@@ -357,7 +407,7 @@ impl Kernel {
     pub fn editor_recovery_discard(&self, pick: &str) -> Result<RecoverableList, String> {
         let records = self.recoverable_records()?;
         let at = Self::pick_recovery(&records, pick)?;
-        let id = records[at].recovery_id;
+        let id = records[at].recovery_id();
         let mut listed = self
             .recoverable_lists(std::slice::from_ref(&records[at]))?
             .pop()
@@ -382,7 +432,12 @@ impl Kernel {
             Ok(records) => {
                 let held: Vec<String> = paths
                     .iter()
-                    .filter(|p| records.iter().any(|r| r.files.iter().any(|f| &f.path == *p)))
+                    .filter(|p| {
+                        records.iter().any(|r| match r {
+                            RecoveryEntry::Valid(r) => r.files.iter().any(|f| &f.path == *p),
+                            RecoveryEntry::Corrupt(_) => false,
+                        })
+                    })
                     .map(|p| format!("{p} is in a recoverable list (vi -r)"))
                     .collect();
                 (!held.is_empty()).then(|| held.join("; "))
@@ -398,6 +453,7 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel_db::RecoverySession;
     use crate::vfs::backends::MemoryBackend;
     use kaijutsu_types::{ContextId, SessionId};
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -697,6 +753,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recorded_cursor_past_the_text_is_clamped_to_the_buffer() {
+        let old = kernel_with_files().await;
+        old.editor_open_list(&[A.to_string()], Some(opener_for(me()))).await.unwrap();
+        let (new, _dir) = restart(&old, &ALL).await;
+        new.kernel_db()
+            .lock()
+            .conn_for_test_mut()
+            .execute("UPDATE editor_recovery_files SET cursor_line = 9, cursor_col = 99", [])
+            .unwrap();
+        let (_, st) = new.editor_recover("1", opener_for(me())).await.unwrap();
+        assert_eq!(st.cursor, "alpha\none".chars().count() - 1, "the last character of the last line");
+    }
+
+    #[tokio::test]
     async fn a_recovered_buffer_is_dirty_writable_without_ack_and_zq_restores_disk() {
         let old = kernel_with_files().await;
         let (id, _) = old.editor_open_list(&[A.to_string(), B.to_string()], Some(opener_for(me()))).await.unwrap();
@@ -803,6 +873,28 @@ mod tests {
         assert!(new2.kernel_db().lock().get_dirty_file_buffer(A).unwrap().is_some());
     }
 
+    /// The close the wire `editorQuit` and `kj vi quit` share settles the
+    /// rolled-back file: text equal to disk leaves no `dirty_file_buffers` row.
+    #[tokio::test]
+    async fn editor_close_settles_a_recovered_buffer_and_reports_a_record_failure() {
+        let old = kernel_with_files().await;
+        let (id, _) = old.editor_open_list(&[A.to_string()], Some(opener_for(me()))).await.unwrap();
+        old.editor_keys(id, "iX<Esc>", me()).await.unwrap();
+        let (new, _dir) = restart(&old, &ALL).await;
+        let (nid, _) = new.editor_recover("1", opener_for(me())).await.unwrap();
+        assert!(new.kernel_db().lock().get_dirty_file_buffer(A).unwrap().is_some());
+
+        deny("editor_recovery_sessions", &new, true);
+        let report = new.editor_close(nid, me()).await.unwrap();
+        assert!(report.recovery_error.is_some(), "a record that failed to delete is in the report");
+        allow_all(&new);
+        assert!(
+            new.kernel_db().lock().get_dirty_file_buffer(A).unwrap().is_none(),
+            "text equals disk after the rollback, so the close left no row"
+        );
+        assert!(new.kernel_db().lock().list_dirty_file_buffers().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_hidden_swap_stays_unacknowledged_until_the_file_is_visited() {
         let (_old, new, _dir) = a_list_cut_off_with_a_dirty_hidden_b().await;
@@ -882,6 +974,75 @@ mod tests {
         assert!(new.editor_recovery_discard("1").unwrap_err().contains("no recoverable"));
     }
 
+    /// A record with no file rows, beside one good list that a restart cut off.
+    async fn a_good_list_beside_a_corrupt_record() -> (Kernel, RecoveryId, tempfile::TempDir) {
+        let old = kernel_with_files().await;
+        old.editor_open_list(&abc(), Some(opener_for(me()))).await.unwrap();
+        let (new, dir) = restart(&old, &ALL).await;
+        let bad = RecoveryId::new();
+        new.kernel_db()
+            .lock()
+            .conn_for_test_mut()
+            .execute(
+                "INSERT INTO editor_recovery_sessions
+                    (recovery_id, opener_principal, opener_context_id, current_index, opened_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, 1, 1)",
+                rusqlite::params![
+                    bad.as_bytes().as_slice(),
+                    me().as_bytes().as_slice(),
+                    ContextId::new().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        (new, bad, dir)
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_record_is_listed_by_its_reason_beside_the_good_ones() {
+        let (new, bad, _dir) = a_good_list_beside_a_corrupt_record().await;
+        let lists = new.editor_recoveries().unwrap();
+        assert_eq!(lists.len(), 2, "{lists:?}");
+        assert_eq!((lists[0].pick, lists[0].error.as_deref()), (1, None));
+        assert_eq!(lists[0].files.len(), 3);
+        assert_eq!((lists[1].pick, lists[1].short_id.as_str()), (2, bad.short().as_str()));
+        assert_eq!(lists[1].error.as_deref(), Some("no files"));
+        let line = render_recoverable_lists(&lists);
+        assert!(line.contains(&format!("2  {}", bad.short())) && line.contains("corrupt: no files"), "{line}");
+        let data = serde_json::to_value(&lists).unwrap();
+        assert_eq!(data[1]["error"], "no files");
+        assert!(data[0]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_record_refuses_reopen_naming_the_reason_and_is_discardable() {
+        let (new, bad, _dir) = a_good_list_beside_a_corrupt_record().await;
+        let err = new.editor_recover(&bad.short(), opener_for(me())).await.unwrap_err();
+        assert!(err.contains("corrupt") && err.contains("no files") && err.contains("--discard"), "{err}");
+        let err = new.editor_recover("2", opener_for(me())).await.unwrap_err();
+        assert!(err.contains("no files"), "{err}");
+
+        // The good list still reopens.
+        new.editor_recover("1", opener_for(me())).await.unwrap();
+
+        // The reopened list is live, so the corrupt record is the only one
+        // listed, and number 1.
+        let discarded = new.editor_recovery_discard("1").unwrap();
+        assert_eq!(discarded.error.as_deref(), Some("no files"));
+        assert_eq!(new.kernel_db().lock().list_editor_recoveries().unwrap().len(), 1, "the good record stays");
+
+        // By id, too.
+        let (new, bad, _dir) = a_good_list_beside_a_corrupt_record().await;
+        new.editor_recovery_discard(&bad.to_hex()).unwrap();
+        assert_eq!(new.editor_recoveries().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_plain_open_still_gets_its_notice_beside_a_corrupt_record() {
+        let (new, _bad, _dir) = a_good_list_beside_a_corrupt_record().await;
+        let (_, st) = new.editor_open_list(&[B.to_string()], Some(opener_for(me()))).await.unwrap();
+        assert_eq!(st.message.as_deref(), Some(&*format!("{B} is in a recoverable list (vi -r)")));
+    }
+
     #[tokio::test]
     async fn a_record_already_open_in_a_live_session_refuses_a_second_open() {
         let (_old, new, _dir) = a_list_cut_off_with_a_dirty_hidden_b().await;
@@ -940,7 +1101,7 @@ mod tests {
             for (i, b) in hex_tail(tail).iter().enumerate() {
                 bytes[12 + i] = *b;
             }
-            RecoverySession {
+            RecoveryEntry::Valid(RecoverySession {
                 recovery_id: RecoveryId::try_from_slice(&bytes).unwrap(),
                 opener_principal: me(),
                 opener_context_id: ContextId::new(),
@@ -948,7 +1109,7 @@ mod tests {
                 opened_at: 0,
                 updated_at: 0,
                 files: vec![],
-            }
+            })
         };
         fn hex_tail(s: &str) -> Vec<u8> {
             (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap()).collect()
@@ -957,7 +1118,7 @@ mod tests {
 
         assert_eq!(Kernel::pick_recovery(&records, "2"), Ok(1), "digits that fit the listing are a number");
         assert_eq!(Kernel::pick_recovery(&records, "a122"), Ok(2), "an id prefix");
-        assert_eq!(Kernel::pick_recovery(&records, &records[0].recovery_id.to_hex()), Ok(0), "a full id");
+        assert_eq!(Kernel::pick_recovery(&records, &records[0].recovery_id().to_hex()), Ok(0), "a full id");
         let ambiguous = Kernel::pick_recovery(&records, "aabbccd").unwrap_err();
         assert!(ambiguous.contains("matches 2") && ambiguous.contains("aabbccd1") && ambiguous.contains("aabbccd2"), "{ambiguous}");
         let unknown = Kernel::pick_recovery(&records, "ffff").unwrap_err();
@@ -969,7 +1130,7 @@ mod tests {
         let digits = Kernel::pick_recovery(&records, "99").unwrap_err();
         assert!(digits.contains("numbered 99") && digits.contains("1 to 4"), "{digits}");
         assert!(Kernel::pick_recovery(&records, "99887766").unwrap_err().contains("numbered"));
-        assert_eq!(Kernel::pick_recovery(&records, &records[3].recovery_id.to_hex()), Ok(3), "a full id of any shape");
+        assert_eq!(Kernel::pick_recovery(&records, &records[3].recovery_id().to_hex()), Ok(3), "a full id of any shape");
         assert_eq!(Kernel::pick_recovery(&[], "1"), Err("no recoverable vi lists".to_string()));
     }
 

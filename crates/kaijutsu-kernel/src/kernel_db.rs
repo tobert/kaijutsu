@@ -102,7 +102,7 @@ pub use approvals::ContinuationOrigin;
 pub(crate) use approvals::{HeldAskEnd, record_approval_tool_call, record_approval_drift_block};
 pub use review::{ReviewFrom, GovernedAct, Authority, ReviewQuery, EffectiveReviewer};
 pub use contexts::ContextRow;
-pub use editor_recovery::{RecoveryFile, RecoveryId, RecoverySession};
+pub use editor_recovery::{CorruptRecovery, RecoveryEntry, RecoveryFile, RecoveryId, RecoverySession};
 pub use context_ring::{ACTIVE_RING_CAPACITY, Archived, DemoteOutcome, Demotion, PromoteOutcome, Retirement, RotationCommit};
 use schema::SCHEMA;
 

@@ -716,3 +716,32 @@ fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
         );
     });
 }
+
+/// The wire close settles like `kj vi quit`: the rollback marks the file
+/// dirty, and since its text equals disk again the close leaves no swap row
+/// and no recovery record.
+#[test]
+fn wire_quit_settles_the_rolled_back_file_and_deletes_the_record() {
+    run_local(async {
+        let (addr, owner) = common::start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (handle, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&handle, "editor-quit-settle").await.unwrap();
+        let opener = kaijutsu_types::PrincipalId::new();
+        let (session, _) = owner.kernel.editor_open_as(RC_PATH, Some(kaijutsu_kernel::editor::EditorOpener {
+            principal: opener, performer: opener, reviewer: None, context_id: context,
+            session_id: kaijutsu_types::SessionId::new(),
+        })).await.unwrap();
+        handle.editor_keys(session.as_u64(), "iKEY<Esc>").await.unwrap();
+        assert_eq!(owner.kernel_db.lock().list_editor_recoveries().unwrap().len(), 1);
+
+        handle.editor_quit(session.as_u64()).await.unwrap();
+
+        assert!(owner.kernel_db.lock().list_editor_recoveries().unwrap().is_empty(), "the close deleted the record");
+        assert!(
+            owner.kernel_db.lock().get_dirty_file_buffer(RC_PATH).unwrap().is_none(),
+            "the rollback equals disk, so the wire close left no swap row"
+        );
+        owner.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}

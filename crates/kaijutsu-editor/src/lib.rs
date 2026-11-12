@@ -442,6 +442,24 @@ impl EditorCore {
         usize::from(self.buffer.get().cursor_to_offset(&cur))
     }
 
+    /// Place the leader cursor at 0-based `line` and `col`, clamped to the
+    /// buffer: a line past the end goes to the last line, and a column past
+    /// the end goes to the last column the current mode can rest on (one past
+    /// the last character in insert and replace mode, the last character
+    /// otherwise, 0 on an empty line). Edits nothing: no text change, undo
+    /// entry or register write. In visual mode the anchor stays.
+    pub fn set_cursor(&mut self, line: usize, col: usize) {
+        let text = self.text();
+        let last = text.split('\n').count().saturating_sub(1);
+        let line = line.min(last);
+        let width = text.split('\n').nth(line).map_or(0, |l| l.chars().count());
+        let past_end = self
+            .mode()
+            .is_some_and(|m| m.contains("INSERT") || m.contains("REPLACE"));
+        let max_col = if past_end { width } else { width.saturating_sub(1) };
+        self.buffer.set_leader(self.group, Cursor::new(line, col.min(max_col)));
+    }
+
     /// The leader's visual-mode selection as the char spans a renderer
     /// highlights; `None` outside visual mode. Read from modalkit's anchor and
     /// cursor, so it follows every motion modalkit knows. See
@@ -2056,6 +2074,68 @@ mod tests {
             ed.apply_keys("fw");
             assert_eq!(ed.text(), "hello world");
             assert_eq!(ed.cursor(), 6, "f w lands on the 'w' of world");
+        }
+    }
+
+    mod set_cursor {
+        use super::*;
+
+        #[test]
+        fn places_the_cursor_by_line_and_column() {
+            let mut ed = EditorCore::new("alpha\nbeta\ngamma");
+            ed.set_cursor(1, 2);
+            assert_eq!(ed.cursor(), "alpha\n".len() + 2);
+            ed.set_cursor(0, 0);
+            assert_eq!(ed.cursor(), 0);
+        }
+
+        #[test]
+        fn clamps_a_line_past_the_end_to_the_last_line() {
+            let mut ed = EditorCore::new("alpha\nbe");
+            ed.set_cursor(99, 1);
+            assert_eq!(ed.cursor(), "alpha\n".len() + 1);
+        }
+
+        #[test]
+        fn a_column_past_the_end_stops_on_the_last_character_in_normal_mode() {
+            let mut ed = EditorCore::new("alpha\nbe");
+            ed.set_cursor(0, 99);
+            assert_eq!(ed.cursor(), 4);
+            ed.set_cursor(0, 5);
+            assert_eq!(ed.cursor(), 4, "one past the end is still past the end");
+            let mut empty = EditorCore::new("a\n\nb");
+            empty.set_cursor(1, 7);
+            assert_eq!(empty.cursor(), 2, "an empty line holds column 0");
+        }
+
+        #[test]
+        fn a_column_past_the_end_rests_after_the_last_character_in_insert_mode() {
+            let mut ed = EditorCore::new("alpha");
+            ed.apply_keys("i");
+            ed.set_cursor(0, 99);
+            assert_eq!(ed.cursor(), 5);
+            ed.apply_keys("X<Esc>");
+            assert_eq!(ed.text(), "alphaX");
+        }
+
+        #[test]
+        fn edits_nothing_and_leaves_no_undo_entry_or_register() {
+            let mut ed = EditorCore::new("hello\nworld");
+            ed.apply_keys("yy");
+            let yanked = ed.last_yank();
+            ed.set_cursor(1, 3);
+            assert_eq!(ed.text(), "hello\nworld");
+            assert_eq!(ed.last_yank(), yanked, "registers are untouched");
+            ed.apply_keys("u");
+            assert_eq!(ed.text(), "hello\nworld", "undo has nothing to undo");
+
+            // An edit after the move is the one undo step.
+            ed.set_cursor(0, 1);
+            ed.apply_keys("x");
+            assert_eq!(ed.text(), "hllo\nworld");
+            ed.set_cursor(1, 0);
+            ed.apply_keys("u");
+            assert_eq!(ed.text(), "hello\nworld", "one undo reverses the one edit");
         }
     }
 

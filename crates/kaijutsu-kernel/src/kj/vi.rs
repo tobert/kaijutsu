@@ -184,7 +184,10 @@ impl KjDispatcher {
                         format!(
                             "discarded recovery record {} ({}); no swap was touched",
                             list.short_id,
-                            list.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(" ")
+                            match &list.error {
+                                Some(error) => format!("corrupt: {error}"),
+                                None => list.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(" "),
+                            }
                         ),
                         serde_json::to_value(&list).expect("RecoverableList serializes"),
                     ),
@@ -297,13 +300,7 @@ impl KjDispatcher {
             }
             EditorCommand::Quit { session } => {
                 let id = EditorSessionId::from_u64(session);
-                let quit = match kernel.editor_quit(id, caller.actor_id) {
-                    Ok(report) => match kernel.editor_settle_rolled_back(&report.rolled_back).await {
-                        Ok(()) => Ok(report),
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                };
+                let quit = kernel.editor_close(id, caller.actor_id).await;
                 match quit {
                     Ok(report) => {
                         let rolled = if report.rolled_back.is_empty() {

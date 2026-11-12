@@ -371,9 +371,7 @@ impl Buffer {
             None => core.text(),
         };
         if let Some((line, col)) = cursor {
-            // Plain motions: they change no text, so no edit op comes back.
-            let keys = format!("{}G0{}", line + 1, if col > 0 { format!("{col}l") } else { String::new() });
-            core.apply_keys(&keys);
+            core.set_cursor(line, col);
         }
         Ok(Buffer { core, target, saved_content, terminator, peer_wrote: false })
     }

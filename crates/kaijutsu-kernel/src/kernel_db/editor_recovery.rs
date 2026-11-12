@@ -82,6 +82,36 @@ pub struct RecoverySession {
     pub files: Vec<RecoveryFile>,
 }
 
+/// A record whose rows do not make a valid list: no files, a gap in the
+/// positions, or an index outside the list. It keeps what the head row says
+/// so a listing can show it and `--discard` can remove it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptRecovery {
+    pub recovery_id: RecoveryId,
+    pub opener_principal: PrincipalId,
+    pub opener_context_id: ContextId,
+    pub opened_at: i64,
+    pub updated_at: i64,
+    /// What is wrong, e.g. `no files`.
+    pub reason: String,
+}
+
+/// One row of the recovery listing: a record that opens, or one that does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryEntry {
+    Valid(RecoverySession),
+    Corrupt(CorruptRecovery),
+}
+
+impl RecoveryEntry {
+    pub fn recovery_id(&self) -> RecoveryId {
+        match self {
+            Self::Valid(s) => s.recovery_id,
+            Self::Corrupt(c) => c.recovery_id,
+        }
+    }
+}
+
 impl KernelDb {
     /// Write a record: the first call for `id` inserts it, later calls replace
     /// its index and files and keep `opened_at`. One transaction, so a failed
@@ -154,8 +184,18 @@ impl KernelDb {
         Ok(deleted > 0)
     }
 
-    /// Every record, newest write first.
+    /// Every record, newest write first. A corrupt record is an error; use
+    /// [`list_editor_recovery_entries`](Self::list_editor_recovery_entries)
+    /// to list the good records beside it.
     pub fn list_editor_recoveries(&self) -> KernelDbResult<Vec<RecoverySession>> {
+        self.list_editor_recovery_entries()?
+            .into_iter()
+            .map(|entry| entry_or_error(entry))
+            .collect()
+    }
+
+    /// Every record, newest write first, each either valid or corrupt.
+    pub fn list_editor_recovery_entries(&self) -> KernelDbResult<Vec<RecoveryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT recovery_id, opener_principal, opener_context_id, current_index, opened_at, updated_at
              FROM editor_recovery_sessions
@@ -167,7 +207,7 @@ impl KernelDb {
         heads.into_iter().map(|head| self.with_recovery_files(head)).collect()
     }
 
-    /// One record, or `None`.
+    /// One record, or `None`. A corrupt record is an error.
     pub fn get_editor_recovery(&self, id: RecoveryId) -> KernelDbResult<Option<RecoverySession>> {
         let mut stmt = self.conn.prepare(
             "SELECT recovery_id, opener_principal, opener_context_id, current_index, opened_at, updated_at
@@ -177,10 +217,10 @@ impl KernelDb {
             .query_map(params![id.as_bytes().as_slice()], read_recovery_head)?
             .next()
             .transpose()?;
-        head.map(|head| self.with_recovery_files(head)).transpose()
+        head.map(|head| entry_or_error(self.with_recovery_files(head)?)).transpose()
     }
 
-    fn with_recovery_files(&self, mut session: RecoverySession) -> KernelDbResult<RecoverySession> {
+    fn with_recovery_files(&self, mut session: RecoverySession) -> KernelDbResult<RecoveryEntry> {
         let mut stmt = self.conn.prepare(
             "SELECT position, path, visited, cursor_line, cursor_col
              FROM editor_recovery_files WHERE recovery_id = ?1 ORDER BY position",
@@ -198,30 +238,43 @@ impl KernelDb {
                 ))
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
+        let corrupt = |session: &RecoverySession, reason: String| {
+            Ok(RecoveryEntry::Corrupt(CorruptRecovery {
+                recovery_id: session.recovery_id,
+                opener_principal: session.opener_principal,
+                opener_context_id: session.opener_context_id,
+                opened_at: session.opened_at,
+                updated_at: session.updated_at,
+                reason,
+            }))
+        };
         for (expected, (position, _)) in rows.iter().enumerate() {
             if *position != expected as i64 {
-                return Err(KernelDbError::Validation(format!(
-                    "editor recovery {} has no file at position {expected}",
-                    session.recovery_id.short()
-                )));
+                return corrupt(&session, format!("no file at position {expected}"));
             }
         }
         if rows.is_empty() {
-            return Err(KernelDbError::Validation(format!(
-                "editor recovery {} has no file rows",
-                session.recovery_id.short()
-            )));
+            return corrupt(&session, "no files".to_string());
         }
         if session.current_index >= rows.len() {
-            return Err(KernelDbError::Validation(format!(
-                "editor recovery {} has index {} in a list of {} files",
-                session.recovery_id.short(),
-                session.current_index,
-                rows.len()
-            )));
+            return corrupt(
+                &session,
+                format!("index {} is outside a list of {} files", session.current_index, rows.len()),
+            );
         }
         session.files = rows.into_iter().map(|(_, file)| file).collect();
-        Ok(session)
+        Ok(RecoveryEntry::Valid(session))
+    }
+}
+
+fn entry_or_error(entry: RecoveryEntry) -> KernelDbResult<RecoverySession> {
+    match entry {
+        RecoveryEntry::Valid(s) => Ok(s),
+        RecoveryEntry::Corrupt(c) => Err(KernelDbError::Validation(format!(
+            "editor recovery {} is corrupt: {}",
+            c.recovery_id.short(),
+            c.reason
+        ))),
     }
 }
 

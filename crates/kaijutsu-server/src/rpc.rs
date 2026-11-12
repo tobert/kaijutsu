@@ -3109,14 +3109,27 @@ impl kernel::Server for KernelImpl {
         _results: kernel::EditorQuitResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _guard = extract_rpc_trace(p.get_trace(), "editor_quit").entered();
+        let span = extract_rpc_trace(p.get_trace(), "editor_quit");
         let session_id = p.get_session_id();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
         let actor = self.connection.borrow().principal;
-        match self.kernel.kernel.editor_quit(id, actor) {
-            Ok(_) => Promise::ok(()),
-            Err(e) => Promise::err(capnp::Error::failed(format!("editor_quit failed: {e}"))),
-        }
+        let kernel = self.kernel.clone();
+        Promise::from_future(
+            async move {
+                match kernel.kernel.editor_close(id, actor).await {
+                    // The wire method has no result field: a record that
+                    // failed to delete reaches the caller as the error text.
+                    Ok(report) => match report.recovery_error {
+                        Some(e) => Err(capnp::Error::failed(format!(
+                            "editor_quit: session {session_id} closed; {e}"
+                        ))),
+                        None => Ok(()),
+                    },
+                    Err(e) => Err(capnp::Error::failed(format!("editor_quit failed: {e}"))),
+                }
+            }
+            .instrument(span),
+        )
     }
 
     /// Push channel: forward `EditorFlow` events to the subscriber's callback.

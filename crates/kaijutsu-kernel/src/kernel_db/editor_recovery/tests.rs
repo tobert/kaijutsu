@@ -116,7 +116,7 @@ fn a_session_row_with_no_files_or_a_bad_index_is_an_error_naming_the_record() {
         .unwrap();
     for result in [db.get_editor_recovery(id).map(|_| ()), db.list_editor_recoveries().map(|_| ())] {
         let err = result.unwrap_err().to_string();
-        assert!(err.contains(&id.short()) && err.contains("no file rows"), "{err}");
+        assert!(err.contains(&id.short()) && err.contains("no files"), "{err}");
     }
 
     db.conn
@@ -131,4 +131,32 @@ fn a_session_row_with_no_files_or_a_bad_index_is_an_error_naming_the_record() {
         .unwrap();
     let err = db.get_editor_recovery(id).unwrap_err().to_string();
     assert!(err.contains(&id.short()) && err.contains("index 4"), "{err}");
+}
+
+#[test]
+fn the_entry_listing_keeps_good_records_beside_a_corrupt_one() {
+    let db = KernelDb::temporary().unwrap();
+    let good = RecoveryId::new();
+    db.write_editor_recovery(
+        good,
+        PrincipalId::new(),
+        ContextId::new(),
+        0,
+        &[RecoveryFile { path: "/a".into(), visited: true, cursor_line: 0, cursor_col: 0 }],
+    )
+    .unwrap();
+    let bad = RecoveryId::new();
+    db.conn
+        .execute(
+            "INSERT INTO editor_recovery_sessions
+                (recovery_id, opener_principal, opener_context_id, current_index, opened_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, 1, 1)",
+            params![bad.as_bytes().as_slice(), PrincipalId::new().as_bytes().as_slice(), ContextId::new().as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert!(db.list_editor_recoveries().is_err(), "the strict listing still fails loudly");
+    let entries = db.list_editor_recovery_entries().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(&entries[0], RecoveryEntry::Valid(s) if s.recovery_id == good));
+    assert!(matches!(&entries[1], RecoveryEntry::Corrupt(c) if c.recovery_id == bad && c.reason == "no files"));
 }

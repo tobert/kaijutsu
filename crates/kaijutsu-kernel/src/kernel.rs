@@ -2218,6 +2218,22 @@ impl Kernel {
         }
     }
 
+    /// Close a session and settle what the close rolled back: the one close
+    /// sequence `kj vi quit` and the wire `editorQuit` share.
+    /// [`editor_quit`](Self::editor_quit) closes and marks; then each rolled
+    /// back file whose text equals its disk text ends clean
+    /// ([`editor_settle_rolled_back`](Self::editor_settle_rolled_back)). A
+    /// settle failure is an `Err` after the session closed.
+    pub async fn editor_close(
+        &self,
+        id: crate::editor::EditorSessionId,
+        actor: PrincipalId,
+    ) -> Result<crate::editor::QuitReport, String> {
+        let report = self.editor_quit(id, actor)?;
+        self.editor_settle_rolled_back(&report.rolled_back).await?;
+        Ok(report)
+    }
+
     /// After a close rolled buffers back: a file whose text now equals its
     /// text on disk ends clean with no swap marker, as after a flush. A file
     /// that differs from disk (it moved, or an acknowledged flush wrote later

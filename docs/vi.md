@@ -200,7 +200,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 | `editor_insert(session, text)` | A paste, not keystrokes: `EditorCore::insert_at_cursor` splices `text` at the live cursor and mirrors the edit onto the block, the same as a key batch's plain edit — no write intent, so nothing to flush. It never touches the vim state machine, so the mode is exactly what it was before the call: insert stays insert, normal stays normal. Refuses with the state unchanged while the `:` command line is open, reporting on `EditorState.message` — the same dialect-level channel a bad `:s` regex uses. Synchronous. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty/selection (what a renderer draws). |
 | `editor_save(session)` | `ZZ` / `:w` — flush the document to its owner; advance the checkpoint. |
-| `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. |
+| `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. Closes through `Kernel::editor_close`, as `kj vi quit` does: a rolled-back file whose text equals disk ends clean with no swap row. The method has no result field, so a recovery record that failed to delete, or a settle failure, comes back as the error text `editor_quit: session N closed; ...` after the session is closed. |
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`,
@@ -710,11 +710,21 @@ each file that has a `dirty_file_buffers` row (`a.rs [b.rs]+ c.rs`).
 `recovery_id` (full), `short_id`, `path` (the current file), `arg_index`
 (0-based), `arg_count`, `files` (`path`, `current`, `dirty`), `dirty_files`,
 `dirty`, `opener` (full principal id), `opener_name`, `context_id`,
-`opened_at`, `updated_at`, `age_secs`.
+`opened_at`, `updated_at`, `age_secs`, `error`.
+
+A record whose rows do not make a list (no file rows, a gap in the
+positions, an index outside the list) is listed on its own line without
+hiding the good ones: `pick  id  age  opener  corrupt: <reason>`, for
+example `corrupt: no files`. Its `.data` object has `error` set to the
+reason, no files, and an empty `path`; `error` is `null` for a good record.
+A pick of a corrupt record refuses a reopen and names the reason, and
+`--discard` takes it by number or id like any other. A plain `vi` ignores a
+corrupt record when it looks for a held path.
 
 `vi -r 2` reopens the second for the caller as opener: one session over the
 same list at the same index, each visited file's cursor restored when that
-file loads. A pick of digits only is a number in the listing, and a number
+file loads (`EditorCore::set_cursor`, clamped to the buffer and to the positions the
+mode can rest on: in normal mode a column past the end is the last character). A pick of digits only is a number in the listing, and a number
 outside it is refused ("use a number from 1 to N"); it never matches an id,
 so an id made only of digits is picked by its full id. Any other pick is a
 prefix of a short id, or a full id. An unknown pick, or one that matches
