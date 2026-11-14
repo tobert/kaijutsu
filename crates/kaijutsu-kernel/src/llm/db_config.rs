@@ -380,8 +380,8 @@ mod tests {
         let err = db
             .upsert_backend(&crate::kernel_db::BackendRow {
                 backend_id: BackendId::new(),
-                name: "gemini2".into(),
-                kind: "gemini".into(),
+                name: "nonesuch2".into(),
+                kind: "nonesuch".into(),
                 base_url: None,
                 api_key_env: None,
                 api_key_file: None,
@@ -394,7 +394,7 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("gemini"),
+            err.to_string().contains("nonesuch"),
             "the write path must reject an unknown kind, naming it: {err}"
         );
     }
