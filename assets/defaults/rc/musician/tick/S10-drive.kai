@@ -4,9 +4,15 @@
 # starting this lifecycle. A late script cannot move its target forward.
 # Missed or invalid output uses the last good phrase.
 #
+# KJ_UNCOVERED, from the context env, says what plays at the phrases before a
+# target more than one phrase ahead: `repeat` (the default) places a
+# `kj transport repeat` at each of them, so the transport plays this
+# performer's last phrase there; `silence` places nothing. Any other value
+# fails this script, even while work is open.
+#
 # One phrase is open at a time. While this performer still has unsettled work
 # on the track (KJ_OPEN_WORK above 0), the tick admits nothing and ends with
-# status 0.
+# status 0. A repeat is not open work.
 #
 # The target is far enough ahead for the performer's measured cost:
 # KJ_LEAD_BEATS is that cost times the safety factor, in beats. The target is
@@ -14,6 +20,14 @@
 # A lead under one phrase, or no measured cost (0), targets one phrase ahead.
 # In 4/4, each quarter-note beat contributes one fourth of a bar.
 set -e
+uncovered="${KJ_UNCOVERED:-repeat}"
+case "$uncovered" in
+  repeat|silence) ;;
+  *)
+    echo "tick: KJ_UNCOVERED is '$uncovered'; use repeat (play the last phrase at each uncovered phrase) or silence"
+    exit 1
+    ;;
+esac
 if [[ "$KJ_OPEN_WORK" -gt 0 ]]; then
   echo "tick: $KJ_OPEN_WORK phrase(s) still open on $KJ_TRACK; no new turn"
   exit 0
@@ -22,3 +36,8 @@ bars=$(( KJ_PHRASE_BEATS / 4 ))
 phrases=$(( KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1 ))
 target=$(( KJ_TICK + phrases * KJ_PHRASE_BEATS ))
 kj drive --track "$KJ_TRACK" --score-at "$target" --fallback last-good --prompt "Commit at tick $target. Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4. Recently played (oldest→newest JSON): $KJ_HEARD. Play the NEXT phrase, continuing seamlessly from what you just played. Write exactly $KJ_PHRASE_BEATS beats with L:1/4 — one beat per bare note or chord, a barline | every 4 beats, $bars bars total — so the line is continuous with no gap. CRITICAL: do NOT add duration numbers (no C2, no C/2) and do NOT pack multiple notes into a beat. Your header and register come from your chair. Output ONE complete ABC tune: that header, then the body. Raw ABC only — no prose, no code fences."
+if [[ "$uncovered" = "repeat" ]] && [[ "$phrases" -gt 1 ]]; then
+  for i in $(seq 1 $(( phrases - 1 ))); do
+    kj transport repeat --track "$KJ_TRACK" --at "$(( KJ_TICK + i * KJ_PHRASE_BEATS ))"
+  done
+fi

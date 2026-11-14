@@ -1,6 +1,6 @@
 //! Transport subcommand: the musician's play/stop/pause/tempo control surface.
 //!
-//! The beat lives on the **track** now (`docs/tracks.md`, Stage 1). A context
+//! The beat lives on the **track** now (`docs/tracks.md`, "The track entity"). A context
 //! *attaches* to a track to be beaten by it. Transport is a single operation
 //! on one clock domain — no per-context fan-out. Clock-domain verbs name the
 //! **track** (`--track <name>`); kaish does the context→track lookup when
@@ -50,15 +50,15 @@ pub(crate) struct TransportArgs {
 
 #[derive(Subcommand, Debug)]
 enum TransportCommand {
-    /// Attach a context to a track — the context announces itself (entity #3 in
-    /// docs/tracks.md). This is the opt-in: a context becomes a beat participant
-    /// by attaching, not by a hardcoded type name. If the track doesn't exist yet
-    /// it is created stopped (no surprise token spend); if it already exists the
-    /// new attachment registers without changing the track's clock. Arms
-    /// **stopped** + OODA-armed (`kj transport play` starts the clock). Policy
-    /// and attachment come from the persisted rows when present (a restart re-attach
-    /// restores the real tempo/cadence), else from the musician defaults + a lane
-    /// derived from the label; an unsluggable label is refused (no shared lane).
+    /// Attach a context to a track, so the track's beat wakes it. A new track is
+    /// created stopped, with OODA armed (`kj transport play` starts the clock);
+    /// an existing track keeps its clock and gains this attachment. Tempo and
+    /// cadence come from the persisted rows when present, else from the musician
+    /// defaults and a track named for the context's label; a label that names no
+    /// valid track is refused. A track holds one live context per character: a
+    /// second live context played by the same character is refused, so give each
+    /// chair its own character (`kj character create drummer --model
+    /// <backend>/<model> --rc musician`).
     Attach {
         /// Target context: . (default) | <label> | <hex prefix>
         #[arg(long)]
@@ -220,6 +220,21 @@ enum TransportCommand {
         #[arg(long)]
         track: String,
     },
+    /// Repeat this context's last phrase at a future tick, with no model turn:
+    /// `kj transport repeat --track bass --at 96`. At that tick's commitment the
+    /// transport plays the latest phrase this context's performer committed on
+    /// the track, or leaves silence when there is none. Needs the `drive`
+    /// capability and an attachment to the track. `kj transport work` shows it
+    /// as `requested: last good`; it is not open work (`KJ_OPEN_WORK`).
+    Repeat {
+        /// Track to repeat on; this context must be attached to it. Omit to use
+        /// the context's attachment.
+        #[arg(long)]
+        track: Option<String>,
+        /// Absolute track tick to repeat at, ahead of the track's playhead.
+        #[arg(long)]
+        at: i64,
+    },
 }
 
 impl TransportCommand {
@@ -240,7 +255,10 @@ impl TransportCommand {
             | TransportCommand::Ooda { context, .. }
             | TransportCommand::Clock { context, .. }
             | TransportCommand::Rotate { context, .. } => context.as_deref(),
-            TransportCommand::Delete { .. } | TransportCommand::List | TransportCommand::Work { .. } => None,
+            TransportCommand::Delete { .. }
+            | TransportCommand::List
+            | TransportCommand::Work { .. }
+            | TransportCommand::Repeat { .. } => None,
         }
     }
 
@@ -256,7 +274,8 @@ impl TransportCommand {
             | TransportCommand::Tempo { track, .. }
             | TransportCommand::Ooda { track, .. }
             | TransportCommand::Clock { track, .. }
-            | TransportCommand::Rotate { track, .. } => track.as_deref(),
+            | TransportCommand::Rotate { track, .. }
+            | TransportCommand::Repeat { track, .. } => track.as_deref(),
             TransportCommand::Delete { track } | TransportCommand::Work { track } => Some(track.as_str()),
             TransportCommand::List => None,
         }
@@ -277,6 +296,7 @@ impl TransportCommand {
             TransportCommand::Delete { .. } => "delete",
             TransportCommand::List => "list",
             TransportCommand::Work { .. } => "work",
+            TransportCommand::Repeat { .. } => "repeat",
         }
     }
 }
@@ -322,6 +342,11 @@ impl KjDispatcher {
             let text = super::format::format_work_table(&statuses);
             let data = serde_json::to_value(statuses).expect("work status is serializable");
             return KjResult::ok_with_data(text, data);
+        }
+        // A repeat puts the caller's own performer's material on the score, as
+        // `kj drive --score-at` does, so it takes `drive`, not `transport`.
+        if let TransportCommand::Repeat { at, .. } = &command {
+            return self.transport_repeat(command.track_name(), *at, caller);
         }
 
         // Driving the beat (play/pause/stop/tempo/ooda) is gated on `transport`.
@@ -518,10 +543,10 @@ impl KjDispatcher {
                     (BeatCommand::Delete { track: track_id }, verb, Some(tid))
                 }
 
-                // `list` is a read — dispatched (and returned) above, before this
-                // match ever runs. Kept only so the match stays exhaustive.
-                TransportCommand::List | TransportCommand::Work { .. } => {
-                    unreachable!("transport list is handled before the command match")
+                // Dispatched (and returned) above, before this match ever runs.
+                // Kept only so the match stays exhaustive.
+                TransportCommand::List | TransportCommand::Work { .. } | TransportCommand::Repeat { .. } => {
+                    unreachable!("transport list, work and repeat are handled before the command match")
                 }
             };
 
@@ -711,12 +736,82 @@ impl KjDispatcher {
         KjResult::ok_with_data(text, serde_json::Value::Array(handles))
     }
 
+    /// `kj transport repeat`: place a requested fallback for the calling
+    /// context's performer on a track that context is attached to
+    /// ([`Timeline::request_fallback`](kaijutsu_hyoushigi::Timeline::request_fallback)).
+    /// Runs no model and no resolver work.
+    fn transport_repeat(&self, track_override: Option<&str>, at: i64, caller: &KjCaller) -> KjResult {
+        if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drive, "transport repeat") {
+            return denied;
+        }
+        let Some(ctx) = caller.context_id else {
+            return KjResult::Err(
+                "kj transport repeat: no active context; a repeat plays the calling context's own phrase".to_string(),
+            );
+        };
+        let track = match self.resolve_track_for_ctx(track_override, ctx) {
+            Ok(t) => t,
+            Err(e) => return KjResult::Err(e),
+        };
+        let performer = {
+            let db = self.kernel_db().lock();
+            let performer = match db.get_context(ctx) {
+                Ok(row) => row.and_then(|row| row.performer),
+                Err(e) => return KjResult::Err(format!("kj transport repeat: reading context {}: {e}", ctx.short())),
+            };
+            let Some(performer) = performer else {
+                return KjResult::Err(format!(
+                    "kj transport repeat: context {} has no performer, so it has no phrase to repeat",
+                    ctx.short()
+                ));
+            };
+            match db.get_attachment(track.as_str(), ctx) {
+                Ok(Some(_)) => {}
+                Ok(None) => return KjResult::Err(format!(
+                    "kj transport repeat: context {} is not attached to track '{}'; a repeat plays on \
+                     the caller's own track (`kj transport attach --track {}` first)",
+                    ctx.short(), track.as_str(), track.as_str()
+                )),
+                Err(e) => return KjResult::Err(format!("kj transport repeat: reading attachment: {e}")),
+            }
+            performer
+        };
+        let Some(timeline) = self.kernel().track_timeline(&track) else {
+            return KjResult::Err(format!(
+                "kj transport repeat: track '{}' is not armed; nothing will play there",
+                track.as_str()
+            ));
+        };
+        let start = kaijutsu_types::Tick::new(at);
+        let admitted = timeline.lock().request_fallback(
+            kaijutsu_types::Span::instant(start), track.clone(), performer, kaijutsu_hyoushigi::Fallback::UseLastGood,
+        );
+        match admitted {
+            Ok(work) => KjResult::ok_with_data(
+                format!("transport: repeat at tick {at} on track '{}'", track.as_str()),
+                serde_json::json!({
+                    "context_id": ctx.to_hex(),
+                    "track_id": track.as_str(),
+                    "action": "repeat",
+                    "start": at,
+                    "work_id": work,
+                }),
+            ),
+            Err(kaijutsu_hyoushigi::ScheduleError::InThePast { now, .. }) => KjResult::Err(format!(
+                "kj transport repeat: tick {at} is not ahead of the playhead {}; nothing was placed. \
+                 Pass a later --at",
+                now.get()
+            )),
+            Err(e) => KjResult::Err(format!("kj transport repeat: nothing was placed: {e}")),
+        }
+    }
+
     /// Resolve the target [`TrackId`] for a clock-domain or per-attachment verb.
     ///
     /// If `track_override` is `Some`, parse it directly. Otherwise look up the
     /// context's persisted attachment set: exactly one row → use its `track_id`;
     /// zero rows → loud error (attach first); more than one → loud error
-    /// (ambiguous; Stage 1 music has one). The stored track string that no longer
+    /// (ambiguous). The stored track string that no longer
     /// parses is corruption → fail loud.
     fn resolve_track_for_ctx(
         &self,
@@ -893,6 +988,7 @@ impl Classify for TransportCommand {
             | TransportCommand::Ooda { .. }
             | TransportCommand::Clock { .. }
             | TransportCommand::Rotate { .. }
+            | TransportCommand::Repeat { .. }
             | TransportCommand::Delete { .. } => Effect::Write,
         }
     }
@@ -1848,6 +1944,114 @@ mod tests {
             "explicit list has no footer: {}",
             result.message()
         );
+    }
+
+    // ── repeat ───────────────────────────────────────────────────────────────
+
+    /// A context played by a fresh performer, attached to an armed track
+    /// `band` whose playhead is at 10, with a loadout of `house` plus `caps`.
+    fn repeat_fixture(
+        d: &super::super::KjDispatcher,
+        label: &str,
+        caps: &[crate::mcp::Capability],
+    ) -> (kaijutsu_types::ContextId, PrincipalId, crate::hyoushigi::SharedTimeline) {
+        let performer = PrincipalId::new();
+        let ctx = register_context(d, Some(label), None, performer);
+        d.kernel_db().lock().update_performer(ctx, Some(performer)).unwrap();
+        seed_track_and_attachment(d, ctx, "band", None);
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::House);
+        for cap in caps {
+            binding.grant(cap.clone());
+        }
+        d.kernel_db().lock().upsert_context_binding(ctx, &binding).unwrap();
+        let timeline = d.kernel().arm_track_timeline(
+            kaijutsu_types::TrackId::new("band").unwrap(),
+            kaijutsu_hyoushigi::TickClock::default(),
+            kaijutsu_types::Tick::new(10),
+        );
+        (ctx, performer, timeline)
+    }
+
+    /// With `drive`, a player places a repeat of its own last phrase on the
+    /// track it is attached to: an item for its performer at that tick, with
+    /// no settlement yet and no open work. `--track` defaults to the
+    /// context's attachment.
+    #[tokio::test]
+    async fn transport_repeat_places_a_requested_repeat_for_the_callers_performer() {
+        let d = test_dispatcher().await;
+        let (ctx, performer, timeline) = repeat_fixture(&d, "bass", &[crate::mcp::Capability::Drive]);
+        let c = caller_with_context(ctx);
+        for args in [
+            vec![s("transport"), s("repeat"), s("--track"), s("band"), s("--at"), s("20")],
+            vec![s("transport"), s("repeat"), s("--at"), s("24")],
+        ] {
+            let result = d.dispatch(&args, &c).await;
+            assert!(result.is_ok(), "{args:?}: {}", result.message());
+        }
+        let statuses = timeline.lock().statuses();
+        let starts: Vec<i64> = statuses.iter().map(|s| s.start.get()).collect();
+        assert_eq!(starts, [20, 24]);
+        for status in &statuses {
+            assert_eq!(status.played_by, performer);
+            assert_eq!(status.disposition, None);
+        }
+        assert_eq!(timeline.lock().open_work(performer), 0, "a repeat is not open work");
+    }
+
+    /// Each refusal says why: no `drive`, a track the context is not
+    /// attached to, a tick not ahead of the playhead, an unarmed track, and a
+    /// context with no performer. A refusal places nothing.
+    #[tokio::test]
+    async fn transport_repeat_refusals_say_why() {
+        let d = test_dispatcher().await;
+        let (ctx, _performer, timeline) = repeat_fixture(&d, "bass", &[crate::mcp::Capability::Drive]);
+        let c = caller_with_context(ctx);
+        d.kernel().arm_track_timeline(
+            kaijutsu_types::TrackId::new("other").unwrap(),
+            kaijutsu_hyoushigi::TickClock::default(),
+            kaijutsu_types::Tick::ZERO,
+        );
+        for (args, expected) in [
+            (vec!["--track", "other", "--at", "20"], "not attached to track 'other'"),
+            (vec!["--track", "band", "--at", "10"], "not ahead of the playhead 10"),
+            (vec!["--track", "band", "--at", "3"], "not ahead of the playhead 10"),
+        ] {
+            let mut argv = vec![s("transport"), s("repeat")];
+            argv.extend(args.iter().map(|a| s(a)));
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{argv:?} must be refused");
+            assert!(result.message().contains(expected), "{argv:?}: {}", result.message());
+        }
+
+        seed_track_and_attachment(&d, ctx, "unarmed", None);
+        let result = d.dispatch(&[s("transport"), s("repeat"), s("--track"), s("unarmed"), s("--at"), s("20")], &c).await;
+        assert!(result.message().contains("track 'unarmed' is not armed"), "{}", result.message());
+
+        let (no_drive, _, _) = repeat_fixture(&d, "drums", &[crate::mcp::Capability::Transport]);
+        let result = d.dispatch(&[s("transport"), s("repeat"), s("--track"), s("band"), s("--at"), s("20")],
+            &caller_with_context(no_drive)).await;
+        assert!(result.message().contains("denied") && result.message().contains("'drive'"), "{}", result.message());
+
+        let probe = register_context(&d, Some("probe"), None, PrincipalId::new());
+        seed_track_and_attachment(&d, probe, "band", None);
+        let result = d.dispatch(&[s("transport"), s("repeat"), s("--track"), s("band"), s("--at"), s("20")],
+            &caller_with_context(probe)).await;
+        assert!(result.message().contains("has no performer"), "{}", result.message());
+
+        assert!(timeline.lock().statuses().is_empty(), "a refusal places nothing");
+    }
+
+    #[tokio::test]
+    async fn transport_repeat_help() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("here"), None, PrincipalId::new());
+        let result = d.dispatch(&[s("transport"), s("repeat"), s("--help")], &caller_with_context(ctx)).await;
+        assert!(result.is_ok(), "{}", result.message());
+        eprintln!("{}", result.message());
+        for flag in ["--track", "--at"] {
+            assert!(result.message().contains(flag), "{}", result.message());
+        }
     }
 
     // ── delete ────────────────────────────────────────────────────────────────

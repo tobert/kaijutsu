@@ -246,7 +246,8 @@ pub fn format_track_table(rows: &[TrackListRow]) -> String {
 /// attempt: waiting for its admission, then doing the work.
 /// MARGIN is how many ticks before START the result was ready. BASIS says
 /// whether the context the result was prepared against still held when it
-/// was checked. OUTCOME is the disposition, or the readiness of open work.
+/// was checked. OUTCOME is the disposition, or the readiness of open work; a
+/// requested repeat (`kj transport repeat`) settles as `requested: last good`.
 pub fn format_work_table(statuses: &[kaijutsu_hyoushigi::WorkStatus]) -> String {
     use kaijutsu_hyoushigi::{Disposition, Fallback, FallbackReason, Readiness};
     if statuses.is_empty() {
@@ -273,20 +274,23 @@ pub fn format_work_table(statuses: &[kaijutsu_hyoushigi::WorkStatus]) -> String 
             Some(Disposition::Cancelled) => "cancelled".to_string(),
             Some(Disposition::Superseded { .. }) => "superseded".to_string(),
             Some(Disposition::Fallback { reason, policy, .. }) => {
-                let reason = match reason {
-                    FallbackReason::ResolveFailed => "resolve failed",
-                    FallbackReason::InvalidBasis => "basis changed",
-                    FallbackReason::DeadlineMissed => "deadline missed",
-                };
                 let policy = match policy {
                     Fallback::Skip => "skip",
                     Fallback::UseLastGood => "last good",
                     Fallback::Literal(_) => "literal",
                 };
-                match &s.error {
+                let miss = match reason {
+                    FallbackReason::ResolveFailed => Some("resolve failed"),
+                    FallbackReason::InvalidBasis => Some("basis changed"),
+                    FallbackReason::DeadlineMissed => Some("deadline missed"),
+                    // What the player asked for, not a miss.
+                    FallbackReason::Requested => None,
+                };
+                match (miss, &s.error) {
+                    (None, _) => format!("requested: {policy}"),
                     // One row per attempt: a multi-line error stays on its row.
-                    Some(error) => format!("fallback: {reason}, {policy}: {}", error.lines().collect::<Vec<_>>().join(" / ")),
-                    None => format!("fallback: {reason}, {policy}"),
+                    (Some(miss), Some(error)) => format!("fallback: {miss}, {policy}: {}", error.lines().collect::<Vec<_>>().join(" / ")),
+                    (Some(miss), None) => format!("fallback: {miss}, {policy}"),
                 }
             }
             None => match s.readiness {
@@ -597,10 +601,13 @@ mod tests {
             reason: FallbackReason::InvalidBasis, policy: Fallback::Skip, content: None,
         }));
         let running = work(180, None, None, None);
+        let requested = work(200, None, None, Some(Disposition::Fallback {
+            reason: FallbackReason::Requested, policy: Fallback::UseLastGood, content: None,
+        }));
 
-        let table = super::format_work_table(&[committed, late, failed, changed, running]);
+        let table = super::format_work_table(&[committed, late, failed, changed, running, requested]);
         let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), 6, "{table}");
+        assert_eq!(lines.len(), 7, "{table}");
         assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), [
             "START", "PREPARE", "EST", "EST_MS", "QUEUE_MS", "COMPUTE_MS", "STARTED", "READY", "MARGIN", "TRY", "BASIS", "OUTCOME",
         ], "{table}");
@@ -613,6 +620,7 @@ mod tests {
         assert!(lines[3].ends_with("fallback: resolve failed, skip: parse error / at bar 3"), "{table}");
         assert!(lines[4].contains("changed") && lines[4].ends_with("fallback: basis changed, skip"), "{table}");
         assert!(lines[5].ends_with("running"), "{table}");
+        assert!(lines[6].ends_with("requested: last good"), "a requested repeat does not read as a failure: {table}");
         assert_eq!(super::format_work_table(&[]), "(no work)");
     }
 

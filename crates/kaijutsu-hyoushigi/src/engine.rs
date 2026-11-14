@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use kaijutsu_cas::ContentHash;
-use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
+use kaijutsu_types::{PrincipalId, Span, Tick, TickDelta, TrackId};
 
 use crate::cell::{Body, Cell, CellState, Fallback, Recipe, ResolverId};
 use crate::content::{ContentRef, ContextHash};
@@ -21,6 +21,10 @@ pub const COST_WINDOW: usize = 32;
 
 /// How many of a performer's newest samples [`Timeline::measured_cost`] reads.
 pub const MEASURED_COST_SAMPLES: usize = 8;
+
+/// The resolver id a requested fallback's recipe names. No resolver is
+/// registered under it; the item never resolves.
+const REQUESTED_FALLBACK: &str = "requested_fallback";
 
 /// Convert preparation costs into lead times at the external clock's tick rate.
 /// `safety_factor` widens the initial lead; `commit_margin` leaves time between
@@ -84,6 +88,9 @@ pub struct SquashEvent {
     pub recovery: Recovery,
 }
 
+/// How many settled works and squash events a timeline keeps.
+const HISTORY_LIMIT: usize = 256;
+
 /// A resolve that errored — recorded, never hidden. Sibling to [`SquashEvent`]:
 /// a squash is a *recoverable* misprediction (predicted ≠ actual, but the bytes
 /// were produced); a failure is a resolve that produced nothing (CAS read miss,
@@ -115,7 +122,10 @@ struct Scheduled {
     status: WorkStatus,
     order: u64,
     work: Option<ResolveFuture>,
-    resolver: Arc<dyn Resolver>,
+    /// The resolver that prepares this cell. `None` for a requested fallback
+    /// ([`Timeline::request_fallback`]): it never speculates, and settles
+    /// through its recipe's fallback at its commitment.
+    resolver: Option<Arc<dyn Resolver>>,
     observed_at: Tick,
     cell: Cell,
     start: Tick,
@@ -127,8 +137,18 @@ struct Scheduled {
 }
 
 impl Scheduled {
+    /// The resolver of resolver-backed work. Only such work speculates,
+    /// polls, or validates a basis.
+    fn resolver(&self) -> &Arc<dyn Resolver> {
+        self.resolver.as_ref().expect("only resolver-backed work prepares")
+    }
+
     /// The tick at which this cell's next lifecycle action is due, if any.
     fn next_at(&self) -> Option<Tick> {
+        if self.resolver.is_none() {
+            // A requested fallback settles at its commitment deadline.
+            return Some(self.commit_deadline.max(self.observed_at));
+        }
         match self.cell.state {
             CellState::Pending => Some(self.status.prepare_at),
             CellState::Speculating => Some(self.start),
@@ -193,7 +213,8 @@ pub struct Timeline {
     committed: Vec<Cell>,
     /// The content store (in-RAM stand-in for CAS). Crystallized at commit.
     cas: HashMap<ContentHash, Vec<u8>>,
-    /// The squash ledger — the bill, and the anticipation-model feedback.
+    /// The squash ledger — the bill, and the anticipation-model feedback. Keeps
+    /// the newest [`HISTORY_LIMIT`] events.
     squashes: Vec<SquashEvent>,
     /// Resolver errors, drained by the kernel into each producer's conversation.
     /// Failed work keeps its deadline until its declared fallback settles.
@@ -234,7 +255,7 @@ impl Timeline {
         timeline
     }
 
-    /// Open work and the most recent 256 dispositions, local to this timeline.
+    /// Open work and the most recent [`HISTORY_LIMIT`] dispositions, local to this timeline.
     pub fn statuses(&self) -> Vec<WorkStatus> {
         self.history.iter().chain(self.future.iter().map(|s| &s.status)).cloned().collect()
     }
@@ -263,7 +284,7 @@ impl Timeline {
     fn finish(&mut self, mut status: WorkStatus, disposition: Disposition) {
         status.settled_at = Some(self.playhead);
         status.disposition = Some(disposition);
-        if self.history.len() == 256 {
+        if self.history.len() == HISTORY_LIMIT {
             self.history.pop_front();
         }
         self.history.push_back(status);
@@ -331,7 +352,10 @@ impl Timeline {
 
     /// Rehydrate a freshly-armed timeline's committed log from durable history (the
     /// materialized score reconstructed by the kernel), so `UseLastGood`
-    /// (`last_committed_content_in`) sees prior phrases across a restart. Only valid
+    /// (`last_committed_content_in`) sees prior phrases across a restart. Each
+    /// cell's `played_by` must be the principal that played it, so a restored
+    /// phrase still belongs to its performer and a restored transport copy to
+    /// [`PrincipalId::beat()`]. Only valid
     /// on a **virgin** timeline (empty committed); the playhead must already be
     /// seeded at/after these cells' ticks. A non-virgin rehydrate is a kernel bug —
     /// crash over corrupting a live committed log. Empty `cells` is a clean no-op
@@ -350,8 +374,16 @@ impl Timeline {
     pub fn committed(&self) -> &[Cell] {
         &self.committed
     }
+    /// The newest [`HISTORY_LIMIT`] squash events, oldest first.
     pub fn squashes(&self) -> &[SquashEvent] {
         &self.squashes
+    }
+
+    fn record_squash(&mut self, event: SquashEvent) {
+        if self.squashes.len() == HISTORY_LIMIT {
+            self.squashes.remove(0);
+        }
+        self.squashes.push(event);
     }
     /// Every resolver error, recorded when observed. The kernel drains these
     /// into Error blocks independently of the later fallback commitment.
@@ -381,20 +413,84 @@ impl Timeline {
         self.schedule_inner(cell, false, Some(resolver))
     }
 
-    fn schedule_inner(&mut self, cell: Cell, replacing: bool, owned: Option<Box<dyn Resolver>>) -> Result<WorkId, ScheduleError> {
+    /// Admit an item that runs no resolver and settles through `fallback` at
+    /// its commitment (`span.start` less the commit margin), as failed work
+    /// does: [`Fallback::UseLastGood`] repeats `played_by`'s latest committed
+    /// phrase on `track` at or before `span.start`, chosen at that commitment,
+    /// or leaves silence when there is none. A repeat or literal is played by
+    /// [`PrincipalId::beat()`]. The disposition is a fallback with
+    /// [`FallbackReason::Requested`]. The item records no failure and no cost
+    /// sample, and it is not [`open_work`](Self::open_work); it does take one
+    /// of the timeline's capacity slots until it settles.
+    pub fn request_fallback(&mut self, span: Span, track: TrackId, played_by: PrincipalId, fallback: Fallback) -> Result<WorkId, ScheduleError> {
+        self.check_admission(span.start, false)?;
+        let cell = Cell::deferred_on(span, Recipe {
+            resolver: ResolverId::new(REQUESTED_FALLBACK),
+            params: serde_json::Value::Null,
+            query: crate::cell::ContextQuery::default(),
+            fallback,
+        }, track, played_by);
+        let commit_deadline = span.start - self.clock.commit_margin;
+        Ok(self.push_scheduled(cell, None, Duration::ZERO, commit_deadline))
+    }
+
+    /// The items `played_by` has admitted through a resolver that have not
+    /// settled. A requested fallback is not counted.
+    pub fn open_work(&self, played_by: PrincipalId) -> usize {
+        self.future.iter().filter(|s| s.resolver.is_some() && s.status.played_by == played_by).count()
+    }
+
+    /// Refuse admission at capacity or at or behind the playhead.
+    fn check_admission(&self, start: Tick, replacing: bool) -> Result<(), ScheduleError> {
         if !replacing && self.future.len() >= self.capacity {
             return Err(ScheduleError::AtCapacity(self.capacity));
         }
-        let Body::Deferred(recipe) = &cell.body else {
-            return Err(ScheduleError::NotDeferred);
-        };
-        let start = cell.span.start;
         if start <= self.playhead {
             return Err(ScheduleError::InThePast {
                 start,
                 now: self.playhead,
             });
         }
+        Ok(())
+    }
+
+    /// Add an admitted item to the open future and return its id.
+    fn push_scheduled(&mut self, cell: Cell, resolver: Option<Arc<dyn Resolver>>, est: Duration, prepare_at: Tick) -> WorkId {
+        let start = cell.span.start;
+        let id = WorkId(uuid::Uuid::new_v4());
+        let order = self.next_order;
+        self.next_order = self.next_order.checked_add(1).expect("timeline admission order overflow");
+        self.future.push(Scheduled {
+            status: WorkStatus {
+                id, track: cell.track.clone(), played_by: cell.played_by,
+                start, admitted_at: self.playhead,
+                estimate: self.clock.beats_for(est),
+                estimate_wall: est,
+                prepare_at,
+                attempt: 0,
+                started_at: None, ready_at: None, readiness: Readiness::Queued,
+                predicted: None, actual: None, valid: None, error: None,
+                timing: None, settled_at: None, disposition: None,
+            },
+            order,
+            work: None,
+            resolver,
+            observed_at: self.playhead,
+            start,
+            commit_deadline: start - self.clock.commit_margin,
+            resolution: None,
+            final_attempt: false,
+            cell,
+        });
+        id
+    }
+
+    fn schedule_inner(&mut self, cell: Cell, replacing: bool, owned: Option<Box<dyn Resolver>>) -> Result<WorkId, ScheduleError> {
+        let Body::Deferred(recipe) = &cell.body else {
+            return Err(ScheduleError::NotDeferred);
+        };
+        let start = cell.span.start;
+        self.check_admission(start, replacing)?;
         let preparing = owned.is_some();
         let resolver: Arc<dyn Resolver> = match owned {
             Some(resolver) => {
@@ -411,34 +507,9 @@ impl Timeline {
             committed: &self.committed,
         };
         let est = resolver.estimate_cost(&recipe.params, &ctx);
-        let est_cost = self.clock.beats_for(est);
         let lead = self.clock.beats_for(est.mul_f64(self.clock.safety_factor));
-
-        let id = WorkId(uuid::Uuid::new_v4());
-        let order = self.next_order;
-        self.next_order = self.next_order.checked_add(1).expect("timeline admission order overflow");
-        self.future.push(Scheduled {
-            status: WorkStatus {
-                id, track: cell.track.clone(), played_by: cell.played_by,
-                start, admitted_at: self.playhead,
-                estimate: est_cost,
-                estimate_wall: est,
-                prepare_at: if preparing { self.playhead } else { start - lead },
-                attempt: 0,
-                started_at: None, ready_at: None, readiness: Readiness::Queued,
-                predicted: None, actual: None, valid: None, error: None,
-                timing: None, settled_at: None, disposition: None,
-            },
-            order,
-            work: None,
-            resolver,
-            observed_at: self.playhead,
-            start,
-            commit_deadline: start - self.clock.commit_margin,
-            resolution: None,
-            final_attempt: false,
-            cell,
-        });
+        let prepare_at = if preparing { self.playhead } else { start - lead };
+        let id = self.push_scheduled(cell, Some(resolver), est, prepare_at);
         if !replacing {
             let idx = self.future.len() - 1;
             if self.future[idx].status.prepare_at <= self.playhead {
@@ -493,6 +564,10 @@ impl Timeline {
                 .min_by_key(|(_, s)| (s.start, s.order))
                 .map(|(idx, _)| idx);
             let Some(idx) = next else { break };
+            if self.future[idx].resolver.is_none() {
+                self.fire_fallback(idx, FallbackReason::Requested);
+                continue;
+            }
             if target > self.future[idx].start && self.future[idx].cell.state != CellState::Failed {
                 self.fire_fallback(idx, FallbackReason::DeadlineMissed);
                 continue;
@@ -510,7 +585,7 @@ impl Timeline {
     /// Snapshot the basis and start an owned resolution without waiting for it.
     fn speculate(&mut self, idx: usize) {
         let recipe = self.deferred_recipe(idx);
-        let resolver = &self.future[idx].resolver;
+        let resolver = self.future[idx].resolver();
         let ctx = CommittedCtx {
             now: self.future[idx].start,
             ambient: &self.ambient,
@@ -551,7 +626,7 @@ impl Timeline {
                 at: self.playhead, played_by: s.cell.played_by,
                 estimate: s.status.estimate_wall, timing, outcome,
             };
-            let resolver = s.resolver.id();
+            let resolver = s.resolver().id();
             self.record_cost(resolver, sample);
         }
         let s = &mut self.future[idx];
@@ -568,7 +643,7 @@ impl Timeline {
                 s.cell.state = CellState::Failed;
                 let Body::Deferred(recipe) = &s.cell.body else { unreachable!("scheduled work is deferred") };
                 self.failures.push(FailureEvent {
-                    source_block: s.resolver.source_block(),
+                    source_block: s.resolver().source_block(),
                     work_id: Some(s.status.id), attempt: s.status.attempt,
                     at: self.playhead, start: s.start, resolver: recipe.resolver.clone(),
                     error, played_by: s.cell.played_by,
@@ -587,7 +662,7 @@ impl Timeline {
         let current_tick = self.playhead;
         let start = self.future[idx].start;
 
-        let resolver = &self.future[idx].resolver;
+        let resolver = self.future[idx].resolver();
         let ctx = CommittedCtx {
             now: start,
             ambient: &self.ambient,
@@ -614,7 +689,7 @@ impl Timeline {
         } else {
             Recovery::FellBack
         };
-        self.squashes.push(SquashEvent {
+        self.record_squash(SquashEvent {
             work_id: self.future[idx].status.id,
             attempt: self.future[idx].status.attempt,
             at: current_tick,
@@ -703,12 +778,6 @@ impl Timeline {
         }
     }
 
-    /// The required real-time miss handler. Never undefined behavior.
-    ///
-    /// Fallback repeats and literals are authored by [`PrincipalId::beat()`], not
-    /// by the player: the transport played them. Attributing vamp-insurance to
-    /// the player would be false provenance. They stay on the missing cell's
-    /// `track` — the lane persists even when no player covered this beat.
     fn record_cost(&mut self, resolver: ResolverId, sample: CostSample) {
         let window = self.costs.entry(resolver.0).or_default();
         if window.len() == COST_WINDOW {
@@ -717,13 +786,21 @@ impl Timeline {
         window.push_back(sample);
     }
 
+    /// The required real-time miss handler. Never undefined behavior.
+    ///
+    /// Fallback repeats and literals are authored by [`PrincipalId::beat()`], not
+    /// by the player: the transport played them. Attributing vamp-insurance to
+    /// the player would be false provenance. They stay on the missing cell's
+    /// `track` — the lane persists even when no player covered this beat. A
+    /// repeat is the latest phrase the missing cell's own performer played on
+    /// that track.
     fn fire_fallback(&mut self, idx: usize, reason: FallbackReason) {
         let s = self.future.swap_remove(idx);
         if s.cell.state == CellState::Speculating
             && let Some(started) = s.status.started_at
         {
             let ran = self.clock.duration_for(self.playhead - started);
-            self.record_cost(s.resolver.id(), CostSample {
+            self.record_cost(s.resolver().id(), CostSample {
                 at: self.playhead, played_by: s.cell.played_by, estimate: s.status.estimate_wall,
                 timing: crate::Timing { queued: Duration::ZERO, compute: ran },
                 outcome: SampleOutcome::Missed,
@@ -733,7 +810,7 @@ impl Timeline {
         let policy = recipe.fallback.clone();
         let content = match &policy {
             Fallback::Skip => None,
-            Fallback::UseLastGood => self.last_committed_content_in(&s.cell.track, s.start),
+            Fallback::UseLastGood => self.last_committed_content_in(&s.cell.track, s.cell.played_by, s.start),
             Fallback::Literal(content) => Some(content.clone()),
         };
         if let Some(content) = &content {
@@ -770,17 +847,20 @@ impl Timeline {
         }
     }
 
-    /// The most recent committed content **on `track`** at or before `before`.
+    /// The most recent committed content **on `track`** played by `performer`
+    /// at or before `before`: what `UseLastGood` repeats.
     ///
-    /// Lane-scoped by construction: `track` is the only lane key. A cell on
-    /// another lane (or a legacy track-blind cell, were one ever present) can
-    /// never satisfy this track's `UseLastGood` — the player principal is never
-    /// consulted here, because the principal is never a lane key.
-    fn last_committed_content_in(&self, track: &TrackId, before: Tick) -> Option<ContentRef> {
+    /// `track` is the only lane key: a cell on another lane never satisfies
+    /// this track's `UseLastGood`. Within the lane the repeat is scoped to the
+    /// performer whose work is falling back, so one player's miss never
+    /// repeats another's phrase. A transport copy is played by
+    /// [`PrincipalId::beat()`], never by a performer, so a repeat of a repeat
+    /// plays the performer's own last phrase again.
+    fn last_committed_content_in(&self, track: &TrackId, performer: PrincipalId, before: Tick) -> Option<ContentRef> {
         self.committed
             .iter()
             .filter(|c| c.span.start <= before)
-            .filter(|c| &c.track == track)
+            .filter(|c| &c.track == track && c.played_by == performer)
             .filter_map(|c| match &c.body {
                 Body::Concrete(cref) => Some((c.span.start, cref.clone())),
                 _ => None,
@@ -808,7 +888,8 @@ impl ResolverCtx for CommittedCtx<'_> {
     }
     /// Latest committed content across this timeline's lanes at or before the
     /// target tick. Model score admission uses this as part of its input basis.
-    /// `last_committed_content_in` narrows the fallback read to one lane.
+    /// `last_committed_content_in` narrows the fallback read to one
+    /// performer's cells on one lane.
     fn content_before(&self, tick: Tick) -> Option<ContentRef> {
         self.committed
             .iter()
@@ -886,10 +967,14 @@ mod tests {
     }
 
     /// Like `deferred_at`, but on an explicit lane — drives the cross-track
-    /// `UseLastGood` tests. `played_by` is irrelevant to these tests, so it
-    /// defaults to `PrincipalId::beat()` (the author axis, independent of the
-    /// `track` lane — the two are distinct coordinates).
+    /// `UseLastGood` tests. Played by `PrincipalId::beat()`, as one
+    /// performer for every cell.
     fn deferred_at_track(start: i64, fallback: Fallback, track: TrackId) -> Cell {
+        deferred_by(start, fallback, track, PrincipalId::beat())
+    }
+
+    /// An `echo` cell on `track` played by `played_by`.
+    fn deferred_by(start: i64, fallback: Fallback, track: TrackId, played_by: PrincipalId) -> Cell {
         Cell::deferred_on(
             Span::instant(Tick::new(start)),
             Recipe {
@@ -899,8 +984,169 @@ mod tests {
                 fallback,
             },
             track,
-            PrincipalId::beat(),
+            played_by,
         )
+    }
+
+    /// Advance one tick at a time to `to`, as the scheduler's pulse does.
+    fn step_to(tl: &mut Timeline, to: i64) {
+        for tick in tl.playhead().get() + 1..=to {
+            tl.advance_to(Tick::new(tick));
+        }
+    }
+
+    /// Commit `bytes` at `at` on `track`, played by `by`, through `echo`.
+    fn play(tl: &mut Timeline, at: i64, track: &TrackId, by: PrincipalId, bytes: &[u8]) {
+        tl.set_ambient("beat", bytes.to_vec());
+        tl.schedule(deferred_by(at, Fallback::Skip, track.clone(), by)).unwrap();
+        step_to(tl, at);
+        assert!(tl.committed().iter().any(|c| c.span.start == Tick::new(at) && c.played_by == by),
+            "the phrase at {at} committed");
+    }
+
+    /// A cell by `by` at `at` whose resolver fails, so it settles through
+    /// `UseLastGood` at its commitment.
+    fn failing_by(at: i64, track: &TrackId, by: PrincipalId) -> Cell {
+        Cell::deferred_on(Span::instant(Tick::new(at)), Recipe {
+            resolver: ResolverId::new("always_fails"),
+            params: serde_json::json!({"cost": 1}),
+            query: ContextQuery::default(),
+            fallback: Fallback::UseLastGood,
+        }, track.clone(), by)
+    }
+
+    fn committed_at(tl: &Timeline, at: i64) -> Vec<&Cell> {
+        tl.committed().iter().filter(|c| c.span.start == Tick::new(at)).collect()
+    }
+
+    /// Last-good is scoped to the performer within the lane: a miss repeats
+    /// that performer's own latest phrase on the track, never another
+    /// performer's phrase and never a transport copy. A repeat of a repeat
+    /// plays the performer's own phrase again, and a performer with no phrase
+    /// of its own gets silence.
+    #[test]
+    fn use_last_good_repeats_the_same_performers_last_phrase() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        });
+        tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+        tl.register_resolver(Box::new(AlwaysFails { message: "missed" }));
+        let track = TrackId::new("band").unwrap();
+        let (bass, drums, keys) = (PrincipalId::new(), PrincipalId::new(), PrincipalId::new());
+        let bass_phrase = ContentRef::of(b"bass phrase", "text/plain");
+        let drum_phrase = ContentRef::of(b"drum phrase", "text/plain");
+
+        play(&mut tl, 4, &track, bass, b"bass phrase");
+        play(&mut tl, 8, &track, drums, b"drum phrase");
+        for (at, by) in [(12, bass), (16, drums), (20, keys), (24, bass)] {
+            tl.schedule(failing_by(at, &track, by)).unwrap();
+            step_to(&mut tl, at);
+        }
+
+        let repeat = |at: i64| -> ContentRef {
+            let cells = committed_at(&tl, at);
+            assert_eq!(cells.len(), 1, "one repeat at {at}");
+            assert_eq!(cells[0].played_by, PrincipalId::beat(), "the transport played the repeat at {at}");
+            match &cells[0].body {
+                Body::Concrete(content) => content.clone(),
+                Body::Deferred(_) => panic!("a repeat is concrete"),
+            }
+        };
+        assert_eq!(repeat(12), bass_phrase, "bass repeats its own phrase, not the newer drum phrase");
+        assert_eq!(repeat(16), drum_phrase, "drums repeats its own phrase, not the copy at 12");
+        assert!(committed_at(&tl, 20).is_empty(), "keys has no phrase of its own: silence");
+        assert_eq!(repeat(24), bass_phrase, "a repeat of a repeat plays bass's own phrase again");
+    }
+
+    /// A requested repeat runs no resolver. Its content is chosen at its
+    /// commitment: the performer's latest phrase at or before its tick, so a
+    /// phrase committed after the request is the one repeated. It records no
+    /// failure and settles as requested.
+    #[test]
+    fn a_requested_repeat_plays_the_performers_phrase_chosen_at_commitment() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        });
+        tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+        let track = TrackId::new("band").unwrap();
+        let (bass, drums) = (PrincipalId::new(), PrincipalId::new());
+        play(&mut tl, 4, &track, bass, b"first");
+        let id = tl.request_fallback(Span::instant(Tick::new(20)), track.clone(), bass, Fallback::UseLastGood).unwrap();
+        let open = tl.status(id).unwrap().clone();
+        assert_eq!((open.played_by, open.start, open.estimate), (bass, Tick::new(20), TickDelta::new(0)));
+        assert_eq!(open.disposition, None);
+        play(&mut tl, 10, &track, bass, b"second");
+        play(&mut tl, 14, &track, drums, b"drums");
+        step_to(&mut tl, 18);
+        assert!(committed_at(&tl, 20).is_empty(), "nothing before the commitment");
+
+        step_to(&mut tl, 19);
+        let second = ContentRef::of(b"second", "text/plain");
+        let cells = committed_at(&tl, 20);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].body, Body::Concrete(second.clone()), "the phrase bass played after the request");
+        assert_eq!(cells[0].played_by, PrincipalId::beat());
+        assert_eq!(cells[0].track, track);
+        let settled = tl.status(id).unwrap();
+        assert_eq!(settled.disposition, Some(Disposition::Fallback {
+            reason: FallbackReason::Requested, policy: Fallback::UseLastGood, content: Some(second),
+        }));
+        assert_eq!(settled.attempt, 0, "no resolver ran");
+        assert_eq!(settled.started_at, None);
+        assert!(tl.failures().is_empty(), "a requested repeat is not a failure");
+        assert!(tl.squashes().is_empty());
+        assert_eq!(tl.future_len(), 0);
+    }
+
+    /// A requested repeat with no earlier phrase by its performer is silence,
+    /// still settled as requested, even when the playhead jumps past its tick.
+    #[test]
+    fn a_requested_repeat_without_a_phrase_is_silence() {
+        let mut tl = timed_timeline();
+        let track = TrackId::solo();
+        let other = PrincipalId::new();
+        tl.schedule(Cell::deferred_on(Span::instant(Tick::new(3)), Recipe {
+            resolver: ResolverId::new("timed"), params: serde_json::json!({ "compute_ms": 700 }),
+            query: ContextQuery::default(), fallback: Fallback::Skip,
+        }, track.clone(), other)).unwrap();
+        step_to(&mut tl, 3);
+        let id = tl.request_fallback(Span::instant(Tick::new(8)), track, PrincipalId::new(), Fallback::UseLastGood).unwrap();
+        tl.advance_to(Tick::new(30));
+        assert!(committed_at(&tl, 8).is_empty(), "silence");
+        assert_eq!(tl.status(id).unwrap().disposition, Some(Disposition::Fallback {
+            reason: FallbackReason::Requested, policy: Fallback::UseLastGood, content: None,
+        }));
+        assert!(tl.failures().is_empty());
+        assert_eq!(tl.cost_samples(&ResolverId::new("timed")).count(), 1, "only the played phrase was measured");
+        assert_eq!(tl.measured_cost(&ResolverId::new("timed"), other), Some(Duration::from_millis(700)));
+    }
+
+    /// A requested repeat takes a capacity slot like admitted work, may not
+    /// be placed at or behind the playhead, and is not open work.
+    #[test]
+    fn a_requested_repeat_takes_capacity_and_is_not_open_work() {
+        let mut tl = Timeline::with_capacity(TickClock::default(), std::num::NonZeroUsize::new(2).unwrap());
+        tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+        let track = TrackId::solo();
+        let me = PrincipalId::new();
+        tl.advance_to(Tick::new(5));
+        assert!(matches!(
+            tl.request_fallback(Span::instant(Tick::new(5)), track.clone(), me, Fallback::UseLastGood),
+            Err(ScheduleError::InThePast { .. })
+        ));
+        tl.request_fallback(Span::instant(Tick::new(9)), track.clone(), me, Fallback::UseLastGood).unwrap();
+        assert_eq!(tl.open_work(me), 0, "a requested repeat is not open work");
+        tl.schedule(deferred_by(12, Fallback::Skip, track.clone(), me)).unwrap();
+        assert_eq!(tl.open_work(me), 1);
+        assert_eq!(tl.open_work(PrincipalId::new()), 0);
+        assert!(matches!(
+            tl.request_fallback(Span::instant(Tick::new(16)), track, me, Fallback::UseLastGood),
+            Err(ScheduleError::AtCapacity(2))
+        ));
     }
 
     fn concrete_hash(bytes: &[u8]) -> ContentHash {
@@ -1048,6 +1294,30 @@ mod tests {
 
     /// Squash with no recovery budget → the required fallback fires. The miss is
     /// recorded with predicted ≠ actual.
+    #[test]
+    fn the_squash_ledger_keeps_the_newest_events() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        });
+        let event = |attempt| SquashEvent {
+            work_id: WorkId(uuid::Uuid::nil()),
+            attempt,
+            at: Tick::new(0),
+            start: Tick::new(1),
+            predicted: ContextHash::of(b"A"),
+            actual: ContextHash::of(b"B"),
+            recovery: Recovery::FellBack,
+        };
+        for attempt in 0..(HISTORY_LIMIT as u32 + 44) {
+            tl.record_squash(event(attempt));
+        }
+        assert_eq!(tl.squashes().len(), HISTORY_LIMIT);
+        assert_eq!(tl.squashes()[0].attempt, 44, "the oldest events are dropped");
+        assert_eq!(tl.squashes()[HISTORY_LIMIT - 1].attempt, HISTORY_LIMIT as u32 + 43);
+    }
+
     #[test]
     fn squashes_and_falls_back_when_no_budget() {
         let clock = TickClock {
@@ -1283,8 +1553,8 @@ mod tests {
                 producer,
             )).unwrap();
 
-            // The failed producer reports now, but another producer can still
-            // supply the lane's last good phrase before this commitment.
+            // The failed producer reports now, but can still supply its own
+            // last good phrase before this commitment.
             tl.advance_to(Tick::new(2));
             assert_eq!(tl.failures().len(), 1);
             assert_eq!(tl.failures()[0].at, Tick::new(2));
@@ -1293,17 +1563,22 @@ mod tests {
             assert!(tl.committed().is_empty());
 
             tl.set_ambient("beat", b"accepted phrase".to_vec());
-            tl.schedule(deferred_at_track(6, Fallback::Skip, track.clone())).unwrap();
+            tl.schedule(deferred_by(6, Fallback::Skip, track.clone(), producer)).unwrap();
             tl.advance_to(Tick::new(6));
             let last_good = match &tl.committed()[0].body {
                 Body::Concrete(content) => content.clone(),
                 _ => panic!("accepted phrase must be concrete"),
             };
+            // A newer phrase by another performer on the same track is not
+            // this producer's last good phrase.
+            tl.set_ambient("beat", b"another performer".to_vec());
+            tl.schedule(deferred_by(8, Fallback::Skip, track.clone(), PrincipalId::new())).unwrap();
+            tl.advance_to(Tick::new(8));
             tl.set_ambient("beat", b"another lane".to_vec());
-            tl.schedule(deferred_at_track(9, Fallback::Skip, TrackId::new("other").unwrap())).unwrap();
+            tl.schedule(deferred_by(9, Fallback::Skip, TrackId::new("other").unwrap(), producer)).unwrap();
             tl.advance_to(Tick::new(9));
             tl.advance_to(Tick::new(10));
-            assert_eq!(tl.committed().len(), 2, "no fallback before its deadline");
+            assert_eq!(tl.committed().len(), 3, "no fallback before its deadline");
 
             tl.advance_to(Tick::new(11));
             let expected = match fallback {
@@ -1312,14 +1587,14 @@ mod tests {
                 Fallback::Literal(content) => Some(content),
             };
             if let Some(content) = expected {
-                assert_eq!(tl.committed().len(), 3);
-                let accepted = &tl.committed()[2];
+                assert_eq!(tl.committed().len(), 4);
+                let accepted = &tl.committed()[3];
                 assert_eq!(accepted.span.start, Tick::new(12));
                 assert_eq!(accepted.body, Body::Concrete(content));
                 assert_eq!(accepted.track, track);
                 assert_eq!(accepted.played_by, PrincipalId::beat());
             } else {
-                assert_eq!(tl.committed().len(), 2);
+                assert_eq!(tl.committed().len(), 3);
             }
             assert_eq!(tl.future_len(), 0);
             let committed = tl.committed().to_vec();

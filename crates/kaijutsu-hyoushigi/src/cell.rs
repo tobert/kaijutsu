@@ -36,7 +36,8 @@ pub struct ContextQuery {
 pub enum Fallback {
     /// Emit nothing — the playhead passes a hole.
     Skip,
-    /// Reuse the last committed content of this lane.
+    /// Repeat the latest content this cell's performer (`played_by`)
+    /// committed on this lane, or emit nothing when there is none.
     UseLastGood,
     /// A pre-baked literal, always available.
     Literal(ContentRef),
@@ -121,15 +122,17 @@ pub struct Cell {
     /// track-less cell is corruption, and the codec should say so when cell
     /// persistence lands.
     ///
-    /// LANE IDENTITY ONLY. `track` is the *only* lane key; `played_by` (the
-    /// scheduling principal) is never a lane key — one track's cells span
-    /// multiple principals (player + `beat()` fallbacks).
+    /// LANE IDENTITY ONLY. `track` is the *only* lane key; `played_by` is never
+    /// a lane key — one track's cells span several performers and the
+    /// `beat()` fallbacks.
     pub track: TrackId,
     /// Who played: the principal whose turn produced this content, or
     /// [`PrincipalId::beat()`] when the transport itself did (fallback repeats,
     /// literals). Becomes `BlockId.principal_id` at materialization. This is
     /// provenance, **not** a lane key — attributing a vamp-insurance repeat to a
-    /// player would be false provenance.
+    /// player would be false provenance. Within a lane, `UseLastGood` repeats
+    /// only cells the falling-back cell's own performer played, so a `beat()`
+    /// copy is never the source of a performer's repeat.
     pub played_by: PrincipalId,
 }
 
@@ -167,10 +170,6 @@ impl Cell {
             played_by,
         }
     }
-
-    pub fn is_deferred(&self) -> bool {
-        matches!(self.body, Body::Deferred(_))
-    }
 }
 
 #[cfg(test)]
@@ -197,7 +196,6 @@ mod tests {
             PrincipalId::beat(),
         );
         assert_eq!(c.state, CellState::Committed);
-        assert!(!c.is_deferred());
     }
 
     #[test]
@@ -209,7 +207,6 @@ mod tests {
             PrincipalId::beat(),
         );
         assert_eq!(c.state, CellState::Pending);
-        assert!(c.is_deferred());
     }
 
     #[test]

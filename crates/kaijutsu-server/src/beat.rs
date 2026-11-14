@@ -5,12 +5,12 @@
 //! something drives its playhead. This module is that driver on the kernel side
 //! — the wall-clock timer the doc says is "the kernel/client integrator's job."
 //! It runs **one** task for the whole server (not a timer per context): a
-//! min-heap of `(wake_instant, ContextId)` plus a message ingress, driven by a
-//! single `select!`. A context holds a heap entry only while its clock is
-//! **playing**; a stopped/paused context (and every coder) has none — quiescent,
-//! zero cost.
+//! min-heap of `(wake_instant, TrackId, generation)` plus a message ingress,
+//! driven by a single `select!`. The clock is per **track**: a track holds a
+//! heap entry only while it is **playing**; a stopped or paused track (and every
+//! coder, which attaches to none) has none — quiescent, zero cost.
 //!
-//! **The context tick is event-counted.** While playing, each beat advances the
+//! **The track tick is event-counted.** While playing, each beat advances the
 //! playhead by exactly [`STEP`] via `advance_to(playhead + STEP)` — *not* from
 //! wall-clock elapsed. So a pause freezes musical time and a resume picks up at
 //! +1, with no catch-up: the kernel can run 24×7 and keep its scheduler alive
@@ -18,11 +18,12 @@
 //! There is **no rewind** — the playhead is forward-only (the write barrier);
 //! revisiting the past is an *export* of committed content, not a transport seek.
 //!
-//! Two switches per context: the **clock** (`playing`) and the **OODA-arm**
-//! (`ooda_armed`). Every beat the scheduler advances the playhead and bridges any
-//! freshly-committed cells into the block log ([`materialize_committed`]); every
-//! `ooda_every` beats — and only when `playing && ooda_armed` — it fires the
-//! `tick` rc verb (`kj drive`) to request the next OODA turn, spawned
+//! Two switches: the track's **clock** (`playing`) and each attachment's
+//! **OODA-arm** (`ooda_armed`). Every beat the scheduler advances the playhead
+//! and bridges any freshly-committed cells into the score context's block log
+//! (`materialize_track`); every [`Attachment::wakeup`] beats — and only when
+//! `playing && ooda_armed` — it fires the `tick` rc verb to request the next
+//! OODA turn, spawned
 //! fire-and-forget so the single driver never blocks (the model turn runs on the
 //! kernel worker, never here).
 
@@ -40,7 +41,7 @@ use kaijutsu_kernel::flows::BlockFlow;
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ClockKind,
     ContentRef, DeriverRegistry, MaterializeCursor, ResolverId, Span, TickClock, TrackSnapshot,
-    WorkStatus, materialize_committed,
+    materialize_committed,
 };
 use kaijutsu_kernel::kernel_db::{
     ContextRow, DEFAULT_HYDRATION_WINDOW, PersistedAttachment, PersistedTrack,
@@ -86,7 +87,7 @@ const GRID_RESEED_AFTER_PERIODS: u32 = 2;
 
 /// The local instant at which a committed cell starting at `start` should render,
 /// given the beat's jitter-free scheduled fire instant (`base`), the live beat
-/// `period`, and the current `playhead` (Stage 3 WI 4). A cell commits AHEAD of
+/// `period`, and the current `playhead`. A cell commits AHEAD of
 /// the playhead (the speculation lead), so `start ≥ playhead` → the instant is in
 /// the near future. A late or out-of-order `start` behind the playhead clamps to
 /// `base` (offset 0): a render is NEVER scheduled into the past (the `next_fire`
@@ -96,12 +97,12 @@ fn render_instant(base: Instant, period: Duration, start: Tick, playhead: Tick) 
     base + period * offset_beats
 }
 
-/// A track's beat bookkeeping — the **clock domain** (`docs/tracks.md`, Stage 1).
+/// A track's beat bookkeeping — the **clock domain** (`docs/tracks.md`, "The track entity").
 /// The clock + playhead live HERE now, not on any one context's timeline: the
 /// track persists, contexts attach to be beaten by it and come and go. Keyed by
 /// [`TrackId`] in the scheduler's `tracks` map.
 struct TrackState {
-    /// The track's clock source — what drives *when* it beats (Stage 3). The
+    /// The track's clock source — what drives *when* it beats. The
     /// SINGLE source of truth for the live beat period; `set_tempo` mutates it and
     /// every period read goes through `clock.period()`, so there is no second,
     /// stale copy. `SystemClock`-only this stage; `Modeled` (MIDI drift) lands at
@@ -126,8 +127,7 @@ struct TrackState {
     /// Musical time, **owned by the track** (moved off the per-context Timeline).
     /// Event-counted: advances one [`STEP`] per beat while playing; a pause freezes
     /// it and a resume picks up at +1, no wall-clock catch-up. Forward-only. Each
-    /// beat the attached contexts' timelines are slewed to this value (Stage-1
-    /// bridge — Stage 2 dissolves the per-context timeline into the track's score).
+    /// beat the attached contexts' timelines are slewed to this value.
     playhead: Tick,
     /// Beats elapsed *while playing* — drives the wakeup/phrase/rotate cadences.
     /// Frozen across a pause, like the playhead.
@@ -171,7 +171,7 @@ struct TrackState {
     /// [`fire_due`] right after the pop — BEFORE `process_track`/`materialize_track`
     /// run. This is the jitter-free reference a render target schedules off: NOT
     /// the `SystemTime`-derived `last_epoch_ns` (the jittery *actual* wakeup), so
-    /// per-beat scheduler jitter never accumulates into the output (Stage 3 review).
+    /// per-beat scheduler jitter never accumulates into the output.
     /// Init'd to `now` at create; overwritten on the first beat before any emit.
     last_fire_scheduled: Instant,
 }
@@ -250,11 +250,8 @@ fn poison_action(failures: u32) -> PoisonAction {
 /// lifecycle folds into the kaish env (referenced as `$TICK` / `$PHRASE` /
 /// `$TEMPO` in `S10-drive.kai`).
 ///
-/// `$HEARD` — the windowed look-back at sibling tracks' recent phrases — is
-/// deliberately NOT here. It's a **pull** (a kaish read of the committed past,
-/// built when a second player makes it load-bearing), not a var pushed every
-/// turn. Slice one is a solo bass: its own hydrated history is its continuity.
-/// (Design: `docs/chameleon.md`, transport report.)
+/// `$HEARD`, the windowed look-back at the track's recent phrases, is not one
+/// of these three: `transport_env` seeds it from the track's score context.
 ///
 /// Pure so the formatting is unit-testable without a live scheduler.
 fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(String, String); 3] {
@@ -275,7 +272,8 @@ fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(Str
 /// The performer's measured cost, for the `tick` rc script to plan its target:
 /// `KJ_COST_MS` (whole milliseconds), `KJ_LEAD_BEATS` (the beats the clock gives
 /// that cost times its safety factor, rounded up as `Timeline::schedule` rounds
-/// a lead) and `KJ_OPEN_WORK` (the performer's unsettled work on the track).
+/// a lead) and `KJ_OPEN_WORK` (the performer's unsettled resolver work on the
+/// track; a requested repeat is not counted).
 /// Cost and lead are 0 when the performer has no measured sample.
 fn cost_vars(
     measured: Option<Duration>, open_work: usize, clock: &TickClock,
@@ -288,11 +286,6 @@ fn cost_vars(
         ("KJ_LEAD_BEATS".to_string(), lead.to_string()),
         ("KJ_OPEN_WORK".to_string(), open_work.to_string()),
     ]
-}
-
-/// The work items `performer` has admitted that no disposition has settled.
-fn open_work(statuses: &[WorkStatus], performer: PrincipalId) -> usize {
-    statuses.iter().filter(|s| s.played_by == performer && s.settled_at.is_none()).count()
 }
 
 /// How many phrases of recent committed notation `$HEARD` carries. Covers the
@@ -372,7 +365,7 @@ pub struct BeatOutcome {
     /// boundary is a position in musical time, not a turn-firing decision.
     pub phrase_due: Vec<ContextId>,
     /// Contexts that hit a rotate horizon this wake. The scheduler has ALREADY
-    /// `stop`ped each one synchronously (so no further tick can fire for it); the
+    /// detached each one synchronously (so no further tick can fire for it); the
     /// run loop fires the `rotate` rc lifecycle for them. A rotating context
     /// appears here and NOT in `ooda_due`/`phrase_due` (it retired this beat).
     pub rotate_due: Vec<ContextId>,
@@ -489,7 +482,7 @@ impl BeatScheduler {
     }
 
     /// Reconstruct a track's committed cell log from its score context's materialized
-    /// ABC source blocks (Stage 2 WI 7, approach b) — so a freshly-(re)armed track
+    /// ABC source blocks — so a freshly-(re)armed track
     /// timeline can rehydrate its `UseLastGood` pool across a restart without a
     /// separate cell-log table. Only the ABC *source* cells are committed Concrete
     /// cells (the MIDI sibling is derived at the barrier, never committed); the
@@ -565,11 +558,14 @@ impl BeatScheduler {
     /// overwrites committed history, so fail loud and let the caller retry (crash
     /// over corruption, per CLAUDE.md).
     ///
-    /// CONSTRAINT (design §11.5): we seed the playhead tick but deliberately do NOT
-    /// seed the fallback pool from the persisted log — the Timeline's committed Vec
-    /// (the `UseLastGood` candidate pool) is born empty so a fresh/re-attached track
-    /// resolves `UseLastGood` to Skip until its first good phrase. No silent
-    /// warm-restart vamping (crash/silence over corruption).
+    /// Creating a track rehydrates its committed log (the `UseLastGood` pool)
+    /// from the score context's ABC blocks (`reconstruct_score_cells`); each
+    /// restored cell keeps the principal that played it, so last-good stays
+    /// scoped to its performer across a restart.
+    ///
+    /// A track holds one live context per performer: attaching a second live
+    /// context of the same character is refused before any state changes
+    /// (`refuse_a_second_context_of_one_performer`).
     pub fn attach(
         &mut self,
         track_id: TrackId,
@@ -577,6 +573,8 @@ impl BeatScheduler {
         attachment: Attachment,
         policy: BeatPolicy,
     ) -> Result<(), String> {
+        // Before any state changes: one live context per performer per track.
+        self.refuse_a_second_context_of_one_performer(&track_id, context_id)?;
         // Enforce one track per context (the `context_track` reverse index is 1:1).
         // If this context is already attached to a DIFFERENT track, MOVE it: detach
         // from the old track (live) and delete that stale persisted attachment row —
@@ -632,10 +630,10 @@ impl BeatScheduler {
                 },
                 None => policy,
             };
-            // Reconstruct the clock SOURCE from the persisted `clock_kind` (Stage 3
-            // WI 3) — a track slaved to MIDI must re-arm as that driver, not silently
-            // revert to the system clock. M1 only builds "system"; a "modeled" row
-            // crashes loud (from_persisted). A fresh track defaults to the system clock.
+            // Reconstruct the clock SOURCE from the persisted `clock_kind` — a track slaved to MIDI
+            // must re-arm as that driver, not silently revert to the system clock.
+            // `from_persisted` restores "system" and "modeled" and fails loud on any
+            // other value. A fresh track defaults to the system clock.
             // Computed BEFORE any side effect (the score-context mint below) so a
             // corrupt clock_kind fails the attach clean, with no half-created state.
             let active_clock = match persisted.as_ref() {
@@ -762,6 +760,44 @@ impl BeatScheduler {
             }
         }
 
+        Ok(())
+    }
+
+    /// Refuse to attach `context_id` while another live context with the same
+    /// performer is attached to `track_id`. Work, measured cost,
+    /// `KJ_OPEN_WORK` and last-good are keyed by performer, so the two would
+    /// be indistinguishable: one's open work would make the other skip its
+    /// tick. Reads the scheduler's live attachments, not the persisted rows: a
+    /// plain detach keeps the row, and the page turn detaches the predecessor
+    /// before its successor (the same performer) attaches. An archived context
+    /// is not live. A context with no performer is not restricted.
+    fn refuse_a_second_context_of_one_performer(&self, track_id: &TrackId, context_id: ContextId) -> Result<(), String> {
+        let Some(track) = self.tracks.get(track_id) else {
+            return Ok(());
+        };
+        let db = self.kernel.kernel_db().lock();
+        let read = |context: ContextId| {
+            db.get_context(context)
+                .map_err(|e| format!("beat: attach to {}: reading context {context}: {e}", track_id.as_str()))
+        };
+        let Some(performer) = read(context_id)?.and_then(|row| row.performer) else {
+            return Ok(());
+        };
+        for &other in track.attached.keys().filter(|&&other| other != context_id) {
+            let Some(row) = read(other)? else { continue };
+            if row.performer == Some(performer) && !row.is_archived() {
+                let name = db.get_character(performer).ok().flatten()
+                    .map_or_else(|| performer.to_string(), |sheet| sheet.name);
+                return Err(format!(
+                    "context {} was not attached to track '{}': context {} of the same character ({name}) \
+                     is already attached there, and one character's work, cost and last good phrase on a \
+                     track are shared, so one context's open work would make the other skip its tick. \
+                     Use a different character for each chair (`kj character create drummer --model \
+                     <backend>/<model> --rc musician`), or detach {} first",
+                    context_id.short(), track_id.as_str(), other.short(), other.short()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -897,7 +933,7 @@ impl BeatScheduler {
     /// speculation lead means a sink's device queue holds ~a phrase of FUTURE
     /// events; the clock stopping won't unschedule them, so a flush cue tells
     /// every attached wire sink to truncate everything after `now` + silence
-    /// sounding notes (Stage 3 review SEV-1) — otherwise a hold would play out
+    /// sounding notes — otherwise a hold would play out
     /// the buffered phrase and leave notes hanging.
     ///
     /// `pause` and `stop` are the same clock-domain operation under two
@@ -961,7 +997,7 @@ impl BeatScheduler {
     /// carries over — a track slaved mid-song keeps its tempo until the first
     /// reference arrives, and un-slaving freezes the last modeled tempo into
     /// the system clock. Persisted (`clock_kind` is mutable over a track's
-    /// life, Stage 3 lock); a same-kind set is an idempotent no-op.
+    /// life); a same-kind set is an idempotent no-op.
     pub fn set_clock(&mut self, track_id: &TrackId, kind: ClockKind) {
         if let Some(track) = self.tracks.get_mut(track_id) {
             let period = track.clock.period();
@@ -1085,9 +1121,9 @@ impl BeatScheduler {
     /// `attachments` row: the rotate page-turn relies on the child inheriting the
     /// parent's binding via the fork-copy of that row (automatic in
     /// `insert_forked_context`), so deleting it here would break inheritance.
-    /// Persisted-row cleanup belongs to context archival (not wired in Stage 1).
+    /// The row is removed only by `delete`.
     ///
-    /// Stage 2: detach does NOT touch the TRACK timeline — the clock + score live on
+    /// Detach does NOT touch the TRACK timeline — the clock + score live on
     /// the track and outlive any producer (continuity is free; that's the whole
     /// point). The track timeline is dropped only on track teardown (`delete`,
     /// below — the first and only wired teardown path).
@@ -1355,7 +1391,7 @@ impl BeatScheduler {
             };
             // Latch the SCHEDULED fire instant BEFORE processing — this is the
             // jitter-free reference the render seam schedules off, not the late
-            // actual wakeup `now` (Stage 3 review, deepseek). Lateness within the cap
+            // actual wakeup `now`. Lateness within the cap
             // pops the next entry immediately in this SAME while-loop pass (bounded
             // catch-up); a re-seed pushes past `now` and breaks the loop.
             if let Some(tr) = self.tracks.get_mut(&track_id) {
@@ -2083,8 +2119,7 @@ impl BeatScheduler {
     /// Snapshot the transport heartbeat for `ctx` — `KJ_TICK`/`KJ_PHRASE`/`KJ_TEMPO`
     /// plus `KJ_HEARD`, `KJ_PULSE`, `KJ_EPOCH_NS`, the performer's `KJ_COST_MS`,
     /// `KJ_LEAD_BEATS` and `KJ_OPEN_WORK` (see `cost_vars`; all 0 when the context
-    /// has no performer or the track has no timeline), and `KJ_ROTATE_EVERY` when
-    /// it rotates — read NOW, on the scheduler thread with the track + attachment in
+    /// has no performer or the track has no timeline) — read NOW, on the scheduler thread with the track + attachment in
     /// hand, so a spawned lifecycle sees facts coherent with the beat that triggered
     /// it. The position facts come from the TRACK (it owns the clock now). Empty when
     /// the context isn't attached to a track.
@@ -2136,7 +2171,7 @@ impl BeatScheduler {
                 let timeline = timeline.lock();
                 (
                     timeline.measured_cost(&ResolverId::new("model_output"), performer),
-                    open_work(&timeline.statuses(), performer),
+                    timeline.open_work(performer),
                 )
             }
             _ => (None, 0),
@@ -2152,13 +2187,6 @@ impl BeatScheduler {
         // context woken on this beat (the human "when" + the cross-context join key).
         vars.insert("KJ_PULSE".to_string(), ac.attachment.pulse.to_string());
         vars.insert("KJ_EPOCH_NS".to_string(), track.last_epoch_ns.to_string());
-        // KJ_ROTATE_EVERY: the rotate cadence in phrases, when this context rotates.
-        // The cadence now TRAVELS with the fork (the attachment row is fork-copied), so
-        // an inheriting child re-binds with the same cadence by construction; this var
-        // is informational. Absent when the context doesn't rotate.
-        if let Some(c) = ac.attachment.rotate {
-            vars.insert("KJ_ROTATE_EVERY".to_string(), c.every.to_string());
-        }
         vars
     }
 
@@ -2370,8 +2398,8 @@ impl BeatScheduler {
                     for ctx in outcome.ooda_due {
                         self.fire_tick(ctx);
                     }
-                    // Rotate-due contexts were already `stop`ped synchronously in
-                    // fire_due; fire their page-turn lifecycle (fork + arm child).
+                    // Rotate-due contexts were already detached synchronously in
+                    // fire_due; fire their page-turn lifecycle (rotate + re-attach).
                     for ctx in outcome.rotate_due {
                         self.fire_rotate(ctx);
                     }
@@ -2644,6 +2672,8 @@ mod tests {
             g.schedule(cell("stays_open", 500, pa)).unwrap();
             g.schedule(cell("stays_open", 501, pb)).unwrap();
             g.schedule(cell("stays_open", 502, pb)).unwrap();
+            // A requested repeat is not open work.
+            g.request_fallback(Span::instant(Tick::new(503)), track.clone(), pa, Fallback::UseLastGood).unwrap();
         }
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
@@ -2674,6 +2704,68 @@ mod tests {
         assert_eq!(env_b["KJ_COST_MS"], "0", "another performer's sample is not b's");
         assert_eq!(env_b["KJ_LEAD_BEATS"], "0");
         assert_eq!(env_b["KJ_OPEN_WORK"], "2");
+    }
+
+    /// A track holds one live context per performer: work, measured cost,
+    /// `KJ_OPEN_WORK` and last-good are keyed by performer, so two live
+    /// contexts of one character would be indistinguishable. A second one is
+    /// refused with the consequence and the fix; a re-attach, another
+    /// performer, a context with no performer, the page turn's successor after
+    /// the predecessor's detach, and a successor beside an archived
+    /// predecessor are not.
+    #[tokio::test]
+    async fn attach_refuses_a_second_live_context_of_one_performer() {
+        use kaijutsu_kernel::kernel_db::ContextRow;
+        use kaijutsu_types::ContextState;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let context_of = |performer: Option<PrincipalId>| {
+            let context = ContextId::new();
+            documents.create_document(context, DocumentKind::Conversation, None).unwrap();
+            let db = kernel.kernel_db().lock();
+            let creator = performer.unwrap_or_else(PrincipalId::new);
+            let workspace = db.get_or_create_default_workspace(creator).unwrap();
+            db.insert_context_with_document(&ContextRow {
+                context_id: context, label: None, system_prompt: None,
+                context_state: ContextState::Live,
+                created_at: 0, created_by: creator,
+                forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+                demoted_at: None, paused_at: None, origin_host: None,
+                performer: None, senpai_ctx: None, persona: None,
+            }, workspace).unwrap();
+            if performer.is_some() {
+                db.update_performer(context, performer).unwrap();
+            }
+            context
+        };
+        let (bass, keys) = (PrincipalId::new(), PrincipalId::new());
+        let first = context_of(Some(bass));
+        let twin = context_of(Some(bass));
+        let other = context_of(Some(keys));
+        let (probe, capture) = (context_of(None), context_of(None));
+        let track = TrackId::new("band").unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let attach = |sched: &mut BeatScheduler, context| {
+            sched.attach(track.clone(), context, slow_attachment(), slow_policy())
+        };
+
+        attach(&mut sched, first).unwrap();
+        attach(&mut sched, first).expect("a re-attach is idempotent");
+        let refusal = attach(&mut sched, twin).expect_err("a second live context of one performer is refused");
+        assert!(refusal.contains(&first.short()) && refusal.contains("skip its tick")
+            && refusal.contains("kj character create"), "{refusal}");
+        assert_eq!(sched.track_of(twin), None, "a refused context is not attached");
+        attach(&mut sched, other).expect("another performer shares the track");
+        attach(&mut sched, probe).expect("a context with no performer is not restricted");
+        attach(&mut sched, capture).expect("nor is a second one");
+
+        // The page turn detaches the predecessor before its successor attaches.
+        sched.detach(&track, first);
+        attach(&mut sched, twin).expect("the successor attaches after the predecessor's detach");
+        // An archived context left attached is not live.
+        kernel.kernel_db().lock().archive_context(twin).unwrap();
+        attach(&mut sched, first).expect("an archived context of the performer does not block");
     }
 
     /// The poison-cell retry budget: the bridge retries the SAME failing cell up to
@@ -3748,7 +3840,7 @@ mod tests {
         );
     }
 
-    /// WI 3 (Stage 3): re-attach reconstructs the clock SOURCE from the persisted
+    /// Re-attach reconstructs the clock SOURCE from the persisted
     /// `clock_kind`. A `"system"` row re-arms a system clock (no regression). A
     /// `"modeled"` row names a driver M1 can't construct ([`ModeledClock`] is
     /// uninhabited until M3) — `attach` crashes loud rather than silently
@@ -4609,7 +4701,7 @@ mod tests {
         assert_eq!(marker, existing_marker, "attach must not override an existing policy's marker");
     }
 
-    /// Stage 2 increment 2: attaching creates the track's SCORE CONTEXT — a real,
+    /// Attaching creates the track's SCORE CONTEXT — a real,
     /// app-viewable context (so it has a `contexts` row + a document) that is a
     /// NON-producer (never armed for a turn, not attached, not in the reverse
     /// index). A "restart" (a fresh scheduler over the same DB) reuses the persisted
@@ -4655,7 +4747,7 @@ mod tests {
         );
     }
 
-    /// Stage 2 WI 7b: on a (re-)arm the track's committed log is rehydrated from its
+    /// On a (re-)arm the track's committed log is rehydrated from its
     /// score context's materialized ABC blocks, so `UseLastGood` survives a restart —
     /// AND the materialize cursor starts PAST the rehydrated cells so they are never
     /// re-emitted (no duplicate score, no DuplicateBlock).
@@ -4714,6 +4806,8 @@ mod tests {
             1,
             "the prior ABC phrase rehydrated into the committed log; the MIDI sibling is excluded"
         );
+        assert_eq!(tl.lock().committed()[0].played_by, player,
+            "a restored phrase keeps its performer, so last-good stays scoped to it after a restart");
 
         // The cursor starts past it: a beat must NOT re-materialize the rehydrated cell
         // (the score context keeps exactly its one ABC block).
@@ -5215,7 +5309,7 @@ mod tests {
         assert_eq!(errors_in(lost_found).len(), 1, "the stuck failure moves exactly once");
     }
 
-    /// Stage 2 concurrent producers: two contexts share ONE track timeline, each
+    /// Two contexts share ONE track timeline, each
     /// producing under its own principal. When each one's cell fails, the shared
     /// failure ledger routes the Error block to the PRODUCING context's conversation
     /// (matched by `played_by`) — a player reads its OWN failure, never a sibling's.
@@ -5415,7 +5509,7 @@ mod tests {
         );
     }
 
-    /// Stage 3 WI 4: the `at` arithmetic in isolation. A cell starting `n` beats
+    /// The `at` arithmetic in isolation. A cell starting `n` beats
     /// ahead of the playhead renders `n × period` after the jitter-free base; a
     /// cell at or behind the playhead clamps to the base (never the past).
     #[test]
@@ -5555,8 +5649,7 @@ mod tests {
     }
 
     /// `stop` halts ONE track's clock and leaves a sibling track beating — two
-    /// independent clock domains (the myaku "metrics keep sampling while music
-    /// pauses" property is just two tracks).
+    /// independent clock domains.
     #[tokio::test]
     async fn stop_halts_one_track_leaves_sibling_running() {
         let (kernel, documents) = fresh_kernel_and_docs().await;

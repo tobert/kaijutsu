@@ -68,9 +68,20 @@ pub(crate) mod millis {
 #[serde(rename_all = "snake_case")]
 pub enum Readiness { Queued, Running, Ready, Failed }
 
+/// Why an item settled through its declared fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FallbackReason { ResolveFailed, InvalidBasis, DeadlineMissed }
+pub enum FallbackReason {
+    /// The resolver returned an error.
+    ResolveFailed,
+    /// The basis changed before commitment and no retry remained.
+    InvalidBasis,
+    /// The work was not ready by its intended start.
+    DeadlineMissed,
+    /// The item asked for its fallback and ran no resolver
+    /// ([`Timeline::request_fallback`](crate::Timeline::request_fallback)).
+    Requested,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -94,7 +105,8 @@ pub struct WorkStatus {
     #[serde(rename = "estimate_ms", with = "millis")]
     pub estimate_wall: Duration,
     /// The tick preparation was planned to begin: the estimate's lead before
-    /// `start`, or admission for work that prepares at once.
+    /// `start`, or admission for work that prepares at once. A requested
+    /// fallback prepares nothing; this is the commitment it settles at.
     pub prepare_at: Tick,
     pub attempt: u32,
     pub started_at: Option<Tick>,

@@ -924,10 +924,23 @@ async fn create_musician_with_env(
     kaijutsu_client::context_id_from_create_result(&result).unwrap_or_else(|e| panic!("create {label}: {e}"))
 }
 
-/// Two musicians made from the one shipped `musician` rc directory sit on one
-/// band track: `KJ_BAND` names the track and `KJ_CHAIR` the chair, bass when
-/// unset. An unknown chair is an Error block that names it and the chairs that
-/// exist. The page turn keeps the chair and the band.
+/// Create the character `name` with the shipped `musician` rc directory from
+/// the kernel's only root context, as `kj character create` does for a chair.
+async fn musician_character(kj: &KernelHandle, name: &str) -> String {
+    let contexts = kj.list_contexts().await.unwrap();
+    let root = kaijutsu_client::choose_parent(None, &contexts).unwrap();
+    let argv = ["character", "create", name, "--rc", "musician"].map(String::from).to_vec();
+    let result = kj.execute_kj_quiet(root.context_id, &argv).await.unwrap();
+    assert_eq!(result.exit_code, 0, "kj character create {name}: {}", result.stderr);
+    name.to_string()
+}
+
+/// Two musicians made from the one shipped `musician` rc directory, each
+/// played by its own character, sit on one band track: `KJ_BAND` names the
+/// track and `KJ_CHAIR` the chair, bass when unset. A second live context of
+/// a character already on the track is refused, naming the consequence and
+/// the fix. An unknown chair is an Error block that names it and the chairs
+/// that exist. The page turn keeps the chair and the band.
 #[test]
 fn two_musicians_share_a_band_track_with_their_own_chairs() {
     run_local(async {
@@ -935,6 +948,7 @@ fn two_musicians_share_a_band_track_with_their_own_chairs() {
         let client = connect_client(addr).await;
         let (kj, _) = client.bind_kernel().await.unwrap();
         let performer = common::rc_performer(&kj, "musician").await.unwrap();
+        let drummer = musician_character(&kj, "drummer").await;
         let bass_chair = include_str!("../../../assets/defaults/rc/musician/chairs/bass.md");
         let drums_chair = include_str!("../../../assets/defaults/rc/musician/chairs/drums.md");
         let blocks_of = |context: ContextId| server.documents.block_snapshots(context).unwrap();
@@ -945,7 +959,7 @@ fn two_musicians_share_a_band_track_with_their_own_chairs() {
 
         let bass = create_musician_with_env(&kj, &performer, "bass", &["KJ_BAND=band"]).await;
         let band_before = server.kernel_db.lock().get_track("band").unwrap().expect("the band track exists");
-        let drums = create_musician_with_env(&kj, &performer, "drums", &["KJ_BAND=band", "KJ_CHAIR=drums"]).await;
+        let drums = create_musician_with_env(&kj, &drummer, "drums", &["KJ_BAND=band", "KJ_CHAIR=drums"]).await;
 
         assert!(has_chair(bass, bass_chair), "no KJ_CHAIR plays bass");
         assert!(!has_chair(bass, drums_chair), "bass carries no drum chair");
@@ -963,20 +977,72 @@ fn two_musicians_share_a_band_track_with_their_own_chairs() {
             "a second attachment leaves the track's clock alone");
         assert_eq!(server.kernel_db.lock().list_tracks().unwrap().len(), 1, "one track, not one per label");
 
+        // A second live context of bass's character on the band is refused:
+        // the attach fails loudly and says why and what to do instead.
+        let twin = create_musician_with_env(&kj, &performer, "twin", &["KJ_BAND=band"]).await;
+        let errors: Vec<String> = blocks_of(twin).into_iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect();
+        assert!(errors.iter().any(|e| e.contains("not attached to track 'band'") && e.contains(&bass.short())
+                && e.contains("skip its tick") && e.contains("kj character create")),
+            "the refusal names the context already there, the consequence and the fix: {errors:?}");
+        assert!(track_of(twin).is_empty(), "the refused context has no attachment row");
+        let live = kj.list_tracks().await.unwrap();
+        let band = live.iter().find(|t| t.id.as_str() == "band").expect("the band track is live");
+        assert!(!band.attached.contains(&twin) && band.attached.contains(&bass) && band.attached.contains(&drums),
+            "only bass and drums are attached: {:?}", band.attached);
+
         // An unknown chair fails the chair script loudly and names the choices.
-        let kazoo = create_musician_with_env(&kj, &performer, "kazoo", &["KJ_BAND=band", "KJ_CHAIR=kazoo"]).await;
+        let kazoo = create_musician_with_env(&kj, &drummer, "kazoo", &["KJ_CHAIR=kazoo"]).await;
         let errors: Vec<String> = blocks_of(kazoo).into_iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect();
         assert!(errors.iter().any(|e| e.contains("kazoo") && e.contains("bass") && e.contains("drums")),
             "an unknown chair is an Error block naming it and the chairs that exist: {errors:?}");
         assert!(!has_chair(kazoo, bass_chair) && !has_chair(kazoo, drums_chair), "an unknown chair seats no chair");
 
-        // The page turn carries the env: the successor keeps the chair and the band.
+        // A plain `kj context rotate` carries the env: the successor keeps the
+        // chair and the band. The predecessor leaves the track before the
+        // successor, played by the same character, attaches.
         common::context_verb(&kj, "rotate", drums, &[]).await;
         let successor = kj.list_contexts().await.unwrap().into_iter()
             .find(|row| row.label == "drums" && !row.archived && row.id != drums).expect("a live successor").id;
         assert!(has_chair(successor, drums_chair), "the successor plays drums");
         assert!(!has_chair(successor, bass_chair));
         assert_eq!(track_of(successor), vec!["band".to_string()], "the successor re-attaches to the band");
+        let live = kj.list_tracks().await.unwrap();
+        let band = live.iter().find(|t| t.id.as_str() == "band").unwrap();
+        assert!(band.attached.contains(&successor) && !band.attached.contains(&drums),
+            "the successor, not its predecessor, is live on the band: {:?}", band.attached);
+        let errors: Vec<String> = blocks_of(successor).into_iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect();
+        assert!(errors.is_empty(), "the successor's create lifecycle raised no error: {errors:?}");
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+/// Archiving an attached context removes it from the scheduler's live
+/// attachments, so another context of the same character can take its chair.
+#[test]
+fn archiving_an_attached_musician_frees_its_chair_on_the_track() {
+    run_local(async {
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let performer = common::rc_performer(&kj, "musician").await.unwrap();
+        let errors_of = |context: ContextId| -> Vec<String> {
+            server.documents.block_snapshots(context).unwrap().into_iter()
+                .filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect()
+        };
+        let live_on_band = || async {
+            let live = kj.list_tracks().await.unwrap();
+            live.iter().find(|t| t.id.as_str() == "band").map(|t| t.attached.clone()).unwrap_or_default()
+        };
+
+        let first = create_musician_with_env(&kj, &performer, "first", &["KJ_BAND=band"]).await;
+        assert!(live_on_band().await.contains(&first), "the first musician is live on the band");
+
+        common::context_verb(&kj, "archive", first, &["--confirm"]).await;
+        assert!(!live_on_band().await.contains(&first), "an archived context leaves the live attachments");
+
+        let second = create_musician_with_env(&kj, &performer, "second", &["KJ_BAND=band"]).await;
+        assert!(errors_of(second).is_empty(), "the freed chair is taken without a refusal: {:?}", errors_of(second));
+        assert!(live_on_band().await.contains(&second), "the second musician is live on the band");
         server.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
@@ -1002,17 +1068,35 @@ async fn run_shipped_tick(
     vars
 }
 
+/// Poll the timeline at its own playhead, without advancing it, until `work`
+/// is ready: the model turn's output is prepared off the beat path.
+async fn wait_until_ready(timeline: &kaijutsu_kernel::hyoushigi::SharedTimeline, work: kaijutsu_hyoushigi::WorkId) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            {
+                let mut timeline = timeline.lock();
+                let at = timeline.playhead();
+                timeline.advance_to(at);
+                if timeline.status(work).unwrap().readiness == kaijutsu_hyoushigi::Readiness::Ready { return; }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the phrase is prepared before its deadline");
+}
+
 /// A performer slower than one phrase is planned for by what it measured: after
 /// a missed deadline the shipped tick script targets two phrases ahead and the
 /// work shows the estimate, and a tick that fires while that performer's work is
-/// still open admits nothing.
+/// still open admits nothing. Each phrase before the target gets a requested
+/// repeat (`KJ_UNCOVERED` unset means `repeat`), which the transport plays as
+/// a copy of the performer's last phrase.
 #[test]
 fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
     run_local(async {
-        use kaijutsu_hyoushigi::{WorkStatus};
+        use kaijutsu_hyoushigi::{Disposition, FallbackReason, WorkStatus};
         use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
         use kaijutsu_server::beat::BeatScheduler;
-        use kaijutsu_types::TrackId;
+        use kaijutsu_types::{ContentType, TrackId};
         let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let (kj, _) = client.bind_kernel().await.unwrap();
@@ -1039,13 +1123,26 @@ fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
 
         let commits = || server.documents.block_snapshots(context).unwrap().into_iter()
             .filter(|block| block.content.starts_with("Commit at tick ")).count();
+        let score = server.kernel_db.lock().get_track(track.as_str()).unwrap().unwrap().score_context_id.unwrap();
 
-        // A tick with no measurement targets one phrase ahead. The turn waits on
-        // the conversation lock, so the work misses its deadline.
+        // A phrase the performer plays in time; a repeat later copies it.
+        let warm = run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert_eq!(warm["KJ_COST_MS"], "0");
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        let warm_work = timeline.lock().statuses()[0].id;
+        wait_until_ready(&timeline, warm_work).await;
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        assert!(matches!(timeline.lock().status(warm_work).unwrap().disposition, Some(Disposition::Committed { .. })));
+
+        // A tick with a lead under one phrase targets one phrase ahead. The turn
+        // waits on the conversation lock, so the work misses its deadline.
         let session = server.kernel.turns().conversations().get_or_create(context);
         let held = session.lock().await;
         let first = run_shipped_tick(&server, &scheduler, context, performer).await;
-        assert_eq!(first["KJ_COST_MS"], "0");
+        assert!(first["KJ_LEAD_BEATS"].parse::<i64>().unwrap() < 4, "{first:?}");
         assert_eq!(first["KJ_OPEN_WORK"], "0");
         let first_tick: i64 = first["KJ_TICK"].parse().unwrap();
         assert_eq!(timeline.lock().future_len(), 1);
@@ -1068,11 +1165,13 @@ fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
         assert!(cost_ms > 0 && lead >= 4, "{second:?}");
         assert_eq!(second["KJ_OPEN_WORK"], "0");
         let second_tick: i64 = second["KJ_TICK"].parse().unwrap();
-        let target = second_tick + (lead / 4 + 1) * 4;
+        let phrases = lead / 4 + 1;
+        let target = second_tick + phrases * 4;
         assert!(target >= second_tick + 8);
         assert!(server.documents.block_snapshots(context).unwrap().iter()
             .any(|block| block.content.starts_with(&format!("Commit at tick {target}."))));
-        assert_eq!(timeline.lock().future_len(), 1);
+        assert_eq!(timeline.lock().future_len() as i64, phrases, "the model's work and one repeat per uncovered phrase");
+        assert_eq!(timeline.lock().open_work(performer), 1, "a repeat is not open work");
         assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
         let result = kj.execute_kj_quiet(context, &[
             "transport".into(), "work".into(), "--track".into(), track.as_str().into(),
@@ -1082,6 +1181,13 @@ fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
         let admitted = rows.iter().find(|row| row.start.get() == target).expect("the new work is listed");
         assert!(admitted.estimate_wall > Duration::ZERO, "{admitted:?}");
         assert!(admitted.estimate.get() > 0, "{admitted:?}");
+        let uncovered = second_tick + 4;
+        for at in (1..phrases).map(|i| second_tick + i * 4) {
+            let repeat = rows.iter().find(|row| row.start.get() == at)
+                .unwrap_or_else(|| panic!("a repeat is placed at the uncovered tick {at}: {rows:?}"));
+            assert_eq!(repeat.played_by, performer);
+            assert_eq!(repeat.disposition, None);
+        }
 
         // While that work is open, a tick admits nothing.
         let (statuses, blocks) = (timeline.lock().statuses().len(), commits());
@@ -1090,5 +1196,84 @@ fn a_slow_performer_gets_a_later_target_and_no_second_open_phrase() {
         assert_eq!(timeline.lock().statuses().len(), statuses, "no work admitted");
         assert_eq!(commits(), blocks, "no Commit block written");
         assert!(!server.kernel.turn_in_flight(context));
+
+        // At the uncovered phrase the transport plays the performer's last phrase.
+        while timeline.lock().playhead().get() < uncovered {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        let repeat = timeline.lock().statuses().into_iter().find(|s| s.start.get() == uncovered).unwrap();
+        assert!(matches!(&repeat.disposition, Some(Disposition::Fallback { reason: FallbackReason::Requested, content: Some(_), .. })),
+            "{repeat:?}");
+        let copies: Vec<_> = server.documents.block_snapshots(score).unwrap().into_iter()
+            .filter(|block| block.tick.map(|t| t.get()) == Some(uncovered) && block.content_type == ContentType::Abc)
+            .collect();
+        assert_eq!(copies.len(), 1, "one phrase at the uncovered tick");
+        assert_eq!(copies[0].id.principal_id, PrincipalId::beat(), "the transport played it");
+        assert_eq!(copies[0].content, abc, "a copy of the performer's last phrase");
+        assert!(server.documents.block_snapshots(context).unwrap().iter().all(|b| b.kind != BlockKind::Error),
+            "a requested repeat writes no Error block into the player's context");
+    });
+}
+
+/// `KJ_UNCOVERED=silence` leaves the phrases before a slow performer's target
+/// silent: no repeat is placed. A value other than `repeat` or `silence` fails
+/// the tick script loudly, naming both, even while work is open.
+#[test]
+fn kj_uncovered_silence_places_no_repeat_and_a_bad_value_fails_loudly() {
+    run_local(async {
+        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
+        use kaijutsu_server::beat::BeatScheduler;
+        use kaijutsu_types::TrackId;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "quiet-player").await.unwrap();
+        let performer = PrincipalId::new();
+        assign_turn_identity(&server, context, performer);
+        kj.join_context(context, "quiet-player").await.unwrap();
+        let (callback, mut events) = turn_events_channel(64);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n"))));
+        let track = TrackId::new("quiet-score").unwrap();
+        let mut scheduler = BeatScheduler::new(server.kernel.clone(), server.documents.clone());
+        let mut attachment = Attachment::musician_default();
+        attachment.ooda_armed = false;
+        scheduler.attach(track.clone(), context, attachment, BeatPolicy {
+            period: Duration::from_secs(1), beats_per_phrase: 4,
+        }).unwrap();
+        let timeline = server.kernel.track_timeline(&track).unwrap();
+        let base = tokio::time::Instant::now();
+        scheduler.play(&track, base);
+        common::perform_with_rc_dir(&server, context, "musician");
+        server.kernel_db.lock().set_context_env(context, "KJ_UNCOVERED", "silence").unwrap();
+        let mut beat = 0u64;
+
+        // A missed deadline leaves a measured lead of more than one phrase.
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        run_shipped_tick(&server, &scheduler, context, performer).await;
+        while timeline.lock().future_len() > 0 {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        drop(held);
+        recv_turn_event(&mut events, context).await;
+
+        let vars = run_shipped_tick(&server, &scheduler, context, performer).await;
+        assert!(vars["KJ_LEAD_BEATS"].parse::<i64>().unwrap() >= 4, "{vars:?}");
+        assert_eq!(timeline.lock().future_len(), 1, "only the model's work; the uncovered phrase stays silent");
+        let uncovered = vars["KJ_TICK"].parse::<i64>().unwrap() + 4;
+        assert!(timeline.lock().statuses().iter().all(|s| s.start.get() != uncovered), "no repeat at {uncovered}");
+        recv_turn_event(&mut events, context).await;
+
+        server.kernel_db.lock().set_context_env(context, "KJ_UNCOVERED", "loop").unwrap();
+        let statuses = timeline.lock().statuses().len();
+        run_shipped_tick(&server, &scheduler, context, performer).await;
+        let errors: Vec<String> = server.documents.block_snapshots(context).unwrap().into_iter()
+            .filter(|b| b.kind == BlockKind::Error).map(|b| b.content).collect();
+        assert!(errors.iter().any(|e| e.contains("loop") && e.contains("repeat") && e.contains("silence")),
+            "a bad KJ_UNCOVERED names the value and the two accepted ones: {errors:?}");
+        assert_eq!(timeline.lock().statuses().len(), statuses, "nothing admitted");
     });
 }

@@ -125,14 +125,38 @@ successor, and the successor's `create` rc announces it to the track. The predec
 ### How a musician finds its track
 
 The shipped `musician` `create` rc runs `kj transport attach`. With `KJ_BAND` in
-the context's env it attaches to that track: `kj context create musician --name
-bass --env KJ_BAND=band` and `kj context create musician --name drums --env
-KJ_BAND=band --env KJ_CHAIR=drums` put two players on track `band`, one clock.
-An existing track keeps its clock and policy; the new attachment is added to
-it. Without `KJ_BAND`, a context that already has an attachment row (a rotated
-successor) keeps that track, and a fresh one gets a track named for its label.
-`KJ_BAND`, when set, wins over the row. `KJ_CHAIR` picks the chair text from
+the context's env it attaches to that track. Each chair is played by its own
+character:
+
+```
+kj character create bassist --model <backend>/<model> --rc musician
+kj character create drummer --model <backend>/<model> --rc musician
+kj context create bassist --name bass --env KJ_BAND=band
+kj context create drummer --name drums --env KJ_BAND=band --env KJ_CHAIR=drums
+```
+
+That puts two players on track `band`, one clock. An existing track keeps its
+clock and policy; the new attachment is added to it. Without `KJ_BAND`, a
+context that already has an attachment row (a rotated successor) keeps that
+track, and a fresh one gets a track named for its label. `KJ_BAND`, when set,
+wins over the row. `KJ_CHAIR` picks the chair text from
 `musician/chairs/<name>.md` (`bass` when unset); it does not affect the track.
+
+**One live context per performer on a track.** Work, measured cost
+(`KJ_COST_MS`), `KJ_OPEN_WORK` and last-good are keyed by the performer, so two
+live contexts of one character on one track would be indistinguishable: one's
+open work would make the other skip its tick. `kj transport attach` refuses a
+second one and names the context already there; use a different character
+for each chair. The check reads the scheduler's live attachments, not the
+persisted rows, so the page turn's successor attaches after the scheduler has
+detached its predecessor. An archived context and a context with no
+performer (a probe, an audio capture context) do not count. `kj context rotate`
+detaches the predecessor from every track it is attached to before the
+successor's `create` rc runs, as the rotate horizon does, so a hand-run rotate
+of an attached musician leaves the successor on the track. A detach keeps the
+persisted attachment rows the successor copied. Archiving a context, by any
+verb that archives, detaches it from the live scheduler too; with no scheduler
+wired, nothing is detached and nothing fails.
 
 ### 5. Non-rotating attachments are first-class
 
@@ -215,13 +239,14 @@ convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 |-----|--------|-----|
 | `KJ_TRACK` | attachment's track name | target for `kj drive --track` |
 | `KJ_TICK` | the track's playhead | musical position (frozen off-beat by design) |
-| `KJ_PHRASE` / `KJ_TEMPO` / `KJ_ROTATE_EVERY` | track policy + attachment | cadence facts |
+| `KJ_PHRASE` / `KJ_TEMPO` | track policy + attachment | cadence facts |
 | `KJ_HEARD` | the track's score context | recent committed notation — the **band view**, spanning all producers across rotations |
 | `KJ_PULSE` | per-attachment monotonic counter | ordering key *within a run* (resets on restart — the documented contract, consistent with conversation re-hydration) |
 | `KJ_EPOCH_NS` | wall clock, latched once per beat | human "when" + cross-context join — identical for every context woken on the same beat |
 | `KJ_COST_MS` | the track's timeline, for this context's performer | the largest `queued + compute` among the performer's newest 8 `model_output` samples, in whole milliseconds; a missed deadline counts at its lower bound; `0` with no sample |
 | `KJ_LEAD_BEATS` | `KJ_COST_MS` through the track's clock | beats for the cost times the clock's safety factor (1.5), rounded up as `Timeline::schedule` rounds a lead; `0` with no sample |
-| `KJ_OPEN_WORK` | the track's timeline, for this context's performer | the performer's admitted work on the track that no disposition has settled |
+| `KJ_OPEN_WORK` | the track's timeline, for this context's performer | the performer's admitted model work on the track that no disposition has settled; a requested repeat is not counted |
+| `KJ_UNCOVERED` | the context's env (`--env KJ_UNCOVERED=silence`), not the scheduler | what the musician tick places at the phrases before a target more than one phrase ahead: `repeat` (default) or `silence` |
 
 `KJ_EPOCH_NS` (phase-align): the value is the beat's **scheduled**
 wallclock, not the actual wakeup's. `fire_due` computes it by back-dating the
@@ -239,8 +264,17 @@ The shipped musician tick uses the three cost variables as policy. While
 `KJ_TICK` plus `KJ_LEAD_BEATS / KJ_PHRASE_BEATS + 1` phrases, so a performer
 that needs more than one phrase is admitted that many phrases ahead; a lead
 under one phrase targets one phrase ahead. A performer slower than one phrase
-therefore plays every other phrase, and a phrase with no admitted work is
-silent (`last-good` covers only admitted work that failed).
+therefore plays every other phrase or fewer.
+
+The phrases before such a target have no model work. `KJ_UNCOVERED` in the
+context's env says what plays there. With `repeat`, the default, the tick runs
+`kj transport repeat --track "$KJ_TRACK" --at <tick>` at each phrase start
+`KJ_TICK + i * KJ_PHRASE_BEATS`, for `i` from 1 to one less than the number of
+phrases, and the transport plays the performer's last phrase at each. With
+`silence` it places nothing and those phrases are silent. Any other value
+fails the tick script with an Error block that names both values; the check
+runs before the open-work skip, so a misconfigured player is visible on every
+tick.
 
 A **musician**'s tick behaviour produces ABC into the track's score; a
 **probe**'s tick behaviour runs a kaish script that writes `/run`
@@ -285,9 +319,15 @@ rc just doesn't spawn it (an ergonomic nudge, not enforcement).
   once and counts `kaijutsu.beat.failure_feedback_lost` by track. A paused
   track does not age the pending report. Inspect moved reports with
   `kj block list -c lost+found --kind error`.
-- **`UseLastGood` stays lane-scoped** (the track's last committed cell,
-  regardless of producer) — the listener hears the lane continue. A's fallback
-  may repeat B's last phrase; that is a decision, not a bug.
+- **`UseLastGood` repeats the same performer's last phrase.** `track` stays
+  the only lane key; within the lane the repeat is the latest committed cell
+  whose `played_by` is the performer of the work falling back, so a bass miss
+  never repeats a drum phrase. A repeat is committed as a separate cell played
+  by `PrincipalId::beat()`, which never matches a performer, so a repeat of a
+  repeat plays the performer's own last phrase again. A performer with no
+  earlier phrase on the track gets silence. A restart keeps this: the
+  committed log is rebuilt from the score's ABC blocks, whose `BlockId`
+  principal is the cell's `played_by`.
 - Ordering of same-tick cells is insertion order at the track lock —
   deterministic per-run, not across runs; `BlockId` uniqueness keeps correctness
   regardless.
@@ -329,8 +369,23 @@ kj transport detach [--track bass]                           # unbind; track per
 kj transport play|pause|stop|tempo --track bass [...]
 kj transport ooda --track bass on|off                        # separate knob
 kj transport rotate --track bass --every N|off               # page-turn cadence, N >= 2
+kj transport repeat --track bass --at 96                     # repeat this context's last phrase at tick 96
+kj transport work --track bass                               # open work and recent dispositions
 kj transport delete --track bass                             # tombstone; --track is REQUIRED
 ```
+
+- **repeat = a fallback-only item.** `kj transport repeat --track bass --at
+  96` places an item for the calling context's performer: at tick 96's
+  commitment the transport plays the latest phrase that performer committed
+  on the track, chosen then, or leaves silence when there is none. It runs no
+  model and no resolver work, records no failure, writes no Error block, and
+  adds no cost sample. It is not open work for `KJ_OPEN_WORK`, but it takes
+  one of the timeline's open-work slots (64 by default) until it settles. `kj
+  transport work` shows it settled as `requested: last good` (JSON reason
+  `requested`). The tick must be ahead of the playhead, the track armed, and
+  the calling context attached to the track with a performer; each refusal
+  says which. It needs the `drive` capability, as `kj drive --score-at` does,
+  not `transport`.
 
 - **list = the roster.** Bare `kj transport` (or `kj transport list`) answers
   "what tracks exist right now and what are they doing?" It merges the persisted
@@ -385,6 +440,9 @@ aside row a future sqlite recovery can restore. The **open future, squashes,
 and in-flight speculations do not survive restart**, and `KJ_PULSE`/`beat_count`
 reset — consistent with conversation re-hydration; full cross-restart counter
 durability lands with the deferred cold-start re-arm sweep.
+
+The persisted attachment rows survive a detach and an archive: the row is the
+binding a rotation successor copies. Only `kj transport delete` removes rows.
 
 ## Render — a wire cue, not an in-process sink
 

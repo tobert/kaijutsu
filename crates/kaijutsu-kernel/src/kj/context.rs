@@ -1627,8 +1627,7 @@ impl KjDispatcher {
         // The beat is no longer a Rust special-case here: arming a musician is an
         // rc step (`musician/create/S20-arm.kai` runs `kj transport arm`), so a
         // context is a beat participant exactly when its directory's `create/`
-        // rc arms it, and new beat-bearing roles (funkMusician, …) need no
-        // kernel edit.
+        // rc arms it, and a new beat-bearing role needs no kernel edit.
 
         // `--cwd-optional` drops a `--cwd` the kernel cannot use, and the
         // create continues as if it had not been given.
@@ -2724,6 +2723,16 @@ impl KjDispatcher {
             ));
         }
 
+        // Rotation is a gap, not an overlap: the predecessor leaves its tracks
+        // before the successor's `create` lifecycle attaches the same performer.
+        // A plain detach keeps the attachment rows the successor copied.
+        if let Err(e) = self.detach_from_scheduler(predecessor.context_id).await {
+            let successor = self.successor_fate(root_console, successor_id);
+            return KjResult::Err(format!(
+                "kj context rotate: {successor}{name} stays live and the successor {successor_id} ran no lifecycle: {e}"
+            ));
+        }
+
         let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", &admission, &caller.cancel) },
@@ -2803,9 +2812,9 @@ impl KjDispatcher {
                 ));
             }
         };
+        self.archived_in_router(std::iter::once(predecessor.context_id));
         {
             let mut drift = self.drift_router().write();
-            let _ = drift.set_state(predecessor.context_id, ContextState::Archived);
             if let Some(label) = &predecessor.label
                 && let Err(e) = drift.rename(successor_id, Some(label))
             {
@@ -3161,9 +3170,7 @@ impl KjDispatcher {
             )),
             DemoteOutcome::Demoted => KjResult::ok(format!("demoted {}", target_id.short())),
             DemoteOutcome::Archived => {
-                let mut drift = self.drift_router().write();
-                let _ = drift.set_state(target_id, ContextState::Archived);
-                drop(drift);
+                self.archived_in_router(std::iter::once(target_id));
                 KjResult::ok(format!(
                     "{} demoted past the rim — archived",
                     target_id.short()
@@ -3385,11 +3392,65 @@ impl KjDispatcher {
 
 impl KjDispatcher {
     /// Mark `archived` contexts archived in the drift router, so it agrees
-    /// with their rows and frees their labels.
+    /// with their rows and frees their labels, and detach them from the beat
+    /// scheduler, which holds no archived context on a track.
     pub(crate) fn archived_in_router(&self, archived: impl IntoIterator<Item = ContextId>) {
+        let archived: Vec<ContextId> = archived.into_iter().collect();
+        for &id in &archived {
+            self.detach_from_scheduler_unacked(id);
+        }
         let mut drift = self.drift_router().write();
         for id in archived {
             let _ = drift.set_state(id, ContextState::Archived);
+        }
+    }
+
+    /// The tracks `context` is bound to, from its persisted attachment rows.
+    fn attached_tracks(&self, context: ContextId) -> Result<Vec<String>, String> {
+        let rows = self.kernel_db().lock().list_attachments_for_context(context)
+            .map_err(|e| format!("could not read {}'s track attachments: {e}", context.short()))?;
+        Ok(rows.into_iter().map(|row| row.track_id).collect())
+    }
+
+    /// Detach `context` from every track it is attached to in the beat
+    /// scheduler and wait for each acknowledgement. A detach keeps the
+    /// persisted attachment row, which a successor copied. With no scheduler
+    /// wired, nothing is live and nothing is sent. A refused or unanswered
+    /// detach is an error: the caller must not go on to attach a second
+    /// context of the same performer.
+    async fn detach_from_scheduler(&self, context: ContextId) -> Result<(), String> {
+        for track in self.attached_tracks(context)? {
+            let track_id = kaijutsu_types::TrackId::new(track.clone())
+                .map_err(|e| format!("track '{track}' of {} is not a valid track id: {e}", context.short()))?;
+            let command = crate::hyoushigi::BeatCommand::Detach { track: track_id, context_id: context };
+            let Some(reply) = self.kernel().send_beat_request(command) else { return Ok(()) };
+            match reply.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(reason)) => return Err(format!("the beat scheduler refused to detach {} from track '{track}': {reason}", context.short())),
+                Err(_) => return Err(format!("the beat scheduler dropped the detach of {} from track '{track}'", context.short())),
+            }
+        }
+        Ok(())
+    }
+
+    /// The archive paths' detach: fire and forget, in order with any later
+    /// attach through the same ingress. A failure to read the rows is logged,
+    /// because the archive has already committed.
+    fn detach_from_scheduler_unacked(&self, context: ContextId) {
+        let tracks = match self.attached_tracks(context) {
+            Ok(tracks) => tracks,
+            Err(e) => {
+                tracing::error!(context = %context.short(), "archived context may stay on its track in the beat scheduler: {e}");
+                return;
+            }
+        };
+        for track in tracks {
+            match kaijutsu_types::TrackId::new(track.clone()) {
+                Ok(track_id) => {
+                    self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Detach { track: track_id, context_id: context });
+                }
+                Err(e) => tracing::error!(context = %context.short(), track, "persisted attachment names an invalid track id: {e}"),
+            }
         }
     }
 }
