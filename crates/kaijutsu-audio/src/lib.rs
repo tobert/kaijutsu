@@ -66,16 +66,6 @@ pub const RENDER_FLUSH_MIME: &str = "application/vnd.kaijutsu.render-flush";
 /// only prefetch/cache-warm.
 pub const PREPARE_MIME: &str = "application/vnd.kaijutsu.prepare";
 
-/// One render sink. Implemented in the app (Bevy) and, later, an edge-node
-/// agent (ALSA). `&self` (not `&mut self`) because the Bevy sink spawns
-/// entities via `Commands` rather than mutating sink state, and the ALSA
-/// sink's handle lives behind internal mutability — see `docs/pcm.md`.
-pub trait RenderSink: Send {
-    /// Emit one render cue. The sink dispatches on `cue.mime` and schedules at
-    /// `receipt + cue.lead` (`Duration::ZERO` == now).
-    fn emit(&self, cue: RenderCue) -> anyhow::Result<()>;
-}
-
 /// A render directive crossing the wire / the seam to an off-box sink
 /// (`docs/midi.md` "Render is a wire cue"; `docs/pcm.md` "How it converges").
 /// Mime-keyed and content-agnostic: an audio sample, a clip record
@@ -225,7 +215,6 @@ impl AudioFormatHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     const ALL_FORMATS: [AudioFormatHint; 5] = [
         AudioFormatHint::Wav,
@@ -376,39 +365,5 @@ mod tests {
         assert_eq!(back.epoch_ns, 0, "missing field defaults to unstamped");
         assert_eq!(back.mime, cue.mime);
         assert_eq!(back.lead, cue.lead);
-    }
-
-    /// Object-safety + `&self`/interior-mutability shape check: a test-only
-    /// sink stored as `Box<dyn RenderSink>`. `emit` takes `&self`, so the
-    /// recorder needs interior mutability (a shared `Arc<Mutex<..>>` so the
-    /// test can still observe what the boxed trait object captured).
-    struct Recorder {
-        captured: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl RenderSink for Recorder {
-        fn emit(&self, cue: RenderCue) -> anyhow::Result<()> {
-            self.captured.lock().unwrap().push(cue.mime);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn render_sink_is_object_safe_and_usable_behind_shared_ref() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let sink: Box<dyn RenderSink> = Box::new(Recorder {
-            captured: captured.clone(),
-        });
-
-        sink.emit(RenderCue {
-            mime: "audio/mpeg".into(),
-            payload: CuePayload::Cas(ContentHash::from_data(b"sample")),
-            lead: Duration::ZERO,
-            epoch_ns: 0,
-            onset_beat: None,
-        })
-        .expect("emit should succeed");
-
-        assert_eq!(*captured.lock().unwrap(), vec!["audio/mpeg".to_string()]);
     }
 }

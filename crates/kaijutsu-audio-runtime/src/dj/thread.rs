@@ -2,8 +2,6 @@
 //! Receives kernel events directly through an independent actor subscription.
 //! See `docs/midi.md`, "The one timebase".
 
-#![allow(dead_code)]
-
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
@@ -19,12 +17,7 @@ use super::core::{ClockFallback, ClockTransition, CuePlacement, DjCore, Metronom
 use super::midi::{AUTOCONNECT_POLL, MidiDispatch, MidiRoutes, MidiSink, dispatch_midi_cue};
 use super::prefetch::{CasPrefetch, PrefetchOutcome};
 
-/// How far ahead the click timer pre-schedules — mirrors
-/// `metronome.rs::SCHEDULE_HORIZON` verbatim (same value, same reasoning:
-/// comfortably above the app's frame interval, comfortably under one beat).
-/// Duplicated rather than imported: `metronome.rs`'s constant is private and
-/// the metronome keeps its own copy of the click policy until Task #4 folds
-/// click dispatch into this thread and deletes it (`core.rs`'s module doc).
+/// How far ahead the click timer pre-schedules: comfortably above the app's frame interval and comfortably under one beat.
 const SCHEDULE_HORIZON: Duration = Duration::from_millis(250);
 
 /// The click timer's sleep target while [`DjCore::next_wake`] returns `None`
@@ -128,9 +121,8 @@ impl ActorSource for ActorHandle {
 pub enum DjCtl<H = ActorHandle> {
     /// A fresh (or respawned) actor is ready — drop any previous
     /// subscription and `subscribe_events()` + `watch_status()` on this one.
-    /// `ssh_config` rides along unused until Task #3's CAS prefetch (kept now
-    /// so this shape doesn't churn between tasks); `generation` likewise, for
-    /// log/telemetry correlation.
+    /// `ssh_config` is handed to the CAS prefetch; `generation` correlates
+    /// logs and telemetry.
     ActorReady { handle: H, ssh_config: SshConfig, generation: u64 },
     /// A freshly parsed per-client `metronome.toml` — applied verbatim to
     /// [`DjCore`]'s click config.
@@ -279,9 +271,8 @@ fn artifact_skew(event: &ServerEvent, now_epoch_ns: u64) -> Option<Duration> {
 /// the `select!` loop's events arm, minus the channel/telemetry/sink
 /// plumbing, so BeatSync→observe / `RENDER_FLUSH`→on_flush /
 /// everything-else→ignored is unit-testable with hand-picked `Instant`s and
-/// no tokio runtime. Every other `RenderCue` mime (Task #3/#4's cue
-/// dispatch) falls through untouched — this task is clock + clicks only, the
-/// same scope `DjCore` itself declares.
+/// no tokio runtime. Every other `RenderCue` mime falls through
+/// untouched; the `select!` loop's events arm dispatches it.
 fn handle_server_event(
     core: &mut DjCore,
     event: &ServerEvent,
@@ -1507,7 +1498,7 @@ mod tests {
         join.join().expect("dj test thread panicked");
     }
 
-    /// The named thread-level test (`docs/midi.md` DJ-thread arc Task #3):
+    /// The thread-level test (`docs/midi.md`, "The DJ thread"):
     /// feed a `RenderCue` through the REAL `run_loop` (not the translation
     /// function directly, unlike `dj::audio`'s own suite) and assert the
     /// resulting `SchedulerCmd` arrives on a `audio_sched::test_handle`
@@ -1752,7 +1743,7 @@ mod tests {
         join.join().expect("dj test thread panicked");
     }
 
-    /// The Task #4 sibling of `thread_dispatches_a_render_cue_to_the_scheduler`:
+    /// The ABC sibling of `thread_dispatches_a_render_cue_to_the_scheduler`:
     /// feed an ABC `RenderCue` through the REAL `run_loop` and assert the
     /// resulting `MidiCmd::ScheduleAbc` arrives on a [`RecordingMidiSink`]
     /// receiver — proves the events arm's ABC-dispatch wiring

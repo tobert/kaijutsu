@@ -290,12 +290,6 @@ impl LocalBeat {
         self
     }
 
-    /// Override the phase-error deadband (beats). Chainable.
-    pub fn with_deadband(mut self, phase_deadband: f64) -> Self {
-        self.phase_deadband = phase_deadband;
-        self
-    }
-
     /// The current extrapolation tempo (beats/sec) — the last reference's tempo.
     pub fn tempo_bps(&self) -> f64 {
         self.tempo_bps

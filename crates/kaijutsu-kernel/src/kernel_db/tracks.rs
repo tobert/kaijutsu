@@ -120,7 +120,7 @@ impl KernelDb {
         // `score_context_id` is set-once: written on INSERT, omitted from the
         // ON CONFLICT UPDATE, so the frequent tempo/playhead upserts can't null it.
         // `clock_kind` is the opposite — MUTABLE, in the UPDATE SET, so a driver
-        // swap (system → modeled) persists (docs/tracks.md Stage 3).
+        // swap (system → modeled) persists (`docs/tracks.md`, "Clock sources").
         conn.execute(
             "INSERT INTO tracks
                  (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id, clock_kind)
@@ -226,15 +226,6 @@ impl KernelDb {
             )?);
         }
         Ok(tracks)
-    }
-
-    /// Delete a track row by `track_id`. Cascades to all its `attachments` rows
-    /// via the FK `ON DELETE CASCADE`. Returns the row count (0 or 1).
-    pub fn delete_track(&self, track_id: &str) -> KernelDbResult<u64> {
-        let deleted = self
-            .conn
-            .execute("DELETE FROM tracks WHERE track_id = ?1", params![track_id])?;
-        Ok(deleted as u64)
     }
 
     /// Tombstone a track: **rename it aside** to `{track_id}~tombstone-{deleted_at}`

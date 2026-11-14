@@ -5,31 +5,18 @@
 //! file. Every entry point takes an explicit `now: Instant` /
 //! `now_epoch_ns: u64` rather than reading a clock itself, so the whole
 //! ladder — mode transitions AND the click policy — is unit-testable with
-//! hand-picked instants, no schedule, no device, no flakiness. `main.rs`
-//! wires this into the real DJ thread starting in Task #2; this task is
-//! clock + clicks only, no cue dispatch (see the `DjAction` sketch at the
-//! bottom).
+//! hand-picked instants, no schedule, no device, no flakiness. The DJ thread
+//! (`dj::thread`) owns the channels and devices and drives this core; the
+//! core decides clock mode and click timing, and places cues.
 //!
-//! **Two things compose here, both ported rather than newly invented:**
-//! - The **click policy** is the deleted `metronome.rs::Metronome::schedule_due`
-//!   ported verbatim (never-replay overdue collapse, un-strand re-seed,
-//!   first-call next-whole-beat). Task #4 (the demolition) deleted
-//!   `metronome.rs` for good — this is now the ONLY copy of the click policy
-//!   in the codebase, not a parallel one kept in sync by hand.
-//! - The **clock mode machine** is new: `docs/midi.md`'s Wallclock/BeatGrid
-//!   ladder has no existing implementation to port from (the metronome is a
-//!   single always-on phasor with no notion of "fall back to wallclock cue
-//!   placement"). `RefDisposition::Touch`'s doc already frames its job as
-//!   "liveness only" — `DjCore` is the first consumer that actually *uses*
-//!   Touch as a liveness signal (the metronome's `ingest_beat_signals` treats
-//!   Touch as a pure no-op, by its own doc comment, because a single-phasor
-//!   design has no separate liveness clock to bump).
-
-// Plan-phase scaffolding (DJ-thread arc Task #1 of 4, docs/midi.md "The DJ
-// thread"): nothing outside this module constructs a `DjCore` yet — Task #2
-// wires it into the real thread and starts calling every method here. Not a
-// "might be useful later" annotation; the plan names the exact consumer.
-#![allow(dead_code)]
+//! **Two things compose here:**
+//! - The **click policy**: never replay an overdue click (collapse it),
+//!   re-seed a stranded phasor, and on the first call click the next whole
+//!   beat. This is the only copy of the policy.
+//! - The **clock mode machine**: the Wallclock/BeatGrid ladder of
+//!   `docs/midi.md`, with cues placed by wallclock until a phasor is
+//!   anchored. `RefDisposition::Touch` is a liveness signal here: it pushes
+//!   the staleness deadline out and folds nothing into the phasor.
 
 use std::time::{Duration, Instant};
 
@@ -54,13 +41,12 @@ pub const MAX_FREE_RUN: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClockMode {
     /// Anchor state: cue placement by the emission-stamp backdating ladder
-    /// (`audio_sched::effective_deadline` / `midi::backdate_events`, Task #1
-    /// keeps them where they are); clicks silent — no phasor to click from.
+    /// (`audio_sched::effective_deadline` / `midi::backdate_events`); clicks silent — no phasor to click from.
     #[default]
     Wallclock,
     /// Dialed in: a [`LocalBeat`] phasor is running. Clicks fire at its
-    /// predicted beat time; a cue carrying an onset-beat stamp will place
-    /// against the phasor once Task #2 adds that field. Held through
+    /// predicted beat time; a cue carrying an onset-beat stamp places
+    /// against the phasor. Held through
     /// `Touch`-aged references (the free-running deadband doctrine,
     /// `docs/midi.md` "The one timebase") — only silence past
     /// [`REF_STALE_MAX`], a flush, or a disconnect drops back out.
@@ -158,13 +144,8 @@ pub struct ClockFallback {
 /// — a plain host file under the client config tree, written through the
 /// file tools (`docs/config-namespace.md`) — and applied via
 /// `DjCtl::MetronomeConfig` (`dj::thread::forward_metronome_config_to_dj`).
-/// Was a straight copy of the deleted `metronome.rs::MetronomeConfig` while
-/// that type still existed side by side (Tasks #1–#3); Task #4 deleted the
-/// original, so this is now the SOLE definition — same fields, same shipped
-/// default, still validated against `assets/defaults/metronome.toml` by this
-/// module's own tests (see `config_parses_the_shipped_default_and_fills_partials`
-/// below; that coverage would otherwise have been lost along with
-/// `metronome.rs`'s own copy of the same test).
+/// The shipped default is validated against `assets/defaults/metronome.toml`
+/// by `config_parses_the_shipped_default_and_fills_partials` below.
 ///
 /// The click is a *pitched* note on a dedicated channel, not a drum: GM
 /// channel-9 percussion is silent under game soundfonts (the FF4 one on
@@ -334,14 +315,15 @@ impl Default for DjCore {
 
 impl DjCore {
     /// The current clock mode.
+    #[cfg(test)]
     pub fn mode(&self) -> ClockMode {
         self.mode
     }
 
     /// The phasor's fractional beat position at `now`, or `None` while no
     /// phasor is anchored (Wallclock with nothing ever folded, or just
-    /// reset). Exposed for the eventual cue-placement wiring (Task #2/#3)
-    /// and for tests.
+    /// reset).
+    #[cfg(test)]
     pub fn beat_position(&self, now: Instant) -> Option<f64> {
         self.beat.as_ref().map(|b| b.position(now))
     }
@@ -744,39 +726,12 @@ impl DjCore {
     }
 }
 
-// ── DjAction — sketch for Tasks #3/#4, not implemented here ────────────────
-//
-// This task is clock + clicks only: `DjCore` decides mode and click timing,
-// nothing else. The eventual cue-dispatch decision core
-// (`handle_event(now, now_epoch, event) -> Vec<DjAction>`, `docs/midi.md`
-// "The DJ thread") will need a vocabulary roughly like:
-//
-// enum DjAction {
-//     /// Fire a click now (or at a scheduled ALSA offset) — what
-//     /// `due_clicks`'s offsets become once the audio dispatch lands.
-//     Click { offset: Duration },
-//     /// Place a RenderCue: either the wallclock-ladder deadline
-//     /// (`audio_sched::effective_deadline`/`midi::backdate_events`, Task
-//     /// #1's untouched machinery) or, once BeatGrid + an onset-beat stamp
-//     /// are wired (Task #2), the phasor's predicted instant for that beat.
-//     PlaceCue { cue: kaijutsu_audio::RenderCue, at: PlacementInstant },
-//     /// A transport flush reached the sink layer: drop pending, silence
-//     /// live.
-//     FlushSinks,
-//     /// Dispatch a CAS prefetch (folded in from `audio.rs::CasPrefetch`,
-//     /// Task #4).
-//     Prefetch { hash: kaijutsu_cas::ContentHash, .. },
-// }
-//
-// `PlacementInstant` would be the Wallclock/BeatGrid split made concrete —
-// exactly the choice `DjCore::mode()` already exposes today.
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use kaijutsu_audio::{CuePayload, REF_FOLD_MAX, ABC_MIME};
 
-    const H: Duration = Duration::from_millis(250); // mirrors metronome.rs's SCHEDULE_HORIZON
+    const H: Duration = Duration::from_millis(250); // the click schedule horizon
 
     fn near(a: Duration, b_ms: f64) -> bool {
         (a.as_secs_f64() * 1000.0 - b_ms).abs() < 1.0
@@ -1494,10 +1449,7 @@ mod tests {
         assert!(near(wake.duration_since(t0), 250.0), "leads beat 1's horizon entry, got {:?}", wake);
     }
 
-    // ── MetronomeConfig: shipped-default + typo-rejection (ported from the
-    // deleted metronome.rs — this module is now the SOLE owner of the type,
-    // so this coverage would otherwise be lost entirely, not merely
-    // duplicated) ───────────────────────────────────────────────────────
+    // ── MetronomeConfig: shipped-default + typo-rejection ───────────────────────────────────────────────────────
 
     /// The shipped `metronome.toml` seed must deserialize to exactly the
     /// compiled-in `MetronomeConfig::default()` — otherwise a fresh client and a

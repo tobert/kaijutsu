@@ -1,10 +1,10 @@
-# Metronome click — the app's audible beat.
+# Metronome click — the audible beat, played by `kaijutsu-audiod`.
 # (docs/midi.md "The relative-lead timebase"; docs/config-namespace.md
 # for the mount registry and namespace this cascade lives under.)
 #
 # This is the shared client default (/config/client/default/metronome.toml). A specific
-# client overrides it at /config/client/<client-id>/metronome.toml; the app reads
-# its own first, then falls back here, then to this compiled-in default.
+# client overrides it at /config/client/<client-id>/metronome.toml; `kaijutsu-audiod`
+# reads its own first, then falls back here, then to the compiled-in default.
 #
 # Independent of these knobs, the metronome only clicks while it is following a
 # live kernel beat — it self-silences when the clock stops or the kernel goes

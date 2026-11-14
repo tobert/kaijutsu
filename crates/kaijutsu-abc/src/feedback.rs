@@ -54,11 +54,6 @@ impl Feedback {
         self.suggestion = Some(suggestion.into());
         self
     }
-
-    pub fn with_span(mut self, start: usize, end: usize) -> Self {
-        self.span = Some((start, end));
-        self
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

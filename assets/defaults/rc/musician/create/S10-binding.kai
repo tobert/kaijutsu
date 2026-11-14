@@ -1,13 +1,15 @@
 # musician: a narrowed loadout for the hyoushigi OODA self-driver.
 #
 # A musician reuses the broad loadout only by *fork inheritance*; created fresh
-# it lands here. The OODA tick runs `kj drive` under THIS loadout, so `drive` is
-# the capability that gates self-driving — narrowing the binding now actually
-# stops the tick (it didn't before kj grew capability gates).
+# it lands here. The loadout governs the model's own tool calls and the kj verbs
+# it runs through a shell tool: this one exposes no model-visible tools. It does
+# not gate the tick. Every rc lifecycle, `tick` included, runs `kj` privileged
+# (`ShellPolicy::Rc`), which bypasses the capability check, so the tick's
+# `kj drive` runs whatever the binding says.
 #
 # A player's complete ABC text is prepared for the tick admitted by `kj drive`.
-# The runtime validates notation; no model tool call is required. This loadout
-# grants `drive` to the tick script and exposes no model-visible tools.
+# The runtime validates notation; no model tool call is required. The `drive`
+# grant below lets the context itself run `kj drive`, for example by hand.
 set -e
 kj binding allow "drive"
 # Deliberately NOT granted: any builtin.* tool instance (block/file/resources/

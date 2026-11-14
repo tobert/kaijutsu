@@ -1,25 +1,17 @@
-//! Clock sources — what drives a track's beat (docs/tracks.md, Stage 3).
+//! Clock sources — what drives a track's beat (`docs/tracks.md`, "Clock sources").
 //!
 //! The firing schedule (the `BeatScheduler` heap + `run()`'s `sleep_until_opt`
-//! arm) decides *when* a track beats. Stage 3 puts that decision behind a
-//! [`ClockSource`]: the kernel always runs a tight LOCAL clock, generative and
+//! arm) decides *when* a track beats. A [`ClockSource`] holds that decision: the kernel always runs a tight LOCAL clock, generative and
 //! heap-schedulable. A clock you don't own (MIDI) never streams realtime pulses
 //! into the scheduler — an edge node models its tempo/phase/drift and ships
 //! low-rate *estimates* over RPC, and the kernel's modeled clock phase-locks to
 //! that estimate (docs/midi.md, "distribute tempo, not pulses").
 //!
-//! Both variants of [`ClockSourceKind`] are live. [`SystemClock`] landed at
-//! midi.md M1; [`ModeledClock`] has a body, a [`ClockSource`] impl, and a
-//! producer — `kj transport clock <track> modeled` selects it, and estimates
-//! arrive over `reportClockEstimate@98` from an edge observer
-//! (`kaijutsu-app/src/midi_in.rs` → `BeatRequest::ClockEstimate` →
+//! Both variants of [`ClockSourceKind`] are live. `kj transport clock <track>
+//! modeled` selects [`ModeledClock`], and estimates arrive over
+//! `reportClockEstimate` from an edge observer (the producer is
+//! `kaijutsu-audio-runtime`; `BeatRequest::ClockEstimate` →
 //! `beat.rs::apply_clock_estimate` → [`ModeledClock::apply_estimate`]).
-//!
-//! (Through 2026-08-11 this header claimed `ModeledClock` was "an uninhabited
-//! placeholder ... you cannot construct one until M3 gives it a body". That was
-//! already false — contradicted by [`ClockSourceKind::from_persisted`] a hundred
-//! lines below, which restores `"modeled"` rows. Trust the code, not this
-//! paragraph, if they ever disagree again.)
 
 use std::time::Duration;
 
@@ -28,8 +20,7 @@ use tokio::time::Instant;
 /// What drives a track's beat — a *proxy* for a clock that may be remote and
 /// drift-modeled (docs/midi.md). The kernel always runs a tight LOCAL clock; a
 /// source answers "when is the next beat?" locally. We dispatch through the
-/// [`ClockSourceKind`] enum rather than `Box<dyn ClockSource>` (Stage 3 review:
-/// `TrackState` already isn't `Clone`/`Debug`, two known variants, hot loop), so
+/// [`ClockSourceKind`] enum rather than `Box<dyn ClockSource>` (`TrackState` already isn't `Clone`/`Debug`, two known variants, hot loop), so
 /// this trait documents the contract each variant fulfils.
 pub trait ClockSource {
     /// The local instant of the next beat after `last`, consulting `now`.
@@ -46,7 +37,7 @@ pub trait ClockSource {
     fn period(&self) -> Duration;
 
     /// Human/transport tempo override (`kj transport tempo`). SystemClock sets
-    /// its period. A modeled clock (M3) MAY honour it as a manual nudge or ignore
+    /// its period. A modeled clock MAY honour it as a manual nudge or ignore
     /// it while slaved. Slaving the new period down to the track's armed
     /// `Timeline` (the TickClock-desync fix) is the *caller's* job, not the
     /// clock's — see `BeatScheduler::set_tempo`.
@@ -54,7 +45,7 @@ pub trait ClockSource {
 }
 
 /// The wall-period system clock: one local timer at a fixed tempo. This is what
-/// `beat.rs` already did before Stage 3 (`now + period`), now behind the trait.
+/// `beat.rs` already did before the trait existed (`now + period`), now behind it.
 #[derive(Debug, Clone, Copy)]
 pub struct SystemClock {
     period: Duration,
@@ -68,9 +59,9 @@ impl SystemClock {
 
 impl ClockSource for SystemClock {
     fn next_fire(&mut self, _last: Instant, now: Instant) -> Instant {
-        // `now + period`: preserves the pre-Stage-3 firing schedule exactly. The
+        // `now + period`: preserves the plain re-push schedule exactly. The
         // system clock spaces beats off the actual pop time, folding scheduler
-        // jitter into the period (decided, Stage 3 lock open-question 2).
+        // jitter into the period.
         now + self.period
     }
 
@@ -99,8 +90,7 @@ const PHASE_SEEK_THRESHOLD: f64 = 0.5;
 /// the design — but says so once (starvation, PLL guard list).
 const STARVATION: Duration = Duration::from_secs(10);
 
-/// The drift-modeled clock — M3's body (built 2026-07-06; the variant sat
-/// uninhabited from Stage 3 until its producer existed). Phase-locks the
+/// The drift-modeled clock. Phase-locks the
 /// track's beat to an observed external master via low-rate
 /// `{beat, tempo}` references from the edge's estimator
 /// (`kaijutsu_audio::clockin`), per "distribute tempo, not pulses": the
@@ -229,9 +219,9 @@ impl ClockSource for ModeledClock {
     }
 }
 
-/// A track's clock source. Enum, not `Box<dyn>` (Stage 3 review): keeps
+/// A track's clock source. Enum, not `Box<dyn>`: keeps
 /// `TrackState` allocation-free in the hot loop and maps 1:1 to the `clock_kind`
-/// persisted column. `Modeled` is unconstructable until M3.
+/// persisted column.
 #[derive(Debug, Clone, Copy)]
 pub enum ClockSourceKind {
     System(SystemClock),
@@ -269,7 +259,7 @@ impl ClockSourceKind {
 
     /// The persisted discriminator (`clock_kind` column). MUTABLE over a track's
     /// life — a track sketched on the system clock can later be slaved to MIDI
-    /// (Stage 3 lock; unlike set-once `score_context_id`).
+    /// (unlike set-once `score_context_id`).
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::System(_) => "system",

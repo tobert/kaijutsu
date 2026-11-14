@@ -2,8 +2,8 @@
 #
 # This is the ONLY thing that makes a context a beat participant: attaching to
 # a track. Attaching is an rc step, so the contexts of an rc directory are beat
-# participants exactly when its `create/` rc attaches them — `funkMusician`,
-# `lyricist_in_time_with_music`, etc. are pure rc bundles, no kernel edit.
+# participants exactly when its `create/` rc attaches them, so a new
+# beat-bearing role is a new rc directory, with no kernel edit.
 # See docs/chameleon.md.
 #
 # `kj transport attach` targets THIS new context. KJ_BAND names the track, so

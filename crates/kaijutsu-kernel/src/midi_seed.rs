@@ -106,10 +106,9 @@ pub fn seed_body(canonical_path: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// The four devices `assets/defaults/midi/devices/` ships today. Named
-    /// once here so the test message is "these named seeds must exist," not a
-    /// pile of individual `assert!`s that silently stop growing when a fifth
-    /// device is added and forgotten in this test.
+    /// The shipped devices of `assets/defaults/midi/devices/` that this test
+    /// names. Named once here so the test message is "these named seeds must
+    /// exist," not a pile of individual `assert!`s.
     const SHIPPED_DEVICES: &[&str] = &["minibrute", "timidity", "keystep-pro", "keylab-88-mkii"];
 
     #[test]

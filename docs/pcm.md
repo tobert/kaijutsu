@@ -28,9 +28,6 @@ pub struct RenderCue {
     pub lead: Duration,      // sink fires at receipt + lead (ZERO = now)
     pub epoch_ns: u64,       // sender wallclock at emission; 0 = unstamped
 }
-pub trait RenderSink: Send {
-    fn emit(&self, cue: RenderCue) -> anyhow::Result<()>;
-}
 ```
 
 - **Mime-keyed, content-agnostic.** ABC, a clip record, an inline sample —

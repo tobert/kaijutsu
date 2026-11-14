@@ -103,75 +103,6 @@ pub fn to_midi(tune: &Tune, params: &MidiParams) -> Vec<u8> {
     midi::generate(tune, params)
 }
 
-/// Transpose a tune by the given number of semitones
-pub fn transpose(tune: &Tune, semitones: i8) -> Tune {
-    let mut result = tune.clone();
-
-    // Transpose the key signature
-    let key_semitone = result.header.key.root.to_semitone()
-        + result
-            .header
-            .key
-            .accidental
-            .map(|a| a.to_semitone_offset())
-            .unwrap_or(0);
-    let new_key_semitone = key_semitone + semitones;
-    let (new_root, new_acc) = NoteName::from_semitone(new_key_semitone);
-    result.header.key.root = new_root;
-    result.header.key.accidental = new_acc;
-
-    // Transpose all notes in all voices
-    for voice in &mut result.voices {
-        for element in &mut voice.elements {
-            transpose_element(element, semitones);
-        }
-    }
-
-    result
-}
-
-fn transpose_element(element: &mut Element, semitones: i8) {
-    match element {
-        Element::Note(note) => transpose_note(note, semitones),
-        Element::Chord(chord) => {
-            for note in &mut chord.notes {
-                transpose_note(note, semitones);
-            }
-        }
-        Element::Tuplet(tuplet) => {
-            for elem in &mut tuplet.elements {
-                transpose_element(elem, semitones);
-            }
-        }
-        Element::GraceNotes { notes, .. } => {
-            for note in notes {
-                transpose_note(note, semitones);
-            }
-        }
-        Element::SlurGroup { elements } => {
-            for elem in elements {
-                transpose_element(elem, semitones);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn transpose_note(note: &mut Note, semitones: i8) {
-    let base = note.pitch.to_semitone();
-    let acc_offset = note.accidental.map(|a| a.to_semitone_offset()).unwrap_or(0);
-    let current_pitch = (base + acc_offset) as i16 + (note.octave as i16 * 12);
-    let new_pitch = current_pitch + semitones as i16;
-
-    let new_octave = new_pitch.div_euclid(12) as i8;
-    let new_semitone = new_pitch.rem_euclid(12) as i8;
-
-    let (new_note, new_acc) = NoteName::from_semitone(new_semitone);
-    note.pitch = new_note;
-    note.accidental = new_acc;
-    note.octave = new_octave;
-}
-
 /// Convert a Tune back to ABC notation string
 pub fn to_abc(tune: &Tune) -> String {
     let mut output = String::new();
@@ -438,63 +369,6 @@ fn format_duration(output: &mut String, duration: &Duration) {
     } else {
         output.push_str(&format!("{}/{}", duration.numerator, duration.denominator));
     }
-}
-
-/// Calculate semitones needed to transpose from source key to target key
-pub fn semitones_to_key(source: &Key, target: &str) -> Result<i8, String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("Target key cannot be empty".to_string());
-    }
-
-    let chars: Vec<char> = target.chars().collect();
-    let first_char = chars[0];
-    let target_note = NoteName::parse(&first_char.to_string())
-        .ok_or_else(|| format!("Invalid note name: {}", first_char))?;
-
-    let mut pos = 1;
-    let target_accidental = if pos < chars.len() && (chars[pos] == '#' || chars[pos] == 'b') {
-        let acc_str = if pos + 1 < chars.len() && chars[pos] == chars[pos + 1] {
-            pos += 2;
-            if chars[pos - 1] == '#' {
-                "##"
-            } else {
-                "bb"
-            }
-        } else {
-            pos += 1;
-            if chars[pos - 1] == '#' {
-                "#"
-            } else {
-                "b"
-            }
-        };
-        Accidental::parse(acc_str)
-    } else {
-        None
-    };
-
-    let source_semitone = source.root.to_semitone()
-        + source
-            .accidental
-            .map(|a| a.to_semitone_offset())
-            .unwrap_or(0);
-
-    let target_semitone = target_note.to_semitone()
-        + target_accidental
-            .map(|a| a.to_semitone_offset())
-            .unwrap_or(0);
-
-    let diff = target_semitone - source_semitone;
-    let normalized = if diff > 6 {
-        diff - 12
-    } else if diff < -6 {
-        diff + 12
-    } else {
-        diff
-    };
-
-    Ok(normalized)
 }
 
 #[cfg(test)]

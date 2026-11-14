@@ -31,7 +31,7 @@ use resolver::CasCommitResolver;
 use crate::flows::BlockFlow;
 
 // Re-export the hyoushigi cell primitives the server's beat scheduler needs to
-// reconstruct a track's committed log (Stage 2 WI 7) — so `kaijutsu-server` reaches
+// reconstruct a track's committed log — so `kaijutsu-server` reaches
 // them through this façade like the rest of the beat types, not a direct dep.
 pub use kaijutsu_hyoushigi::{Body, Cell, ContentRef, ResolverId, Span, TickClock, WorkStatus};
 
@@ -43,7 +43,7 @@ use crate::kernel::Kernel;
 /// domain* (the track owns the tempo + phrase length), not of any one context.
 /// How often a given context is *woken* on top of this clock is the per-context
 /// [`Attachment::wakeup`] divisor, which subsumed the old `ooda_every` field
-/// (see `docs/tracks.md`, Stage 1).
+/// (see `docs/tracks.md`, "The track entity").
 #[derive(Debug, Clone, Copy)]
 pub struct BeatPolicy {
     /// Wall-clock duration of one beat (e.g. a quarter note).
@@ -156,7 +156,7 @@ impl Attachment {
 /// and send it; the scheduler that consumes it lives in `kaijutsu-server`. The
 /// kernel holds the ingress `Sender`; the server owns the loop.
 ///
-/// **The clock lives on the track now** (`docs/tracks.md`, Stage 1). Clock-domain
+/// **The clock lives on the track now** (`docs/tracks.md`, "The track entity"). Clock-domain
 /// ops (`Play`/`Pause`/`Stop`/`SetTempo`) name a [`TrackId`]; per-context ops
 /// (`SetOoda`/`SetRotate`) name the track *and* the context. A context joins a
 /// track with `Attach` and leaves with `Detach`.
@@ -235,7 +235,7 @@ pub enum BeatCommand {
 }
 
 /// Which driver beats a track (the `clock_kind` persisted discriminator's
-/// wire face — `docs/tracks.md` Stage 3, `docs/midi.md` M3).
+/// wire face — `docs/tracks.md`, "Clock sources", `docs/midi.md` M3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockKind {
     /// One local timer at a fixed tempo.
@@ -1798,9 +1798,8 @@ mod tests {
     /// T2 (design-chameleon-batch1-f2-notation §16) — the musician default speaks
     /// in phrases. `beats_per_phrase` is the kernel's only musical chunking unit
     /// above the beat (32 = an 8-bar phrase in 4/4). The OODA wakeup cadence is no
-    /// longer on `BeatPolicy` — it moved to `Attachment::wakeup` (Stage 1:
-    /// `docs/tracks.md`) and is one phrase (32 beats) in the musician default so
-    /// phrases tile back-to-back.
+    /// longer on `BeatPolicy` — it moved to `Attachment::wakeup` and is one phrase (32 beats) in the
+    /// musician default so phrases tile back-to-back.
     #[test]
     fn musician_default_speaks_phrases() {
         let p = super::BeatPolicy::musician_default();
@@ -1829,9 +1828,9 @@ mod tests {
         assert!(kernel.timeline(ctx).is_none(), "disarmed → no timeline");
     }
 
-    // --- Stage 2: the per-TRACK timeline registry (docs/tracks.md) -----------
+    // --- the per-TRACK timeline registry (docs/tracks.md) -----------
 
-    /// Stage 2: arming a TRACK gives it a timeline keyed by `TrackId`, with **no
+    /// Arming a TRACK gives it a timeline keyed by `TrackId`, with **no
     /// `ContextId` involved** — the clock now belongs to the track, and two tracks
     /// are independent clock domains.
     #[tokio::test]
@@ -1849,7 +1848,7 @@ mod tests {
         );
     }
 
-    /// Stage 2: re-arming a track never clobbers the live timeline — continuity is
+    /// Re-arming a track never clobbers the live timeline — continuity is
     /// the whole point (a rotating producer must not reset the clock). Same handle.
     #[tokio::test]
     async fn arm_track_is_idempotent() {
@@ -1860,7 +1859,7 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&a, &b), "re-arm returns the same track timeline");
     }
 
-    /// Stage 2: the track seed lands on the playhead at creation (virgin), and a
+    /// The track seed lands on the playhead at creation (virgin), and a
     /// re-arm does NOT re-seed — a producer rejoining a running track at a later
     /// tick can't rewind it.
     #[tokio::test]
@@ -1878,7 +1877,7 @@ mod tests {
         );
     }
 
-    /// Stage 2: disarm drops a track's timeline — used on track teardown, never on
+    /// Disarm drops a track's timeline — used on track teardown, never on
     /// a context detach (the continuity invariant lives in the scheduler, not here).
     #[tokio::test]
     async fn disarm_track_removes_the_timeline() {

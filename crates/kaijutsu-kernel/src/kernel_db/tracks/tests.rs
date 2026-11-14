@@ -101,36 +101,6 @@ fn track_upsert_updates_in_place() {
     );
 }
 
-#[test]
-fn track_list_and_delete() {
-    let db = KernelDb::temporary().unwrap();
-    let ws_id = setup_test_db(&db);
-
-    db.upsert_track(&make_track("bass", 250)).unwrap();
-    db.upsert_track(&make_track("lead", 500)).unwrap();
-    assert_eq!(db.list_tracks().unwrap().len(), 2, "two tracks");
-
-    // Attach a context to bass so we can verify cascade.
-    let ctx = make_context_row(Some("ctx-cascade"));
-    insert_context_with_doc(&db, &ctx, ws_id);
-    db.upsert_attachment(&make_attachment("bass", ctx.context_id)).unwrap();
-    assert_eq!(
-        db.list_attachments_for_track("bass").unwrap().len(),
-        1,
-        "attachment present before delete"
-    );
-
-    // Delete bass — should cascade to the attachment.
-    assert_eq!(db.delete_track("bass").unwrap(), 1, "one row deleted");
-    assert_eq!(db.list_tracks().unwrap().len(), 1, "lead still present");
-    assert_eq!(
-        db.list_attachments_for_track("bass").unwrap().len(),
-        0,
-        "attachment cascade-deleted with the track"
-    );
-}
-
-
 // ── tombstone (kj transport delete) ─────────────────────────────────
 
 #[test]
@@ -269,7 +239,7 @@ fn track_score_context_round_trips_and_is_set_once() {
 fn track_clock_kind_round_trips_and_is_mutable() {
     // Unlike `score_context_id` (set-once), `clock_kind` is MUTABLE: a track
     // sketched on the system clock can be slaved to a MIDI master later
-    // (docs/tracks.md Stage 3). The driver swap must survive an upsert.
+    // (`docs/tracks.md`, "Clock sources"). The driver swap must survive an upsert.
     let db = KernelDb::temporary().unwrap();
     db.upsert_track(&make_track("bass", 250)).unwrap();
     assert_eq!(

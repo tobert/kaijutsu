@@ -169,28 +169,6 @@ pub fn diff(prev: &PatchGraphSnapshot, next: &PatchGraphSnapshot) -> GraphDelta 
     }
 }
 
-/// Drop the ALSA System client (client 0: Timer/Announce) and our own
-/// reader client from a snapshot — scene clutter, not studio topology.
-/// Wires touching dropped endpoints are dropped with them.
-pub fn without_plumbing(snapshot: &PatchGraphSnapshot, own_client: i32) -> PatchGraphSnapshot {
-    let is_plumbing = |client_id: i32| client_id == 0 || client_id == own_client;
-
-    let endpoints: Vec<EndpointInfo> = snapshot
-        .endpoints
-        .iter()
-        .filter(|e| !is_plumbing(e.client_id))
-        .cloned()
-        .collect();
-    let wires: Vec<WireInfo> = snapshot
-        .wires
-        .iter()
-        .filter(|w| !is_plumbing(w.src.0) && !is_plumbing(w.dst.0))
-        .copied()
-        .collect();
-
-    PatchGraphSnapshot { endpoints, wires }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,76 +293,6 @@ mod tests {
         };
         let delta = diff(&prev, &next);
         assert!(delta.endpoints_changed);
-    }
-
-    // -- without_plumbing -----------------------------------------------
-
-    #[test]
-    fn without_plumbing_drops_system_client_and_its_wires() {
-        let snapshot = PatchGraphSnapshot {
-            endpoints: vec![
-                endpoint(0, 0, "System", "Timer"),
-                endpoint(0, 1, "System", "Announce"),
-                endpoint(128, 0, "TiMidity", "port 0"),
-            ],
-            wires: vec![
-                // Announce is subscribed by our own ear (client 999) — plumbing.
-                wire((0, 1), (999, 0)),
-                // A real studio wire between two non-system clients.
-                wire((14, 0), (128, 0)),
-            ],
-        };
-        let cleaned = without_plumbing(&snapshot, 999);
-        assert_eq!(
-            cleaned.endpoints,
-            vec![endpoint(128, 0, "TiMidity", "port 0")]
-        );
-        assert_eq!(cleaned.wires, vec![wire((14, 0), (128, 0))]);
-    }
-
-    #[test]
-    fn without_plumbing_drops_own_client_endpoints_and_wires() {
-        let snapshot = PatchGraphSnapshot {
-            endpoints: vec![
-                endpoint(42, 0, "kaijutsu-patchview", "capture"),
-                endpoint(128, 0, "TiMidity", "port 0"),
-            ],
-            wires: vec![wire((42, 0), (128, 0)), wire((14, 0), (128, 0))],
-        };
-        let cleaned = without_plumbing(&snapshot, 42);
-        assert_eq!(
-            cleaned.endpoints,
-            vec![endpoint(128, 0, "TiMidity", "port 0")]
-        );
-        assert_eq!(cleaned.wires, vec![wire((14, 0), (128, 0))]);
-    }
-
-    #[test]
-    fn without_plumbing_keeps_a_wire_whose_far_end_is_dropped_only_if_neither_end_is_plumbing() {
-        // A wire where only ONE end is plumbing must still be dropped: it's
-        // not a "studio topology" wire once one of its ports vanished.
-        let snapshot = PatchGraphSnapshot {
-            endpoints: Vec::new(),
-            wires: vec![wire((0, 1), (128, 0)), wire((14, 0), (0, 1))],
-        };
-        let cleaned = without_plumbing(&snapshot, 999);
-        assert!(cleaned.wires.is_empty(), "{:?}", cleaned.wires);
-    }
-
-    #[test]
-    fn without_plumbing_is_a_no_op_when_there_is_no_plumbing_present() {
-        let snapshot = PatchGraphSnapshot {
-            endpoints: vec![endpoint(14, 0, "A", "p"), endpoint(128, 0, "B", "p")],
-            wires: vec![wire((14, 0), (128, 0))],
-        };
-        let cleaned = without_plumbing(&snapshot, 999);
-        assert_eq!(cleaned, snapshot);
-    }
-
-    #[test]
-    fn without_plumbing_on_an_empty_snapshot_is_empty() {
-        let cleaned = without_plumbing(&PatchGraphSnapshot::default(), 42);
-        assert_eq!(cleaned, PatchGraphSnapshot::default());
     }
 
     // -- GraphDelta::is_empty --------------------------------------------

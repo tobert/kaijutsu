@@ -682,7 +682,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- score. Set once at creation; never rewritten. NULL on a pre-score row.
     score_context_id  BLOB,
     -- The clock-source discriminator (ClockSourceKind::kind_str). MUTABLE over a
-    -- track's life (docs/tracks.md Stage 3): a track sketched on the system clock
+    -- track's life (`docs/tracks.md`, "Clock sources"): a track sketched on the system clock
     -- can later be slaved to a MIDI master — unlike set-once `score_context_id`,
     -- the clock *source* is circumstantial. `'system'` is the only kind M1 builds.
     clock_kind        TEXT    NOT NULL DEFAULT 'system',

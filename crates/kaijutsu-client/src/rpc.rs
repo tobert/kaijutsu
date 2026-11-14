@@ -597,7 +597,7 @@ pub struct TrackInfo {
     pub beat_count: u64,
     /// Wall clock (ns) of the most recent beat; 0 = never fired.
     pub last_epoch_ns: u64,
-    /// Clock driver discriminator (`"system"` today, `"modeled"` at M3).
+    /// Clock driver discriminator (`"system"` or `"modeled"`).
     pub clock_kind: String,
     /// Contexts currently bound to this track.
     pub attached: Vec<ContextId>,

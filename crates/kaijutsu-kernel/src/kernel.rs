@@ -158,7 +158,7 @@ pub struct Kernel {
     /// handler schedules cells onto them. Sharded by `ContextId`, each behind a
     /// sync mutex (see [`SharedTimeline`]).
     timelines: dashmap::DashMap<kaijutsu_types::ContextId, crate::hyoushigi::SharedTimeline>,
-    /// Per-**track** hyoushigi timelines — Stage 2 (`docs/tracks.md`): the clock's
+    /// Per-**track** hyoushigi timelines — (`docs/tracks.md`): the clock's
     /// open future + committed score live on the TRACK now, not the producing
     /// context, so the timeline never leaves when a producer detaches/rotates
     /// (continuity is free) and N producers attached to one track share one open
@@ -1341,7 +1341,7 @@ impl Kernel {
         self.timelines.remove(&context_id);
     }
 
-    // --- Stage 2: per-track timeline registry (docs/tracks.md) ---------------
+    // --- per-track timeline registry (docs/tracks.md) ---------------
     //
     // The clock + open future + committed score live on the TRACK now. These are
     // the `TrackId`-keyed twins of the per-context arm/lookup/disarm above. The

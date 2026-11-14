@@ -251,7 +251,7 @@ pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
 }
 
 /// The timed MIDI event stream for a tune — the per-event view the SMF blob from
-/// [`generate`] frames. Stage 3 WI 5 (docs/tracks.md): the render target consumes
+/// [`generate`] frames. The render target consumes
 /// this to schedule individual NoteOn/NoteOff into an ALSA seq queue, rather than
 /// re-parse the SMF byte blob. Events are absolute-tick and **sorted**; meta
 /// events (tempo `0xFF 0x51`, etc.) are included for the consumer to honour or

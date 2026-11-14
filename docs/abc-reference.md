@@ -1037,8 +1037,8 @@ For use with `%%MIDI program N`:
 ## 23. Kaijutsu-ABC Public API
 
 ```rust
-use kaijutsu_abc::{parse, parse_with_mode, ParseMode, to_midi, transpose,
-                   to_abc, semitones_to_key, MidiParams};
+use kaijutsu_abc::{parse, parse_with_mode, ParseMode, to_midi, to_abc,
+                   MidiParams};
 use kaijutsu_abc::ast::*;
 use kaijutsu_abc::engrave::{engrave_to_svg, EngravingOptions};
 
@@ -1051,12 +1051,6 @@ let first = &tunes[0];
 
 // Generate MIDI (SMF format 0) from a single tune
 let midi_bytes = to_midi(first, &MidiParams::default());
-
-// Transpose
-let transposed = transpose(first, 5);  // up 5 semitones
-
-// Calculate transposition interval between keys
-let semitones = semitones_to_key(&first.header.key, "Am").unwrap();
 
 // Round-trip back to ABC text (single tune at a time)
 let abc_text = to_abc(first);

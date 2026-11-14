@@ -1475,8 +1475,8 @@ struct RenderCue {
   # transfer latency can't walk the render out of phase with the click
   # (`docs/midi.md`).
   epochNs @4 :UInt64;
-  # The beat coordinate this cue is placed at (1 tick == 1 beat — see
-  # publishBeatSync's own doc comment), stamped by the kernel for a
+  # The beat coordinate this cue is placed at (1 tick == 1 beat; see
+  # `docs/midi.md`, "The one timebase"), stamped by the kernel for a
   # track-committed cell (phase-align Slice 2). Unset for directive cues with
   # no track/beat association (transport flush, kj play's play-now, the
   # PREPARE_MIME cache-warm directive) — those always dispatch immediately
@@ -1526,7 +1526,7 @@ struct TrackInfo {
   beatsPerPhrase @5 :UInt64;
   beatCount @6 :UInt64;           # beats elapsed while playing (resets on kernel restart)
   lastEpochNs @7 :UInt64;         # wall clock (ns) of the most recent beat; 0 = never fired
-  clockKind @8 :Text;             # clock driver: "system" today, "modeled" at M3
+  clockKind @8 :Text;             # clock driver: "system" or "modeled"
   attached @9 :List(Data);        # 16-byte ContextIds currently bound to this track
 }
 
