@@ -51,7 +51,7 @@ TrackState {
 
 Attachment {                           // the persisted binding contract
     wakeup:  Cadence,        // wake THIS context every N beats (its own divisor)
-    rotate:  Option<Cadence>,// self-fork page-turn cadence; None = never auto-rotate
+    rotate:  Option<Cadence>,// page-turn cadence in phrases (>= 2); None = never auto-rotate
     // (role/behavior is the context's own tick rc — see "Behavior on a beat")
 }
 ```
@@ -106,22 +106,22 @@ the track's own work and runs regardless. Track-level musical knobs (tempo,
 `beats_per_phrase`) live on the track's `BeatPolicy`; the wakeup cadence is the
 attachment's.
 
-### 4. The context binds; the child inherits the bind at fork
+### 4. The context binds; the successor inherits the bind
 
 The rotate cadence is part of the binding — but **the context drives the bind,
 not the track.** The track stays *ignorant of context lifecycles*; it just holds
 the current set of bindings. At fork, the child inherits the bind (the
 attachment row copies with the fork) and re-binds — announces itself to the track
-— on the way up. A rotation page-turn is: the context self-forks, the child
-inherits the binding, the child re-attaches to the **same** track, the parent
-detaches. The clock and score never pause. Lifecycle knowledge stays on the
-context side (where `fork` already lives); the track stays a passive clock +
-score.
+— on the way up. A rotation page turn is: the scheduler detaches the retiring
+context, `kj context rotate` creates a successor that inherits the binding, and
+the successor's `create` rc re-attaches it to the **same** track. The clock and
+score never pause. Lifecycle knowledge stays on the context side; the track
+stays a passive clock + score.
 
-`kj context rotate` copies the attachment rows to the successor the same way,
-and the successor's `create` rc runs `kj transport attach` (no flags) to
-announce itself. The predecessor's `archive` rc detaches it. A `companion`
-context does this (`docs/companion.md`).
+`kj context rotate` copies the attachment rows to the successor, and the
+successor's `create` rc runs `kj transport attach` (no flags) to announce
+itself. The predecessor is archived. A `companion` context does this
+(`docs/companion.md`).
 
 ### 5. Non-rotating attachments are first-class
 
@@ -277,8 +277,8 @@ parent detaches synchronously (a few *producerless* beats while the child boots 
 a GAP) or the parent lingers until the child binds (two producers
 double-scheduling — an OVERLAP). Rotation takes the **gap**: at the rotate
 horizon the track synchronously detaches the retiring context and fires `rotate`;
-the child forks, attaches to the same track, and is seeded at the track's
-*current* playhead. There is never a beat with two producing bindings.
+the successor (`kj context rotate`) attaches to the same track and is seeded at
+the track's *current* playhead. There is never a beat with two producing bindings.
 
 The gap is safe because it is in *live production*, not in *playback*: hyoushigi
 stages content **ahead of the playhead** (the speculation lead), so the retiring
@@ -305,7 +305,8 @@ kj transport list                                            # read-only; needs 
 kj transport attach --track bass [--wakeup N] [--rotate N]   # bind; track created stopped if new
 kj transport detach [--track bass]                           # unbind; track persists
 kj transport play|pause|stop|tempo --track bass [...]
-kj transport ooda|rotate --track bass on|off                 # separate knobs
+kj transport ooda --track bass on|off                        # separate knob
+kj transport rotate --track bass --every N|off               # page-turn cadence, N >= 2
 kj transport delete --track bass                             # tombstone; --track is REQUIRED
 ```
 

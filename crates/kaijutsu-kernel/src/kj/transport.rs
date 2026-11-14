@@ -24,6 +24,18 @@ use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
 use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence, ClockKind};
 
+/// The smallest rotate cadence in phrases. At 1 every phrase boundary is a
+/// rotate horizon and the rotate replaces the tick, so the context never plays.
+const MIN_ROTATE_PHRASES: u64 = 2;
+
+fn rotate_cadence_refusal(verb: &str, every: u64) -> String {
+    format!(
+        "{verb}: a rotate cadence of {every} leaves no phrase to play: every phrase boundary \
+         would rotate before the tick; use {MIN_ROTATE_PHRASES} or more (`kj transport rotate off` \
+         clears the cadence)"
+    )
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "transport",
@@ -62,7 +74,7 @@ enum TransportCommand {
         /// divisor). Overrides any persisted value. Defaults to 32 beats.
         #[arg(long)]
         wakeup: Option<u64>,
-        /// Self-fork rotate cadence in phrases. Overrides any persisted value.
+        /// Rotate cadence in phrases, at least 2. Overrides any persisted value.
         /// Omit to inherit the persisted cadence (or no auto-rotation by default).
         #[arg(long)]
         rotate: Option<u64>,
@@ -145,13 +157,14 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
-    /// Set (or clear) the self-fork rotate cadence — the page-turn. At every
-    /// phrase horizon where `phrase % N == 0` the scheduler retires this context
-    /// and fires the `rotate` rc lifecycle (fork a `spawn` child + attach it). The
-    /// detach is synchronous in the scheduler (Rust), so it can't race the beat;
-    /// the fork/attach action stays rc.
+    /// Set (or clear) the rotate cadence — the page turn. At every phrase
+    /// horizon where `phrase % N == 0` the scheduler detaches this context and
+    /// fires the `rotate` rc lifecycle, which replaces it with a successor
+    /// (`kj context rotate`). The detach is synchronous in the scheduler, so it
+    /// can't race the beat. A rotate horizon replaces that phrase's tick, so N
+    /// must be at least 2.
     Rotate {
-        /// Phrases per rotation (positive). Omit and pass `off` to disable.
+        /// Phrases per rotation, at least 2. Omit and pass `off` to disable.
         #[arg(long)]
         every: Option<u64>,
         /// `off` to clear the rotate cadence.
@@ -460,12 +473,9 @@ impl KjDispatcher {
                     let every_cadence = match (every, state.as_deref()) {
                         // `off` clears the cadence.
                         (_, Some("off")) => None,
-                        (Some(n), _) if *n > 0 => Some(Cadence::new(*n)),
-                        (Some(_), _) => {
-                            return KjResult::Err(
-                                "kj transport rotate: --every needs a positive phrase count"
-                                    .to_string(),
-                            );
+                        (Some(n), _) if *n >= MIN_ROTATE_PHRASES => Some(Cadence::new(*n)),
+                        (Some(n), _) => {
+                            return KjResult::Err(rotate_cadence_refusal("kj transport rotate", *n));
                         }
                         (None, _) => {
                             return KjResult::Err(
@@ -849,6 +859,9 @@ impl KjDispatcher {
             attachment.wakeup = Cadence::new(w);
         }
         if let Some(r) = rotate_override {
+            if r < MIN_ROTATE_PHRASES {
+                return Err(rotate_cadence_refusal("kj transport attach", r));
+            }
             attachment.rotate = Some(Cadence::new(r));
         }
 
@@ -1551,6 +1564,38 @@ mod tests {
         }
     }
 
+    /// A cadence of 1 makes every phrase boundary a rotate horizon, which
+    /// replaces the tick: the context would never play.
+    #[tokio::test]
+    async fn a_rotate_cadence_of_one_is_refused_with_its_consequence() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("c"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
+
+        for argv in [
+            vec![s("transport"), s("rotate"), s("--every"), s("1"), s("--track"), s("bass")],
+            vec![s("transport"), s("rotate"), s("--every"), s("0"), s("--track"), s("bass")],
+            vec![s("transport"), s("attach"), s("--rotate"), s("1"), s("--track"), s("bass")],
+        ] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{argv:?} must be refused");
+            assert!(
+                result.message().contains("no phrase to play") && result.message().contains("use 2 or more"),
+                "the refusal states the consequence and the fix: {}",
+                result.message()
+            );
+        }
+        assert!(cmds.try_recv().is_err(), "no command reaches the scheduler");
+
+        let ok = d
+            .dispatch(&[s("transport"), s("rotate"), s("--every"), s("2"), s("--track"), s("bass")], &c)
+            .await;
+        assert!(ok.is_ok(), "2 is the smallest cadence: {}", ok.message());
+    }
+
     #[tokio::test]
     async fn transport_rotate_needs_every_or_off() {
         let d = test_dispatcher().await;
@@ -1803,149 +1848,6 @@ mod tests {
             "explicit list has no footer: {}",
             result.message()
         );
-    }
-
-    // ── rotate rc end-to-end ──────────────────────────────────────────────────
-
-    /// Run `body` to completion on a thread sized for rc lifecycles, joining it
-    /// and re-raising any panic. Mirrors the server's beat-scheduler/SSH threads:
-    /// a deep rc nest (kaish re-entered many levels) overflows the default 2 MiB
-    /// test stack, so the work runs through [`crate::spawn_kaish_thread`] instead.
-    fn run_on_rc_stack(body: impl FnOnce() + Send + 'static) {
-        crate::spawn_kaish_thread("rc-test-thread", body)
-            .expect("spawn rc-stack thread")
-            .join()
-            .expect("rc-stack thread panicked");
-    }
-
-    #[test]
-    fn rotate_rc_forks_attaches_and_plays_the_child_on_the_parent_track() {
-        // The page-turn nests rc deeply (rotate → `kj fork` → the child's
-        // fork+attach rc → `kj transport attach`/`play`, each `kj` re-entering
-        // kaish), which overflows the default 2 MiB test stack — exactly as it
-        // would on the production beat-scheduler thread. Drive the body on the
-        // same generous stack that thread now uses.
-        run_on_rc_stack(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build current-thread runtime")
-                .block_on(rotate_rc_body());
-        });
-    }
-
-    /// Body of [`rotate_rc_forks_attaches_and_plays_the_child_on_the_parent_track`],
-    /// extracted verbatim so the wrapper can run it on a deep stack.
-    async fn rotate_rc_body() {
-        // End-to-end page-turn: the `rotate` lifecycle (musician/rotate/S10-rotate.kai)
-        // forks a spawn child, switches the rc shell to it, and attaches + plays it
-        // on the PARENT's track. The child inherits the attachment (track + wakeup +
-        // rotate cadence) via the fork-copy of the attachment row in
-        // `insert_forked_context`. The child's `kj transport attach` re-announces
-        // the inherited binding, so the song keeps turning at the same cadence
-        // without any explicit SetRotate — the cadence travels with the fork.
-        use crate::kernel_db::{PersistedAttachment, PersistedTrack};
-        use kaijutsu_types::TrackId;
-        use std::collections::HashMap;
-
-        let d = std::sync::Arc::new(test_dispatcher().await);
-        d.set_self_arc();
-        // The `spawn` factory preset the rotate rc forks with is seeded at server
-        // startup; test_dispatcher doesn't, so seed it here.
-        crate::seed_presets::ensure_factory_presets(
-            &mut d.kernel_db().lock(),
-            PrincipalId::new(),
-        )
-        .unwrap();
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("bass"), None, principal);
-        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
-        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
-            context_id: parent, cwd: Some("/scratch".into()), updated_at: 0,
-        }).unwrap();
-        crate::kj::test_helpers::perform_with_rc_dir(&d, parent, "musician");
-
-        // Seed a track + attachment (with rotate cadence) so the fork-copy carries
-        // the real values. This simulates what the scheduler would have persisted
-        // after the original arm + rotate --every 4.
-        d.kernel_db()
-            .lock()
-            .upsert_track(&PersistedTrack {
-                track_id: "bass".to_string(),
-                period_ms: 500,
-                beats_per_phrase: 16,
-                playhead_tick: None,
-                playing: false,
-                score_context_id: None,
-                clock_kind: "system".to_string(),
-            })
-            .unwrap();
-        d.kernel_db()
-            .lock()
-            .upsert_attachment(&PersistedAttachment {
-                track_id: "bass".to_string(),
-                context_id: parent,
-                wakeup_every: 128,
-                rotate_every_phrases: Some(4),
-                ooda_armed: true,
-            })
-            .unwrap();
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        d.kernel().set_beat_ingress(tx);
-        // The rc runs `kj transport attach && kj transport play`, each AWAITing the
-        // scheduler ack; the stub acks Ok so the `&&` chain proceeds.
-        let mut cmds = spawn_beat_stub(rx, Ok(None));
-
-        // Fire the rotate lifecycle exactly as the beat scheduler's fire_rotate does.
-        let caller = caller_with_context(parent);
-        let vars = HashMap::new(); // rotate cadence is inherited via attachment, not via env
-        let admission = d.kernel().admit_context(parent).expect("admit rotate lifecycle");
-        crate::rc::run(
-            &d,
-            crate::rc::RcInvocation {
-                vars: vars.clone(),
-                ..crate::rc::RcInvocation::new(
-                    "rotate",
-                    &admission,
-                    &tokio_util::sync::CancellationToken::new(),
-                )
-            },
-            &caller,
-        )
-            .await
-            .expect("rotate lifecycle runs");
-
-        // The page-turn emits two commands — all for the forked CHILD (the rc
-        // `--switch`ed onto it), never the retired parent.
-        let attach_cmd = tokio::time::timeout(std::time::Duration::from_secs(3), cmds.recv())
-            .await.expect("rotate must send an attach command").expect("rotate attaches the child");
-        let (child, track) = match attach_cmd {
-            BeatCommand::Attach { context_id, track, attachment, .. } => {
-                assert_eq!(
-                    attachment.rotate,
-                    Some(Cadence::new(4)),
-                    "child inherits the parent's rotate cadence via attachment fork-copy"
-                );
-                assert!(attachment.ooda_armed, "child inherits ooda_armed");
-                (context_id, track)
-            }
-            other => panic!("expected Attach first, got {other:?}"),
-        };
-        assert_ne!(child, parent, "the child is a NEW context, not the parent");
-        assert_eq!(track, TrackId::new("bass").unwrap(), "child keeps the parent's lane");
-
-        match cmds.recv().await.expect("rotate plays the child's track") {
-            BeatCommand::Play(id) => {
-                assert_eq!(id, TrackId::new("bass").unwrap(), "the track's clock starts")
-            }
-            other => panic!("expected Play, got {other:?}"),
-        }
-
-        // The child really is a fork of the parent.
-        let forked_from =
-            d.kernel_db().lock().get_context(child).unwrap().unwrap().forked_from;
-        assert_eq!(forked_from, Some(parent), "child is forked from the parent");
     }
 
     // ── delete ────────────────────────────────────────────────────────────────

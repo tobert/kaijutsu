@@ -135,9 +135,9 @@ pub const VERB_DRIFT: &str = "drift";
 /// same throwaway-kaish way the other verbs are; no new runtime.
 pub const VERB_TICK: &str = "tick";
 /// The page-turn verb: fired by the beat scheduler when a context hits its rotate
-/// horizon (`phrase % rotate_every == 0`). The scheduler has ALREADY stopped the
-/// parent synchronously, so the rotate scripts (`kj fork --preset spawn` + arm +
-/// play the child) run race-free — fork-lineage becomes song form
+/// horizon (`phrase % rotate_every == 0`). The scheduler has ALREADY detached the
+/// context synchronously, so the rotate scripts (`kj context rotate`) run
+/// race-free: the successor's `create` rc attaches it to the same track
 /// (`docs/chameleon.md`).
 pub const VERB_ROTATE: &str = "rotate";
 /// The submit verb: fired by the server after a chat submit has promoted the

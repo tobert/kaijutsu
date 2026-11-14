@@ -775,8 +775,7 @@ impl BeatScheduler {
     }
 
     /// Mirror one context's binding into the `attachments` row — the durable copy a
-    /// fork inherits (via `insert_forked_context`'s `copy_attachments_for_fork`) and
-    /// a restart re-announces. db-less = no-op; write failure loud-but-tolerable.
+    /// fork or rotation successor inherits and a restart re-announces. db-less = no-op; write failure loud-but-tolerable.
     fn persist_attachment(&self, track_id: &TrackId, context_id: ContextId) -> Result<(), String> {
         let Some(track) = self.tracks.get(track_id) else {
             return Ok(());
@@ -2154,12 +2153,12 @@ impl BeatScheduler {
         self.fire_lifecycle(ctx, "tick");
     }
 
-    /// Fire the `rotate` rc verb — the page-turn (`docs/chameleon.md`). Called for a
+    /// Fire the `rotate` rc verb — the page turn (`docs/chameleon.md`). Called for a
     /// context the scheduler has ALREADY `detach`ed this beat (the synchronous detach
-    /// in `process_track`), so the script's `kj fork --preset spawn` + re-attach child
-    /// runs with the parent already off the track. The TRACK's clock keeps running
-    /// across the handoff (the gap is covered by the speculation lead). Absent rc
-    /// scripts → no-op.
+    /// in `process_track`), so the script's `kj context rotate` runs with the
+    /// predecessor already off the track; the successor's `create` rc attaches it.
+    /// The TRACK's clock keeps running across the handoff (the gap is covered by the
+    /// speculation lead). Absent rc scripts → no-op.
     fn fire_rotate(&self, ctx: ContextId) {
         self.fire_lifecycle(ctx, "rotate");
     }

@@ -817,3 +817,88 @@ fn a_failing_shell_result_marks_stderr_and_sends_no_json() {
         server.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
+
+/// The page turn runs the shipped `rotate` rc through the server's beat
+/// scheduler: the successor keeps the label and the track, runs the `create`
+/// rc again, and takes over the tick; the predecessor is archived.
+#[test]
+fn the_page_turn_replaces_a_musician_with_a_fully_set_successor_on_the_same_track() {
+    run_local(async {
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let performer = common::rc_performer(&kj, "musician").await.unwrap();
+        let label = "page-turner";
+        let original = common::create_context_as(&kj, label, &performer).await.unwrap();
+        let operator = kaijutsu_client::choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap().context_id;
+        let transport = |args: &[&str]| {
+            let mut argv = vec!["transport".to_string()];
+            argv.extend(args.iter().map(|arg| arg.to_string()));
+            argv
+        };
+        let original_hex = original.to_string();
+        // The create rc attached the context to the lane its label names.
+        let track = label;
+        for argv in [
+            transport(&["tempo", "1200", "--track", track]),
+            transport(&["rotate", "--every", "2", "--context", &original_hex, "--track", track]),
+            transport(&["play", "--track", track]),
+        ] {
+            let result = kj.execute_kj_quiet(operator, &argv).await.unwrap();
+            assert_eq!(result.exit_code, 0, "{argv:?}: {}{}", result.stdout, result.stderr);
+        }
+        // Two phrases of 32 beats at 50 ms each reach the rotate horizon in 3.2 s.
+        let successor = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let rows = kj.list_contexts().await.unwrap();
+                if let Some(row) = rows.iter().find(|row| row.id != original && !row.archived
+                    && (row.label == label || row.forked_from == Some(original)))
+                {
+                    return row.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("the rotate horizon produces a live successor");
+        assert_eq!(successor.label, label, "the successor keeps the label");
+        let successor = successor.id;
+        // One page turn is the subject: clear the cadence the successor
+        // inherited, well before its own horizon 3.2 s later.
+        let successor_hex = successor.to_string();
+        let off = transport(&["rotate", "off", "--context", &successor_hex, "--track", track]);
+        let result = kj.execute_kj_quiet(operator, &off).await.unwrap();
+        assert_eq!(result.exit_code, 0, "{off:?}: {}{}", result.stdout, result.stderr);
+        let rows = kj.list_contexts().await.unwrap();
+        assert!(rows.iter().find(|row| row.id == original).expect("the original is retained").archived,
+            "the predecessor is archived");
+        assert_eq!(rows.iter().filter(|row| row.label == label && !row.archived).count(), 1);
+
+        let blocks = kj.get_blocks(successor, &BlockQuery::All).await.unwrap();
+        for (name, text) in [
+            ("stance", include_str!("../../../assets/defaults/rc/musician/create/S00-stance.md")),
+            ("chair", include_str!("../../../assets/defaults/rc/musician/create/S05-chair.md")),
+            ("primer", include_str!("../../../assets/defaults/rc/musician/create/S15-abc-primer.md")),
+        ] {
+            let first_line = text.lines().next().unwrap();
+            assert!(blocks.iter().any(|block| block.content.contains(first_line)),
+                "the successor carries the {name} block ({first_line:?})");
+        }
+        assert!(blocks.iter().any(|block| block.content.starts_with("You're a musician here")),
+            "the successor carries the stance");
+
+        let attached: Vec<String> = server.kernel_db.lock().list_attachments_for_context(successor).unwrap()
+            .into_iter().map(|row| row.track_id).collect();
+        assert_eq!(attached, vec![track.to_string()], "the successor is attached to the same track");
+
+        // The successor's own tick admits work after the page turn.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let blocks = kj.get_blocks(successor, &BlockQuery::All).await.unwrap();
+                if blocks.iter().any(|block| block.content.starts_with("Commit at tick ")) { return; }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("the successor's tick lifecycle admits a phrase");
+        let listed = kj.execute_kj_quiet(operator, &transport(&["list"])).await.unwrap();
+        assert!(listed.stdout.contains(track), "{}", listed.stdout);
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}

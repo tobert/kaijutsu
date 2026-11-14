@@ -12,8 +12,7 @@
 #    (mirror of create — the marker defaults to the tail) is cheap and CORRECT:
 #    pin the lean seed (this fork's rebuilt stance + binding + whatever it carried)
 #    and slide a window over the phrases that follow. A thin child makes
-#    re-anchor-at-tail right with no need to read the parent's marker — which is
-#    why the player-spawn design is thin-fork + rc-rebuilds.
+#    re-anchor-at-tail right with no need to read the parent's marker.
 #  • FULL fork (regular `kj fork`) — the powerful path: take the whole context
 #    (optionally minus a few explicitly-excluded blocks) into a fresh lineage = a
 #    NEW KV cache (resume a session as another model, orchestrator repair, drift a
