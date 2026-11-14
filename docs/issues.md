@@ -8,15 +8,50 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## vi registers: what sharing leaves open (2026-11-10)
 
-Compose keeps one set of registers per client, and the kernel one per
-player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
-`dd`, switched, and `p` in a real terminal or the running app. Open:
+A player's text registers are shared through the kernel's register store:
+compose in the tui and the app and the kernel's vi sessions replay one
+another's writes (`docs/vi.md`, "A kernel-owned register store"). Amy's
+bar: "the register works for my common workflow of yy/dd/p". Open:
 
-- **Compose and the kernel's vi sessions do not share,** and neither do
-  the tui and the app. The design is written and not built: `docs/vi.md`,
-  "A kernel-owned register store", with Amy's answers: a durable table,
-  nothing restored unasked, models maybe later. It follows the argument
-  list.
+- **A client without `onRegisterWrite` can lose its editor pushes.** It
+  answers the new callback method with an unimplemented error, which the
+  server's editor bridge counts as a callback failure; 15 s of continuous
+  failures reap the bridge. State pushes that succeed reset the streak, so
+  the risk is a mixed-version deploy, not a steady state.
+- **`registers_put` holds the editor sessions lock across one synchronous
+  SQLite write,** so disk latency stalls every editor operation for that
+  write.
+- **A key that writes more than once is recorded as its net change.** A
+  macro running `"ayy"byy` with the same text is recorded as the first
+  write, and older ring rows stay in the table until the next delete.
+- **A write to `"1`–`"9` by name (`"1yy`) is replayed as a delete,** so
+  another side pushes it onto its ring instead of overwriting `"1`.
+- **`:regpull` replaces recorded macros** in `"a`–`"z`: modalkit keeps a
+  macro in its named register.
+- **The app sends writes made before it connected** once its writer
+  starts, so they reach the kernel without being asked for; Amy's
+  reconnect answer was "nobody gets it". The tui shows a note and drops
+  them. Writes a writer had already taken are not re-sent after a
+  reconnect. Pick one rule for both clients.
+- **A refused `registersPut` leaves the kernel's copy behind** the
+  client's registers until the next write or a `:regpull`, and a
+  `:regpull` can race a batch still on its way out.
+- **A lagging client loses pushed writes for good.** The client's event
+  broadcast holds 256 events and drops on lag with a log line; a write is a
+  change, not a state, so a dropped ring shift leaves the client's `"2`
+  unlike the kernel's until `:regpull`, which nothing prompts. The push's
+  `seq` cannot show the gap (a client never receives its own writes); the
+  lag signal itself could start a `registersGet`.
+- **A `ZZ` whose flush fails drops the batch's yank** from the reply
+  (`kernel.rs`, the close arm returns before `EditorBatchEnd::Closed`), so
+  `yyZZ` writes no clipboard; the register write itself is kept.
+- **The app feeds `Esc` and `i` outside its register lending**
+  (`ComposeBuffer::settle_for_focus`, `leave_to_normal`), against an empty
+  store. Those keys write no register today; a binding that did would be
+  misread.
+- **No test types `dd` in a kernel vi session and `p` in client
+  compose,** or the reverse, end to end; a second connection's put
+  stands in for the vi session in the tui and app tests.
 - **A recovered buffer's dirty test compares normalized text.** The
   checkpoint and the buffer drop one trailing newline, so a swap that
   differs from the disk text only by its final newline reads clean after
@@ -83,7 +118,9 @@ player across vi sessions (`docs/vi.md`, "Registers"). Nobody has yet typed
   middle-click paste and never writes it; `docs/input.md` used to say a
   selection auto-copies there.
 - **The kernel's register map is never pruned.** `EditorSessions` keeps an
-  entry for every principal that ever sent vi keys, until a restart.
+  entry for every principal that ever sent vi keys or a register write,
+  until a restart. The table holds the same rows and loads lazily, so an
+  idle principal's entry could be dropped and reloaded.
 
 ## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 

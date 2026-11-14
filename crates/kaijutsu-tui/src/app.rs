@@ -18,6 +18,7 @@ use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
 use kaijutsu_client::{DraftOutbox, EditorOutbox};
+use crate::register_outbox::RegisterOutbox;
 use kaijutsu_client::draft_ledger::draft_of;
 use crate::present::{Palette, WrapCache};
 use kaijutsu_present::fold::{AutoFold, collapses_by_default};
@@ -192,6 +193,9 @@ pub struct App {
     pub drafts: DraftOutbox,
     /// Where keys and pastes for a full-screen editor session go, in order.
     pub editor_keys: EditorOutbox,
+    /// Where the vi register writes a key made go to reach the kernel, in
+    /// order.
+    pub register_puts: RegisterOutbox,
     pub palette: Palette,
     /// The terminal's row count, from the last size the event loop read.
     /// Sizes what may grow with the screen (the compose cap).
@@ -312,6 +316,7 @@ impl App {
             compose: Compose::new(),
             drafts: DraftOutbox::default(),
             editor_keys: EditorOutbox::default(),
+            register_puts: RegisterOutbox::default(),
             palette: Palette::builtin(),
             screen_rows: 24,
             wrap: WrapCache::new(),
@@ -607,6 +612,28 @@ impl App {
     /// [`Self::clear_notice`] runs.
     pub fn note(&mut self, message: impl Into<String>) {
         self.notice = Some(message.into());
+    }
+
+    /// Queue the register writes the compose editor made since the last
+    /// call for the kernel. The local registers keep the text whatever the
+    /// kernel says, and a refused queue is noted rather than dropped.
+    pub fn send_register_writes(&mut self) {
+        let writes = self.compose.take_register_writes();
+        if writes.is_empty() {
+            return;
+        }
+        let count = writes.len();
+        if let Err(e) = self.register_puts.send(writes) {
+            self.note(format!("{count} register write(s) not shared with other clients: {e}"));
+        }
+    }
+
+    /// Apply a register write another client of this player pushed. It does
+    /// not reach the clipboard and is not sent back.
+    pub fn apply_register_push(&mut self, write: &kaijutsu_types::editor::RegisterWrite) {
+        if let Err(e) = self.compose.apply_register_write(write) {
+            self.note(format!("a register write from another client was refused: {e}"));
+        }
     }
 
     pub fn notice(&self) -> Option<&str> {

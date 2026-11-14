@@ -51,6 +51,8 @@ struct Harness {
     writer: Option<std::pin::Pin<Box<dyn Future<Output = ()>>>>,
     context: ContextId,
     chat: Entity,
+    /// What the register writer would have sent to the kernel.
+    registers: tokio::sync::mpsc::UnboundedReceiver<Vec<kaijutsu_editor::RegisterWrite>>,
 }
 
 impl Harness {
@@ -61,15 +63,18 @@ impl Harness {
         *kernel.draft.borrow_mut() = draft.to_string();
         let (outbox, writer, landed) = draft_outbox::channel(kernel.clone());
         let context = ContextId::new();
+        let (sink, registers) = crate::input::compose::registers::RegisterSink::for_test();
         let mut app = App::new();
         app.add_message::<GrabbedKey>()
             .add_message::<LiteralPrefix>()
             .add_message::<ActionFired>()
             .add_message::<RpcResultMessage>()
+            .add_message::<crate::connection::ServerEventMessage>()
             .init_resource::<ButtonInput<KeyCode>>()
             .insert_resource(KeyboardGrab::ComposeVim)
             .init_resource::<ComposeState>()
             .insert_resource(DraftOutboxState::for_test(outbox, landed))
+            .insert_resource(sink)
             .init_resource::<ActiveSurface>()
             .insert_resource(FocusArea::Compose)
             .init_resource::<DocumentCache>()
@@ -82,6 +87,7 @@ impl Harness {
             .add_systems(
                 Update,
                 (
+                    crate::input::compose::registers::apply_pushed_registers,
                     compose_dispatch_keys,
                     handle_focus_compose,
                     handle_pop_level,
@@ -94,12 +100,13 @@ impl Harness {
                     drain_draft_acks,
                     reconcile_chat_draft,
                     project_compose_overlays,
+                    crate::input::compose::registers::flush_register_writes,
                 )
                     .chain(),
             );
         app.world_mut().resource_mut::<DocumentCache>().set_active(context);
         let chat = app.world_mut().spawn((InputOverlayMarker, InputOverlay::default())).id();
-        Self { app, kernel, writer: Some(Box::pin(writer)), context, chat }
+        Self { app, kernel, writer: Some(Box::pin(writer)), context, chat, registers }
     }
 
     /// Run the writer until everything queued so far has reached the
@@ -714,4 +721,92 @@ fn a_new_draft_writer_waits_for_the_old_one() {
 
     drop(in_flight);
     assert!(wait(&mut second_rx, 2000).is_some(), "the new writer starts once the old one ends");
+}
+
+/// Every register write sent so far, flattened, oldest first.
+fn sent(h: &mut Harness) -> Vec<kaijutsu_editor::RegisterWrite> {
+    let mut out = Vec::new();
+    while let Ok(batch) = h.registers.try_recv() {
+        out.extend(batch);
+    }
+    out
+}
+
+fn push(h: &mut Harness, write: kaijutsu_editor::RegisterWrite) {
+    h.app.world_mut().write_message(crate::connection::ServerEventMessage(kaijutsu_client::ServerEvent::RegisterWrite { seq: 1, write }));
+    h.app.update();
+}
+
+/// `dd` in the chat draft sends one Delete write holding the line.
+#[test]
+fn dd_in_the_chat_draft_sends_a_delete_write() {
+    use kaijutsu_editor::RegisterWriteKind;
+    let mut h = Harness::new("one\ntwo");
+    h.load();
+    h.keys("gg");
+    h.keys("dd");
+    let writes = sent(&mut h);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].kind, RegisterWriteKind::Delete);
+    assert_eq!(writes[0].text.trim_end(), "one");
+}
+
+/// `yy` on the shell line sends a Yank write, and a key that writes no
+/// register sends nothing.
+#[test]
+fn yy_on_the_shell_line_sends_a_yank_write_and_motions_send_none() {
+    use kaijutsu_editor::RegisterWriteKind;
+    let mut h = Harness::new("");
+    h.load();
+    h.open_shell();
+    h.keys("ils -la<Esc>");
+    assert!(sent(&mut h).is_empty());
+    h.keys("yy");
+    let writes = sent(&mut h);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].kind, RegisterWriteKind::Yank);
+}
+
+/// A write pushed from another connection is what `p` puts, and it is not
+/// sent back.
+#[test]
+fn a_pushed_write_is_what_p_puts_and_is_not_echoed() {
+    use kaijutsu_editor::{RegisterShape, RegisterWrite, RegisterWriteKind};
+    let mut h = Harness::new("draft");
+    h.load();
+    push(&mut h, RegisterWrite { kind: RegisterWriteKind::Delete, text: "pushed\n".into(), shape: RegisterShape::Linewise });
+    h.keys("p");
+    assert_eq!(h.overlay().text, "draft\npushed");
+    assert!(sent(&mut h).is_empty(), "a pushed write must not go back to the kernel");
+}
+
+/// An outside yank (the diff viewer, `y` on a block) is sent too.
+#[test]
+fn an_outside_yank_sends_a_yank_write() {
+    use kaijutsu_editor::RegisterWriteKind;
+    let mut h = Harness::new("draft");
+    h.load();
+    h.app.world_mut().resource_mut::<ComposeState>().yank(&kaijutsu_editor::Yank::lines("+added"));
+    h.app.update();
+    let writes = sent(&mut h);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].kind, RegisterWriteKind::Yank);
+}
+
+/// `:regpull` replaces the registers with the kernel's copy and says how
+/// many it took.
+#[test]
+fn regpull_replaces_the_registers_with_the_kernels_copy() {
+    let mut h = Harness::new("draft");
+    h.load();
+    h.app.world_mut().write_message(RpcResultMessage::RegistersPulled {
+        result: Ok(vec![kaijutsu_editor::RegisterText { name: '"', text: "kernel\n".into(), shape: kaijutsu_editor::RegisterShape::Linewise }]),
+    });
+    h.app.update();
+    assert!(h.errors().iter().any(|e| e.contains("pulled 1 register")), "{:?}", h.errors());
+    h.keys("p");
+    assert_eq!(h.overlay().text, "draft\nkernel");
+    h.app.world_mut().write_message(RpcResultMessage::RegistersPulled { result: Err("down".into()) });
+    h.app.update();
+    assert!(h.errors().iter().any(|e| e.contains("down")), "{:?}", h.errors());
 }

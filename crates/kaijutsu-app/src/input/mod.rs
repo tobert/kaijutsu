@@ -185,7 +185,8 @@ impl Plugin for InputPlugin {
             .init_resource::<interrupt::InterruptState>()
             .init_resource::<scroll_config::ScrollConfig>()
             .init_resource::<compose::ComposeState>()
-            .init_resource::<compose::outbox::DraftOutboxState>();
+            .init_resource::<compose::outbox::DraftOutboxState>()
+            .init_resource::<compose::registers::RegisterSink>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
@@ -216,8 +217,19 @@ impl Plugin for InputPlugin {
         // outbox on the current connection before any key needs it.
         app.add_systems(
             Update,
-            (context::sync_input_context, compose::outbox::sync_draft_outbox)
+            (
+                context::sync_input_context,
+                compose::outbox::sync_draft_outbox,
+                compose::registers::sync_register_sink,
+                // Writes other connections pushed land between keys.
+                compose::registers::apply_pushed_registers,
+            )
                 .in_set(InputPhase::SyncContext),
+        );
+        // Register writes keys and yanks made this frame go to the kernel.
+        app.add_systems(
+            Update,
+            compose::registers::flush_register_writes.after(InputPhase::Handle),
         );
 
         // Dispatch phase: raw input → ActionFired/GrabbedKey.

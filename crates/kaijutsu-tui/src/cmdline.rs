@@ -16,6 +16,8 @@ pub enum ColonVerb {
     /// `:!<statement>` — one kaish statement through `shell_execute`, the
     /// gated human path a key press already takes.
     Shell(String),
+    /// `:regpull` — replace the vi registers with the kernel's copy.
+    RegPull,
     /// `:q` (unforced) / `:q!` (forced).
     Quit { force: bool },
     /// Anything else — the caller posts it verbatim as a status-line notice.
@@ -31,6 +33,9 @@ pub fn parse(line: &str) -> ColonVerb {
     };
     if body == "q" {
         return ColonVerb::Quit { force: false };
+    }
+    if body == "regpull" {
+        return ColonVerb::RegPull;
     }
     if body == "q!" {
         return ColonVerb::Quit { force: true };
@@ -124,6 +129,13 @@ mod tests {
     #[test]
     fn q_and_q_bang_are_never_confused() {
         assert_ne!(parse(":q"), parse(":q!"));
+    }
+
+    #[test]
+    fn regpull_takes_no_argument() {
+        assert_eq!(parse(":regpull"), ColonVerb::RegPull);
+        assert_eq!(parse(":regpull now"), ColonVerb::Unknown);
+        assert_eq!(parse(":regpul"), ColonVerb::Unknown);
     }
 
     #[test]

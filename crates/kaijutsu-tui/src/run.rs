@@ -83,6 +83,8 @@ struct Wires {
     draft_landed: mpsc::UnboundedReceiver<Landed>,
     /// Answers to our own editor keys and pastes ([`kaijutsu_client::editor_outbox`]).
     editor_landed: mpsc::UnboundedReceiver<editor_outbox::Landed>,
+    /// Register batches the kernel did not take ([`crate::register_outbox`]).
+    register_failed: mpsc::UnboundedReceiver<crate::register_outbox::Failed>,
 }
 
 /// Run the client until it quits, restoring the terminal on the way out.
@@ -150,6 +152,8 @@ pub async fn run(
     app.drafts = drafts;
     let (editor_keys, editor_landed) = editor_outbox::spawn_local(bridge.actor().clone());
     app.editor_keys = editor_keys;
+    let (register_puts, register_failed) = crate::register_outbox::spawn_local(bridge.actor().clone());
+    app.register_puts = register_puts;
 
     // A panic on this thread, outside any task, past this point unwinds
     // through the screen without reaching `leave_terminal`. The hook
@@ -207,6 +211,7 @@ pub async fn run(
         editor_opens: open_rx,
         draft_landed,
         editor_landed,
+        register_failed,
     };
     let result = event_loop(&bridge, &mut app, &mut terminal, &mut wires).await;
     leave_terminal(&mut terminal, &term_lock, &reader_stop);
@@ -323,6 +328,10 @@ async fn event_loop(
                     ls.frame.dirty = true;
                     ls.frame.answer = true;
                 }
+            }
+            Some(failed) = wires.register_failed.recv() => {
+                app.note(format!("{} register write(s) not shared with other clients: {}", failed.writes, failed.error));
+                ls.frame.dirty = true;
             }
             Some(landed) = wires.draft_landed.recv() => {
                 if land_draft_edit(app, landed) {

@@ -10,12 +10,13 @@
 //! This module is the model: no Bevy systems, no RPC. `systems.rs` drives it.
 
 pub mod outbox;
+pub mod registers;
 pub mod systems;
 
 use std::collections::HashMap;
 
 use kaijutsu_client::draft_ledger::{DraftLedger, draft_of};
-use kaijutsu_editor::{EditOp, EditorCore, Registers};
+use kaijutsu_editor::{EditOp, EditorCore, RegisterText, RegisterWrite, RegisterWriteKind, Registers};
 use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, PrincipalId};
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -57,6 +58,9 @@ pub enum Submit {
 /// One compose surface's text, cursor and mode.
 pub struct ComposeBuffer {
     editor: EditorCore,
+    /// Register writes this buffer's editor made, not yet taken by
+    /// [`ComposeState::take_register_writes`].
+    writes: Vec<RegisterWrite>,
 }
 
 impl Default for ComposeBuffer {
@@ -71,7 +75,7 @@ impl ComposeBuffer {
     pub fn over(text: &str) -> Self {
         let mut editor = EditorCore::new(text);
         editor.apply_keys("G$");
-        Self { editor }
+        Self { editor, writes: Vec::new() }
     }
 
     pub fn text(&self) -> String {
@@ -114,6 +118,8 @@ impl ComposeBuffer {
         let mut action = ComposeAction::default();
         if let Some(raw) = self.command_line() {
             action.ops = self.editor.apply_key_event(key);
+            // `Enter` on a `/`·`?` bar runs a pending operator (`y/pat`).
+            action.yanked = self.collect_yank();
             let reported = self.editor.take_commands();
             if key.code == KeyCode::Enter && raw.starts_with(':') {
                 // The core's `:w`/`:q` dialect answers the editor screen, not
@@ -132,9 +138,8 @@ impl ComposeBuffer {
             action.submit = true;
             return action;
         }
-        let before = self.editor.last_yank();
         action.ops = self.editor.apply_key_event(key);
-        action.yanked = self.editor.last_yank().filter(|now| Some(now) != before.as_ref()).map(|yank| yank.text);
+        action.yanked = self.collect_yank();
         if let Some(Err(message)) = self.editor.take_commands() {
             action.notice = Some(message);
         }
@@ -211,7 +216,22 @@ impl ComposeBuffer {
         self.editor.give_registers(std::mem::take(registers));
         let result = act(self);
         *registers = self.editor.take_registers();
+        self.collect_writes();
         result
+    }
+
+    /// Move the editor's register writes to this buffer's outbound list,
+    /// returning the ones just moved.
+    /// Collect the key's register writes, returning its yank for the system
+    /// clipboard; a delete never is one.
+    fn collect_yank(&mut self) -> Option<String> {
+        self.collect_writes().into_iter().rev().find(|write| write.kind == RegisterWriteKind::Yank).map(|write| write.text)
+    }
+
+    fn collect_writes(&mut self) -> Vec<RegisterWrite> {
+        let writes = self.editor.take_register_writes();
+        self.writes.extend(writes.iter().cloned());
+        writes
     }
 }
 
@@ -301,6 +321,8 @@ pub struct ComposeState {
     /// one buffer: each key borrows them, so a switch, a submit or a clear,
     /// which each build a new buffer, keeps them (`docs/vi.md`, "Registers").
     registers: Registers,
+    /// Register writes made and not yet sent to the kernel, oldest first.
+    outbound: Vec<RegisterWrite>,
 }
 
 // SAFETY: `EditorCore` holds a modalkit `ModalMachine`, whose only
@@ -326,6 +348,7 @@ impl Default for ComposeState {
             submits: 0,
             escape: TapCounter::new(ESCAPE_WINDOW_MS, 2),
             registers: Registers::default(),
+            outbound: Vec::new(),
         }
     }
 }
@@ -357,19 +380,50 @@ impl ComposeState {
             return None;
         }
         let escape = &mut self.escape;
-        Some(self.chat.lending(&mut self.registers, |chat| press_with_escape(chat, escape, Submit::FromNormalMode, key)))
+        let action = self.chat.lending(&mut self.registers, |chat| press_with_escape(chat, escape, Submit::FromNormalMode, key));
+        self.collect_register_writes();
+        Some(action)
     }
 
     /// Yank text from outside compose (the diff viewer's `y`) into the vi
     /// registers, where `p` on either surface finds it.
     pub fn yank(&mut self, yank: &kaijutsu_editor::Yank) {
         self.chat.lending(&mut self.registers, |chat| chat.editor.yank(yank));
+        self.collect_register_writes();
+    }
+
+    /// The register writes made since the last take, oldest first, for the
+    /// kernel's store (`docs/vi.md`, "A kernel-owned register store").
+    pub fn take_register_writes(&mut self) -> Vec<RegisterWrite> {
+        self.collect_register_writes();
+        std::mem::take(&mut self.outbound)
+    }
+
+    /// Move each buffer's writes to the outbound list. Every method that
+    /// feeds a buffer calls this, so a write survives the buffer being
+    /// replaced by a submit or a clear.
+    fn collect_register_writes(&mut self) {
+        self.outbound.append(&mut self.chat.writes);
+        self.outbound.append(&mut self.shell.writes);
+    }
+
+    /// Apply a write the kernel pushed from another connection. It is not
+    /// recorded as an outbound write, so it is never sent back.
+    pub fn apply_register_write(&mut self, write: &RegisterWrite) -> Result<(), String> {
+        self.registers.apply(write)
+    }
+
+    /// Replace the text registers with the kernel's copy (`:regpull`).
+    pub fn replace_registers(&mut self, cells: &[RegisterText]) -> Result<(), String> {
+        self.registers.replace_text(cells)
     }
 
     /// One keystroke on the shell surface.
     pub fn press_shell(&mut self, key: KeyEvent) -> ComposeAction {
         let escape = &mut self.escape;
-        self.shell.lending(&mut self.registers, |shell| press_with_escape(shell, escape, Submit::FromAnyMode, key))
+        let action = self.shell.lending(&mut self.registers, |shell| press_with_escape(shell, escape, Submit::FromAnyMode, key));
+        self.collect_register_writes();
+        action
     }
 
     /// A paste into the chat draft. `None` while the draft is loading: the
@@ -389,12 +443,16 @@ impl ComposeState {
             self.held.push(HeldInput::Put);
             return None;
         }
-        Some(self.chat.put(&mut self.registers))
+        let action = self.chat.put(&mut self.registers);
+        self.collect_register_writes();
+        Some(action)
     }
 
     /// `Ctrl+A ]` on the shell surface.
     pub fn put_shell(&mut self) -> ComposeAction {
-        self.shell.put(&mut self.registers)
+        let action = self.shell.put(&mut self.registers);
+        self.collect_register_writes();
+        action
     }
 
     /// Count one chat edit as sent. Returns the generation to send with it.

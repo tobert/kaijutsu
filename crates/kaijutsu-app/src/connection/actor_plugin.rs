@@ -391,6 +391,8 @@ pub enum RpcResultMessage {
     },
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
+    /// The kernel's text registers, for `:regpull` in compose.
+    RegistersPulled { result: Result<Vec<kaijutsu_editor::RegisterText>, String> },
     /// The per-client mouse-wheel scroll config (`/config/client/<id>/scroll.toml`,
     /// cascading to the shared `/config/client/default/scroll.toml`), fetched over RPC on
     /// (re)connect. Drained by

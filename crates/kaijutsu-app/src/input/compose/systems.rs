@@ -81,6 +81,7 @@ impl ComposeIo<'_, '_> {
         if let Some(line) = action.command {
             match line.strip_prefix(':').and_then(kaijutsu_client::vi_statement) {
                 Some(statement) => self.run_colon_vi(statement),
+                None if line.trim() == ":regpull" => self.run_regpull(),
                 None => self.error("compose", format!("{line}: compose runs no `:` commands; Ctrl+Z opens the shell context")),
             }
         }
@@ -123,6 +124,23 @@ impl ComposeIo<'_, '_> {
                 },
                 span,
             ))
+            .detach();
+    }
+
+    /// `:regpull`: replace the compose registers with the kernel's copy.
+    /// The answer lands in [`Self::land`].
+    fn run_regpull(&mut self) {
+        let Some(actor) = self.actor.as_ref() else {
+            self.error("regpull", "not connected; the registers are unchanged");
+            return;
+        };
+        let handle = actor.handle.clone();
+        let tx = self.rpc_results.sender();
+        IoTaskPool::get()
+            .spawn(async move {
+                let result = handle.registers_get().await.map_err(|e| e.to_string());
+                let _ = tx.send(RpcResultMessage::RegistersPulled { result });
+            })
             .detach();
     }
 
@@ -292,6 +310,16 @@ impl ComposeIo<'_, '_> {
                     }
                 }
             }
+            RpcResultMessage::RegistersPulled { result } => match result {
+                Ok(cells) => match self.compose.replace_registers(cells) {
+                    Ok(()) => {
+                        let noun = if cells.len() == 1 { "register" } else { "registers" };
+                        self.error("regpull", format!("pulled {} {noun} from the kernel", cells.len()));
+                    }
+                    Err(e) => self.error("regpull", format!("the kernel's registers were refused: {e}")),
+                },
+                Err(e) => self.error("regpull", format!("could not read the kernel's registers: {e}")),
+            },
             RpcResultMessage::DraftSubmitted { context_id, result } => match result {
                 Ok(block) => self.compose.finish_submit(Some(*block)),
                 Err(e) => {

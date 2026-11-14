@@ -162,6 +162,23 @@ pub fn kernel_drafts(server: &EphemeralServer) -> Vec<String> {
     })
 }
 
+/// The text registers the kernel holds for `server`'s root principal, as
+/// `(name, text)`.
+pub fn kernel_registers(server: &EphemeralServer) -> Vec<(char, String)> {
+    with_kernel(server, async |kernel| {
+        let cells = kernel.registers_get().await.expect("read the kernel's registers");
+        cells.into_iter().map(|cell| (cell.name, cell.text)).collect()
+    })
+}
+
+/// Write `writes` to the root principal's registers over a connection of
+/// its own, which the client under test hears as a push.
+pub fn put_registers(server: &EphemeralServer, writes: &[kaijutsu_types::editor::RegisterWrite]) {
+    with_kernel(server, async |kernel| {
+        kernel.registers_put(writes).await.expect("put register writes");
+    })
+}
+
 /// Check that every context but the root seat and its model-less MCP hub
 /// has a performer, so a submit
 /// is accepted rather than refused before it commits. The client under test

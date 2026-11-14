@@ -194,6 +194,15 @@ clipboard when there is one; a delete is not. A `y` in the full-screen vi
 editor is written to the system clipboard too (the reply to the keys carries
 the yank; the compose registers are not filled). `docs/vi.md`, "Registers".
 
+The kernel keeps a copy of the player's registers, so `dd` or `yy` in compose
+puts in the terminal client or a kernel `vi` session, and the reverse. Each
+key's register writes go to the kernel in order on one writer task, so `p`
+never waits on the wire; a failed send is reported and the local registers
+keep the text. A write another connection pushes is applied between keys,
+is not sent back, and never reaches the clipboard. `:regpull` on the `:` bar
+replaces the compose registers with the kernel's copy and says how many it
+took. `docs/vi.md`, "A kernel-owned register store".
+
 | Key | Does |
 |---|---|
 | `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |

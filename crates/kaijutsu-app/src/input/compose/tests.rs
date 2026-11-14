@@ -330,6 +330,19 @@ fn a_yank_is_reported_and_a_delete_is_not() {
     assert_eq!(last(&mut state, "dd"), None, "a delete stays out of the clipboard");
 }
 
+/// An operator over a search runs when the `/` bar submits, so its
+/// `Enter` is the key that yanks, and the yank is offered to the clipboard.
+#[test]
+fn a_yank_made_by_the_search_bars_enter_is_reported() {
+    let mut state = ComposeState::default();
+    ready(&mut state, "one two");
+    for c in "0y/two".chars() {
+        state.press_chat(press(KeyCode::Char(c))).expect("the draft is loaded");
+    }
+    let action = state.press_chat(press(KeyCode::Enter)).expect("the draft is loaded");
+    assert_eq!(action.yanked.as_deref(), Some("one "));
+}
+
 /// A yank made outside compose puts on either surface.
 #[test]
 fn an_outside_yank_puts_in_the_chat_draft() {

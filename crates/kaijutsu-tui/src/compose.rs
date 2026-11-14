@@ -21,6 +21,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kaijutsu_client::draft_ledger::DraftLedger;
 use kaijutsu_editor::{EditOp, EditorCore, Yank};
+use kaijutsu_types::editor::{RegisterText, RegisterWrite, RegisterWriteKind};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -158,6 +159,11 @@ pub struct Compose {
     /// context switch. The vi registers are kept the same way, inside
     /// `editor`: [`Self::load_draft`] moves them into each new core.
     colon_history: ColonHistory,
+    /// Register writes the editor core made, drained after each call that
+    /// can make one, not yet taken by [`Self::take_register_writes`]. A new
+    /// core ([`Self::load_draft`]) starts with an empty record, so this is
+    /// the only place a write waits.
+    register_outbox: Vec<RegisterWrite>,
 }
 
 impl Default for Compose {
@@ -182,6 +188,7 @@ impl Compose {
             editor: EditorCore::new(""),
             ledger: DraftLedger::default(),
             colon_history: ColonHistory::default(),
+            register_outbox: Vec::new(),
         };
         compose.load_draft(text);
         compose
@@ -192,6 +199,8 @@ impl Compose {
     /// vi registers, which are this session's, not this draft's
     /// (`docs/tui.md`, "Compose").
     pub fn load_draft(&mut self, text: &str) {
+        // The old core's record of writes goes with it otherwise.
+        self.drain_core_writes();
         let mut editor = EditorCore::with_registers(text, self.editor.take_registers());
         // The core opens in normal mode at the top; `G$` lands the cursor on
         // the last character, so `a` resumes a draft where it left off.
@@ -409,6 +418,49 @@ impl Compose {
     /// vi registers, where `p` and `Ctrl+A ]` find them.
     pub fn yank_lines(&mut self, text: &str) {
         self.editor.yank(&Yank::lines(text));
+        self.drain_core_writes();
+    }
+
+    /// The register writes made since the last call, oldest first, for the
+    /// caller to send to the kernel. Draining is the only way the record
+    /// shrinks, so each write is taken once, across rebuilds of the core
+    /// included.
+    pub fn take_register_writes(&mut self) -> Vec<RegisterWrite> {
+        self.drain_core_writes();
+        std::mem::take(&mut self.register_outbox)
+    }
+
+    fn drain_core_writes(&mut self) {
+        let writes = self.editor.take_register_writes();
+        self.register_outbox.extend(writes);
+    }
+
+    /// Move one key's register writes to the outbox, returning the key's
+    /// yank as its write says it: a delete is never one, and an identical
+    /// re-yank wrote nothing.
+    fn drain_key_writes(&mut self) -> Option<String> {
+        let writes = self.editor.take_register_writes();
+        let yanked = writes.iter().rev().find(|write| write.kind == RegisterWriteKind::Yank).map(|write| write.text.clone());
+        self.register_outbox.extend(writes);
+        yanked
+    }
+
+    /// Apply a write another client of this player made to the vi
+    /// registers. It is not recorded, so it is never sent back.
+    pub fn apply_register_write(&mut self, write: &RegisterWrite) -> Result<(), String> {
+        let mut registers = self.editor.take_registers();
+        let applied = registers.apply(write);
+        self.editor.give_registers(registers);
+        applied
+    }
+
+    /// Replace the text registers with the kernel's copy. The registers
+    /// stay as they were when the copy is refused.
+    pub fn replace_registers(&mut self, cells: &[RegisterText]) -> Result<(), String> {
+        let mut registers = self.editor.take_registers();
+        let replaced = registers.replace_text(cells);
+        self.editor.give_registers(registers);
+        replaced
     }
 
     /// `Ctrl+A ]`: put the unnamed register, as `p` does. `None` while the
@@ -417,7 +469,9 @@ impl Compose {
         if self.editor.command_line().is_some() {
             return None;
         }
-        Some(self.editor.put())
+        let ops = self.editor.put();
+        self.drain_core_writes();
+        Some(ops)
     }
 
     /// Interpret one keystroke. Compose always holds the keyboard: there is
@@ -429,7 +483,11 @@ impl Compose {
         // it — never the core's own `:w`/`:q` ex-command dialect, which
         // answers the alternate-screen editor, not this bar.
         if let Some(raw) = self.editor.command_line() {
-            return self.press_cmdline(key, raw);
+            // `Enter` on a `/`·`?` bar runs a pending operator (`y/pat`), so
+            // the bar's keys can write registers too.
+            let mut action = self.press_cmdline(key, raw);
+            action.yanked = self.drain_key_writes();
+            return action;
         }
 
         // Plain `Enter` submits in normal mode; `Esc Enter` is the way out
@@ -443,16 +501,15 @@ impl Compose {
             };
         }
 
-        let before = self.editor.last_yank();
         let ops = self.editor.apply_key_event(key);
-        let yanked = self.editor.last_yank().filter(|now| Some(now) != before.as_ref());
+        let yanked = self.drain_key_writes();
         let notice = match self.editor.take_commands() {
             Some(Err(message)) => Some(message),
             _ => None,
         };
         ComposeAction {
             ops,
-            yanked: yanked.map(|yank| yank.text),
+            yanked,
             notice,
             ..ComposeAction::default()
         }
@@ -971,6 +1028,91 @@ mod tests {
         compose.reset();
         typed(&mut compose, "p");
         assert_eq!(compose.text(), "echo ");
+    }
+
+    fn write(kind: RegisterWriteKind, text: &str, shape: kaijutsu_types::editor::RegisterShape) -> RegisterWrite {
+        RegisterWrite { kind, text: text.into(), shape }
+    }
+
+    /// A `dd` is one delete write and a `yy` one yank write; taking them
+    /// empties the record, and a motion adds none.
+    #[test]
+    fn keys_leave_register_writes_to_be_taken_once() {
+        use kaijutsu_types::editor::RegisterShape::Linewise;
+        let mut compose = Compose::over("one\ntwo");
+        typed(&mut compose, "ggjdd");
+        typed(&mut compose, "kyy");
+        typed(&mut compose, "j");
+        assert_eq!(
+            compose.take_register_writes(),
+            vec![write(RegisterWriteKind::Delete, "two\n", Linewise), write(RegisterWriteKind::Yank, "one\n", Linewise)]
+        );
+        assert_eq!(compose.take_register_writes(), vec![], "a write is taken once");
+    }
+
+    /// A `dd`, then a seat switch that rebuilds the core before anything
+    /// takes the write: the write is still there, once.
+    #[test]
+    fn a_write_survives_a_rebuild_of_the_core_and_is_not_repeated() {
+        use kaijutsu_types::editor::RegisterShape::Linewise;
+        let mut compose = Compose::over("wrong\nkeep");
+        typed(&mut compose, "ggdd");
+        compose.load_draft("other");
+        compose.load_draft("another");
+        assert_eq!(compose.take_register_writes(), vec![write(RegisterWriteKind::Delete, "wrong\n", Linewise)]);
+        assert_eq!(compose.take_register_writes(), vec![]);
+    }
+
+    /// An operator over a search runs when the `/` bar submits, so that
+    /// `Enter` is the key that yanks: it is offered to the clipboard and its
+    /// write outlives the next rebuild of the core.
+    #[test]
+    fn a_yank_made_by_the_search_bars_enter_is_kept_and_offered() {
+        use kaijutsu_types::editor::RegisterShape::Charwise;
+        let mut compose = Compose::over("one two");
+        typed(&mut compose, "0y/two");
+        let action = compose.press(press(KeyCode::Enter));
+        assert_eq!(action.yanked.as_deref(), Some("one "));
+        compose.load_draft("next");
+        assert_eq!(compose.take_register_writes(), vec![write(RegisterWriteKind::Yank, "one ", Charwise)]);
+    }
+
+    /// Copy mode's yank and `Ctrl+A ]` are register traffic too: the yank
+    /// is a write, and a put is not.
+    #[test]
+    fn copy_modes_yank_is_a_write_and_a_put_is_not() {
+        use kaijutsu_types::editor::RegisterShape::Linewise;
+        let mut compose = Compose::over("draft");
+        compose.yank_lines("from\nabove");
+        assert_eq!(compose.take_register_writes(), vec![write(RegisterWriteKind::Yank, "from\nabove\n", Linewise)]);
+        compose.put().expect("the draft holds the keyboard");
+        assert_eq!(compose.take_register_writes(), vec![], "a put writes no register");
+    }
+
+    /// A write another client made lands in the registers, `p` puts it, and
+    /// it is not recorded to be sent back.
+    #[test]
+    fn an_applied_write_is_put_by_p_and_never_sent_back() {
+        use kaijutsu_types::editor::RegisterShape::Linewise;
+        let mut compose = Compose::over("keep");
+        compose.apply_register_write(&write(RegisterWriteKind::Delete, "gone\n", Linewise)).expect("a delete applies");
+        typed(&mut compose, "p");
+        assert_eq!(compose.text(), "keep\ngone");
+        assert_eq!(compose.take_register_writes(), vec![]);
+    }
+
+    /// The kernel's copy replaces the registers wholesale.
+    #[test]
+    fn a_replaced_copy_is_what_p_puts() {
+        use kaijutsu_types::editor::RegisterShape::Charwise;
+        let mut compose = Compose::over("ab");
+        typed(&mut compose, "0yl");
+        compose.take_register_writes();
+        let cells = [RegisterText { name: '"', text: "kernel".into(), shape: Charwise }];
+        compose.replace_registers(&cells).expect("the copy applies");
+        typed(&mut compose, "p");
+        assert_eq!(compose.text(), "akernelb");
+        assert_eq!(compose.take_register_writes(), vec![]);
     }
 
     /// A resumed draft opens in normal mode with the cursor on its last

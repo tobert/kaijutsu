@@ -77,8 +77,8 @@ pub async fn resolve_editor_target(
 use std::collections::HashMap;
 
 use kaijutsu_editor::{
-    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, RegisterText, RegisterWrite,
-    Registers, Yank,
+    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, RegisterShape, RegisterText, RegisterWrite,
+    RegisterWriteKind, Registers, Yank,
 };
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
@@ -906,9 +906,9 @@ impl EditorSessions {
         Ok(outcome)
     }
 
-    /// [`batch`](Self::batch)'s body. `yank` is set from the player's `"0`
-    /// before and after the keys; the registers belong to the player, not the
-    /// buffer, so the compare holds whichever buffer the keys ran in.
+    /// [`batch`](Self::batch)'s body. `yank` is set from the last yank among
+    /// the keys' register writes; the registers belong to the player, not the
+    /// buffer, so it holds whichever buffer the keys ran in.
     /// `registers` takes the core's register writes.
     #[allow(clippy::too_many_arguments)] // one batch's inputs and its two register reports
     fn run_batch(
@@ -932,17 +932,15 @@ impl EditorSessions {
             let len_before = buffer.core.text().chars().count();
             let before = player.registers.text_cells();
             buffer.core.give_registers(std::mem::take(&mut player.registers));
-            let yank_before = buffer.core.last_yank();
             let ops = match input {
                 BatchInput::Keys(keys) => buffer.core.apply_keys(keys),
                 BatchInput::Pending(keys) => buffer.core.apply_pending(keys),
             };
-            let yank_after = buffer.core.last_yank();
-            if yank_after != yank_before {
-                *yank = yank_after;
-            }
             player.registers = buffer.core.take_registers();
             registers.writes = buffer.core.take_register_writes();
+            if let Some(last) = registers.writes.iter().rev().find(|w| w.kind == RegisterWriteKind::Yank) {
+                *yank = Some(Yank { text: last.text.clone(), linewise: last.shape == RegisterShape::Linewise });
+            }
             if !registers.writes.is_empty() {
                 registers.before = before;
             }

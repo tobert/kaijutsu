@@ -518,19 +518,6 @@ impl EditorCore {
         }
     }
 
-    /// The last yank, vim's `"0`: what a `y` wrote, never what a delete did.
-    /// `None` before the first yank. A client compares this across a key to
-    /// learn that the key yanked, and offers the text to the system
-    /// clipboard.
-    pub fn last_yank(&self) -> Option<Yank> {
-        let cell = self.store.registers.get(&Register::LastYanked).ok()?;
-        let text = cell.value.to_string();
-        if text.is_empty() {
-            return None;
-        }
-        Some(Yank { text, linewise: cell.shape == TargetShape::LineWise })
-    }
-
     /// Put the unnamed register, for a key that is not vi's own (`Ctrl+A ]`).
     ///
     /// In normal mode this is `p`, and a half-typed command (a count, an
@@ -2349,10 +2336,10 @@ mod tests {
         fn edits_nothing_and_leaves_no_undo_entry_or_register() {
             let mut ed = EditorCore::new("hello\nworld");
             ed.apply_keys("yy");
-            let yanked = ed.last_yank();
+            assert_eq!(ed.take_register_writes().len(), 1);
             ed.set_cursor(1, 3);
             assert_eq!(ed.text(), "hello\nworld");
-            assert_eq!(ed.last_yank(), yanked, "registers are untouched");
+            assert!(ed.take_register_writes().is_empty(), "registers are untouched");
             ed.apply_keys("u");
             assert_eq!(ed.text(), "hello\nworld", "undo has nothing to undo");
 
@@ -2415,25 +2402,32 @@ mod tests {
             assert_eq!(ed.text(), "aXYbc");
         }
 
-        /// `"0` is the last yank; a delete fills the unnamed register and
-        /// leaves it alone.
+        /// Only a `y` or an outside yank records a yank write; a delete or a
+        /// change records something else.
         #[test]
-        fn last_yank_follows_y_and_ignores_a_delete() {
+        fn only_a_yank_records_a_yank_write() {
+            fn yanks(ed: &mut EditorCore) -> Vec<(String, RegisterShape)> {
+                ed.take_register_writes()
+                    .into_iter()
+                    .filter(|w| w.kind == RegisterWriteKind::Yank)
+                    .map(|w| (w.text, w.shape))
+                    .collect()
+            }
             let mut ed = EditorCore::new("one\ntwo\nthree");
-            assert_eq!(ed.last_yank(), None);
             ed.apply_keys("yy");
-            assert_eq!(ed.last_yank(), Some(Yank::lines("one")));
+            assert_eq!(yanks(&mut ed), [("one\n".to_string(), RegisterShape::Linewise)]);
             ed.apply_keys("jdd");
-            assert_eq!(ed.last_yank(), Some(Yank::lines("one")), "a delete is not a yank");
+            assert_eq!(yanks(&mut ed), [], "a delete is not a yank");
             for keys in ["x", "D", "cwz<Esc>", "S<Esc>", "\"add", "vld"] {
                 ed.apply_keys(keys);
-                assert_eq!(ed.last_yank(), Some(Yank::lines("one")), "{keys} is not a yank");
+                assert_eq!(yanks(&mut ed), [], "{keys} is not a yank");
             }
             ed.apply_keys("ggOthree four<Esc>0");
+            ed.take_register_writes();
             ed.apply_keys("yw");
-            assert_eq!(ed.last_yank(), Some(Yank { text: "three ".into(), linewise: false }));
+            assert_eq!(yanks(&mut ed), [("three ".to_string(), RegisterShape::Charwise)]);
             ed.yank(&Yank::lines("outside"));
-            assert_eq!(ed.last_yank(), Some(Yank::lines("outside")));
+            assert_eq!(yanks(&mut ed), [("outside\n".to_string(), RegisterShape::Linewise)]);
         }
 
         /// `put` is `p` in normal mode and typed text in insert mode.

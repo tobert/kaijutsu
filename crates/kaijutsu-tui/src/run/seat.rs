@@ -251,6 +251,13 @@ pub(super) async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx:
             Ok(_) => app.clear_notice(),
             Err(e) => app.note(format!("shell failed: {e}")),
         },
+        ColonVerb::RegPull => match bridge.actor().registers_get().await {
+            Ok(cells) => match app.compose.replace_registers(&cells) {
+                Ok(()) => app.note(format!("{} registers pulled from the kernel", cells.len())),
+                Err(e) => app.note(format!(":regpull refused the kernel's registers: {e}")),
+            },
+            Err(e) => app.note(format!(":regpull failed: {e}")),
+        },
         ColonVerb::Quit { force } => {
             if force || !app.any_turn_running() {
                 app.quit = true;

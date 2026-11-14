@@ -85,6 +85,9 @@ pub(super) async fn on_input(
                     app.saw_input();
                 }
             }
+            // Whatever the key wrote to the vi registers goes to the kernel
+            // without the key waiting on it.
+            app.send_register_writes();
             spawn_ask_work(bridge, app, &ls.asks.read_tx);
             // A switch, an `Esc`, or an answer may leave room for
             // a card; `raise_card` does nothing while one is up.
@@ -153,6 +156,12 @@ pub(super) async fn on_server_event(
         frame.dirty = true;
     }
     if mark_turn_liveness(app, &event) {
+        frame.dirty = true;
+    }
+    // Another client's yank or delete, between keys: the registers take it,
+    // the clipboard does not.
+    if let ServerEvent::RegisterWrite { write, .. } = &event {
+        app.apply_register_push(write);
         frame.dirty = true;
     }
     if observe_editor_event(bridge, app, &event).await {

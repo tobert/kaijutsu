@@ -518,11 +518,27 @@ Rules the figure carries:
   marks, undo history and the cursor stay with the old draft. Amy,
   2026-11-10: *"it doesn't have to be one global, but like, I want to be
   able to dd while working in one context's editor, then go to another and
-  'p' when I type in the wrong spot."* The registers are this client's: the
-  app and the kernel's vi sessions each keep their own. Copy mode's `y`
-  fills them, and a yank is also written to the system clipboard
-  (`docs/vi.md`, "Registers").
+  'p' when I type in the wrong spot."* Copy mode's `y` fills them, and a
+  yank is also written to the system clipboard (`docs/vi.md`,
+  "Registers").
   Probe: `a_deleted_line_survives_a_seat_switch`.
+- **The registers are shared through the kernel.** After every key, copy
+  mode's `y` and `Ctrl+A ]`, `Compose::take_register_writes` hands over the
+  register writes the core recorded (`EditorCore::take_register_writes`),
+  and `App::send_register_writes` queues them on the register outbox
+  (`register_outbox`): one writer task sends each batch with
+  `registersPut` and waits for its answer before the next, so `p` never
+  waits on the wire. A refused batch shows a status-line note; the local
+  registers keep the text. A `ServerEvent::RegisterWrite` pushed from
+  another client of the player is applied between keys
+  (`Compose::apply_register_write`): it is not sent back and it never
+  reaches the clipboard. `:regpull` replaces the registers with the
+  kernel's copy (`registersGet`) and says how many came back. So `dd` or
+  `yy` here, then `p` in the app or in a kernel `vi` session, puts it, and
+  the other way round (`docs/vi.md`, "A kernel-owned register store").
+  Probes: `a_dd_and_a_yy_in_compose_reach_the_kernels_registers`,
+  `a_write_from_another_client_is_put_by_p_in_compose`,
+  `regpull_reports_the_registers_the_kernel_returned`.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
   indent under the prompt; Enter in insert mode is a newline. Every row
@@ -784,6 +800,7 @@ compose's bar.
   :kj fork --name alt              run kj, blocks land like a player's own
   :!git status                     one kaish statement, the gated human path
   :vi notes/draft.md               open the kernel-owned vi on a path
+  :regpull                         replace the vi registers with the kernel's
   :q                               quit, unless a turn is known running
   :kj con█                         the bar draws on the compose row
   :!git status█                    a shell line, drawn as typed
@@ -802,7 +819,7 @@ compose's bar.
   way it always did); its `Ok`/`Err` is drained via `take_commands()` and
   never surfaced — the core's `Err("Not an editor command")` for a line like
   `:kj fork` is not this parse's failure.
-- Four verbs. `:kj <argv>` is whitespace-split (no shell-style quoting —
+- Five verbs. `:kj <argv>` is whitespace-split (no shell-style quoting —
   MVP) and runs through `execute_kj` (a player's command, so it authors its
   block pair); `:!<statement>` runs through `shell_execute`, the gated path a
   key press already took on the old shell surface, and joins its history;
@@ -811,7 +828,8 @@ compose's bar.
   builtin opens the editor and takes the alternate screen (`docs/vi.md`). A
   failed open lands in the command block, as any `:!` failure does;
   `:q` quits unless this client knows of a turn still running, which warns
-  instead (`:q!` quits regardless — the turn keeps running in the kernel).
+  instead (`:q!` quits regardless — the turn keeps running in the kernel);
+  `:regpull` takes no argument ("Compose", the registers).
   Anything else is a status-line notice naming the line verbatim, and the
   draft is untouched.
 - A `/` or `?` search that finds nothing (and `n`/`N` after it) shows the
@@ -1036,8 +1054,10 @@ Rules the figure carries:
   content, with no blank line around it. While the `:` bar is open the
   chord is refused with a notice (`EditorCore::put`, `Compose::put`).
 - **A yank also goes to the system clipboard**, over OSC 52: copy mode's
-  `y` and a `y` in the draft both (`ComposeAction::yanked`). A delete
-  stays in the registers and out of the clipboard. The write is one way;
+  `y` and a `y` in the draft both (`ComposeAction::yanked`, read off the
+  key's yank register write). A delete stays in the registers and out of
+  the clipboard; a write into a named register (`"ayy`) is not a yank
+  write and stays out too. The write is one way;
   the tui never reads the OS clipboard back, and a terminal that drops
   OSC 52 loses only the copy out. A `y` in a full-screen kernel vi
   session goes out the same way: the `editorKeys` reply to this client's

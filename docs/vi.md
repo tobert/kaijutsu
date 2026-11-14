@@ -429,11 +429,11 @@ re-applies the terminator.
 
 ## Registers
 
-Registers belong to the player, not to one editor. In the kernel, every vi
-session a player types in shares that player's registers, across sessions
-and contexts. In a client, compose keeps one set for the client, across
-drafts. `dd` in one, then `p` in another, puts the line below the cursor,
-linewise, as one vim would. Amy, 2026-11-10: *"it doesn't have to be one
+Registers belong to the player, not to one editor. Every vi session a
+player types in, and the compose line of every client the player connects,
+share that player's text registers through the kernel's register store. `dd`
+in one, then `p` in another, puts the line below the cursor, linewise, as
+one vim would. Amy, 2026-11-10: *"it doesn't have to be one
 global, but like, I want to be able to dd while working in one context's
 editor, then go to another and 'p' when I type in the wrong spot."*
 
@@ -449,8 +449,11 @@ editor, then go to another and 'p' when I type in the wrong spot."*
 - **Compose.** The tui's `Compose::load_draft` moves the registers into each
   new core (a seat switch, a submit, a clear). The app's `ComposeState` holds
   them and lends them to the chat draft or the shell line for each key, so
-  its two surfaces share them. See `docs/tui.md`, "Compose", and
-  `docs/input.md`, "Compose keys".
+  its two surfaces share them. Each client sends the writes a key made
+  to the kernel, applies the writes the kernel pushes between keys, and
+  takes the kernel's copy on `:regpull` ("A kernel-owned register store"
+  below). See `docs/tui.md`, "Compose", and `docs/input.md`, "Compose
+  keys".
 - **What moves.** `Registers` is modalkit's register store: the unnamed
   register, `"0`, the delete ring `"1`–`"9`, `"-`, `"a`–`"z`, recorded
   macros, and the last `:` line and search pattern. Nothing else in
@@ -466,31 +469,32 @@ editor, then go to another and 'p' when I type in the wrong spot."*
   `EditorCore::put` is `p` for a key that is not vi's own: the tui's
   `Ctrl+A ]`.
 - **The system clipboard.** A compose `y` is also written to the system
-  clipboard: OSC 52 in the tui, arboard in the app. A client learns that a
-  key yanked by comparing `EditorCore::last_yank` (`"0`) across the key, so
-  a delete never goes out, and neither does a second yank of the same
-  text. Nothing reads the clipboard into a register: `"+` and `"*` read
+  clipboard: OSC 52 in the tui, arboard in the app. The text is the last
+  yank among the key's register writes, so a delete never goes out, nor a
+  write to a named register (`"ayy`), nor a yank of text the registers
+  already hold. A write pushed from another client never reaches the
+  clipboard. Nothing reads the clipboard into a register: `"+` and `"*` read
   empty because modalkit's `clipboard` feature is off, and paste from the
   clipboard stays the terminal's bracketed paste and the app's `Ctrl+V`.
 - **A yank in a kernel vi session** reaches the system clipboard of the
-  client that typed it. The kernel compares the player's `"0` before and
-  after each key batch, as the compose editors do across a key, and the
-  `editorKeys` reply carries the result (`EditorYank`). The compare is on
-  the player's registers, so it holds across a move to another file of the
+  client that typed it. The kernel takes the last yank among the batch's
+  register writes, as the compose editors do for a key, and the
+  `editorKeys` reply carries it (`EditorYank`). The writes are made in the
+  player's registers, so this holds across a move to another file of the
   argument list. A batch the kernel splits at a `:` line reports the latest
   yank of any part. The tui writes it over OSC 52 and the app through its
-  clipboard writer; neither puts it in the compose registers. `kj vi keys`
+  clipboard writer, and the register push carries the write itself to
+  every client's compose registers. `kj vi keys`
   returns it as `yank` (`{text, linewise}`, or null) in its structured
-  result and writes no clipboard. A delete is not a yank. Yanking text that
-  `"0` already holds reports nothing, so the second of two identical yanks
-  does not take the clipboard back.
-- **Not shared yet:** compose with the kernel's vi sessions, and the tui
-  with the app. See `docs/issues.md`, "vi registers: what
-  sharing leaves open".
+  result and writes no clipboard. A delete is not a yank. Yanking text the
+  registers already hold records nothing, so the second of two identical
+  yanks does not take the clipboard back.
+- **What is left open:** `docs/issues.md`, "vi registers: what sharing
+  leaves open".
 
 ---
 
-### A kernel-owned register store (design, being built)
+### A kernel-owned register store
 
 Amy, 2026-11-11, asked for this design after choosing that `p` always puts
 the vi register and never the system clipboard. The goal: `dd` in the tui
@@ -959,12 +963,15 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |
-| Wire schema | `kaijutsu.capnp` (`EditorState`, `EditorSelection`, `editorOpen @74` … `subscribeEditor @79`, `editorInsert @105`) |
+| Wire schema | `kaijutsu.capnp` (`EditorState`, `EditorSelection`, `editorOpen @74` … `subscribeEditor @79`, `editorInsert @105`, `registersPut @111`, `registersGet @112`, `EditorEvents.onRegisterWrite`) |
 | Wire e2e | `kaijutsu-server/tests/editor_wire.rs` |
 | App renderer | `kaijutsu-app/src/view/editor/` (`mod.rs`, `render.rs`, `keys.rs`); screen FSM `ui/screen.rs` |
 | Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `editor_selection_rects`, `sync_editor_cursor`) |
 | Compose draft block | `kaijutsu-kernel/src/block_store.rs` (`get_or_create_draft`, `edit_draft`) |
 | Compose (app) | `kaijutsu-app/src/input/compose/` (`mod.rs` `ComposeState`, `systems.rs`, `outbox.rs`) |
 | Compose (tui) | `kaijutsu-tui/src/compose.rs` (`Compose`) |
+| Register store | `kaijutsu-kernel/src/kernel/editor_registers.rs` (`registers_put`, `registers_get`); table `kernel_db/editor_registers.rs` (`editor_registers`: `principal`, `name`, `shape`, `text`, `seq`, `updated_at`) |
+| Register writes (pure) | `kaijutsu-editor/src/lib.rs` (`take_register_writes`, `Registers::apply`, `from_rows`, `replace_text`); types in `kaijutsu-types/src/editor.rs` |
+| Register clients | `kaijutsu-tui/src/register_outbox.rs`; `kaijutsu-app/src/input/compose/registers.rs` |
 | Draft outbox and ledger | `kaijutsu-client/src/draft_outbox.rs`, `draft_ledger.rs` |
 | File doc cache | `kaijutsu-kernel/src/file_tools/cache.rs` (`get_or_load`, `try_get_or_load`) |

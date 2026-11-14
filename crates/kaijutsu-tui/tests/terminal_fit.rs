@@ -2648,3 +2648,94 @@ fn a_lone_escape_leaves_insert_mode_under_the_kitty_protocol() {
 
 
 
+
+// ────────────────────────────────────────────────────────────────────────────
+// Registers: yy/dd/p across clients (`docs/vi.md`, "A kernel-owned register store")
+// ────────────────────────────────────────────────────────────────────────────
+
+/// What the kernel holds in the unnamed register for the root principal,
+/// polled for up to `timeout` until `want` is true of it.
+fn wait_for_kernel_register(server: &EphemeralServer, timeout: Duration, want: impl Fn(&str) -> bool) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let held = support::kernel_registers(server).into_iter().find(|(name, _)| *name == '"').map(|(_, text)| text);
+        if let Some(text) = held.filter(|text| want(text)) {
+            return Some(text);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `dd` and `yy` on the compose line reach the kernel's registers, where a
+/// `p` in another client or a kernel vi session finds them.
+#[test]
+fn a_dd_and_a_yy_in_compose_reach_the_kernels_registers() {
+    let _serial = serial();
+    let (server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("ihello world\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send("dd");
+    let held = wait_for_kernel_register(&server, Duration::from_secs(10), |text| text == "hello world\n");
+    assert_eq!(held.as_deref(), Some("hello world\n"), "the kernel never held the deleted line: {}", session.dump("after dd"));
+
+    session.send("ione\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send("yy");
+    let held = wait_for_kernel_register(&server, Duration::from_secs(10), |text| text == "one\n");
+    assert_eq!(held.as_deref(), Some("one\n"), "the kernel never held the yanked line: {}", session.dump("after yy"));
+    assert_eq!(session.clipboard(), vec!["one\n".to_string()], "only the yank reaches the clipboard");
+}
+
+/// A write another connection of the player makes is applied to compose's
+/// registers: `p` puts it, and it is not written to the clipboard.
+#[test]
+fn a_write_from_another_client_is_put_by_p_in_compose() {
+    use kaijutsu_types::editor::{RegisterShape, RegisterWrite, RegisterWriteKind};
+    let _serial = serial();
+    let (server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("ikeep\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    support::put_registers(&server, &[RegisterWrite {
+        kind: RegisterWriteKind::Delete,
+        text: "from the other client\n".into(),
+        shape: RegisterShape::Linewise,
+    }]);
+
+    // The push races the key, so `p` is sent until the line appears.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let put = loop {
+        session.send("p");
+        if session.wait_until(Duration::from_millis(700), |screen| screen_contains_str(screen, "from the other client")) {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+    };
+    assert!(put, "`p` never put the other client's write: {}", session.dump("after the push"));
+    assert!(session.clipboard().is_empty(), "a push never reaches the clipboard: {:?}", session.clipboard());
+}
+
+/// `:regpull` replaces compose's registers with the kernel's copy and says
+/// how many came back.
+#[test]
+fn regpull_reports_the_registers_the_kernel_returned() {
+    let _serial = serial();
+    let (server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("ione\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send("dd");
+    wait_for_kernel_register(&server, Duration::from_secs(10), |text| text == "one\n");
+    session.send(":regpull\r");
+    let pulled = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "registers pulled from the kernel"));
+    assert!(pulled, "no regpull note: {}", session.dump("after :regpull"));
+}
