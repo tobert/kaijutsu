@@ -255,8 +255,11 @@ What the run showed:
   phrase, to play at this tempo.
 - On that day the model resolver estimated zero cost and the tick always
   targeted one phrase ahead, which is why the slow model never played. The
-  tick now plans from measured cost ("Players", "The turn"); that change has
-  tests and has not yet run on a live kernel.
+  tick now plans from measured cost ("Players", "The turn"). Run live the
+  same day: a bassist and a drummer on one track, both on
+  `deepseek/deepseek-flash`, committed every phrase with estimates of 5 and
+  9 beats; the slow local model got a later target and repeats in between,
+  and still never finished a phrase.
 - The faults found are in `docs/issues.md`, "Music refresh: live run findings".
 
 ## Omni models

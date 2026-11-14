@@ -1007,7 +1007,8 @@ Delete's sqlite recipe), and a performer's own clip record can now be its
 ### A band on one track: what is open
 
 Two musicians can share a track (`KJ_BAND`) with their own chairs
-(`KJ_CHAIR`); `docs/chameleon.md`, "A band". Not run on a live kernel yet.
+(`KJ_CHAIR`); `docs/chameleon.md`, "A band". A live run on zorak with a
+DeepSeek bassist and drummer committed every phrase of both.
 
 - No phrase-length check: `validate_abc` is a strict parse only, so a short
   or long phrase commits.
@@ -1019,8 +1020,14 @@ Two musicians can share a track (`KJ_BAND`) with their own chairs
 
 ### Lead time from measured cost: what is open
 
-- Not run on a live kernel yet; the 8-sample maximum is untested against real
-  model variance, and one slow turn holds the longer lead for 8 turns.
+- **A producer that never finishes keeps doubling its lead.** A missed
+  deadline is sampled at its lower bound, the time it ran, which grows with
+  the lead; the next target is that times the safety factor. Seen live with
+  a local thinking model: estimates of 32 s, then 64 s, a target 7 phrases
+  out and 6 repeats queued. Decide a ceiling on phrases ahead, and what the
+  tick does at it (say so and stop admitting).
+- The 8-sample maximum means one slow turn holds the longer lead for 8
+  turns. Two DeepSeek players on a live band held 5 and 9 beats.
 - `KJ_LEAD_BEATS` uses the track's `BeatPolicy::clock()`, not the timeline's
   own clock; check that they agree after a tempo change.
 - `transport_env` reads the performer from `kernel_db` on the clock thread;
