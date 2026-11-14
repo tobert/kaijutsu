@@ -7,7 +7,7 @@
 use crate::cell::{Cell, ResolverId};
 use crate::content::{ContentRef, ContextHash};
 use crate::work::Timing;
-use kaijutsu_types::Tick;
+use kaijutsu_types::{PrincipalId, Tick};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -28,6 +28,10 @@ pub trait ResolverCtx {
     fn ambient(&self, key: &str) -> Option<Vec<u8>>;
     /// The most recent committed content at or before `tick`.
     fn content_before(&self, tick: Tick) -> Option<ContentRef>;
+    /// The most recent committed content `performer` played at or before
+    /// `tick`. Another performer's content and the transport's fallback
+    /// copies are not this performer's.
+    fn content_by(&self, performer: PrincipalId, tick: Tick) -> Option<ContentRef>;
 }
 
 /// What a `resolve` produces: the content **bytes** for this cell, plus any cells

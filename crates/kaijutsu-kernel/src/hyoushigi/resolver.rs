@@ -142,6 +142,7 @@ mod tests {
             fn now(&self) -> kaijutsu_types::Tick { kaijutsu_types::Tick::ZERO }
             fn ambient(&self, _: &str) -> Option<Vec<u8>> { None }
             fn content_before(&self, _: kaijutsu_types::Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
+            fn content_by(&self, _: kaijutsu_types::PrincipalId, _: kaijutsu_types::Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
         }
         let dir = tempfile::tempdir().unwrap();
         let resolver = CasCommitResolver::new(Arc::new(FileStore::at_path(dir.path())));

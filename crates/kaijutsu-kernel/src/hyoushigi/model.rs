@@ -28,6 +28,8 @@ struct ModelOutput {
     /// What this performer's earlier model turns on the track measured, read at
     /// admission; zero when none was measured.
     estimate: Duration,
+    /// Whose phrases the score basis reads.
+    performer: PrincipalId,
 }
 
 /// A model producer's timing: preparation measured only its own slot wait and
@@ -61,7 +63,7 @@ impl Resolver for ModelOutput {
             other => serde_json::json!({ "unavailable": format!("{other:?}") }),
         };
         ContextHash::of(&serde_json::to_vec(&serde_json::json!({
-            "seed": seed, "score": ctx.content_before(ctx.now()),
+            "seed": seed, "score": ctx.content_by(self.performer, ctx.now()),
         })).expect("score basis contains JSON values"))
     }
 
@@ -184,7 +186,7 @@ pub(crate) fn admit(
         }, intent.track.clone(), performer,
     ), Box::new(ModelOutput {
         receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
-        context, seed, interrupt: lease.interrupt(), admitted, estimate,
+        context, seed, interrupt: lease.interrupt(), admitted, estimate, performer,
     })).map_err(|error| format!("score admission refused: {error}"))?;
     drop(timeline_guard);
     lease.deliver_to(OutputDelivery { sender: delivery, documents: kernel.blocks().clone(), context, performer, admitted });
@@ -205,6 +207,7 @@ mod tests {
             fn now(&self) -> Tick { Tick::ZERO }
             fn ambient(&self, _: &str) -> Option<Vec<u8>> { None }
             fn content_before(&self, _: Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
+            fn content_by(&self, _: PrincipalId, _: Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
         }
         let kernel = crate::Kernel::new_ephemeral("score-interrupt").await;
         let context = ContextId::new();
@@ -214,7 +217,7 @@ mod tests {
             receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
             context, seed: BlockId::new(context, PrincipalId::new(), 0), interrupt: interrupt.clone(),
             admitted: std::time::Instant::now() - Duration::from_millis(200),
-            estimate: Duration::ZERO,
+            estimate: Duration::ZERO, performer: PrincipalId::new(),
         };
         let future = resolver.resolve(&serde_json::Value::Null, &Context);
         sender.send(Ok(Resolution::new(b"prepared", ABC_MIME))).unwrap();
@@ -232,6 +235,7 @@ mod tests {
             fn now(&self) -> Tick { Tick::ZERO }
             fn ambient(&self, _: &str) -> Option<Vec<u8>> { None }
             fn content_before(&self, _: Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
+            fn content_by(&self, _: PrincipalId, _: Tick) -> Option<kaijutsu_hyoushigi::ContentRef> { None }
         }
         let kernel = crate::Kernel::new_ephemeral("score-estimate").await;
         let context = ContextId::new();
@@ -239,9 +243,42 @@ mod tests {
         let resolver = ModelOutput {
             receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
             context, seed: BlockId::new(context, PrincipalId::new(), 0), interrupt: ContextInterruptState::new(),
-            admitted: std::time::Instant::now(), estimate: Duration::from_secs(20),
+            admitted: std::time::Instant::now(), estimate: Duration::from_secs(20), performer: PrincipalId::new(),
         };
         assert_eq!(resolver.estimate_cost(&serde_json::Value::Null, &Context), Duration::from_secs(20));
+    }
+
+    /// The score basis reads the performer's own latest phrase. Another
+    /// player's phrase on the track is a peer, not an input: it must not
+    /// invalidate this performer's work.
+    #[tokio::test]
+    async fn the_score_basis_reads_only_the_performers_own_phrases() {
+        use kaijutsu_hyoushigi::ContentRef;
+        struct Context { own: Option<ContentRef>, newest: Option<ContentRef>, me: PrincipalId }
+        impl ResolverCtx for Context {
+            fn now(&self) -> Tick { Tick::new(64) }
+            fn ambient(&self, _: &str) -> Option<Vec<u8>> { None }
+            fn content_before(&self, _: Tick) -> Option<ContentRef> { self.newest.clone() }
+            fn content_by(&self, performer: PrincipalId, _: Tick) -> Option<ContentRef> {
+                if performer == self.me { self.own.clone() } else { None }
+            }
+        }
+        let phrase = |text: &str| ContentRef::of(text.as_bytes(), ABC_MIME);
+        let kernel = crate::Kernel::new_ephemeral("score-basis").await;
+        let context = ContextId::new();
+        let me = PrincipalId::new();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let resolver = ModelOutput {
+            receiver: parking_lot::Mutex::new(Some(receiver)), documents: kernel.blocks().clone(),
+            context, seed: BlockId::new(context, PrincipalId::new(), 0), interrupt: ContextInterruptState::new(),
+            admitted: std::time::Instant::now(), estimate: Duration::ZERO, performer: me,
+        };
+        let basis = |own: &str, newest: &str| resolver.compute_basis(&serde_json::Value::Null,
+            &Context { own: Some(phrase(own)), newest: Some(phrase(newest)), me });
+        assert_eq!(basis("bass 1", "bass 1"), basis("bass 1", "drums 2"),
+            "another player's newer phrase leaves this performer's basis alone");
+        assert_ne!(basis("bass 1", "drums 2"), basis("bass 2", "drums 2"),
+            "this performer's own newer phrase changes its basis");
     }
 
     /// The preparation's slot wait is the queue; the rest since admission is

@@ -236,7 +236,10 @@ the conversation lock, without cancelling another turn in the same context.
 Capacity refusal starts no model work; runtime refusal cancels its reservation.
 
 The score basis covers the seed block's content, status and inclusion, plus the
-latest committed content at or before the intended tick on that timeline. This
+latest content the same performer committed at or before the intended tick on
+that timeline. Another player's phrase at the same tick is a peer, not an
+input, and the transport's fallback copies belong to no performer, so neither
+changes the basis. This
 is a declared score dependency, not a claim that the model's whole conversation,
 tool inputs, or cross-track `KJ_HEARD` view is frozen. Changed basis uses fallback;
 a handoff cannot replay the model as an automatic resolver retry. Already accepted

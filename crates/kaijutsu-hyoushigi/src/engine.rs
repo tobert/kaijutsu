@@ -901,6 +901,17 @@ impl ResolverCtx for CommittedCtx<'_> {
             .max_by_key(|(t, _)| *t)
             .map(|(_, cref)| cref)
     }
+    fn content_by(&self, performer: PrincipalId, tick: Tick) -> Option<ContentRef> {
+        self.committed
+            .iter()
+            .filter(|c| c.played_by == performer && c.span.start <= tick)
+            .filter_map(|c| match &c.body {
+                Body::Concrete(cref) => Some((c.span.start, cref.clone())),
+                _ => None,
+            })
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, cref)| cref)
+    }
 }
 
 #[cfg(test)]
