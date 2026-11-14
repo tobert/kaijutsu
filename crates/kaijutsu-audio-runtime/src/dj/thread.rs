@@ -524,7 +524,7 @@ async fn run_loop<H, F, M>(
                         // change, but by then `connected` is already false and
                         // the change arm would not flush. Flush on the level.
                         if !connected {
-                            midi.flush();
+                            midi.flush_all();
                             if let Some(audio) = &sinks.audio { audio.flush(); }
                         }
                         for effect in handle_status_change(&mut core, &status, Instant::now()) {
@@ -598,7 +598,7 @@ async fn run_loop<H, F, M>(
                         // posture — the only allocation slice 2 adds is the
                         // MOVE into `pending_cues` on the `Buffer` branch,
                         // never a clone).
-                        if let ServerEvent::RenderCue { cue, .. } = ev {
+                        if let ServerEvent::RenderCue { context_id, cue } = ev {
                             // `decide_placement` runs its own `settle` check
                             // and can trip a fallback that drops whatever is
                             // already buffered; report both halves.
@@ -617,13 +617,13 @@ async fn run_loop<H, F, M>(
                                         sinks.audio.as_ref(),
                                         prefetch,
                                     );
-                                    dispatch_midi_cue(&cue, event_epoch_ns, &midi_routes, &mut midi);
+                                    dispatch_midi_cue(&cue, context_id, event_epoch_ns, &midi_routes, &mut midi);
                                     if midi.take_traffic() {
                                         let _ = pulse_tx.try_send(DjPulse::RenderTraffic);
                                     }
                                 }
                                 CuePlacement::Buffer(beat) => {
-                                    core.enqueue_cue(beat, cue);
+                                    core.enqueue_cue(beat, context_id, cue);
                                 }
                             }
                         }
@@ -646,7 +646,7 @@ async fn run_loop<H, F, M>(
                     Ok(()) => {
                         let status = status_rx.as_ref().unwrap().borrow().clone();
                         if connected && !matches!(status, ConnectionStatus::Connected { .. }) {
-                            midi.flush();
+                            midi.flush_all();
                             if let Some(audio) = &sinks.audio { audio.flush(); }
                         }
                         connected = matches!(status, ConnectionStatus::Connected { .. });
@@ -662,7 +662,7 @@ async fn run_loop<H, F, M>(
                         status_rx = None;
                         connected = false;
                         for effect in fallback_effects(core.on_disconnect(Instant::now())) { record_effect(effect); }
-                        midi.flush();
+                        midi.flush_all();
                         if let Some(audio) = &sinks.audio { audio.flush(); }
                     }
                 }
@@ -719,7 +719,7 @@ async fn run_loop<H, F, M>(
                         sinks.audio.as_ref(),
                         prefetch,
                     );
-                    dispatch_midi_cue(&cue, dispatch_epoch_ns, &midi_routes, &mut midi);
+                    dispatch_midi_cue(&cue, due_cue.context_id, dispatch_epoch_ns, &midi_routes, &mut midi);
                 }
                 if midi.take_traffic() {
                     let _ = pulse_tx.try_send(DjPulse::RenderTraffic);
@@ -761,7 +761,7 @@ async fn run_loop<H, F, M>(
             }
         }
     }
-    midi.flush();
+    midi.flush_all();
     if let Some(audio) = &sinks.audio { audio.flush(); }
 }
 
@@ -861,7 +861,7 @@ mod tests {
         assert_eq!(status.receiver_count(), 2, "the DJ must be watching status before the disconnect is sent");
         status.send(ConnectionStatus::Closing { cause: "test disconnect".into() }).unwrap();
         assert!(matches!(audio_rx.recv_timeout(Duration::from_secs(1)), Ok(SchedulerCmd::Flush)));
-        assert!(matches!(midi_rx.recv_timeout(Duration::from_secs(1)), Ok(MidiCmd::Flush)));
+        assert!(matches!(midi_rx.recv_timeout(Duration::from_secs(1)), Ok(MidiCmd::FlushAll)));
         events.send(ServerEvent::RenderCue { context_id: ContextId::new(), cue: RenderCue::now_inline("audio/wav", vec![1, 2, 3]) }).unwrap();
         let replayed = audio_rx.recv_timeout(Duration::from_millis(100)).is_ok();
         ctl_tx.send(DjCtl::Shutdown).unwrap();
@@ -879,7 +879,7 @@ mod tests {
         ctl_tx.send(DjCtl::Shutdown).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(run_loop(ctl_rx, midi, DjSinks { audio: Some(audio) }, &prefetch, prefetch_rx, pulse_tx, |_| {}));
-        assert!(matches!(midi_rx.try_recv(), Ok(MidiCmd::Flush)));
+        assert!(matches!(midi_rx.try_recv(), Ok(MidiCmd::FlushAll)));
         assert!(matches!(audio_rx.try_recv(), Ok(SchedulerCmd::Flush)));
     }
 
@@ -1040,6 +1040,7 @@ mod tests {
         // batch, not just "one cue was pending."
         core.enqueue_cue(
             4.0,
+            ContextId::new(),
             RenderCue {
                 mime: "text/vnd.abc".into(),
                 payload: CuePayload::Inline(vec![]),
@@ -1050,6 +1051,7 @@ mod tests {
         );
         core.enqueue_cue(
             6.0,
+            ContextId::new(),
             RenderCue {
                 mime: "text/vnd.abc".into(),
                 payload: CuePayload::Inline(vec![]),
@@ -1143,6 +1145,7 @@ mod tests {
         // to re-prove decide_placement's own routing (covered elsewhere).
         core.enqueue_cue(
             4.0,
+            ContextId::new(),
             RenderCue {
                 mime: "text/vnd.abc".into(),
                 payload: CuePayload::Inline(vec![]),
@@ -1178,9 +1181,10 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     enum MidiCmd {
         ClickAt { note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration },
-        ScheduleAbc { events: Vec<(Duration, Vec<u8>)>, lead: Duration },
+        ScheduleAbc { context: ContextId, events: Vec<(Duration, Vec<u8>)>, lead: Duration },
         SendControl { address: String, events: Vec<(Duration, Vec<u8>)> },
-        Flush,
+        FlushContext(ContextId),
+        FlushAll,
     }
 
     /// A channel-backed [`MidiDispatch`] double — the MIDI-sink analog of
@@ -1202,14 +1206,17 @@ mod tests {
         fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
             let _ = self.tx.send(MidiCmd::ClickAt { note, channel, velocity, gate_ms, offset });
         }
-        fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
-            let _ = self.tx.send(MidiCmd::ScheduleAbc { events, lead });
+        fn schedule_abc(&mut self, context: ContextId, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+            let _ = self.tx.send(MidiCmd::ScheduleAbc { context, events, lead });
         }
         fn send_control(&mut self, _device: &str, address: &str, events: Vec<(Duration, Vec<u8>)>) {
             let _ = self.tx.send(MidiCmd::SendControl { address: address.to_string(), events });
         }
-        fn flush(&mut self) {
-            let _ = self.tx.send(MidiCmd::Flush);
+        fn flush_context(&mut self, context: ContextId) {
+            let _ = self.tx.send(MidiCmd::FlushContext(context));
+        }
+        fn flush_all(&mut self) {
+            let _ = self.tx.send(MidiCmd::FlushAll);
         }
         fn take_traffic(&mut self) -> bool {
             false // not exercised by these tests; the pulse-coalescing is untested plumbing here
@@ -1271,6 +1278,7 @@ mod tests {
         core.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
         core.enqueue_cue(
             4.0,
+            ContextId::new(),
             RenderCue {
                 mime: ABC_MIME.into(),
                 payload: CuePayload::Inline(vec![]),
@@ -1782,11 +1790,13 @@ mod tests {
         // ABC-render/backdate decisions `dj::midi`'s own suite already owns.
         const CDEF: &str = "X:1\nT:t\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\nCDEF|\n";
         let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
+        let score = ContextId::new();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let _ = events.send(ServerEvent::RenderCue { context_id: ContextId::new(), cue: cue.clone() });
+            let _ = events.send(ServerEvent::RenderCue { context_id: score, cue: cue.clone() });
             match midi_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(MidiCmd::ScheduleAbc { events, lead }) => {
+                Ok(MidiCmd::ScheduleAbc { context, events, lead }) => {
+                    assert_eq!(context, score, "the cue's score context reaches the sink");
                     let note_ons = events
                         .iter()
                         .filter(|(_, d)| d.len() == 3 && d[0] & 0xF0 == 0x90 && d[2] > 0)
@@ -1796,6 +1806,56 @@ mod tests {
                     break;
                 }
                 Ok(other) => panic!("expected ScheduleAbc, got {other:?}"),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        panic!("no MidiCmd observed within 2s");
+                    }
+                }
+            }
+        }
+
+        ctl_tx.send(DjCtl::Shutdown).expect("send Shutdown");
+        join.join().expect("dj test thread panicked");
+    }
+
+    /// A transport flush names one score context; the sink gets a flush for
+    /// that context alone, never the whole-sink flush.
+    #[test]
+    fn thread_flushes_the_midi_sink_per_score_context() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        let (midi, midi_rx) = RecordingMidiSink::new();
+
+        let join = std::thread::Builder::new()
+            .name("dj-test-midi-flush".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                rt.block_on(run_loop(ctl_rx, midi, DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+            })
+            .expect("spawn test dj thread");
+
+        let (events, _keep_events) = broadcast::channel(16);
+        let (status, _keep_status) = watch::channel(connected_status());
+        ctl_tx
+            .send(DjCtl::ActorReady {
+                handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() },
+                ssh_config: SshConfig::default(),
+                generation: 1,
+            })
+            .expect("send ActorReady");
+
+        let track = ContextId::new();
+        let flush = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = events.send(ServerEvent::RenderCue { context_id: track, cue: flush.clone() });
+            match midi_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(MidiCmd::FlushContext(got)) => {
+                    assert_eq!(got, track);
+                    break;
+                }
+                Ok(other) => panic!("a flush cue must flush one context, got {other:?}"),
                 Err(_) => {
                     if Instant::now() >= deadline {
                         panic!("no MidiCmd observed within 2s");

@@ -41,6 +41,9 @@ pub struct Header {
     pub midi_program: Option<u8>,
     /// Semitone transposition from a `%%MIDI transpose N` directive.
     pub midi_transpose: Option<i8>,
+    /// Wire channel index (0-15) from a `%%MIDI channel N` directive, where
+    /// `N` is 1-16 in the notation. `%%MIDI channel 10` is index 9, GM percussion.
+    pub midi_channel: Option<u8>,
 }
 
 impl Default for Header {
@@ -61,6 +64,7 @@ impl Default for Header {
             other_fields: Vec::new(),
             midi_program: None,
             midi_transpose: None,
+            midi_channel: None,
         }
     }
 }

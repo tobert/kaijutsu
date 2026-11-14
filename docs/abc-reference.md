@@ -83,6 +83,25 @@ Rules:
 ```
 %%MIDI program 67           ← set MIDI program (instrument) 0-127
 %%MIDI transpose -14        ← transpose playback by semitones
+%%MIDI channel 10           ← play on MIDI channel 1-16 (10 is GM percussion)
+```
+
+A tune plays on the channel it names. `%%MIDI channel N` takes N from 1 to 16;
+a value outside that range is a warning and the directive is ignored. Without
+the directive, `K:perc` plays on channel 10 and any other tune plays on the
+channel the player supplies (channel 1 by default). The directive wins over
+`K:perc`. On channel 10 a program change is sent only when the tune has its own
+`%%MIDI program`; the player's program does not apply to percussion. A
+multi-voice tune that names a channel keeps every voice on it.
+
+```abc
+X:1
+T:Kick and snare
+M:4/4
+L:1/4
+%%MIDI channel 10
+K:perc
+C z D z|C z D z|
 ```
 
 ---

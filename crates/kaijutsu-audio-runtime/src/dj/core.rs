@@ -33,6 +33,7 @@
 
 use std::time::{Duration, Instant};
 
+use kaijutsu_types::ContextId;
 use kaijutsu_audio::{BeatRef, LocalBeat, REF_STALE_MAX, RefDisposition, RenderCue, Slew};
 
 /// How long BeatGrid may free-run on liveness alone — `Touch`-aged references
@@ -258,6 +259,8 @@ pub struct DueCues {
 /// actual [`RenderCue`] the caller decided to buffer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DueCue {
+    /// The score context the cue was published for.
+    pub context_id: ContextId,
     pub cue: RenderCue,
     pub offset: Duration,
 }
@@ -312,7 +315,7 @@ pub struct DjCore {
     /// reports the drop count ([`ClockFallback`]/[`DueCues::dropped_cues`]) —
     /// see [`ClockFallback`]'s doc for the "dropped silently,
     /// telemetry-counted, never rescued" policy this implements.
-    pending_cues: Vec<(f64, RenderCue)>,
+    pending_cues: Vec<(f64, ContextId, RenderCue)>,
 }
 
 impl Default for DjCore {
@@ -654,8 +657,8 @@ impl DjCore {
     /// directly (allocation posture: the majority-`Immediate` case never
     /// reaches this method, and `pending_cues` itself is pre-reserved via
     /// [`PENDING_CUES_CAPACITY`]).
-    pub fn enqueue_cue(&mut self, beat: f64, cue: RenderCue) {
-        self.pending_cues.push((beat, cue));
+    pub fn enqueue_cue(&mut self, beat: f64, context_id: ContextId, cue: RenderCue) {
+        self.pending_cues.push((beat, context_id, cue));
     }
 
     /// Cues ready to fire within `horizon` of `now` — the cue-placement
@@ -707,8 +710,8 @@ impl DjCore {
             let onset_beat = self.pending_cues[i].0;
             let secs = (onset_beat - cur) / tempo;
             if secs <= horizon_secs {
-                let (_, cue) = self.pending_cues.swap_remove(i);
-                due.push(DueCue { cue, offset: Duration::from_secs_f64(secs.max(0.0)) });
+                let (_, context_id, cue) = self.pending_cues.swap_remove(i);
+                due.push(DueCue { context_id, cue, offset: Duration::from_secs_f64(secs.max(0.0)) });
                 // Do not advance `i` — swap_remove moved the last element
                 // into this slot, and it still needs to be checked.
             } else {
@@ -735,7 +738,7 @@ impl DjCore {
             return None;
         }
         let cur = beat.position(now);
-        let earliest = self.pending_cues.iter().map(|(beat, _)| *beat).fold(f64::INFINITY, f64::min);
+        let earliest = self.pending_cues.iter().map(|(beat, _, _)| *beat).fold(f64::INFINITY, f64::min);
         let secs = ((earliest - cur) / tempo - horizon.as_secs_f64()).max(0.0);
         Some(now + Duration::from_secs_f64(secs))
     }
@@ -1289,7 +1292,7 @@ mod tests {
         let (placement, fallback) = dj.decide_placement(&test_cue(Some(1.0)), t0);
         assert_eq!(placement, CuePlacement::Buffer(1.0));
         assert_eq!(fallback.transition, None);
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
 
         // Well before horizon entry (t0+250ms with H=250ms): nothing due yet.
         assert!(dj.due_cues(t0, H).due.is_empty(), "not yet within the horizon");
@@ -1306,7 +1309,7 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
 
         let due = dj.due_cues(t0 + Duration::from_millis(250), H);
         assert_eq!(due.due.len(), 1);
@@ -1322,8 +1325,8 @@ mod tests {
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // 120 BPM: beat n at n*500ms
         // Enqueued out of onset order deliberately — placement order must not
         // matter, only predicted-instant-within-horizon does.
-        dj.enqueue_cue(2.0, test_cue(Some(2.0))); // sounds +1000ms, horizon entry +750ms
-        dj.enqueue_cue(1.0, test_cue(Some(1.0))); // sounds +500ms, horizon entry +250ms
+        dj.enqueue_cue(2.0, ContextId::new(), test_cue(Some(2.0))); // sounds +1000ms, horizon entry +750ms
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0))); // sounds +500ms, horizon entry +250ms
 
         assert!(dj.due_cues(t0, H).due.is_empty(), "neither cue within the horizon yet");
 
@@ -1342,7 +1345,7 @@ mod tests {
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
         assert_eq!(dj.mode(), ClockMode::BeatGrid);
-        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+        dj.enqueue_cue(2.0, ContextId::new(), test_cue(Some(2.0)));
 
         // A cue arrives nominally "in BeatGrid," but the clock has actually
         // gone stale by the time it's evaluated — decide_placement must
@@ -1366,8 +1369,8 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
-        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
+        dj.enqueue_cue(2.0, ContextId::new(), test_cue(Some(2.0)));
 
         let fallback = dj.on_flush(t0);
         assert_eq!(fallback.dropped_cues, 2, "both buffered cues dropped with the flush");
@@ -1383,7 +1386,7 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
 
         let fallback = dj.on_disconnect(t0);
         assert_eq!(fallback.dropped_cues, 1);
@@ -1398,8 +1401,8 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
-        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
+        dj.enqueue_cue(2.0, ContextId::new(), test_cue(Some(2.0)));
 
         let due = dj.due_cues(t0 + REF_STALE_MAX + Duration::from_millis(1), H);
         assert!(due.due.is_empty(), "a settle-fallback schedules nothing");
@@ -1415,7 +1418,7 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // anchoring Fold
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
 
         // Sustained Touch (mirrors
         // sustained_touch_past_the_free_run_cap_falls_back_even_with_fresh_liveness
@@ -1444,7 +1447,7 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // 120 BPM: beat 1 at +500ms
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
 
         // Checked well past the cue's onset beat, with the clock still fine
         // (nowhere near REF_STALE_MAX/MAX_FREE_RUN) — this is lateness, not a
@@ -1460,8 +1463,8 @@ mod tests {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
-        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
+        dj.enqueue_cue(2.0, ContextId::new(), test_cue(Some(2.0)));
 
         let cap_before = dj.pending_cues.capacity();
         let due = dj.due_cues(t0 + Duration::from_secs(2), H); // both long overdue -> both fire
@@ -1485,8 +1488,8 @@ mod tests {
 
         // Two cues buffered out of onset order; the wake must key on the
         // EARLIEST one (beat 1, sounding at +500ms), not insertion order.
-        dj.enqueue_cue(3.0, test_cue(Some(3.0)));
-        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(3.0, ContextId::new(), test_cue(Some(3.0)));
+        dj.enqueue_cue(1.0, ContextId::new(), test_cue(Some(1.0)));
         let wake = dj.next_cue_wake(t0, H).expect("a cue is buffered and the phasor runs");
         assert!(near(wake.duration_since(t0), 250.0), "leads beat 1's horizon entry, got {:?}", wake);
     }

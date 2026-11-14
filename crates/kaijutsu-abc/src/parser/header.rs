@@ -450,6 +450,8 @@ fn parse_stem_direction(s: &str) -> StemDirection {
 ///
 /// Currently supports:
 /// - `%%MIDI program N` - Set MIDI program number (0-127)
+/// - `%%MIDI transpose N` - Shift playback by N semitones
+/// - `%%MIDI channel N` - Play on MIDI channel N (1-16); 10 is GM percussion
 fn parse_midi_directive(directive: &str, header: &mut Header, collector: &mut FeedbackCollector) {
     let parts: Vec<&str> = directive.split_whitespace().collect();
 
@@ -494,6 +496,16 @@ fn parse_midi_directive(directive: &str, header: &mut Header, collector: &mut Fe
                 collector.warning("%%MIDI transpose requires a semitone count");
             }
         }
+        "channel" => match parts.get(1) {
+            Some(n) => match n.parse::<u8>() {
+                Ok(ch) if (1..=16).contains(&ch) => header.midi_channel = Some(ch - 1),
+                _ => collector.warning(format!(
+                    "Invalid %%MIDI channel '{}', expected a number 1-16, ignoring",
+                    n
+                )),
+            },
+            None => collector.warning("%%MIDI channel requires a number (1-16)"),
+        },
         other => {
             // Silently ignore other MIDI directives for now
             collector.info(format!("Ignoring %%MIDI {} directive", other));
@@ -641,6 +653,14 @@ mod tests {
         let abc = "X:1\nT:Test\n%%MIDI program 33\nM:4/4\nK:C\n";
         let (_, header) = parse_header(abc, &mut collector, ParseMode::Generous);
         assert_eq!(header.midi_program, Some(33));
+    }
+
+    #[test]
+    fn test_parse_midi_channel() {
+        let mut collector = FeedbackCollector::new();
+        let abc = "X:1\nT:Test\n%%MIDI channel 10\nM:4/4\nK:C\n";
+        let (_, header) = parse_header(abc, &mut collector, ParseMode::Generous);
+        assert_eq!(header.midi_channel, Some(9));
     }
 
     #[test]

@@ -357,6 +357,22 @@ Every transition emits telemetry (`kaijutsu.dj.clock_transition`, attrs
 reasons are the health signal for the whole timing path, same stance as the
 phasor's slew histogram.
 
+**Tracks share one sink; the notation names the channel.** Every cue carries
+its track's score `context_id`, and the DJ passes it to the MIDI sink. A tune
+picks its own MIDI channel: `%%MIDI channel N` (1 to 16; 10 is GM percussion),
+else channel 10 for `K:perc`, else channel 1 (`docs/abc-reference.md`). The
+sink stamps every event of a context with that context's tag and remembers
+which channels the context has sounded. A `RENDER_FLUSH_MIME` cue then removes
+only its own context's unplayed events and silences only the channels that
+context sounded; other tracks' queued events and sounding notes, and the
+metronome click, are untouched. A context whose events have all played holds
+no tag, so its flush is a no-op. The whole-sink flush (every event, all sixteen
+channels) remains for connection loss and shutdown. If all 255 tags are held
+by contexts with events in flight, the next phrase plays untagged and only a
+whole-sink flush can take it back; the sink logs an error. Two tracks that name
+the same channel share its silencing: a flush for one cuts the other's notes on
+that channel, so simultaneous tracks name different channels.
+
 Beat-grid placement rides an additive `RenderCue.onset_beat` field, stamped
 by the kernel at emission; a cue carrying one is placed at the phasor's
 predicted instant for that beat instead of the wallclock ladder.
@@ -442,14 +458,15 @@ same daemon (`kaijutsu-audio-runtime`'s `midi_in.rs`, `clockin.rs`,
   (two `played_by`s, one track) or ride a parallel track — and what
   `UseLastGood` should repeat in the mixed case (today it's lane-scoped,
   producer-blind — a decision, not a bug).
-- **Per-track channel + per-track render-cue routing** (the moment two tracks
-  sound at once). Every cue plays on MIDI **channel 0**, and a
-  `RENDER_FLUSH_MIME` cue flushes the sink's *whole* queue, so a second
-  simultaneous track collides on the channel and cross-flushes on stop. The
-  cue already carries the track's score `context_id`; the sink needs to
-  schedule + flush *per context* and assign a channel per track/lane (drums →
-  ch 9). Full write-up: `docs/chameleon.md` "Open items". Same routing gap as
-  `docs/pcm.md` "Distributed listening" — solve together. The
-  channel-assignment vocabulary lives in `docs/midi-next.md` (device
-  profiles + bindings): a track binds to a *device.role* resolved through a
-  profile, not a raw channel int — build the fix on that.
+- **Per-track device role** (the moment two tracks sound at once). The sink
+  already schedules and flushes per score context, and a tune names its own
+  channel (see "The DJ thread"). Still open: a track does not bind to a
+  *device.role* through a profile, so the channel is whatever the committed
+  notation says, not a placement the rig decides. The channel-assignment
+  vocabulary lives in `docs/midi-next.md` (device profiles + bindings): a track
+  binds to a *device.role* resolved through a profile, not a raw channel int
+  — build that on top of the per-context sink. Also open: the DJ's clock
+  machine is not per context. A flush cue for any track drops every buffered
+  beat-grid cue and returns the clock to wallclock, and the PCM scheduler
+  (`dj/audio.rs`, `audio_sched.rs`) still drops every context's pending clips
+  on a flush. Same routing gap as `docs/pcm.md` "Distributed listening".

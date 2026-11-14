@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Accidental, Bar, Element, Key, Note, NoteName, Tune, UnitLength, Voice};
+use crate::ast::{Accidental, Bar, Clef, Element, Key, Note, NoteName, Tune, UnitLength, Voice};
 use crate::MidiParams;
 
 /// Get the combined pitch offset from voice properties (transpose + octave)
@@ -210,6 +210,28 @@ fn expand_repeats(elements: &[Element]) -> Vec<Element> {
     result
 }
 
+/// GM percussion channel index (channel 10 in 1-based notation).
+const PERCUSSION_CHANNEL: u8 = 9;
+
+/// The channel the tune names for itself: a `%%MIDI channel` directive, else
+/// the percussion channel for a percussion clef (`K:perc`). `None` means the
+/// tune does not choose and the caller's channel applies.
+fn tune_channel(tune: &Tune) -> Option<u8> {
+    tune.header.midi_channel.or_else(|| {
+        (tune.header.key.clef == Some(Clef::Percussion)).then_some(PERCUSSION_CHANNEL)
+    })
+}
+
+/// The program change to send on `channel`: the tune's `%%MIDI program`, else
+/// the caller's program. The percussion channel takes only the tune's own.
+fn program_for(tune: &Tune, params: &MidiParams, channel: u8) -> Option<u8> {
+    if channel == PERCUSSION_CHANNEL {
+        tune.header.midi_program
+    } else {
+        tune.header.midi_program.or(params.program)
+    }
+}
+
 /// Generate MIDI bytes from a parsed ABC tune
 pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
     // Count voices with actual content
@@ -234,9 +256,10 @@ pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
 /// re-parse the SMF byte blob. Events are absolute-tick and **sorted**; meta
 /// events (tempo `0xFF 0x51`, etc.) are included for the consumer to honour or
 /// skip — an ALSA seq target plays only the channel-voice (`0x80`/`0x90`/…)
-/// messages. M1 renders the single-track (format-0) merge: a multi-voice tune
-/// collapses onto one channel here, every voice starting at tick 0 (per-voice
-/// channel split is a later milestone, matching `generate`'s own format-0 path).
+/// messages. This is the single-track (format-0) merge: a multi-voice tune
+/// collapses onto one channel, every voice starting at tick 0. The channel is
+/// the tune's `%%MIDI channel`, else 9 for a percussion clef, else
+/// `params.channel`.
 pub fn events(tune: &Tune, params: &MidiParams) -> Vec<MidiEvent> {
     let mut writer = build_single_track_writer(tune, params);
     writer.events.sort_by_key(|e| e.tick);
@@ -244,10 +267,11 @@ pub fn events(tune: &Tune, params: &MidiParams) -> Vec<MidiEvent> {
 }
 
 /// Build the single-track (SMF format-0) writer for a tune — all voices merged
-/// onto `params.channel`. Shared by [`generate`] (frames it as an SMF blob) and
+/// onto the tune's named channel, else `params.channel`. Shared by [`generate`] (frames it as an SMF blob) and
 /// [`events`] (returns its timed event stream). Stage 3 WI 5.
 fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
-    let mut writer = MidiWriter::new(params.ticks_per_beat, params.channel);
+    let channel = tune_channel(tune).unwrap_or(params.channel);
+    let mut writer = MidiWriter::new(params.ticks_per_beat, channel);
 
     // Set tempo
     if let Some(tempo) = &tune.header.tempo {
@@ -257,8 +281,8 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
     }
 
     // Set program: ABC %%MIDI program takes priority, then params.program
-    let program = tune.header.midi_program.or(params.program);
-    if let Some(program) = program {
+    // (never on the percussion channel).
+    if let Some(program) = program_for(tune, params, channel) {
         writer.program_change(program);
     }
 
@@ -319,7 +343,7 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                             &bar_accidentals,
                             pitch_offset,
                             params.velocity,
-                            params.channel,
+                            channel,
                         );
                         ticks = ticks.saturating_sub(stolen);
                         pending_grace.clear();
@@ -371,7 +395,7 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                             &bar_accidentals,
                             pitch_offset,
                             params.velocity,
-                            params.channel,
+                            channel,
                         );
                         ticks = ticks.saturating_sub(stolen);
                         pending_grace.clear();
@@ -545,18 +569,21 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
             + key_pitch_offset(&tune.header.key)
             + tune.header.midi_transpose.map(|t| t as i16).unwrap_or(0);
 
-        // Use different MIDI channel per voice (0-15, skip 9 which is percussion)
-        let channel = if voice_idx >= 9 {
-            voice_idx + 1
-        } else {
-            voice_idx
-        } as u8
-            % 16;
+        // A tune that names its channel keeps every voice on it. Otherwise each
+        // voice gets its own channel (0-15, skipping 9, which is percussion).
+        let channel = tune_channel(tune).unwrap_or(
+            if voice_idx >= 9 {
+                voice_idx + 1
+            } else {
+                voice_idx
+            } as u8
+                % 16,
+        );
         let mut writer = MidiWriter::new(params.ticks_per_beat, channel);
 
         // Set program: ABC %%MIDI program takes priority, then params.program
-        let program = tune.header.midi_program.or(params.program);
-        if let Some(program) = program {
+        // (never on the percussion channel).
+        if let Some(program) = program_for(tune, params, channel) {
             writer.program_change_channel(program, channel);
         }
 
@@ -1146,6 +1173,118 @@ mod tests {
             .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
             .unwrap();
         assert_eq!(first.data[1], 58, "c (72) transposed -14 semitones = 58");
+    }
+
+    /// Channel nibble of every note-on and note-off in `evs`, deduplicated.
+    fn note_channels(evs: &[MidiEvent]) -> Vec<u8> {
+        let mut chans: Vec<u8> = evs
+            .iter()
+            .filter(|e| matches!(e.data.first().map(|b| b & 0xF0), Some(0x80) | Some(0x90)))
+            .map(|e| e.data[0] & 0x0F)
+            .collect();
+        chans.sort();
+        chans.dedup();
+        chans
+    }
+
+    fn program_changes(evs: &[MidiEvent]) -> Vec<(u8, u8)> {
+        evs.iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0xC0))
+            .map(|e| (e.data[0] & 0x0F, e.data[1]))
+            .collect()
+    }
+
+    #[test]
+    fn midi_channel_directive_sets_note_channel() {
+        let abc = "X:1\nT:t\n%%MIDI channel 3\nM:4/4\nL:1/4\nK:C\nc|\n";
+        let tune = &crate::parse(abc).value[0];
+        assert_eq!(tune.header.midi_channel, Some(2));
+        let evs = events(tune, &MidiParams::default());
+        assert_eq!(note_channels(&evs), vec![2], "channel 3 is wire index 2");
+        // generate() frames the same writer: note-on 0x92 for pitch 72.
+        let blob = generate(tune, &MidiParams::default());
+        assert!(blob.windows(2).any(|w| w[0] == 0x92 && w[1] == 72));
+    }
+
+    #[test]
+    fn midi_channel_ten_is_gm_percussion() {
+        let abc = "X:1\nT:t\n%%MIDI channel 10\nM:4/4\nL:1/4\nK:C\nc|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        assert_eq!(note_channels(&evs), vec![9]);
+    }
+
+    #[test]
+    fn key_perc_plays_on_channel_nine() {
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:perc\nc|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        assert_eq!(note_channels(&evs), vec![9]);
+        let blob = generate(tune, &MidiParams::default());
+        assert!(blob.windows(2).any(|w| w[0] == 0x99 && w[1] == 72));
+    }
+
+    #[test]
+    fn midi_channel_directive_wins_over_perc() {
+        let abc = "X:1\nT:t\n%%MIDI channel 2\nM:4/4\nL:1/4\nK:perc\nc|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        assert_eq!(note_channels(&evs), vec![1]);
+    }
+
+    #[test]
+    fn no_directive_no_perc_keeps_params_channel() {
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\nc|\n";
+        let tune = &crate::parse(abc).value[0];
+        let p = MidiParams {
+            channel: 5,
+            ..MidiParams::default()
+        };
+        assert_eq!(note_channels(&events(tune, &p)), vec![5]);
+        assert_eq!(note_channels(&events(tune, &MidiParams::default())), vec![0]);
+    }
+
+    #[test]
+    fn midi_channel_out_of_range_is_reported_not_clamped() {
+        for bad in ["0", "17", "99", "x"] {
+            let abc = format!("X:1\nT:t\n%%MIDI channel {bad}\nM:4/4\nL:1/4\nK:C\nc|\n");
+            let result = crate::parse(&abc);
+            let tune = &result.value[0];
+            assert_eq!(tune.header.midi_channel, None, "channel {bad} must not be stored");
+            assert!(
+                result.warnings().any(|w| w.message.contains("channel")),
+                "channel {bad} must produce a diagnostic"
+            );
+            assert_eq!(note_channels(&events(tune, &MidiParams::default())), vec![0]);
+        }
+    }
+
+    #[test]
+    fn percussion_channel_gets_no_program_change_unless_asked() {
+        let p = MidiParams {
+            program: Some(33),
+            ..MidiParams::default()
+        };
+        let perc = &crate::parse("X:1\nT:t\nM:4/4\nL:1/4\nK:perc\nc|\n").value[0];
+        assert!(program_changes(&events(perc, &p)).is_empty(), "params.program must not reach ch 9");
+        let perc10 = &crate::parse("X:1\nT:t\n%%MIDI channel 10\nM:4/4\nL:1/4\nK:C\nc|\n").value[0];
+        assert!(program_changes(&events(perc10, &p)).is_empty());
+        let asked = &crate::parse("X:1\nT:t\n%%MIDI program 40\nM:4/4\nL:1/4\nK:perc\nc|\n").value[0];
+        assert_eq!(program_changes(&events(asked, &p)), vec![(9, 40)]);
+        // Melodic channels still take params.program.
+        let melodic = &crate::parse("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nc|\n").value[0];
+        assert_eq!(program_changes(&events(melodic, &p)), vec![(0, 33)]);
+    }
+
+    #[test]
+    fn multivoice_tune_with_named_channel_keeps_it_on_every_voice() {
+        let abc = "X:1\nT:t\n%%MIDI channel 10\nM:4/4\nL:1/4\nK:C\nV:1\nc|\nV:2\nE|\n";
+        let tune = &crate::parse(abc).value[0];
+        let blob = generate(tune, &MidiParams::default());
+        assert!(blob.windows(2).any(|w| w[0] == 0x99 && w[1] == 72));
+        assert!(blob.windows(2).any(|w| w[0] == 0x99 && w[1] == 64));
+        // No note on the default voice-assigned channels 0/1.
+        assert!(!blob.windows(2).any(|w| (w[0] == 0x90 || w[0] == 0x91) && (w[1] == 72 || w[1] == 64)));
     }
 
     #[test]

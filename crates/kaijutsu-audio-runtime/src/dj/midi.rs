@@ -52,12 +52,13 @@
 //! — a hand `aconnect -d` after auto-connect settled stays cut; the one-shot
 //! never re-arms.
 
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use kaijutsu_audio::{
     ABC_MIME, CuePayload, MIDI_CONTROL_MIME, MidiControl, RENDER_FLUSH_MIME, RenderCue,
 };
+use kaijutsu_types::ContextId;
 use tracing::{debug, warn};
 
 use crate::patch_graph::{EndpointInfo, WireInfo};
@@ -132,8 +133,11 @@ pub(crate) trait MidiDispatch {
     /// [`MidiSink::click_at`].
     fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration);
     /// Schedule a rendered ABC phrase's events, each already offset from
-    /// phrase start, `lead` ahead of now — see [`MidiSink::schedule_abc`].
-    fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration);
+    /// phrase start, `lead` ahead of now. `context` is the track's score
+    /// context; the sink remembers which events and channels belong to it so
+    /// [`Self::flush_context`] can take back only those — see
+    /// [`MidiSink::schedule_abc`].
+    fn schedule_abc(&mut self, context: ContextId, events: Vec<(Duration, Vec<u8>)>, lead: Duration);
     /// Emit device-addressed control messages at an **already-resolved**
     /// backend port address (`"24:0"` under ALSA) — see
     /// [`MidiSink::send_control`]. The device→address resolution happened in
@@ -147,8 +151,14 @@ pub(crate) trait MidiDispatch {
     /// pinned to devices that are no longer routed. Default no-op so test
     /// doubles that never route stay small.
     fn routes_updated(&mut self, _routes: &MidiRoutes) {}
-    /// Drop every scheduled-but-unplayed event and silence sounding notes.
-    fn flush(&mut self);
+    /// Drop the scheduled-but-unplayed events of one score `context` and
+    /// silence the channels that context has sounded. Other contexts' events,
+    /// the metronome click, and device control traffic are left alone.
+    fn flush_context(&mut self, context: ContextId);
+    /// Drop every scheduled-but-unplayed event of every context (clicks and
+    /// control traffic included) and silence all sixteen channels. For the
+    /// cases that mean "everything": connection loss and shutdown.
+    fn flush_all(&mut self);
     /// Drain "did anything leave the render port since the last drain" —
     /// the [`super::thread::DjPulse::RenderTraffic`] source.
     fn take_traffic(&mut self) -> bool;
@@ -254,8 +264,9 @@ fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
         .collect()
 }
 
-/// Consume one `RenderCue` off the DJ thread's events arm: flush the sink on
-/// a transport stop/pause, or render+schedule an ABC phrase. Everything else
+/// Consume one `RenderCue` off the DJ thread's events arm: flush one score
+/// context's events on its transport stop/pause, or render+schedule an ABC
+/// phrase. `context` is the cue's score context (the track); it keys both. Everything else
 /// (audio/*, CLIP_MIME, PREPARE_MIME) is `dj::audio`'s own mime, ignored here
 /// — the two dispatch functions run side by side off the SAME events-arm
 /// iteration (`dj::thread::run_loop`), each reading `RENDER_FLUSH_MIME`
@@ -272,12 +283,13 @@ fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
 /// stays completely untouched by it.
 pub(crate) fn dispatch_midi_cue(
     cue: &RenderCue,
+    context: ContextId,
     now_epoch_ns: u64,
     routes: &MidiRoutes,
     sink: &mut dyn MidiDispatch,
 ) {
     if cue.mime == RENDER_FLUSH_MIME {
-        sink.flush();
+        sink.flush_context(context);
         return;
     }
     if cue.mime == MIDI_CONTROL_MIME {
@@ -316,7 +328,7 @@ pub(crate) fn dispatch_midi_cue(
         warn!("MIDI cue backdated to no survivors (fully in the past); skipping");
         return;
     }
-    sink.schedule_abc(events, lead);
+    sink.schedule_abc(context, events, lead);
 }
 
 /// The [`MIDI_CONTROL_MIME`] branch: decode the envelope, resolve the named
@@ -473,6 +485,105 @@ fn decide_autoconnect(
     })
 }
 
+// ── per-context scheduling book (pure) ──────────────────────────────────────
+
+/// The raw output queue a [`ScoreBook`] drives. [`MidiOut`] is the ALSA
+/// implementation; tests use an in-memory model, so everything above these
+/// four calls runs without a sequencer.
+pub(crate) trait ScoreQueue {
+    /// Queue `events` (offsets from phrase start) `lead` from now, each
+    /// stamped with `tag` (`0` means untagged).
+    fn queue_events(&mut self, tag: u8, events: &[(Duration, Vec<u8>)], lead: Duration);
+    /// Drop every queued, unplayed event stamped with `tag`.
+    fn remove_tagged(&mut self, tag: u8);
+    /// Drop every queued, unplayed event, whatever its tag.
+    fn remove_all(&mut self);
+    /// Send all-sound-off and all-notes-off, directly (not queued), on each
+    /// of `channels`.
+    fn silence(&mut self, channels: &[u8]);
+}
+
+/// What the sink remembers about one score context's scheduled phrases.
+struct ScoreVoice {
+    tag: u8,
+    channels: u16,
+    ends: Instant,
+}
+
+/// Which queued events and which channels belong to which score context.
+/// Each context with events still in flight owns one tag; a flush for that
+/// context removes exactly the events carrying it and silences exactly the
+/// channels it has sounded. A context whose last event has already played
+/// holds nothing, so its tag is reused and a flush for it is a no-op.
+#[derive(Default)]
+pub(crate) struct ScoreBook {
+    voices: HashMap<ContextId, ScoreVoice>,
+}
+
+impl ScoreBook {
+    /// Schedule one phrase for `context`. `now` is the instant `lead` counts
+    /// from. Every event is stamped with the context's tag. When all 255 tags
+    /// are held by contexts with events still in flight, the phrase is queued
+    /// untagged: it plays, but only a whole-sink flush can take it back.
+    pub(crate) fn schedule(
+        &mut self,
+        queue: &mut impl ScoreQueue,
+        context: ContextId,
+        events: &[(Duration, Vec<u8>)],
+        lead: Duration,
+        now: Instant,
+    ) {
+        self.voices.retain(|_, voice| voice.ends > now);
+        let Some(tag) = self.tag_for(context) else {
+            tracing::error!(
+                "MIDI sink: all {} score tags are in use; scheduling this phrase untagged \
+                 (a flush for its context cannot take it back)",
+                u8::MAX
+            );
+            queue.queue_events(0, events, lead);
+            return;
+        };
+        queue.queue_events(tag, events, lead);
+        let last = events.iter().map(|(offset, _)| *offset).max().unwrap_or_default();
+        let ends = now + lead + last;
+        let voice = self.voices.entry(context).or_insert(ScoreVoice { tag, channels: 0, ends });
+        voice.ends = voice.ends.max(ends);
+        for (_, data) in events {
+            if let Some(&status) = data.first()
+                && (0x80..0xF0).contains(&status)
+            {
+                voice.channels |= 1 << (status & 0x0F);
+            }
+        }
+    }
+
+    /// The tag `context` already holds, else the lowest free one.
+    fn tag_for(&self, context: ContextId) -> Option<u8> {
+        if let Some(voice) = self.voices.get(&context) {
+            return Some(voice.tag);
+        }
+        (1..=u8::MAX).find(|tag| self.voices.values().all(|v| v.tag != *tag))
+    }
+
+    /// Take back one context's unplayed events and silence the channels it
+    /// has sounded. Does nothing for a context with no events in flight.
+    pub(crate) fn flush_context(&mut self, queue: &mut impl ScoreQueue, context: ContextId) {
+        let Some(voice) = self.voices.remove(&context) else {
+            return;
+        };
+        queue.remove_tagged(voice.tag);
+        let channels: Vec<u8> = (0..16u8).filter(|c| voice.channels & (1 << c) != 0).collect();
+        queue.silence(&channels);
+    }
+
+    /// Take back everything and silence every channel.
+    pub(crate) fn flush_all(&mut self, queue: &mut impl ScoreQueue) {
+        queue.remove_all();
+        queue.silence(&(0..16).collect::<Vec<u8>>());
+        self.voices.clear();
+    }
+}
+
 // ── MidiSink — the real, loop-local, ALSA-backed sink ───────────────────────
 
 /// Local ALSA output. Production opens enabled MIDI before reporting ready.
@@ -483,6 +594,8 @@ pub(crate) struct MidiSink {
     #[cfg(target_os = "linux")]
     out: Option<MidiOut>,
     failed: bool,
+    /// Which scheduled events and channels belong to which score context.
+    book: ScoreBook,
     /// Set whenever a send is actually issued out the render port (an ABC cue
     /// or a metronome click); drained by [`Self::take_traffic`] once per
     /// select!-iteration burst that touched the sink — see
@@ -590,17 +703,17 @@ impl MidiDispatch for MidiSink {
     }
 
     #[cfg(target_os = "linux")]
-    fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+    fn schedule_abc(&mut self, context: ContextId, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
         if !self.ensure_open() {
             return;
         }
         if let Some(out) = self.out.as_mut() {
-            out.schedule(&events, lead, None);
+            self.book.schedule(out, context, &events, lead, Instant::now());
             self.traffic = true; // a cue left the render port — pulse the chord
         }
     }
     #[cfg(not(target_os = "linux"))]
-    fn schedule_abc(&mut self, _events: Vec<(Duration, Vec<u8>)>, _lead: Duration) {
+    fn schedule_abc(&mut self, _context: ContextId, _events: Vec<(Duration, Vec<u8>)>, _lead: Duration) {
         self.ensure_open();
     }
 
@@ -619,7 +732,7 @@ impl MidiDispatch for MidiSink {
         if let Some(out) = self.out.as_mut() {
             match out.ensure_control_route(device, dest) {
                 Ok(ctl) => {
-                    out.schedule(&events, Duration::ZERO, Some(ctl));
+                    out.schedule(&events, Duration::ZERO, Some(ctl), 0);
                     // Control traffic is still traffic out of our client —
                     // the patch bay's RENDER chord lights for it too.
                     self.traffic = true;
@@ -647,13 +760,22 @@ impl MidiDispatch for MidiSink {
     }
 
     #[cfg(target_os = "linux")]
-    fn flush(&mut self) {
+    fn flush_context(&mut self, context: ContextId) {
         if let Some(out) = self.out.as_mut() {
-            out.flush();
+            self.book.flush_context(out, context);
         }
     }
     #[cfg(not(target_os = "linux"))]
-    fn flush(&mut self) {}
+    fn flush_context(&mut self, _context: ContextId) {}
+
+    #[cfg(target_os = "linux")]
+    fn flush_all(&mut self) {
+        if let Some(out) = self.out.as_mut() {
+            self.book.flush_all(out);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn flush_all(&mut self) {}
 
     fn take_traffic(&mut self) -> bool {
         std::mem::take(&mut self.traffic)
@@ -899,6 +1021,7 @@ impl MidiOut {
         events: &[(Duration, Vec<u8>)],
         lead: Duration,
         from_port: Option<i32>,
+        tag: u8,
     ) {
         let mut encoder = match alsa::seq::MidiEvent::new(16) {
             Ok(e) => e,
@@ -918,6 +1041,7 @@ impl MidiOut {
                     let from_render_port = from_port.is_none();
                     ev.set_source(from_port.unwrap_or(self.port));
                     ev.set_subs();
+                    ev.set_tag(tag);
                     ev.schedule_real(self.queue, true, when);
                     if let Err(e) = self.seq.event_output(&mut ev) {
                         tracing::error!("MIDI event_output failed: {e}");
@@ -940,30 +1064,27 @@ impl MidiOut {
         }
     }
 
-    /// Drop every scheduled-but-unplayed event on our queue and silence sounding
-    /// notes (ALL_SOUNDS_OFF + ALL_NOTES_OFF on every channel, sent DIRECT so
-    /// they bypass the queue). Ported from the server's `flush_scheduled_after`.
-    fn flush(&mut self) {
-        use alsa::seq::{EvCtrl, Event, EventType, Remove, RemoveEvents};
+    /// Remove queued, unplayed events from our output queue: those stamped
+    /// `tag`, or all of them when `tag` is `None`.
+    fn remove_queued(&mut self, tag: Option<u8>) {
+        use alsa::seq::{Remove, RemoveEvents};
 
-        if let Ok(rm) = RemoveEvents::new() {
-            rm.set_queue(self.queue);
-            rm.set_condition(Remove::OUTPUT);
-            if let Err(e) = self.seq.remove_events(rm) {
-                tracing::error!("MIDI remove_events failed: {e}");
+        match RemoveEvents::new() {
+            Ok(rm) => {
+                rm.set_queue(self.queue);
+                match tag {
+                    Some(tag) => {
+                        rm.set_condition(Remove::OUTPUT | Remove::TAG_MATCH);
+                        rm.set_tag(tag);
+                    }
+                    None => rm.set_condition(Remove::OUTPUT),
+                }
+                if let Err(e) = self.seq.remove_events(rm) {
+                    tracing::error!("MIDI remove_events failed: {e}");
+                }
             }
+            Err(e) => tracing::error!("MIDI remove_events alloc failed: {e}"),
         }
-        for channel in 0..16u8 {
-            for param in [120u32, 123u32] {
-                let ctrl = EvCtrl { channel, param, value: 0 };
-                let mut e = Event::new(EventType::Controller, &ctrl);
-                e.set_source(self.port);
-                e.set_subs();
-                e.set_direct();
-                let _ = self.seq.event_output(&mut e);
-            }
-        }
-        let _ = self.seq.drain_output();
     }
 
     /// Schedule a metronome click at `offset` from now: a short **gated** note
@@ -985,7 +1106,41 @@ impl MidiOut {
             &[(offset, on), (offset + Duration::from_millis(gate_ms), off)],
             Duration::ZERO,
             None,
+            0,
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ScoreQueue for MidiOut {
+    fn queue_events(&mut self, tag: u8, events: &[(Duration, Vec<u8>)], lead: Duration) {
+        self.schedule(events, lead, None, tag);
+    }
+
+    fn remove_tagged(&mut self, tag: u8) {
+        self.remove_queued(Some(tag));
+    }
+
+    fn remove_all(&mut self) {
+        self.remove_queued(None);
+    }
+
+    /// ALL_SOUNDS_OFF (120) and ALL_NOTES_OFF (123) on each channel, sent
+    /// DIRECT so they bypass the queue.
+    fn silence(&mut self, channels: &[u8]) {
+        use alsa::seq::{EvCtrl, Event, EventType};
+
+        for &channel in channels {
+            for param in [120u32, 123u32] {
+                let ctrl = EvCtrl { channel: channel & 0x0F, param, value: 0 };
+                let mut e = Event::new(EventType::Controller, &ctrl);
+                e.set_source(self.port);
+                e.set_subs();
+                e.set_direct();
+                let _ = self.seq.event_output(&mut e);
+            }
+        }
+        let _ = self.seq.drain_output();
     }
 }
 
@@ -1174,21 +1329,36 @@ mod tests {
         /// (`device` rides along in real dispatch to label the control port;
         /// these tests assert routing, so the address is the interesting half.)
         controls: Vec<(String, TimedMidiEvents)>,
-        flushed: bool,
+        /// The score context of the last scheduled phrase.
+        scheduled_context: Option<ContextId>,
+        /// Contexts passed to `flush_context`, in order.
+        flushed_contexts: Vec<ContextId>,
+        /// A whole-sink flush happened.
+        flushed_all: bool,
+    }
+
+    impl RecordingSink {
+        fn flushed(&self) -> bool {
+            self.flushed_all || !self.flushed_contexts.is_empty()
+        }
     }
 
     impl MidiDispatch for RecordingSink {
         fn click_at(&mut self, _: u8, _: u8, _: u8, _: u64, _: Duration) {
             unreachable!("dispatch_midi_cue never clicks")
         }
-        fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+        fn schedule_abc(&mut self, context: ContextId, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+            self.scheduled_context = Some(context);
             self.scheduled = Some((events, lead));
         }
         fn send_control(&mut self, _device: &str, address: &str, events: Vec<(Duration, Vec<u8>)>) {
             self.controls.push((address.to_string(), events));
         }
-        fn flush(&mut self) {
-            self.flushed = true;
+        fn flush_context(&mut self, context: ContextId) {
+            self.flushed_contexts.push(context);
+        }
+        fn flush_all(&mut self) {
+            self.flushed_all = true;
         }
         fn take_traffic(&mut self) -> bool {
             false
@@ -1202,8 +1372,10 @@ mod tests {
     fn a_flush_cue_flushes_the_sink_and_schedules_nothing() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
-        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
-        assert!(sink.flushed);
+        let track = ContextId::new();
+        dispatch_midi_cue(&cue, track, 0, &MidiRoutes::new(), &mut sink);
+        assert_eq!(sink.flushed_contexts, vec![track], "the flush names the cue's context");
+        assert!(!sink.flushed_all, "a track's stop must not flush the whole sink");
         assert!(sink.scheduled.is_none());
     }
 
@@ -1211,8 +1383,8 @@ mod tests {
     fn a_non_abc_mime_is_ignored() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline("audio/wav", vec![1, 2, 3]);
-        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
-        assert!(!sink.flushed);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &MidiRoutes::new(), &mut sink);
+        assert!(!sink.flushed());
         assert!(sink.scheduled.is_none());
     }
 
@@ -1220,7 +1392,9 @@ mod tests {
     fn an_unstamped_zero_lead_abc_cue_schedules_events_untouched() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
-        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
+        let track = ContextId::new();
+        dispatch_midi_cue(&cue, track, 0, &MidiRoutes::new(), &mut sink);
+        assert_eq!(sink.scheduled_context, Some(track), "the phrase carries its score context");
         let (events, lead) = sink.scheduled.expect("ABC cue must schedule");
         assert_eq!(events.len(), abc_to_timed_events(CDEF).len());
         assert_eq!(lead, Duration::ZERO, "unstamped, zero-lead cue: lead untouched");
@@ -1239,9 +1413,9 @@ mod tests {
             epoch_ns: 0,
             onset_beat: None,
         };
-        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &MidiRoutes::new(), &mut sink);
         assert!(sink.scheduled.is_none());
-        assert!(!sink.flushed);
+        assert!(!sink.flushed());
     }
 
     #[test]
@@ -1257,8 +1431,221 @@ mod tests {
             epoch_ns: stale_epoch_ns,
             onset_beat: None,
         };
-        dispatch_midi_cue(&cue, now_epoch_ns, &MidiRoutes::new(), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), now_epoch_ns, &MidiRoutes::new(), &mut sink);
         assert!(sink.scheduled.is_none(), "a too-stale cue must not schedule");
+    }
+
+
+    // ── per-context scheduling (ScoreBook over an in-memory queue) ──────────
+
+    /// One event the model queue holds: stamped tag, time from the queue's
+    /// origin, raw bytes.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Queued {
+        tag: u8,
+        at: Duration,
+        data: Vec<u8>,
+    }
+
+    /// An in-memory stand-in for the ALSA output queue: it keeps queued events
+    /// with their tags and records every direct silence, so the book's
+    /// per-context choices are observable without a sequencer.
+    #[derive(Default)]
+    struct ModelQueue {
+        queued: Vec<Queued>,
+        silenced: Vec<u8>,
+    }
+
+    impl ScoreQueue for ModelQueue {
+        fn queue_events(&mut self, tag: u8, events: &[(Duration, Vec<u8>)], lead: Duration) {
+            for (offset, data) in events {
+                self.queued.push(Queued { tag, at: lead + *offset, data: data.clone() });
+            }
+        }
+        fn remove_tagged(&mut self, tag: u8) {
+            self.queued.retain(|q| q.tag != tag);
+        }
+        fn remove_all(&mut self) {
+            self.queued.clear();
+        }
+        fn silence(&mut self, channels: &[u8]) {
+            self.silenced.extend_from_slice(channels);
+        }
+    }
+
+    impl ModelQueue {
+        /// Channel nibbles of the queued note events, sorted, deduplicated.
+        fn channels(&self) -> Vec<u8> {
+            let mut c: Vec<u8> = self.queued.iter().map(|q| q.data[0] & 0x0F).collect();
+            c.sort();
+            c.dedup();
+            c
+        }
+    }
+
+    /// A [`MidiDispatch`] that runs the real book over a [`ModelQueue`], so a
+    /// test can drive `dispatch_midi_cue` end to end.
+    #[derive(Default)]
+    struct ModelSink {
+        book: ScoreBook,
+        queue: ModelQueue,
+    }
+
+    impl MidiDispatch for ModelSink {
+        fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
+            let (on, off) = click_bytes(note, channel, velocity);
+            self.queue.queue_events(
+                0,
+                &[(offset, on), (offset + Duration::from_millis(gate_ms), off)],
+                Duration::ZERO,
+            );
+        }
+        fn schedule_abc(&mut self, context: ContextId, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+            self.book.schedule(&mut self.queue, context, &events, lead, Instant::now());
+        }
+        fn send_control(&mut self, _: &str, _: &str, _: Vec<(Duration, Vec<u8>)>) {}
+        fn flush_context(&mut self, context: ContextId) {
+            self.book.flush_context(&mut self.queue, context);
+        }
+        fn flush_all(&mut self) {
+            self.book.flush_all(&mut self.queue);
+        }
+        fn take_traffic(&mut self) -> bool {
+            false
+        }
+        fn tick_autoconnect(&mut self) -> bool {
+            true
+        }
+    }
+
+    fn abc_cue(abc: &str) -> RenderCue {
+        RenderCue::now_inline(ABC_MIME, abc.as_bytes().to_vec())
+    }
+
+    /// Two tracks as the models write them: a bass naming channel 2 and a
+    /// drum track on a percussion clef.
+    const BASS: &str = "X:1\nT:bass\nM:4/4\nL:1/4\n%%MIDI channel 2\nK:C\nC,D,E,F,|\n";
+    const DRUMS: &str = "X:1\nT:drums\nM:4/4\nL:1/4\nK:perc\nC z D z|\n";
+
+    #[test]
+    fn two_contexts_schedule_on_their_own_channels() {
+        let mut sink = ModelSink::default();
+        let (bass, drums) = (ContextId::new(), ContextId::new());
+        let routes = MidiRoutes::new();
+        dispatch_midi_cue(&abc_cue(BASS), bass, 0, &routes, &mut sink);
+        dispatch_midi_cue(&abc_cue(DRUMS), drums, 0, &routes, &mut sink);
+        assert_eq!(sink.queue.channels(), vec![1, 9], "bass on channel 2 (index 1), drums on index 9");
+        let tags: std::collections::BTreeSet<u8> = sink.queue.queued.iter().map(|q| q.tag).collect();
+        assert_eq!(tags.len(), 2, "each context stamps its own tag: {tags:?}");
+        assert!(!tags.contains(&0), "a scheduled context is never untagged");
+    }
+
+    #[test]
+    fn a_flush_for_one_context_removes_only_its_events_and_silences_only_its_channels() {
+        let mut sink = ModelSink::default();
+        let (bass, drums) = (ContextId::new(), ContextId::new());
+        let routes = MidiRoutes::new();
+        dispatch_midi_cue(&abc_cue(BASS), bass, 0, &routes, &mut sink);
+        dispatch_midi_cue(&abc_cue(DRUMS), drums, 0, &routes, &mut sink);
+        let bass_events = sink.queue.queued.iter().filter(|q| q.data[0] & 0x0F == 1).count();
+        assert!(bass_events > 0);
+
+        let flush = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
+        dispatch_midi_cue(&flush, drums, 0, &routes, &mut sink);
+
+        assert_eq!(sink.queue.channels(), vec![1], "only the bass events remain");
+        assert_eq!(
+            sink.queue.queued.iter().filter(|q| q.data[0] & 0x0F == 1).count(),
+            bass_events,
+            "every bass event survives"
+        );
+        assert_eq!(sink.queue.silenced, vec![9], "only the drum channel is silenced");
+
+        // The flushed context's tag is free again and a second flush is a no-op.
+        dispatch_midi_cue(&flush, drums, 0, &routes, &mut sink);
+        assert_eq!(sink.queue.silenced, vec![9], "a repeat flush silences nothing more");
+    }
+
+    #[test]
+    fn a_context_flush_leaves_a_queued_click_alone() {
+        let mut sink = ModelSink::default();
+        let drums = ContextId::new();
+        sink.click_at(84, 15, 110, 60, Duration::from_millis(200));
+        dispatch_midi_cue(&abc_cue(DRUMS), drums, 0, &MidiRoutes::new(), &mut sink);
+        let flush = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
+        dispatch_midi_cue(&flush, drums, 0, &MidiRoutes::new(), &mut sink);
+        assert_eq!(sink.queue.channels(), vec![15], "the click (untagged) is not a context's event");
+    }
+
+    #[test]
+    fn a_whole_sink_flush_clears_every_context_and_every_channel() {
+        let mut sink = ModelSink::default();
+        let routes = MidiRoutes::new();
+        dispatch_midi_cue(&abc_cue(BASS), ContextId::new(), 0, &routes, &mut sink);
+        dispatch_midi_cue(&abc_cue(DRUMS), ContextId::new(), 0, &routes, &mut sink);
+        sink.click_at(84, 15, 110, 60, Duration::from_millis(200));
+        sink.flush_all();
+        assert!(sink.queue.queued.is_empty(), "nothing stays queued: {:?}", sink.queue.queued);
+        assert_eq!(sink.queue.silenced, (0..16).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn a_flush_for_a_context_that_never_scheduled_does_nothing() {
+        let mut sink = ModelSink::default();
+        let routes = MidiRoutes::new();
+        dispatch_midi_cue(&abc_cue(BASS), ContextId::new(), 0, &routes, &mut sink);
+        let before = sink.queue.queued.clone();
+        let flush = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
+        dispatch_midi_cue(&flush, ContextId::new(), 0, &routes, &mut sink);
+        assert_eq!(sink.queue.queued, before);
+        assert!(sink.queue.silenced.is_empty());
+    }
+
+    #[test]
+    fn a_context_whose_events_all_played_gives_its_tag_back() {
+        let mut book = ScoreBook::default();
+        let mut queue = ModelQueue::default();
+        let t0 = Instant::now();
+        let ev = vec![(Duration::ZERO, vec![0x90, 60, 90]), (Duration::from_millis(500), vec![0x80, 60, 0])];
+        // 255 contexts hold every tag; each phrase ends one second out.
+        for _ in 0..255 {
+            book.schedule(&mut queue, ContextId::new(), &ev, Duration::ZERO, t0);
+        }
+        assert!(queue.queued.iter().all(|q| q.tag != 0), "every one of them got a real tag");
+        // All 255 have played out by t0 + 2s; the next context reuses a tag.
+        let late = ContextId::new();
+        book.schedule(&mut queue, late, &ev, Duration::ZERO, t0 + Duration::from_secs(2));
+        let last_tags: Vec<u8> = queue.queued.iter().rev().take(2).map(|q| q.tag).collect();
+        assert!(last_tags.iter().all(|t| *t != 0), "a retired tag is reused, not refused: {last_tags:?}");
+    }
+
+    #[test]
+    fn a_full_tag_table_schedules_untagged_instead_of_dropping_the_phrase() {
+        let mut book = ScoreBook::default();
+        let mut queue = ModelQueue::default();
+        let t0 = Instant::now();
+        let ev = vec![(Duration::ZERO, vec![0x90, 60, 90]), (Duration::from_millis(500), vec![0x80, 60, 0])];
+        for _ in 0..255 {
+            book.schedule(&mut queue, ContextId::new(), &ev, Duration::ZERO, t0);
+        }
+        let n = queue.queued.len();
+        book.schedule(&mut queue, ContextId::new(), &ev, Duration::ZERO, t0);
+        assert_eq!(queue.queued.len(), n + 2, "the phrase still plays");
+        assert!(queue.queued[n..].iter().all(|q| q.tag == 0), "but it cannot be flushed per context");
+    }
+
+    #[test]
+    fn a_second_phrase_for_a_context_keeps_its_tag_and_channels() {
+        let mut book = ScoreBook::default();
+        let mut queue = ModelQueue::default();
+        let ctx = ContextId::new();
+        let t0 = Instant::now();
+        book.schedule(&mut queue, ctx, &[(Duration::ZERO, vec![0x91, 60, 90])], Duration::from_secs(1), t0);
+        book.schedule(&mut queue, ctx, &[(Duration::ZERO, vec![0x93, 60, 90])], Duration::from_secs(1), t0);
+        assert_eq!(queue.queued[0].tag, queue.queued[1].tag);
+        book.flush_context(&mut queue, ctx);
+        assert!(queue.queued.is_empty());
+        assert_eq!(queue.silenced, vec![1, 3], "every channel the context sounded, ascending");
     }
 
     // ── device-addressed control cues (docs/midi-next.md slice 1 step 4) ──
@@ -1290,7 +1677,7 @@ mod tests {
                 MidiControlEvent::new(250, &[0x80, 60, 0]),
             ],
         );
-        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
 
         assert_eq!(sink.controls.len(), 1, "exactly one emit: {:?}", sink.controls);
         let (address, events) = &sink.controls[0];
@@ -1303,7 +1690,7 @@ mod tests {
             ]
         );
         assert!(sink.scheduled.is_none(), "the score path is untouched");
-        assert!(!sink.flushed);
+        assert!(!sink.flushed());
     }
 
     /// **The rule that matters most.** A device this sink can't route is a
@@ -1314,7 +1701,7 @@ mod tests {
     fn a_control_cue_for_an_unmatched_device_is_dropped_never_rerouted() {
         let mut sink = RecordingSink::default();
         let cue = control_cue("subharmonicon", vec![MidiControlEvent::now(&[0xB0, 74, 64])]);
-        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
         assert!(sink.controls.is_empty(), "unroutable = dropped: {:?}", sink.controls);
         assert!(sink.scheduled.is_none(), "and NEVER onto the render port");
     }
@@ -1326,7 +1713,7 @@ mod tests {
     fn a_sink_with_no_routes_drops_every_control_cue() {
         let mut sink = RecordingSink::default();
         let cue = control_cue("minibrute", vec![MidiControlEvent::now(&[0xB0, 74, 64])]);
-        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &MidiRoutes::new(), &mut sink);
         assert!(sink.controls.is_empty());
     }
 
@@ -1354,7 +1741,7 @@ mod tests {
         let mut cue = control_cue("minibrute", vec![MidiControlEvent::now(&[0xB0, 123, 0])]);
         cue.epoch_ns = now_epoch_ns
             .saturating_sub((CUE_STALE_MAX + Duration::from_secs(60)).as_nanos() as u64);
-        dispatch_midi_cue(&cue, now_epoch_ns, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), now_epoch_ns, &routes(&[("minibrute", &["26:0"])]), &mut sink);
         assert_eq!(sink.controls.len(), 1, "a panic must never be dropped for age");
     }
 
@@ -1363,7 +1750,7 @@ mod tests {
     fn a_malformed_control_envelope_is_dropped_not_partially_played() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline(MIDI_CONTROL_MIME, b"{not json".to_vec());
-        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
         assert!(sink.controls.is_empty());
 
         // A version this build doesn't understand is refused too.
@@ -1371,7 +1758,7 @@ mod tests {
             MIDI_CONTROL_MIME,
             br#"{"v":99,"device":"minibrute","events":[{"data":"b07b00"}]}"#.to_vec(),
         );
-        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
         assert!(sink.controls.is_empty());
     }
 
@@ -1387,7 +1774,7 @@ mod tests {
             epoch_ns: 0,
             onset_beat: None,
         };
-        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
         assert!(sink.controls.is_empty());
     }
 
@@ -1397,7 +1784,7 @@ mod tests {
     fn the_score_path_is_unchanged_by_the_routing_table() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
-        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        dispatch_midi_cue(&cue, ContextId::new(), 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
         let (events, lead) = sink.scheduled.expect("ABC still schedules");
         assert_eq!(events.len(), abc_to_timed_events(CDEF).len());
         assert_eq!(lead, Duration::ZERO);
@@ -1419,6 +1806,7 @@ mod tests {
             .collect();
         dispatch_midi_cue(
             &control_cue("keystep-pro", events),
+            ContextId::new(),
             0,
             &routes(&[("keystep-pro", &["24:0"])]),
             &mut sink,
@@ -1511,7 +1899,7 @@ mod tests {
         subs.set_dest(Addr { client: reader.client_id().unwrap(), port: in_port });
         reader.subscribe_port(&subs).expect("subscribe reader");
 
-        out.schedule(&abc_to_timed_events(CDEF), Duration::from_millis(20), None);
+        out.schedule(&abc_to_timed_events(CDEF), Duration::from_millis(20), None, 0);
 
         let mut note_ons: Vec<u8> = Vec::new();
         let mut input = reader.input();
@@ -1531,6 +1919,65 @@ mod tests {
         }
         assert_eq!(note_ons.len(), 4, "four NoteOns through the loopback: {note_ons:?}");
         assert!(note_ons.windows(2).all(|w| w[0] < w[1]), "ascending: {note_ons:?}");
+    }
+
+    /// Live ALSA proof that a per-context flush removes only that context's
+    /// queued events: two contexts schedule phrases on different channels, one
+    /// is flushed, and a subscribed reader hears only the other's notes. This
+    /// is the one place the tag stamp and the `TAG_MATCH` removal meet a real
+    /// sequencer. `#[ignore]`d like its siblings.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a live ALSA sequencer (/dev/snd/seq); run on the zorak runner"]
+    fn alsa_flush_context_removes_only_that_contexts_queued_events() {
+        use alsa::seq::{Addr, EventType, PortCap, PortSubscribe, PortType};
+        use std::ffi::CString;
+
+        let mut out = MidiOut::open().expect("open ALSA sink");
+        let (out_client, out_port) = out.addr();
+        let reader = alsa::Seq::open(None, None, true).expect("open reader");
+        reader.set_client_name(&CString::new("kj-app-test-reader").unwrap()).unwrap();
+        let in_port = reader
+            .create_simple_port(
+                &CString::new("in").unwrap(),
+                PortCap::WRITE | PortCap::SUBS_WRITE,
+                PortType::MIDI_GENERIC | PortType::APPLICATION,
+            )
+            .unwrap();
+        let subs = PortSubscribe::empty().unwrap();
+        subs.set_sender(Addr { client: out_client, port: out_port });
+        subs.set_dest(Addr { client: reader.client_id().unwrap(), port: in_port });
+        reader.subscribe_port(&subs).expect("subscribe reader");
+
+        let phrase = |channel: u8| {
+            vec![
+                (Duration::ZERO, vec![0x90 | channel, 60, 90]),
+                (Duration::from_millis(50), vec![0x80 | channel, 60, 0]),
+            ]
+        };
+        let (a, b) = (ContextId::new(), ContextId::new());
+        let mut book = ScoreBook::default();
+        let now = Instant::now();
+        book.schedule(&mut out, a, &phrase(1), Duration::from_millis(400), now);
+        book.schedule(&mut out, b, &phrase(9), Duration::from_millis(400), now);
+        book.flush_context(&mut out, a);
+
+        let mut channels: Vec<u8> = Vec::new();
+        let mut input = reader.input();
+        let deadline = std::time::Instant::now() + Duration::from_millis(1200);
+        while std::time::Instant::now() < deadline {
+            if input.event_input_pending(true).unwrap_or(0) > 0 {
+                if let Ok(ev) = input.event_input()
+                    && ev.get_type() == EventType::Noteon
+                    && let Some(n) = ev.get_data::<alsa::seq::EvNote>()
+                {
+                    channels.push(n.channel);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(channels, vec![9], "only the unflushed context sounds: {channels:?}");
     }
 
     /// Live ALSA proof of the platform truth slice 1 step 4 NOW rests on:
@@ -1575,7 +2022,7 @@ mod tests {
         // Idempotent: a second ensure reuses the port and the wire.
         assert_eq!(out.ensure_control_route("fake-device", dest).unwrap(), ctl);
 
-        out.schedule(&[(Duration::ZERO, vec![0xB0, 74, 64])], Duration::ZERO, Some(ctl));
+        out.schedule(&[(Duration::ZERO, vec![0xB0, 74, 64])], Duration::ZERO, Some(ctl), 0);
 
         let mut input = reader.input();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
