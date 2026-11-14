@@ -122,6 +122,18 @@ bar: "the register works for my common workflow of yy/dd/p". Open:
   until a restart. The table holds the same rows and loads lazily, so an
   idle principal's entry could be dropped and reloaded.
 
+## The headless app harness cannot seed (2026-11-14)
+
+`contrib/headless-app.sh start` stops at "kernel listened but never
+answered". Its readiness probe and seed steps run `kj` through
+`contrib/kjmcp.py` with the root character's key, and `kaijutsu-mcp` now
+refuses to auto-register a context a person performs ("Name the character
+that performs this session's context with --character"). The kernel is
+fine; the app can be launched by hand against it. The harness needs a
+non-root character to seed through, or a seed path that needs no MCP
+session. At the headless app's ~1 fps, `type_text` also drops characters
+after a surface switch.
+
 ## The tui's local tasks stall, and a picker switch went missing (2026-11-10)
 
 Two pty tests failed for about twenty minutes and then stopped:
