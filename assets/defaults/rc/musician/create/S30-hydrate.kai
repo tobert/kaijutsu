@@ -12,7 +12,7 @@
 # at ~2-3 blocks per OODA turn, 16 keeps roughly the last 5-8 turns. Tune it
 # here. The window slides in memory each turn (no per-turn write); to advance the
 # pinned prefix later on a durable revision, re-run `kj context hydrate`.
-# See docs/chameleon.md, the hydration marker.
+# See docs/chameleon.md, "Players".
 #
 # Runs privileged in the create lifecycle, so it clears the Operator gate even
 # under the musician's narrowed loadout (which doesn't grant it directly).

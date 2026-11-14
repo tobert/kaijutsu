@@ -5,7 +5,7 @@
 > deliberate exception: a context with a hydration policy
 > (`kj context hydrate --window N`) rebuilds a *windowed* wire per turn via
 > `ConversationMailbox::rehydrate_windowed` — prefix byte-stable, tail
-> sliding (see `docs/chameleon.md`, "RC-driven hydration marker"). The
+> sliding (see `docs/chameleon.md`, "Players"). The
 > fork-side selection/seam design that leans on the same keep-set is
 > `docs/fork-filters.md`. The rest of this doc is accurate as the original
 > design record.

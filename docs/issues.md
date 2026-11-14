@@ -929,6 +929,181 @@ only tests reach it. Decide whether `kaijutsu-server` gets an `--unlist`
 flag (or a `mounts.toml` key) or the feature is removed. The footprint is
 about a dozen files in `kaijutsu-kernel` and `kaijutsu-server`.
 
+## Music refresh: live run findings (2026-11-14)
+
+Found playing one musician per track on zorak against the `nagaya` council
+backend and `deepseek` (`docs/chameleon.md`, "What a live run looks like").
+
+- **One unloaded model puts the whole endpoint in cooldown.** The nagaya
+  answers 503 `ModelUnavailable` for `lfm3` while it is unloaded. The kernel
+  starts an endpoint cooldown (10 s, doubling to 60 s,
+  `llm/endpoint.rs`), and no request for any model starts at that address
+  meanwhile. A ready model on the same server, the gate's decisions, and
+  embeddings wait behind a player retrying a model that is not there. Decide
+  whether a model-scoped 503 should cool the model, not the endpoint.
+- **A stopped track leaves its admitted turn retrying.** `kj transport stop`
+  freezes musical time, so the turn's deadline never arrives and the turn
+  keeps its retry loop (3 attempts, each behind the cooldown). Seen running
+  90 s after the stop until `kj interrupt`. Decide whether stop cancels open
+  work or `work` shows it as held.
+- **A beat turn retries on the generic schedule.** A phrase turn has one
+  useful window. A retry that cannot finish before the target tick spends the
+  endpoint for nothing; bound retries by the admitted deadline.
+- **A thinking model cannot play at 16 s per phrase.** Local
+  Qwen3.8-Flash-Next was still thinking at each deadline. Each interrupted
+  turn leaves a thinking block that the next hydration drops with a warning,
+  and the request "does not extend the previous one", so there is no cache
+  reuse either. A player's character needs thinking off or bounded, and the
+  tick script needs a lead longer than one phrase when the model is slow.
+- **The nagaya on zorak does not load a model on request.** `lfm3`,
+  `lfm3-1` and `lfm3-omni` are engines on spaceghost, reached through zorak's
+  cluster forward; zorak's own engines are Qwen3.8 and the image models. With
+  spaceghost away the models show `unloaded` and nothing loads them. This is
+  the nagaya lane's to answer: should a generation load its model, and can
+  zorak host `lfm3` itself?
+- **Nothing audible on zorak.** `kj audio devices --node audio/zorak` lists
+  only PipeWire MIDI ports, no synth. `audio/moltar` has no connected node.
+- **The council provider sends text only**, so no omni experiment can run
+  through a kaijutsu turn yet (`docs/chameleon.md`, "Omni models"; also
+  "Council backend: what retiring mk leaves open").
+- **Test tracks pile up.** 19 dormant tracks on zorak, most from tests;
+  `kj transport delete` works one at a time. The modeled track `ear` reports
+  338 BPM.
+
+### rc lifecycles run `kj` privileged
+
+Every rc lifecycle, the tick included, runs `kj` as a privileged caller
+(`rc/mod.rs` `ShellPolicy::Rc`, `runtime/context_shell.rs`), so a musician's
+`drive`-only loadout does not gate its tick script. The loadout governs the
+model's own tool calls. Read from code; no test pins it. Also: the
+`kj transport` clap help still names internals (Clock "docs/midi.md M3",
+Delete's sqlite recipe), and a performer's own clip record can now be its
+`last-good` source, untested.
+
+### lfm3 as a text player: first runs (2026-11-14)
+
+`nagaya/lfm3` through the shipped musician rc, once spaceghost was back:
+
+- **A council model's thinking is switched by `--effort none`.**
+  `--thinking-style off` does not apply to a council backend
+  (`llm/council/generation.rs`, `wants_thinking`). With thinking on, lfm3
+  spent all of `max_tokens` thinking and wrote no phrase: "model turn
+  produced no complete score output". `kj character model set` accepts the
+  style flag for a council model without saying it does nothing.
+- **It does not stop after the phrase.** With thinking off it writes a
+  correct header, a bar or two with wrong lengths, then reasons in the
+  answer ("Wait, that is nonsense. I need to...") until `max_tokens`. A
+  32-beat phrase fails the ABC parse every time; a one-bar request gave
+  `C z4 | C z4 |` and then prose.
+- **It is fast.** 192 output tokens over 4 calls finished in 0.9 s. A
+  one-bar phrase is about 20 tokens.
+- **A `max_tokens` stop continued the turn.** With `--max-tokens 48` one
+  drive made 4 calls. For a player the limit should end the reply.
+- Next: bound the output (a stop string, if council generations take one, or
+  a council decision that picks a cell per bar, as the October prototype
+  did), and play bar-length windows. A track's phrase length has no `kj`
+  verb.
+
+### A band on one track: what is open
+
+Two musicians can share a track (`KJ_BAND`) with their own chairs
+(`KJ_CHAIR`); `docs/chameleon.md`, "A band". Not run on a live kernel yet.
+
+- No phrase-length check: `validate_abc` is a strict parse only, so a short
+  or long phrase commits.
+- `KJ_HEARD` is 8 phrases per track, not per performer.
+- An unknown `KJ_CHAIR` leaves an Error block and the create still succeeds,
+  so the context exists with no chair.
+- The primer's header list does not mention a `%%MIDI` line before `K:`; the
+  drums chair gives the exact header.
+
+### Lead time from measured cost: what is open
+
+- Not run on a live kernel yet; the 8-sample maximum is untested against real
+  model variance, and one slow turn holds the longer lead for 8 turns.
+- `KJ_LEAD_BEATS` uses the track's `BeatPolicy::clock()`, not the timeline's
+  own clock; check that they agree after a tempo change.
+- `transport_env` reads the performer from `kernel_db` on the clock thread;
+  carry it in the attachment snapshot if that read shows in beat latency.
+- A persisted attachment row with a rotate cadence of 1 is still restored,
+  and that context never plays; `kj transport` now refuses to write one.
+
+### Per-track sound: what the sink still shares
+
+MIDI is now scheduled and flushed per score context, and the notation names
+its channel (`docs/midi.md`). Left shared:
+
+- A flush cue for one track returns the DJ clock to wallclock and drops every
+  track's buffered beat-grid cues (`dj/core.rs`, `on_flush`). Stopping the
+  drums still loses the bass track's phrases that were waiting for their beat.
+- The PCM scheduler (`dj/audio.rs`, `audio_sched.rs`) drops every context's
+  pending clips on any flush; `SchedulerCmd::Flush` carries no context.
+- Two contexts that name the same MIDI channel are silenced together when
+  either is flushed. A tune that names no channel plays on channel 1.
+- A sink holds 255 context tags; past that a phrase plays untagged and only a
+  whole-sink flush removes it.
+- A track does not bind to a device role (`docs/midi-next.md`); the channel
+  the notation names is the default such a binding would override.
+
+### The page turn: what is open
+
+The page turn runs `kj context rotate` (`docs/chameleon.md`, "Players").
+
+- If a hand rotation's `create` rc fails after the predecessor was detached,
+  the predecessor is off its track though the message says it stays live.
+  The scheduler's page turn has the same property.
+- What a section carries forward is undecided: today nothing but `KJ_HEARD`.
+  `kj context rotate --migrate --drop` could carry recent turns.
+- Each tick prompt carries `KJ_HEARD` (8 phrases) and the 16-block window
+  keeps 5 to 8 earlier prompts, each with its own copy. Unmeasured.
+- The `window` fork preset has no caller.
+- Archive paths outside the dispatcher (the stray sweep, root-console
+  successors) do not detach from the scheduler; retire and demote do, by
+  inference, with no test of their own.
+
+### Dead music code left in the clients (2026-11-14 survey)
+
+The kernel-side and audio-side deletions are done. Left for the app's lane:
+
+- `kaijutsu-app/src/view/time_well/card.rs`, `haystack_order_keys`:
+  `#[allow(dead_code)]` "not called until tracks land"; tracks landed and
+  only its tests call it.
+- Comments naming the deleted app `metronome` module:
+  `input/mod.rs`, `input/scroll_config.rs`, `view/time_well/live.rs`,
+  `connection/actor_plugin.rs` (which also says it fetches metronome config).
+- `kaijutsu-present/src/beats.rs`, `any_rolling`: called only by app tests.
+- `TrackInfo` in `kaijutsu-client` parses `beats_per_phrase`, `beat_count`,
+  `last_epoch_ns` and `clock_kind`; no client reads them.
+- `kaijutsu-abc`'s `to_abc` has only test callers; kept for a
+  MIDI-to-notation hearing path.
+
+### Music docs after the rewrite (kaibo deepseek review, 2026-11-14)
+
+Fixed in `docs/chameleon.md` the same day. Left open:
+
+- `docs/hyoushigi.md` states unbuilt design as present fact: the `Timebase`
+  struct and Bevy `Time<Hyoushigi>` binding, fork cloning the open future,
+  "Clients run hyoushigi too" (no client crate depends on
+  `kaijutsu-hyoushigi`; the built pieces are `kaijutsu_audio::BeatRef` and
+  `LocalBeat` plus `onBeatSync`), the two-bit beat policy, and the block
+  model "has no tick today" paragraphs. The "As landed" block is the accurate
+  part. Split it: as-built first, design notes marked as such.
+- Stale references into `docs/chameleon.md`: `docs/pcm.md` (clip and cue
+  vocabulary), `docs/tracks.md` (lane and voice; and `rotate on|off`, which
+  takes `--every N` or `off`), `docs/midi.md` ("MIDI is a render of the
+  score", and a `Timebase` that does not exist).
+- `docs/pcm.md` lists `RenderCue` without `onset_beat`.
+
+### A stopped turn waiting on a person
+
+Moved from `docs/chameleon.md`; it concerns players whose work is not on a
+beat. A turn blocked on an ask waits up to `gate_wait_timeout` (300 s) and
+then expires. Amy's three points: expiry is an error the player can read and
+act on, not silence; the bound belongs to the ask, and some asks should wait
+without limit; expiry never grants. A musician on the grid should hold no
+capability that can raise an ask. Check these against
+`docs/approval-identity.md` and delete this note when they are covered there.
+
 ## Anticipation and commitment — iteration order
 
 The kernel coordinates anticipation and commitment on the shared pulse.
@@ -962,9 +1137,11 @@ work. `docs/audio-inference.md` records the workload and measured costs.
    cancelled, superseded), with the estimate and planned preparation tick
    beside them, as a table and as JSON. Producers report measured queue
    and compute time on results and errors, and each timeline keeps the
-   newest 32 samples per resolver (`docs/hyoushigi.md`). Open: nothing
-   reads the window yet (`estimate_cost` is a fixed guess, and the model
-   output resolver estimates zero); transfer durations wait for media
+   newest 32 samples per resolver (`docs/hyoushigi.md`). The model
+   output resolver's estimate is the performer's largest recent sample, and
+   the musician tick script targets by it ("Lead time from measured cost:
+   what is open"). Open: CAS preparation's estimate is a fixed guess;
+   transfer durations wait for media
    delivery in the scenario; no client shows work yet. Measure under overlap
    before choosing lead-time targets; avoid turning unmeasured percentiles
    into guarantees.
@@ -4844,8 +5021,6 @@ carry the mechanism; these are what none of them cover:
 - **Players get no tools at all.** A read-only kaish (kaibo's posture) would
   remove the tool-palette-hangs-small-models cliff by construction and give
   bar math an escape hatch. Decide which RO builtins.
-- **Rotate chains pollute the director's tree** (`kj context list --tree`
-  shows a 17-deep chain per song); no `--hide-archived` or chain folding.
 
 ## kaijutsu-mcp Remote backend collapses multi-context ops to one context
 

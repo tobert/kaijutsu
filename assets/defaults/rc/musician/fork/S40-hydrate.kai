@@ -22,7 +22,7 @@
 #    only marker available here is the tail — `[0, tail]` = the entire log — which
 #    isn't what a full-fork caller wants anyway.) An operator who later arms a full
 #    clone and wants it windowed runs `kj context hydrate --window N` by hand.
-# See docs/chameleon.md, "Players are rc programs" + the hydration marker.
+# See docs/chameleon.md, "Players".
 #
 # KJ_FORK_INFO is {"kind":"full|filtered|compact","parent":"<hex>"}. Match
 # the kind field precisely. Runs privileged in the fork lifecycle, so it clears

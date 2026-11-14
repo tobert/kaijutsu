@@ -76,7 +76,10 @@ commit_deadline = start − commit_margin
 
 A MIDI resolver reporting tens of ms speculates about a beat ahead; a neural-audio
 resolver reporting tens of seconds speculates minutes ahead — automatically, with no
-magic numbers.
+magic numbers. That is the design. Today each resolver's estimate is a fixed guess
+and the model output resolver reports zero; see "Measured cost" below in this
+section and `docs/chameleon.md`, "Omni models", for the producer that will need
+the derived lead first.
 
 ### Invariants
 
@@ -113,11 +116,15 @@ Measured cost is recorded beside each estimate (below); no estimate learns from 
 A resolver error records a `FailureEvent` immediately. The failed source cell
 is terminal, but its scheduled entry retains the commitment deadline. At that
 deadline the transport applies the declared fallback: `Skip` leaves silence,
-`UseLastGood` repeats the latest accepted content on the same track (or leaves
-silence if none exists), and `Literal` commits the supplied reference. Repeats
-and literals create separate cells authored by `beat()`. Selecting the fallback
-at commitment lets another producer supply a newer accepted phrase after the
-failure. A failed re-speculation keeps its final deadline at the intended start.
+`UseLastGood` repeats the latest accepted content the same performer played on
+the same track (or leaves silence if none exists), and `Literal` commits the
+supplied reference. Repeats and literals create separate cells authored by
+`beat()`, so a repeat of a repeat goes back to the performer's own phrase.
+Selecting the fallback at commitment lets the performer supply a newer accepted
+phrase after the failure. `Timeline::request_fallback` admits an item with no
+resolver (`kj transport repeat`): it settles through its declared fallback at
+its commitment with reason `Requested`, records no failure or cost sample, is
+not open work, and takes a capacity slot. A failed re-speculation keeps its final deadline at the intended start.
 Resolver errors do not automatically retry. Neither the error nor its fallback
 fires again on later ticks. `Recovery::ReSpeculated` records that a retry started,
 not that it succeeded; a second basis divergence records a second squash.
@@ -143,7 +150,7 @@ not replay elapsed beats. Due actions run by intended start, then admission orde
 so unrelated cancellation cannot change simultaneous fallback selection.
 
 Admission defaults to 64 open work items per timeline, including failures waiting
-for fallback. `with_capacity` selects another positive limit. Supersession validates
+for fallback and requested fallbacks. `with_capacity` selects another positive limit. Supersession validates
 its replacement before cancelling old work and reuses its capacity. Cancellation,
 supersession, deadline expiry, and timeline removal drop the owned future. A resolver
 that delegates work must carry cancellation ownership with that future; dropping a
@@ -162,7 +169,7 @@ timeline and is lost on process restart or timeline removal. Committed score blo
 remain durable. Clock inputs must be finite, with a positive rate and nonnegative
 safety factor and margin.
 
-A producer reports its wall-clock time on the result or the error it returns:
+**Measured cost.** A producer reports its wall-clock time on the result or the error it returns:
 `Timing { queued, compute }`, the wait for its own admission and the work after
 it. The timeline observes readiness only on a pulse, so only the producer can
 measure either. CAS preparation measures its slot wait as queued and everything
@@ -178,9 +185,26 @@ Each timeline keeps a window of the newest 32 `CostSample`s per resolver,
 its deadline adds a `missed` sample, because an overrun is what the window most
 needs to show; the producer reported nothing, so its compute is a lower bound,
 the ticks it ran at the clock's rate. Work cancelled, superseded, or missed
-before it started adds nothing. The samples stay raw; nothing reads them yet,
-and `estimate_cost` is still each resolver's fixed guess. The window is local
+before it started adds nothing. The samples stay raw. The model output
+resolver reads them for its estimate (below); CAS preparation's estimate is a
+fixed guess. The window is local
 to the live timeline and is lost on restart.
+
+A live run on 2026-11-14 shows the consequence. At 120 BPM with 32-beat phrases
+(16 s), a model turn that took 1.7 to 4.1 s committed with 23 to 28 beats of
+margin, and a local thinking model that needed more than 16 s missed every
+phrase. Both had an estimate of zero, so both started at admission, one phrase
+ahead; the fixed lead is the tick script's choice, not a derived one. A slower
+producer needs a target further ahead, which only its measured cost can say
+(`docs/chameleon.md`, "What a live run looks like").
+
+The model output resolver now reports `Timeline::measured_cost` as its
+estimate: the largest `queued + compute` among the performer's newest 8
+samples, with a missed deadline counted at its lower bound. `kj transport
+work` shows it beside the measured time. A model turn still starts at
+admission. The scheduler gives the tick script `KJ_COST_MS`, `KJ_LEAD_BEATS`
+(the cost times the clock's safety factor, in beats), and `KJ_OPEN_WORK`; the
+script chooses the target. CAS preparation keeps its fixed guess.
 
 `timeline_commitment_wire` drives the real scheduler with controlled fast, delayed,
 failed, superseded, missed-deadline, and stale-basis producers. The actual SSH client
@@ -199,7 +223,9 @@ returns `turn_id` and `work_id`; an ordinary drive returns a null `work_id` and
 does not put its output on the score. The track must already be armed, and the
 absolute target must be ahead of its playhead. `last-good` is the default fallback;
 `skip` leaves silence. Rc chooses this policy and target. The shipped musician
-tick script adds `KJ_PHRASE_BEATS` to its captured `KJ_TICK` and uses `KJ_TRACK`.
+tick script targets its captured `KJ_TICK` plus whole phrases of `KJ_PHRASE_BEATS`,
+as many as `KJ_LEAD_BEATS` needs, on `KJ_TRACK`, and admits nothing while the
+performer has open work.
 A delayed script cannot give old work a new target.
 
 The timeline retains the resolver selected at admission. Dedicated preparation
@@ -533,10 +559,11 @@ This makes the cheap things cheap **by construction**:
   a block. Contrast N per-context OS timers, where idle still costs a wakeup and a slot
   each.
 - **Backoff is one heap operation** — push a context's next deadline out (double on
-  repeat). The single heap owns the policy globally, and it can be *driven by signals the
-  engine already emits*: the `Squashed` ledger (a context burning compute on repeated
-  mispredictions backs off) and `estimate_cost`'s measured-vs-predicted learning. The
-  cadence adapts from the same feedback the speculation loop produces.
+  repeat). The single heap can own the policy globally, driven by signals the engine
+  already emits: the `Squashed` ledger (a context burning compute on repeated
+  mispredictions) and the measured cost samples. Not built in the scheduler: no cadence
+  backs off today. The musician's tick script does skip a tick while its earlier phrase
+  is open.
 
 Wakeup work is **fire-and-forget and lightweight on the scheduler** — it advances the
 timeline and enqueues/flushes; it must never run a model turn or synthesis inline, or the
@@ -703,8 +730,7 @@ fallback are exercised by their first user.
 >   (successor-derived, strictly increasing) — block order matches tick order
 >   without the two ever being the same number.
 > - **The engine:** `crates/kaijutsu-hyoushigi` — `Cell` carries `track` (the
->   lane identity) + `played_by` (who played; never a lane key — `track ==
->   None` matches no track); `Body`/`Recipe`/`Fallback`/`CellState`/
+>   lane identity) + `played_by` (who played; never a lane key); `Body`/`Recipe`/`Fallback`/`CellState`/
 >   `Resolver`/`ContentRef` as specified above; the `Timeline` with lead-time
 >   derivation, the speculate→commit-or-squash→fallback loop, a `SquashEvent`
 >   ledger (predicted vs. actual basis), a `FailureEvent` ledger stamped with
@@ -732,11 +758,11 @@ fallback are exercised by their first user.
 >   anything heavier stays a timeline resolver, never a deriver. Score blocks
 >   are `ephemeral` (hydration-silent), so `KJ_HEARD` is the player's *only*
 >   window onto the score — a player's memory of its own output flows
->   entirely through it (`docs/chameleon.md` § The stamp-turn process model).
+>   entirely through it (`docs/chameleon.md`, "Players").
 > - **The transport:** the beat scheduler (`kaijutsu-server/src/beat.rs`) is
 >   the single coalescing driver described above — one `(Instant, TrackId)`
 >   heap + ingress, generation tokens against stale entries. Surface:
->   `kj transport attach|detach|play|pause|stop|tempo|ooda|clock|rotate`,
+>   `kj transport attach|detach|play|pause|stop|tempo|ooda|clock|rotate|work|delete|list`,
 >   track-scoped. The tick is **event-counted**: pause freezes musical time
 >   and resume picks up at +1 — no wall-clock catch-up, no rewind (revisiting
 >   the past is an export, not a seek). Tracks arm **stopped** (no surprise
@@ -753,12 +779,15 @@ fallback are exercised by their first user.
 >
 > **Not yet:** the UI timeline render + transport buttons/spacebar. The
 > capnp read/distribution surface has shipped: `listTracks`/`TrackInfo`
-> (`kaijutsu.capnp:2438,1269`) read track state, consumed by the app and
-> tui; `onRenderCue`/`onBeatSync` (`kaijutsu.capnp:873,882`) distribute
+> (`kaijutsu.capnp`) read track state, consumed by the app and
+> tui; `onRenderCue`/`onBeatSync` (`kaijutsu.capnp`) distribute
 > committed cells and beat sync, consumed by `kaijutsu-audiod`
 > (`kaijutsu-audio-runtime`) and the app's display. `kj transport` remains
 > the only surface for transport *control* (attach/detach/play/pause/…).
-> Still open: disarm-on-archive and the cold-start re-attach sweep (restart resets to stopped;
+> Archiving a context, by any verb that archives, detaches it from the beat
+> scheduler and keeps its attachment rows; `kj context rotate` detaches the
+> predecessor before the successor's `create` rc runs.
+> Still open: the cold-start re-attach sweep (restart resets to stopped;
 > re-attach is manual, and arming is restart-safe by construction — playhead
 > and committed log rehydrate from the score context); a richer
 > `compute_basis` / section-placement policy (cells schedule a fixed phrase

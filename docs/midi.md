@@ -456,8 +456,10 @@ same daemon (`kaijutsu-audio-runtime`'s `midi_in.rs`, `clockin.rs`,
   structure. What's still open is the *musical* policy when Amy plays with
   the band on one lane: does the human's MIDI-in share the model's lane
   (two `played_by`s, one track) or ride a parallel track — and what
-  `UseLastGood` should repeat in the mixed case (today it's lane-scoped,
-  producer-blind — a decision, not a bug).
+  `UseLastGood` should repeat in the mixed case (today `UseLastGood`
+  repeats the latest phrase the falling-back performer played on that lane,
+  never another player's; captured MIDI-in is an observation block, not a
+  committed cell, so it is never repeated).
 - **Per-track device role** (the moment two tracks sound at once). The sink
   already schedules and flushes per score context, and a tune names its own
   channel (see "The DJ thread"). Still open: a track does not bind to a
