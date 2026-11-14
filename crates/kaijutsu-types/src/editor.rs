@@ -39,6 +39,72 @@ impl EditorSelection {
     }
 }
 
+/// How a register's text puts: `p` puts charwise text inside a line,
+/// linewise text on its own lines below the cursor, and blockwise text as a
+/// column. Vim's register type; see `docs/vi.md`, "Registers".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegisterShape {
+    Charwise,
+    Linewise,
+    Blockwise,
+}
+
+/// The name of the unnamed register, `""`.
+pub const UNNAMED_REGISTER: char = '"';
+
+/// Whether `name` is a text register: the unnamed register `"`, `0`, the
+/// delete ring `1`–`9`, the small delete `-`, or a named register `a`–`z`.
+pub fn is_text_register(name: char) -> bool {
+    matches!(name, '"' | '0'..='9' | '-' | 'a'..='z')
+}
+
+/// Which register an editor wrote, as the store's put sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegisterWriteKind {
+    /// The unnamed register as a yank: it and `"0` take the text.
+    Yank,
+    /// The unnamed register as a delete: it takes the text, and the delete
+    /// ring takes it when it holds a line break, `"-` otherwise.
+    Delete,
+    /// A named register `a`–`z`: it and the unnamed register take the text.
+    Named(char),
+}
+
+/// One write an editor made to its text registers. Another store applies it
+/// with the same put, so two stores that apply the same writes in the same
+/// order hold the same text registers. See `docs/vi.md`, "A kernel-owned
+/// register store".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterWrite {
+    pub kind: RegisterWriteKind,
+    pub text: String,
+    pub shape: RegisterShape,
+}
+
+impl RegisterWrite {
+    /// Refuse a write a store cannot apply: a named write to anything but
+    /// `a`–`z`.
+    pub fn check(&self) -> Result<(), String> {
+        match self.kind {
+            RegisterWriteKind::Named(c) if !c.is_ascii_lowercase() => Err(format!(
+                "register write names {c:?}; a named register is one of a-z"
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// One text register's content: its name (see [`is_text_register`]), text
+/// and shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterText {
+    pub name: char,
+    pub text: String,
+    pub shape: RegisterShape,
+}
+
 /// The status-line label for the current file's place in an editor session's
 /// argument list: `"(2 of 5)"` for the second of five files, from a 0-based
 /// `index`. `None` when the list holds one file: a single file shows no

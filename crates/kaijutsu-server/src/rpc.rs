@@ -3068,6 +3068,50 @@ impl kernel::Server for KernelImpl {
         }
     }
 
+    /// Apply a client's register writes to the caller's store, with this
+    /// connection as their origin so the editor bridge does not send them
+    /// back here.
+    fn registers_put(
+        self: Rc<Self>,
+        params: kernel::RegistersPutParams,
+        _results: kernel::RegistersPutResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "registers_put").entered();
+        let writes = pry!(pry!(p.get_writes()).iter().map(read_register_write).collect::<Result<Vec<_>, _>>());
+        let (principal, origin) = {
+            let conn = self.connection.borrow();
+            (conn.principal, conn.session_id)
+        };
+        match self.kernel.kernel.registers_put(principal, Some(origin), &writes) {
+            Ok(()) => Promise::ok(()),
+            Err(e) => Promise::err(capnp::Error::failed(format!("registers_put failed: {e}"))),
+        }
+    }
+
+    /// The caller's text registers as the kernel holds them.
+    fn registers_get(
+        self: Rc<Self>,
+        params: kernel::RegistersGetParams,
+        mut results: kernel::RegistersGetResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "registers_get").entered();
+        let principal = self.connection.borrow().principal;
+        let cells = match self.kernel.kernel.registers_get(principal) {
+            Ok(cells) => cells,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("registers_get failed: {e}"))),
+        };
+        let mut out = results.get().init_cells(cells.len() as u32);
+        for (i, cell) in cells.iter().enumerate() {
+            let mut b = out.reborrow().get(i as u32);
+            b.set_name(cell.name.to_string().as_str());
+            b.set_text(&cell.text);
+            b.set_shape(wire_register_shape(cell.shape));
+        }
+        Promise::ok(())
+    }
+
     fn editor_state(
         self: Rc<Self>,
         params: kernel::EditorStateParams,
@@ -3153,9 +3197,9 @@ impl kernel::Server for KernelImpl {
         {
             let editor_flows = self.kernel.kernel.editor_flows().clone();
             let kernel_id = self.kernel.id;
-            let (conn_cancel, disconnect) = {
+            let (conn_cancel, disconnect, conn_principal, conn_session) = {
                 let conn = self.connection.borrow();
-                (conn.cancel_token(), conn.disconnect_token())
+                (conn.cancel_token(), conn.disconnect_token(), conn.principal, conn.session_id)
             };
 
             tokio::task::spawn_local(async move {
@@ -3200,6 +3244,20 @@ impl kernel::Server for KernelImpl {
                                 EditorFlow::Closed { session_id } => {
                                     let mut req = callback.on_editor_closed_request();
                                     req.get().set_session_id(session_id);
+                                    await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
+                                }
+                                // A register write goes only to connections of
+                                // the player whose registers took it, and never
+                                // back to the connection that sent it.
+                                EditorFlow::RegisterWrite { principal, origin, .. }
+                                    if principal != conn_principal || origin == Some(conn_session) =>
+                                {
+                                    true
+                                }
+                                EditorFlow::RegisterWrite { seq, ref write, .. } => {
+                                    let mut req = callback.on_register_write_request();
+                                    req.get().set_seq(seq);
+                                    set_register_write(req.get().init_write(), write);
                                     await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
                                 }
                             }
@@ -8249,6 +8307,63 @@ fn set_editor_state(
             out.set_end(span.end as u64);
         }
     }
+}
+
+fn wire_register_shape(shape: kaijutsu_types::editor::RegisterShape) -> crate::kaijutsu_capnp::RegisterShape {
+    use crate::kaijutsu_capnp::RegisterShape as Wire;
+    use kaijutsu_types::editor::RegisterShape;
+    match shape {
+        RegisterShape::Charwise => Wire::Charwise,
+        RegisterShape::Linewise => Wire::Linewise,
+        RegisterShape::Blockwise => Wire::Blockwise,
+    }
+}
+
+/// Fill a `RegisterWrite` capnp builder.
+fn set_register_write(
+    mut b: crate::kaijutsu_capnp::register_write::Builder<'_>,
+    write: &kaijutsu_types::editor::RegisterWrite,
+) {
+    use kaijutsu_types::editor::RegisterWriteKind;
+    match write.kind {
+        RegisterWriteKind::Yank => b.set_yank(()),
+        RegisterWriteKind::Delete => b.set_delete(()),
+        RegisterWriteKind::Named(c) => b.set_named(c.to_string().as_str()),
+    }
+    b.set_text(&write.text);
+    b.set_shape(wire_register_shape(write.shape));
+}
+
+/// Read a `RegisterWrite` a client sent. A named write must name one
+/// character; which characters a store accepts is the kernel's check.
+fn read_register_write(
+    r: crate::kaijutsu_capnp::register_write::Reader<'_>,
+) -> Result<kaijutsu_types::editor::RegisterWrite, capnp::Error> {
+    use crate::kaijutsu_capnp::register_write::Which;
+    use crate::kaijutsu_capnp::RegisterShape as Wire;
+    use kaijutsu_types::editor::{RegisterShape, RegisterWriteKind};
+    let kind = match r.which()? {
+        Which::Yank(()) => RegisterWriteKind::Yank,
+        Which::Delete(()) => RegisterWriteKind::Delete,
+        Which::Named(name) => {
+            let name = name?.to_str()?;
+            let mut chars = name.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => RegisterWriteKind::Named(c),
+                _ => {
+                    return Err(capnp::Error::failed(format!(
+                        "a named register write names one letter a-z, not {name:?}"
+                    )));
+                }
+            }
+        }
+    };
+    let shape = match r.get_shape()? {
+        Wire::Charwise => RegisterShape::Charwise,
+        Wire::Linewise => RegisterShape::Linewise,
+        Wire::Blockwise => RegisterShape::Blockwise,
+    };
+    Ok(kaijutsu_types::editor::RegisterWrite { kind, text: r.get_text()?.to_string()?, shape })
 }
 
 // ============================================================================

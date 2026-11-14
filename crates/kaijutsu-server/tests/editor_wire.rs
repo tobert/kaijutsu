@@ -104,6 +104,138 @@ fn an_argument_list_moves_over_the_wire_and_a_second_open_joins_it() {
     });
 }
 
+/// One server, two connections of the root principal and one of another.
+struct RegisterPlayers {
+    _clients: Vec<kaijutsu_client::RpcClient>,
+    a1: kaijutsu_client::KernelHandle,
+    a2: kaijutsu_client::KernelHandle,
+    other: kaijutsu_client::KernelHandle,
+    rx_a1: Receiver<ServerEvent>,
+    rx_a2: Receiver<ServerEvent>,
+    rx_other: Receiver<ServerEvent>,
+}
+
+async fn register_players() -> RegisterPlayers {
+    use russh::keys::{Algorithm, PrivateKey};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = kaijutsu_server::SshServerConfig::ephemeral(addr.port());
+    common::register_root_key(addr, config.root_key());
+    let other_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    kaijutsu_server::AuthDb::open(config.auth_db_path.as_ref().expect("an ephemeral config has an auth db"))
+        .unwrap()
+        .add_key(kaijutsu_types::PrincipalId::new(), other_key.public_key(), Some("other"))
+        .unwrap();
+    tokio::task::spawn_local(async move {
+        kaijutsu_server::SshServer::new(config).run_on_listener(listener).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+
+    let a1_client = connect_client(addr).await;
+    let a2_client = connect_client(addr).await;
+    let other_client = {
+        let ssh_config = kaijutsu_client::SshConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            username: "other".to_string(),
+            key_source: kaijutsu_client::KeySource::InMemory(std::sync::Arc::new(other_key)),
+            insecure: true,
+        };
+        let mut ssh = kaijutsu_client::SshClient::new(ssh_config);
+        let channel = ssh.connect().await.unwrap();
+        let mut client = kaijutsu_client::RpcClient::new(channel.into_stream()).await.unwrap();
+        client.retain_ssh_session(ssh);
+        client
+    };
+    let (a1, _) = a1_client.bind_kernel().await.unwrap();
+    let (a2, _) = a2_client.bind_kernel().await.unwrap();
+    let (other, _) = other_client.bind_kernel().await.unwrap();
+    let mut receivers = Vec::new();
+    for handle in [&a1, &a2, &other] {
+        let (callback, rx) = editor_events_channel(64);
+        handle.subscribe_editor(callback).await.unwrap();
+        receivers.push(rx);
+    }
+    let rx_other = receivers.pop().unwrap();
+    let rx_a2 = receivers.pop().unwrap();
+    let rx_a1 = receivers.pop().unwrap();
+    RegisterPlayers { _clients: vec![a1_client, a2_client, other_client], a1, a2, other, rx_a1, rx_a2, rx_other }
+}
+
+/// Drain until a register write arrives.
+async fn recv_register_write(rx: &mut Receiver<ServerEvent>) -> (u64, kaijutsu_types::editor::RegisterWrite) {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(ServerEvent::RegisterWrite { seq, write })) => return (seq, write),
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("editor push channel error: {e}"),
+            Err(_) => panic!("timed out waiting for a RegisterWrite push"),
+        }
+    }
+}
+
+fn reg_write(kind: kaijutsu_types::editor::RegisterWriteKind, text: &str) -> kaijutsu_types::editor::RegisterWrite {
+    kaijutsu_types::editor::RegisterWrite { kind, text: text.to_string(), shape: kaijutsu_types::editor::RegisterShape::Linewise }
+}
+
+/// A put from one connection reaches the same player's other connection and
+/// not itself; another player gets nothing; `registersGet` is the kernel's
+/// copy. Each "gets nothing" is read against a later write that does
+/// arrive on that connection: the push channel is ordered, so the first
+/// register write it sees must be that later one.
+#[test]
+fn a_register_put_reaches_the_players_other_connections_only() {
+    use kaijutsu_types::editor::RegisterWriteKind;
+    run_local(async {
+        let mut p = register_players().await;
+        let deleted = reg_write(RegisterWriteKind::Delete, "from a1\n");
+        p.a1.registers_put(&[deleted.clone()]).await.unwrap();
+        assert_eq!(recv_register_write(&mut p.rx_a2).await, (1, deleted.clone()));
+
+        let cells = p.a2.registers_get().await.unwrap();
+        assert_eq!(cells.iter().map(|c| (c.name, c.text.as_str())).collect::<Vec<_>>(), [('"', "from a1\n"), ('1', "from a1\n")]);
+        assert!(p.other.registers_get().await.unwrap().is_empty(), "another player's registers are their own");
+
+        let yanked = reg_write(RegisterWriteKind::Yank, "from a2\n");
+        p.a2.registers_put(&[yanked.clone()]).await.unwrap();
+        assert_eq!(recv_register_write(&mut p.rx_a1).await, (2, yanked), "a1's own put never came back to it");
+
+        let session = p.other.editor_open(RC_PATH).await.unwrap().session;
+        p.other.editor_keys(session, "\"qyy").await.unwrap();
+        let (seq, got) = recv_register_write(&mut p.rx_other).await;
+        assert_eq!(got.kind, RegisterWriteKind::Named('q'), "the first write the other player sees is their own");
+        assert_eq!(seq, 1, "the other player's writes are numbered on their own");
+        p.other.editor_quit(session).await.unwrap();
+    });
+}
+
+/// A kernel vi session's `dd` reaches every connection of the player who
+/// typed it, the typing one included, and no other player's.
+#[test]
+fn a_kernel_vi_delete_reaches_every_connection_of_the_typist() {
+    use kaijutsu_types::editor::RegisterWriteKind;
+    run_local(async {
+        let mut p = register_players().await;
+        let session = p.a1.editor_open(RC_PATH).await.unwrap().session;
+        let first_line = p.a1.editor_state(session).await.unwrap().text.split('\n').next().unwrap().to_string();
+        p.a1.editor_keys(session, "dd").await.unwrap();
+        let expected = (1, reg_write(RegisterWriteKind::Delete, &format!("{first_line}\n")));
+        assert_eq!(recv_register_write(&mut p.rx_a1).await, expected, "the typing connection gets it too");
+        assert_eq!(recv_register_write(&mut p.rx_a2).await, expected);
+        assert_eq!(p.a2.registers_get().await.unwrap()[0].text, format!("{first_line}\n"));
+
+        let mine = p.other.editor_open(RC_PATH).await.unwrap().session;
+        p.other.editor_keys(mine, "yy").await.unwrap();
+        assert_eq!(
+            recv_register_write(&mut p.rx_other).await.1.kind,
+            RegisterWriteKind::Yank,
+            "the first write the other player sees is their own yank, not a1's delete"
+        );
+        p.a1.editor_quit(session).await.unwrap();
+        p.other.editor_quit(mine).await.unwrap();
+    });
+}
+
 /// Drain the editor push channel until a `EditorStateChanged` arrives (or fail
 /// loud on timeout — a missing push is the bug this test exists to catch).
 async fn recv_state(rx: &mut Receiver<ServerEvent>) -> EditorState {

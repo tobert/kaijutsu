@@ -260,7 +260,7 @@ impl FlowTopics for TurnFlow {
 }
 
 impl FlowTopics for EditorFlow {
-    const TOPICS: &[&'static str] = &["editor.state_changed", "editor.closed"];
+    const TOPICS: &[&'static str] = &["editor.state_changed", "editor.closed", "editor.register_write"];
 }
 
 // ============================================================================
@@ -1609,8 +1609,9 @@ impl HasSubject for TurnFlow {
 /// onto the `EditorEvents` capnp callback so every renderer of a session sees
 /// state the instant it lands — the reason the editor channel is push, not poll.
 ///
-/// Published by the kernel's `editor_keys`/`editor_save` (→ `StateChanged`) and
-/// `editor_quit` (→ `Closed`).
+/// Published by the kernel's `editor_keys`/`editor_save` (→ `StateChanged`),
+/// `editor_quit` (→ `Closed`), and each accepted register write
+/// (→ `RegisterWrite`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EditorFlow {
     /// A session's state changed (a keystroke landed, a save moved the
@@ -1627,6 +1628,20 @@ pub enum EditorFlow {
         /// The session that closed.
         session_id: u64,
     },
+    /// The kernel accepted a write to a player's text registers and wrote it
+    /// to the table. The server's bridge sends it only to connections of
+    /// `principal`, and never to the connection `origin` names
+    /// (`docs/vi.md`, "A kernel-owned register store").
+    RegisterWrite {
+        /// Whose registers took the write.
+        principal: kaijutsu_types::PrincipalId,
+        /// The connection that sent the write; `None` for a kernel vi
+        /// session's keys, which every connection of `principal` gets.
+        origin: Option<kaijutsu_types::SessionId>,
+        /// The write's sequence number among `principal`'s writes.
+        seq: u64,
+        write: kaijutsu_types::editor::RegisterWrite,
+    },
 }
 
 impl EditorFlow {
@@ -1635,13 +1650,16 @@ impl EditorFlow {
         match self {
             Self::StateChanged { .. } => "editor.state_changed",
             Self::Closed { .. } => "editor.closed",
+            Self::RegisterWrite { .. } => "editor.register_write",
         }
     }
 
-    /// The session this event concerns.
-    pub fn session_id(&self) -> u64 {
+    /// The session this event concerns; `None` for a register write, which
+    /// belongs to a player rather than a session.
+    pub fn session_id(&self) -> Option<u64> {
         match self {
-            Self::StateChanged { session_id, .. } | Self::Closed { session_id } => *session_id,
+            Self::StateChanged { session_id, .. } | Self::Closed { session_id } => Some(*session_id),
+            Self::RegisterWrite { .. } => None,
         }
     }
 }

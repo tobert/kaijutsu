@@ -46,6 +46,7 @@ mod presets;
 mod hooks;
 mod client_state;
 mod editor_recovery;
+mod editor_registers;
 mod watches;
 pub use watches::WatchRow;
 mod well_known;

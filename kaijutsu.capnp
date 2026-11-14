@@ -1157,16 +1157,51 @@ struct CharSpan {
   end @1 :UInt64;
 }
 
+# How a register's text puts: charwise inside a line, linewise on its own
+# lines below the cursor, blockwise as a column.
+enum RegisterShape {
+  charwise @0;
+  linewise @1;
+  blockwise @2;
+}
+
+# One write an editor made to its text registers. A store applies it with
+# the same put the editor used, so stores that apply the same writes in the
+# same order hold the same text registers (docs/vi.md, "A kernel-owned
+# register store").
+struct RegisterWrite {
+  union {
+    yank @0 :Void;     # the unnamed register and "0 take the text
+    delete @1 :Void;   # the unnamed register takes it; the delete ring
+                       # when it holds a line break, "- otherwise
+    named @2 :Text;    # one letter a-z: that register and the unnamed one
+  }
+  text @3 :Text;
+  shape @4 :RegisterShape;
+}
+
+# One text register's content.
+struct RegisterCell {
+  name @0 :Text;   # one character: `"` (unnamed), 0-9, -, or a-z
+  text @1 :Text;
+  shape @2 :RegisterShape;
+}
+
 # Callback for receiving editor-session state pushes (the in-app vi editor).
 # The push channel exists so a peer's write to an open block reaches every
 # renderer the instant it lands — collaborative editing, not poll lag.
 interface EditorEvents {
-  # Next free ordinal: 2. Ordinals are dense and permanent — never
+  # Next free ordinal: 3. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
   onEditorState @0 (state :EditorState);
   onEditorClosed @1 (sessionId :UInt64);
+  # A write the kernel accepted into this connection's principal's
+  # registers, from another connection or a kernel vi session. `seq` orders
+  # the principal's writes. The client applies it between keys and does not
+  # send it back.
+  onRegisterWrite @2 (seq :UInt64, write :RegisterWrite);
 }
 
 # ============================================================================
@@ -2069,7 +2104,7 @@ interface World {
 }
 
 interface Kernel {
-  # Next free ordinal: 111. Ordinals are dense and permanent — never
+  # Next free ordinal: 113. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -2605,6 +2640,16 @@ interface Kernel {
   # insert, normal stays normal); refuses with the state unchanged while the
   # `:` command line is open, reporting on `EditorState.message`.
   editorInsert @105 (sessionId :UInt64, text :Text, trace :TraceContext) -> (state :EditorState);
+
+  # Apply the register writes a key made in this client's editor, in order,
+  # to the caller's registers on the kernel. The kernel writes them to its
+  # table, then sends each to the caller's other connections through
+  # `EditorEvents.onRegisterWrite`. A write naming a register outside a-z,
+  # or a failed table write, refuses them all.
+  registersPut @111 (writes :List(RegisterWrite), trace :TraceContext) -> ();
+  # The caller's text registers as the kernel holds them; an empty register
+  # is left out.
+  registersGet @112 (trace :TraceContext) -> (cells :List(RegisterCell));
 
   # ==========================================================================
   # Transport and time (tracks, MIDI capture/presence, clock estimates)

@@ -1100,6 +1100,30 @@ CREATE TABLE IF NOT EXISTS editor_recovery_files (
     PRIMARY KEY (recovery_id, position)
 );
 
+-- ── Editor registers (docs/vi.md, "A kernel-owned register store") ─
+-- Each character's vi text registers, written through on each accepted
+-- register write. The unnamed register has no row: a load puts every row
+-- through its register's own put in `seq` order, so the unnamed register
+-- ends equal to the row written last.
+--   principal   the character the registers belong to.
+--   name        '0', '1' to '9', '-', or 'a' to 'z'.
+--   shape       how `p` puts the text.
+--   text        the register's text; empty for a ring slot not yet filled.
+--   seq         the write that set the row; increasing per principal. A
+--               delete that shifts the ring sets '1' to '9' with one seq,
+--               and a load puts '1' last among them.
+--   updated_at  when the row was written.
+CREATE TABLE IF NOT EXISTS editor_registers (
+    principal  BLOB    NOT NULL,
+    name       TEXT    NOT NULL
+        CHECK (length(name) = 1 AND (name GLOB '[0-9a-z]' OR name = '-')),
+    shape      TEXT    NOT NULL CHECK (shape IN ('charwise', 'linewise', 'blockwise')),
+    text       TEXT    NOT NULL,
+    seq        INTEGER NOT NULL CHECK (seq > 0),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (principal, name)
+);
+
 -- ── Context watches (docs/watch.md) ─────────────────────────────
 -- One row per thing a context watches. The status columns are the
 -- coalesced record since the last delivery: a prompt submit renders every

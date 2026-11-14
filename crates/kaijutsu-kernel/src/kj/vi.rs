@@ -18,7 +18,7 @@ use crate::mcp::Capability;
 #[derive(Parser, Debug)]
 #[command(
     name = "vi",
-    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list/recover); the agent and scripting door, not the in-app entry",
+    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list/recover/registers); the agent and scripting door, not the in-app entry",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -110,6 +110,13 @@ enum EditorCommand {
         #[arg(long, requires = "pick")]
         discard: bool,
     },
+    /// Print your vi text registers as the kernel holds them, one per line:
+    /// name, shape (charwise, linewise or blockwise), and text with each
+    /// line break shown as `^J`. Lists the unnamed register `""`, `"0`,
+    /// `"1`-`"9`, `"-` and `"a`-`"z`; an empty register is left out. These
+    /// are what `p` puts in a kernel vi session you type in. Read-only. The
+    /// structured result is an array of `{name, text, shape}`.
+    Registers,
 }
 
 /// The capability `kj vi save` gates on. A write reached through
@@ -329,6 +336,29 @@ impl KjDispatcher {
                     Err(e) => KjResult::Err(format!("kj vi quit: {e}")),
                 }
             }
+            EditorCommand::Registers => match kernel.registers_get(caller.actor_id) {
+                Ok(cells) => {
+                    let line = if cells.is_empty() {
+                        "no vi registers".to_string()
+                    } else {
+                        cells
+                            .iter()
+                            .map(|c| {
+                                let shape = match c.shape {
+                                    kaijutsu_editor::RegisterShape::Charwise => "charwise",
+                                    kaijutsu_editor::RegisterShape::Linewise => "linewise",
+                                    kaijutsu_editor::RegisterShape::Blockwise => "blockwise",
+                                };
+                                format!("\"{}  {shape}  {}", c.name, c.text.replace('\n', "^J"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    let data = serde_json::to_value(&cells).expect("RegisterText serializes");
+                    KjResult::ok_with_data(line, data)
+                }
+                Err(e) => KjResult::Err(format!("kj vi registers: {e}")),
+            },
             EditorCommand::List => {
                 let sessions = kernel.editor_list();
                 let line = if sessions.is_empty() {
@@ -394,6 +424,7 @@ impl Classify for EditorCommand {
         match self {
             EditorCommand::State { .. }
             | EditorCommand::List
+            | EditorCommand::Registers
             | EditorCommand::Recover { pick: None, .. } => Effect::Read,
             // `open` allocates a new kernel-owned session (and signals it to
             // attached app windows) even though nothing here writes a file —
@@ -459,6 +490,42 @@ mod tests {
         match moved {
             KjResult::Ok { data: Some(dd), .. } => assert!(dd["yank"].is_null()),
             other => panic!("expected keys data, got {other:?}"),
+        }
+    }
+
+    /// `kj vi registers` shows the caller's registers as the kernel holds
+    /// them, as text and as an array of cells, and never another caller's.
+    #[tokio::test]
+    async fn kj_vi_registers_shows_the_callers_kernel_copy() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let empty = d.dispatch(&[s("vi"), s("registers")], &c).await;
+        match &empty {
+            KjResult::Ok { data: Some(dd), .. } => assert_eq!(dd, &serde_json::json!([])),
+            other => panic!("expected registers data, got {other:?}"),
+        }
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("one\ntwo")], &c).await;
+        let id = session_of(&d.dispatch(&[s("vi"), s("open"), s(P)], &c).await);
+        d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("yyjdd")], &c).await;
+
+        match d.dispatch(&[s("vi"), s("registers")], &c).await {
+            KjResult::Ok { message, data: Some(dd), .. } => {
+                assert_eq!(
+                    dd,
+                    serde_json::json!([
+                        {"name": "\"", "text": "two\n", "shape": "linewise"},
+                        {"name": "0", "text": "one\n", "shape": "linewise"},
+                        {"name": "1", "text": "two\n", "shape": "linewise"},
+                    ])
+                );
+                assert_eq!(message, "\"\"  linewise  two^J\n\"0  linewise  one^J\n\"1  linewise  two^J");
+            }
+            other => panic!("expected registers data, got {other:?}"),
+        }
+        match d.dispatch(&[s("vi"), s("registers")], &test_caller()).await {
+            KjResult::Ok { data: Some(dd), .. } => assert_eq!(dd, serde_json::json!([]), "another caller has none"),
+            other => panic!("expected registers data, got {other:?}"),
         }
     }
 

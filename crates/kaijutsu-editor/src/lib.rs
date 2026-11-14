@@ -39,7 +39,10 @@ use modalkit::keybindings::{BindingMachine, InputBindings, InputState};
 use std::collections::VecDeque;
 use std::ops::Range;
 
-pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
+pub use kaijutsu_types::editor::{
+    EditorSelection, RegisterShape, RegisterText, RegisterWrite, RegisterWriteKind, SelectionShape,
+    UNNAMED_REGISTER,
+};
 
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -154,6 +157,206 @@ pub enum EditorIo {
 #[derive(Default)]
 pub struct Registers(RegisterStore);
 
+/// The registers a [`Registers`] table row may name, in the order a listing
+/// shows them: everything but the unnamed register, which a store derives
+/// from the latest put.
+const STORED_REGISTERS: &str = "0123456789-abcdefghijklmnopqrstuvwxyz";
+
+impl Registers {
+    /// Apply a write another editor made, through the same put that editor
+    /// used: a yank sets the unnamed register and `"0`; a delete sets the
+    /// unnamed register and pushes the delete ring, or sets `"-` for text
+    /// without a line break; a named write sets that register and the
+    /// unnamed one. A write [`RegisterWrite::check`] refuses changes nothing.
+    pub fn apply(&mut self, write: &RegisterWrite) -> Result<(), String> {
+        write.check()?;
+        let (reg, flags) = match write.kind {
+            RegisterWriteKind::Yank => (Register::Unnamed, RegisterPutFlags::NONE),
+            RegisterWriteKind::Delete => (Register::Unnamed, RegisterPutFlags::DELETE),
+            RegisterWriteKind::Named(c) => (Register::Named(c), RegisterPutFlags::NONE),
+        };
+        self.0
+            .put(&reg, cell_of(&write.text, write.shape), flags)
+            .map_err(|e| format!("register write refused: {e}"))
+    }
+
+    /// The registers besides the unnamed one that `write` sets when applied:
+    /// `"0` for a yank, `"1`–`"9` for a delete with a line break and `"-`
+    /// for one without, the named register for a named write.
+    pub fn targets(write: &RegisterWrite) -> Vec<char> {
+        match write.kind {
+            RegisterWriteKind::Yank => vec!['0'],
+            RegisterWriteKind::Delete if EditRope::from(write.text.as_str()).get_lines() >= 1 => {
+                ('1'..='9').collect()
+            }
+            RegisterWriteKind::Delete => vec!['-'],
+            RegisterWriteKind::Named(c) => vec![c],
+        }
+    }
+
+    /// One text register's content; `None` when it is empty or `name` is
+    /// not a text register.
+    pub fn cell(&self, name: char) -> Option<RegisterText> {
+        let reg = if name == UNNAMED_REGISTER { Register::Unnamed } else { stored_register(name)? };
+        let cell = self.0.get(&reg).ok()?;
+        let text = cell.value.to_string();
+        (!text.is_empty()).then(|| RegisterText { name, text, shape: shape_of(cell.shape) })
+    }
+
+    /// Every text register that holds text: the unnamed register, `"0`,
+    /// `"1`–`"9`, `"-`, then `"a`–`"z`.
+    pub fn text_cells(&self) -> Vec<RegisterText> {
+        std::iter::once(UNNAMED_REGISTER)
+            .chain(STORED_REGISTERS.chars())
+            .filter_map(|name| self.cell(name))
+            .collect()
+    }
+
+    /// Rebuild text registers from stored rows, `(sequence number, cell)`.
+    /// Each row goes through its own register's put in sequence order, so
+    /// the unnamed register ends equal to the latest row. Within one
+    /// sequence number (a delete that shifted the ring) `"1` goes last.
+    /// A row naming the unnamed register or a register that is not a text
+    /// register is refused.
+    pub fn from_rows(rows: impl IntoIterator<Item = (u64, RegisterText)>) -> Result<Self, String> {
+        let mut rows: Vec<(u64, RegisterText)> = rows.into_iter().collect();
+        if let Some((_, bad)) = rows.iter().find(|(_, r)| stored_register(r.name).is_none()) {
+            return Err(format!("a stored register row names {:?}, which is not one of {STORED_REGISTERS}", bad.name));
+        }
+        rows.sort_by_key(|(seq, r)| (*seq, r.name == '1'));
+        let mut store = RegisterStore::default();
+        for (_, row) in rows {
+            let reg = stored_register(row.name).expect("checked above");
+            store
+                .put(&reg, cell_of(&row.text, row.shape), RegisterPutFlags::NONE)
+                .map_err(|e| format!("register {:?} refused its row: {e}", row.name))?;
+        }
+        Ok(Registers(store))
+    }
+
+    /// Replace every text register with the snapshot's cell, and empty the
+    /// ones the snapshot does not name. A macro recorded in `"a`-`"z` is a
+    /// named register and is replaced with it; the last `:` line, the last
+    /// search pattern and the macro `@@` repeats stay. A name that is not a
+    /// text register, or one named twice, is refused before anything changes.
+    pub fn replace_text(&mut self, cells: &[RegisterText]) -> Result<(), String> {
+        for (i, c) in cells.iter().enumerate() {
+            if !kaijutsu_types::editor::is_text_register(c.name) {
+                return Err(format!("{:?} is not a text register", c.name));
+            }
+            if cells[..i].iter().any(|d| d.name == c.name) {
+                return Err(format!("register {:?} is named twice", c.name));
+            }
+        }
+        let cell_for = |name: char| {
+            cells
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| cell_of(&c.text, c.shape))
+                .unwrap_or_default()
+        };
+        for name in STORED_REGISTERS.chars() {
+            let reg = stored_register(name).expect("a stored register");
+            self.0
+                .put(&reg, cell_for(name), RegisterPutFlags::NOTEXT)
+                .map_err(|e| format!("register {name:?} refused: {e}"))?;
+        }
+        // The unnamed register alone: modalkit's put of a read-only register
+        // stores nothing there and sets the unnamed register to the cell.
+        self.0
+            .put(&Register::LastInserted, cell_for(UNNAMED_REGISTER), RegisterPutFlags::NONE)
+            .map_err(|e| format!("the unnamed register refused: {e}"))
+    }
+}
+
+/// The modalkit register a stored row names: every text register but the
+/// unnamed one.
+fn stored_register(name: char) -> Option<Register> {
+    match name {
+        '0' => Some(Register::LastYanked),
+        '1'..='9' => Some(Register::RecentlyDeleted(name as usize - '1' as usize)),
+        '-' => Some(Register::SmallDelete),
+        'a'..='z' => Some(Register::Named(name)),
+        _ => None,
+    }
+}
+
+fn shape_of(shape: TargetShape) -> RegisterShape {
+    match shape {
+        TargetShape::CharWise => RegisterShape::Charwise,
+        TargetShape::LineWise => RegisterShape::Linewise,
+        TargetShape::BlockWise => RegisterShape::Blockwise,
+    }
+}
+
+fn cell_of(text: &str, shape: RegisterShape) -> RegisterCell {
+    let shape = match shape {
+        RegisterShape::Charwise => TargetShape::CharWise,
+        RegisterShape::Linewise => TargetShape::LineWise,
+        RegisterShape::Blockwise => TargetShape::BlockWise,
+    };
+    RegisterCell::new(shape, EditRope::from(text))
+}
+
+/// A store's text registers at one moment, compared across a key to learn
+/// the write the key made.
+#[derive(PartialEq)]
+struct TextRegisters {
+    unnamed: RegisterCell,
+    yanked: RegisterCell,
+    ring: Vec<RegisterCell>,
+    small: RegisterCell,
+    named: Vec<RegisterCell>,
+}
+
+impl TextRegisters {
+    fn of(store: &RegisterStore) -> Self {
+        let get = |reg: Register| store.get(&reg).expect("a text register always reads");
+        TextRegisters {
+            unnamed: get(Register::Unnamed),
+            yanked: get(Register::LastYanked),
+            ring: (0..9).map(|i| get(Register::RecentlyDeleted(i))).collect(),
+            small: get(Register::SmallDelete),
+            named: ('a'..='z').map(|c| get(Register::Named(c))).collect(),
+        }
+    }
+
+    /// The write that took `before` to `self`, tested in this order: a
+    /// named register changed to the unnamed register's text is a named
+    /// write; `"0` changed to it is a yank; the ring or `"-` changed to it is
+    /// a delete; the unnamed register changed to `"0`'s text is a yank, and
+    /// to any other text a delete. A register that changed without the
+    /// unnamed register following it was a macro being recorded, which is
+    /// not a text write.
+    fn write_since(&self, before: &TextRegisters) -> Option<RegisterWrite> {
+        let write = |kind, cell: &RegisterCell| {
+            Some(RegisterWrite { kind, text: cell.value.to_string(), shape: shape_of(cell.shape) })
+        };
+        let named = self
+            .named
+            .iter()
+            .zip(&before.named)
+            .zip('a'..='z')
+            .find(|((now, was), _)| now != was && **now == self.unnamed);
+        if let Some(((cell, _), name)) = named {
+            return write(RegisterWriteKind::Named(name), cell);
+        }
+        if self.yanked != before.yanked && self.yanked == self.unnamed {
+            return write(RegisterWriteKind::Yank, &self.yanked);
+        }
+        let ring_pushed = self.ring != before.ring && self.ring[0] == self.unnamed;
+        let small_set = self.small != before.small && self.small == self.unnamed;
+        if ring_pushed || small_set {
+            return write(RegisterWriteKind::Delete, &self.unnamed);
+        }
+        if self.unnamed != before.unnamed {
+            let kind = if self.unnamed == self.yanked { RegisterWriteKind::Yank } else { RegisterWriteKind::Delete };
+            return write(kind, &self.unnamed);
+        }
+        None
+    }
+}
+
 /// Text yanked: what the unnamed register holds after a `y`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Yank {
@@ -225,6 +428,9 @@ pub struct EditorCore {
     /// The keys an intent for the kernel left unfed, awaiting the kernel via
     /// [`take_rest`](EditorCore::take_rest).
     pending_rest: Option<PendingKeys>,
+    /// The text-register writes keys and outside yanks made, oldest first,
+    /// awaiting [`take_register_writes`](EditorCore::take_register_writes).
+    register_writes: Vec<RegisterWrite>,
 }
 
 impl EditorCore {
@@ -259,6 +465,7 @@ impl EditorCore {
             pending_substitution: None,
             pending_io: None,
             pending_rest: None,
+            register_writes: Vec::new(),
         }
     }
 
@@ -287,10 +494,28 @@ impl EditorCore {
     pub fn yank(&mut self, yank: &Yank) {
         let shape = if yank.linewise { TargetShape::LineWise } else { TargetShape::CharWise };
         let cell = RegisterCell::new(shape, EditRope::from(yank.text.as_str()));
+        let before = TextRegisters::of(&self.store.registers);
         self.store
             .registers
             .put(&Register::Unnamed, cell, RegisterPutFlags::NONE)
             .expect("the unnamed register accepts any text");
+        self.record_register_write(&before);
+    }
+
+    /// Take the writes to the text registers made since the last take,
+    /// oldest first: one per key that changed them (its last write, for a
+    /// key that wrote more than once), and one per [`yank`](Self::yank) that
+    /// changed them. Another store that [`Registers::apply`]s them in order
+    /// holds the same text registers. See `docs/vi.md`, "A kernel-owned
+    /// register store".
+    pub fn take_register_writes(&mut self) -> Vec<RegisterWrite> {
+        std::mem::take(&mut self.register_writes)
+    }
+
+    fn record_register_write(&mut self, before: &TextRegisters) {
+        if let Some(write) = TextRegisters::of(&self.store.registers).write_since(before) {
+            self.register_writes.push(write);
+        }
     }
 
     /// The last yank, vim's `"0`: what a `y` wrote, never what a delete did.
@@ -600,6 +825,7 @@ impl EditorCore {
         // offsets are char-indexed into the logical content, matching the
         // kernel block — not modalkit's trailing-newline'd rope.
         let before = strip_one_trailing_newline(&self.buffer.get_text());
+        let registers_before = TextRegisters::of(&self.store.registers);
         self.machine.input_key(key);
         // Actions taken out of the machine to read its edit sequence wait
         // here, ahead of anything the machine still holds.
@@ -714,6 +940,7 @@ impl EditorCore {
         if let Some(op) = diff_op(&before, &after) {
             ops.push(op);
         }
+        self.record_register_write(&registers_before);
         ops
     }
 
@@ -2315,6 +2542,277 @@ mod tests {
             assert_eq!(next.cursor(), "alpha\nbeta\ngamma\n".chars().count(), "mark a was set in another buffer");
             next.apply_keys("p");
             assert_eq!(next.text(), "alpha\nbeta\ngamma\ndelta\nwo", "the registers did move");
+        }
+    }
+
+    /// Each key's write to the text registers is recorded, and another
+    /// store that applies the writes in order holds the same text registers.
+    mod register_writes {
+        use super::*;
+
+        fn write(kind: RegisterWriteKind, text: &str, shape: RegisterShape) -> RegisterWrite {
+            RegisterWrite { kind, text: text.to_string(), shape }
+        }
+
+        fn writes_of(initial: &str, keys: &str) -> Vec<RegisterWrite> {
+            let mut ed = EditorCore::new(initial);
+            ed.apply_keys(keys);
+            ed.take_register_writes()
+        }
+
+        #[test]
+        fn a_yank_is_a_yank_write() {
+            assert_eq!(
+                writes_of("one\ntwo", "yy"),
+                [write(RegisterWriteKind::Yank, "one\n", RegisterShape::Linewise)]
+            );
+            assert_eq!(
+                writes_of("hello world", "yw"),
+                [write(RegisterWriteKind::Yank, "hello ", RegisterShape::Charwise)]
+            );
+        }
+
+        #[test]
+        fn a_line_delete_and_a_small_delete_are_delete_writes() {
+            assert_eq!(
+                writes_of("one\ntwo", "dd"),
+                [write(RegisterWriteKind::Delete, "one\n", RegisterShape::Linewise)]
+            );
+            assert_eq!(
+                writes_of("hello world", "dw"),
+                [write(RegisterWriteKind::Delete, "hello ", RegisterShape::Charwise)]
+            );
+        }
+
+        #[test]
+        fn a_named_yank_and_a_named_delete_are_named_writes() {
+            assert_eq!(
+                writes_of("one\ntwo", "\"ayy"),
+                [write(RegisterWriteKind::Named('a'), "one\n", RegisterShape::Linewise)]
+            );
+            assert_eq!(
+                writes_of("one\ntwo", "\"bdd"),
+                [write(RegisterWriteKind::Named('b'), "one\n", RegisterShape::Linewise)]
+            );
+            // `"A` appends: the write carries the register's whole new text.
+            assert_eq!(
+                writes_of("one\ntwo", "\"ayyj\"Ayy").last(),
+                Some(&write(RegisterWriteKind::Named('a'), "one\ntwo\n", RegisterShape::Linewise))
+            );
+        }
+
+        /// The unnamed register taking the text `"0` holds is a yank even
+        /// though `"0` itself did not change.
+        #[test]
+        fn yanking_the_text_of_0_after_a_delete_is_a_yank() {
+            let mut ed = EditorCore::new("one\none\ntwo");
+            ed.apply_keys("yyjjdd");
+            ed.take_register_writes();
+            ed.apply_keys("ggyy");
+            assert_eq!(
+                ed.take_register_writes(),
+                [write(RegisterWriteKind::Yank, "one\n", RegisterShape::Linewise)]
+            );
+        }
+
+        /// A small delete of the text `"-` already holds, after a yank, still
+        /// changes the unnamed register: a delete.
+        #[test]
+        fn a_small_delete_of_the_text_of_minus_is_a_delete() {
+            let mut ed = EditorCore::new("aab");
+            ed.apply_keys("xlyl");
+            ed.take_register_writes();
+            ed.apply_keys("0x");
+            assert_eq!(
+                ed.take_register_writes(),
+                [write(RegisterWriteKind::Delete, "a", RegisterShape::Charwise)]
+            );
+        }
+
+        #[test]
+        fn keys_that_write_no_register_record_nothing() {
+            assert!(writes_of("one\ntwo", "jkliX<Esc>u").is_empty());
+            assert!(writes_of("one\ntwo", "\"_dd").is_empty(), "the black hole register is not a text register");
+            let mut ed = EditorCore::new("one");
+            ed.apply_keys("yy");
+            ed.take_register_writes();
+            ed.apply_keys("yy");
+            assert!(ed.take_register_writes().is_empty(), "yanking held text changes nothing");
+        }
+
+        /// Recording a macro into `"a` is not a text write: the unnamed
+        /// register keeps its text.
+        #[test]
+        fn recording_a_macro_records_no_write() {
+            assert!(writes_of("one\ntwo", "qajq").is_empty());
+        }
+
+        #[test]
+        fn one_write_per_key_in_order_and_take_drains() {
+            let mut ed = EditorCore::new("one\ntwo\nthree");
+            ed.apply_keys("yyjdd");
+            assert_eq!(
+                ed.take_register_writes(),
+                [
+                    write(RegisterWriteKind::Yank, "one\n", RegisterShape::Linewise),
+                    write(RegisterWriteKind::Delete, "two\n", RegisterShape::Linewise),
+                ]
+            );
+            assert!(ed.take_register_writes().is_empty());
+        }
+
+        #[test]
+        fn a_yank_from_outside_and_a_put_record_like_keys() {
+            let mut ed = EditorCore::new("alpha");
+            ed.yank(&Yank::lines("outside"));
+            assert_eq!(
+                ed.take_register_writes(),
+                [write(RegisterWriteKind::Yank, "outside\n", RegisterShape::Linewise)]
+            );
+            ed.yank(&Yank::lines("outside"));
+            assert!(ed.take_register_writes().is_empty(), "the same yank again changes nothing");
+            ed.put();
+            assert!(ed.take_register_writes().is_empty(), "`p` writes no register");
+        }
+
+        #[test]
+        fn a_key_event_records_its_write() {
+            let mut ed = EditorCore::new("one\ntwo");
+            ed.apply_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+            ed.apply_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+            assert_eq!(
+                ed.take_register_writes(),
+                [write(RegisterWriteKind::Delete, "one\n", RegisterShape::Linewise)]
+            );
+        }
+
+        /// The headline: `dd` here, the writes applied there, `p` there puts
+        /// the same lines, and the two stores hold the same text registers.
+        #[test]
+        fn applied_writes_converge_two_stores() {
+            let mut here = EditorCore::new("one\ntwo\nthree four\nfive");
+            here.apply_keys("dd\"ayyjdwyyjdd");
+            let writes = here.take_register_writes();
+            assert_eq!(writes.len(), 5);
+
+            let mut there = Registers::default();
+            for w in &writes {
+                there.apply(w).unwrap();
+            }
+            assert_eq!(there.text_cells(), here.take_registers().text_cells());
+
+            let mut ed = EditorCore::with_registers("x", there);
+            ed.apply_keys("p");
+            assert_eq!(ed.text(), "x\nfive", "the unnamed register is the last delete");
+            ed.apply_keys("\"2p\"ap\"-p");
+            assert_eq!(ed.text(), "x\nfive\none\ntthree wo", "the ring, \"a and \"- converge");
+        }
+
+        #[test]
+        fn a_small_delete_lands_in_minus_and_a_named_write_in_its_register() {
+            let mut regs = Registers::default();
+            regs.apply(&write(RegisterWriteKind::Delete, "word", RegisterShape::Charwise)).unwrap();
+            regs.apply(&write(RegisterWriteKind::Named('a'), "kept\n", RegisterShape::Linewise)).unwrap();
+            let mut ed = EditorCore::with_registers("x", regs);
+            ed.apply_keys("\"-p");
+            assert_eq!(ed.text(), "xword");
+            ed.apply_keys("\"ap");
+            assert_eq!(ed.text(), "xword\nkept");
+            let regs = ed.take_registers();
+            assert_eq!(regs.cell('1'), None, "a small delete leaves the ring alone");
+            assert_eq!(regs.cell('"').map(|c| c.text), Some("kept\n".to_string()));
+        }
+
+        #[test]
+        fn apply_refuses_a_name_outside_a_to_z() {
+            let mut regs = Registers::default();
+            for bad in ['A', '1', '"', '+'] {
+                assert!(regs.apply(&write(RegisterWriteKind::Named(bad), "x", RegisterShape::Charwise)).is_err());
+            }
+            assert!(regs.text_cells().is_empty(), "a refused write changes nothing");
+        }
+
+        #[test]
+        fn text_cells_lists_the_nonempty_text_registers_in_order() {
+            let mut ed = EditorCore::new("one\ntwo three");
+            ed.apply_keys("\"ayyddyw");
+            let names: String = ed.take_registers().text_cells().iter().map(|c| c.name).collect();
+            assert_eq!(names, "\"01a");
+        }
+
+        /// What a write touches, for the table: `"0` for a yank, the ring or
+        /// `"-` for a delete, the named register for a named write.
+        #[test]
+        fn targets_name_the_registers_a_write_sets() {
+            let t = |kind, text| Registers::targets(&write(kind, text, RegisterShape::Charwise));
+            assert_eq!(t(RegisterWriteKind::Yank, "x"), vec!['0']);
+            assert_eq!(t(RegisterWriteKind::Delete, "x"), vec!['-']);
+            assert_eq!(t(RegisterWriteKind::Delete, "x\n"), ('1'..='9').collect::<Vec<_>>());
+            assert_eq!(t(RegisterWriteKind::Named('q'), "x"), vec!['q']);
+        }
+
+        fn row(seq: u64, name: char, text: &str) -> (u64, RegisterText) {
+            (seq, RegisterText { name, text: text.to_string(), shape: RegisterShape::Linewise })
+        }
+
+        /// Rows put in sequence order leave the unnamed register equal to
+        /// the latest; a ring shift's rows share a sequence number and `"1`
+        /// goes last.
+        #[test]
+        fn from_rows_puts_in_sequence_order_with_1_last() {
+            let rows = vec![
+                row(4, '1', "new\n"),
+                row(4, '2', "old\n"),
+                row(1, '0', "yanked\n"),
+                row(3, 'a', "named\n"),
+            ];
+            let regs = Registers::from_rows(rows).unwrap();
+            assert_eq!(regs.cell('"').map(|c| c.text), Some("new\n".to_string()));
+            let mut ed = EditorCore::with_registers("x", regs);
+            ed.apply_keys("\"0p\"ap\"2p");
+            assert_eq!(ed.text(), "x\nyanked\nnamed\nold");
+
+            let regs = Registers::from_rows(vec![row(1, '1', "del\n"), row(2, '0', "yank\n")]).unwrap();
+            assert_eq!(regs.cell('"').map(|c| c.text), Some("yank\n".to_string()));
+        }
+
+        #[test]
+        fn from_rows_refuses_a_name_that_is_not_a_stored_register() {
+            for bad in ['"', 'A', '+'] {
+                assert!(Registers::from_rows(vec![row(1, bad, "x")]).is_err(), "{bad:?}");
+            }
+        }
+
+        /// `:regpull`: the text registers become the snapshot's, empty where
+        /// the snapshot has none; the last search stays.
+        #[test]
+        fn replace_text_takes_the_snapshot_and_keeps_the_rest() {
+            let mut kernel = EditorCore::new("k1\nk2");
+            kernel.apply_keys("\"byyjdd");
+            let snapshot = kernel.take_registers().text_cells();
+
+            let mut client = EditorCore::new("one\ntwo three\nfour");
+            client.apply_keys("\"ayyjdwyy/four<CR>");
+            let mut regs = client.take_registers();
+            regs.replace_text(&snapshot).unwrap();
+            assert_eq!(regs.text_cells(), snapshot);
+
+            let mut ed = EditorCore::with_registers("x\nfour", regs);
+            ed.apply_keys("p");
+            assert_eq!(ed.text(), "x\nk2\nfour", "the unnamed register is the kernel's");
+            ed.apply_keys("ggn");
+            assert_eq!(ed.cursor(), "x\nk2\n".chars().count(), "the search pattern stays");
+        }
+
+        /// The unnamed register can hold text no other register does (a
+        /// macro recorded over the register that held it); the snapshot
+        /// still carries it.
+        #[test]
+        fn replace_text_sets_an_unnamed_register_no_other_register_holds() {
+            let mut regs = Registers::default();
+            let only = RegisterText { name: '"', text: "alone".into(), shape: RegisterShape::Charwise };
+            regs.replace_text(std::slice::from_ref(&only)).unwrap();
+            assert_eq!(regs.text_cells(), vec![only]);
         }
     }
 

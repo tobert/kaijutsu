@@ -635,6 +635,13 @@ enum RpcCommand {
         text: String,
         reply: oneshot::Sender<Result<EditorState, CallError>>,
     },
+    RegistersPut {
+        writes: Vec<kaijutsu_types::editor::RegisterWrite>,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    RegistersGet {
+        reply: oneshot::Sender<Result<Vec<kaijutsu_types::editor::RegisterText>, CallError>>,
+    },
 
     // ── Tool Execution ───────────────────────────────────────────────────
     GetToolSchemas {
@@ -810,6 +817,8 @@ impl RpcCommand {
             Self::VfsReadAll { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorInsert { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::RegistersPut { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::RegistersGet { reply } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1765,6 +1774,23 @@ impl ActorHandle {
             reply,
         })
         .await
+    }
+
+    /// Send the register writes a key made in this client's editor
+    /// (`EditorCore::take_register_writes`) to the kernel's copy of the
+    /// caller's registers. The caller's other connections receive each as
+    /// [`ServerEvent::RegisterWrite`](crate::ServerEvent::RegisterWrite);
+    /// this one does not. See `docs/vi.md`, "A kernel-owned register store".
+    #[tracing::instrument(skip(self, writes))]
+    pub async fn registers_put(&self, writes: Vec<kaijutsu_types::editor::RegisterWrite>) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::RegistersPut { writes, reply }).await
+    }
+
+    /// The caller's text registers as the kernel holds them, for a client
+    /// that replaces its own with them (`Registers::replace_text`).
+    #[tracing::instrument(skip(self))]
+    pub async fn registers_get(&self) -> Result<Vec<kaijutsu_types::editor::RegisterText>, CallError> {
+        self.send(|reply| RpcCommand::RegistersGet { reply }).await
     }
 
     // ── Tool Execution ───────────────────────────────────────────────────
@@ -3785,6 +3811,12 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::EditorInsert { session_id, text, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.editor_insert(session_id, &text));
+        }
+        RpcCommand::RegistersPut { writes, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.registers_put(&writes));
+        }
+        RpcCommand::RegistersGet { reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.registers_get());
         }
 
         // ── Tool Execution ──

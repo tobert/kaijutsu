@@ -1410,6 +1410,60 @@ impl KernelHandle {
         parse_editor_state(response.get()?.get_state()?)
     }
 
+    /// Send the register writes a key made in this client's editor to the
+    /// caller's registers on the kernel, in order. The kernel sends each to
+    /// the caller's other connections (`ServerEvent::RegisterWrite`), never
+    /// back to this one. See `docs/vi.md`, "A kernel-owned register store".
+    #[tracing::instrument(skip(self, writes), name = "rpc_client.registers_put")]
+    pub async fn registers_put(&self, writes: &[kaijutsu_types::editor::RegisterWrite]) -> Result<(), RpcError> {
+        let mut request = self.kernel.registers_put_request();
+        {
+            let mut list = request.get().init_writes(writes.len() as u32);
+            for (i, write) in writes.iter().enumerate() {
+                set_register_write(list.reborrow().get(i as u32), write);
+            }
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// The caller's text registers as the kernel holds them; an empty
+    /// register is left out.
+    #[tracing::instrument(skip(self), name = "rpc_client.registers_get")]
+    pub async fn registers_get(&self) -> Result<Vec<kaijutsu_types::editor::RegisterText>, RpcError> {
+        let mut request = self.kernel.registers_get_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        response
+            .get()?
+            .get_cells()?
+            .iter()
+            .map(|cell| {
+                let name = cell.get_name()?.to_string()?;
+                let mut chars = name.chars();
+                let (Some(name), None) = (chars.next(), chars.next()) else {
+                    return Err(RpcError::ServerError(format!("a register cell names {name:?}, not one character")));
+                };
+                Ok(kaijutsu_types::editor::RegisterText {
+                    name,
+                    text: cell.get_text()?.to_string()?,
+                    shape: parse_register_shape(cell.get_shape()?),
+                })
+            })
+            .collect()
+    }
+
     /// Read the current state of an open session.
     #[tracing::instrument(skip(self), name = "rpc_client.editor_state")]
     pub async fn editor_state(&self, session_id: u64) -> Result<EditorState, RpcError> {
@@ -4348,6 +4402,60 @@ pub struct EditorYank {
 pub struct EditorKeysReply {
     pub state: EditorState,
     pub yank: Option<EditorYank>,
+}
+
+fn parse_register_shape(shape: crate::kaijutsu_capnp::RegisterShape) -> kaijutsu_types::editor::RegisterShape {
+    use crate::kaijutsu_capnp::RegisterShape as Wire;
+    use kaijutsu_types::editor::RegisterShape;
+    match shape {
+        Wire::Charwise => RegisterShape::Charwise,
+        Wire::Linewise => RegisterShape::Linewise,
+        Wire::Blockwise => RegisterShape::Blockwise,
+    }
+}
+
+fn set_register_write(
+    mut b: crate::kaijutsu_capnp::register_write::Builder<'_>,
+    write: &kaijutsu_types::editor::RegisterWrite,
+) {
+    use crate::kaijutsu_capnp::RegisterShape as Wire;
+    use kaijutsu_types::editor::{RegisterShape, RegisterWriteKind};
+    match write.kind {
+        RegisterWriteKind::Yank => b.set_yank(()),
+        RegisterWriteKind::Delete => b.set_delete(()),
+        RegisterWriteKind::Named(c) => b.set_named(c.to_string().as_str()),
+    }
+    b.set_text(&write.text);
+    b.set_shape(match write.shape {
+        RegisterShape::Charwise => Wire::Charwise,
+        RegisterShape::Linewise => Wire::Linewise,
+        RegisterShape::Blockwise => Wire::Blockwise,
+    });
+}
+
+/// A pushed register write. A named write names one character.
+pub(crate) fn parse_register_write(
+    r: crate::kaijutsu_capnp::register_write::Reader<'_>,
+) -> Result<kaijutsu_types::editor::RegisterWrite, RpcError> {
+    use crate::kaijutsu_capnp::register_write::Which;
+    use kaijutsu_types::editor::RegisterWriteKind;
+    let kind = match r.which().map_err(|e| RpcError::ServerError(format!("register write: {e}")))? {
+        Which::Yank(()) => RegisterWriteKind::Yank,
+        Which::Delete(()) => RegisterWriteKind::Delete,
+        Which::Named(name) => {
+            let name = name?.to_string()?;
+            let mut chars = name.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return Err(RpcError::ServerError(format!("a named register write names {name:?}, not one letter")));
+            };
+            RegisterWriteKind::Named(c)
+        }
+    };
+    Ok(kaijutsu_types::editor::RegisterWrite {
+        kind,
+        text: r.get_text()?.to_string()?,
+        shape: parse_register_shape(r.get_shape()?),
+    })
 }
 
 /// The `yank` of an `editorKeys` reply: `None` when the field is unset, which

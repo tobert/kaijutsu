@@ -29,6 +29,7 @@ use crate::mcp::Broker;
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
 
 mod editor_recovery;
+mod editor_registers;
 pub use editor_recovery::{
     RecoverableFile, RecoverableList, age_label, render_recoverable_lists,
 };
@@ -492,9 +493,11 @@ impl Kernel {
             temp_cleanup: None,
             council_sync: crate::council::sync::CouncilSync::default(),
             endpoints: crate::llm::endpoint::Endpoints::default(),
-            editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
-                crate::editor::EditorSessions::new(),
-            )),
+            editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions({
+                let mut sessions = crate::editor::EditorSessions::new();
+                sessions.set_register_loader(Self::register_loader(db.clone()));
+                sessions
+            })),
             editor_flows: shared_editor_flow_bus(default_flow_capacity()),
             ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
             shell_operations: {
@@ -1888,9 +1891,17 @@ impl Kernel {
         // then fulfilled below: the async fetch happens *outside* the lock,
         // so the `!Send` `EditorCore` never crosses an await (the
         // `SendSessions` invariant); only the fetched `String` does.
-        let (outcome, io, io_cursor, io_opener) = {
+        let (outcome, io, io_cursor, io_opener, register_error) = {
             let mut sessions = self.editor_sessions.lock();
-            let outcome = sessions.0.batch(id, input, blocks, actor, can_write)?;
+            let mut outcome = sessions.0.batch(id, input, blocks, actor, can_write)?;
+            // The batch's register writes go to the table under the same
+            // lock, so no other write lands between the batch and its row.
+            let register_batch = match &mut outcome {
+                crate::editor::KeysOutcome::Updated(u) | crate::editor::KeysOutcome::Closed(u) => {
+                    std::mem::take(&mut u.registers)
+                }
+            };
+            let register_error = self.commit_batch_registers(&mut sessions.0, actor, register_batch);
             let io = if matches!(outcome, crate::editor::KeysOutcome::Updated(_)) {
                 sessions.0.take_io(id)
             } else {
@@ -1903,7 +1914,7 @@ impl Kernel {
             // The opener context, captured at submit too — `:r !cmd` shells out
             // in it (the caller's context/capabilities, not the edited block's).
             let io_opener = io.as_ref().and_then(|_| sessions.0.session_opener(id));
-            (outcome, io, io_cursor, io_opener)
+            (outcome, io, io_cursor, io_opener, register_error)
         };
 
         // No cache invalidation here. An editor edit lands *through* the
@@ -1915,7 +1926,7 @@ impl Kernel {
         match outcome {
             crate::editor::KeysOutcome::Updated(update) => {
                 let fp = update.path.as_str();
-                let mut message = update.state.message.clone();
+                let mut message = join_notes(update.state.message.clone(), register_error);
                 let mut go = update.go;
                 // Fulfill a `:r` read: fetch the content, then splice it at
                 // the buffer and cursor captured above. A failed fetch
@@ -2055,6 +2066,7 @@ impl Kernel {
                     None => {
                         let mut state = update.state;
                         state.message = join_notes(state.message.take(), recovery_error);
+                        state.message = join_notes(state.message.take(), register_error);
                         Ok(EditorBatchEnd::Closed(state, update.yank))
                     }
                 }

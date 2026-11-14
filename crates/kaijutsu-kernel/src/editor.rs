@@ -77,7 +77,8 @@ pub async fn resolve_editor_target(
 use std::collections::HashMap;
 
 use kaijutsu_editor::{
-    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, Registers, Yank,
+    ArgMove, CloseRequest, CommandRequest, EditorCore, EditorIo, PendingKeys, RegisterText, RegisterWrite,
+    Registers, Yank,
 };
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
@@ -175,6 +176,33 @@ pub struct KeysUpdate {
     /// player's `"0` after the keys differs from before them. A delete is not
     /// a yank, and yanking the text `"0` already held reports nothing.
     pub yank: Option<Yank>,
+    /// The batch's writes to the player's text registers, for the kernel
+    /// layer to write to the table and publish.
+    pub registers: RegisterBatch,
+}
+
+/// What a key batch did to the player's text registers.
+#[derive(Debug, Default)]
+pub struct RegisterBatch {
+    /// One write per key that changed them, oldest first
+    /// (`EditorCore::take_register_writes`).
+    pub writes: Vec<RegisterWrite>,
+    /// The player's text registers before the batch, when it wrote any. The
+    /// kernel layer puts them back when the table write fails, so the store
+    /// never holds a write the table does not.
+    pub before: Vec<RegisterText>,
+}
+
+/// Loads a player's registers the first time they are used after a start:
+/// the registers and the sequence number their next write takes. The kernel
+/// installs one that reads the table (`EditorSessions::set_register_loader`).
+pub type RegisterLoader = Box<dyn Fn(PrincipalId) -> Result<(Registers, u64), String> + Send>;
+
+/// One player's registers and the sequence number of their next write.
+#[derive(Default)]
+pub struct PlayerRegisters {
+    pub registers: Registers,
+    pub next_seq: u64,
 }
 
 /// What closing a session did to its loaded files.
@@ -535,14 +563,39 @@ pub struct EditorSessions {
     /// Each player's vi registers, keyed by the principal that sends the
     /// keys. They are lent to a session's core for one key batch and taken
     /// back after it, so every session a player types in shares them, and no
-    /// player reads or overwrites another's. Held in memory only: a kernel
-    /// restart empties them (`docs/vi.md`, "Registers").
-    registers: HashMap<PrincipalId, Registers>,
+    /// player reads or overwrites another's (`docs/vi.md`, "Registers").
+    registers: HashMap<PrincipalId, PlayerRegisters>,
+    /// Fills a player's entry in `registers` on first use. Without one, a
+    /// player starts with empty registers.
+    register_loader: Option<RegisterLoader>,
 }
 
 impl EditorSessions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Load each player's registers with `loader` the first time they are
+    /// used.
+    pub fn set_register_loader(&mut self, loader: RegisterLoader) {
+        self.register_loader = Some(loader);
+    }
+
+    /// `actor`'s registers, loaded on first use. A failed load installs
+    /// nothing, so the next use loads again.
+    pub fn player_registers(&mut self, actor: PrincipalId) -> Result<&mut PlayerRegisters, String> {
+        if !self.registers.contains_key(&actor) {
+            let loaded = match &self.register_loader {
+                Some(load) => {
+                    let (registers, next_seq) =
+                        load(actor).map_err(|e| format!("cannot load the vi registers: {e}"))?;
+                    PlayerRegisters { registers, next_seq }
+                }
+                None => PlayerRegisters { registers: Registers::default(), next_seq: 1 },
+            };
+            self.registers.insert(actor, loaded);
+        }
+        Ok(self.registers.get_mut(&actor).expect("inserted above"))
     }
 
     /// Open an editor over the argument list `paths`, on a *pre-resolved*
@@ -842,9 +895,13 @@ impl EditorSessions {
         can_write: bool,
     ) -> Result<KeysOutcome, String> {
         let mut yank = None;
-        let mut outcome = self.run_batch(id, input, blocks, actor, can_write, &mut yank)?;
+        let mut registers = RegisterBatch::default();
+        let mut outcome = self.run_batch(id, input, blocks, actor, can_write, &mut yank, &mut registers)?;
         match &mut outcome {
-            KeysOutcome::Updated(update) | KeysOutcome::Closed(update) => update.yank = yank,
+            KeysOutcome::Updated(update) | KeysOutcome::Closed(update) => {
+                update.yank = yank;
+                update.registers = registers;
+            }
         }
         Ok(outcome)
     }
@@ -852,6 +909,8 @@ impl EditorSessions {
     /// [`batch`](Self::batch)'s body. `yank` is set from the player's `"0`
     /// before and after the keys; the registers belong to the player, not the
     /// buffer, so the compare holds whichever buffer the keys ran in.
+    /// `registers` takes the core's register writes.
+    #[allow(clippy::too_many_arguments)] // one batch's inputs and its two register reports
     fn run_batch(
         &mut self,
         id: EditorSessionId,
@@ -860,12 +919,19 @@ impl EditorSessions {
         actor: PrincipalId,
         can_write: bool,
         yank: &mut Option<Yank>,
+        registers: &mut RegisterBatch,
     ) -> Result<KeysOutcome, String> {
+        if !self.sessions.contains_key(&id) {
+            return Err(no_session(id));
+        }
+        self.player_registers(actor)?;
         let (close, commands, rest) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+            let player = self.registers.get_mut(&actor).expect("loaded above");
             let buffer = session.buffer()?;
             let len_before = buffer.core.text().chars().count();
-            buffer.core.give_registers(self.registers.remove(&actor).unwrap_or_default());
+            let before = player.registers.text_cells();
+            buffer.core.give_registers(std::mem::take(&mut player.registers));
             let yank_before = buffer.core.last_yank();
             let ops = match input {
                 BatchInput::Keys(keys) => buffer.core.apply_keys(keys),
@@ -875,9 +941,13 @@ impl EditorSessions {
             if yank_after != yank_before {
                 *yank = yank_after;
             }
-            self.registers.insert(actor, buffer.core.take_registers());
+            player.registers = buffer.core.take_registers();
+            registers.writes = buffer.core.take_register_writes();
+            if !registers.writes.is_empty() {
+                registers.before = before;
+            }
             let buffer_after = buffer.core.text();
-            mirror_ops(
+            let mirrored = mirror_ops(
                 &ops,
                 &buffer.target,
                 &buffer.terminator,
@@ -886,7 +956,19 @@ impl EditorSessions {
                 blocks,
                 actor,
                 "editor keys",
-            )?;
+            );
+            // A failed batch never reaches the kernel layer's table write,
+            // so its register writes leave the store too.
+            if let Err(e) = mirrored {
+                if !registers.writes.is_empty() {
+                    player
+                        .registers
+                        .replace_text(&registers.before)
+                        .expect("a snapshot of text registers names only text registers");
+                    *registers = RegisterBatch::default();
+                }
+                return Err(e);
+            }
             (buffer.core.take_close(), buffer.core.take_commands(), buffer.core.take_rest())
         };
 
@@ -915,6 +997,7 @@ impl EditorSessions {
                             go: None,
                             rest: None,
                             yank: None,
+                            registers: RegisterBatch::default(),
                         }));
                     }
                     // ZZ: checkpoint current as saved, then quit — the rollback
@@ -932,6 +1015,7 @@ impl EditorSessions {
                         go: None,
                         rest: None,
                         yank: None,
+                        registers: RegisterBatch::default(),
                     }));
                 }
                 CloseRequest::Discard => {
@@ -951,6 +1035,7 @@ impl EditorSessions {
                         go: None,
                         rest: None,
                         yank: None,
+                        registers: RegisterBatch::default(),
                     }));
                 }
             }
@@ -990,6 +1075,7 @@ impl EditorSessions {
             go: None,
             rest: None,
             yank: None,
+            registers: RegisterBatch::default(),
         })
     }
 
@@ -1112,6 +1198,7 @@ impl EditorSessions {
                         go: None,
                         rest: None,
                         yank: None,
+                        registers: RegisterBatch::default(),
                     }));
                 }
             }
@@ -2581,6 +2668,105 @@ mod session_tests {
         assert!(sessions.keys(first, "yy", &blocks, amy).unwrap().yank().is_some());
         let later = sessions.keys(second, "l", &other_blocks, amy).unwrap();
         assert_eq!(later.yank(), None, "another session's later batch yanked nothing");
+    }
+
+    /// A batch carries the writes its keys made to the player's registers,
+    /// and the text registers from before it, for the kernel layer.
+    #[tokio::test]
+    async fn a_batch_carries_its_register_writes_and_the_registers_before_it() {
+        use kaijutsu_editor::{RegisterShape, RegisterWrite, RegisterWriteKind};
+        let (blocks, target) = seeded(b"one\ntwo").await;
+        let amy = PrincipalId::new();
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+
+        let yy = sessions.keys(id, "yy", &blocks, amy).unwrap();
+        let KeysOutcome::Updated(yy) = yy else { panic!("yy closes nothing") };
+        assert!(yy.registers.before.is_empty(), "nothing was held before");
+        let dd = sessions.keys(id, "jdd", &blocks, amy).unwrap();
+        let KeysOutcome::Updated(dd) = dd else { panic!("dd closes nothing") };
+        assert_eq!(
+            dd.registers.writes,
+            [RegisterWrite { kind: RegisterWriteKind::Delete, text: "two\n".into(), shape: RegisterShape::Linewise }]
+        );
+        assert_eq!(dd.registers.before.iter().map(|c| c.name).collect::<String>(), "\"0");
+        let motion = sessions.keys(id, "k", &blocks, amy).unwrap();
+        let KeysOutcome::Updated(motion) = motion else { panic!("k closes nothing") };
+        assert!(motion.registers.writes.is_empty());
+    }
+
+    /// A player's registers load the first time that player's keys arrive,
+    /// once, from the loader the kernel installs.
+    #[tokio::test]
+    async fn registers_load_lazily_once_per_player() {
+        use kaijutsu_editor::{RegisterShape, RegisterWrite, RegisterWriteKind};
+        let (blocks, target) = seeded(b"alpha").await;
+        let (amy, model) = (PrincipalId::new(), PrincipalId::new());
+        let loads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sessions = EditorSessions::new();
+        let seen = loads.clone();
+        sessions.set_register_loader(Box::new(move |who| {
+            seen.lock().unwrap().push(who);
+            let mut regs = Registers::default();
+            if who == amy {
+                regs.apply(&RegisterWrite {
+                    kind: RegisterWriteKind::Yank,
+                    text: "stored\n".into(),
+                    shape: RegisterShape::Linewise,
+                })?;
+            }
+            Ok((regs, 5))
+        }));
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+
+        assert_eq!(sessions.keys(id, "p", &blocks, amy).unwrap().state().text, "alpha\nstored");
+        sessions.keys(id, "u", &blocks, amy).unwrap();
+        assert_eq!(sessions.keys(id, "p", &blocks, model).unwrap().state().text, "alpha");
+        sessions.keys(id, "p", &blocks, amy).unwrap();
+        assert_eq!(*loads.lock().unwrap(), [amy, model], "one load per player");
+        assert_eq!(sessions.player_registers(amy).unwrap().next_seq, 5);
+    }
+
+    /// A loader that fails fails the batch and installs nothing, so the next
+    /// use loads again.
+    #[tokio::test]
+    async fn a_failed_register_load_fails_the_batch_and_retries() {
+        let (blocks, target) = seeded(b"alpha").await;
+        let amy = PrincipalId::new();
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut sessions = EditorSessions::new();
+        let failing = fail.clone();
+        sessions.set_register_loader(Box::new(move |_| {
+            if failing.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("disk on fire".to_string())
+            } else {
+                Ok((Registers::default(), 1))
+            }
+        }));
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        let err = sessions.keys(id, "x", &blocks, amy).unwrap_err();
+        assert!(err.contains("disk on fire"), "{err}");
+        assert_eq!(sessions.state(id).unwrap().text, "alpha", "no key ran");
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(sessions.keys(id, "x", &blocks, amy).unwrap().state().text, "lpha");
+    }
+
+    /// A batch whose block mirror fails leaves the player's registers as
+    /// they were before it: the kernel layer never writes that batch's rows,
+    /// so the store must not hold them either.
+    #[tokio::test]
+    async fn a_failed_block_mirror_leaves_the_registers_as_before_the_batch() {
+        let (blocks, target) = seeded(b"one\ntwo").await;
+        let (elsewhere, _) = seeded(b"other").await;
+        let amy = PrincipalId::new();
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(&[RC_PATH], target, &blocks, None).unwrap();
+        sessions.keys(id, "yy", &blocks, amy).unwrap();
+        let held = sessions.player_registers(amy).unwrap().registers.text_cells();
+
+        let err = sessions.keys(id, "jdd", &elsewhere, amy).unwrap_err();
+        assert!(err.contains("block mirror failed"), "{err}");
+        assert_eq!(sessions.player_registers(amy).unwrap().registers.text_cells(), held);
     }
 
     /// A yank followed by the `ZZ` that closes the session is still reported.

@@ -443,8 +443,9 @@ editor, then go to another and 'p' when I type in the wrong spot."*
   edit is attributed to. They are lent to the session's `EditorCore` for one
   key batch and taken back after it, so two open sessions of one player see
   each other's yanks at once, and a model's session never reads or
-  overwrites a person's registers. They are held in memory: a kernel restart
-  empties them.
+  overwrites a person's registers. They are written through to the
+  `editor_registers` table and loaded on first use after a start; see "A
+  kernel-owned register store" below.
 - **Compose.** The tui's `Compose::load_draft` moves the registers into each
   new core (a seat switch, a submit, a clear). The app's `ComposeState` holds
   them and lends them to the chat draft or the shell line for each key, so
@@ -489,7 +490,7 @@ editor, then go to another and 'p' when I type in the wrong spot."*
 
 ---
 
-### A kernel-owned register store (design, not built)
+### A kernel-owned register store (design, being built)
 
 Amy, 2026-11-11, asked for this design after choosing that `p` always puts
 the vi register and never the system clipboard. The goal: `dd` in the tui
@@ -514,62 +515,102 @@ the client, so its registers never reach the kernel.
   already: the principal the edit is attributed to. A model's yank never
   lands in a person's registers.
 - The kernel sequences writes. Two clients yanking at once resolve to the
-  later accepted write per register; nothing merges register text.
+  order the kernel accepts them in; nothing merges register text.
 - Only text registers move: the unnamed register, `"0`, `"1`–`"9`, `"-`
   and `"a`–`"z`, each as text and a shape (charwise, linewise, blockwise).
   Macros, the last `:` line and the search pattern stay with the client.
 
-**Two ways to carry it.**
+**A write is the unit, replayed through modalkit's own put.** A yank, a
+delete, or a write to a named register is one `RegisterWrite`: which
+register the editor wrote (the unnamed register as a yank, the unnamed
+register as a delete, or a named register) and the cell it wrote. Another
+side applies it with the same `RegisterStore::put` the editor used, so it
+updates the same registers in the same way: a yank sets the unnamed
+register and `"0`; a delete sets the unnamed register and either pushes
+the delete ring or, for less than a line, sets `"-`; a named write sets
+that register and the unnamed one. Two sides that apply the same writes in
+the same order hold the same text registers. Sending register state
+instead would need a way to set the unnamed register alone, which
+modalkit's store offers only as a side effect of putting a read-only
+register; `Registers::replace_text` uses that for `:regpull`.
 
-1. *Wire methods.* `registersPut(cells, since)` sends the cells a key
-   changed; `subscribeRegisters` pushes accepted cells to the person's
-   other connections with a kernel sequence number. `EditorSessions` lends
-   from the same store, so a vi session needs no new code path. A client
-   applies a pushed cell between keys, never inside a half-typed command,
-   and ignores the echo of its own write by sequence number. Cost: two
-   wire methods and a callback, and `EditorCore` must report which
-   registers a key changed (today only `last_yank` is readable).
-2. *VFS files.* Each register is a file under a per-character directory,
-   with the shape in a sidecar or a one-line header. Clients write through
-   the file RPCs and learn of changes through a watch. Scripts and models
-   could read a register with `cat` and fill one with a redirect, which is
-   new capability, not only plumbing. Cost: a watch path clients do not
-   have today, a file format for the shape, and a yank on every `x` and
-   `dw` becoming a file write.
+- **Detection.** `EditorCore` compares its text registers before and after
+  each key it feeds, and records the write the key made
+  (`take_register_writes`). A key that writes more than once (`.`, a
+  macro) is recorded as its last write. The class comes from what changed,
+  tested in this order: a named register that changed to the unnamed
+  register's text is a named write; `"0` changed to it is a yank; the ring
+  or `"-` changed to it is a delete; the unnamed register now equal to `"0`
+  is a yank; any other change to the unnamed register is a delete. A
+  register that changed while the unnamed register did not follow it is a
+  macro being recorded (`qa…q`), which records nothing.
+  `EditorCore::yank` (copy mode, the diff viewer) records a yank too.
+  Yanking text the registers already hold changes nothing and records
+  nothing; the other side holds that text already.
+- **Wire.** `registersPut(writes)` carries the writes a key made, in
+  order. The kernel applies them to the person's store, writes the table,
+  and publishes each accepted write on the editor flow bus. The
+  `EditorEvents` callback gains `onRegisterWrite`; the server's editor
+  bridge sends a write only to connections of the principal that made it,
+  and never back to the connection that sent it. A kernel vi session's
+  writes go to every connection of the player who typed the keys.
+- **Applying a push.** A client applies a pushed write to its `Registers`
+  between keys, and an applied write is not sent again. A push never
+  touches the system clipboard.
+- **The kernel's vi sessions** lend from the same store, and their writes
+  are taken from the core after each batch, written to the table, and
+  published. The yank that rides the `editorKeys` reply stays as it is.
 
-**Recommendation: the wire methods, held in memory.** Compose input is
-already an interaction-rate RPC path (`AGENTS.md`, "State and
-interfaces"), and a register changes on most normal-mode edits. The VFS
-form earns its cost only if scripts should reach registers, and the draft
-is the player's alone today: a delete from a draft would become readable
-at a path. If that reach is wanted later, a read-only `kj` verb over the
-same store is a smaller step than files.
+**Durability.** The store is a table, one row per (principal, register),
+written through on each accepted write; a failed write is an error the
+writer sees. The table takes a `registersPut` before the store does, and
+a failed one changes nothing. A kernel vi batch has already changed the
+store, so a failed table write puts the player's text registers back as
+they were before the batch and says so on the status line; the edit
+stands. The unnamed register has no row. Each row carries the sequence number of the write that set
+it. The kernel loads a principal's rows the first time that principal's
+registers are used after a start, by putting each row through the
+register's own put in sequence order, so the unnamed register ends equal
+to the row written last. After a restart, `p` in a kernel vi session puts
+what the player yanked before it.
 
-**Smallest useful slice.** Share the unnamed register and `"0` only. That
-covers `dd` here and `p` there, and needs one cell per message. The delete
-ring and the named registers follow once the push path has been played
-with.
+**Reconnect and recovery.** A client that connects keeps its own
+registers and takes nothing from the kernel by itself. `:regpull` on the
+compose line replaces the client's text registers with the kernel's copy
+(`registersGet`, `Registers::replace_text`); the next `p` puts the
+kernel's unnamed register. The client's last `:` line and search pattern
+stay; a macro is a named register (see "Still open"). `kj vi registers`
+shows the kernel's copy, read-only, for scripts and models.
 
-**Amy's answers, 2026-11-11.**
+**Amy's answers.**
 
-- *Durability:* "the state should survive in some recoverable form even
-  if the vi session doesn't, basic power outage / kill -9 protection for
-  ongoing work." The store is a table, written through on each accepted
-  write.
-- *Reconnect:* "on reconnect nobody gets it, they can recover it." No
-  side wins by itself. A reconnecting client keeps its local registers and
-  the kernel keeps its copy; a person asks for the kernel's copy when they
-  want it. The verb for that is not chosen.
-- *Models:* "might be cool I suppose I was thinking about some short term
-  memory options." A model's character may get a store. As short-term
-  memory it is a separate idea from yank and put and wants its own design.
+- 2026-11-11, *durability:* "the state should survive in some recoverable
+  form even if the vi session doesn't, basic power outage / kill -9
+  protection for ongoing work."
+- 2026-11-11, *reconnect:* "on reconnect nobody gets it, they can recover
+  it."
+- 2026-11-11, *models:* "might be cool I suppose I was thinking about some
+  short term memory options." A model's character has a store like anyone
+  else, filled by its `kj vi keys`. Using it as short-term memory is a
+  separate idea from yank and put and wants its own design.
+- 2026-11-14: the kernel loads its copy after a restart; a client's
+  recover command replaces its unnamed register and `"0` (with the rest of
+  the text registers) from the kernel's copy.
 
 **Still open.**
 
-- The recover verb: a `:` command, a `kj` verb, or both, and whether it
-  replaces the local registers or fills named ones.
 - The system clipboard stays a separate, outbound path: a yank is written
   to it, and nothing here reads it.
+- A write to `"1`–`"9` by name (`"1yy`) is detected as a delete, so
+  another side pushes it onto its ring instead of overwriting `"1`.
+- In modalkit a recorded macro lives in its named register. Recording
+  sends nothing, so `"a` can differ between sides after `qa…q`, and
+  `:regpull` replaces a macro recorded in `"a`–`"z`. What stays is the
+  last `:` line, the search pattern and which macro `@@` repeats.
+- A key that writes more than once sends its last write, but the kernel's
+  vi sessions keep every write in the store; a delete ring row the last
+  write did not touch keeps its older text in the table until the next
+  delete.
 
 ### The argument list
 

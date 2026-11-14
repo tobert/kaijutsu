@@ -128,6 +128,12 @@ pub enum ServerEvent {
     EditorStateChanged { state: EditorState },
     /// An in-app editor session closed (`ZQ`/quit). Renderers drop it.
     EditorClosed { session_id: u64 },
+    /// The kernel accepted a write into this connection's principal's vi
+    /// registers, from another connection or a kernel vi session. An editor
+    /// applies it to its `Registers` between keys (`Registers::apply`) and
+    /// does not send it back. `seq` orders the principal's writes. See
+    /// `docs/vi.md`, "A kernel-owned register store".
+    RegisterWrite { seq: u64, write: kaijutsu_types::editor::RegisterWrite },
     /// The reconnect FSM re-established a dropped connection — a `Connected` that
     /// follows a drop, not the first connect. The re-subscribed block stream
     /// missed everything the kernel published during the outage, so renderers
@@ -484,6 +490,29 @@ impl editor_events::Server for EditorEventsForwarder {
             .is_err()
         {
             tracing::warn!("Event channel closed, dropping EditorClosed event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_register_write(
+        self: Rc<Self>,
+        params: editor_events::OnRegisterWriteParams,
+        _results: editor_events::OnRegisterWriteResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let write = match params.get_write() {
+            Ok(r) => match crate::rpc::parse_register_write(r) {
+                Ok(w) => w,
+                Err(e) => return Promise::err(rpc_to_capnp(e)),
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let seq = params.get_seq();
+        if self.event_tx.send(ServerEvent::RegisterWrite { seq, write }).is_err() {
+            tracing::warn!("Event channel closed, dropping RegisterWrite event");
         }
         Promise::ok(())
     }
